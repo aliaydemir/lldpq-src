@@ -24,12 +24,8 @@ AI_PROXY_URL="${AI_PROXY_URL:-}"
 ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 
 source "$(dirname "$0")/auth-guard.sh"
-case "$ACTION" in
-    get-config|save-config|test-connection|list-models)
-        require_admin ;;
-    *)
-        require_auth ;;
-esac
+# AI Assistant is admin-only — operators cannot access any AI action
+require_admin
 
 # All responses are JSON (SSE streaming not supported by fcgiwrap)
 echo "Content-Type: application/json"

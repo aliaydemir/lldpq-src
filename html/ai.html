@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Assistant - LLDPq</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <style>
         input:-webkit-autofill,
         input:-webkit-autofill:hover,
@@ -283,7 +284,16 @@ function loadChatFromStorage() {
 }
 
 // ===================== INIT =====================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+    // AI Assistant is admin-only — block operators (and unauthenticated users)
+    if (window.LLDPqAuth) {
+        const isAuth = await LLDPqAuth.check();
+        if (!isAuth) return;
+        if (!LLDPqAuth.isAdmin()) {
+            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Admin only.</div>';
+            return;
+        }
+    }
     loadConfig();
     loadContext();
     loadAnalysisBadge();
