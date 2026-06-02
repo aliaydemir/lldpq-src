@@ -22,6 +22,14 @@
             padding: 0;
             box-sizing: border-box;
         }
+
+        input:-webkit-autofill,
+        input:-webkit-autofill:hover,
+        input:-webkit-autofill:focus {
+            -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important;
+            -webkit-text-fill-color: #fff !important;
+            caret-color: #fff !important;
+        }
         
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -1470,6 +1478,7 @@
                             topologyEditorCM.setValue(data.content);
                         }
                         document.getElementById('topologyEditorStatus').textContent = 'Loaded successfully. Edit and save.';
+                        resetReplacePanel();
                     } else {
                         document.getElementById('topologyEditorStatus').textContent = 'Error: ' + data.error;
                     }
@@ -1477,6 +1486,76 @@
                 .catch(err => {
                     document.getElementById('topologyEditorStatus').textContent = 'Error: ' + err.message;
                 });
+        }
+
+        // ===== Find & Replace (batch, quote-aware) =====
+        function toggleReplacePanel() {
+            const body = document.getElementById('replacePanelBody');
+            const caret = document.getElementById('replacePanelCaret');
+            const opening = body.style.display === 'none';
+            body.style.display = opening ? 'block' : 'none';
+            caret.innerHTML = opening ? '&#9660;' : '&#9654;';
+            if (opening && document.getElementById('replaceRows').children.length === 0) {
+                addReplaceRow();
+            }
+        }
+
+        function addReplaceRow(find, to) {
+            const container = document.getElementById('replaceRows');
+            if (!container) return;
+            const esc = (s) => (s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+            const inputStyle = 'flex:1; background:#1a1a1a; color:#fff; border:1px solid #555; border-radius:4px; padding:5px 8px; font-size:12px; font-family:monospace;';
+            const row = document.createElement('div');
+            row.className = 'replace-row';
+            row.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:6px;';
+            row.innerHTML =
+                '<input type="text" class="replace-find" placeholder="M1" autocomplete="off" value="' + esc(find) + '" style="' + inputStyle + '">' +
+                '<span style="color:#76b900; font-weight:bold;">&rarr;</span>' +
+                '<input type="text" class="replace-to" placeholder="enp3s0f0" autocomplete="off" value="' + esc(to) + '" style="' + inputStyle + '">' +
+                '<button type="button" title="Remove" onclick="this.closest(\'.replace-row\').remove()" style="background:#555; color:#fff; border:none; width:26px; height:26px; border-radius:4px; cursor:pointer; font-size:14px; line-height:1;">&times;</button>';
+            container.appendChild(row);
+        }
+
+        function applyReplacements() {
+            const status = document.getElementById('replaceStatus');
+            if (!topologyEditorCM) return;
+            let content = topologyEditorCM.getValue();
+            let total = 0, rulesApplied = 0;
+            document.querySelectorAll('#replaceRows .replace-row').forEach(row => {
+                const find = row.querySelector('.replace-find').value.trim();
+                const to = row.querySelector('.replace-to').value.trim();
+                if (!find || !to) return;
+                // Quote-aware: only replace the exact quoted interface token
+                const needle = '"' + find + '"';
+                const repl = '"' + to + '"';
+                const parts = content.split(needle);
+                const count = parts.length - 1;
+                if (count > 0) {
+                    content = parts.join(repl);
+                    total += count;
+                    rulesApplied++;
+                }
+            });
+            topologyEditorCM.setValue(content);
+            if (total > 0) {
+                status.style.color = '#76b900';
+                status.textContent = 'Replaced ' + total + ' occurrence(s) via ' + rulesApplied + ' rule(s). Review, then Save.';
+            } else {
+                status.style.color = '#e0a030';
+                status.textContent = 'No matching quoted tokens found.';
+            }
+        }
+
+        function resetReplacePanel() {
+            const rows = document.getElementById('replaceRows');
+            if (rows) rows.innerHTML = '';
+            const body = document.getElementById('replacePanelBody');
+            if (body) body.style.display = 'none';
+            const caret = document.getElementById('replacePanelCaret');
+            if (caret) caret.innerHTML = '&#9654;';
+            const status = document.getElementById('replaceStatus');
+            if (status) status.textContent = '';
+            addReplaceRow();
         }
 
         function closeTopologyEditor(event) {
@@ -1550,6 +1629,22 @@
                 <div style="padding: 15px; background: #333; border-bottom: 1px solid #4a4a4a; font-size: 12px; color: #888;">
                     Format: <code style="color: #76b900;">"device1":"port1" -- "device2":"port2"</code>
                     &nbsp;|&nbsp; One link per line &nbsp;|&nbsp; Lines starting with # are comments
+                </div>
+                <div style="padding: 10px 15px; background: #2a2a2a; border-bottom: 1px solid #4a4a4a;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <button type="button" onclick="toggleReplacePanel()" style="background: none; border: none; color: #76b900; font-size: 12px; cursor: pointer; padding: 0; display: flex; align-items: center; gap: 6px; font-weight: bold;">
+                            <span id="replacePanelCaret">&#9654;</span> Find &amp; Replace (interface names)
+                        </button>
+                        <span style="color: #666; font-size: 11px;">Replaces quoted tokens: <code style="color:#999;">"M1"</code> &rarr; <code style="color:#999;">"enp3s0f0"</code> &nbsp;(safe: won't touch <code style="color:#999;">"M10"</code>)</span>
+                    </div>
+                    <div id="replacePanelBody" style="display: none; margin-top: 10px;">
+                        <div id="replaceRows"></div>
+                        <div style="margin-top: 8px; display: flex; align-items: center; gap: 10px;">
+                            <button type="button" onclick="addReplaceRow()" style="background: #444; color: #ddd; border: 1px solid #555; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px;">+ Add Row</button>
+                            <button type="button" onclick="applyReplacements()" style="background: #607d8b; color: #fff; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">Replace All</button>
+                            <span id="replaceStatus" style="color: #888; font-size: 12px;"></span>
+                        </div>
+                    </div>
                 </div>
                 <div id="topologyEditorContainer" style="height: 50vh; border: none;"></div>
                 <div style="padding: 15px; background: #333; border-top: 1px solid #4a4a4a; text-align: right; display: flex; justify-content: space-between; align-items: center;">
