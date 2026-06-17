@@ -121,6 +121,8 @@ def check_connections(topology_file, device_neighbors, device_port_status):
         expected_connections = file.readlines()
     results = {}
     valid_devices = device_neighbors.keys()
+    # Hostname matching is case-insensitive (DNS-style); interface names stay exact
+    valid_devices_lower = {d.lower() for d in valid_devices}
     edge_re = re.compile(r'"([^"]+)"\s*:\s*"([^"]+)"\s*--\s*"([^"]+)"\s*:\s*"([^"]+)"')
     for device, neighbors in device_neighbors.items():
         port_status = device_port_status.get(device, {})
@@ -154,11 +156,13 @@ def check_connections(topology_file, device_neighbors, device_port_status):
                     continue
                 left, left_interface = lp[0].strip(), lp[1].strip()
                 right, right_interface = rp[0].strip(), rp[1].strip()
-            if left != device and right != device:
+            left_is_device = left.lower() == device.lower()
+            right_is_device = right.lower() == device.lower()
+            if not left_is_device and not right_is_device:
                 continue
-            expected_interface = left_interface if left == device else right_interface
-            expected_neighbor_sys_name = right if left == device else left
-            expected_neighbor_port = right_interface if left == device else left_interface
+            expected_interface = left_interface if left_is_device else right_interface
+            expected_neighbor_sys_name = right if left_is_device else left
+            expected_neighbor_port = right_interface if left_is_device else left_interface
             active_neighbor = next((n for n in neighbors if n['interface'] == expected_interface), None)
             active_neighbor_sys_name = 'None'
             active_neighbor_port = 'None'
@@ -174,7 +178,7 @@ def check_connections(topology_file, device_neighbors, device_port_status):
                     status = 'Fail'
                     active_neighbor_sys_name = active_neighbor['sys_name']
                     active_neighbor_port = active_neighbor['port_id']
-                elif active_neighbor['sys_name'] == expected_neighbor_sys_name and active_neighbor['port_id'] == expected_neighbor_port:
+                elif active_neighbor['sys_name'].lower() == expected_neighbor_sys_name.lower() and active_neighbor['port_id'] == expected_neighbor_port:
                     status = 'Pass'
                     active_neighbor_sys_name = active_neighbor['sys_name']
                     active_neighbor_port = active_neighbor['port_id']
@@ -198,7 +202,7 @@ def check_connections(topology_file, device_neighbors, device_port_status):
         for neighbor in neighbors:
             if neighbor['interface'] == 'eth0' or neighbor['port_id'] == 'eth0':
                 continue
-            if neighbor['sys_name'] not in valid_devices:
+            if neighbor['sys_name'].lower() not in valid_devices_lower:
                 continue
             if not any(n['interface'] == neighbor['interface'] for n in device_results):
                 # Get port status for this interface

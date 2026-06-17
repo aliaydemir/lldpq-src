@@ -545,6 +545,13 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
 
     defined_links = parse_topology_dot_file(dot_file_path)
 
+    # Hostname matching is case-insensitive (DNS-style); interface names stay exact
+    def _link_key(s_dev, s_if, t_dev, t_if):
+        return (s_dev.lower(), s_if, t_dev.lower(), t_if)
+    defined_links_lc = {_link_key(*dl) for dl in defined_links}
+    all_lldp_links_found_lc = {_link_key(*ll) for ll in all_lldp_links_found}
+    device_nodes_lc = {name.lower(): nid for name, nid in device_nodes.items()}
+
     for link in topology_data["links"]:
         src_device = link["srcDevice"]
         tgt_device = link["tgtDevice"]
@@ -554,7 +561,7 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
         forward_link_tuple = (src_device, src_ifname, tgt_device, tgt_ifname)
         reverse_link_tuple = (tgt_device, tgt_ifname, src_device, src_ifname)
 
-        if forward_link_tuple not in defined_links and reverse_link_tuple not in defined_links:
+        if _link_key(*forward_link_tuple) not in defined_links_lc and _link_key(*reverse_link_tuple) not in defined_links_lc:
             link["is_missing"] = "fail"
 
     final_links_to_add = []
@@ -564,9 +571,9 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
         forward_link_tuple = (src_device, src_ifname, tgt_device, tgt_ifname)
         reverse_link_tuple = (tgt_device, tgt_ifname, src_device, src_ifname)
 
-        if forward_link_tuple not in all_lldp_links_found and reverse_link_tuple not in all_lldp_links_found:
+        if _link_key(*forward_link_tuple) not in all_lldp_links_found_lc and _link_key(*reverse_link_tuple) not in all_lldp_links_found_lc:
 
-            if src_device in device_nodes and tgt_device in device_nodes:
+            if src_device.lower() in device_nodes_lc and tgt_device.lower() in device_nodes_lc:
                 # Get port status for both source and target interfaces
                 src_port_status = all_port_status.get(src_device, {}).get(src_ifname, "N/A")
                 tgt_port_status = all_port_status.get(tgt_device, {}).get(tgt_ifname, "N/A")
@@ -576,12 +583,12 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
                 
                 link = {
                     "id": current_link_id,
-                    "source": device_nodes[src_device],
+                    "source": device_nodes_lc[src_device.lower()],
                     "srcDevice": src_device,
                     "srcIfName": src_ifname,
                     "srcPortStatus": src_port_status,
                     "srcPortSpeed": format_speed(src_port_speed),
-                    "target": device_nodes[tgt_device],
+                    "target": device_nodes_lc[tgt_device.lower()],
                     "tgtDevice": tgt_device,
                     "tgtIfName": tgt_ifname,
                     "tgtPortStatus": tgt_port_status,
