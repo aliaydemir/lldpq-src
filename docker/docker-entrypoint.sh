@@ -58,6 +58,43 @@ touch /etc/lldpq.conf.lock
 chown root:www-data /etc/lldpq.conf /etc/lldpq.conf.lock
 chmod 664 /etc/lldpq.conf /etc/lldpq.conf.lock
 
+# ─── Single config directory (optional, backward compatible) ───
+# Manage ALL user config from ONE mounted dir (like monitor-results):
+#   -v /host/configs:/home/lldpq/lldpq/config
+# When mounted: missing files self-seed from baked-in defaults, then the
+# app-expected paths are symlinked into the dir so edits persist to the host.
+# When NOT mounted: legacy individual-file mounts / baked-in files keep working.
+CONFIG_DIR=/home/lldpq/lldpq/config
+mkdir -p "$CONFIG_DIR"
+chown lldpq:www-data "$CONFIG_DIR" 2>/dev/null || true
+chmod 775 "$CONFIG_DIR" 2>/dev/null || true
+
+if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$CONFIG_DIR" 2>/dev/null; then
+    _setup_config_file() {
+        local name="$1" app_path="$2" owner="$3" mode="$4"
+        local src="$CONFIG_DIR/$name"
+        # Seed config dir from baked-in/default file on first run
+        if [ ! -f "$src" ] && [ -f "$app_path" ]; then
+            cp -a "$(readlink -f "$app_path")" "$src" 2>/dev/null || cp "$app_path" "$src" 2>/dev/null || true
+        fi
+        # Point the app-expected path at the file in the config dir
+        if [ -f "$src" ]; then
+            rm -f "$app_path" 2>/dev/null || true
+            ln -sf "$src" "$app_path" 2>/dev/null || true
+            chown "$owner" "$src" 2>/dev/null || true
+            chmod "$mode" "$src" 2>/dev/null || true
+        fi
+    }
+    _setup_config_file devices.yaml         /home/lldpq/lldpq/devices.yaml      lldpq:www-data    664
+    _setup_config_file topology.dot         /var/www/html/topology.dot          lldpq:www-data    664
+    _setup_config_file topology_config.yaml /var/www/html/topology_config.yaml  lldpq:www-data    664
+    _setup_config_file lldpq-users.conf     /etc/lldpq-users.conf               www-data:www-data 600
+    # Scripts read topology files from the lldpq dir → keep those symlinks valid
+    ln -sf /var/www/html/topology.dot /home/lldpq/lldpq/topology.dot 2>/dev/null || true
+    ln -sf /var/www/html/topology_config.yaml /home/lldpq/lldpq/topology_config.yaml 2>/dev/null || true
+    echo "✓ Config directory active: $CONFIG_DIR (devices.yaml, topology.dot, topology_config.yaml, lldpq-users.conf)"
+fi
+
 # ─── devices.yaml Setup ───
 if [ -f /home/lldpq/lldpq/devices.yaml ]; then
     chown lldpq:www-data /home/lldpq/lldpq/devices.yaml

@@ -16,7 +16,13 @@ services:
     ports:
       - "${LLDPQ_PORT:-80}:80"
     volumes:
-      # Optional: Override baked-in example files with your own
+      # Recommended: manage ALL config from ONE directory (single mount).
+      # On first run the files self-seed from the baked-in defaults; afterwards
+      # they persist on the host and are editable (UI or directly). Includes:
+      # devices.yaml, topology.dot, topology_config.yaml, lldpq-users.conf
+      # - ./configs:/home/lldpq/lldpq/config
+
+      # Legacy alternative: override baked-in files individually
       # - ./devices.yaml:/home/lldpq/lldpq/devices.yaml
       # - ./topology.dot:/var/www/html/topology.dot
       # - ./topology_config.yaml:/var/www/html/topology_config.yaml
