@@ -466,6 +466,9 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     _preserved_dir=$(mktemp -d)
     [[ -f "$LLDPQ_INSTALL_DIR/devices.yaml" ]] && cp "$LLDPQ_INSTALL_DIR/devices.yaml" "$_preserved_dir/"
     [[ -f "$LLDPQ_INSTALL_DIR/notifications.yaml" ]] && cp "$LLDPQ_INSTALL_DIR/notifications.yaml" "$_preserved_dir/"
+    # Preserve the customized ZTP script (image server IP, target OS, password, SSH key
+    # are all baked into this file by the Provision UI — must survive 'cp -r html/*')
+    [[ -f "$WEB_ROOT/cumulus-ztp.sh" ]] && cp "$WEB_ROOT/cumulus-ztp.sh" "$_preserved_dir/" 2>/dev/null || true
 
     # Preserve telemetry user config
     if [[ -d "$LLDPQ_INSTALL_DIR/telemetry/config" ]]; then
@@ -585,6 +588,9 @@ if [[ -n "$_preserved_dir" ]] && [[ -d "$_preserved_dir" ]]; then
         sudo cp "$_preserved_dir/devices.yaml" "$LLDPQ_INSTALL_DIR/" && echo "    • devices.yaml"
     [[ -f "$_preserved_dir/notifications.yaml" ]] && \
         sudo cp "$_preserved_dir/notifications.yaml" "$LLDPQ_INSTALL_DIR/" && echo "    • notifications.yaml"
+    # Restore the customized ZTP script over the freshly-copied template (update only)
+    [[ -f "$_preserved_dir/cumulus-ztp.sh" ]] && \
+        sudo cp "$_preserved_dir/cumulus-ztp.sh" "$WEB_ROOT/" && echo "    • cumulus-ztp.sh (ZTP script preserved)"
 fi
 
 echo "  - Copying telemetry stack to $LLDPQ_INSTALL_DIR/telemetry"
@@ -1019,7 +1025,7 @@ function ping_until_reachable(){
 
 function set_password(){
     passwd -x 99999 cumulus
-    echo 'cumulus:CumulusLinux!' | chpasswd
+    echo 'cumulus:Nvidia@123' | chpasswd
 }
 
 # Resolve hostname from serial number via mapping file on HTTP server

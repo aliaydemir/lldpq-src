@@ -5903,8 +5903,13 @@ ALLOWED_PATTERNS = [
     r'^/sbin/bridge vlan\b',
     r'^lldpctl\b',
     r'^sudo lldpctl\b',
-    # Bonding/LAG
+    # Bonding/LAG / MLAG (read-only status only)
     r'^cat /proc/net/bonding/',
+    r'^clagctl$',
+    r'^sudo clagctl$',
+    # LLDPq on-switch colored interface view (read-only)
+    r'^nvt$',
+    r'^/usr/local/bin/nvt$',
     # Hardware/sensors
     r'^sensors\b',
     r'^sudo sensors\b',

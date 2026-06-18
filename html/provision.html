@@ -3321,7 +3321,7 @@ function escapeBashSingleQuote(s) {
 function applyQuickSettings() {
     let content = document.getElementById('ztpEditor').value;
     const os = document.getElementById('ztpTargetOS').value.trim() || '5.14.0';
-    const pwRaw = document.getElementById('ztpPassword').value.trim() || 'CumulusLinux!';
+    const pwRaw = document.getElementById('ztpPassword').value.trim() || 'Nvidia@123';
     const pw = escapeBashSingleQuote(pwRaw);
     const ip = document.getElementById('ztpImageServer').value.trim() || '192.168.100.200';
     const key = document.getElementById('ztpSSHKey').value.trim();

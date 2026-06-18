@@ -24,7 +24,7 @@ function ping_until_reachable(){
 
 function set_password(){
     passwd -x 99999 cumulus
-    echo 'cumulus:CumulusLinux!' | chpasswd
+    echo 'cumulus:Nvidia@123' | chpasswd
 }
 
 function resolve_hostname(){
