@@ -257,6 +257,9 @@
         .log-entry.info {
             color: #4fc3f7;
         }
+        .log-entry.warning {
+            color: #ffca28;
+        }
         .log-entry .device {
             color: #ffb74d;
             font-weight: 500;
@@ -2558,7 +2561,7 @@
                 });
                 addLogEntry('Collector config saved', 'success');
             } catch (error) {
-                addLogEntry('Warning: Could not save collector config', 'error');
+                addLogEntry('Warning: Could not save collector config', 'warning');
             }
             
             // Ensure telemetry stack is running
@@ -2580,10 +2583,10 @@
                     showNotification('Telemetry stack not installed', 'error');
                     return;
                 } else {
-                    addLogEntry(`Warning: Could not start stack: ${stackResult.error}`, 'error');
+                    addLogEntry(`Warning: Could not start stack: ${stackResult.error}`, 'warning');
                 }
             } catch (error) {
-                addLogEntry('Warning: Could not check stack status', 'error');
+                addLogEntry('Warning: Could not check stack status', 'warning');
             }
             
             // Step 1: Check device capability

@@ -140,6 +140,12 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
             echo "Docker found: $(docker --version)"
         fi
 
+        # The web UI runs as www-data and lldpq scripts as the current user; both need
+        # Docker socket access to (re)start the telemetry stack from the UI later.
+        sudo usermod -aG docker www-data 2>/dev/null || true
+        sudo usermod -aG docker "$(whoami)" 2>/dev/null || true
+        sudo systemctl restart fcgiwrap 2>/dev/null || sudo service fcgiwrap restart 2>/dev/null || true
+
         if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
             echo "Installing docker-compose..."
             sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
@@ -1438,6 +1444,31 @@ HOOKEOF
 
     echo "  Git repository initialized with initial commit"
     echo "  Git hooks created (permissions preserved after git operations)"
+fi
+
+# ============================================================================
+# TELEMETRY DOCKER ACCESS (self-healing on every install/update)
+# ============================================================================
+# The web UI (www-data) and lldpq scripts must reach the Docker socket to start/
+# manage the telemetry stack. Without this the UI hits "permission denied ...
+# /var/run/docker.sock". Granted idempotently whenever telemetry is enabled and
+# Docker is present, so existing deployments self-heal on their next update.
+if command -v docker >/dev/null 2>&1 && grep -q "^TELEMETRY_ENABLED=true" /etc/lldpq.conf 2>/dev/null; then
+    _docker_granted=false
+    for _u in www-data "$LLDPQ_USER"; do
+        [[ -z "$_u" ]] && continue
+        if id -nG "$_u" 2>/dev/null | grep -qw docker; then
+            continue
+        fi
+        if sudo usermod -aG docker "$_u" 2>/dev/null; then
+            _docker_granted=true
+            echo "  Granted Docker access to '$_u' (telemetry stack management)"
+        fi
+    done
+    # fcgiwrap must restart to pick up the new group membership
+    if [[ "$_docker_granted" == "true" ]]; then
+        sudo systemctl restart fcgiwrap 2>/dev/null || sudo service fcgiwrap restart 2>/dev/null || true
+    fi
 fi
 
 # ============================================================================
