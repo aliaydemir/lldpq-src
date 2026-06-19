@@ -2263,8 +2263,12 @@
                 return;
             }
             
-            // Sort: trunk first, then access; natural number ordering within each group
+            // Sort: the "all VLANs" trunk profile is pinned to the very top, then
+            // trunk before access; natural number ordering within each group.
             profiles.sort((a, b) => {
+                const allA = (a[1].sw_port_mode === 'trunk') && a[1].trunk_allowed_vlan_all === true;
+                const allB = (b[1].sw_port_mode === 'trunk') && b[1].trunk_allowed_vlan_all === true;
+                if (allA !== allB) return allA ? -1 : 1;
                 const modeA = a[1].sw_port_mode || 'access';
                 const modeB = b[1].sw_port_mode || 'access';
                 if (modeA !== modeB) return modeA === 'trunk' ? -1 : 1;

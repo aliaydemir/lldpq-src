@@ -5507,6 +5507,71 @@ if not success:
 PYTHON_STOP_STACK
         exit 0
         ;;
+    remove-telemetry-stack)
+        # Remove Docker telemetry stack (down -v: containers + volumes) + mark disabled
+        python3 << 'PYTHON_REMOVE_STACK'
+import json, os, subprocess
+
+conf_lines = []
+lldpq_dir = None
+try:
+    with open('/etc/lldpq.conf', 'r') as f:
+        conf_lines = f.readlines()
+    for line in conf_lines:
+        if line.startswith('LLDPQ_DIR='):
+            lldpq_dir = line.strip().split('=', 1)[1].strip('"\'')
+            break
+except Exception:
+    pass
+
+if not lldpq_dir:
+    print(json.dumps({'success': False, 'error': 'LLDPQ_DIR not configured'}))
+    exit()
+
+telemetry_dir = f"{lldpq_dir}/telemetry"
+removed = False
+last_error = ''
+
+if os.path.exists(f"{telemetry_dir}/docker-compose.yaml"):
+    for cmd in [['docker', 'compose', 'down', '-v'], ['docker-compose', 'down', '-v']]:
+        try:
+            result = subprocess.run(cmd, cwd=telemetry_dir, capture_output=True, text=True, timeout=120)
+            if result.returncode == 0:
+                removed = True
+                break
+            last_error = result.stderr
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            print(json.dumps({'success': False, 'error': 'Timeout removing stack'}))
+            exit()
+        except Exception as e:
+            last_error = str(e)
+else:
+    last_error = 'Telemetry stack files not found'
+
+# Best-effort: mark telemetry disabled in lldpq.conf
+try:
+    out, seen = [], False
+    for line in conf_lines:
+        if line.startswith('TELEMETRY_ENABLED='):
+            out.append('TELEMETRY_ENABLED=false\n'); seen = True
+        else:
+            out.append(line)
+    if not seen:
+        out.append('TELEMETRY_ENABLED=false\n')
+    with open('/etc/lldpq.conf', 'w') as f:
+        f.writelines(out)
+except Exception:
+    pass
+
+if removed:
+    print(json.dumps({'success': True, 'message': 'Collector stack removed (containers + stored metrics)'}))
+else:
+    print(json.dumps({'success': False, 'error': last_error or 'Could not remove stack'}))
+PYTHON_REMOVE_STACK
+        exit 0
+        ;;
     get-telemetry-disable-commands)
         # Generate specific unset commands based on saved config
         python3 << 'PYTHON_DISABLE_CMDS'

@@ -882,6 +882,10 @@
                     <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
                     Disable Telemetry
                 </button>
+                <button class="btn btn-danger" onclick="openRemoveStackModal()" title="Stop & remove the collector containers and stored metrics (host-level)">
+                    <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    Remove Stack
+                </button>
             </div>
         </div>
         
@@ -1359,6 +1363,37 @@
                 <button class="btn btn-danger" onclick="disableTelemetry()" id="disableBtn">
                     <svg viewBox="0 0 24 24"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>
                     Disable on Selected Devices
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Remove Collector Stack Modal -->
+    <div class="modal-overlay" id="removeStackModal">
+        <div class="modal">
+            <h2 style="color: #f44336;">
+                <svg viewBox="0 0 24 24" style="fill: #f44336;"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                Remove Collector Stack
+            </h2>
+            <p style="color: #888; margin-bottom: 15px; line-height: 1.6;">
+                This stops and removes the collector containers (OTEL Collector, Prometheus,
+                Alertmanager) and <strong style="color:#f44336;">deletes all stored metrics</strong>.
+                Switches are not affected by this — disable telemetry on devices separately if needed.
+            </p>
+            <div class="command-preview" style="margin-bottom: 20px;">
+                <div class="cmd">docker compose down -v</div>
+            </div>
+            <div class="form-group" style="margin-bottom: 20px;">
+                <label style="display:flex; align-items:center; gap:8px; color:#ccc; cursor:pointer;">
+                    <input type="checkbox" id="removeShowDockerCmds" style="width:auto; flex:none; margin:0; padding:0; accent-color:#76b900;">
+                    Also show commands to remove Docker completely (run manually on host)
+                </label>
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="closeRemoveStackModal()">Cancel</button>
+                <button class="btn btn-danger" onclick="removeStack()" id="removeStackBtn">
+                    <svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+                    Remove Stack
                 </button>
             </div>
         </div>
@@ -2489,6 +2524,61 @@
         
         function closeDisableModal() {
             document.getElementById('disableModal').classList.remove('active');
+        }
+
+        // ===== Remove Collector Stack (host-level teardown) =====
+        function openRemoveStackModal() {
+            const cb = document.getElementById('removeShowDockerCmds');
+            if (cb) cb.checked = false;
+            document.getElementById('removeStackModal').classList.add('active');
+        }
+
+        function closeRemoveStackModal() {
+            document.getElementById('removeStackModal').classList.remove('active');
+        }
+
+        async function removeStack() {
+            const showDocker = document.getElementById('removeShowDockerCmds')?.checked;
+            closeRemoveStackModal();
+
+            const progressSection = document.getElementById('progressSection');
+            const progressLog = document.getElementById('progressLog');
+            progressSection.classList.add('active');
+            progressLog.innerHTML = '';
+            document.getElementById('progressTitle').textContent = 'Removing Collector Stack...';
+            document.getElementById('progressSpinner').style.display = '';
+
+            addLogEntry('Stopping and removing collector containers (down -v)...', 'info');
+            try {
+                const resp = await fetch('/fabric-api.sh?action=remove-telemetry-stack');
+                const data = await resp.json();
+                if (data.success) {
+                    addLogEntry(data.message || 'Collector stack removed (containers + stored metrics).', 'success');
+                } else {
+                    addLogEntry('Warning: ' + (data.error || 'Could not remove stack'), 'warning');
+                }
+            } catch (e) {
+                addLogEntry('Warning: Could not remove stack: ' + e.message, 'warning');
+            }
+
+            if (showDocker) {
+                addLogEntry('', 'info');
+                addLogEntry('To remove Docker completely, run these on the LLDPq host:', 'info');
+                [
+                    'sudo systemctl disable --now docker docker.socket containerd',
+                    'sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker.io docker-compose',
+                    'sudo apt-get autoremove -y --purge',
+                    'sudo rm -rf /var/lib/docker /var/lib/containerd /etc/docker',
+                    'sudo rm -f /usr/local/bin/docker-compose',
+                    'sudo gpasswd -d www-data docker',
+                    'sudo systemctl restart fcgiwrap.socket fcgiwrap.service nginx',
+                ].forEach(c => addLogEntry('  ' + c, 'info'));
+                addLogEntry('(Only if nothing else on this host uses Docker.)', 'warning');
+            }
+
+            document.getElementById('progressTitle').textContent = 'Done';
+            document.getElementById('progressSpinner').style.display = 'none';
+            showNotification('Collector stack removed', 'success');
         }
         
         function showNotification(message, type) {
