@@ -332,15 +332,167 @@ def build_device_detail(hostname, devices, device_health):
     return '\n'.join(detail) if detail else f"Device '{hostname}' found but no detailed data available."
 
 
+def read_collected_config(hostname, max_chars=15000):
+    """Full collected running config for one device (nv config show -o commands),
+    saved by get-configs.sh at WEB_ROOT/configs/<hostname>.txt."""
+    try:
+        path = os.path.join(WEB_ROOT, 'configs', f'{hostname}.txt')
+        if not os.path.isfile(path):
+            return ''
+        with open(path, 'r') as f:
+            cfg = f.read().strip()
+        if not cfg:
+            return ''
+        if len(cfg) > max_chars:
+            cfg = cfg[:max_chars] + f"\n... (truncated; {len(cfg)} chars total)"
+        return f"FULL RUNNING CONFIG -- {hostname} (nv config show -o commands):\n{cfg}"
+    except Exception:
+        return ''
+
+
+def build_all_collected_configs(devices=None, max_per_device=2500, max_total=120000):
+    """Every collected running config on disk (truncated per device) for fabric-wide
+    config analysis / drift detection. Reads WEB_ROOT/configs/*.txt DIRECTLY so it works
+    even when devices.yaml hostnames differ from the collected config filenames."""
+    config_dir = os.path.join(WEB_ROOT, 'configs')
+    if not os.path.isdir(config_dir):
+        return ''
+    out, total = [], 0
+    for path in sorted(glob.glob(os.path.join(config_dir, '*.txt'))):
+        hn = os.path.basename(path)[:-4]  # strip .txt
+        try:
+            with open(path, 'r') as f:
+                cfg = f.read().strip()
+        except Exception:
+            continue
+        if not cfg:
+            continue
+        block = cfg[:max_per_device]
+        if len(cfg) > max_per_device:
+            block += f"\n... (truncated; {len(cfg)} total)"
+        entry = f"----- {hn} -----\n{block}"
+        if total + len(entry) > max_total:
+            out.append("... (remaining device configs omitted for length)")
+            break
+        out.append(entry)
+        total += len(entry)
+    if not out:
+        return ''
+    return ("FULL COLLECTED RUNNING CONFIGS (all devices, nv config show -o commands; "
+            "truncated per device):\n\n" + "\n\n".join(out))
+
+
+def _mr_path(*parts):
+    """Resolve a monitor-results file, preferring LLDPQ_DIR then the synced WEB_ROOT copy."""
+    p1 = os.path.join(LLDPQ_DIR, 'monitor-results', *parts)
+    if os.path.exists(p1):
+        return p1
+    return os.path.join(WEB_ROOT, 'monitor-results', *parts)
+
+
+def _load_json_file(path):
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def build_transceiver_context(hosts=None, max_chars=9000):
+    """Transceiver inventory: per-module vendor/part/serial/FW + status, plus summary."""
+    inv = _load_json_file(_mr_path('transceiver_inventory.json'))
+    if not inv or not inv.get('modules'):
+        return ''
+    mods = [m for m in inv['modules'] if (not hosts or m.get('device') in hosts)]
+    if not mods:
+        return ''
+    lines = ["TRANSCEIVER INVENTORY (device/port: vendor part sn fw [fw_status]):"]
+    for m in mods[:250]:
+        lines.append(f"  {m.get('device','?')}/{m.get('port','?')}: {m.get('vendor','')} "
+                     f"{m.get('part_number','')} sn={m.get('serial','')} fw={m.get('fw_version','')} "
+                     f"[{m.get('fw_status','')}]")
+    s = inv.get('summary') or {}
+    if s:
+        lines.append(f"  SUMMARY: {s.get('total_modules')} modules, {s.get('unique_models')} models, "
+                     f"mixed-fw={s.get('mixed_fw_models')}, status={s.get('status_counts')}")
+    return '\n'.join(lines)[:max_chars]
+
+
+def build_optical_context(hosts=None, max_chars=9000):
+    """Optical DOM per port: health, Rx/Tx power, temperature, voltage, bias, link margin."""
+    stats = (_load_json_file(_mr_path('optical_history.json')) or {}).get('current_optical_stats') or {}
+    if not stats:
+        return ''
+    lines = ["OPTICAL DOM (host:port: health rx_dBm tx_dBm temp_C volt bias_mA margin_dB):"]
+    for key in sorted(stats):
+        if hosts and key.split(':')[0] not in hosts:
+            continue
+        v = stats[key]
+        lines.append(f"  {key}: {v.get('health_status','')} rx={v.get('rx_power_dbm','')} "
+                     f"tx={v.get('tx_power_dbm','')} temp={v.get('temperature_c','')} "
+                     f"v={v.get('voltage_v','')} bias={v.get('bias_current_ma','')} "
+                     f"margin={v.get('link_margin_db','')}")
+    return '\n'.join(lines)[:max_chars] if len(lines) > 1 else ''
+
+
+def build_ber_context(hosts=None, max_chars=9000):
+    """Per-port BER / interface errors: ber value, grade, rx/tx errors, total packets, deltas."""
+    stats = (_load_json_file(_mr_path('ber_history.json')) or {}).get('current_ber_stats') or {}
+    if not stats:
+        return ''
+    lines = ["BER / INTERFACE ERRORS (host:port: ber grade rxErr txErr totalPkt dErr):"]
+    for key in sorted(stats):
+        if hosts and key.split(':')[0] not in hosts:
+            continue
+        v = stats[key]
+        lines.append(f"  {key}: ber={v.get('ber_value','')} grade={v.get('grade','')} "
+                     f"rxErr={v.get('rx_errors','')} txErr={v.get('tx_errors','')} "
+                     f"totalPkt={v.get('total_packets','')} dErr={v.get('delta_errors','')}")
+    return '\n'.join(lines)[:max_chars] if len(lines) > 1 else ''
+
+
+def build_hardware_context(hosts=None, max_chars=9000):
+    """Per-device hardware: sensors/thermal/PSU/fan/memory/load (raw collected text)."""
+    hw_dir = _mr_path('hardware-data')
+    if not os.path.isdir(hw_dir):
+        return ''
+    out, total = ["HARDWARE (per-device sensors/thermal/PSU/fan/mem/load):"], 0
+    for f in sorted(glob.glob(os.path.join(hw_dir, '*_hardware.txt'))):
+        host = os.path.basename(f).replace('_hardware.txt', '')
+        if hosts and host not in hosts:
+            continue
+        try:
+            with open(f, 'r') as fh:
+                content = fh.read().strip()
+        except Exception:
+            continue
+        if not content:
+            continue
+        block = f"--- {host} ---\n{content[:1400]}"
+        if total + len(block) > max_chars:
+            out.append("... (more devices omitted)")
+            break
+        out.append(block)
+        total += len(block)
+    return '\n\n'.join(out) if len(out) > 1 else ''
+
+
 def build_context_for_question(question, devices, device_health):
     """Build targeted context based on the question content."""
     extra_context = []
     q_lower = question.lower()
+    mentioned_any = False
+    mentioned_hosts = []
     
     # Detect specific device mentions
     for ip, dev in devices.items():
         if dev['hostname'].lower() in q_lower or ip in q_lower:
+            mentioned_any = True
+            mentioned_hosts.append(dev['hostname'])
             extra_context.append(build_device_detail(dev['hostname'], devices, device_health))
+            _cfg = read_collected_config(dev['hostname'])
+            if _cfg:
+                extra_context.append(_cfg)
     
     # Keyword-based enrichment
     if any(kw in q_lower for kw in ['flap', 'down', 'carrier', 'link down']):
@@ -385,6 +537,28 @@ def build_context_for_question(question, devices, device_health):
     # Config check: load Ansible host_vars + group_vars for config consistency analysis
     if any(kw in q_lower for kw in ['config', 'consistency', 'check', 'asn', 'mtu', 'mismatch', 'validate', 'audit', 'compare', 'bgp config', 'vlan config']):
         extra_context.append(build_config_context(devices))
+        # Fabric-wide config question (no specific device named) -> feed every device's
+        # actual running config so the model can do real drift/consistency analysis.
+        if not mentioned_any:
+            _allcfg = build_all_collected_configs(devices)
+            if _allcfg:
+                extra_context.append(_allcfg)
+    
+    # Other collected data (transceiver / optical / BER / hardware). Filtered to the
+    # mentioned device(s) when named, otherwise fabric-wide.
+    _hf = mentioned_hosts or None
+    if any(kw in q_lower for kw in ['transceiver', 'optic', 'optical', 'sfp', 'qsfp', 'osfp', 'dom', 'module', 'firmware', 'fw version']):
+        for _b in (build_transceiver_context(_hf), build_optical_context(_hf)):
+            if _b:
+                extra_context.append(_b)
+    if any(kw in q_lower for kw in ['ber', 'fec', 'crc', 'symbol error', 'bit error', 'errored', 'rx error', 'tx error', 'corrupt']):
+        _b = build_ber_context(_hf)
+        if _b:
+            extra_context.append(_b)
+    if any(kw in q_lower for kw in ['hardware', 'sensor', 'temperature', 'temp', 'psu', 'power supply', 'fan', 'cpu', 'memory', 'thermal', 'health']):
+        _b = build_hardware_context(_hf)
+        if _b:
+            extra_context.append(_b)
     
     return '\n\n'.join(extra_context)
 
@@ -664,6 +838,26 @@ Format: [hostname] port = neighbor(port) Status
 ## log_summary.json
 - critical > 0 = URGENT. error > 0 = important. warning = often transient.
 
+## TRANSCEIVER INVENTORY (per device/port, when present)
+Optic/cable inventory: vendor, part_number (model), serial, fw (firmware), fw_status.
+- Mixed fw across the same optic model = firmware should be aligned. Watch fw_status.
+
+## OPTICAL DOM (per host:port, when present)
+rx_dBm / tx_dBm (light levels), temp_C, voltage, bias_mA, link margin, health.
+- Very low rx (near/below the optic's floor) = dirty/failing fiber or weak far-end Tx.
+- health WARN/CRITICAL and low margin = pre-failure; correlate with flaps and BER.
+
+## BER / INTERFACE ERRORS (per host:port, when present)
+ber (frame BER), grade, rxErr/txErr, totalPkt, dErr (delta errors since baseline).
+- Rising dErr / poor grade = bad optic/cable/connector. Cross-check OPTICAL + flap data.
+
+## HARDWARE (per device, when present)
+Raw sensors/thermal/PSU/fan/memory/load text. High temp, failed PSU/fan, or high mem/load = hardware risk.
+
+## Live telemetry (Prometheus, only when telemetry is enabled)
+Query cumulus_nvswitch_* metrics with the [PROMQL: <expr>] tool for rate / top-N over
+time (in/out discards, errors, AR congestion, rx-buffer, FEC corrections, traffic, flaps).
+
 # NVUE COMMAND REFERENCE
 
 Diagnostic:
@@ -913,6 +1107,257 @@ def call_llm_sync(messages):
         return f"Error: {e}"
 
 
+# ======================== LIVE DEVICE TOOL (read-only) ========================
+
+TOOL_INSTRUCTIONS = """
+=== LIVE DEVICE TOOL (read-only) ===
+When the static fabric data above is not enough, you may pull LIVE read-only data
+from a device by writing a tool call on its own line, exactly:
+[RUN: <device> <command>]
+  - <device> = a hostname from the fabric (e.g. tan-leaf-01).
+  - <command> = a READ-ONLY show/diagnostic command. Examples:
+      nv show interface  |  nv show router bgp  |  nv show evpn vni  |
+      nv config show  |  nv config diff  |  sudo vtysh -c 'show bgp summary'  |
+      ip route show  |  nv show interface lldp  |  sudo clagctl
+    Write/config commands (nv set/unset, nv config apply/replace, reboot, ...) are
+    blocked by the backend and will be rejected.
+  - Emit at most 3 tool calls per turn. After you receive "TOOL RESULTS", continue;
+    request more only if truly needed.
+  - When you have enough, give your FINAL answer with NO [RUN: ...] / [RUNALL: ...] lines.
+  - Prefer the collected data above; use live tools only when current state is needed.
+
+For a fabric-wide check, fan ONE command out to many devices IN PARALLEL:
+[RUNALL: <target> <command>]
+  - <target> = "all" (every device) or a role/name substring (e.g. leaf, spine, border).
+  - Same read-only command rules as [RUN:]. Use this instead of many [RUN:] lines when
+    comparing the same thing across devices (e.g. BGP summary on all leaves).
+  - At most one fan-out per turn; results return per device.
+
+For live streaming-telemetry metrics (only when telemetry is enabled), query Prometheus:
+[PROMQL: <PromQL expression>]
+  - Cumulus telemetry metrics are named cumulus_nvswitch_* (interface in/out errors,
+    in/out discards, AR congestion, rx-buffer, drops, traffic, FEC corrections, flaps).
+    Example: [PROMQL: topk(10, rate(cumulus_nvswitch_interface_if_in_discards[5m]))]
+  - Read-only; ideal for "last N minutes", rate, and top-N questions. If telemetry is
+    off you'll get an error — fall back to the collected data above.
+
+For a metric TREND over time (only when telemetry is enabled):
+[PROMQLRANGE: <PromQL> | <range> | <step>]
+  - range/step like 15m, 1h, 24h / 30s, 60s. Returns first/min/max/last per series so
+    you can state whether something is rising/falling.
+    Example: [PROMQLRANGE: rate(cumulus_nvswitch_interface_if_in_discards[2m]) | 1h | 60s]
+
+To check reachability / trace the path between two endpoints (graph-based, read-only):
+[PATH: <source> <dest_ip>]
+  - <source> = a device hostname OR a source IP; <dest_ip> = the destination IP.
+  - Returns the hop-by-hop path (or where it breaks). Use for "how does A reach B",
+    blackhole, or asymmetric-routing questions.
+
+=== REMEDIATION SUGGESTIONS ===
+When you recommend a command the operator should RUN to fix something, put it on its own
+line exactly as:
+[FIX: <device-or-group> <command>]
+  - This is a SUGGESTION rendered as a one-click button — you do NOT execute it.
+  - Use a real device/group name and a concrete command (e.g.
+    [FIX: tan-leaf-01 nv set interface swp5 link state up] then nv config apply).
+  - Only suggest safe, intentional changes; never destructive commands.
+"""
+
+
+def run_device_tool(device, command, cookie):
+    """Run ONE read-only device command by invoking fabric-api.sh's run-device-command
+    as a subprocess. This reuses its exact read-only whitelist, admin auth (via the
+    forwarded session cookie) and ssh exec — nothing is duplicated. Never raises."""
+    import subprocess
+    try:
+        body = json.dumps({'device': device, 'command': command})
+        env = dict(os.environ)
+        env['REQUEST_METHOD'] = 'POST'
+        env['QUERY_STRING'] = 'action=run-device-command'
+        env['CONTENT_TYPE'] = 'application/json'
+        env['CONTENT_LENGTH'] = str(len(body.encode('utf-8')))
+        if cookie:
+            env['HTTP_COOKIE'] = cookie
+        proc = subprocess.run(
+            ['bash', os.path.join(WEB_ROOT, 'fabric-api.sh')],
+            input=body, env=env, capture_output=True, text=True, timeout=60
+        )
+        raw = proc.stdout or ''
+        for sep in ('\r\n\r\n', '\n\n'):
+            if sep in raw:
+                raw = raw.split(sep, 1)[1]
+                break
+        d = json.loads(raw.strip())
+        if d.get('success'):
+            return True, (d.get('output') or '(no output)')
+        return False, (d.get('error') or 'command rejected')
+    except subprocess.TimeoutExpired:
+        return False, 'tool timed out'
+    except Exception as e:
+        return False, f'tool error: {e}'
+
+
+def run_dispatch(target, command, devices, cookie, max_devices=60, pool=8, per_out=1200):
+    """Phase 3: run ONE read-only command on many devices in PARALLEL (fan-out).
+    target = 'all'/'*' or a role/hostname substring (e.g. 'leaf', 'spine', 'border').
+    Returns (hostnames, {hostname: (ok, output)}). Reuses run_device_tool per device."""
+    from concurrent.futures import ThreadPoolExecutor
+    t = (target or '').strip().lstrip('@').lower()
+    targets = []
+    for ip, dev in devices.items():
+        hn = dev.get('hostname', '')
+        role = (dev.get('role', '') or '').lower()
+        if not hn:
+            continue
+        if t in ('all', '*', '') or t in role or t in hn.lower():
+            targets.append(hn)
+    targets = sorted(set(targets))[:max_devices]
+    results = {}
+    if not targets:
+        return targets, results
+
+    def _one(h):
+        ok, out = run_device_tool(h, command, cookie)
+        return h, ok, (out or '')[:per_out]
+
+    try:
+        with ThreadPoolExecutor(max_workers=min(pool, len(targets))) as ex:
+            for h, ok, out in ex.map(_one, targets):
+                results[h] = (ok, out)
+    except Exception as e:
+        for h in targets:
+            results.setdefault(h, (False, f'dispatch error: {e}'))
+    return targets, results
+
+
+def run_promql(query, cookie, max_rows=60):
+    """Live streaming-telemetry query via fabric-api.sh prometheus-query (read-only).
+    Returns (ok, text). Degrades gracefully when telemetry/Prometheus is unavailable."""
+    import subprocess
+    try:
+        body = json.dumps({'query': query})
+        env = dict(os.environ)
+        env['REQUEST_METHOD'] = 'POST'
+        env['QUERY_STRING'] = 'action=prometheus-query'
+        env['CONTENT_TYPE'] = 'application/json'
+        env['CONTENT_LENGTH'] = str(len(body.encode('utf-8')))
+        if cookie:
+            env['HTTP_COOKIE'] = cookie
+        proc = subprocess.run(
+            ['bash', os.path.join(WEB_ROOT, 'fabric-api.sh')],
+            input=body, env=env, capture_output=True, text=True, timeout=30
+        )
+        raw = proc.stdout or ''
+        for sep in ('\r\n\r\n', '\n\n'):
+            if sep in raw:
+                raw = raw.split(sep, 1)[1]
+                break
+        d = json.loads(raw.strip())
+        if not d.get('success'):
+            return False, (d.get('error') or 'query failed')
+        res = ((d.get('data') or {}).get('result')) or []
+        rows = []
+        for r in res[:max_rows]:
+            m = r.get('metric', {}) or {}
+            host = m.get('net_host_name') or m.get('instance') or ''
+            iface = m.get('swp') or m.get('interface') or ''
+            val = (r.get('value') or [None, ''])[1]
+            rows.append(f"  {host} {iface} = {val}")
+        return True, ('\n'.join(rows) if rows else '(no series matched)')
+    except subprocess.TimeoutExpired:
+        return False, 'promql timed out'
+    except Exception as e:
+        return False, f'promql error: {e}'
+
+
+def run_tracepath(src, dst, cookie):
+    """Read-only graph-based path discovery via search-api.sh. src may be a device
+    hostname or an IP; dst is a destination IP. Returns (ok, compact_json_text)."""
+    import subprocess
+    import urllib.parse
+    try:
+        def is_ip(s):
+            s = s or ''
+            return bool(re.match(r'^\d{1,3}(\.\d{1,3}){3}$', s)) or ':' in s
+        if is_ip(src) and is_ip(dst):
+            qs = ('action=trace-path-ip'
+                  f'&source_ip={urllib.parse.quote(src)}'
+                  f'&dest_ip={urllib.parse.quote(dst)}&vrf=default')
+        else:
+            qs = ('action=trace-path'
+                  f'&source={urllib.parse.quote(src)}'
+                  f'&ip={urllib.parse.quote(dst)}&vrf=default')
+        env = dict(os.environ)
+        env['REQUEST_METHOD'] = 'GET'
+        env['QUERY_STRING'] = qs
+        if cookie:
+            env['HTTP_COOKIE'] = cookie
+        proc = subprocess.run(
+            ['bash', os.path.join(WEB_ROOT, 'search-api.sh')],
+            env=env, capture_output=True, text=True, timeout=60
+        )
+        raw = proc.stdout or ''
+        for sep in ('\r\n\r\n', '\n\n'):
+            if sep in raw:
+                raw = raw.split(sep, 1)[1]
+                break
+        d = json.loads(raw.strip())
+        if isinstance(d, dict) and d.get('success') is False and d.get('error'):
+            return False, str(d.get('error'))
+        return True, json.dumps(d)[:4000]
+    except subprocess.TimeoutExpired:
+        return False, 'tracepath timed out'
+    except Exception as e:
+        return False, f'tracepath error: {e}'
+
+
+def run_promql_range(query, rng, step, cookie, max_series=30):
+    """Live telemetry range query via fabric-api.sh prometheus-query-range (read-only).
+    Summarizes each series as first/min/max/last + trend arrow over the window."""
+    import subprocess
+    try:
+        body = json.dumps({'query': query, 'range': rng or '15m', 'step': step or '60s'})
+        env = dict(os.environ)
+        env['REQUEST_METHOD'] = 'POST'
+        env['QUERY_STRING'] = 'action=prometheus-query-range'
+        env['CONTENT_TYPE'] = 'application/json'
+        env['CONTENT_LENGTH'] = str(len(body.encode('utf-8')))
+        if cookie:
+            env['HTTP_COOKIE'] = cookie
+        proc = subprocess.run(
+            ['bash', os.path.join(WEB_ROOT, 'fabric-api.sh')],
+            input=body, env=env, capture_output=True, text=True, timeout=40
+        )
+        raw = proc.stdout or ''
+        for sep in ('\r\n\r\n', '\n\n'):
+            if sep in raw:
+                raw = raw.split(sep, 1)[1]
+                break
+        d = json.loads(raw.strip())
+        if not d.get('success'):
+            return False, (d.get('error') or 'range query failed')
+        res = ((d.get('data') or {}).get('result')) or []
+        rows = []
+        for r in res[:max_series]:
+            m = r.get('metric', {}) or {}
+            host = m.get('net_host_name') or m.get('instance') or ''
+            iface = m.get('swp') or m.get('interface') or ''
+            try:
+                vals = [float(v[1]) for v in (r.get('values') or []) if v and v[1] not in ('NaN', None)]
+            except Exception:
+                vals = []
+            if not vals:
+                continue
+            arrow = '^' if vals[-1] > vals[0] else ('v' if vals[-1] < vals[0] else '=')
+            rows.append(f"  {host} {iface}: first={vals[0]:.3g} min={min(vals):.3g} "
+                        f"max={max(vals):.3g} last={vals[-1]:.3g} {arrow}")
+        return True, ('\n'.join(rows) if rows else '(no series matched)')
+    except subprocess.TimeoutExpired:
+        return False, 'range query timed out'
+    except Exception as e:
+        return False, f'range query error: {e}'
+
+
 # ======================== ACTIONS ========================
 
 def action_chat():
@@ -937,7 +1382,7 @@ def action_chat():
         fabric_summary=fabric_summary,
         device_list=device_list,
         extra_context=extra_context
-    )
+    ) + "\n" + TOOL_INSTRUCTIONS
     
     # Build messages array
     messages = [{"role": "system", "content": system_prompt}]
@@ -948,10 +1393,119 @@ def action_chat():
     
     messages.append({"role": "user", "content": question})
     
-    # Synchronous LLM call
-    response = call_llm_sync(messages)
+    # Bounded read-only tool-calling loop. The model may emit [RUN: device command]
+    # to pull live data; each call is executed via fabric-api.sh run-device-command
+    # (its read-only whitelist + admin auth + ssh exec are reused, not duplicated).
+    cookie = os.environ.get('HTTP_COOKIE', '')
+    valid_hostnames = {d.get('hostname', '') for d in devices.values() if d.get('hostname')}
+    MAX_ROUNDS = 4
+    MAX_TOOLS_PER_ROUND = 3
+    MAX_TOTAL_TOOLS = 10
+    MAX_DISPATCHES = 2            # [RUNALL: ...] parallel fan-outs per question
+    DISPATCH_DEVICE_CAP = 120     # total devices across all dispatches
+    MAX_PROMQL = 4                # [PROMQL: ...] live telemetry queries per question
+    deadline = time.time() + 220  # keep whole request under nginx's 300s read timeout
+    total_tools = 0
+    dispatches_used = 0
+    dispatch_dev_total = 0
+    promql_used = 0
+    response = ''
+    tools_used = []
     
-    result_json({"success": True, "response": response})
+    for _round in range(MAX_ROUNDS):
+        response = call_llm_sync(messages)
+        runs = re.findall(r'\[RUN:\s*(\S+)\s+([^\]]+)\]', response or '')
+        runalls = re.findall(r'\[RUNALL:\s*(\S+)\s+([^\]]+)\]', response or '')
+        promqls = re.findall(r'\[PROMQL:\s*(.+)\]', response or '')  # greedy: PromQL may contain ] (e.g. [5m])
+        promranges = re.findall(r'\[PROMQLRANGE:\s*(.+)\]', response or '')
+        paths = re.findall(r'\[PATH:\s*(\S+)\s+(\S+)\]', response or '')
+        if (not runs and not runalls and not promqls and not promranges and not paths) or time.time() > deadline:
+            break
+        results = []
+        # Single-device read-only tools
+        for dev_name, cmd in runs[:MAX_TOOLS_PER_ROUND]:
+            if total_tools >= MAX_TOTAL_TOOLS or time.time() > deadline:
+                break
+            dev_name = dev_name.strip()
+            cmd = cmd.strip()
+            if dev_name not in valid_hostnames:
+                results.append(f"[{dev_name}] error: unknown device (not in fabric)")
+                continue
+            ok, out = run_device_tool(dev_name, cmd, cookie)
+            total_tools += 1
+            tools_used.append({'device': dev_name, 'command': cmd, 'ok': ok})
+            results.append(f"[RUN {dev_name}: {cmd}]\n{(out or '')[:6000]}")
+        # Parallel multi-device fan-out (Phase 3): at most one dispatch per round
+        for tgt, cmd in runalls[:1]:
+            if dispatches_used >= MAX_DISPATCHES or dispatch_dev_total >= DISPATCH_DEVICE_CAP or time.time() > deadline:
+                break
+            tgt = tgt.strip()
+            cmd = cmd.strip()
+            hosts, dres = run_dispatch(tgt, cmd, devices, cookie,
+                                       max_devices=min(60, DISPATCH_DEVICE_CAP - dispatch_dev_total))
+            dispatches_used += 1
+            dispatch_dev_total += len(hosts)
+            tools_used.append({'dispatch': tgt, 'command': cmd, 'devices': len(hosts)})
+            lines = [f"[RUNALL {tgt}: {cmd}]  ({len(hosts)} devices, parallel)"]
+            for h in hosts:
+                ok, out = dres.get(h, (False, ''))
+                lines.append(f"--- {h} [{'OK' if ok else 'FAIL'}] ---\n{out}")
+            results.append('\n'.join(lines))
+        # Live telemetry (PromQL) queries
+        for q in promqls[:2]:
+            if promql_used >= MAX_PROMQL or time.time() > deadline:
+                break
+            q = q.strip()
+            ok, out = run_promql(q, cookie)
+            promql_used += 1
+            tools_used.append({'promql': q, 'ok': ok})
+            results.append(f"[PROMQL: {q}]\n{out}")
+        # Live telemetry trend (PromQL range)
+        for spec in promranges[:2]:
+            if promql_used >= MAX_PROMQL or time.time() > deadline:
+                break
+            parts = [p.strip() for p in spec.split('|')]
+            q = parts[0] if parts else ''
+            rng = parts[1] if len(parts) > 1 else '15m'
+            step = parts[2] if len(parts) > 2 else '60s'
+            ok, out = run_promql_range(q, rng, step, cookie)
+            promql_used += 1
+            tools_used.append({'promqlrange': q, 'range': rng, 'ok': ok})
+            results.append(f"[PROMQLRANGE: {q} | {rng} | {step}]\n{out}")
+        # Path discovery (graph-based tracepath)
+        for src, dst in paths[:2]:
+            if total_tools >= MAX_TOTAL_TOOLS or time.time() > deadline:
+                break
+            src, dst = src.strip(), dst.strip()
+            ok, out = run_tracepath(src, dst, cookie)
+            total_tools += 1
+            tools_used.append({'path': f'{src} -> {dst}', 'ok': ok})
+            results.append(f"[PATH {src} -> {dst}]\n{out}")
+        messages.append({"role": "assistant", "content": response})
+        messages.append({"role": "user", "content":
+            "TOOL RESULTS:\n" + "\n\n".join(results) +
+            "\n\nContinue. Request more data only if needed; otherwise give the final answer with no [RUN: ...] / [RUNALL: ...] / [PROMQL: ...] / [PROMQLRANGE: ...] / [PATH: ...] lines."})
+    
+    # If still requesting tools (hit the round cap), force one final answer.
+    if re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH):', response or '') and time.time() < deadline:
+        messages.append({"role": "assistant", "content": response})
+        messages.append({"role": "user", "content":
+            "Stop using tools. Give your final answer now from the results above; do not emit any data-tool lines ([RUN:]/[RUNALL:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]). You MAY include [FIX: ...] remediation suggestions."})
+        response = call_llm_sync(messages)
+    
+    # Suggested remediation commands (NOT executed) -> returned as one-click buttons.
+    fixes = []
+    for dev, cmd in re.findall(r'\[FIX:\s*(\S+)\s+(.+?)\]', response or ''):
+        fixes.append({'device': dev.strip(), 'command': cmd.strip()})
+    
+    # Strip leftover tool-call / fix lines from the visible answer (line-based: robust
+    # even when a PromQL expression contains ']' like a [5m] range selector).
+    final = '\n'.join(
+        ln for ln in (response or '').splitlines()
+        if not re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|FIX):', ln)
+    ).strip()
+    
+    result_json({"success": True, "response": final, "tools_used": tools_used, "fixes": fixes})
 
 
 def action_get_context():

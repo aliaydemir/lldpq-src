@@ -163,7 +163,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     renderGroupsBar();
     showGroup(0);
-    loadDevices();
+    await loadDevices();
+    applyPrefillFromURL();   // prefill from Ask AI "Run in Commands" (devices + cmd), never auto-runs
     // command preset buttons (event delegation — safe for commands containing quotes)
     document.getElementById('groupPanel').addEventListener('click', e => {
         const btn = e.target.closest('.cmd-btn');
@@ -229,6 +230,46 @@ function renderTargetList(filter = '') {
 }
 
 function filterDevices() { renderTargetList(document.getElementById('deviceSearch').value); }
+
+// Prefill from Ask AI's "Run in Commands" button: ?devices=a,b&cmd=...  (selects + fills,
+// but NEVER auto-runs — the operator must review and click Run).
+function applyPrefillFromURL() {
+    let params;
+    try { params = new URLSearchParams(window.location.search); } catch (e) { return; }
+    const devs = (params.get('devices') || '').split(',').map(s => s.trim()).filter(Boolean);
+    const cmd = params.get('cmd') || '';
+    let matched = 0;
+    devs.forEach(d => {
+        const host = allHostnames.find(h => h.toLowerCase() === d.toLowerCase());
+        if (host) { selected.add(host); expandToDevice(host); matched++; return; }
+        const grp = Object.keys(devicesByGroup).find(g => g.toLowerCase() === d.toLowerCase());
+        if (grp) { (devicesByGroup[grp] || []).forEach(h => selected.add(h)); matched++; }
+    });
+    if (matched) updateSelectionUI();
+    if (cmd) {
+        const box = document.getElementById('customCmd');
+        if (box) { box.value = cmd; box.focus(); }
+    }
+    if (matched || cmd) {
+        const banner = document.getElementById('targetBanner');
+        if (banner) banner.innerHTML = 'Prefilled from Ask AI — review the command and selected ' +
+            `device${matched === 1 ? '' : 's'}, then click <strong>Run</strong>.`;
+    }
+    // Drop the query string so a refresh won't re-apply it or leak the command in history.
+    try { history.replaceState(null, '', window.location.pathname); } catch (e) {}
+}
+
+function expandToDevice(host) {
+    for (const item of document.querySelectorAll('.device-item')) {
+        if (item.getAttribute('data-host') === host) {
+            const devs = item.closest('.group-devices');
+            if (devs) devs.classList.remove('collapsed');
+            const grp = devs ? devs.previousElementSibling : null;
+            if (grp && grp.classList.contains('group-header')) grp.classList.remove('collapsed');
+            break;
+        }
+    }
+}
 
 function toggleDeviceGroup(header) {
     header.classList.toggle('collapsed');

@@ -416,46 +416,58 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     WEB_ROOT="${WEB_ROOT:-/var/www/html}"
     LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 
-    # -- Full backup ----------------------------------------------------------
-    step "Creating backup..."
-    BACKUP_DIR="$HOME/lldpq-backup-$(date +%Y-%m-%d_%H-%M)"
-    mkdir -p "$BACKUP_DIR"
-    echo "  Backup directory: $BACKUP_DIR"
-
-    # Configuration files
-    [[ -f "$LLDPQ_INSTALL_DIR/devices.yaml" ]] && \
-        cp "$LLDPQ_INSTALL_DIR/devices.yaml" "$BACKUP_DIR/" && echo "  • devices.yaml"
-    [[ -f "$LLDPQ_INSTALL_DIR/notifications.yaml" ]] && \
-        cp "$LLDPQ_INSTALL_DIR/notifications.yaml" "$BACKUP_DIR/" && echo "  • notifications.yaml"
-    [[ -f "$WEB_ROOT/topology.dot" ]] && \
-        sudo cp "$WEB_ROOT/topology.dot" "$BACKUP_DIR/" && echo "  • topology.dot"
-    [[ -f "$WEB_ROOT/topology_config.yaml" ]] && \
-        sudo cp "$WEB_ROOT/topology_config.yaml" "$BACKUP_DIR/" && echo "  • topology_config.yaml"
-    [[ -f /etc/lldpq.conf ]] && \
-        sudo cp /etc/lldpq.conf "$BACKUP_DIR/" && echo "  • /etc/lldpq.conf"
-    [[ -f /etc/lldpq-users.conf ]] && \
-        sudo cp /etc/lldpq-users.conf "$BACKUP_DIR/" && echo "  • /etc/lldpq-users.conf"
-    [[ -f /etc/dhcp/dhcpd.conf ]] && \
-        sudo cp /etc/dhcp/dhcpd.conf "$BACKUP_DIR/" && echo "  • /etc/dhcp/dhcpd.conf"
-    [[ -f /etc/dhcp/dhcpd.hosts ]] && \
-        sudo cp /etc/dhcp/dhcpd.hosts "$BACKUP_DIR/" && echo "  • /etc/dhcp/dhcpd.hosts"
-
-    # SSH keys
-    if ls ~/.ssh/id_* >/dev/null 2>&1; then
-        mkdir -p "$BACKUP_DIR/ssh-keys"
-        cp ~/.ssh/id_* "$BACKUP_DIR/ssh-keys/" 2>/dev/null || true
-        echo "  • SSH keys (~/.ssh/id_*)"
+    # -- Optional full backup (ask; default No) -------------------------------
+    # NOTE: runtime monitoring data is ALWAYS preserved across the update (see the
+    # "Preparing update" step below) — this optional backup is just an extra rollback
+    # copy of configs, keys and a data snapshot.
+    BACKUP_DIR=""
+    _do_backup=false
+    if [[ "$AUTO_YES" != "true" ]]; then
+        read -p "  Take a full backup (configs/keys/data) before updating? [y/N]: " _bk_response
+        [[ "$_bk_response" =~ ^[Yy]$ ]] && _do_backup=true
     fi
 
-    # Monitoring data
-    [[ -d "$LLDPQ_INSTALL_DIR/monitor-results" ]] && \
-        cp -r "$LLDPQ_INSTALL_DIR/monitor-results" "$BACKUP_DIR/" && echo "  • monitor-results/"
-    [[ -d "$LLDPQ_INSTALL_DIR/lldp-results" ]] && \
-        cp -r "$LLDPQ_INSTALL_DIR/lldp-results" "$BACKUP_DIR/" && echo "  • lldp-results/"
-    [[ -d "$LLDPQ_INSTALL_DIR/alert-states" ]] && \
-        cp -r "$LLDPQ_INSTALL_DIR/alert-states" "$BACKUP_DIR/" && echo "  • alert-states/"
+    if [[ "$_do_backup" == "true" ]]; then
+        step "Creating backup..."
+        BACKUP_DIR="$HOME/lldpq-backup-$(date +%Y-%m-%d_%H-%M)"
+        mkdir -p "$BACKUP_DIR"
+        echo "  Backup directory: $BACKUP_DIR"
 
-    echo "  Backup complete"
+        # Configuration files
+        [[ -f "$LLDPQ_INSTALL_DIR/devices.yaml" ]] && \
+            cp "$LLDPQ_INSTALL_DIR/devices.yaml" "$BACKUP_DIR/" && echo "  • devices.yaml"
+        [[ -f "$LLDPQ_INSTALL_DIR/notifications.yaml" ]] && \
+            cp "$LLDPQ_INSTALL_DIR/notifications.yaml" "$BACKUP_DIR/" && echo "  • notifications.yaml"
+        [[ -f "$WEB_ROOT/topology.dot" ]] && \
+            sudo cp "$WEB_ROOT/topology.dot" "$BACKUP_DIR/" && echo "  • topology.dot"
+        [[ -f "$WEB_ROOT/topology_config.yaml" ]] && \
+            sudo cp "$WEB_ROOT/topology_config.yaml" "$BACKUP_DIR/" && echo "  • topology_config.yaml"
+        [[ -f /etc/lldpq.conf ]] && \
+            sudo cp /etc/lldpq.conf "$BACKUP_DIR/" && echo "  • /etc/lldpq.conf"
+        [[ -f /etc/lldpq-users.conf ]] && \
+            sudo cp /etc/lldpq-users.conf "$BACKUP_DIR/" && echo "  • /etc/lldpq-users.conf"
+        [[ -f /etc/dhcp/dhcpd.conf ]] && \
+            sudo cp /etc/dhcp/dhcpd.conf "$BACKUP_DIR/" && echo "  • /etc/dhcp/dhcpd.conf"
+        [[ -f /etc/dhcp/dhcpd.hosts ]] && \
+            sudo cp /etc/dhcp/dhcpd.hosts "$BACKUP_DIR/" && echo "  • /etc/dhcp/dhcpd.hosts"
+
+        # SSH keys
+        if ls ~/.ssh/id_* >/dev/null 2>&1; then
+            mkdir -p "$BACKUP_DIR/ssh-keys"
+            cp ~/.ssh/id_* "$BACKUP_DIR/ssh-keys/" 2>/dev/null || true
+            echo "  • SSH keys (~/.ssh/id_*)"
+        fi
+
+        # Monitoring data snapshot (sudo: may hold root-owned files from cron)
+        for _d in monitor-results lldp-results alert-states; do
+            [[ -d "$LLDPQ_INSTALL_DIR/$_d" ]] && \
+                sudo cp -r "$LLDPQ_INSTALL_DIR/$_d" "$BACKUP_DIR/" 2>/dev/null && echo "  • $_d/"
+        done
+
+        echo "  Backup complete"
+    else
+        echo "  Skipping full backup (monitoring data is still preserved across the update)"
+    fi
 
     # -- Stop processes -------------------------------------------------------
     step "Preparing update..."
@@ -487,9 +499,19 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         echo "  Git history preserved"
     fi
 
-    # Remove old lldpq directory (will be recreated in common section)
+    # Preserve runtime data across the rm+recopy (ALWAYS — independent of the optional
+    # backup above). Uses sudo because monitor-results may contain root-owned files
+    # written by cron; a rename keeps it on the same filesystem (fast, no big copy).
+    _DATA_PRESERVE="$HOME/.lldpq-data-preserve-$$"
+    sudo rm -rf "$_DATA_PRESERVE" 2>/dev/null || true
+    mkdir -p "$_DATA_PRESERVE"
+    for _d in monitor-results lldp-results alert-states; do
+        [[ -e "$LLDPQ_INSTALL_DIR/$_d" ]] && sudo mv "$LLDPQ_INSTALL_DIR/$_d" "$_DATA_PRESERVE/" 2>/dev/null || true
+    done
+
+    # Remove old lldpq directory (sudo fallback: may contain root-owned files)
     echo "  Removing old lldpq directory..."
-    rm -rf "$LLDPQ_INSTALL_DIR"
+    rm -rf "$LLDPQ_INSTALL_DIR" 2>/dev/null || sudo rm -rf "$LLDPQ_INSTALL_DIR"
     echo "  Ready for update"
 
     # Save config vars from sourced config (before /etc/lldpq.conf is overwritten)
@@ -891,12 +913,18 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     sudo sed -i "s/^TRANSCEIVER_FW_MAX_PARALLEL=.*/TRANSCEIVER_FW_MAX_PARALLEL=$_SAVE_TRANSCEIVER_FW_MAX_PARALLEL/" /etc/lldpq.conf
     sudo sed -i "s/^TRANSCEIVER_FW_MIN_INTERVAL=.*/TRANSCEIVER_FW_MIN_INTERVAL=$_SAVE_TRANSCEIVER_FW_MIN_INTERVAL/" /etc/lldpq.conf
     sudo sed -i "s/^TRANSCEIVER_FW_SSH_TIMEOUT=.*/TRANSCEIVER_FW_SSH_TIMEOUT=$_SAVE_TRANSCEIVER_FW_SSH_TIMEOUT/" /etc/lldpq.conf
-    # Preserve AI settings
-    sudo sed -i "s/^AI_PROVIDER=.*/AI_PROVIDER=$_SAVE_AI_PROVIDER/" /etc/lldpq.conf
-    sudo sed -i "s/^AI_MODEL=.*/AI_MODEL=$_SAVE_AI_MODEL/" /etc/lldpq.conf
-    [[ -n "$_SAVE_AI_API_KEY" ]] && sudo sed -i "s/^AI_API_KEY=.*/AI_API_KEY=$_SAVE_AI_API_KEY/" /etc/lldpq.conf
-    sudo sed -i "s|^AI_API_URL=.*|AI_API_URL=$_SAVE_AI_API_URL|" /etc/lldpq.conf
-    sudo sed -i "s|^OLLAMA_URL=.*|OLLAMA_URL=$_SAVE_OLLAMA_URL|" /etc/lldpq.conf
+    # Preserve AI settings. Values (API key, model like "openai/gpt-5.5", URLs) often
+    # contain '/', '|', '&' which break `sed s///` ("unknown option to s"), so delete
+    # the freshly-written default lines and re-append the preserved values with echo
+    # (safe for ANY value).
+    sudo sed -i '/^AI_PROVIDER=/d;/^AI_MODEL=/d;/^AI_API_KEY=/d;/^AI_API_URL=/d;/^OLLAMA_URL=/d' /etc/lldpq.conf
+    {
+        echo "AI_PROVIDER=$_SAVE_AI_PROVIDER"
+        echo "AI_MODEL=$_SAVE_AI_MODEL"
+        echo "AI_API_KEY=$_SAVE_AI_API_KEY"
+        echo "AI_API_URL=$_SAVE_AI_API_URL"
+        echo "OLLAMA_URL=$_SAVE_OLLAMA_URL"
+    } | sudo tee -a /etc/lldpq.conf > /dev/null
 fi
 
 # Create cache and data files with correct permissions
@@ -1234,20 +1262,21 @@ echo "    - git auto-commit: daily at midnight"
 # ============================================================================
 if [[ "$INSTALL_MODE" == "update" ]]; then
 
-    if [[ -n "$BACKUP_DIR" ]]; then
+    if [[ -n "$_DATA_PRESERVE" ]] && [[ -d "$_DATA_PRESERVE" ]]; then
         step "Restoring monitoring data..."
-        [[ -d "$BACKUP_DIR/monitor-results" ]] && \
-            sudo cp -r "$BACKUP_DIR/monitor-results" "$LLDPQ_INSTALL_DIR/" && echo "  • monitor-results/"
-        [[ -d "$BACKUP_DIR/lldp-results" ]] && \
-            sudo cp -r "$BACKUP_DIR/lldp-results" "$LLDPQ_INSTALL_DIR/" && echo "  • lldp-results/"
-        [[ -d "$BACKUP_DIR/alert-states" ]] && \
-            sudo cp -r "$BACKUP_DIR/alert-states" "$LLDPQ_INSTALL_DIR/" && echo "  • alert-states/"
+        for _d in monitor-results lldp-results alert-states; do
+            if [[ -e "$_DATA_PRESERVE/$_d" ]]; then
+                sudo rm -rf "$LLDPQ_INSTALL_DIR/$_d" 2>/dev/null || true
+                sudo mv "$_DATA_PRESERVE/$_d" "$LLDPQ_INSTALL_DIR/" 2>/dev/null && echo "  • $_d/"
+            fi
+        done
         # Fix ownership and permissions on restored data
         sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/monitor-results" 2>/dev/null || true
         sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/lldp-results" 2>/dev/null || true
         sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/alert-states" 2>/dev/null || true
         sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type d -exec chmod 775 {} \; 2>/dev/null || true
         sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type f -exec chmod 664 {} \; 2>/dev/null || true
+        rmdir "$_DATA_PRESERVE" 2>/dev/null || sudo rm -rf "$_DATA_PRESERVE" 2>/dev/null || true
         echo "  Monitoring data restored"
     fi
 

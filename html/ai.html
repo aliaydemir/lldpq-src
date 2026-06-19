@@ -105,6 +105,29 @@
         .suggestion-chip { padding: 6px 12px; background: #2d2d2d; border: 1px solid #3c3c3c; border-radius: 18px; font-size: 12px; color: #aaa; cursor: pointer; transition: all 0.2s; white-space: nowrap; }
         .suggestion-chip:hover { border-color: #76b900; color: #76b900; background: #1a2e00; }
 
+        /* Agent activity trace (live tool calls the model ran) */
+        .tool-trace { margin: 6px 0 2px; background: #161616; border: 1px solid #2c2c2c; border-radius: 8px; font-size: 12px; max-width: 100%; }
+        .tool-trace > summary { cursor: pointer; padding: 6px 10px; color: #8aa; list-style: none; user-select: none; }
+        .tool-trace > summary::-webkit-details-marker { display: none; }
+        .tool-trace > summary::before { content: '\25B8'; margin-right: 6px; color: #666; }
+        .tool-trace[open] > summary::before { content: '\25BE'; }
+        .tool-trace-body { padding: 4px 10px 8px; display: flex; flex-direction: column; gap: 4px; }
+        .tool-row { display: flex; align-items: center; gap: 8px; }
+        .tool-row code { background: #0e0e0e; padding: 2px 6px; border-radius: 4px; color: #cfcfcf; font-size: 11px; overflow-wrap: anywhere; flex: 1; }
+        .tool-kind { font-size: 9px; font-weight: 700; letter-spacing: .5px; padding: 1px 5px; border-radius: 3px; background: #243; color: #9c6; white-space: nowrap; }
+        .tool-status { font-size: 9px; font-weight: 700; color: #6bbf59; white-space: nowrap; }
+        .tool-row.fail .tool-status { color: #ef5350; }
+
+        /* Suggested remediation (one-click → Commands, prefilled) */
+        .fix-suggestions { margin: 8px 0 2px; display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
+        .fix-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #d4a017; }
+        .fix-btn { display: flex; align-items: center; gap: 10px; text-align: left; background: #1c1a12; border: 1px solid #4a3f1a; border-radius: 8px; padding: 7px 10px; cursor: pointer; transition: all .15s; width: 100%; }
+        .fix-btn:hover { border-color: #d4a017; background: #2a2410; }
+        .fix-btn .fix-dev { font-size: 11px; font-weight: 700; color: #e0b84a; white-space: nowrap; }
+        .fix-btn code { flex: 1; background: transparent; color: #ddd; font-size: 12px; overflow-wrap: anywhere; }
+        .fix-btn .fix-go { font-size: 11px; color: #888; white-space: nowrap; }
+        .fix-btn:hover .fix-go { color: #d4a017; }
+
         /* Message wrapper for actions */
         .msg-wrapper { display: flex; flex-direction: column; max-width: 85%; }
         .msg-wrapper.user { align-self: flex-end; }
@@ -199,6 +222,7 @@
                 <option value="openai">OpenAI</option>
                 <option value="claude">Claude (Anthropic)</option>
                 <option value="custom">Custom (OpenAI-compatible)</option>
+                <option value="nvidia">Nvidia (inference)</option>
             </select>
         </div>
         <div class="settings-field" id="cfgOllamaGroup">
@@ -419,6 +443,11 @@ function onProviderChange() {
         document.getElementById('cfgApiUrl').disabled = false;
         document.getElementById('cfgApiUrl').placeholder = 'https://your-server/v1';
         document.getElementById('cfgModelCloud').placeholder = 'model-name';
+    } else if (provider === 'nvidia') {
+        // NVIDIA Inference proxy (OpenAI-compatible / LiteLLM). URL is fixed; only the key is needed.
+        document.getElementById('cfgApiUrl').value = 'https://inference-api.nvidia.com';
+        document.getElementById('cfgApiUrl').disabled = true;
+        document.getElementById('cfgModelCloud').placeholder = 'e.g. bedrock-claude-opus-4-8 / openai/gpt-5.5';
     }
 }
 
@@ -488,7 +517,7 @@ function toggleSettings() {
 }
 
 // ===================== CHAT =====================
-function addMessage(role, content) {
+function addMessage(role, content, info) {
     const area = document.getElementById('chatArea');
     
     if (role === 'system') {
@@ -514,6 +543,12 @@ function addMessage(role, content) {
         div.textContent = content;
     }
     wrapper.appendChild(div);
+    
+    // Remediation suggestions + agent activity trace (assistant only)
+    if (role === 'assistant' && info) {
+        if (info.fixes && info.fixes.length) wrapper.appendChild(renderFixes(info.fixes));
+        if (info.tools && info.tools.length) wrapper.appendChild(renderToolTrace(info.tools));
+    }
     
     // Meta row: timestamp + action buttons
     const meta = document.createElement('div');
@@ -541,6 +576,57 @@ function addMessage(role, content) {
 
 function formatTime(date) {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+// Collapsible "what the agent actually ran" trace (from tools_used)
+function renderToolTrace(tools) {
+    const det = document.createElement('details');
+    det.className = 'tool-trace';
+    const sum = document.createElement('summary');
+    sum.textContent = `Agent activity — ${tools.length} live ${tools.length === 1 ? 'check' : 'checks'}`;
+    det.appendChild(sum);
+    const body = document.createElement('div');
+    body.className = 'tool-trace-body';
+    tools.forEach(t => {
+        let kind = 'RUN', label = '', failed = (t.ok === false);
+        if ('dispatch' in t) { kind = 'RUNALL'; label = `${t.dispatch} (${t.devices} devices): ${t.command}`; }
+        else if ('promqlrange' in t) { kind = 'TREND'; label = `${t.promqlrange}  [${t.range}]`; }
+        else if ('promql' in t) { kind = 'PROMQL'; label = t.promql; }
+        else if ('path' in t) { kind = 'PATH'; label = t.path; }
+        else { kind = 'RUN'; label = `${t.device}: ${t.command}`; }
+        const row = document.createElement('div');
+        row.className = 'tool-row' + (failed ? ' fail' : '');
+        row.innerHTML = `<span class="tool-kind">${kind}</span><code>${escHtml(label)}</code>` +
+                        `<span class="tool-status">${failed ? 'FAIL' : 'OK'}</span>`;
+        body.appendChild(row);
+    });
+    det.appendChild(body);
+    return det;
+}
+
+// One-click remediation buttons → open the Commands page prefilled (NOT auto-run)
+function renderFixes(fixes) {
+    const box = document.createElement('div');
+    box.className = 'fix-suggestions';
+    box.innerHTML = '<div class="fix-title">Suggested fixes</div>';
+    fixes.forEach(f => {
+        const b = document.createElement('button');
+        b.className = 'fix-btn';
+        b.title = 'Open in Commands (prefilled — review, then run)';
+        b.innerHTML = `<span class="fix-dev">${escHtml(f.device)}</span>` +
+                      `<code>${escHtml(f.command)}</code>` +
+                      `<span class="fix-go">Run in Commands &rsaquo;</span>`;
+        b.onclick = () => openInCommands(f.device, f.command);
+        box.appendChild(b);
+    });
+    return box;
+}
+
+function openInCommands(device, command) {
+    // ai.html runs inside the app content iframe; navigating it swaps to Commands
+    // while keeping the shell + sidebar (same as clicking the Commands menu item).
+    const url = `commands.html?devices=${encodeURIComponent(device)}&cmd=${encodeURIComponent(command)}`;
+    window.location.href = url;
 }
 
 function copyMsgContent(btn) {
@@ -677,7 +763,7 @@ async function sendMessage() {
         removeTypingIndicator();
         
         if (data.success && data.response) {
-            const assistantDiv = addMessage('assistant', data.response);
+            const assistantDiv = addMessage('assistant', data.response, { tools: data.tools_used, fixes: data.fixes });
             linkDeviceNames(assistantDiv);
             chatHistory.push({ role: 'assistant', content: data.response });
             saveChatToStorage();
@@ -794,6 +880,15 @@ const PROMPT_CATEGORIES = [
             { chip: 'Config consistency', full: 'Check config consistency across all devices: compare ASN, MTU, VRFs, VLANs, and BGP peer counts for same-role devices. Report any mismatches.' },
             { chip: 'MTU mismatches', full: 'Check for MTU mismatches across fabric interfaces. All fabric-facing ports should have the same MTU. Report any differences.' },
             { chip: 'Pending changes', full: 'Are there any devices with pending/uncommitted config changes (Ansible diff)? What changes are waiting?' },
+        ]
+    },
+    {
+        label: 'Path & Trend',
+        prompts: [
+            { chip: 'Trace a path', full: 'Trace the path between two endpoints. I will give you a source and destination (device hostname or IP + destination IP) — use the path tool to show the hop-by-hop route and tell me exactly where it breaks if it does.' },
+            { chip: 'Discard trend (1h)', full: 'Using live telemetry, show the interface in/out discard trend over the last hour and tell me which ports are rising. If telemetry is disabled, say so and analyze the collected error/BER data instead.' },
+            { chip: 'Optic degradation', full: 'Correlate optical DOM data (Rx/Tx power, link margin, temperature) with the BER/interface-error data. Which optics are degrading or pre-failing? Rank by severity and suggest one-click fixes.' },
+            { chip: 'Flap hotspots', full: 'Which interfaces are flapping the most? Correlate carrier transitions with optical and BER data, identify the likely bad optic/cable, and suggest remediation for the worst offenders.' },
         ]
     },
     {
