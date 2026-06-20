@@ -952,7 +952,7 @@ echo "  Configuration saved to /etc/lldpq.conf"
 # ============================================================================
 step "Configuring sudoers..."
 
-echo "www-data ALL=($LLDPQ_USER) NOPASSWD: /usr/bin/timeout, /usr/bin/ssh, /usr/bin/scp, /usr/bin/mkdir, /usr/bin/rm, /usr/bin/tee, /usr/bin/cat, /usr/bin/ssh-keygen" | \
+echo "www-data ALL=($LLDPQ_USER) NOPASSWD: /usr/bin/timeout, /usr/bin/ssh, /usr/bin/scp, /usr/bin/mkdir, /usr/bin/rm, /usr/bin/tee, /usr/bin/cat, /usr/bin/ssh-keygen, /usr/bin/bash, /bin/bash" | \
     sudo tee /etc/sudoers.d/www-data-lldpq > /dev/null
 sudo chmod 440 /etc/sudoers.d/www-data-lldpq
 
@@ -1229,6 +1229,36 @@ fi
 sudo systemctl restart nginx
 sudo systemctl restart fcgiwrap
 echo "  nginx and fcgiwrap configured and restarted"
+
+# ============================================================================
+# COMMON: Console service (web SSH terminal — WebSocket/PTY bridge)
+# ============================================================================
+step "Configuring console service..."
+
+# Runs as www-data (to validate admin sessions); opens PTYs as $LLDPQ_USER via sudo.
+sudo tee /etc/systemd/system/lldpq-console.service > /dev/null <<UNIT
+[Unit]
+Description=LLDPq Console (web SSH terminal WebSocket/PTY bridge)
+After=network.target nginx.service
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Environment=LLDPQ_CONF=/etc/lldpq.conf
+ExecStart=/usr/bin/python3 $LLDPQ_INSTALL_DIR/console-pty.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo mkdir -p /var/log/lldpq 2>/dev/null || true
+sudo chown www-data:www-data /var/log/lldpq 2>/dev/null || true
+sudo systemctl daemon-reload
+sudo systemctl enable lldpq-console.service >/dev/null 2>&1 || true
+sudo systemctl restart lldpq-console.service 2>/dev/null || true
+echo "  console-pty service enabled (127.0.0.1:8765)"
 
 # ============================================================================
 # COMMON: Cron jobs

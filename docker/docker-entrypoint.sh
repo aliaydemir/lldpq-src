@@ -322,6 +322,11 @@ echo "  ✓ fcgiwrap"
 # Start SSH server (port 2033)
 /usr/sbin/sshd 2>/dev/null && echo "  ✓ sshd (port 2033)" || echo "  ⚠ sshd failed to start"
 
+# Start console PTY bridge (web SSH terminal, admin-gated) as www-data
+mkdir -p /var/log/lldpq 2>/dev/null && chown www-data:www-data /var/log/lldpq 2>/dev/null || true
+runuser -u www-data -- python3 /home/lldpq/lldpq/console-pty.py >> /var/log/lldpq/console.log 2>&1 &
+echo "  ✓ console-pty (127.0.0.1:8765)"
+
 # Start nginx (foreground - keeps container alive)
 echo "  ✓ nginx (port 80)"
 echo ""

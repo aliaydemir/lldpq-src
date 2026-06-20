@@ -293,11 +293,9 @@ function loadChatFromStorage() {
                 area.innerHTML = '<div class="msg msg-system">Chat history restored. ' +
                     '<a href="#" onclick="clearChat();return false;" style="color:#76b900;">Clear</a> to start fresh.</div>';
                 chatHistory.forEach(msg => {
-                    const div = document.createElement('div');
-                    div.className = `msg msg-${msg.role === 'user' ? 'user' : 'assistant'}`;
-                    if (msg.role === 'user') div.textContent = msg.content;
-                    else div.innerHTML = renderMarkdown(msg.content);
-                    area.appendChild(div);
+                    // Re-render through addMessage so restored answers keep their agent-activity
+                    // trace, one-click fix buttons, device links and copy/re-ask actions.
+                    addMessage(msg.role, msg.content, { tools: msg.tools, fixes: msg.fixes });
                 });
                 area.scrollTop = area.scrollHeight;
                 return true;
@@ -745,6 +743,8 @@ async function sendMessage() {
         abtn.style.borderColor = '#555';
     }
     
+    // Conversation history (PRIOR turns only) sent to the model — role+content only.
+    const historyPayload = chatHistory.slice(-10).map(m => ({ role: m.role, content: m.content }));
     // Add user message (show original, send with logs)
     addMessage('user', message);
     chatHistory.push({ role: 'user', content: message });
@@ -759,13 +759,13 @@ async function sendMessage() {
     showTypingIndicator();
     
     try {
-        const data = await apiCall('chat', { message: finalMessage, history: chatHistory.slice(-10) });
+        const data = await apiCall('chat', { message: finalMessage, history: historyPayload });
         removeTypingIndicator();
         
         if (data.success && data.response) {
             const assistantDiv = addMessage('assistant', data.response, { tools: data.tools_used, fixes: data.fixes });
             linkDeviceNames(assistantDiv);
-            chatHistory.push({ role: 'assistant', content: data.response });
+            chatHistory.push({ role: 'assistant', content: data.response, tools: data.tools_used, fixes: data.fixes });
             saveChatToStorage();
         } else {
             addMessage('system', 'Error: ' + (data.error || 'No response from AI'));

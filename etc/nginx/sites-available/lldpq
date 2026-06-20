@@ -44,6 +44,26 @@ server {
         location ~ \.sh$ {
             return 404;
         }
+
+        # Never serve backend Python sources (e.g. console-pty.py) as static text.
+        location ~ \.py$ {
+            return 404;
+        }
+
+        # Console — interactive SSH terminal. WebSocket reverse-proxy to the
+        # console-pty bridge (admin session is validated inside the bridge).
+        location /console-ws {
+            proxy_pass http://127.0.0.1:8765;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header Cookie $http_cookie;
+            proxy_read_timeout 86400s;
+            proxy_send_timeout 86400s;
+            proxy_buffering off;
+        }
         
         # Auto-trigger endpoint with fcgiwrap
         location = /trigger-lldp {

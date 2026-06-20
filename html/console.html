@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Console - LLDPq</title>
+<link rel="stylesheet" href="/css/xterm/xterm.css">
+<script src="/css/auth.js"></script>
+<style>
+    @font-face {
+        font-family: 'JetBrains Mono';
+        font-style: normal; font-weight: 400; font-display: swap;
+        src: url('/css/xterm/JetBrainsMono-400.woff2?v=nf1') format('woff2');
+    }
+    @font-face {
+        font-family: 'JetBrains Mono';
+        font-style: normal; font-weight: 700; font-display: swap;
+        src: url('/css/xterm/JetBrainsMono-700.woff2?v=nf1') format('woff2');
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: #1a1a1a; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; overflow: hidden;
+    }
+
+    /* ---- header ---- */
+    .hdr { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #1e1e1e; border-bottom: 1px solid #333; flex: none; }
+    .hdr .title { font-size: 16px; font-weight: 700; color: #76b900; display: flex; align-items: center; gap: 8px; }
+    .hdr .title svg { width: 20px; height: 20px; fill: #76b900; }
+    .hdr .sub { font-size: 12px; color: #888; }
+    .hdr .badge { font-size: 10px; font-weight: 700; letter-spacing: .5px; padding: 2px 8px; border-radius: 4px; background: #3a2a10; color: #e0b84a; border: 1px solid #5a4520; }
+    .hdr .spacer { flex: 1; }
+    .hdr .hbtn { display: inline-flex; align-items: center; gap: 6px; background: #2d2d2d; border: 1px solid #3c3c3c; color: #ccc; border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
+    .hdr .hbtn:hover { border-color: #76b900; color: #76b900; }
+    .hdr .hbtn svg { width: 14px; height: 14px; fill: currentColor; }
+    .hdr .hbtn.active { border-color: #76b900; color: #76b900; background: #1a2e00; }
+
+    /* broadcast bar (type once → all tabs) */
+    .bcast-bar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #1a2410; border-top: 1px solid #3a5212; flex: none; position: relative; z-index: 5; }
+    .bcast-bar[hidden] { display: none; }
+    .bcast-bar .bcast-label { font-size: 12px; font-weight: 700; color: #9ccc65; white-space: nowrap; }
+    .bcast-bar input { flex: 1; background: #0d0d0d; border: 1px solid #3a5212; color: #e0e0e0; border-radius: 6px; padding: 7px 10px; font-size: 13px; font-family: 'JetBrains Mono', Menlo, monospace; outline: none; }
+    .bcast-bar input:focus { border-color: #76b900; }
+    .bcast-bar button { background: #2d2d2d; border: 1px solid #3c3c3c; color: #ccc; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    .bcast-bar button:hover { border-color: #76b900; color: #76b900; }
+
+    /* ---- layout ---- */
+    .wrap { flex: 1; display: flex; min-height: 0; }
+
+    /* ---- left target list (matches Commands/Details) ---- */
+    .cr-left { width: 290px; min-width: 290px; background: #252526; border-right: 1px solid #333; display: flex; flex-direction: column; min-height: 0; }
+    .cr-left-header { padding: 12px 14px; font-size: 16px; font-weight: 700; color: #e0e0e0; border-bottom: 1px solid #333; background: #2d2d2d; }
+    .cr-search { padding: 8px 10px; border-bottom: 1px solid #333; }
+    .cr-search input { width: 100%; background: #1a1a1a; border: 1px solid #3c3c3c; color: #e0e0e0; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+    .cr-search input:focus { border-color: #76b900; }
+    input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
+        -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important; -webkit-text-fill-color: #fff !important; caret-color: #fff !important;
+    }
+    .cr-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+    .cr-count { padding: 8px 14px; font-size: 11px; color: #777; border-top: 1px solid #333; }
+    .host-item, .device-item {
+        display: flex; align-items: center; gap: 8px; padding: 7px 14px; font-size: 13px; color: #ccc; cursor: pointer; border-left: 3px solid transparent;
+    }
+    .host-item:hover, .device-item:hover { background: #2a2d2e; }
+    .host-item.active, .device-item.active { background: #37373d; border-left-color: #76b900; color: #fff; }
+    .host-item { color: #e0b84a; font-weight: 600; border-bottom: 1px solid #333; }
+    .host-item .dot, .device-item .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
+    .host-item.active .dot, .device-item.active .dot { background: #76b900; }
+    .group-header { display: flex; align-items: center; gap: 6px; padding: 7px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #888; cursor: pointer; user-select: none; }
+    .group-header:hover { color: #aaa; }
+    .group-header .arrow { transition: transform .15s; font-size: 9px; }
+    .group-header.collapsed .arrow { transform: rotate(-90deg); }
+    .group-devices.collapsed { display: none; }
+    .device-item { padding-left: 26px; }
+
+    /* ---- terminal area ---- */
+    .term-main { flex: 1; display: flex; flex-direction: column; min-width: 0; background: #282828; }
+    .tabs { display: flex; align-items: stretch; gap: 2px; background: #1a1a1a; border-bottom: 1px solid #333; min-height: 36px; overflow-x: auto; flex: none; }
+    .tab { display: flex; align-items: center; gap: 8px; padding: 0 12px; font-size: 12px; color: #aaa; background: #232323; cursor: pointer; white-space: nowrap; border-right: 1px solid #2a2a2a; border-top: 2px solid transparent; }
+    .tab:hover { background: #2a2a2a; }
+    .tab.active { background: #0d0d0d; color: #fff; border-top-color: #76b900; }
+    .tab .st { width: 7px; height: 7px; border-radius: 50%; background: #777; flex: none; }
+    .tab.connected .st { background: #76b900; }
+    .tab.closed .st { background: #ef5350; }
+    .tab .x { color: #777; font-size: 14px; border-radius: 3px; padding: 0 3px; }
+    .tab .x:hover { color: #fff; background: #444; }
+    .term-stack { flex: 1; position: relative; min-height: 0; }
+    .term-pane { position: absolute; inset: 0; padding: 6px 4px 4px 8px; display: none; }
+    .term-pane.active { display: block; }
+    .empty-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #555; font-size: 14px; }
+    .reconnect { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 5; background: #1e1e1e; border: 1px solid #444; padding: 16px 22px; border-radius: 10px; text-align: center; color: #ccc; }
+    .reconnect button { margin-top: 10px; background: #76b900; color: #0d0d0d; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 700; cursor: pointer; }
+
+    /* search bar */
+    .searchbar { position: absolute; top: 8px; right: 16px; z-index: 10; display: flex; gap: 6px; background: #1e1e1e; border: 1px solid #444; border-radius: 8px; padding: 6px; }
+    .searchbar[hidden] { display: none; }
+    .searchbar input { background: #0d0d0d; border: 1px solid #3c3c3c; color: #e0e0e0; border-radius: 5px; padding: 5px 8px; font-size: 12px; outline: none; width: 180px; }
+    .searchbar input:focus { border-color: #76b900; }
+    .searchbar button { background: #2d2d2d; border: 1px solid #3c3c3c; color: #ccc; border-radius: 5px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+    .searchbar button:hover { border-color: #76b900; color: #76b900; }
+    .xterm { height: 100%; }
+    .xterm-viewport::-webkit-scrollbar { width: 10px; }
+    .xterm-viewport::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 5px; }
+</style>
+</head>
+<body>
+    <div class="hdr">
+        <div class="title">
+            <svg viewBox="0 0 24 24"><path d="M20,19V7H4V19H20M20,3A2,2 0 0,1 22,5V19A2,2 0 0,1 20,21H4A2,2 0 0,1 2,19V5C2,3.89 2.89,3 4,3H20M9.58,13L5.57,9H8.4L11.7,12.3C12.09,12.69 12.09,13.32 11.7,13.71L8.42,17H5.59L9.58,13Z"/></svg>
+            Console
+        </div>
+        <span class="sub" id="hdrSub">interactive SSH terminal</span>
+        <span class="badge" title="Full interactive shell — every session is audited">FULL ACCESS · AUDITED</span>
+        <div class="spacer"></div>
+        <button class="hbtn" id="bcastBtn" onclick="toggleBroadcast()" title="Broadcast — type once, send to ALL open tabs"><b>B</b></button>
+        <button class="hbtn" onclick="fontStep(-1)" title="Smaller font">A−</button>
+        <button class="hbtn" onclick="fontStep(1)" title="Larger font">A+</button>
+        <button class="hbtn" onclick="openSearch()" title="Search (Ctrl+F)"><svg viewBox="0 0 24 24"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg></button>
+        <button class="hbtn" onclick="copyAll()" title="Copy buffer"><svg viewBox="0 0 24 24"><path d="M16,1H4C2.9,1 2,1.9 2,3V17H4V3H16V1M19,5H8C6.9,5 6,5.9 6,7V21C6,22.1 6.9,23 8,23H19C20.1,23 21,22.1 21,21V7C21,5.9 20.1,5 19,5M19,21H8V7H19V21Z"/></svg></button>
+        <button class="hbtn" onclick="downloadLog()" title="Download session log"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg></button>
+    </div>
+
+    <div class="wrap">
+        <aside class="cr-left">
+            <div class="cr-left-header">Targets</div>
+            <div class="cr-search"><input type="text" id="search" placeholder="Search targets..." autocomplete="off" oninput="renderList()"></div>
+            <div class="cr-list" id="list"></div>
+            <div class="cr-count" id="count">Loading…</div>
+        </aside>
+        <main class="term-main">
+            <div class="tabs" id="tabs"></div>
+            <div class="term-stack" id="stack">
+                <div class="empty-hint" id="emptyHint">Select a target on the left to open a session.</div>
+                <div class="searchbar" id="searchbar" hidden>
+                    <input type="text" id="searchInput" placeholder="Find in terminal…" onkeydown="if(event.key==='Enter'){event.shiftKey?searchPrev():searchNext()} if(event.key==='Escape')closeSearch()">
+                    <button onclick="searchPrev()" title="Previous">↑</button>
+                    <button onclick="searchNext()" title="Next">↓</button>
+                    <button onclick="closeSearch()" title="Close">✕</button>
+                </div>
+            </div>
+            <div class="bcast-bar" id="bcastBar" hidden>
+                <span class="bcast-label">Broadcast →</span>
+                <input id="bcastInput" autocomplete="off" placeholder="send commands to all tabs" onkeydown="if(event.key==='Enter'){broadcastSend()} if(event.key==='Escape'){closeBroadcast()}">
+                <button onclick="closeBroadcast()" title="Close broadcast">✕</button>
+            </div>
+        </main>
+    </div>
+
+    <script src="/css/xterm/xterm.js"></script>
+    <script src="/css/xterm/addon-fit.js"></script>
+    <script src="/css/xterm/addon-web-links.js"></script>
+    <script src="/css/xterm/addon-search.js"></script>
+    <script src="/css/xterm/addon-unicode11.js"></script>
+    <script>
+    const HOST_TARGET = '__lldpq_host__';
+    // Imported 1:1 from the user's iTerm2 "Default" profile (mine.itermcolors).
+    const XTERM_THEME = {
+        background: '#282828', foreground: '#e8dcb7',
+        cursor: '#e8dcb7', cursorAccent: '#282828',
+        selectionBackground: '#645c55', selectionForeground: '#e8dcb7',
+        black: '#282828', red: '#bb362a', green: '#989736', yellow: '#ce9c3e',
+        blue: '#558387', magenta: '#a66685', cyan: '#749c6f', white: '#a59a86',
+        brightBlack: '#8f8476', brightRed: '#e85841', brightGreen: '#b9bb46', brightYellow: '#f1bf4f',
+        brightBlue: '#8aa499', brightMagenta: '#c8899b', brightCyan: '#98bf83', brightWhite: '#e8dcb7'
+    };
+    let fontSize = parseInt(localStorage.getItem('lldpq_console_font') || '14', 10);
+
+    let devicesByGroup = {};   // group -> [hostnames]
+    let groupOrder = [];
+    let allTargets = [];       // {id,label,group}
+    const collapsed = {};
+    const sessions = {};       // id -> {target,label,term,fit,search,ws,paneEl,tabEl,log,connected}
+    let activeId = null;
+    let seq = 0;
+
+    document.addEventListener('DOMContentLoaded', async () => {
+        if (window.LLDPqAuth) {
+            const ok = await LLDPqAuth.check();
+            if (!ok) return;
+            if (!LLDPqAuth.isAdmin()) {
+                document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Admin only.</div>';
+                return;
+            }
+        }
+        // Load the terminal webfont BEFORE opening any xterm so glyph metrics are correct
+        // (otherwise xterm measures a fallback font and rendering looks off).
+        try { await document.fonts.load("14px 'JetBrains Mono'"); await document.fonts.load("700 14px 'JetBrains Mono'"); } catch(e){}
+        await loadDevices();
+        restoreTabs();   // reopen + reattach sessions that were open before navigating away
+        window.addEventListener('resize', () => { const s = sessions[activeId]; if (s) try { s.fit.fit(); } catch(e){} });
+        // Re-measure terminals once the webfont is fully active (in case any opened early).
+        if (document.fonts && document.fonts.ready) {
+            document.fonts.ready.then(() => {
+                for (const id in sessions) {
+                    const t = sessions[id];
+                    try { t.term.options.fontSize = t.term.options.fontSize; t.fit.fit(); } catch(e){}
+                }
+            });
+        }
+        document.addEventListener('keydown', e => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'f' && activeId) { e.preventDefault(); openSearch(); }
+        });
+    });
+
+    async function loadDevices() {
+        try {
+            const r = await fetch('/fabric-api.sh?action=list-devices', { cache: 'no-store' });
+            const data = await r.json();
+            if (!data.success || !data.devices) throw new Error(data.error || 'Failed to load devices');
+            devicesByGroup = {}; groupOrder = Object.keys(data.devices); allTargets = [];
+            for (const [group, list] of Object.entries(data.devices)) {
+                const names = list.map(d => d.hostname).filter(Boolean)
+                    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+                if (!names.length) continue;
+                devicesByGroup[group] = names;
+                names.forEach(n => allTargets.push(n));
+            }
+            renderList();
+            document.getElementById('count').textContent = `${allTargets.length} device${allTargets.length === 1 ? '' : 's'} + LLDPq host`;
+        } catch (e) {
+            document.getElementById('list').innerHTML = `<div style="padding:16px;color:#ef5350;">${esc(e.message)}</div>`;
+            document.getElementById('count').textContent = '';
+        }
+    }
+
+    function renderList() {
+        const f = (document.getElementById('search').value || '').toLowerCase();
+        let html = '';
+        if (!f || 'lldpq host this server'.includes(f)) {
+            html += `<div class="host-item ${activeTarget()===HOST_TARGET?'active':''}" onclick="openTarget('${HOST_TARGET}','LLDPq host')">
+                        <span class="dot"></span><span>★ LLDPq (this server)</span></div>`;
+        }
+        groupOrder.forEach(group => {
+            const names = (devicesByGroup[group] || []).filter(n => n.toLowerCase().includes(f));
+            if (!names.length) return;
+            // Collapsed by default; a group counts as open only if explicitly opened
+            // (collapsed[group] === false). While searching, matching groups auto-expand.
+            const open = f ? true : (collapsed[group] === false);
+            const isCol = open ? '' : 'collapsed';
+            html += `<div class="group-header ${isCol}" onclick="toggleGroup('${esc(group)}')"><span class="arrow">▼</span>${esc(group)} (${names.length})</div>`;
+            html += `<div class="group-devices ${isCol}" data-group="${esc(group)}">`;
+            names.forEach(n => {
+                html += `<div class="device-item ${activeTarget()===n?'active':''}" onclick="openTarget('${esc(n)}','${esc(n)}')"><span class="dot"></span><span>${esc(n)}</span></div>`;
+            });
+            html += `</div>`;
+        });
+        document.getElementById('list').innerHTML = html;
+    }
+
+    function toggleGroup(g) { collapsed[g] = (collapsed[g] === false) ? true : false; renderList(); }
+    function activeTarget() { return sessions[activeId] ? sessions[activeId].target : null; }
+
+    // ---------------- sessions / tabs ----------------
+    function openTarget(target, label, sid) {
+        if (!sid) {
+            // user click: focus an existing tab for this target instead of duplicating
+            for (const id in sessions) { if (sessions[id].target === target) { switchTo(id); return; } }
+            sid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'cs' + Date.now() + Math.random().toString(16).slice(2);
+        }
+        const id = 'cs' + (++seq);
+        const pane = document.createElement('div');
+        pane.className = 'term-pane';
+        document.getElementById('stack').appendChild(pane);
+
+        const term = new Terminal({
+            fontFamily: "'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
+            fontSize: fontSize, lineHeight: 1.2, cursorBlink: true, cursorStyle: 'block',
+            scrollback: 5000, allowProposedApi: true, theme: XTERM_THEME, macOptionIsMeta: true
+        });
+        const fit = new FitAddon.FitAddon();
+        const search = new SearchAddon.SearchAddon();
+        term.loadAddon(fit);
+        term.loadAddon(search);
+        term.loadAddon(new WebLinksAddon.WebLinksAddon());
+        try { const u = new Unicode11Addon.Unicode11Addon(); term.loadAddon(u); term.unicode.activeVersion = '11'; } catch(e){}
+        term.open(pane);
+
+        const sess = { id, sid, target, label, term, fit, search, ws: null, paneEl: pane, tabEl: null, log: '', connected: false };
+        sessions[id] = sess;
+
+        // copy-on-select (PuTTY/iTerm style) — bound to mouseup so the clipboard write
+        // happens inside a real user gesture (browsers block it from onSelectionChange).
+        pane.addEventListener('mouseup', () => { const sel = term.getSelection(); if (sel) copyText(sel); });
+        // Ctrl+Shift+V / Ctrl+Shift+C ; leave Ctrl+C as SIGINT
+        term.attachCustomKeyEventHandler(ev => {
+            if (ev.type !== 'keydown') return true;
+            if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && (ev.key === 'V' || ev.key === 'v')) { doPaste(sess); return false; }
+            if ((ev.ctrlKey || ev.metaKey) && ev.shiftKey && (ev.key === 'C' || ev.key === 'c')) {
+                copyText(term.getSelection()); return false;
+            }
+            return true;
+        });
+        pane.addEventListener('contextmenu', e => { e.preventDefault(); doPaste(sess); });
+        term.onData(d => { if (sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'i', d })); });
+        term.onResize(({ cols, rows }) => { if (sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'r', c: cols, r: rows })); });
+
+        buildTab(sess);
+        switchTo(id);
+        connect(sess);
+        renderList();
+        saveTabs();
+    }
+
+    function buildTab(sess) {
+        const tab = document.createElement('div');
+        tab.className = 'tab';
+        tab.onclick = () => switchTo(sess.id);
+        tab.innerHTML = `<span class="st"></span><span class="lbl">${esc(sess.label)}</span><span class="x" title="Close">✕</span>`;
+        tab.querySelector('.x').onclick = (e) => { e.stopPropagation(); closeSession(sess.id); };
+        document.getElementById('tabs').appendChild(tab);
+        sess.tabEl = tab;
+    }
+
+    function switchTo(id) {
+        activeId = id;
+        document.getElementById('emptyHint').style.display = 'none';
+        closeSearch();
+        for (const sid in sessions) {
+            const s = sessions[sid];
+            const on = sid === id;
+            s.paneEl.classList.toggle('active', on);
+            s.tabEl.classList.toggle('active', on);
+        }
+        const s = sessions[id];
+        if (s) {
+            document.getElementById('hdrSub').textContent = s.label;
+            setTimeout(() => { try { s.fit.fit(); } catch(e){} s.term.focus(); }, 0);
+        }
+        renderList();
+    }
+
+    function connect(sess) {
+        clearReconnect(sess);
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`);
+        ws.binaryType = 'arraybuffer';
+        sess.ws = ws;
+        const dec = new TextDecoder('utf-8', { fatal: false });
+        ws.onopen = () => {
+            sess.connected = true;
+            sess.tabEl.classList.add('connected'); sess.tabEl.classList.remove('closed');
+            try { sess.fit.fit(); } catch(e){}
+            sess.term.focus();
+        };
+        ws.onmessage = (e) => {
+            let text;
+            if (typeof e.data === 'string') { text = e.data; sess.term.write(text); }
+            else { const u = new Uint8Array(e.data); text = dec.decode(u, { stream: true }); sess.term.write(u); }
+            sess.log += text;
+            if (sess.log.length > 4000000) sess.log = sess.log.slice(-3000000);
+        };
+        ws.onclose = () => {
+            sess.connected = false;
+            sess.tabEl.classList.remove('connected'); sess.tabEl.classList.add('closed');
+            sess.term.write('\r\n\x1b[90m• disconnected\x1b[0m\r\n');
+            showReconnect(sess);
+        };
+        ws.onerror = () => { try { ws.close(); } catch(e){} };
+    }
+
+    function showReconnect(sess) {
+        if (sess.paneEl.querySelector('.reconnect')) return;
+        const box = document.createElement('div');
+        box.className = 'reconnect';
+        box.innerHTML = `<div>Session to <b>${esc(sess.label)}</b> closed.</div><button>Reconnect</button>`;
+        box.querySelector('button').onclick = () => { clearReconnect(sess); sess.term.clear(); connect(sess); };
+        sess.paneEl.appendChild(box);
+    }
+    function clearReconnect(sess) { const b = sess.paneEl.querySelector('.reconnect'); if (b) b.remove(); }
+
+    function closeSession(id) {
+        const s = sessions[id];
+        if (!s) return;
+        // Explicit close → tell the bridge to kill the PTY (navigation-away does NOT send this,
+        // so those sessions stay alive for reattach).
+        try { if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'end' })); } catch(e){}
+        try { if (s.ws) s.ws.close(); } catch(e){}
+        try { s.term.dispose(); } catch(e){}
+        s.paneEl.remove(); s.tabEl.remove();
+        delete sessions[id];
+        saveTabs();
+        if (activeId === id) {
+            const rest = Object.keys(sessions);
+            activeId = null;
+            if (rest.length) switchTo(rest[rest.length - 1]);
+            else { document.getElementById('emptyHint').style.display = 'flex'; document.getElementById('hdrSub').textContent = 'interactive SSH terminal'; }
+        }
+        renderList();
+    }
+
+    async function doPaste(sess) {
+        try {
+            const txt = await navigator.clipboard.readText();
+            if (txt && sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'i', d: txt }));
+        } catch (e) {}
+    }
+
+    // Robust copy: async clipboard when allowed, execCommand fallback (http / blocked).
+    function copyText(text) {
+        if (!text) return;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).catch(() => execCopy(text));
+        } else {
+            execCopy(text);
+        }
+    }
+    function execCopy(text) {
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0;';
+            document.body.appendChild(ta);
+            ta.focus(); ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        } catch (e) {}
+        const s = sessions[activeId]; if (s) s.term.focus();   // execCommand steals focus → restore
+    }
+
+    // ---------------- header actions ----------------
+    function fontStep(d) {
+        fontSize = Math.max(9, Math.min(24, fontSize + d));
+        localStorage.setItem('lldpq_console_font', String(fontSize));
+        for (const id in sessions) { sessions[id].term.options.fontSize = fontSize; try { sessions[id].fit.fit(); } catch(e){} }
+    }
+    function copyAll() {
+        const s = sessions[activeId]; if (!s) return;
+        s.term.selectAll();
+        copyText(s.term.getSelection());
+        s.term.clearSelection();
+    }
+    function downloadLog() {
+        const s = sessions[activeId]; if (!s) return;
+        const blob = new Blob([s.log.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `console-${s.label.replace(/[^a-z0-9]+/gi, '_')}-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'')}.log`;
+        a.click(); URL.revokeObjectURL(a.href);
+    }
+
+    // ---------------- search ----------------
+    function openSearch() { if (!activeId) return; const b = document.getElementById('searchbar'); b.hidden = false; document.getElementById('searchInput').focus(); }
+    function closeSearch() { document.getElementById('searchbar').hidden = true; }
+    function searchNext() { const s = sessions[activeId]; if (s) s.search.findNext(document.getElementById('searchInput').value); }
+    function searchPrev() { const s = sessions[activeId]; if (s) s.search.findPrevious(document.getElementById('searchInput').value); }
+
+    // ---------------- persistence (sessions survive iframe reloads via server reattach) ----------------
+    function saveTabs() {
+        try {
+            const tabs = Object.keys(sessions).map(id => ({ sid: sessions[id].sid, target: sessions[id].target, label: sessions[id].label }));
+            sessionStorage.setItem('lldpq_console_tabs', JSON.stringify(tabs));
+        } catch (e) {}
+    }
+    function restoreTabs() {
+        let tabs = [];
+        try { tabs = JSON.parse(sessionStorage.getItem('lldpq_console_tabs') || '[]'); } catch (e) {}
+        tabs.forEach(t => { if (t && t.sid && t.target) openTarget(t.target, t.label || t.target, t.sid); });
+    }
+
+    // ---------------- broadcast (type once → all open tabs) ----------------
+    let broadcasting = false;
+    function refitActive() { const s = sessions[activeId]; if (s) setTimeout(() => { try { s.fit.fit(); } catch(e){} }, 0); }
+    function toggleBroadcast() {
+        broadcasting = !broadcasting;
+        document.getElementById('bcastBtn').classList.toggle('active', broadcasting);
+        document.getElementById('bcastBar').hidden = !broadcasting;
+        refitActive();   // reflow so the bar shows immediately (and the terminal resizes around it)
+        if (broadcasting) document.getElementById('bcastInput').focus();
+    }
+    function closeBroadcast() {
+        broadcasting = false;
+        document.getElementById('bcastBtn').classList.remove('active');
+        document.getElementById('bcastBar').hidden = true;
+        refitActive();
+        const s = sessions[activeId]; if (s) s.term.focus();
+    }
+    function broadcastSend() {
+        const inp = document.getElementById('bcastInput');
+        const cmd = inp.value;
+        if (!cmd) return;
+        for (const id in sessions) {
+            const s = sessions[id];
+            if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'i', d: cmd + '\n' }));
+        }
+        inp.value = '';   // placeholder stays "send commands to all tabs"
+    }
+
+    function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+    </script>
+</body>
+</html>
