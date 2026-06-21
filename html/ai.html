@@ -119,6 +119,20 @@
         .tool-row.fail .tool-status { color: #ef5350; }
 
         /* Suggested remediation (one-click → Commands, prefilled) */
+        /* follow-up question chips */
+        .followups { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; }
+        .followup-chip { background: #2d2d2d; border: 1px solid #3c3c3c; color: #aaa; border-radius: 16px; padding: 5px 12px; font-size: 12px; cursor: pointer; text-align: left; }
+        .followup-chip:hover { border-color: #76b900; color: #76b900; background: #1a2e00; }
+        /* "open live console" buttons — green variant of the fix buttons */
+        .console-suggestions .fix-title { color: #76b900; }
+        .console-suggestions .fix-btn { border-color: #2e4d12; background: #15200a; }
+        .console-suggestions .fix-btn:hover { border-color: #76b900; background: #1a2e10; }
+        .console-suggestions .fix-btn .fix-dev { color: #9ccc65; }
+        .console-suggestions .fix-btn:hover .fix-go { color: #76b900; }
+        /* status cell color-coding in AI tables */
+        table td.cell-ok { color: #76b900; font-weight: 600; }
+        table td.cell-bad { color: #ef5350; font-weight: 600; }
+        table td.cell-warn { color: #ffca28; font-weight: 600; }
         .fix-suggestions { margin: 8px 0 2px; display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
         .fix-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #d4a017; }
         .fix-btn { display: flex; align-items: center; gap: 10px; text-align: left; background: #1c1a12; border: 1px solid #4a3f1a; border-radius: 8px; padding: 7px 10px; cursor: pointer; transition: all .15s; width: 100%; }
@@ -295,7 +309,7 @@ function loadChatFromStorage() {
                 chatHistory.forEach(msg => {
                     // Re-render through addMessage so restored answers keep their agent-activity
                     // trace, one-click fix buttons, device links and copy/re-ask actions.
-                    addMessage(msg.role, msg.content, { tools: msg.tools, fixes: msg.fixes });
+                    addMessage(msg.role, msg.content, { tools: msg.tools, fixes: msg.fixes, followups: msg.followups, consoles: msg.consoles });
                 });
                 area.scrollTop = area.scrollHeight;
                 return true;
@@ -324,6 +338,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Show welcome + suggestions only if no history
     }
     document.getElementById('chatInput').focus();
+
+    // "Ask AI about this" deep-link: ?ask=<prompt> (or sessionStorage lldpq_ai_ask)
+    // preloads the input and auto-sends — lets other pages hand context to Ask AI.
+    try {
+        const params = new URLSearchParams(window.location.search);
+        let ask = params.get('ask');
+        if (!ask) { ask = sessionStorage.getItem('lldpq_ai_ask'); if (ask) sessionStorage.removeItem('lldpq_ai_ask'); }
+        if (ask) {
+            history.replaceState(null, '', window.location.pathname);
+            document.getElementById('chatInput').value = ask;
+            setTimeout(() => sendMessage(), 120);
+        }
+    } catch (e) {}
 });
 
 // ===================== API =====================
@@ -537,6 +564,7 @@ function addMessage(role, content, info) {
         div.innerHTML = renderMarkdown(content);
         // Auto-link device names to Details page
         linkDeviceNames(div);
+        colorizeStatus(div);   // color-code status cells in any tables (OK=green, Down/Fail=red, Warn=amber)
     } else {
         div.textContent = content;
     }
@@ -545,6 +573,8 @@ function addMessage(role, content, info) {
     // Remediation suggestions + agent activity trace (assistant only)
     if (role === 'assistant' && info) {
         if (info.fixes && info.fixes.length) wrapper.appendChild(renderFixes(info.fixes));
+        if (info.consoles && info.consoles.length) wrapper.appendChild(renderConsoleBtns(info.consoles));
+        if (info.followups && info.followups.length) wrapper.appendChild(renderFollowups(info.followups));
         if (info.tools && info.tools.length) wrapper.appendChild(renderToolTrace(info.tools));
     }
     
@@ -625,6 +655,55 @@ function openInCommands(device, command) {
     // while keeping the shell + sidebar (same as clicking the Commands menu item).
     const url = `commands.html?devices=${encodeURIComponent(device)}&cmd=${encodeURIComponent(command)}`;
     window.location.href = url;
+}
+
+// "Open live Console" buttons (from the AI's [CONSOLE: device] suggestions)
+function renderConsoleBtns(consoles) {
+    const box = document.createElement('div');
+    box.className = 'fix-suggestions console-suggestions';
+    box.innerHTML = '<div class="fix-title">Live console</div>';
+    consoles.forEach(dev => {
+        const b = document.createElement('button');
+        b.className = 'fix-btn';
+        b.title = 'Open an interactive SSH console to this device';
+        b.innerHTML = `<span class="fix-dev">${escHtml(dev)}</span>` +
+                      `<code>interactive terminal</code>` +
+                      `<span class="fix-go">Open Console &rsaquo;</span>`;
+        b.onclick = () => openInConsole(dev);
+        box.appendChild(b);
+    });
+    return box;
+}
+
+function openInConsole(device) {
+    window.location.href = `console.html?target=${encodeURIComponent(device)}`;
+}
+
+// Follow-up question chips (from the AI's [NEXT: question] suggestions)
+function renderFollowups(list) {
+    const box = document.createElement('div');
+    box.className = 'followups';
+    list.forEach(q => {
+        const chip = document.createElement('button');
+        chip.className = 'followup-chip';
+        chip.textContent = q;
+        chip.onclick = () => { document.getElementById('chatInput').value = q; sendMessage(); };
+        box.appendChild(chip);
+    });
+    return box;
+}
+
+// Color-code status cells in AI-rendered tables (green OK, red bad, amber warning).
+function colorizeStatus(root) {
+    if (!root) return;
+    root.querySelectorAll('table td').forEach(c => {
+        const t = c.textContent.trim();
+        if (!t || t.length > 40) return;   // only short, status-like cells
+        if (/^(ok|up|pass|passed|established|healthy|enabled|online|reachable|normal|yes)$/i.test(t)
+            || /\b(established|healthy|reachable)\b/i.test(t)) c.classList.add('cell-ok');
+        else if (/\b(down|fail|failed|idle|critical|error|errors|unreachable|missing|offline|dead|dropped)\b/i.test(t)) c.classList.add('cell-bad');
+        else if (/\b(warn|warning|partial|degraded|stale|pending)\b/i.test(t)) c.classList.add('cell-warn');
+    });
 }
 
 function copyMsgContent(btn) {
@@ -763,9 +842,10 @@ async function sendMessage() {
         removeTypingIndicator();
         
         if (data.success && data.response) {
-            const assistantDiv = addMessage('assistant', data.response, { tools: data.tools_used, fixes: data.fixes });
+            const _info = { tools: data.tools_used, fixes: data.fixes, followups: data.followups, consoles: data.consoles };
+            const assistantDiv = addMessage('assistant', data.response, _info);
             linkDeviceNames(assistantDiv);
-            chatHistory.push({ role: 'assistant', content: data.response, tools: data.tools_used, fixes: data.fixes });
+            chatHistory.push(Object.assign({ role: 'assistant', content: data.response }, _info));
             saveChatToStorage();
         } else {
             addMessage('system', 'Error: ' + (data.error || 'No response from AI'));

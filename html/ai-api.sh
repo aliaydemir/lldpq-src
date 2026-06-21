@@ -69,6 +69,31 @@ if AI_PROXY_URL:
 
 ANALYSIS_FILE = os.path.join(WEB_ROOT, 'ai-analysis.json')
 
+AI_FALLBACK_MODEL = os.environ.get('AI_FALLBACK_MODEL', '')
+# Cloud providers receive a redacted copy of the context (secrets stripped); local ollama does not.
+IS_CLOUD_PROVIDER = AI_PROVIDER != 'ollama'
+
+_SECRET_RE = re.compile(
+    r'(?i)\b(password|passwd|secret|community|key-string|psk|pre-?shared-?key|md5|'
+    r'auth-?key|priv-?key|snmp-community|wpa-psk|api[-_]?key|token)\b(\s*[:=]?\s+)(\S+)'
+)
+
+
+def redact_secrets(text):
+    """Strip credential-like values (passwords, keys, community strings, private-key blocks)
+    so they are never sent to a cloud LLM."""
+    if not text:
+        return text
+    text = _SECRET_RE.sub(lambda m: "%s%s***REDACTED***" % (m.group(1), m.group(2)), text)
+    text = re.sub(r'-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----',
+                  '***PRIVATE KEY REDACTED***', text, flags=re.DOTALL)
+    return text
+
+
+def maybe_redact(text):
+    return redact_secrets(text) if IS_CLOUD_PROVIDER else text
+
+
 def result_json(data):
     print(json.dumps(data))
     sys.exit(0)
@@ -396,6 +421,46 @@ def _load_json_file(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _save_json_web(path, data):
+    """Write JSON under WEB_ROOT, falling back to sudo tee when www-data can't write."""
+    txt = json.dumps(data, indent=2)
+    try:
+        with open(path, 'w') as f:
+            f.write(txt)
+    except PermissionError:
+        import subprocess
+        subprocess.run(['sudo', '-n', 'tee', path], input=txt, capture_output=True, text=True, timeout=10)
+        subprocess.run(['sudo', '-n', 'chown', f'{LLDPQ_USER}:www-data', path], capture_output=True, timeout=5)
+        subprocess.run(['sudo', '-n', 'chmod', '664', path], capture_output=True, timeout=5)
+
+
+def _health_snapshot(devices, device_health):
+    """Per-device status map for run-to-run change detection (defensive about shapes)."""
+    snap = {}
+    for ip, dev in (devices or {}).items():
+        hn = dev.get('hostname')
+        if not hn:
+            continue
+        h = (device_health or {}).get(hn) or (device_health or {}).get(ip) or {}
+        snap[hn] = (h.get('status') if isinstance(h, dict) else None) or dev.get('status') or 'unknown'
+    return snap
+
+
+def _diff_snapshots(prev, cur):
+    """List human-readable status changes between two snapshots."""
+    changes = []
+    for hn, st in cur.items():
+        p = prev.get(hn)
+        if p is None:
+            changes.append("NEW device %s (%s)" % (hn, st))
+        elif p != st:
+            changes.append("%s: %s -> %s" % (hn, p, st))
+    for hn, p in prev.items():
+        if hn not in cur:
+            changes.append("REMOVED device %s (was %s)" % (hn, p))
+    return changes
 
 
 def build_transceiver_context(hosts=None, max_chars=9000):
@@ -1161,6 +1226,16 @@ line exactly as:
   - Use a real device/group name and a concrete command (e.g.
     [FIX: tan-leaf-01 nv set interface swp5 link state up] then nv config apply).
   - Only suggest safe, intentional changes; never destructive commands.
+
+=== FOLLOW-UPS & LIVE CONSOLE ===
+End your answer with up to 3 helpful next questions, each on its own line:
+[NEXT: <a concise, specific follow-up question>]
+  - Rendered as one-click chips. Tailor them to your answer (not generic).
+
+If hands-on interactive access would help (multi-step debugging, editing config, or a
+TUI like vtysh / top), suggest opening a live terminal:
+[CONSOLE: <device>]
+  - <device> = a real fabric hostname. Rendered as an "Open live Console" button.
 """
 
 
@@ -1375,7 +1450,7 @@ def action_chat():
     
     # Build context
     fabric_summary, devices, device_health = build_fabric_summary()
-    extra_context = build_context_for_question(question, devices, device_health)
+    extra_context = maybe_redact(build_context_for_question(question, devices, device_health))
     device_list = build_device_list(devices, device_health)
     
     system_prompt = get_system_prompt().format(
@@ -1483,29 +1558,38 @@ def action_chat():
             results.append(f"[PATH {src} -> {dst}]\n{out}")
         messages.append({"role": "assistant", "content": response})
         messages.append({"role": "user", "content":
-            "TOOL RESULTS:\n" + "\n\n".join(results) +
+            "TOOL RESULTS:\n" + maybe_redact("\n\n".join(results)) +
             "\n\nContinue. Request more data only if needed; otherwise give the final answer with no [RUN: ...] / [RUNALL: ...] / [PROMQL: ...] / [PROMQLRANGE: ...] / [PATH: ...] lines."})
     
     # If still requesting tools (hit the round cap), force one final answer.
     if re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH):', response or '') and time.time() < deadline:
         messages.append({"role": "assistant", "content": response})
         messages.append({"role": "user", "content":
-            "Stop using tools. Give your final answer now from the results above; do not emit any data-tool lines ([RUN:]/[RUNALL:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]). You MAY include [FIX: ...] remediation suggestions."})
+            "Stop using tools. Give your final answer now from the results above; do not emit any data-tool lines ([RUN:]/[RUNALL:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]). You MAY include [FIX: ...], [NEXT: ...] and [CONSOLE: ...] suggestions."})
         response = call_llm_sync(messages)
     
     # Suggested remediation commands (NOT executed) -> returned as one-click buttons.
     fixes = []
     for dev, cmd in re.findall(r'\[FIX:\s*(\S+)\s+(.+?)\]', response or ''):
         fixes.append({'device': dev.strip(), 'command': cmd.strip()})
+    # Suggested follow-up questions -> one-click chips.
+    followups = [q.strip() for q in re.findall(r'\[NEXT:\s*(.+?)\]', response or '')][:4]
+    # Suggested live-console targets -> "Open Console" buttons (validated against the fabric).
+    consoles = []
+    for dev in re.findall(r'\[CONSOLE:\s*([^\]\s]+)\s*\]', response or ''):
+        dev = dev.strip()
+        if dev in valid_hostnames and dev not in consoles:
+            consoles.append(dev)
     
-    # Strip leftover tool-call / fix lines from the visible answer (line-based: robust
-    # even when a PromQL expression contains ']' like a [5m] range selector).
+    # Strip leftover tool-call / suggestion lines from the visible answer (line-based:
+    # robust even when a PromQL expression contains ']' like a [5m] range selector).
     final = '\n'.join(
         ln for ln in (response or '').splitlines()
-        if not re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|FIX):', ln)
+        if not re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|FIX|NEXT|CONSOLE):', ln)
     ).strip()
     
-    result_json({"success": True, "response": final, "tools_used": tools_used, "fixes": fixes})
+    result_json({"success": True, "response": final, "tools_used": tools_used,
+                 "fixes": fixes, "followups": followups, "consoles": consoles})
 
 
 def action_get_context():
@@ -1693,14 +1777,25 @@ def action_list_models():
 
 
 def action_analyze():
-    """Run autonomous fabric health analysis."""
+    """Run autonomous fabric health analysis (with change detection vs the previous run)."""
     fabric_summary, devices, device_health = build_fabric_summary()
     device_list = build_device_list(devices, device_health)
-    
+
+    # Change detection: diff this run's per-device status against the previous snapshot.
+    snap_file = os.path.join(WEB_ROOT, 'ai-analysis-snapshot.json')
+    cur_snap = _health_snapshot(devices, device_health)
+    prev_snap = (_load_json_file(snap_file) or {}).get('statuses', {})
+    changes = _diff_snapshots(prev_snap, cur_snap)
+    changes_text = ("CHANGES SINCE LAST RUN:\n" + "\n".join("  - " + c for c in changes)) \
+        if changes else "CHANGES SINCE LAST RUN: none — device status unchanged."
+
     prompt = f"""Analyze this network fabric health data and report any issues, anomalies, or concerns.
 Be specific: mention device names, IPs, and exact metrics.
 Categorize findings as: CRITICAL, WARNING, or INFO.
-If everything looks healthy, say so briefly.
+LEAD your report with what CHANGED since the last run (section below) when anything changed;
+then cover current issues. If everything is healthy and nothing changed, say so briefly.
+
+{changes_text}
 
 {fabric_summary}
 
@@ -1720,6 +1815,7 @@ DEVICE LIST:
         "device_count": len(devices),
         "provider": AI_PROVIDER,
         "model": AI_MODEL,
+        "changes": changes,
     }
     
     # Save analysis
@@ -1733,7 +1829,13 @@ DEVICE LIST:
         subprocess.run(['sudo', '-n', 'chown', f'{LLDPQ_USER}:www-data', ANALYSIS_FILE], capture_output=True, timeout=5)
         subprocess.run(['sudo', '-n', 'chmod', '664', ANALYSIS_FILE], capture_output=True, timeout=5)
     
-    result_json({"success": True, "analysis": response, "timestamp": analysis['timestamp']})
+    # Persist this run's snapshot for next-run change detection.
+    try:
+        _save_json_web(snap_file, {"timestamp": time.time(), "statuses": cur_snap})
+    except Exception:
+        pass
+
+    result_json({"success": True, "analysis": response, "timestamp": analysis['timestamp'], "changes": changes})
 
 
 def action_get_analysis():

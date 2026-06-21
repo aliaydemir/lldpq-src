@@ -117,6 +117,7 @@
         <span class="sub" id="hdrSub">interactive SSH terminal</span>
         <span class="badge" title="Full interactive shell — every session is audited">FULL ACCESS · AUDITED</span>
         <div class="spacer"></div>
+        <button class="hbtn" id="askAiBtn" onclick="askAIaboutSelection()" title="Send the selected terminal output to Ask AI">Ask AI</button>
         <button class="hbtn" id="bcastBtn" onclick="toggleBroadcast()" title="Broadcast — type once, send to ALL open tabs"><b>B</b></button>
         <button class="hbtn" onclick="fontStep(-1)" title="Smaller font">A−</button>
         <button class="hbtn" onclick="fontStep(1)" title="Larger font">A+</button>
@@ -192,6 +193,18 @@
         try { await document.fonts.load("14px 'JetBrains Mono'"); await document.fonts.load("700 14px 'JetBrains Mono'"); } catch(e){}
         await loadDevices();
         restoreTabs();   // reopen + reattach sessions that were open before navigating away
+        // deep-link: ?target=<hostname> (e.g. from Ask AI "Open Console") auto-opens that target
+        try {
+            const tgt = new URLSearchParams(window.location.search).get('target');
+            if (tgt) {
+                history.replaceState(null, '', window.location.pathname);
+                if (tgt === HOST_TARGET) openTarget(HOST_TARGET, 'LLDPq host');
+                else {
+                    const host = allTargets.find(h => h.toLowerCase() === tgt.toLowerCase());
+                    if (host) openTarget(host, host);
+                }
+            }
+        } catch (e) {}
         window.addEventListener('resize', () => { const s = sessions[activeId]; if (s) snug(s); });
         // Re-measure terminals once the webfont is fully active (in case any opened early).
         if (document.fonts && document.fonts.ready) {
@@ -434,6 +447,21 @@
         s.term.selectAll();
         copyText(s.term.getSelection());
         s.term.clearSelection();
+    }
+    // Hand the current terminal selection to Ask AI ("explain this output").
+    function askAIaboutSelection() {
+        const s = sessions[activeId];
+        const sel = s ? s.term.getSelection() : '';
+        const btn = document.getElementById('askAiBtn');
+        if (!sel || !sel.trim()) {
+            const o = btn.textContent; btn.textContent = 'select output first';
+            setTimeout(() => { btn.textContent = o; }, 1500);
+            return;
+        }
+        const label = s ? s.label : 'a device';
+        const prompt = `Explain this terminal output from ${label} and flag anything wrong or noteworthy:\n\n${sel.slice(0, 4000)}`;
+        try { sessionStorage.setItem('lldpq_ai_ask', prompt); } catch (e) {}
+        window.location.href = 'ai.html';
     }
     function downloadLog() {
         const s = sessions[activeId]; if (!s) return;
