@@ -87,7 +87,7 @@
     .tab .x:hover { color: #fff; background: #444; }
     .term-stack { flex: 1; position: relative; min-height: 0; }
     .term-pane { position: absolute; inset: 0; padding: 6px 4px 0 8px; display: none; }
-    .term-pane.active { display: block; }
+    .term-pane.active { display: flex; flex-direction: column; justify-content: flex-end; }
     .empty-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #555; font-size: 14px; }
     .reconnect { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); z-index: 5; background: #1e1e1e; border: 1px solid #444; padding: 16px 22px; border-radius: 10px; text-align: center; color: #ccc; }
     .reconnect button { margin-top: 10px; background: #76b900; color: #0d0d0d; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 700; cursor: pointer; }
@@ -99,7 +99,11 @@
     .searchbar input:focus { border-color: #76b900; }
     .searchbar button { background: #2d2d2d; border: 1px solid #3c3c3c; color: #ccc; border-radius: 5px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
     .searchbar button:hover { border-color: #76b900; color: #76b900; }
-    .xterm { height: 100%; }
+    /* xterm.css defaults .xterm / .xterm-viewport to background:#000, so the area below the
+       last rendered row shows as a black strip (e.g. above the broadcast bar). Paint these
+       with the terminal background so any sub-row remainder blends in. */
+    .xterm { height: 100%; background-color: #282828; }
+    .xterm .xterm-viewport { background-color: #282828 !important; }
     .xterm-viewport::-webkit-scrollbar { width: 10px; }
     .xterm-viewport::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 5px; }
 </style>
@@ -188,13 +192,14 @@
         try { await document.fonts.load("14px 'JetBrains Mono'"); await document.fonts.load("700 14px 'JetBrains Mono'"); } catch(e){}
         await loadDevices();
         restoreTabs();   // reopen + reattach sessions that were open before navigating away
-        window.addEventListener('resize', () => { const s = sessions[activeId]; if (s) try { s.fit.fit(); } catch(e){} });
+        window.addEventListener('resize', () => { const s = sessions[activeId]; if (s) snug(s); });
         // Re-measure terminals once the webfont is fully active (in case any opened early).
         if (document.fonts && document.fonts.ready) {
             document.fonts.ready.then(() => {
                 for (const id in sessions) {
                     const t = sessions[id];
-                    try { t.term.options.fontSize = t.term.options.fontSize; t.fit.fit(); } catch(e){}
+                    try { t.term.options.fontSize = t.term.options.fontSize; } catch(e){}
+                    snug(t);
                 }
             });
         }
@@ -325,7 +330,7 @@
         const s = sessions[id];
         if (s) {
             document.getElementById('hdrSub').textContent = s.label;
-            setTimeout(() => { try { s.fit.fit(); } catch(e){} s.term.focus(); }, 0);
+            setTimeout(() => { snug(s); s.term.focus(); }, 0);
         }
         renderList();
     }
@@ -340,7 +345,7 @@
         ws.onopen = () => {
             sess.connected = true;
             sess.tabEl.classList.add('connected'); sess.tabEl.classList.remove('closed');
-            try { sess.fit.fit(); } catch(e){}
+            snug(sess);
             sess.term.focus();
         };
         ws.onmessage = (e) => {
@@ -422,7 +427,7 @@
     function fontStep(d) {
         fontSize = Math.max(9, Math.min(24, fontSize + d));
         localStorage.setItem('lldpq_console_font', String(fontSize));
-        for (const id in sessions) { sessions[id].term.options.fontSize = fontSize; try { sessions[id].fit.fit(); } catch(e){} }
+        for (const id in sessions) { sessions[id].term.options.fontSize = fontSize; snug(sessions[id]); }
     }
     function copyAll() {
         const s = sessions[activeId]; if (!s) return;
@@ -460,7 +465,21 @@
 
     // ---------------- broadcast (type once → all open tabs) ----------------
     let broadcasting = false;
-    function refitActive() { const s = sessions[activeId]; if (s) setTimeout(() => { try { s.fit.fit(); } catch(e){} }, 0); }
+    // Fit to the container, then pin the terminal element to the EXACT rendered row height
+    // and bottom-align it (.term-pane is flex-end) so the last row sits flush against the
+    // broadcast bar / bottom — eliminating xterm's sub-row remainder (the "1 row" gap).
+    function snug(sess) {
+        if (!sess) return;
+        try { sess.fit.fit(); } catch (e) {}
+        requestAnimationFrame(() => {
+            try {
+                const el = sess.term.element;
+                const scr = el && el.querySelector('.xterm-screen');
+                if (scr && scr.offsetHeight) el.style.height = scr.offsetHeight + 'px';
+            } catch (e) {}
+        });
+    }
+    function refitActive() { const s = sessions[activeId]; if (s) setTimeout(() => snug(s), 0); }
     function toggleBroadcast() {
         broadcasting = !broadcasting;
         document.getElementById('bcastBtn').classList.toggle('active', broadcasting);
