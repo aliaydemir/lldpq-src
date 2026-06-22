@@ -6189,6 +6189,46 @@ PYTHON_END
             echo '{"success": true, "configured": false}'
         fi
         ;;
+    "save-display-aliases")
+        # Save DISPLAY aliases (real name -> P2P/field label) for both interfaces
+        # (e.g. enP22p3s0f0np0 -> M1) and devices (e.g. tan-spine-01 -> SPINE-01).
+        # Display-only (consumed by lldp.html); does not touch validation data.
+        # Admin only (default auth gate at top of file). Generic: no naming hardcoded.
+        read -r POST_DATA
+        export POST_DATA
+        source /etc/lldpq.conf 2>/dev/null || true
+        WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+        ALIAS_FILE="$WEB_ROOT/display-aliases.json"
+        CLEAN_JSON=$(python3 -c '
+import sys, json, os
+def clean_map(m, klen, vlen):
+    out = {}
+    if isinstance(m, dict):
+        for k, v in list(m.items())[:2000]:
+            k = str(k).strip(); v = str(v).strip()
+            if k and v and len(k) <= klen and len(v) <= vlen:
+                out[k] = v
+    return out
+try:
+    data = json.loads(os.environ.get("POST_DATA", "{}"))
+    result = {
+        "interfaces": clean_map(data.get("interfaces", {}), 64, 32),
+        "devices": clean_map(data.get("devices", {}), 128, 64),
+    }
+    print(json.dumps(result, indent=2))
+except Exception:
+    pass
+' 2>/dev/null)
+        if [ -z "$CLEAN_JSON" ]; then
+            echo '{"success": false, "error": "Invalid aliases payload"}'
+        elif echo "$CLEAN_JSON" > "$ALIAS_FILE" 2>/dev/null || echo "$CLEAN_JSON" | sudo -n tee "$ALIAS_FILE" > /dev/null 2>&1; then
+            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$ALIAS_FILE" 2>/dev/null
+            sudo -n chmod 664 "$ALIAS_FILE" 2>/dev/null
+            echo '{"success": true}'
+        else
+            echo '{"success": false, "error": "Failed to write alias file"}'
+        fi
+        ;;
     *)
         echo '{"success": false, "error": "Unknown action: '"$ACTION"'"}'
         ;;

@@ -115,16 +115,23 @@ function convertToCytoscapeFormat(topologyData) {
 }
 
 /**
- * Re-position staggered endpoint groups as an interleaved brick/zigzag:
- * global left-to-right order, with nodes tagged staggerRow=1 (even number) dropped
- * to a lower sub-row so they sit between the staggerRow=0 (odd) blocks.
+ * Re-position staggered endpoint groups (nodes tagged with staggerRow by the
+ * generator's `type: stagger` rule) as RACK COLUMNS so individual devices stay
+ * legible:
+ *   - members are split into racks wherever the sub-row parity flips (rack N and
+ *     N+1 always differ in parity, so this delineates racks without parsing names),
+ *   - each rack becomes its own vertical column (devices listed top-to-bottom, one
+ *     per row, so labels don't overlap),
+ *   - even racks are dropped half a column to keep the brick/zigzag offset.
  *
- * Fully config-driven: nodes are tagged by the generator from a `type: stagger`
- * rule in topology_config.yaml (no device names are hardcoded here). Members are
- * grouped by level so multiple independent stagger groups stay separate.
- * Runs after the normal level layout (TB) and only overrides tagged nodes.
+ * Fully config-driven: no device names are hardcoded here. Grouped by level so
+ * multiple independent stagger groups stay separate. Runs after the normal TB
+ * level layout and only overrides tagged nodes.
  */
 function applyStagger(positions, padding, containerWidth) {
+    const NODE_VGAP = 26;          // vertical pitch between devices in a rack column
+    const MIN_RACK_PITCH = 340;    // horizontal gap between rack columns (spread + label room)
+    const SUBCOL_GAP = 50;         // horizontal gap between a rack's two sub-columns
     const groups = {};
     cy.nodes().forEach(n => {
         const sr = n.data('staggerRow');
@@ -136,18 +143,44 @@ function applyStagger(positions, padding, containerWidth) {
     Object.keys(groups).forEach(lvl => {
         const members = groups[lvl];
         if (members.length < 2) return;
-        // Keep the familiar left-to-right order (natural by label).
+        // Natural order by label: pod -> rack -> compute slot.
         members.sort((a, b) =>
             a.data('label').localeCompare(b.data('label'), undefined, { numeric: true, sensitivity: 'base' }));
-        // All members share one level => one base Y; drop the even sub-row below it.
+        // Split into racks: a new rack begins wherever the sub-row parity flips.
+        const racks = [];
+        let prev = null;
+        members.forEach(n => {
+            const row = n.data('staggerRow');
+            if (row !== prev) { racks.push([]); prev = row; }
+            racks[racks.length - 1].push(n);
+        });
         const baseY = (positions[members[0].id()] || {}).y != null ? positions[members[0].id()].y : padding;
-        const dropY = baseY + 90;
-        const dx = (containerWidth - padding * 2) / members.length * 1.3;
-        members.forEach((n, i) => {
-            positions[n.id()] = {
-                x: padding + dx * i + dx / 2,
-                y: n.data('staggerRow') === 1 ? dropY : baseY
-            };
+        // Median rack size for the brick offset. Each rack renders as TWO sub-columns,
+        // so the visible height is ~half; offset by half of that.
+        const sizes = racks.map(r => r.length).slice().sort((a, b) => a - b);
+        const medianRack = sizes[Math.floor(sizes.length / 2)] || 1;
+        const drop = Math.ceil(medianRack / 2) * NODE_VGAP * 0.5;     // even-rack brick offset
+        const avail = containerWidth - padding * 2;
+        const pitchX = Math.max(avail / racks.length, MIN_RACK_PITCH);
+        const bandWidth = racks.length * pitchX;
+        // Center the band on the same axis as the other levels (they overspread by 1.3x,
+        // so their center is padding + 0.65*avail). Without this the wide band drifts right.
+        const startX = (padding + avail * 0.65) - bandWidth / 2;
+        racks.forEach((rack, r) => {
+            const colX = startX + (r + 0.5) * pitchX;
+            const colTopY = baseY + (rack[0].data('staggerRow') === 1 ? drop : 0);
+            // Split each rack into two sub-columns (first half left, second half right)
+            // so the leaf->rack links fan into two streams instead of one overlapping bar.
+            const half = Math.ceil(rack.length / 2);
+            rack.forEach((n, k) => {
+                const left = k < half;
+                n.data('subCol', left ? 'L' : 'R');   // drives label side (style below)
+                const row = left ? k : k - half;
+                positions[n.id()] = {
+                    x: colX + (left ? -SUBCOL_GAP / 2 : SUBCOL_GAP / 2),
+                    y: colTopY + row * NODE_VGAP
+                };
+            });
         });
     });
 }
@@ -1386,6 +1419,27 @@ function initCytoscape() {
                     'height': 40,
                     'shape': 'ellipse',
                     'border-width': 0
+                }
+            },
+            // Staggered endpoint nodes (rack columns): label to the RIGHT so each
+            // device reads as its own row in the vertical column without overlap.
+            {
+                selector: 'node[staggerRow >= 0]',
+                style: {
+                    'text-halign': 'right',
+                    'text-valign': 'center',
+                    'text-margin-x': 6,
+                    'text-margin-y': 0,
+                    'font-size': '8px'
+                }
+            },
+            // Left sub-column of a rack: label on the LEFT so the two sub-columns' labels
+            // don't collide (right sub-column keeps the default right-aligned label above).
+            {
+                selector: "node[subCol = 'L']",
+                style: {
+                    'text-halign': 'left',
+                    'text-margin-x': -6
                 }
             },
             // Highlighted node
