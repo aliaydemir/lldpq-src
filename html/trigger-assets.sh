@@ -3,7 +3,7 @@
 # Called by nginx via fcgiwrap
 
 source "$(dirname "$0")/auth-guard.sh"
-require_admin
+require_auth   # operator or admin may trigger an assets refresh (read-only collection)
 
 # Set HTTP headers
 echo "Content-Type: application/json"

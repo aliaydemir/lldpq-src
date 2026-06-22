@@ -960,6 +960,10 @@
         .then(response => response.json())
         .then(data => {
             console.log('✅ Refresh assets response:', data);
+            if (data.status !== 'started') {
+                // 403 / failure -> surface the real error instead of a fake success
+                throw new Error(data.error || data.message || 'Trigger failed');
+            }
             
             // Show success
             buttonText.textContent = '✓ Refreshed';

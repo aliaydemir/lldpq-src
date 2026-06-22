@@ -3,7 +3,7 @@
 # Called by nginx via fcgiwrap
 
 source "$(dirname "$0")/auth-guard.sh"
-require_admin
+require_auth   # any logged-in user (operator or admin) may trigger an LLDP re-check (read-only refresh)
 
 # Set HTTP headers
 echo "Content-Type: application/json"

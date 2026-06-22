@@ -1156,6 +1156,10 @@
             .then(response => response.json())
             .then(data => {
                 console.log('✅ LLDP check response:', data);
+                if (data.status !== 'started') {
+                    // 403 / failure -> surface the real error instead of a fake success
+                    throw new Error(data.error || data.message || 'Trigger failed');
+                }
                 
                 // Always show manual trigger instruction
                 buttonText.textContent = '✓ Triggered';
