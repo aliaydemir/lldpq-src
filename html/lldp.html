@@ -296,6 +296,7 @@
             display: flex;
             gap: 10px;
             align-items: center;
+            flex-wrap: wrap;
         }
         
         /* Device Search - Dark Theme */
@@ -305,7 +306,8 @@
             gap: 8px;
         }
         
-        .device-search-container .select2-container { min-width: 220px; }
+        /* Start ~Filter-Device width, grow with selected tags up to ~5 wide, then wrap */
+        .device-search-container .select2-container { width: fit-content !important; min-width: 220px; max-width: 720px; }
         .device-search-container .select2-container--default .select2-selection--single {
             height: 34px;
             border: 1px solid #555;
@@ -348,6 +350,19 @@
         .select2-container--default .select2-results__option[aria-selected=true] {
             background: #3c3c3c;
         }
+        /* multi-select tags (dark theme, green accent) */
+        .device-search-container .select2-container--default .select2-selection--multiple {
+            background: #3c3c3c; border: 1px solid #555; min-height: 34px;
+            max-height: 72px; overflow-y: auto; overflow-x: hidden;   /* ~5 tags/row; 6-10 wrap to 2nd row; no horizontal scrollbar */
+        }
+        .device-search-container .select2-container--default .select2-selection--multiple .select2-selection__choice {
+            background: #2c3a12; border: 1px solid #76b900; color: #d4d4d4; border-radius: 3px; padding: 1px 6px;
+        }
+        .device-search-container .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+            color: #9ccc65; margin-right: 4px;
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__rendered { color: #d4d4d4; }
+        .select2-container--default .select2-search--inline .select2-search__field { color: #d4d4d4; }
         
         .clear-search-btn {
             background: #f44336;
@@ -384,8 +399,7 @@
         </div>
         <div class="action-buttons">
             <div class="device-search-container">
-                <select id="deviceSearch" style="width: 220px;">
-                    <option value="">Search Device...</option>
+                <select id="deviceSearch" multiple style="min-width: 220px;">
                 </select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
@@ -532,9 +546,11 @@
             
             // Clear device search when using card filters
             if (deviceSearchActive) {
-                selectedDevice = '';
+                selectedDevices = [];
                 deviceSearchActive = false;
-                $('#deviceSearch').val('').trigger('change');
+                _suppressDeviceChange = true;
+                $('#deviceSearch').val(null).trigger('change');
+                _suppressDeviceChange = false;
                 document.getElementById('clearSearchBtn').style.display = 'none';
             }
             
@@ -592,9 +608,11 @@
             
             // Also clear device search
             if (deviceSearchActive) {
-                selectedDevice = '';
+                selectedDevices = [];
                 deviceSearchActive = false;
-                $('#deviceSearch').val('').trigger('change');
+                _suppressDeviceChange = true;
+                $('#deviceSearch').val(null).trigger('change');
+                _suppressDeviceChange = false;
                 document.getElementById('clearSearchBtn').style.display = 'none';
             }
             
@@ -625,9 +643,10 @@
                 baseLabel = 'All';
             }
             
-            if (deviceSearchActive && selectedDevice) {
-                base = base.filter(conn => conn.localDevice === selectedDevice || conn.expectedDevice === selectedDevice || conn.actualDevice === selectedDevice);
-                baseLabel = selectedDevice;
+            if (deviceSearchActive && selectedDevices.length) {
+                const _set = new Set(selectedDevices);
+                base = base.filter(conn => _set.has(conn.localDevice));
+                baseLabel = selectedDevices.join(', ');
             }
             
             if (!query) {
@@ -1327,15 +1346,17 @@
 
         // ===== Device Search Functions =====
         let deviceSearchActive = false;
-        let selectedDevice = '';
+        let selectedDevices = [];
+        let _suppressDeviceChange = false;
         
         function initDeviceSearch() {
-            // Initialize Select2 with search capability
+            // Multi-select with search; pick several devices at once
             $('#deviceSearch').select2({
-                placeholder: 'Search Device...',
-                allowClear: true,
-                width: '250px',
+                placeholder: 'Search devices…',
+                allowClear: false,      // no built-in (black) clear-x; the red ✕ button handles clear-all
+                width: 'auto',          // grow with content (CSS clamps min/max width)
                 dropdownAutoWidth: true,
+                closeOnSelect: false,   // keep dropdown open so 2-3-4 devices can be added in a row
                 matcher: function(params, data) {
                     // Custom matcher for case-insensitive search
                     if ($.trim(params.term) === '') {
@@ -1351,17 +1372,10 @@
                 }
             });
             
-            // Handle device selection
-            $('#deviceSearch').on('select2:select', function(e) {
-                const device = e.params.data.id;
-                if (device) {
-                    filterByDevice(device);
-                }
-            });
-            
-            // Handle clear selection
-            $('#deviceSearch').on('select2:clear', function(e) {
-                clearDeviceSearch();
+            // Re-apply the filter whenever the set of selected devices changes (select / unselect / clear)
+            $('#deviceSearch').on('change', function() {
+                if (_suppressDeviceChange) return;
+                applyDeviceFilter($(this).val() || []);
             });
         }
         
@@ -1382,7 +1396,7 @@
             
             // Clear existing options and populate
             const select = document.getElementById('deviceSearch');
-            select.innerHTML = '<option value="">🔍 Search device...</option>';
+            select.innerHTML = '';   // multi-select: no empty placeholder option
             
             sortedDevices.forEach(device => {
                 const option = document.createElement('option');
@@ -1391,57 +1405,54 @@
                 select.appendChild(option);
             });
             
-            // Reinitialize Select2 with new options
-            $('#deviceSearch').trigger('change');
+            // Refresh Select2 without triggering the filter (nothing selected yet)
+            _suppressDeviceChange = true;
+            $('#deviceSearch').val(null).trigger('change');
+            _suppressDeviceChange = false;
         }
         
-        function filterByDevice(deviceName) {
-            if (!deviceName || allConnections.length === 0) return;
+        function applyDeviceFilter(devices) {
+            devices = (devices || []).filter(Boolean);
+            selectedDevices = devices;
             
-            selectedDevice = deviceName;
+            // No devices selected -> behave like "show all"
+            if (devices.length === 0) {
+                deviceSearchActive = false;
+                document.getElementById('clearSearchBtn').style.display = 'none';
+                document.getElementById('filter-info').style.display = 'none';
+                renderConnectionsTable(allConnections);
+                return;
+            }
+            
             deviceSearchActive = true;
             
             // Clear card-based filter
             currentFilter = 'ALL';
-            document.querySelectorAll('.summary-card').forEach(card => {
-                card.classList.remove('active');
-            });
+            document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
             
-            // Filter connections where device appears in any column
-            const filteredConnections = allConnections.filter(conn => {
-                return conn.localDevice === deviceName ||
-                       conn.expectedDevice === deviceName ||
-                       conn.actualDevice === deviceName;
-            });
+            // Connections whose LOCAL DEVICE is one of the selected devices (local column only)
+            const set = new Set(devices);
+            const filteredConnections = allConnections.filter(conn => set.has(conn.localDevice));
             
-            // Show filter info
             document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent = 
-                `Showing ${filteredConnections.length} connections for "${deviceName}"`;
-            
-            // Show clear button
+            document.getElementById('filter-text').textContent =
+                `Showing ${filteredConnections.length} connections for ${devices.length} device${devices.length > 1 ? 's' : ''}: ${devices.join(', ')}`;
             document.getElementById('clearSearchBtn').style.display = 'inline-block';
             
-            // Render filtered table
             renderConnectionsTable(filteredConnections);
-            
-            console.log(`Device filter: ${deviceName}, found ${filteredConnections.length} connections`);
         }
         
         function clearDeviceSearch() {
-            selectedDevice = '';
+            selectedDevices = [];
             deviceSearchActive = false;
             
-            // Clear Select2 selection
-            $('#deviceSearch').val('').trigger('change');
+            // Clear Select2 selection (don't double-render via the change handler)
+            _suppressDeviceChange = true;
+            $('#deviceSearch').val(null).trigger('change');
+            _suppressDeviceChange = false;
             
-            // Hide clear button
             document.getElementById('clearSearchBtn').style.display = 'none';
-            
-            // Hide filter info
             document.getElementById('filter-info').style.display = 'none';
-            
-            // Render all connections
             renderConnectionsTable(allConnections);
         }
 

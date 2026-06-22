@@ -427,17 +427,17 @@
                         <button class="format-btn active" data-format="txt" onclick="selectFormat('txt')">NV-SET</button>
                         <button class="format-btn" data-format="yaml" onclick="selectFormat('yaml')">YAML</button>
                     </div>
-                    <button class="btn" onclick="runValidate()" id="btn-validate" style="background: #0097a7; color: #fff; display: none;">
-                        <svg viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
-                        </svg>
-                        Validate
-                    </button>
                     <button class="btn" onclick="collectConfigs()" id="btn-collect" style="background: #ff9800; color: #000; font-weight: bold;">
                         <svg viewBox="0 0 24 24" fill="currentColor">
                             <path d="M19.35,10.04C18.67,6.59 15.64,4 12,4C9.11,4 6.6,5.64 5.35,8.04C2.34,8.36 0,10.91 0,14A6,6 0 0,0 6,20H19A5,5 0 0,0 24,15C24,12.36 21.95,10.22 19.35,10.04M19,18H6A4,4 0 0,1 2,14C2,11.95 3.53,10.24 5.56,10.03L6.63,9.92L7.13,8.97C8.08,7.14 9.94,6 12,6C14.62,6 16.88,7.86 17.39,10.43L17.69,11.93L19.22,12.04C20.78,12.14 22,13.45 22,15A3,3 0 0,1 19,18M8,13H10.55V16H13.45V13H16L12,9L8,13Z"/>
                         </svg>
                         <span id="collect-text">Collect Configs</span>
+                    </button>
+                    <button class="btn" onclick="runValidate()" id="btn-validate" style="background: #0097a7; color: #fff;" title="Validate generated configs — whole fabric, or the selected device">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
+                        </svg>
+                        Validate
                     </button>
                     <button class="btn btn-primary" onclick="downloadAllConfigs('txt')" id="download-nvset">
                         <svg viewBox="0 0 24 24" fill="currentColor">
@@ -717,7 +717,6 @@
             document.getElementById('contentTitle').textContent = device;
             document.getElementById('contentSubtitle').textContent = 'Configuration file';
             document.getElementById('formatSelector').style.display = 'flex';
-            document.getElementById('btn-validate').style.display = 'flex';
             
             // Load config
             loadConfig();
@@ -738,15 +737,16 @@
         }
         
         async function runValidate() {
-            if (!selectedDevice) {
-                alert('Please select a device first');
-                return;
-            }
-            
-            showLoading(`Validating ${selectedDevice}...`);
+            // A device is open -> validate just that one; otherwise validate the WHOLE fabric.
+            const all = !selectedDevice;
+            const label = all ? 'all devices' : selectedDevice;
+            showLoading(`Validating ${label}...`);
             
             try {
-                const response = await fetch(`/edit-config?action=validate&devices=${encodeURIComponent(selectedDevice)}`);
+                const url = all
+                    ? '/edit-config?action=validate'
+                    : `/edit-config?action=validate&devices=${encodeURIComponent(selectedDevice)}`;
+                const response = await fetch(url);
                 const data = await response.json();
                 
                 hideLoading();
@@ -757,7 +757,7 @@
                 }
                 
                 const result = data.result;
-                const summary = result.summary;
+                const summary = result.summary || {};
                 const isValid = result.valid;
                 const statusColor = isValid ? '#76b900' : '#f44336';
                 const statusIcon = isValid ? '✓' : '✗';
@@ -766,29 +766,34 @@
                 
                 // Summary
                 html += `<div style="padding: 15px; background: ${isValid ? 'rgba(118,185,0,0.1)' : 'rgba(244,67,54,0.1)'}; border-radius: 8px; margin-bottom: 15px; border: 1px solid ${statusColor};">`;
-                html += `<div style="font-size: 18px; color: ${statusColor}; margin-bottom: 10px;">${statusIcon} ${isValid ? 'Configuration Valid' : 'Validation Issues Found'}</div>`;
+                html += `<div style="font-size: 18px; color: ${statusColor}; margin-bottom: 10px;">${statusIcon} ${isValid ? 'All Configurations Valid' : 'Validation Issues Found'}</div>`;
                 html += `<div style="color: #ccc;">`;
-                html += `<div>Device: <span style="color: #4fc3f7; font-weight: bold;">${selectedDevice}</span></div>`;
-                html += `<div>Issues: <span style="color: #f44336;">${summary.total_errors} errors</span>, <span style="color: #ff9800;">${summary.total_warnings} warnings</span></div>`;
+                if (all) {
+                    html += `<div>Files: <span style="color: #fff;">${summary.total_files ?? '?'}</span> (${summary.valid_files ?? 0} valid, ${summary.invalid_files ?? 0} invalid)</div>`;
+                } else {
+                    html += `<div>Device: <span style="color: #4fc3f7; font-weight: bold;">${selectedDevice}</span></div>`;
+                }
+                html += `<div>Issues: <span style="color: #f44336;">${summary.total_errors ?? 0} errors</span>, <span style="color: #ff9800;">${summary.total_warnings ?? 0} warnings</span></div>`;
                 html += '</div></div>';
                 
-                // File issues
-                const filesWithIssues = result.files.filter(f => f.issues && f.issues.length > 0);
-                if (filesWithIssues.length > 0) {
-                    filesWithIssues.forEach(file => {
-                        file.issues.forEach(issue => {
-                            const sevColor = issue.severity === 'ERROR' ? '#f44336' : '#ff9800';
-                            html += `<div style="margin-bottom: 8px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
-                            html += `<span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> `;
-                            html += `<span style="color: #888;">${issue.path}:</span> `;
-                            html += `<span style="color: #ddd;">${issue.message}</span>`;
-                            if (issue.suggestion) {
-                                html += `<div style="color: #999; font-style: italic;">→ ${issue.suggestion}</div>`;
-                            }
-                            html += '</div>';
-                        });
+                // Per-file issues (group by device for the fabric-wide view)
+                const filesWithIssues = (result.files || []).filter(f => f.issues && f.issues.length > 0);
+                filesWithIssues.forEach(file => {
+                    if (all) {
+                        html += `<div style="margin: 12px 0 4px; color: #4fc3f7; font-weight: bold;">${file.device || file.file || ''}</div>`;
+                    }
+                    file.issues.forEach(issue => {
+                        const sevColor = issue.severity === 'ERROR' ? '#f44336' : '#ff9800';
+                        html += `<div style="margin-bottom: 8px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
+                        html += `<span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> `;
+                        html += `<span style="color: #888;">${issue.path}:</span> `;
+                        html += `<span style="color: #ddd;">${issue.message}</span>`;
+                        if (issue.suggestion) {
+                            html += `<div style="color: #999; font-style: italic;">→ ${issue.suggestion}</div>`;
+                        }
+                        html += '</div>';
                     });
-                }
+                });
                 
                 html += '</div>';
                 
