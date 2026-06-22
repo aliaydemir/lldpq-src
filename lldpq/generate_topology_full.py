@@ -68,14 +68,29 @@ def categorize_device(device_name, config):
     for rule in config.get("special_rules", []):
         try:
             if re.search(rule["pattern"], device_name, re.IGNORECASE):
+                if rule.get("type") == "stagger":
+                    # Single band; the brick/zigzag (even -> lower sub-row) is drawn
+                    # client-side by cyto-app.js using the staggerRow tag (see
+                    # stagger_row_for). Honor the rule's layer/icon here.
+                    default_layer = config.get("default", {}).get("layer", 9)
+                    return rule.get("layer", default_layer), rule.get("icon", "server")
                 if rule.get("type") == "even_odd_suffix":
                     try:
-                        device_number = int(device_name.split("-")[-1])
+                        number_regex = rule.get("number_regex")
+                        if number_regex:
+                            # Pull the even/odd number from a capture group anywhere in the
+                            # name (e.g. the rack field) — not just the trailing "-" segment.
+                            m = re.search(number_regex, device_name, re.IGNORECASE)
+                            if not m:
+                                break  # no match -> fall through to regular patterns
+                            device_number = int(m.group(1))
+                        else:
+                            device_number = int(device_name.split("-")[-1])
                         if device_number % 2 == 0:
                             return rule["even_layer"], rule["icon"]
                         else:
                             return rule["odd_layer"], rule["icon"]
-                    except (ValueError, IndexError):
+                    except (ValueError, IndexError, re.error):
                         # If parsing fails, continue to regular patterns
                         break
         except re.error:
@@ -96,6 +111,33 @@ def categorize_device(device_name, config):
     # Return default if no pattern matches
     default = config.get("default", {"layer": 9, "icon": "server"})
     return default["layer"], default["icon"]
+
+def stagger_row_for(device_name, config):
+    """Return the brick sub-row for a 'stagger' special rule:
+      0 -> odd number  (upper sub-row)
+      1 -> even number (lower sub-row)
+      None -> device is not part of any stagger rule.
+    The number comes from number_regex group 1 (e.g. the rack field); if absent,
+    falls back to the trailing "-" segment. Generic: works for any naming scheme.
+    """
+    for rule in config.get("special_rules", []):
+        if rule.get("type") != "stagger":
+            continue
+        try:
+            if not re.search(rule["pattern"], device_name, re.IGNORECASE):
+                continue
+            number_regex = rule.get("number_regex")
+            if number_regex:
+                m = re.search(number_regex, device_name, re.IGNORECASE)
+                if not m:
+                    continue
+                num = int(m.group(1))
+            else:
+                num = int(device_name.split("-")[-1])
+            return 1 if num % 2 == 0 else 0
+        except (ValueError, IndexError, re.error):
+            continue
+    return None
 
 def append_creation_time_to_html(html_file_path):
     timestamp = datetime.now().strftime("Created on %Y-%m-%d %H-%M")
@@ -351,6 +393,9 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
             "version": info.get("version", "N/A"),
             "dcimDeviceLink": f"/monitor-results/{device_name}.html"
         }
+        _srow = stagger_row_for(device_name, topology_config)
+        if _srow is not None:
+            device_node["staggerRow"] = _srow
         topology_data["nodes"].append(device_node)
         device_nodes[device_name] = device_id
         device_id += 1
@@ -382,7 +427,7 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
             layer_sort_preference, dev_icon = categorize_device(device_name_from_lldp, topology_config)
             dev_id_for_lldp_only = device_id
             device_nodes[device_name_from_lldp] = dev_id_for_lldp_only
-            topology_data["nodes"].append({
+            lldp_node = {
                 "icon": dev_icon,
                 "id": dev_id_for_lldp_only,
                 "layerSortPreference": layer_sort_preference,
@@ -392,7 +437,11 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
                 "serial_number": "N/A",
                 "version": "N/A",
                 "dcimDeviceLink": f"/monitor-results/{device_name_from_lldp}.html"
-            })
+            }
+            _srow = stagger_row_for(device_name_from_lldp, topology_config)
+            if _srow is not None:
+                lldp_node["staggerRow"] = _srow
+            topology_data["nodes"].append(lldp_node)
             device_id += 1
 
         try:
@@ -456,7 +505,7 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
                 layer_sort_preference, dev_icon = categorize_device(neighbor_device, topology_config)
                 neighbor_id = device_id
                 device_nodes[neighbor_device] = neighbor_id
-                topology_data["nodes"].append({
+                neighbor_node = {
                     "icon": dev_icon,
                     "id": neighbor_id,
                     "layerSortPreference": layer_sort_preference,
@@ -466,7 +515,11 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
                     "serial_number": "N/A",
                     "version": "N/A",
                     "dcimDeviceLink": f"/monitor-results/{neighbor_device}.html"
-                })
+                }
+                _srow = stagger_row_for(neighbor_device, topology_config)
+                if _srow is not None:
+                    neighbor_node["staggerRow"] = _srow
+                topology_data["nodes"].append(neighbor_node)
                 device_id += 1
 
             # Get port status for both source and target interfaces
@@ -636,7 +689,8 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
 
     topology_data["nodes"] = [node for node in topology_data["nodes"] if node["name"] in final_nodes_set]
 
-    topology_data["nodes"].sort(key=lambda x: x["name"])
+    # Natural sort so "...-1-2" comes before "...-1-10" (numeric-aware ordering)
+    topology_data["nodes"].sort(key=lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', x["name"])])
 
     id_map = {node["id"]: new_id for new_id, node in enumerate(topology_data["nodes"])}
 

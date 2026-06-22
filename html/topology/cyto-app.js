@@ -72,6 +72,7 @@ function convertToCytoscapeFormat(topologyData) {
                 id: 'n' + node.id,
                 label: node.name,
                 level: node.layerSortPreference || 5,
+                staggerRow: node.staggerRow,
                 icon: iconType,
                 iconChar: iconChar,
                 iconBgChar: bgChar,
@@ -114,8 +115,43 @@ function convertToCytoscapeFormat(topologyData) {
 }
 
 /**
- * Get layout options
+ * Re-position staggered endpoint groups as an interleaved brick/zigzag:
+ * global left-to-right order, with nodes tagged staggerRow=1 (even number) dropped
+ * to a lower sub-row so they sit between the staggerRow=0 (odd) blocks.
+ *
+ * Fully config-driven: nodes are tagged by the generator from a `type: stagger`
+ * rule in topology_config.yaml (no device names are hardcoded here). Members are
+ * grouped by level so multiple independent stagger groups stay separate.
+ * Runs after the normal level layout (TB) and only overrides tagged nodes.
  */
+function applyStagger(positions, padding, containerWidth) {
+    const groups = {};
+    cy.nodes().forEach(n => {
+        const sr = n.data('staggerRow');
+        if (sr === 0 || sr === 1) {
+            const lvl = n.data('level');
+            (groups[lvl] = groups[lvl] || []).push(n);
+        }
+    });
+    Object.keys(groups).forEach(lvl => {
+        const members = groups[lvl];
+        if (members.length < 2) return;
+        // Keep the familiar left-to-right order (natural by label).
+        members.sort((a, b) =>
+            a.data('label').localeCompare(b.data('label'), undefined, { numeric: true, sensitivity: 'base' }));
+        // All members share one level => one base Y; drop the even sub-row below it.
+        const baseY = (positions[members[0].id()] || {}).y != null ? positions[members[0].id()].y : padding;
+        const dropY = baseY + 90;
+        const dx = (containerWidth - padding * 2) / members.length * 1.3;
+        members.forEach((n, i) => {
+            positions[n.id()] = {
+                x: padding + dx * i + dx / 2,
+                y: n.data('staggerRow') === 1 ? dropY : baseY
+            };
+        });
+    });
+}
+
 /**
  * Calculate hierarchical positions based on level
  */
@@ -148,7 +184,7 @@ function calculateHierarchicalPositions(direction) {
             const nodeWidth = (containerWidth - padding * 2) / nodes.length * 1.3;
             
             // Sort nodes by name for consistent ordering
-            nodes.sort((a, b) => a.data('label').localeCompare(b.data('label')));
+            nodes.sort((a, b) => a.data('label').localeCompare(b.data('label'), undefined, { numeric: true, sensitivity: 'base' }));
             
             nodes.forEach((node, nodeIndex) => {
                 positions[node.id()] = {
@@ -157,6 +193,7 @@ function calculateHierarchicalPositions(direction) {
                 };
             });
         });
+        applyStagger(positions, padding, containerWidth);
     } else {
         // Left to Right - levels are columns
         // Increase level spacing for horizontal (1.8x)
@@ -168,7 +205,7 @@ function calculateHierarchicalPositions(direction) {
             const nodeHeight = (containerHeight - padding * 2) / nodes.length * 1.8;
             
             // Sort nodes by name for consistent ordering
-            nodes.sort((a, b) => a.data('label').localeCompare(b.data('label')));
+            nodes.sort((a, b) => a.data('label').localeCompare(b.data('label'), undefined, { numeric: true, sensitivity: 'base' }));
             
             nodes.forEach((node, nodeIndex) => {
                 positions[node.id()] = {
