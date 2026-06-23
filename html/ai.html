@@ -189,6 +189,10 @@
         <button class="btn btn-secondary btn-sm" onclick="exportChat()" title="Export chat as markdown">
             <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
         </button>
+        <button class="btn btn-secondary btn-sm" onclick="openMemory()" title="What the AI remembers about this site (teach it with: remember: ...)">
+            <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M13 3a9 9 0 00-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 117 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0013 21a9 9 0 000-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+            Memory
+        </button>
         <button class="btn btn-secondary btn-sm" onclick="clearChat()">Clear</button>
         <button class="btn-icon" onclick="toggleSettings()" title="Settings">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1115.6 12 3.6 3.6 0 0112 15.6z"/></svg>
@@ -230,7 +234,7 @@
     <div class="settings-body">
         <div class="settings-field">
             <label>Provider</label>
-            <select id="cfgProvider" onchange="onProviderChange()">
+            <select id="cfgProvider" onchange="onProviderChange(true)">
                 <option value="ollama">Local (Ollama)</option>
                 <option value="gemini">Google Gemini</option>
                 <option value="openai">OpenAI</option>
@@ -262,6 +266,10 @@
                 <label>Model</label>
                 <input type="text" id="cfgModelCloud" placeholder="gpt-4o / claude-sonnet-4-20250514">
             </div>
+            <div style="margin-top: 10px;">
+                <label>Search model (optional) — enables [SEARCH:] web research</label>
+                <input type="text" id="cfgSearchModel" placeholder="e.g. perplexity/sonar-pro (same endpoint)" autocomplete="off">
+            </div>
         </div>
         <div class="settings-field" style="margin-top:10px; padding-top:10px; border-top:1px solid #3c3c3c;">
             <label>HTTP Proxy</label>
@@ -275,6 +283,28 @@
     <div class="settings-footer">
         <button class="btn btn-secondary" onclick="toggleSettings()">Cancel</button>
         <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+    </div>
+</div>
+
+<!-- Memory modal (site facts the AI remembers) -->
+<div id="memoryModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:200; align-items:center; justify-content:center;">
+    <div style="background:#252526; border:1px solid #3c3c3c; border-radius:8px; width:600px; max-width:92vw; max-height:85vh; display:flex; flex-direction:column;">
+        <div style="display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #3c3c3c;">
+            <h3 style="color:#76b900; font-size:16px; margin:0;">AI Memory — site facts</h3>
+            <button class="btn-icon" onclick="closeMemory()"><svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg></button>
+        </div>
+        <div style="padding:12px 18px 4px; color:#888; font-size:13px;">
+            Facts the AI keeps across chats and injects into context. You can also teach it inline in chat: <code style="color:#76b900;">remember: spine MTU is 9216</code>.
+        </div>
+        <div id="memoryRows" style="overflow:auto; flex:1; padding:8px 18px;"></div>
+        <div style="padding:4px 18px 12px;">
+            <button class="btn btn-secondary btn-sm" onclick="addMemoryRow('')">+ Add fact</button>
+        </div>
+        <div class="settings-footer">
+            <span id="memoryStatus" style="color:#888; font-size:12px; align-self:center; margin-right:auto;"></span>
+            <button class="btn btn-secondary" onclick="closeMemory()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveMemory()">Save</button>
+        </div>
     </div>
 </div>
 
@@ -435,6 +465,7 @@ async function loadConfig() {
         document.getElementById('cfgApiUrl').value = data.api_url || 'https://api.openai.com/v1';
         document.getElementById('cfgModel').value = data.model || 'llama3.2';
         document.getElementById('cfgModelCloud').value = data.model || '';
+        document.getElementById('cfgSearchModel').value = data.search_model || '';
         document.getElementById('cfgProxyUrl').value = data.proxy_url || '';
         updateProviderBadge(data.provider, data.model);
         onProviderChange();
@@ -447,7 +478,9 @@ function updateProviderBadge(provider, model) {
     badge.textContent = `${short} on ${provider}`;
 }
 
-function onProviderChange() {
+// userInitiated=true when the operator changes the provider dropdown (so we apply
+// sensible defaults); false/undefined when called from loadConfig (keep saved values).
+function onProviderChange(userInitiated) {
     const provider = document.getElementById('cfgProvider').value;
     document.getElementById('cfgOllamaGroup').style.display = provider === 'ollama' ? '' : 'none';
     document.getElementById('cfgCloudGroup').style.display = provider !== 'ollama' ? '' : 'none';
@@ -472,7 +505,12 @@ function onProviderChange() {
         // NVIDIA Inference proxy (OpenAI-compatible / LiteLLM). URL is fixed; only the key is needed.
         document.getElementById('cfgApiUrl').value = 'https://inference-api.nvidia.com';
         document.getElementById('cfgApiUrl').disabled = true;
-        document.getElementById('cfgModelCloud').placeholder = 'e.g. bedrock-claude-opus-4-8 / openai/gpt-5.5';
+        document.getElementById('cfgModelCloud').placeholder = 'e.g. aws/anthropic/bedrock-claude-opus-4-8';
+        // Sensible Nvidia-inference defaults: fill on an explicit switch, or when empty.
+        const _m = document.getElementById('cfgModelCloud');
+        const _s = document.getElementById('cfgSearchModel');
+        if (userInitiated || !_m.value) _m.value = 'aws/anthropic/bedrock-claude-opus-4-8';
+        if (userInitiated || !_s.value) _s.value = 'perplexity/perplexity/sonar-pro';
     }
 }
 
@@ -488,6 +526,7 @@ async function saveSettings() {
         config.model = document.getElementById('cfgModelCloud').value.trim();
     }
     config.proxy_url = document.getElementById('cfgProxyUrl').value.trim();
+    config.search_model = document.getElementById('cfgSearchModel').value.trim();
     const data = await apiCall('save-config', config);
     if (data.success) {
         showToast('Settings saved', 'success');
@@ -539,6 +578,49 @@ async function fetchOllamaModels() {
 
 function toggleSettings() {
     document.getElementById('settingsPanel').classList.toggle('open');
+}
+
+// ===================== MEMORY (site facts) =====================
+async function openMemory() {
+    const data = await apiCall('get-learnings');
+    const box = document.getElementById('memoryRows');
+    box.innerHTML = '';
+    const items = (data && data.learnings) || [];
+    if (!items.length) addMemoryRow('');
+    else items.forEach(it => addMemoryRow((it && it.text) || ''));
+    document.getElementById('memoryStatus').textContent = '';
+    document.getElementById('memoryModal').style.display = 'flex';
+}
+function closeMemory() { document.getElementById('memoryModal').style.display = 'none'; }
+function addMemoryRow(text) {
+    const row = document.createElement('div');
+    row.className = 'memory-row';
+    row.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:8px;';
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.className = 'memory-text';
+    inp.value = text || ''; inp.placeholder = 'e.g. rack 1-2 hosts are named dgx-02';
+    inp.autocomplete = 'off';
+    inp.style.cssText = 'flex:1; padding:8px 10px; background:#1a1a1a; border:1px solid #555; border-radius:4px; color:#d4d4d4; font-size:13px; outline:none;';
+    const del = document.createElement('button');
+    del.className = 'btn btn-secondary btn-sm'; del.type = 'button'; del.textContent = '✕';
+    del.onclick = () => row.remove();
+    row.appendChild(inp); row.appendChild(del);
+    document.getElementById('memoryRows').appendChild(row);
+}
+async function saveMemory() {
+    const learnings = [];
+    document.querySelectorAll('#memoryRows .memory-text').forEach(i => {
+        const t = i.value.trim(); if (t) learnings.push({ text: t });
+    });
+    const status = document.getElementById('memoryStatus');
+    status.style.color = '#888'; status.textContent = 'Saving...';
+    const data = await apiCall('save-learnings', { learnings });
+    if (data && data.success) {
+        status.style.color = '#76b900'; status.textContent = 'Saved (' + data.count + ')';
+        setTimeout(closeMemory, 600);
+    } else {
+        status.style.color = '#f44336'; status.textContent = (data && data.error) || 'Save failed';
+    }
 }
 
 // ===================== CHAT =====================

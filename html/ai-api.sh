@@ -19,6 +19,11 @@ AI_API_KEY="${AI_API_KEY:-}"
 AI_API_URL="${AI_API_URL:-https://api.openai.com/v1}"
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 AI_PROXY_URL="${AI_PROXY_URL:-}"
+# Optional web-research model (OpenAI-compatible, e.g. a Perplexity/Sonar model on the
+# NVIDIA inference proxy). Empty = [SEARCH:] tool disabled. URL/key default to AI_API_*.
+AI_SEARCH_MODEL="${AI_SEARCH_MODEL:-}"
+AI_SEARCH_URL="${AI_SEARCH_URL:-}"
+AI_SEARCH_KEY="${AI_SEARCH_KEY:-}"
 
 # Parse query string
 ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
@@ -40,6 +45,7 @@ fi
 # Export for Python
 export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 export AI_PROVIDER AI_MODEL AI_API_KEY AI_API_URL OLLAMA_URL AI_PROXY_URL
+export AI_SEARCH_MODEL AI_SEARCH_URL AI_SEARCH_KEY
 export POST_DATA ACTION
 
 python3 << 'PYTHON_SCRIPT'
@@ -61,6 +67,11 @@ AI_API_KEY = os.environ.get('AI_API_KEY', '')
 AI_API_URL = os.environ.get('AI_API_URL', 'https://api.openai.com/v1')
 OLLAMA_URL = os.environ.get('OLLAMA_URL', 'http://localhost:11434')
 AI_PROXY_URL = os.environ.get('AI_PROXY_URL', '')
+# Web-research model (OpenAI-compatible). URL/key fall back to the main AI endpoint.
+AI_SEARCH_MODEL = os.environ.get('AI_SEARCH_MODEL', '')
+AI_SEARCH_URL = os.environ.get('AI_SEARCH_URL', '') or AI_API_URL
+AI_SEARCH_KEY = os.environ.get('AI_SEARCH_KEY', '') or AI_API_KEY
+SEARCH_ENABLED = bool(AI_SEARCH_MODEL)
 
 # Set HTTP proxy if configured (allows airgapped servers to reach cloud APIs via SSH tunnel)
 if AI_PROXY_URL:
@@ -436,6 +447,83 @@ def _save_json_web(path, data):
         subprocess.run(['sudo', '-n', 'chmod', '664', path], capture_output=True, timeout=5)
 
 
+# ======================== MEMORY (operator-taught learnings) ==================
+# Persistent site-specific facts the operator teaches ("remember: ..."). Injected
+# into the prompt context so the AI learns this fabric's quirks across sessions.
+LEARNINGS_FILE = os.path.join(WEB_ROOT, 'ai-learnings.json')
+
+def load_learnings():
+    try:
+        with open(LEARNINGS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+def save_learnings(items):
+    clean, seen = [], set()
+    for it in (items or [])[:500]:
+        t = (it.get('text') if isinstance(it, dict) else str(it)).strip()
+        if t and t.lower() not in seen and len(t) <= 400:
+            seen.add(t.lower())
+            ts = (it.get('ts') if isinstance(it, dict) else None) or int(time.time())
+            clean.append({'text': t, 'ts': ts})
+    _save_json_web(LEARNINGS_FILE, clean)
+    return clean
+
+def add_learning(text):
+    text = (text or '').strip()
+    if not text:
+        return False
+    items = load_learnings()
+    if any(it.get('text', '').lower() == text.lower() for it in items):
+        return True
+    items.append({'text': text[:400], 'ts': int(time.time())})
+    save_learnings(items)
+    return True
+
+def relevant_learnings(question, cap=30):
+    """All learnings if few; otherwise the ones sharing words with the question."""
+    items = load_learnings()
+    texts = [it.get('text', '') for it in items if it.get('text')]
+    if not texts:
+        return ''
+    if len(texts) > cap:
+        qwords = set(re.findall(r'[A-Za-z0-9_.-]{3,}', (question or '').lower()))
+        scored = [(len(qwords & set(re.findall(r'[A-Za-z0-9_.-]{3,}', t.lower()))), i, t)
+                  for i, t in enumerate(texts)]
+        scored.sort(key=lambda x: (-x[0], -x[1]))
+        texts = [t for _, _, t in scored[:cap]]
+    return '\n'.join('- ' + t for t in texts)
+
+
+# ======================== WEB RESEARCH ([SEARCH:]) ============================
+def run_search(query):
+    """Web research via a configured search-capable model (OpenAI-compatible)."""
+    query = (query or '').strip()
+    if not SEARCH_ENABLED:
+        return "Web search is not configured (set AI_SEARCH_MODEL)."
+    if not query:
+        return "Empty search query."
+    import urllib.request
+    url = f"{AI_SEARCH_URL}/chat/completions"
+    msgs = [
+        {"role": "system", "content": "You are a network research assistant. Answer concisely "
+         "using current web sources, focused on NVIDIA Cumulus Linux / networking known issues, "
+         "release notes, CVEs and advisories. Always include source URLs."},
+        {"role": "user", "content": query},
+    ]
+    payload = json.dumps({"model": AI_SEARCH_MODEL, "messages": msgs}).encode()
+    headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {AI_SEARCH_KEY}'}
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers)
+        resp = urllib.request.urlopen(req, timeout=70)
+        result = json.loads(resp.read().decode())
+        return (result.get('choices', [{}])[0].get('message', {}).get('content', '') or '(no result)')[:4000]
+    except Exception as e:
+        return f"Search error: {e}"
+
+
 def _health_snapshot(devices, device_health):
     """Per-device status map for run-to-run change detection (defensive about shapes)."""
     snap = {}
@@ -548,6 +636,11 @@ def build_context_for_question(question, devices, device_health):
     q_lower = question.lower()
     mentioned_any = False
     mentioned_hosts = []
+
+    # Operator-taught site facts (memory) — trust these as ground truth.
+    _lr = relevant_learnings(question)
+    if _lr:
+        extra_context.append("OPERATOR-TAUGHT FACTS (site-specific; trust these):\n" + _lr)
     
     # Detect specific device mentions
     for ip, dev in devices.items():
@@ -1455,6 +1548,13 @@ def run_promql_range(query, rng, step, cookie, max_series=30):
 
 # ======================== ACTIONS ========================
 
+SEARCH_INSTRUCTIONS = """
+[SEARCH: <query>]
+  - Look up CURRENT external info (known Cumulus/SONiC bugs, release notes, CVEs,
+    advisories, vendor docs) when the fabric data above is not enough to answer.
+  - Use sparingly (max 2 per question). Cite the source URLs returned.
+"""
+
 def action_chat():
     """Handle chat message — synchronous response (fcgiwrap doesn't support SSE streaming)."""
     try:
@@ -1467,6 +1567,15 @@ def action_chat():
     
     if not question:
         error_json("Empty message")
+
+    # Operator teaches a persistent fact: "remember: <fact>" (also hatırla:/unutma:).
+    _mem = re.match(r'^\s*(?:remember|remember that|hat[\u0131i]rla|unutma)\s*[:,]?\s+(.+)$',
+                    question, re.IGNORECASE | re.DOTALL)
+    if _mem:
+        fact = _mem.group(1).strip()
+        add_learning(fact)
+        result_json({"success": True, "response": "Got it — I'll remember that: " + fact,
+                     "tools_used": [], "fixes": [], "followups": [], "consoles": [], "learned": fact})
     
     # Build context
     fabric_summary, devices, device_health = build_fabric_summary()
@@ -1478,6 +1587,8 @@ def action_chat():
         device_list=device_list,
         extra_context=extra_context
     ) + "\n" + TOOL_INSTRUCTIONS
+    if SEARCH_ENABLED:
+        system_prompt += "\n" + SEARCH_INSTRUCTIONS
     
     # Build messages array
     messages = [{"role": "system", "content": system_prompt}]
@@ -1499,11 +1610,13 @@ def action_chat():
     MAX_DISPATCHES = 2            # [RUNALL: ...] parallel fan-outs per question
     DISPATCH_DEVICE_CAP = 120     # total devices across all dispatches
     MAX_PROMQL = 4                # [PROMQL: ...] live telemetry queries per question
+    MAX_SEARCH = 2                # [SEARCH: ...] web-research queries per question
     deadline = time.time() + 220  # keep whole request under nginx's 300s read timeout
     total_tools = 0
     dispatches_used = 0
     dispatch_dev_total = 0
     promql_used = 0
+    searches_used = 0
     response = ''
     tools_used = []
     
@@ -1514,7 +1627,8 @@ def action_chat():
         promqls = re.findall(r'\[PROMQL:\s*(.+)\]', response or '')  # greedy: PromQL may contain ] (e.g. [5m])
         promranges = re.findall(r'\[PROMQLRANGE:\s*(.+)\]', response or '')
         paths = re.findall(r'\[PATH:\s*(\S+)\s+(\S+)\]', response or '')
-        if (not runs and not runalls and not promqls and not promranges and not paths) or time.time() > deadline:
+        searches = re.findall(r'\[SEARCH:\s*(.+?)\]', response or '') if SEARCH_ENABLED else []
+        if (not runs and not runalls and not promqls and not promranges and not paths and not searches) or time.time() > deadline:
             break
         results = []
         # Single-device read-only tools
@@ -1576,13 +1690,22 @@ def action_chat():
             total_tools += 1
             tools_used.append({'path': f'{src} -> {dst}', 'ok': ok})
             results.append(f"[PATH {src} -> {dst}]\n{out}")
+        # Web research (known bugs / release notes / advisories)
+        for q in searches[:1]:
+            if searches_used >= MAX_SEARCH or time.time() > deadline:
+                break
+            q = q.strip()
+            out = run_search(q)
+            searches_used += 1
+            tools_used.append({'search': q})
+            results.append(f"[SEARCH: {q}]\n{out}")
         messages.append({"role": "assistant", "content": response})
         messages.append({"role": "user", "content":
             "TOOL RESULTS:\n" + maybe_redact("\n\n".join(results)) +
             "\n\nContinue. Request more data only if needed; otherwise give the final answer with no [RUN: ...] / [RUNALL: ...] / [PROMQL: ...] / [PROMQLRANGE: ...] / [PATH: ...] lines."})
     
     # If still requesting tools (hit the round cap), force one final answer.
-    if re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH):', response or '') and time.time() < deadline:
+    if re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|SEARCH):', response or '') and time.time() < deadline:
         messages.append({"role": "assistant", "content": response})
         messages.append({"role": "user", "content":
             "Stop using tools. Give your final answer now from the results above; do not emit any data-tool lines ([RUN:]/[RUNALL:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]). You MAY include [FIX: ...], [NEXT: ...] and [CONSOLE: ...] suggestions."})
@@ -1605,7 +1728,7 @@ def action_chat():
     # robust even when a PromQL expression contains ']' like a [5m] range selector).
     final = '\n'.join(
         ln for ln in (response or '').splitlines()
-        if not re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|FIX|NEXT|CONSOLE):', ln)
+        if not re.search(r'\[(?:RUN(?:ALL)?|PROMQLRANGE|PROMQL|PATH|SEARCH|FIX|NEXT|CONSOLE):', ln)
     ).strip()
     
     result_json({"success": True, "response": final, "tools_used": tools_used,
@@ -1641,6 +1764,8 @@ def action_get_config():
         "ollama_url": OLLAMA_URL,
         "has_key": bool(AI_API_KEY),
         "proxy_url": AI_PROXY_URL,
+        "search_model": AI_SEARCH_MODEL,
+        "search_enabled": SEARCH_ENABLED,
     })
 
 
@@ -1668,6 +1793,8 @@ def action_save_config():
         updates['OLLAMA_URL'] = data['ollama_url']
     if 'proxy_url' in data:
         updates['AI_PROXY_URL'] = data['proxy_url']
+    if 'search_model' in data:
+        updates['AI_SEARCH_MODEL'] = data['search_model']
     
     try:
         lock_fd = open(conf + '.lock', 'w')
@@ -1903,6 +2030,15 @@ elif ACTION == 'get-log-messages':
             result_json({"success": True, "messages": {}, "totals": {}})
     except Exception as e:
         error_json(str(e))
+elif ACTION == 'get-learnings':
+    result_json({"success": True, "learnings": load_learnings(), "search_enabled": SEARCH_ENABLED})
+elif ACTION == 'save-learnings':
+    try:
+        _d = json.loads(POST_DATA)
+    except Exception:
+        error_json("Invalid JSON")
+    _items = save_learnings(_d.get('learnings', []))
+    result_json({"success": True, "count": len(_items)})
 else:
     error_json(f"Unknown action: {ACTION}")
 
