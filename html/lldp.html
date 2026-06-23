@@ -583,6 +583,14 @@
             updateP2pToggleUI();
             filterTable(); // re-render current view with new labels
         }
+        // Live sync if the P2P toggle is flipped on another page/tab (shared localStorage key).
+        window.addEventListener('storage', function(e){
+            if (e.key === 'lldpq_port_alias_on') {
+                p2pNamesOn = (e.newValue !== 'false');
+                updateP2pToggleUI();
+                filterTable();
+            }
+        });
 
         // ----- Display alias editor modal (admin) — devices + ports -----
         function openPortAliasModal() {

@@ -1750,6 +1750,7 @@ class BGPAnalyzer:
         }
 
     </script>
+    <script src="/p2p-alias.js"></script>
 </body>
 </html>
 """

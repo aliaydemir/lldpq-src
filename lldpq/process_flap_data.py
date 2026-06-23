@@ -30,6 +30,9 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     for filename in os.listdir(data_dir):
         if filename.endswith("_carrier_transitions.txt"):
             hostname = filename.replace("_carrier_transitions.txt", "")
+            # Skip stale artifacts from report pages (e.g. optical-analysis) — not devices.
+            if hostname.endswith("-analysis"):
+                continue
             filepath = os.path.join(data_dir, filename)
             
             try:
@@ -126,7 +129,10 @@ def extract_carrier_transitions_from_monitor_results(data_dir="monitor-results")
     print("Extracting carrier transitions from monitor HTML files...")
     
     for filename in os.listdir(data_dir):
-        if filename.endswith(".html") and not filename.startswith(("bgp-analysis", "link-flap-analysis")):
+        # Only per-device monitor HTML — skip the generated report pages
+        # (bgp-analysis.html, optical-analysis.html, ber-analysis.html, ...), which all
+        # end in "-analysis.html" and are NOT devices.
+        if filename.endswith(".html") and not filename.endswith("-analysis.html"):
             hostname = filename.replace(".html", "")
             filepath = os.path.join(data_dir, filename)
             

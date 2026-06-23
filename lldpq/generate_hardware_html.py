@@ -1421,6 +1421,7 @@ def generate_hardware_html():
             }
         }
     </script>
+    <script src="/p2p-alias.js"></script>
 </body>
 </html>"""
     
