@@ -1255,6 +1255,24 @@ WantedBy=multi-user.target
 UNIT
 sudo mkdir -p /var/log/lldpq 2>/dev/null || true
 sudo chown www-data:www-data /var/log/lldpq 2>/dev/null || true
+
+# Route ISC DHCP server logs to a dedicated file so the Provision "DHCP Logs" panel can
+# read them without journal access. (In Docker, dhcpd -d writes this file directly; on a
+# systemd/rsyslog host, dhcpd logs via syslog and rsyslog forwards them here.)
+if [ -d /etc/rsyslog.d ]; then
+    sudo touch /var/log/lldpq/dhcpd.log 2>/dev/null || true
+    sudo chown syslog:www-data /var/log/lldpq/dhcpd.log 2>/dev/null || sudo chown root:www-data /var/log/lldpq/dhcpd.log 2>/dev/null || true
+    sudo chmod 640 /var/log/lldpq/dhcpd.log 2>/dev/null || true
+    sudo tee /etc/rsyslog.d/10-lldpq-dhcp.conf > /dev/null <<'RSYSLOG_DHCP'
+# LLDPq: send ISC dhcpd messages to a file the web UI (www-data) can tail.
+if $programname == 'dhcpd' then {
+    action(type="omfile" file="/var/log/lldpq/dhcpd.log" fileGroup="www-data" fileCreateMode="0640")
+}
+RSYSLOG_DHCP
+    sudo systemctl restart rsyslog 2>/dev/null || sudo service rsyslog restart 2>/dev/null || true
+    echo "  DHCP logs → /var/log/lldpq/dhcpd.log (rsyslog)"
+fi
+
 sudo systemctl daemon-reload
 sudo systemctl enable lldpq-console.service >/dev/null 2>&1 || true
 sudo systemctl restart lldpq-console.service 2>/dev/null || true

@@ -20,6 +20,7 @@ WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 DHCP_HOSTS_FILE="${DHCP_HOSTS_FILE:-/etc/dhcp/dhcpd.hosts}"
 DHCP_CONF_FILE="${DHCP_CONF_FILE:-/etc/dhcp/dhcpd.conf}"
 DHCP_LEASES_FILE="${DHCP_LEASES_FILE:-/var/lib/dhcp/dhcpd.leases}"
+DHCP_LOG_FILE="${DHCP_LOG_FILE:-/var/log/lldpq/dhcpd.log}"
 ZTP_SCRIPT_FILE="${ZTP_SCRIPT_FILE:-${WEB_ROOT}/cumulus-ztp.sh}"
 BASE_CONFIG_DIR="${BASE_CONFIG_DIR:-${LLDPQ_DIR}/sw-base}"
 
@@ -29,6 +30,7 @@ echo ""
 
 # Parse query string
 ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
+LINES_PARAM=$(echo "$QUERY_STRING" | grep -oP '(^|&)lines=\K[0-9]+' | head -1)
 
 # Read POST data if present (skip for file uploads — Python reads stdin directly)
 POST_DATA=""
@@ -48,9 +50,9 @@ AUTO_SET_HOSTNAME="${AUTO_SET_HOSTNAME:-true}"
 
 # Export for Python
 export LLDPQ_DIR LLDPQ_USER WEB_ROOT
-export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
+export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE DHCP_LOG_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
-export POST_DATA ACTION
+export POST_DATA ACTION LINES_PARAM
 
 python3 << 'PYTHON_SCRIPT'
 import json
@@ -70,6 +72,7 @@ LLDPQ_USER = os.environ.get('LLDPQ_USER', 'lldpq')
 WEB_ROOT = os.environ.get('WEB_ROOT', '/var/www/html')
 DHCP_HOSTS_FILE = os.environ.get('DHCP_HOSTS_FILE', '/etc/dhcp/dhcpd.hosts')
 DHCP_LEASES_FILE = os.environ.get('DHCP_LEASES_FILE', '/var/lib/dhcp/dhcpd.leases')
+DHCP_LOG_FILE = os.environ.get('DHCP_LOG_FILE', '/var/log/lldpq/dhcpd.log')
 ZTP_SCRIPT_FILE = os.environ.get('ZTP_SCRIPT_FILE', f'{WEB_ROOT}/cumulus-ztp.sh')
 BASE_CONFIG_DIR = os.environ.get('BASE_CONFIG_DIR', f'{LLDPQ_DIR}/sw-base')
 DISCOVERY_RANGE = os.environ.get('DISCOVERY_RANGE', '')
@@ -687,7 +690,8 @@ def restart_dhcp():
         except Exception:
             continue
     
-    # Try direct dhcpd restart (Docker)
+    # Try direct dhcpd restart (Docker). Use -d so dhcpd logs to stderr, redirected to
+    # DHCP_LOG_FILE (no syslog/journald in the container); detach so it survives the CGI.
     try:
         # Kill existing
         subprocess.run(['sudo', 'pkill', '-x', 'dhcpd'], capture_output=True, timeout=5)
@@ -699,14 +703,25 @@ def restart_dhcp():
                 m = re.search(r'INTERFACES="(\S+)"', f.read())
                 if m:
                     iface = m.group(1)
-        # Start
-        result = subprocess.run(
-            ['sudo', 'dhcpd', '-cf', os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf'), iface],
-            capture_output=True, text=True, timeout=10
+        logpath = os.environ.get('DHCP_LOG_FILE', '/var/log/lldpq/dhcpd.log')
+        try:
+            os.makedirs(os.path.dirname(logpath), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            logf = open(logpath, 'a')
+        except Exception:
+            logf = subprocess.DEVNULL
+        conf = os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf')
+        # Start detached, foreground (-d) so its packet log goes to the file.
+        proc = subprocess.Popen(
+            ['sudo', 'dhcpd', '-d', '-cf', conf, iface],
+            stdout=logf, stderr=logf, start_new_session=True
         )
-        if result.returncode == 0:
-            return True, "dhcpd restarted"
-        return False, result.stderr.strip()[:200]
+        time.sleep(0.8)
+        if proc.poll() is not None and proc.returncode not in (0, None):
+            return False, "dhcpd failed to start (see DHCP log)"
+        return True, "dhcpd restarted (logging to %s)" % logpath
     except Exception as e:
         return False, str(e)
 
@@ -1730,6 +1745,46 @@ def action_dhcp_leases():
         "leases": leases,
         "reserved_count": len(bindings)
     })
+
+
+def action_dhcp_log():
+    """Return the tail of the DHCP server log.
+    Docker logs to DHCP_LOG_FILE (dhcpd -d). On systemd hosts we fall back to journalctl."""
+    try:
+        n = int(os.environ.get('LINES_PARAM') or 300)
+    except Exception:
+        n = 300
+    n = max(20, min(n, 2000))
+    text, source = '', ''
+    # 1) Docker: tail the log file (read only the last chunk, efficient on big logs)
+    if os.path.exists(DHCP_LOG_FILE):
+        try:
+            with open(DHCP_LOG_FILE, 'rb') as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 262144))
+                chunk = f.read().decode('utf-8', 'replace')
+            lines = chunk.splitlines()
+            if lines:
+                text = '\n'.join(lines[-n:])
+                source = DHCP_LOG_FILE
+        except Exception as e:
+            text, source = 'Error reading %s: %s' % (DHCP_LOG_FILE, e), DHCP_LOG_FILE
+    # 2) systemd host fallback: journalctl
+    if not text:
+        import shutil
+        if shutil.which('journalctl'):
+            for unit in ('isc-dhcp-server', 'dhcpd'):
+                try:
+                    r = subprocess.run(['sudo', 'journalctl', '-u', unit, '-n', str(n), '--no-pager'],
+                                       capture_output=True, text=True, timeout=10)
+                    if r.returncode == 0 and r.stdout.strip():
+                        text, source = r.stdout, 'journalctl -u %s' % unit
+                        break
+                except Exception:
+                    continue
+    result_json({"success": True, "log": text, "source": source or DHCP_LOG_FILE,
+                 "exists": bool(text)})
 
 # ======================== LIST DEVICES ========================
 
@@ -3254,6 +3309,8 @@ elif ACTION == 'save-dhcp-config':
     action_save_dhcp_config()
 elif ACTION == 'dhcp-leases':
     action_dhcp_leases()
+elif ACTION == 'dhcp-log':
+    action_dhcp_log()
 elif ACTION == 'list-devices':
     action_list_devices()
 elif ACTION == 'deploy-base-config':

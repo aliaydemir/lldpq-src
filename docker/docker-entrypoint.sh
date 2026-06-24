@@ -296,7 +296,16 @@ if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
     if [ -f /etc/default/isc-dhcp-server ]; then
         DHCP_IFACE=$(grep '^INTERFACES=' /etc/default/isc-dhcp-server 2>/dev/null | sed 's/INTERFACES="//;s/"//' || echo "eth0")
     fi
-    dhcpd -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE" 2>/dev/null && echo "✓ DHCP server started (interface: $DHCP_IFACE)" || echo "  DHCP: not started (interface issue)"
+    mkdir -p /var/log/lldpq 2>/dev/null
+    # -d keeps dhcpd in the foreground logging to stderr; redirect to a file so the logs
+    # survive (no syslog/journald in the container) and the Provision UI can tail them.
+    dhcpd -d -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE" >> /var/log/lldpq/dhcpd.log 2>&1 &
+    sleep 1
+    if pgrep -x dhcpd >/dev/null 2>&1; then
+        echo "✓ DHCP server started (interface: $DHCP_IFACE, log: /var/log/lldpq/dhcpd.log)"
+    else
+        echo "  DHCP: not started (see /var/log/lldpq/dhcpd.log)"
+    fi
 else
     echo "  DHCP: not started (start from Provision page or set DHCP_AUTOSTART=true)"
 fi

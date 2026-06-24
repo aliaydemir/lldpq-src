@@ -953,6 +953,29 @@
             </tbody>
         </table>
     </div>
+
+    <div class="section-title" style="margin-top: 20px;">DHCP Logs
+        <span style="font-size: 12px; color: #666; font-weight: normal; margin-left: 10px;" id="dhcp-log-source"></span>
+        <span style="float: right; display: inline-flex; gap: 10px; align-items: center;">
+            <label style="font-size:12px; color:#aaa; display:inline-flex; align-items:center; gap:4px;">Lines
+                <select id="dhcpLogLines" class="form-input" style="width:80px; height:28px; padding:2px 6px;" onchange="loadDhcpLog()">
+                    <option>100</option><option selected>300</option><option>1000</option>
+                </select>
+            </label>
+            <label style="font-size:12px; color:#aaa; display:inline-flex; align-items:center; gap:4px;">Every
+                <select id="dhcpLogInterval" class="form-input" style="width:80px; height:28px; padding:2px 6px;" onchange="restartDhcpLogTimer()">
+                    <option value="0">Off</option>
+                    <option value="5" selected>5s</option>
+                    <option value="15">15s</option>
+                    <option value="60">60s</option>
+                </select>
+            </label>
+            <button id="dhcpLogLive" class="btn btn-secondary btn-sm" onclick="toggleDhcpLive()" title="Live follow (tail -f) — refreshes ~2s and follows the tail">● Live -f</button>
+            <button class="btn btn-secondary btn-sm" onclick="loadDhcpLog()">Refresh</button>
+        </span>
+    </div>
+    <div class="section-desc">Live DHCP server log (DISCOVER / OFFER / REQUEST / ACK), persisted inside the container.</div>
+    <pre id="dhcp-log-output" style="background:#0d0d0d; color:#cfe9a0; border:1px solid #3c3c3c; border-radius:6px; padding:12px; height:320px; overflow:auto; margin:0; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; line-height:1.45; white-space:pre-wrap; word-break:break-word;">Open this tab to load the DHCP log…</pre>
 </div>
 
 <!-- ==================== TAB 1: INVENTORY (was Bindings) ==================== -->
@@ -1437,11 +1460,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function onTabSwitch(tab) {
+    if (tab !== 'dhcpd') stopDhcpLog();   // stop log polling when leaving the DHCP tab
     if (tab === 'discover') {
         loadDiscoveryCache();
         if (generatedConfigs.length === 0) apiCall('list-generated-configs').then(d => { if (d.success) generatedConfigs = d.configs || []; });
     }
-    if (tab === 'dhcpd') { loadDHCPConfig(); loadDHCPHosts(); }
+    if (tab === 'dhcpd') { loadDHCPConfig(); loadDHCPHosts(); updateDhcpLiveBtn(); restartDhcpLogTimer(); }
     if (tab === 'bindings') {
         if (allBindings.length === 0) loadBindings();
         // Ensure discovery data is loaded for serial picker
@@ -1474,6 +1498,58 @@ async function apiCall(action, data = null) {
     } catch (e) {
         return { success: false, error: e.message };
     }
+}
+
+// ===================== DHCP LOG VIEWER =====================
+let dhcpLogTimer = null;
+let dhcpLogLive = true;   // -f follow mode (on by default)
+async function loadDhcpLog() {
+    const out = document.getElementById('dhcp-log-output');
+    if (!out) return;
+    const linesEl = document.getElementById('dhcpLogLines');
+    const n = (linesEl && linesEl.value) || 300;
+    const data = await apiCall('dhcp-log&lines=' + n);
+    if (!data || !data.success) {
+        out.textContent = 'Error: ' + ((data && data.error) || 'failed to load DHCP log');
+        return;
+    }
+    const txt = data.log || '(no DHCP log yet — start the DHCP server or wait for a lease request)';
+    const src = document.getElementById('dhcp-log-source');
+    if (src) src.textContent = data.source ? ('source: ' + data.source) : '';
+    if (txt === out.textContent) return;   // unchanged → don't disturb the user's scroll
+    const atBottom = out.scrollTop + out.clientHeight >= out.scrollHeight - 30;
+    const prevTop = out.scrollTop;
+    out.textContent = txt;
+    out.scrollTop = atBottom ? out.scrollHeight : prevTop;   // follow tail (-f), else keep position
+}
+function stopDhcpLog() {
+    if (dhcpLogTimer) { clearInterval(dhcpLogTimer); dhcpLogTimer = null; }
+}
+function restartDhcpLogTimer() {
+    stopDhcpLog();
+    loadDhcpLog();
+    let sec = 0;
+    if (dhcpLogLive) {
+        sec = 2;   // -f: tight follow
+    } else {
+        const el = document.getElementById('dhcpLogInterval');
+        sec = el ? (parseInt(el.value, 10) || 0) : 0;
+    }
+    if (sec > 0) dhcpLogTimer = setInterval(loadDhcpLog, sec * 1000);
+}
+function updateDhcpLiveBtn() {
+    const b = document.getElementById('dhcpLogLive');
+    if (!b) return;
+    b.textContent = dhcpLogLive ? '● Live -f' : '▶ Live -f';
+    b.style.color = dhcpLogLive ? '#76b900' : '';
+    b.style.borderColor = dhcpLogLive ? '#76b900' : '';
+    const el = document.getElementById('dhcpLogInterval');
+    if (el) el.disabled = dhcpLogLive;   // interval ignored while live follow is on
+}
+function toggleDhcpLive() {
+    dhcpLogLive = !dhcpLogLive;
+    updateDhcpLiveBtn();
+    restartDhcpLogTimer();
 }
 
 // ===================== TOAST =====================
