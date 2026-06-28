@@ -16,6 +16,12 @@ import os
 import re
 from datetime import datetime
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 def parse_assets_file(assets_file_path="assets.ini"):
     """Parse assets.ini file to get device model information"""
     device_info = {}
@@ -917,7 +923,7 @@ def generate_hardware_html():
         
         html_content += f"""
                 <tr data-status="{health_grade.lower()}">
-                    <td>{device_name}</td>
+                    <td>{canonical(device_name)}</td>
                     <td><span class="{health_badge_class}">{health_grade.upper()}</span></td>
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
                     <td>{asic_temp_str}{asic_cell_suffix}</td>

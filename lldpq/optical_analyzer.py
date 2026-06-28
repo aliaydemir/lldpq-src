@@ -15,6 +15,12 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 class OpticalHealth(Enum):
     EXCELLENT = "excellent"
     GOOD = "good"
@@ -630,7 +636,7 @@ class OpticalAnalyzer:
 
             html_content += f"""
                 <tr data-health="{port['health']}">
-                    <td>{device_name}</td>
+                    <td>{canonical(device_name)}</td>
                     <td>{interface_name}</td>
                     <td><span class="{badge_class}">{port['health'].upper()}</span></td>
                     <td>{rx_power}</td>

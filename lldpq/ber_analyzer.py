@@ -15,6 +15,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from enum import Enum
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 class BERGrade(Enum):
     """BER quality grades"""
     EXCELLENT = "excellent"
@@ -788,7 +794,7 @@ class BERAnalyzer:
             
             html_content += f"""
                 <tr data-status="{status.lower()}">
-                    <td>{device}</td>
+                    <td>{canonical(device)}</td>
                     <td>{interface}</td>
                     <td><span class="{badge_class}">{status}</span></td>
                     <td>{ber_display}</td>

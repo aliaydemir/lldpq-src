@@ -548,18 +548,30 @@
         //   interfaces: enP22p3s0f0np0 -> M1   (port columns)
         //   devices:    tan-spine-01   -> SPINE-01 (device columns)
         // The toggle swaps the displayed names; underlying data/validation is untouched.
-        let portAliasMap = {};
+        let portAliasMap = {};      // original keys (admin modal display/edit)
         let deviceAliasMap = {};
+        let portAliasLc = {};       // lower(realName) -> alias (case-insensitive lookup)
+        let deviceAliasLc = {};
         let p2pNamesOn = localStorage.getItem('lldpq_port_alias_on') !== 'false'; // default ON
 
-        function aliasedLabel(v, map) {
-            if (p2pNamesOn && v && map[v]) return map[v];
-            return v;
+        // Build case-INSENSITIVE lookup maps. This decouples aliasing from the
+        // server-side canonical casing (device_names.py rewrites device cells to the
+        // topology.dot spelling): an alias matches whether the cell shows MEL01-... or
+        // mel01-... The original maps are kept intact for the admin modal.
+        function rebuildAliasLc() {
+            portAliasLc = {}; deviceAliasLc = {};
+            Object.keys(portAliasMap).forEach(k => { if (k) portAliasLc[k.toLowerCase()] = portAliasMap[k]; });
+            Object.keys(deviceAliasMap).forEach(k => { if (k) deviceAliasLc[k.toLowerCase()] = deviceAliasMap[k]; });
         }
-        function setAliasedCell(cell, raw, map) {
+        function aliasedLabel(v, mapLc) {
+            const a = (v && mapLc) ? mapLc[String(v).toLowerCase()] : undefined;
+            return (p2pNamesOn && a) ? a : v;
+        }
+        function setAliasedCell(cell, raw, mapLc) {
             const v = (raw === undefined || raw === null || raw === '') ? 'N/A' : raw;
-            cell.textContent = aliasedLabel(v, map);
-            if (p2pNamesOn && map[v]) cell.title = v; else cell.removeAttribute('title');
+            cell.textContent = aliasedLabel(v, mapLc);
+            const a = mapLc ? mapLc[String(v).toLowerCase()] : undefined;
+            if (p2pNamesOn && a) cell.title = v; else cell.removeAttribute('title');
         }
         function loadDisplayAliases() {
             return fetch('display-aliases.json', { cache: 'no-store' })
@@ -568,8 +580,9 @@
                     d = (d && typeof d === 'object') ? d : {};
                     portAliasMap = (d.interfaces && typeof d.interfaces === 'object') ? d.interfaces : {};
                     deviceAliasMap = (d.devices && typeof d.devices === 'object') ? d.devices : {};
+                    rebuildAliasLc();
                 })
-                .catch(() => { portAliasMap = {}; deviceAliasMap = {}; });
+                .catch(() => { portAliasMap = {}; deviceAliasMap = {}; rebuildAliasLc(); });
         }
         function updateP2pToggleUI() {
             const t = document.getElementById('p2p-toggle-text');
@@ -664,6 +677,7 @@
                 if (d.success) {
                     portAliasMap = interfaces;
                     deviceAliasMap = devices;
+                    rebuildAliasLc();
                     status.style.color = '#76b900';
                     status.textContent = 'Saved';
                     updateP2pToggleUI();
@@ -918,8 +932,8 @@
                 const row = tbody.insertRow();
                 row.className = status.healthClass;
                 
-                setAliasedCell(row.insertCell(0), connection.localDevice, deviceAliasMap);
-                setAliasedCell(row.insertCell(1), connection.localPort, portAliasMap);
+                setAliasedCell(row.insertCell(0), connection.localDevice, deviceAliasLc);
+                setAliasedCell(row.insertCell(1), connection.localPort, portAliasLc);
                 
                 // Port Status cell with badge
                 const portStatusCell = row.insertCell(2);
@@ -932,10 +946,10 @@
                 }
                 portStatusCell.innerHTML = `<span class="${portBadgeClass}">${portStatus}</span>`;
                 
-                setAliasedCell(row.insertCell(3), connection.expectedDevice, deviceAliasMap);
-                setAliasedCell(row.insertCell(4), connection.expectedPort, portAliasMap);
-                setAliasedCell(row.insertCell(5), connection.actualDevice, deviceAliasMap);
-                setAliasedCell(row.insertCell(6), connection.actualPort, portAliasMap);
+                setAliasedCell(row.insertCell(3), connection.expectedDevice, deviceAliasLc);
+                setAliasedCell(row.insertCell(4), connection.expectedPort, portAliasLc);
+                setAliasedCell(row.insertCell(5), connection.actualDevice, deviceAliasLc);
+                setAliasedCell(row.insertCell(6), connection.actualPort, portAliasLc);
                 
                 // Status cell with badge
                 const statusCell = row.insertCell(7);

@@ -13,6 +13,12 @@ import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 class LogAnalyzer:
     def __init__(self, data_dir="monitor-results"):
         self.data_dir = data_dir
@@ -501,7 +507,7 @@ class LogAnalyzer:
             
             html_content += f"""
                     <tr>
-                        <td>{device_name}</td>
+                        <td>{canonical(device_name)}</td>
                         <td>
                             <span class="severity-count critical {'zero' if counts['critical'] == 0 else ''}" 
                                   data-device="{device_name}" data-severity="critical"

@@ -17,6 +17,12 @@ from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 class BGPState(Enum):
     """BGP neighbor states"""
     ESTABLISHED = "established"
@@ -1079,7 +1085,7 @@ class BGPAnalyzer:
             
             html_content += f"""
         <tr data-health="{health_val}" data-state="{state_val}">
-            <td>{hostname}</td>
+            <td>{canonical(hostname)}</td>
             <td>{neighbor.neighbor_name}</td>
             <td>{neighbor.interface or 'N/A'}</td>
             <td><span class="{state_badge_class}">{state_val.upper()}</span></td>

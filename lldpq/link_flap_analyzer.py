@@ -17,6 +17,12 @@ from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass, asdict
 
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 class FlapStatus(Enum):
     """flap status"""
     OK = "ok"
@@ -541,7 +547,7 @@ class LinkFlapAnalyzer:
                 
             table_rows.append(f"""
         <tr data-status="{status_val}">
-            <td>{port['device']}</td>
+            <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
             <td><span class="{badge_class}">{status_val.upper()}</span></td>
             <td>{counters['flap_30_sec']}</td>

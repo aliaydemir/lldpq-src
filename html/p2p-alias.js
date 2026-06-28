@@ -22,7 +22,7 @@
     'use strict';
     var KEY = 'lldpq_port_alias_on';
     var on = localStorage.getItem(KEY) !== 'false'; // default ON
-    var amap = {};                                   // realName -> alias (devices + interfaces)
+    var amap = {};                                   // lower(realName) -> alias (devices + interfaces)
     var loaded = false;
     var observer = null;
     var pending = false;
@@ -33,10 +33,14 @@
             .then(function (d) {
                 d = (d && typeof d === 'object') ? d : {};
                 var m = {};
+                // Key by lower(realName) so matching is case-INSENSITIVE. This fully
+                // decouples the alias from the server-side canonical casing
+                // (device_names.py rewrites device cells to the topology.dot spelling):
+                // the alias matches whether the cell shows MEL01-... or mel01-...
                 ['interfaces', 'devices'].forEach(function (sec) {
                     var o = d[sec];
                     if (o && typeof o === 'object') {
-                        Object.keys(o).forEach(function (k) { if (k && o[k]) m[k] = o[k]; });
+                        Object.keys(o).forEach(function (k) { if (k && o[k]) m[String(k).toLowerCase()] = o[k]; });
                     }
                 });
                 amap = m; loaded = true; if (done) done();
@@ -68,9 +72,10 @@
             if (on) {
                 if (el.hasAttribute('data-p2p-orig')) continue; // already aliased
                 var t = (el.textContent || '').trim();
-                if (t && amap[t]) {
+                var alias = t ? amap[t.toLowerCase()] : '';     // case-insensitive lookup
+                if (alias) {
                     el.setAttribute('data-p2p-orig', el.textContent);
-                    el.textContent = amap[t];
+                    el.textContent = alias;
                     el.title = t;
                 }
             } else if (el.hasAttribute('data-p2p-orig')) {
