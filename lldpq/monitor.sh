@@ -363,6 +363,7 @@ EOF
         free -h 2>/dev/null || echo "No memory info"
         echo "CPU_INFO:"
         cat /proc/loadavg 2>/dev/null || echo "No CPU info"
+        echo "CPU_CORES: $(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)"
         echo "===HARDWARE_DATA_END==="
         
         # =====================================================================

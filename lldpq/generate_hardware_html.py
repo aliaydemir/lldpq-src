@@ -400,10 +400,41 @@ def parse_resources_from_hardware_file(device_name):
         if cpu_line:
             results['cpu_load'] = float(cpu_line.group(2))
 
+        # CPU core count, so the load average can be normalized per core. Older
+        # collected data (before CPU_CORES existed) simply leaves this unset.
+        cores_line = re.search(r'^CPU_CORES:\s*(\d+)', content, re.MULTILINE)
+        if cores_line:
+            cores = int(cores_line.group(1))
+            if cores > 0:
+                results['cpu_cores'] = cores
+
         # Uptime no longer used in table; keep parser but do not require
     except Exception as e:
         print(f"Warning: Could not parse resources for {device_name}: {e}")
     return results
+
+def grade_load_per_core(cpu_load, cpu_cores):
+    """Grade the CPU load average normalized by core count.
+
+    Load average is a per-core measure, so an absolute threshold falsely flags
+    healthy multi-core switches (e.g. load 3.3 on an 8-core CPU is ~0.4/core).
+    When the core count is unknown (data collected before CPU_CORES existed),
+    fall back to 4 cores — a conservative minimum for a switch CPU — so we do
+    not regress to the old absolute behavior.
+    """
+    if not isinstance(cpu_load, (int, float)):
+        return None
+    cores = cpu_cores if isinstance(cpu_cores, int) and cpu_cores > 0 else 4
+    load_per_core = cpu_load / cores
+    if load_per_core < 0.7:
+        return "EXCELLENT"
+    elif load_per_core < 1.0:
+        return "GOOD"
+    elif load_per_core < 1.5:
+        return "WARNING"
+    else:
+        return "CRITICAL"
+
 
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
@@ -455,14 +486,15 @@ def calculate_device_health_grade(device_name, device_data):
         if not parsed_resources:
             parsed_resources = parse_resources_from_hardware_file(device_name)
         cpu_load = parsed_resources.get('cpu_load', 0)
-    if cpu_load < 1.0:
-        health_grades.append("EXCELLENT")
-    elif cpu_load < 2.0:
-        health_grades.append("GOOD")
-    elif cpu_load < 3.0:
-        health_grades.append("WARNING")
-    else:
-        health_grades.append("CRITICAL")
+    # Normalize the load average by CPU core count (see grade_load_per_core).
+    cpu_cores = device_data.get("resources", {}).get("cpu", {}).get("cores", None)
+    if not cpu_cores:
+        if not parsed_resources:
+            parsed_resources = parse_resources_from_hardware_file(device_name)
+        cpu_cores = parsed_resources.get('cpu_cores')
+    load_grade = grade_load_per_core(cpu_load, cpu_cores)
+    if load_grade:
+        health_grades.append(load_grade)
     
     # PSU Efficiency grade
     psu_efficiency = parse_psu_efficiency_from_hardware_file(device_name) or 0.0
@@ -678,6 +710,10 @@ def generate_hardware_html():
                 <select id="deviceSearch" style="width: 200px;"><option value="">Search Device...</option></select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
+            <button id="thresholds-btn" onclick="openThresholdsModal()" class="btn btn-secondary" title="Thresholds &amp; grading reference">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3,17V19H9V17H3M3,5V7H13V5H3M13,21V19H21V17H13V15H11V21H13M7,9V11H3V13H7V15H9V9H7M21,13V11H11V13H21M15,9H17V7H21V5H17V3H15V9Z"/></svg>
+                Thresholds
+            </button>
             <button id="run-analysis" onclick="runAnalysis()" class="btn btn-secondary">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4Z"/></svg>
                 Run Analysis
@@ -765,15 +801,18 @@ def generate_hardware_html():
         # Prefer values from JSON resources; otherwise parse from raw hardware file
         memory_usage = device_data.get("resources", {}).get("memory", {}).get("usage_percent", None)
         cpu_load = device_data.get("resources", {}).get("cpu", {}).get("load_5min", None)
+        cpu_cores = device_data.get("resources", {}).get("cpu", {}).get("cores", None)
         # Uptime removed from table
         uptime = None
 
-        if memory_usage is None or cpu_load is None or not uptime:
+        if memory_usage is None or cpu_load is None or cpu_cores is None or not uptime:
             parsed = parse_resources_from_hardware_file(device_name)
             if memory_usage is None:
                 memory_usage = parsed.get('memory_usage', 0.0)
             if cpu_load is None:
                 cpu_load = parsed.get('cpu_load', 0.0)
+            if cpu_cores is None:
+                cpu_cores = parsed.get('cpu_cores')
             # do not set uptime anymore
         
         # PSU Efficiency 
@@ -864,18 +903,6 @@ def generate_hardware_html():
             else:
                 return "CRITICAL"
 
-        def grade_cpu_load(l):
-            if not isinstance(l, (int, float)):
-                return None
-            if l < 1.0:
-                return "EXCELLENT"
-            elif l < 2.0:
-                return "GOOD"
-            elif l < 3.0:
-                return "WARNING"
-            else:
-                return "CRITICAL"
-
         def grade_psu(eff, raw):
             # Only grade when we have parsed value
             if raw is None:
@@ -892,7 +919,7 @@ def generate_hardware_html():
         cpu_g = grade_cpu(cpu_temp)
         asic_g = grade_asic(asic_temp)
         mem_g = grade_memory(memory_usage if isinstance(memory_usage, (int, float)) else None)
-        load_g = grade_cpu_load(cpu_load if isinstance(cpu_load, (int, float)) else None)
+        load_g = grade_load_per_core(cpu_load if isinstance(cpu_load, (int, float)) else None, cpu_cores)
         fan_g = fan_status if fan_status in ("EXCELLENT", "GOOD", "WARNING", "CRITICAL") else None
         psu_g = grade_psu(psu_efficiency, psu_efficiency_parsed)
 
@@ -1426,6 +1453,50 @@ def generate_hardware_html():
                 alert('Error generating CSV file. Please try again.');
             }
         }
+    </script>
+    <!-- Thresholds reference modal: the in-page threshold/explanation sections are
+         relocated in here at load time and shown via the "Thresholds" toolbar button. -->
+    <div id="thresholdModal" class="threshold-modal" onclick="if(event.target===this)closeThresholdsModal()">
+        <div class="threshold-modal-box">
+            <div class="threshold-modal-head">
+                <h2>Thresholds</h2>
+                <button type="button" class="threshold-modal-close" onclick="closeThresholdsModal()" title="Close">&times;</button>
+            </div>
+            <div id="thresholdModalBody" class="threshold-modal-body"></div>
+        </div>
+    </div>
+    <style>
+        .threshold-modal { display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.65); }
+        .threshold-modal.open { display:flex; align-items:flex-start; justify-content:center; }
+        .threshold-modal-box { background:#1e1e1e; border:1px solid #3c3c3c; border-radius:8px; width:92%; max-width:920px; margin:40px 16px; max-height:85vh; display:flex; flex-direction:column; box-shadow:0 12px 48px rgba(0,0,0,0.55); }
+        .threshold-modal-head { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #3c3c3c; }
+        .threshold-modal-head h2 { margin:0; font-size:16px; color:#e0e0e0; }
+        .threshold-modal-close { background:none; border:none; color:#aaa; font-size:24px; line-height:1; cursor:pointer; padding:0 6px; }
+        .threshold-modal-close:hover { color:#fff; }
+        .threshold-modal-body { padding:4px 18px 18px; overflow:auto; }
+        .threshold-modal-body .dashboard-section { margin:14px 0 0; }
+        .threshold-modal-body .dashboard-section:first-child { margin-top:6px; }
+    </style>
+    <script>
+        (function () {
+            function buildThresholdModal() {
+                var body = document.getElementById('thresholdModalBody');
+                if (!body) return;
+                var sections = Array.prototype.slice.call(document.querySelectorAll('.dashboard-section'));
+                var start = -1;
+                for (var i = 0; i < sections.length; i++) {
+                    var h = sections[i].querySelector('.section-header');
+                    if (h && /threshold/i.test(h.textContent)) { start = i; break; }
+                }
+                if (start < 0) return;
+                // Move the threshold section + any trailing explanation sections into the modal.
+                for (var j = start; j < sections.length; j++) { body.appendChild(sections[j]); }
+            }
+            window.openThresholdsModal = function () { var m = document.getElementById('thresholdModal'); if (m) m.classList.add('open'); };
+            window.closeThresholdsModal = function () { var m = document.getElementById('thresholdModal'); if (m) m.classList.remove('open'); };
+            document.addEventListener('keydown', function (e) { if (e.key === 'Escape') window.closeThresholdsModal(); });
+            buildThresholdModal();
+        })();
     </script>
     <script src="/p2p-alias.js"></script>
 </body>

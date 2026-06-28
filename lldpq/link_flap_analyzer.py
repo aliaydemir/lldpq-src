@@ -407,6 +407,10 @@ class LinkFlapAnalyzer:
                 <select id="deviceSearch" style="width: 200px;"><option value="">Search Device...</option></select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
+            <button id="thresholds-btn" onclick="openThresholdsModal()" class="btn btn-secondary" title="Thresholds &amp; grading reference">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3,17V19H9V17H3M3,5V7H13V5H3M13,21V19H21V17H13V15H11V21H13M7,9V11H3V13H7V15H9V9H7M21,13V11H11V13H21M15,9H17V7H21V5H17V3H15V9Z"/></svg>
+                Thresholds
+            </button>
             <button id="run-analysis" onclick="runAnalysis()" class="btn btn-secondary">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4Z"/></svg>
                 Run Analysis
@@ -1059,6 +1063,50 @@ class LinkFlapAnalyzer:
                 alert('Error generating CSV file. Please try again.');
             }
         }
+    </script>
+    <!-- Thresholds reference modal: the in-page threshold/explanation sections are
+         relocated in here at load time and shown via the "Thresholds" toolbar button. -->
+    <div id="thresholdModal" class="threshold-modal" onclick="if(event.target===this)closeThresholdsModal()">
+        <div class="threshold-modal-box">
+            <div class="threshold-modal-head">
+                <h2>Thresholds</h2>
+                <button type="button" class="threshold-modal-close" onclick="closeThresholdsModal()" title="Close">&times;</button>
+            </div>
+            <div id="thresholdModalBody" class="threshold-modal-body"></div>
+        </div>
+    </div>
+    <style>
+        .threshold-modal { display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.65); }
+        .threshold-modal.open { display:flex; align-items:flex-start; justify-content:center; }
+        .threshold-modal-box { background:#1e1e1e; border:1px solid #3c3c3c; border-radius:8px; width:92%; max-width:920px; margin:40px 16px; max-height:85vh; display:flex; flex-direction:column; box-shadow:0 12px 48px rgba(0,0,0,0.55); }
+        .threshold-modal-head { display:flex; align-items:center; justify-content:space-between; padding:14px 18px; border-bottom:1px solid #3c3c3c; }
+        .threshold-modal-head h2 { margin:0; font-size:16px; color:#e0e0e0; }
+        .threshold-modal-close { background:none; border:none; color:#aaa; font-size:24px; line-height:1; cursor:pointer; padding:0 6px; }
+        .threshold-modal-close:hover { color:#fff; }
+        .threshold-modal-body { padding:4px 18px 18px; overflow:auto; }
+        .threshold-modal-body .dashboard-section { margin:14px 0 0; }
+        .threshold-modal-body .dashboard-section:first-child { margin-top:6px; }
+    </style>
+    <script>
+        (function () {
+            function buildThresholdModal() {
+                var body = document.getElementById('thresholdModalBody');
+                if (!body) return;
+                var sections = Array.prototype.slice.call(document.querySelectorAll('.dashboard-section'));
+                var start = -1;
+                for (var i = 0; i < sections.length; i++) {
+                    var h = sections[i].querySelector('.section-header');
+                    if (h && /threshold/i.test(h.textContent)) { start = i; break; }
+                }
+                if (start < 0) return;
+                // Move the threshold section + any trailing explanation sections into the modal.
+                for (var j = start; j < sections.length; j++) { body.appendChild(sections[j]); }
+            }
+            window.openThresholdsModal = function () { var m = document.getElementById('thresholdModal'); if (m) m.classList.add('open'); };
+            window.closeThresholdsModal = function () { var m = document.getElementById('thresholdModal'); if (m) m.classList.remove('open'); };
+            document.addEventListener('keydown', function (e) { if (e.key === 'Escape') window.closeThresholdsModal(); });
+            buildThresholdModal();
+        })();
     </script>
     <script src="/p2p-alias.js"></script>
 </body>
