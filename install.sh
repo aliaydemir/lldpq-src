@@ -86,14 +86,19 @@ step() { STEP=$((STEP + 1)); printf "\n[%02d] %s\n" "$STEP" "$1"; }
 AUTO_YES=false
 ENABLE_TELEMETRY=false
 DISABLE_TELEMETRY=false
+FORCE_BACKUP=false
+# Remember where we were installed FROM (the source repo) so the web "Update"
+# button can later git pull + reinstall from here (stored as LLDPQ_SRC in lldpq.conf).
+LLDPQ_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 for arg in "$@"; do
     case $arg in
         -y) AUTO_YES=true ;;
+        --backup) FORCE_BACKUP=true ;;
         --enable-telemetry) ENABLE_TELEMETRY=true ;;
         --disable-telemetry) DISABLE_TELEMETRY=true ;;
         -h|--help)
-            echo "Usage: ./install.sh [-y] [--enable-telemetry] [--disable-telemetry]"
+            echo "Usage: ./install.sh [-y] [--backup] [--enable-telemetry] [--disable-telemetry]"
             echo ""
             echo "Automatically detects existing installation:"
             echo "  No existing install → Fresh install (packages, configs, everything)"
@@ -101,6 +106,7 @@ for arg in "$@"; do
             echo ""
             echo "Options:"
             echo "  -y                  Auto-yes to all prompts"
+            echo "  --backup            (update mode) take a full backup before updating"
             echo "  --enable-telemetry  Enable streaming telemetry (requires Docker)"
             echo "  --disable-telemetry Disable streaming telemetry"
             exit 0
@@ -422,7 +428,9 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # copy of configs, keys and a data snapshot.
     BACKUP_DIR=""
     _do_backup=false
-    if [[ "$AUTO_YES" != "true" ]]; then
+    if [[ "$FORCE_BACKUP" == "true" ]]; then
+        _do_backup=true
+    elif [[ "$AUTO_YES" != "true" ]]; then
         read -p "  Take a full backup (configs/keys/data) before updating? [y/N]: " _bk_response
         [[ "$_bk_response" =~ ^[Yy]$ ]] && _do_backup=true
     fi
@@ -508,6 +516,22 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     for _d in monitor-results lldp-results alert-states; do
         [[ -e "$LLDPQ_INSTALL_DIR/$_d" ]] && sudo mv "$LLDPQ_INSTALL_DIR/$_d" "$_DATA_PRESERVE/" 2>/dev/null || true
     done
+
+    # Safety net: if the install is interrupted (e.g. triggered from the web Update
+    # button), move runtime data back and remove the preserve dir on ANY exit so it
+    # never lingers or strands data. The normal restore below handles the success path;
+    # by then the preserve dir is empty and this trap just removes it.
+    _lldpq_restore_preserve() {
+        local _d
+        [[ -n "$_DATA_PRESERVE" ]] && [[ -d "$_DATA_PRESERVE" ]] || return 0
+        for _d in monitor-results lldp-results alert-states; do
+            if [[ -e "$_DATA_PRESERVE/$_d" ]] && [[ ! -e "$LLDPQ_INSTALL_DIR/$_d" ]]; then
+                sudo mv "$_DATA_PRESERVE/$_d" "$LLDPQ_INSTALL_DIR/" 2>/dev/null || true
+            fi
+        done
+        rmdir "$_DATA_PRESERVE" 2>/dev/null || sudo rm -rf "$_DATA_PRESERVE" 2>/dev/null || true
+    }
+    trap _lldpq_restore_preserve EXIT
 
     # Remove old lldpq directory (sudo fallback: may contain root-owned files)
     echo "  Removing old lldpq directory..."
@@ -858,6 +882,10 @@ step "Writing /etc/lldpq.conf..."
 echo "# LLDPq Configuration" | sudo tee /etc/lldpq.conf > /dev/null
 echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "LLDPQ_USER=$LLDPQ_USER" | sudo tee -a /etc/lldpq.conf > /dev/null
+echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
+# Cron schedules (editable from Setup; preserved across updates via the sourced config)
+echo "LLDPQ_CRON=\"${LLDPQ_CRON:-*/10 * * * *}\"" | sudo tee -a /etc/lldpq.conf > /dev/null
+echo "GETCONF_CRON=\"${GETCONF_CRON:-0 */12 * * *}\"" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "WEB_ROOT=$WEB_ROOT" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "ANSIBLE_DIR=$ANSIBLE_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | sudo tee -a /etc/lldpq.conf > /dev/null
@@ -1286,8 +1314,8 @@ step "Configuring cron jobs..."
 # Remove existing LLDPq cron jobs and re-add (ensures latest)
 sudo sed -i '/lldpq\|monitor\|get-conf\|fabric-scan\|ai-analyze/d' /etc/crontab
 
-echo "*/10 * * * * $LLDPQ_USER /usr/local/bin/lldpq" | sudo tee -a /etc/crontab > /dev/null
-echo "0 */12 * * * $LLDPQ_USER /usr/local/bin/get-conf" | sudo tee -a /etc/crontab > /dev/null
+echo "${LLDPQ_CRON:-*/10 * * * *} $LLDPQ_USER /usr/local/bin/lldpq" | sudo tee -a /etc/crontab > /dev/null
+echo "${GETCONF_CRON:-0 */12 * * *} $LLDPQ_USER /usr/local/bin/get-conf" | sudo tee -a /etc/crontab > /dev/null
 echo "* * * * * $LLDPQ_USER /usr/local/bin/lldpq-trigger" | sudo tee -a /etc/crontab > /dev/null
 echo "* * * * * $LLDPQ_USER cd $LLDPQ_INSTALL_DIR && ./fabric-scan.sh >/dev/null 2>&1" | sudo tee -a /etc/crontab > /dev/null
 echo "0 0 * * * $LLDPQ_USER cd $LLDPQ_INSTALL_DIR && cp /var/www/html/topology.dot topology.dot.bkp 2>/dev/null; cp /var/www/html/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m 'auto: \$(date +\\%Y-\\%m-\\%d)'" | sudo tee -a /etc/crontab > /dev/null

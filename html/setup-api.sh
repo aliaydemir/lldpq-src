@@ -41,6 +41,7 @@ import sys
 import os
 import subprocess
 import re
+import shlex
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def load_devices(devices_yaml):
@@ -307,6 +308,306 @@ if action == 'save-key':
     except Exception as e:
         print(json.dumps({'success': False, 'error': str(e)}))
     
+    sys.exit(0)
+
+# ─── Action: Export the collector PRIVATE key (back up / migrate LLDPq to another host) ───
+if action == 'get-private-key':
+    private_key = ''
+    key_file = ''
+    for key_name in ('id_ed25519', 'id_rsa'):
+        p = os.path.expanduser(f'~{lldpq_user}/.ssh/{key_name}')
+        try:
+            r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', p],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and 'PRIVATE KEY' in r.stdout:
+                private_key = r.stdout
+                key_file = p
+                break
+        except Exception:
+            pass
+    if private_key:
+        print(json.dumps({'success': True, 'private_key': private_key, 'key_file': key_file}))
+    else:
+        print(json.dumps({'success': False, 'error': f'No private key found for {lldpq_user}'}))
+    sys.exit(0)
+
+# ─── Action: Verify which devices already trust the collector key (no password) ───
+if action == 'verify':
+    all_devices, load_error = load_devices(devices_yaml)
+    if load_error:
+        print(json.dumps({'success': False, 'error': load_error}))
+        sys.exit(0)
+
+    PING_CMD = detect_ping_cmd(lldpq_user)
+
+    def verify_device(device):
+        ip = device['ip']
+        username = device['username']
+        res = {'hostname': device['hostname'], 'ip': ip, 'username': username, 'trusted': False, 'msg': ''}
+        if not ping_check(ip, PING_CMD):
+            res['msg'] = 'Unreachable (ping failed)'
+            return res
+        try:
+            chk = subprocess.run(
+                ['sudo', '-u', lldpq_user, 'ssh',
+                 '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                 '-q', f'{username}@{ip}', 'exit'],
+                capture_output=True, text=True, timeout=10
+            )
+            if chk.returncode == 0:
+                res['trusted'] = True
+                res['msg'] = 'Key trusted'
+            else:
+                res['msg'] = 'Key not accepted (needs distribution)'
+        except subprocess.TimeoutExpired:
+            res['msg'] = 'Timeout (10s)'
+        except Exception as e:
+            res['msg'] = str(e)[:120]
+        return res
+
+    results = []
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        futures = {executor.submit(verify_device, d): d for d in all_devices}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                d = futures[future]
+                results.append({'hostname': d['hostname'], 'ip': d['ip'], 'username': d['username'],
+                                'trusted': False, 'msg': str(e)[:120]})
+    results.sort(key=lambda r: r['hostname'])
+
+    # Include the current public key so the page can show it without a separate call.
+    public_key = ''
+    for key_name in ('id_ed25519', 'id_rsa'):
+        pub_path = os.path.expanduser(f'~{lldpq_user}/.ssh/{key_name}.pub')
+        if os.path.isfile(pub_path):
+            try:
+                with open(pub_path) as fh:
+                    public_key = fh.read().strip()
+            except Exception:
+                pass
+            break
+
+    trusted = sum(1 for r in results if r['trusted'])
+    print(json.dumps({'success': True, 'total': len(results), 'trusted': trusted,
+                      'public_key': public_key, 'results': results}))
+    sys.exit(0)
+
+# ─── Action: Run the full LLDPq pipeline verbosely (lldpq -) into a log we can tail ───
+if action == 'run':
+    cmd = (
+        f'cd {shlex.quote(lldpq_dir)} && : > .run.log && '
+        f'nohup setsid bash -c "/usr/local/bin/lldpq - >> .run.log 2>&1; '
+        f'echo __LLDPQ_DONE__ >> .run.log" >/dev/null 2>&1 &'
+    )
+    try:
+        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', cmd],
+                         start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(json.dumps({'success': True, 'message': 'LLDPq run started'}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': str(e)}))
+    sys.exit(0)
+
+# ─── Action: Tail the run log started by action=run ───
+if action == 'run-log':
+    log_path = os.path.join(lldpq_dir, '.run.log')
+    content = ''
+    try:
+        r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', log_path],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            content = r.stdout
+    except Exception:
+        content = ''
+    done = '__LLDPQ_DONE__' in content
+    display = content.replace('__LLDPQ_DONE__', '').rstrip()
+    print(json.dumps({'success': True, 'done': done, 'log': display}))
+    sys.exit(0)
+
+# ─── Action: environment info (is this running inside Docker?) ───
+if action == 'env':
+    print(json.dumps({'success': True, 'docker': os.path.exists('/.dockerenv')}))
+    sys.exit(0)
+
+# ─── Action: Update LLDPq (git pull + ./install.sh -y [--backup]) into a tailable log ───
+if action == 'update':
+    # Docker: a container can't replace its own image. Update is a host operation
+    # (docker load + docker compose up); refuse here and let the UI show the host command.
+    if os.path.exists('/.dockerenv'):
+        print(json.dumps({'success': False, 'docker': True,
+                          'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
+        sys.exit(0)
+    backup = bool(post_data.get('backup'))
+    url = 'https://github.com/aliaydemir/lldpq-src.git'
+    # Stage the runner + log in ~/.lldpq-state, NOT inside lldpq_dir: install.sh wipes/
+    # replaces the lldpq dir during an update (that's why it preserves data), which would
+    # delete the log mid-run. A dedicated hidden dir in HOME survives the install and keeps
+    # the home directory tidy.
+    home_dir = os.path.expanduser('~' + lldpq_user)
+    state_dir = os.path.join(home_dir, '.lldpq-state')
+    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
+                   capture_output=True, text=True, timeout=10)
+    script_path = os.path.join(state_dir, 'update-run.sh')
+    SCRIPT = '''#!/usr/bin/env bash
+source /etc/lldpq.conf 2>/dev/null
+SRC="${LLDPQ_SRC:-}"
+HOMESRC="$HOME/lldpq-src"
+URL="__URL__"
+LOG="__LOG__"
+: > "$LOG"
+{
+  echo "=== LLDPq Update $(date) ==="
+  if [ -n "$SRC" ] && [ -d "$SRC/.git" ]; then
+    cd "$SRC" || exit 1
+  elif [ -d "$HOMESRC/.git" ]; then
+    cd "$HOMESRC" || exit 1
+  else
+    echo "Source repo not found (LLDPQ_SRC=$SRC); cloning $URL -> $HOMESRC"
+    rm -rf "$HOMESRC"
+    git clone "$URL" "$HOMESRC" && cd "$HOMESRC" || { echo "clone failed"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; }
+  fi
+  echo "--- git pull (in $(pwd)) ---"
+  GIT_TERMINAL_PROMPT=0 timeout 120 git pull 2>&1 || echo "(git pull skipped/failed -- continuing with the current checkout)"
+  echo "--- ./install.sh -y __BACKUP__ ---"
+  ./install.sh -y __BACKUP__ 2>&1
+  echo "--- install finished (exit $?) ---"
+} >> "$LOG" 2>&1
+echo __LLDPQ_DONE__ >> "$LOG"
+'''
+    log_path = os.path.join(state_dir, 'update.log')
+    script = (SCRIPT.replace('__URL__', url)
+              .replace('__BACKUP__', '--backup' if backup else '')
+              .replace('__LOG__', log_path))
+    try:
+        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', script_path],
+                           input=script, capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
+            sys.exit(0)
+        # Run the update in its OWN systemd transient unit (separate cgroup). install.sh
+        # restarts fcgiwrap, and systemd kills the fcgiwrap.service cgroup on restart — a
+        # plain nohup/setsid child stays in that cgroup (setsid changes the session, not the
+        # cgroup) and gets killed mid-update. A transient unit is cgroup-independent and
+        # survives. Fall back to nohup/setsid if systemd-run is unavailable.
+        launch = ('if sudo systemd-run --no-block --collect '
+                  '--uid=' + shlex.quote(lldpq_user) + ' '
+                  '--setenv=HOME=' + shlex.quote(home_dir) + ' '
+                  '/bin/bash ' + shlex.quote(script_path) + ' 2>/dev/null; then :; '
+                  'else nohup setsid /bin/bash ' + shlex.quote(script_path) + ' >/dev/null 2>&1 & fi')
+        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
+                         start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(json.dumps({'success': True, 'message': 'Update started'}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': str(e)}))
+    sys.exit(0)
+
+# ─── Action: Tail the update log started by action=update ───
+if action == 'update-log':
+    log_path = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state', 'update.log')
+    content = ''
+    try:
+        r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', log_path],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            content = r.stdout
+    except Exception:
+        content = ''
+    done = '__LLDPQ_DONE__' in content
+    display = content.replace('__LLDPQ_DONE__', '').rstrip()
+    print(json.dumps({'success': True, 'done': done, 'log': display}))
+    sys.exit(0)
+
+# ─── Action: Read cron schedules for lldpq (auto-run) and get-conf (config collection) ───
+if action == 'get-schedules':
+    cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
+    lldpq_expr = ''
+    getconf_expr = ''
+    try:
+        with open(cron_file) as f:
+            for line in f:
+                if line.lstrip().startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq':
+                    lldpq_expr = ' '.join(parts[:5])
+                elif len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf':
+                    getconf_expr = ' '.join(parts[:5])
+    except Exception:
+        pass
+
+    def _mins(e):
+        m = re.match(r'^\*/(\d+) \* \* \* \*$', e)
+        return int(m.group(1)) if m else None
+
+    def _hours(e):
+        m = re.match(r'^0 \*/(\d+) \* \* \*$', e)
+        if m:
+            return int(m.group(1))
+        return 24 if e == '0 0 * * *' else None
+
+    print(json.dumps({'success': True, 'cron_file': cron_file,
+                      'lldpq_minutes': _mins(lldpq_expr), 'lldpq_cron': lldpq_expr,
+                      'getconf_hours': _hours(getconf_expr), 'getconf_cron': getconf_expr}))
+    sys.exit(0)
+
+# ─── Action: Change cron schedules (presets only) + persist to lldpq.conf ───
+if action == 'set-schedules':
+    LLDPQ_PRESETS = {5: '*/5 * * * *', 10: '*/10 * * * *', 15: '*/15 * * * *', 20: '*/20 * * * *', 30: '*/30 * * * *'}
+    GETCONF_PRESETS = {6: '0 */6 * * *', 12: '0 */12 * * *', 24: '0 0 * * *'}
+    try:
+        mins = int(post_data.get('lldpq_minutes'))
+        hours = int(post_data.get('getconf_hours'))
+    except Exception:
+        print(json.dumps({'success': False, 'error': 'Invalid interval'}))
+        sys.exit(0)
+    if mins not in LLDPQ_PRESETS or hours not in GETCONF_PRESETS:
+        print(json.dumps({'success': False, 'error': 'Unsupported interval'}))
+        sys.exit(0)
+    lldpq_cron = LLDPQ_PRESETS[mins]
+    getconf_cron = GETCONF_PRESETS[hours]
+    cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
+    try:
+        with open(cron_file) as f:
+            orig = f.readlines()
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': 'Cannot read ' + cron_file + ': ' + str(e)}))
+        sys.exit(0)
+    # Rebuild only the lldpq + get-conf lines (preserve every other line byte-for-byte).
+    out = []
+    for line in orig:
+        parts = line.split()
+        if (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq':
+            out.append(lldpq_cron + ' ' + ' '.join(parts[5:]) + '\n')
+        elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf':
+            out.append(getconf_cron + ' ' + ' '.join(parts[5:]) + '\n')
+        else:
+            out.append(line)
+    new_content = ''.join(out)
+    tmp = os.path.join(lldpq_dir, '.cron.tmp')
+    try:
+        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', tmp], input=new_content,
+                           capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not stage cron file'}))
+            sys.exit(0)
+        apply_cmd = (
+            'sudo cp ' + shlex.quote(tmp) + ' ' + shlex.quote(cron_file) + ' && '
+            'sudo chmod 644 ' + shlex.quote(cron_file) + ' && rm -f ' + shlex.quote(tmp) + ' && '
+            "sudo sed -i '/^LLDPQ_CRON=/d;/^GETCONF_CRON=/d' /etc/lldpq.conf 2>/dev/null; "
+            'echo ' + shlex.quote('LLDPQ_CRON="' + lldpq_cron + '"') + ' | sudo tee -a /etc/lldpq.conf >/dev/null; '
+            'echo ' + shlex.quote('GETCONF_CRON="' + getconf_cron + '"') + ' | sudo tee -a /etc/lldpq.conf >/dev/null'
+        )
+        a = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c', apply_cmd],
+                           capture_output=True, text=True, timeout=20)
+        if a.returncode != 0:
+            print(json.dumps({'success': False, 'error': (a.stderr or 'apply failed').strip()[:200]}))
+            sys.exit(0)
+        print(json.dumps({'success': True, 'lldpq_cron': lldpq_cron, 'getconf_cron': getconf_cron}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
 
 # ─── Action: Generate new key + distribute with password ───

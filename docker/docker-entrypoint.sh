@@ -179,15 +179,19 @@ echo "✓ Authentication ready"
 # ─── Cron Setup ───
 # lldpq = assets.sh + check-lldp.sh + monitor.sh + fabric-scan.sh + alerts
 # lldpq-trigger = web UI refresh buttons (Refresh Assets, Refresh LLDP, etc.)
-cat > /etc/cron.d/lldpq << 'CRON'
-# LLDPq full run (assets + lldp + monitor + alerts) - every 10 minutes
-*/10 * * * * lldpq /usr/local/bin/lldpq > /dev/null 2>&1
+# Honor schedules from lldpq.conf if present (editable from Setup), else defaults.
+source /etc/lldpq.conf 2>/dev/null || true
+LLDPQ_CRON="${LLDPQ_CRON:-*/10 * * * *}"
+GETCONF_CRON="${GETCONF_CRON:-0 */12 * * *}"
+cat > /etc/cron.d/lldpq << CRON
+# LLDPq full run (assets + lldp + monitor + alerts)
+$LLDPQ_CRON lldpq /usr/local/bin/lldpq > /dev/null 2>&1
 # Web trigger daemon (handles Refresh buttons from UI) - every minute
 * * * * * lldpq /usr/local/bin/lldpq-trigger > /dev/null 2>&1
 # Fabric scan (topology data for search) - every minute
 * * * * * lldpq cd /home/lldpq/lldpq && ./fabric-scan.sh > /dev/null 2>&1
-# Config backup - every 12 hours
-0 */12 * * * lldpq /usr/local/bin/get-conf > /dev/null 2>&1
+# Config backup
+$GETCONF_CRON lldpq /usr/local/bin/get-conf > /dev/null 2>&1
 CRON
 chmod 644 /etc/cron.d/lldpq
 

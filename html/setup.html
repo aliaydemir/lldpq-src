@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="shortcut icon" href="/png/favicon.ico">
+    <title>..::LLDPQ:: Setup</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <script src="/css/auth.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+        body { background:#1e1e1e; color:#d4d4d4; font-family:'Segoe UI',Roboto,sans-serif; font-size:14px; }
+
+        /* keep dark theme through browser autofill */
+        input:-webkit-autofill,
+        input:-webkit-autofill:hover,
+        input:-webkit-autofill:focus {
+            -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important;
+            -webkit-text-fill-color: #fff !important;
+            caret-color: #fff !important;
+        }
+
+        .su-header { padding:18px 24px; border-bottom:1px solid #333; background:#252526; }
+        .su-title { font-size:20px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; }
+        .su-title svg { width:22px; height:22px; fill:#76b900; }
+        .su-sub { color:#9a9a9a; font-size:13px; margin-top:4px; }
+
+        .su-wrap { display:flex; gap:0; height:calc(100vh - 75px); }
+
+        /* ---- left: steps rail ---- */
+        .su-steps { width:280px; min-width:280px; background:#252526; border-right:1px solid #333; padding:18px 12px; overflow-y:auto; }
+        .su-step { display:flex; align-items:flex-start; gap:12px; padding:14px 14px; border-radius:8px; cursor:pointer; margin-bottom:6px; border:1px solid transparent; }
+        .su-step:hover { background:#2d2d2d; }
+        .su-step.active { background:#2c3a12; border-color:#76b900; }
+        .su-step .num { width:26px; height:26px; min-width:26px; border-radius:50%; background:#3c3c3c; color:#cfcfcf; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; }
+        .su-step.active .num { background:#76b900; color:#1a1a1a; }
+        .su-step.done .num { background:#76b900; color:#1a1a1a; }
+        .su-step .lbl { color:#e0e0e0; font-weight:600; font-size:14px; }
+        .su-step .desc { color:#8f8f8f; font-size:11.5px; margin-top:2px; line-height:1.4; }
+        .su-step.active .lbl { color:#fff; }
+
+        /* ---- right: active panel ---- */
+        .su-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+        .su-panels { flex:1; overflow:auto; padding:22px 26px; }
+        .su-panel { display:none; }
+        .su-panel.active { display:block; }
+        .su-panel h2 { margin:0 0 4px; font-size:17px; color:#fff; }
+        .su-panel .p-desc { color:#9a9a9a; font-size:13px; line-height:1.6; margin:0 0 16px; max-width:760px; }
+        .su-panel code { background:#111; color:#dcdcaa; padding:1px 6px; border-radius:4px; font-size:12px; }
+
+        .p-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+        .p-toolbar .spacer { flex:1; }
+        .p-file { color:#76b900; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; }
+
+        textarea.su-ta { width:100%; min-height:360px; background:#111; color:#d4d4d4; border:1px solid #333; border-radius:6px;
+            padding:14px; font-family:'Cascadia Code',Consolas,monospace; font-size:12.5px; line-height:1.55; resize:vertical; }
+        textarea.su-ta:focus { outline:none; border-color:#76b900; }
+        .run-output { background:#0d0d0d; color:#cfe9a0; border:1px solid #333; border-radius:6px; padding:14px; height:380px; overflow:auto; margin:10px 0 0; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+        .sched-card { background:#202020; border:1px solid #333; border-radius:8px; padding:12px 16px; margin-bottom:16px; }
+        .sched-sel { background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:5px; padding:6px 10px; font-size:13px; min-width:170px; }
+        .sched-sel:focus { outline:none; border-color:#76b900; }
+
+        .btn { border:0; border-radius:5px; padding:9px 14px; cursor:pointer; font-size:13px; font-weight:600; display:inline-flex; align-items:center; gap:7px; }
+        .btn svg { width:14px; height:14px; fill:currentColor; }
+        .btn.primary { background:#76b900; color:#1a1a1a; }
+        .btn.primary:hover { background:#8ad400; }
+        .btn.secondary { background:#3c3c3c; color:#e0e0e0; }
+        .btn.secondary:hover { background:#4a4a4a; }
+        .btn:disabled { opacity:.5; cursor:not-allowed; }
+
+        .status { font-size:12.5px; margin-top:10px; min-height:18px; }
+        .status.ok { color:#76b900; }
+        .status.err { color:#f44336; }
+        .status.info { color:#9a9a9a; }
+
+        .key-input { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0 4px; }
+        .key-input input { flex:1; min-width:220px; padding:10px 12px; background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:6px; font-size:14px; }
+        .key-input input:focus { outline:none; border-color:#76b900; }
+        .note { background:#2a2a1a; border:1px solid #4a4424; border-radius:6px; padding:10px 14px; color:#d6ca8a; font-size:12.5px; line-height:1.55; margin-bottom:14px; }
+
+        .key-card { background:#202020; border:1px solid #333; border-radius:8px; padding:14px 16px; margin-bottom:16px; }
+        .key-row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:13px; }
+        .key-row .k { color:#9a9a9a; }
+        .key-lbl { display:block; color:#9a9a9a; font-size:12px; margin:10px 0 6px; }
+        .key-pub { min-height:64px !important; color:#9cdcfe; }
+        .mono { font-family:'Cascadia Code',Consolas,monospace; font-size:12px; color:#cfcfcf; }
+
+        table.res { width:100%; border-collapse:collapse; margin-top:14px; font-size:12.5px; display:none; }
+        table.res th { text-align:left; color:#9a9a9a; font-weight:600; padding:8px 12px; border-bottom:1px solid #333; }
+        table.res td { padding:8px 12px; border-bottom:1px solid #2a2a2a; }
+        .summary { margin-top:10px; font-size:13px; color:#cfcfcf; display:none; }
+
+        /* footer nav */
+        .su-nav { display:flex; align-items:center; gap:12px; padding:14px 26px; border-top:1px solid #333; background:#252526; }
+        .su-nav .ind { color:#9a9a9a; font-size:13px; }
+        .su-nav .spacer { flex:1; }
+
+        .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+        .badge.green { background:rgba(118,185,0,.2); color:#76b900; }
+        .badge.gray { background:rgba(255,255,255,.1); color:#999; }
+    </style>
+</head>
+<body>
+    <div class="su-header">
+        <div class="su-title">
+            <svg viewBox="0 0 24 24"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
+            Setup
+        </div>
+        <div class="su-sub">First-run wizard &mdash; prepare inventory, distribute SSH keys and define the topology. You can also come back here anytime to edit and download these files.</div>
+    </div>
+
+    <div class="su-wrap">
+        <div class="su-steps" id="steps"></div>
+
+        <div class="su-main">
+            <div class="su-panels">
+                <!-- Step 1: devices.yaml -->
+                <div class="su-panel" data-step="0">
+                    <h2>1. Inventory <span class="p-file">devices.yaml</span></h2>
+                    <p class="p-desc">Define every switch LLDPq should reach: management IPs (or hostnames), the default login username, and optional roles/groups. This is the source for collection, assets, key distribution and analysis.</p>
+                    <div class="p-toolbar">
+                        <button class="btn secondary" onclick="document.getElementById('up-devices').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <input type="file" id="up-devices" style="display:none" onchange="uploadFile('devices', this)">
+                        <button class="btn secondary" onclick="loadFile('devices', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('devices')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <div class="spacer"></div>
+                        <button class="btn primary" onclick="saveFile('devices')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save devices.yaml</button>
+                    </div>
+                    <textarea class="su-ta" id="ta-devices" spellcheck="false" placeholder="Loading devices.yaml..."></textarea>
+                    <div class="status info" id="st-devices"></div>
+                </div>
+
+                <!-- Step 2: SSH keys -->
+                <div class="su-panel" data-step="1">
+                    <h2>2. SSH Keys</h2>
+                    <p class="p-desc">Authorize the collector's SSH key on every device in <code>devices.yaml</code> and enable passwordless <code>sudo</code> for the login user. This is the <strong>same single key pair</strong> used by Provision/ZTP.</p>
+
+                    <div class="key-card">
+                        <div class="key-row"><span class="k">Collector key</span><span id="key-state" class="badge gray">checking&hellip;</span></div>
+                        <div class="key-row"><span class="k">Key file</span><span id="key-file" class="mono">&mdash;</span></div>
+                        <label class="key-lbl">Public key &mdash; safe to share; paste into a switch's <code>authorized-key</code> / ZTP if you prefer manual setup:</label>
+                        <textarea id="key-pub" class="su-ta key-pub" readonly spellcheck="false" placeholder="(no key yet — Generate or Import below)"></textarea>
+                        <div class="p-toolbar">
+                            <button class="btn secondary" onclick="copyKey()">Copy</button>
+                            <button class="btn secondary" onclick="downloadKey()" title="Download the PRIVATE key to back up / migrate LLDPq to another host">Backup key</button>
+                            <button class="btn secondary" onclick="document.getElementById('up-key').click()" title="Upload a private key file (e.g. from a previous LLDPq install)">Upload key&hellip;</button>
+                            <input type="file" id="up-key" style="display:none" onchange="uploadKey(this)">
+                            <button class="btn secondary" id="gen-btn" onclick="generateKey()">Generate</button>
+                            <button class="btn secondary" onclick="toggleImport()">Import&hellip;</button>
+                            <button class="btn secondary" onclick="loadSSHKeyInfo()">Refresh</button>
+                        </div>
+                        <div id="key-import" style="display:none; margin-top:8px;">
+                            <textarea id="key-import-text" class="su-ta" style="min-height:110px; color:#4fc3f7;" spellcheck="false" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"></textarea>
+                            <div class="p-toolbar"><button class="btn primary" onclick="importKey()">Save imported key</button><span class="status info" id="key-import-msg"></span></div>
+                        </div>
+                    </div>
+
+                    <div class="note">If you have already distributed the key, just click <strong>Verify</strong> &mdash; no password needed. To push the key to devices that don't trust it yet, enter the switch admin password once: it is used transiently (<code>ssh-copy-id</code>) and is <strong>never stored</strong>. Already-trusting devices are skipped. Make sure Step&nbsp;1 is saved first.</div>
+                    <div class="key-input">
+                        <input type="password" id="key-pw" placeholder="switch admin password (only needed to push the key)" autocomplete="new-password">
+                        <button class="btn secondary" id="verify-btn" onclick="verifyKeys()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Verify (no password)</button>
+                        <button class="btn primary" id="key-btn" onclick="distributeKeys()"><svg viewBox="0 0 24 24"><path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/></svg>Distribute to all</button>
+                    </div>
+                    <div class="status info" id="key-progress"></div>
+                    <div class="summary" id="key-summary"></div>
+                    <table class="res" id="key-results">
+                        <thead id="key-results-head"></thead>
+                        <tbody id="key-results-body"></tbody>
+                    </table>
+                </div>
+
+                <!-- Step 3: topology.dot -->
+                <div class="su-panel" data-step="2">
+                    <h2>3. Topology <span class="p-file">topology.dot</span></h2>
+                    <p class="p-desc">Describe the expected cabling as a Graphviz <code>.dot</code> graph (<code>"deviceA":"port" -- "deviceB":"port"</code>). LLDP results are validated against this expected wiring.</p>
+                    <div class="p-toolbar">
+                        <button class="btn secondary" onclick="document.getElementById('up-topology').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <input type="file" id="up-topology" style="display:none" onchange="uploadFile('topology', this)">
+                        <button class="btn secondary" onclick="loadFile('topology', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('topology')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <div class="spacer"></div>
+                        <button class="btn primary" onclick="saveFile('topology')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save topology.dot</button>
+                    </div>
+                    <textarea class="su-ta" id="ta-topology" spellcheck="false" placeholder="Loading topology.dot..."></textarea>
+                    <div class="status info" id="st-topology"></div>
+                </div>
+
+                <!-- Step 4: topology_config.yaml -->
+                <div class="su-panel" data-step="3">
+                    <h2>4. Topology Config <span class="p-file">topology_config.yaml</span></h2>
+                    <p class="p-desc">Tune how the topology is rendered &mdash; tier ordering, which names are endpoint hosts, and special layout rules (e.g. staggered compute racks). Optional, but improves the Topology view.</p>
+                    <div class="p-toolbar">
+                        <button class="btn secondary" onclick="document.getElementById('up-config').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <input type="file" id="up-config" style="display:none" onchange="uploadFile('config', this)">
+                        <button class="btn secondary" onclick="loadFile('config', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('config')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <div class="spacer"></div>
+                        <button class="btn primary" onclick="saveFile('config')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save topology_config.yaml</button>
+                    </div>
+                    <textarea class="su-ta" id="ta-config" spellcheck="false" placeholder="Loading topology_config.yaml..."></textarea>
+                    <div class="status info" id="st-config"></div>
+                </div>
+
+                <!-- Step 5: Run LLDPq -->
+                <div class="su-panel" data-step="4">
+                    <h2>5. Run LLDPq</h2>
+                    <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
+
+                    <div class="sched-card">
+                        <div class="key-row">
+                            <span class="k">Auto-run LLDPq (collection)</span>
+                            <select id="sched-lldpq" class="sched-sel">
+                                <option value="5">every 5 minutes</option>
+                                <option value="10">every 10 minutes</option>
+                                <option value="15">every 15 minutes</option>
+                                <option value="20">every 20 minutes</option>
+                                <option value="30">every 30 minutes</option>
+                            </select>
+                        </div>
+                        <div class="key-row">
+                            <span class="k">Collect device configs (get-conf)</span>
+                            <select id="sched-getconf" class="sched-sel">
+                                <option value="6">every 6 hours</option>
+                                <option value="12">every 12 hours</option>
+                                <option value="24">every 24 hours</option>
+                            </select>
+                        </div>
+                        <div class="p-toolbar" style="margin-top:8px;">
+                            <button class="btn secondary" onclick="saveSchedules()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save schedules</button>
+                            <span class="status info" id="sched-status" style="margin-top:0;"></span>
+                        </div>
+                    </div>
+
+                    <div class="p-toolbar">
+                        <button class="btn primary" id="run-btn" onclick="runLLDPq()"><svg viewBox="0 0 24 24"><path d="M8,5.14V19.14L19,12.14L8,5.14Z"/></svg>Run LLDPq</button>
+                        <div class="spacer"></div>
+                        <button class="btn secondary" onclick="location.href='start.html'">Open Fabric</button>
+                    </div>
+                    <div class="status info" id="run-status"></div>
+                    <pre id="run-output" class="run-output">Click "Run LLDPq" to start a collection and stream the output here&hellip;</pre>
+                </div>
+
+                <!-- Step 6: Update LLDPq -->
+                <div class="su-panel" data-step="5">
+                    <h2>6. Update LLDPq</h2>
+                    <p class="p-desc">Pull the latest LLDPq and reinstall. Configs, keys and monitoring data are preserved across the update.</p>
+
+                    <!-- Docker deployments: a container can't replace its own image — update on the host. -->
+                    <div id="update-docker" style="display:none;">
+                        <div class="note">This is a <strong>Docker</strong> deployment. A container can't replace its own image, so run the update on the <strong>host</strong> that runs the container:</div>
+                        <pre id="docker-cmd" class="run-output" style="height:auto; min-height:0; padding:14px;">curl -fsSL https://aliaydemir.com/lldpq-amd64.tar.gz | gunzip | docker load &amp;&amp; docker compose up -d</pre>
+                        <div class="p-toolbar">
+                            <button class="btn secondary" onclick="copyDockerCmd(this)"><svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg>Copy command</button>
+                        </div>
+                        <p class="p-desc">Loads the new image and recreates the container; named volumes (config &amp; monitoring data) persist. Run it from the directory containing your <code>docker-compose.yml</code>.</p>
+                    </div>
+
+                    <div id="update-bare">
+                    <div class="note">Heads up: the update reinstalls and <strong>restarts nginx &amp; fcgiwrap</strong>, so this page briefly disconnects and reconnects &mdash; the update keeps running in the background and the log resumes. Requires the LLDPq service account to have passwordless <code>sudo</code>.</div>
+                    <label style="display:flex; align-items:center; gap:8px; margin:6px 0 10px; color:#d4d4d4; font-size:13px; cursor:pointer;">
+                        <input type="checkbox" id="update-backup" style="width:16px; height:16px; accent-color:#76b900;">
+                        Take a full backup (configs / keys / data) before updating
+                    </label>
+                    <div class="p-toolbar">
+                        <button class="btn primary" id="update-btn" onclick="updateLLDPq()"><svg viewBox="0 0 24 24"><path d="M12,4V1L8,5L12,9V6A6,6 0 0,1 18,12C18,13.57 17.4,15 16.42,16.06L17.84,17.48C19.17,16.07 20,14.13 20,12A8,8 0 0,0 12,4M6.16,7.94L4.74,6.52C3.41,7.93 2.58,9.87 2.58,12A8,8 0 0,0 10.58,20V23L14.58,19L10.58,15V18A6,6 0 0,1 4.58,12C4.58,10.43 5.18,9 6.16,7.94Z"/></svg>Update LLDPq</button>
+                        <div class="spacer"></div>
+                    </div>
+                    <div class="status info" id="update-status"></div>
+                    <pre id="update-output" class="run-output">Click "Update LLDPq" to git pull + reinstall and stream the output here&hellip;</pre>
+                    </div>
+                </div>
+            </div>
+
+            <div class="su-nav">
+                <button class="btn secondary" id="nav-back" onclick="goStep(current-1)"><svg viewBox="0 0 24 24"><path d="M15.41,16.58L10.83,12L15.41,7.41L14,6L8,12L14,18L15.41,16.58Z"/></svg>Back</button>
+                <span class="ind" id="nav-ind">Step 1 of 4</span>
+                <div class="spacer"></div>
+                <button class="btn primary" id="nav-next" onclick="goStep(current+1)">Next<svg viewBox="0 0 24 24"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"/></svg></button>
+            </div>
+        </div>
+    </div>
+
+<script>
+const STEPS = [
+    { key:'devices',  label:'Inventory',        desc:'devices.yaml — switches & credentials' },
+    { key:'keys',     label:'SSH Keys',         desc:'Authorize collector key + sudo' },
+    { key:'topology', label:'Topology',         desc:'topology.dot — expected cabling' },
+    { key:'config',   label:'Topology Config',  desc:'topology_config.yaml — layout rules' },
+    { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
+    { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
+];
+const FILES = {
+    devices:  { url:'/edit-devices',  file:'devices.yaml',          ta:'ta-devices',  st:'st-devices',  loaded:false },
+    topology: { url:'/edit-topology', file:'topology.dot',          ta:'ta-topology', st:'st-topology', loaded:false },
+    config:   { url:'/edit-config',   file:'topology_config.yaml',  ta:'ta-config',   st:'st-config',   loaded:false },
+};
+let current = 0;
+const done = {};   // stepKey -> true
+let keyInfoLoaded = false;   // SSH key panel loaded once
+let keyExists = false;       // a collector key currently exists
+let genArmed = false;        // two-click guard before replacing an existing key
+let runActive = false;       // an lldpq run is in progress (drives polling)
+let runLogShown = false;     // run log fetched once on entering the step
+let runPollTimer = null;
+let schedLoaded = false;     // cron schedules fetched once on entering the run step
+let updateActive = false;    // an update is in progress (drives polling)
+let updateLogShown = false;  // update log fetched once on entering the step
+let updatePollTimer = null;
+
+document.addEventListener('DOMContentLoaded', async () => {
+    // Admin-only: hidden from operators in the menu, and refused here too.
+    if (window.LLDPqAuth) {
+        const ok = await LLDPqAuth.check();
+        if (!ok) return;
+        if (!LLDPqAuth.isAdmin()) {
+            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Setup is admin only.</div>';
+            return;
+        }
+    }
+    renderSteps();
+    goStep(0);
+});
+
+function renderSteps() {
+    const c = document.getElementById('steps');
+    c.innerHTML = STEPS.map((s, i) =>
+        `<div class="su-step" id="step-${i}" onclick="goStep(${i})">
+            <div class="num" id="num-${i}">${i + 1}</div>
+            <div><div class="lbl">${s.label}</div><div class="desc">${s.desc}</div></div>
+        </div>`).join('');
+}
+
+function goStep(i) {
+    if (i < 0 || i >= STEPS.length) return;
+    current = i;
+    document.querySelectorAll('.su-step').forEach((el, idx) => el.classList.toggle('active', idx === i));
+    document.querySelectorAll('.su-panel').forEach(el => el.classList.toggle('active', +el.dataset.step === i));
+    document.getElementById('nav-ind').textContent = `Step ${i + 1} of ${STEPS.length}`;
+    document.getElementById('nav-back').disabled = (i === 0);
+    document.getElementById('nav-next').style.visibility = (i === STEPS.length - 1) ? 'hidden' : 'visible';
+    // Lazy-load file editors the first time their step is shown.
+    const key = STEPS[i].key;
+    if (FILES[key] && !FILES[key].loaded) loadFile(key, false);
+    if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
+    if (key === 'run' && !runLogShown) { runLogShown = true; showRunLog(); }
+    if (key === 'run' && !schedLoaded) { schedLoaded = true; loadSchedules(); }
+    if (key === 'update') {
+        checkDockerForUpdate();
+        if (!updateLogShown) { updateLogShown = true; showUpdateLog(); }
+    }
+}
+
+function markDone(stepKey, isDone) {
+    const idx = STEPS.findIndex(s => s.key === stepKey);
+    if (idx < 0) return;
+    done[stepKey] = isDone;
+    const el = document.getElementById('step-' + idx);
+    const num = document.getElementById('num-' + idx);
+    if (el) el.classList.toggle('done', !!isDone);
+    if (num) num.innerHTML = isDone ? '&#10003;' : (idx + 1);
+}
+
+function setStatus(id, msg, cls) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = 'status ' + (cls || 'info');
+    el.textContent = msg || '';
+}
+
+async function loadFile(key, force) {
+    const cfg = FILES[key];
+    if (!cfg) return;
+    const ta = document.getElementById(cfg.ta);
+    if (cfg.loaded && !force) return;
+    setStatus(cfg.st, 'Loading…', 'info');
+    try {
+        const r = await fetch(cfg.url, { cache: 'no-store' });
+        const data = await r.json();
+        if (data.success) {
+            ta.value = data.content || '';
+            cfg.loaded = true;
+            setStatus(cfg.st, ta.value.trim() ? ('Loaded ' + cfg.file) : (cfg.file + ' is empty — fill it in below.'), 'info');
+            markDone(key, !!ta.value.trim());
+        } else {
+            ta.value = '';
+            cfg.loaded = true;   // file may not exist yet; let the admin create it
+            setStatus(cfg.st, (data.error || 'Not found') + ' — you can create it here and Save.', 'info');
+            markDone(key, false);
+        }
+    } catch (e) {
+        setStatus(cfg.st, 'Load failed: ' + e.message, 'err');
+    }
+}
+
+async function saveFile(key) {
+    const cfg = FILES[key];
+    if (!cfg) return;
+    const ta = document.getElementById(cfg.ta);
+    setStatus(cfg.st, 'Saving…', 'info');
+    try {
+        const r = await fetch(cfg.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: ta.value })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (data.success) {
+            setStatus(cfg.st, (data.message || 'Saved ' + cfg.file) + ' \u2713', 'ok');
+            markDone(key, !!ta.value.trim());
+        } else {
+            setStatus(cfg.st, data.error || 'Save failed', 'err');
+        }
+    } catch (e) {
+        setStatus(cfg.st, 'Save failed: ' + e.message, 'err');
+    }
+}
+
+function downloadFile(key) {
+    const cfg = FILES[key];
+    if (!cfg) return;
+    const text = document.getElementById(cfg.ta).value;
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = cfg.file;
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+}
+
+function uploadFile(key, input) {
+    const cfg = FILES[key];
+    const f = input.files && input.files[0];
+    if (!cfg || !f) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+        document.getElementById(cfg.ta).value = e.target.result || '';
+        cfg.loaded = true;
+        setStatus(cfg.st, 'Loaded "' + f.name + '" into the editor \u2014 review and click Save to apply.', 'info');
+    };
+    reader.onerror = () => setStatus(cfg.st, 'Could not read the selected file.', 'err');
+    reader.readAsText(f);
+    input.value = '';   // allow re-selecting the same file
+}
+
+/* ---- Step 2: SSH key info / generate / import / verify ---- */
+async function loadSSHKeyInfo() {
+    const st = document.getElementById('key-state');
+    try {
+        const r = await fetch('/provision-api.sh?action=get-ssh-key', { cache: 'no-store' });
+        const d = await r.json().catch(() => ({}));
+        if (d.success && d.public_key) {
+            keyExists = true;
+            document.getElementById('key-pub').value = d.public_key;
+            document.getElementById('key-file').textContent = d.key_file || '\u2014';
+            st.textContent = 'present'; st.className = 'badge green';
+        } else {
+            keyExists = false;
+            document.getElementById('key-pub').value = '';
+            document.getElementById('key-file').textContent = '\u2014';
+            st.textContent = 'none'; st.className = 'badge gray';
+        }
+    } catch (e) {
+        st.textContent = 'error'; st.className = 'badge gray';
+    }
+}
+
+function copyKey() {
+    const t = document.getElementById('key-pub').value;
+    if (!t) { setStatus('key-progress', 'No key to copy yet.', 'err'); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(t).then(() => setStatus('key-progress', 'Public key copied \u2713', 'ok')).catch(() => fallbackCopyKey(t));
+    } else { fallbackCopyKey(t); }
+}
+function fallbackCopyKey(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px;';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); setStatus('key-progress', 'Public key copied \u2713', 'ok'); }
+    catch (e) { setStatus('key-progress', 'Copy failed \u2014 select the key and copy manually.', 'err'); }
+    ta.remove();
+}
+
+async function generateKey() {
+    const btn = document.getElementById('gen-btn');
+    if (keyExists && !genArmed) {
+        genArmed = true;
+        btn.textContent = 'Confirm replace';
+        setStatus('key-progress', 'A key already exists. Generating a new one REPLACES it \u2014 devices trusting the old key must be re-distributed. Click "Confirm replace" to proceed.', 'err');
+        setTimeout(() => { genArmed = false; btn.textContent = 'Generate'; }, 5000);
+        return;
+    }
+    genArmed = false; btn.textContent = 'Generate';
+    setStatus('key-progress', 'Generating key\u2026', 'info');
+    try {
+        const r = await fetch('/provision-api.sh?action=generate-ssh-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) { await loadSSHKeyInfo(); setStatus('key-progress', 'New key generated \u2014 distribute it to the devices below.', 'ok'); }
+        else setStatus('key-progress', d.error || 'Key generation failed', 'err');
+    } catch (e) { setStatus('key-progress', 'Generate failed: ' + e.message, 'err'); }
+}
+
+function toggleImport() {
+    const a = document.getElementById('key-import');
+    a.style.display = (a.style.display === 'none' || !a.style.display) ? 'block' : 'none';
+    if (a.style.display === 'block') document.getElementById('key-import-text').focus();
+}
+async function importKey() {
+    const key = document.getElementById('key-import-text').value.trim();
+    if (!key || key.indexOf('PRIVATE KEY') < 0) { setStatus('key-import-msg', 'Paste a valid private key.', 'err'); return; }
+    setStatus('key-import-msg', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/provision-api.sh?action=import-ssh-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ private_key: key }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) { setStatus('key-import-msg', 'Key imported \u2713', 'ok'); document.getElementById('key-import-text').value = ''; toggleImport(); loadSSHKeyInfo(); }
+        else setStatus('key-import-msg', d.error || 'Import failed', 'err');
+    } catch (e) { setStatus('key-import-msg', 'Import failed: ' + e.message, 'err'); }
+}
+
+function uploadKey(input) {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = async e => {
+        const key = (e.target.result || '').trim();
+        if (!key || key.indexOf('PRIVATE KEY') < 0) { setStatus('key-progress', 'That file is not a valid OpenSSH private key.', 'err'); return; }
+        setStatus('key-progress', 'Installing uploaded key\u2026', 'info');
+        try {
+            const r = await fetch('/provision-api.sh?action=import-ssh-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ private_key: key }) });
+            const d = await r.json().catch(() => ({}));
+            if (d.success) { await loadSSHKeyInfo(); setStatus('key-progress', 'Key uploaded & installed \u2713 \u2014 now Verify (or Distribute for new devices).', 'ok'); }
+            else setStatus('key-progress', d.error || 'Import failed', 'err');
+        } catch (err) { setStatus('key-progress', 'Upload failed: ' + err.message, 'err'); }
+    };
+    reader.onerror = () => setStatus('key-progress', 'Could not read the selected file.', 'err');
+    reader.readAsText(f);
+    input.value = '';
+}
+
+async function downloadKey() {
+    setStatus('key-progress', 'Preparing private key download\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-private-key' }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success || !d.private_key) { setStatus('key-progress', d.error || 'No private key available to download.', 'err'); return; }
+        const name = (d.key_file || 'id_ed25519').split('/').pop();
+        const blob = new Blob([d.private_key], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+        setStatus('key-progress', 'Downloaded ' + name + ' (PRIVATE key). Keep it safe \u2014 anyone with it can log into your devices. Use \u201cUpload key\u201d on a new install to restore.', 'ok');
+    } catch (e) { setStatus('key-progress', 'Download failed: ' + e.message, 'err'); }
+}
+
+async function verifyKeys() {
+    const btn = document.getElementById('verify-btn');
+    btn.disabled = true;
+    setStatus('key-progress', 'Checking which devices already trust the key (no password)\u2026', 'info');
+    document.getElementById('key-results').style.display = 'none';
+    document.getElementById('key-summary').style.display = 'none';
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'verify' }) });
+        const data = await r.json().catch(() => ({}));
+        if (!data.success) { setStatus('key-progress', data.error || 'Verify failed', 'err'); btn.disabled = false; return; }
+        if (data.public_key && !document.getElementById('key-pub').value) {
+            document.getElementById('key-pub').value = data.public_key;
+            const st = document.getElementById('key-state'); st.textContent = 'present'; st.className = 'badge green'; keyExists = true;
+        }
+        document.getElementById('key-results-head').innerHTML = '<tr><th>Device</th><th>IP</th><th>Key trusted</th></tr>';
+        const body = document.getElementById('key-results-body'); body.innerHTML = '';
+        (data.results || []).forEach(x => {
+            const tr = document.createElement('tr');
+            if (!x.trusted) tr.style.background = 'rgba(244,67,54,.08)';
+            tr.innerHTML =
+                `<td style="color:#ddd;">${x.hostname || ''}</td>` +
+                `<td style="color:#999;font-family:monospace;">${x.ip || ''}</td>` +
+                (x.trusted
+                    ? '<td><span style="color:#76b900;">\u2714 trusted</span></td>'
+                    : `<td><span style="color:#f44336;">\u2716 ${x.msg || 'not trusted'}</span></td>`);
+            body.appendChild(tr);
+        });
+        document.getElementById('key-results').style.display = 'table';
+        const sum = document.getElementById('key-summary'); sum.style.display = 'block';
+        sum.innerHTML = `<strong>${data.trusted || 0}/${data.total || 0}</strong> devices already trust the collector key.`;
+        const allOk = (data.trusted || 0) === (data.total || 0) && (data.total || 0) > 0;
+        setStatus('key-progress', allOk ? 'All devices already trust the key \u2014 no password needed \u2713' : 'Some devices don\u2019t trust the key yet \u2014 use Distribute (with password) for those.', allOk ? 'ok' : 'info');
+        markDone('keys', (data.trusted || 0) > 0);
+    } catch (e) {
+        setStatus('key-progress', 'Verify failed: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+/* ---- Step 2: SSH key distribution (reuses /setup-api.sh) ---- */
+function keyIcon(s) {
+    if (s === 'ok' || s === 'already') return '<span style="color:#76b900;">\u2714</span>';
+    if (s === 'fail') return '<span style="color:#f44336;">\u2716</span>';
+    return '<span style="color:#999;">\u2014</span>';
+}
+function keyColor(s) {
+    if (s === 'ok' || s === 'already') return '#76b900';
+    if (s === 'fail') return '#f44336';
+    return '#999';
+}
+
+async function distributeKeys() {
+    const pw = document.getElementById('key-pw').value;
+    const btn = document.getElementById('key-btn');
+    if (!pw) { setStatus('key-progress', 'Enter the switch admin password first.', 'err'); return; }
+    btn.disabled = true;
+    setStatus('key-progress', 'Distributing key & enabling sudo (this can take a while for large fabrics)…', 'info');
+    document.getElementById('key-results').style.display = 'none';
+    document.getElementById('key-summary').style.display = 'none';
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pw })
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!data.success) {
+            setStatus('key-progress', data.error || 'Distribution failed', 'err');
+            btn.disabled = false;
+            return;
+        }
+        document.getElementById('key-pw').value = '';
+        document.getElementById('key-results-head').innerHTML = '<tr><th>Device</th><th>IP</th><th>SSH Key</th><th>Sudo</th></tr>';
+        const body = document.getElementById('key-results-body');
+        body.innerHTML = '';
+        (data.results || []).sort((a, b) => (a.hostname || '').localeCompare(b.hostname || '')).forEach(x => {
+            const tr = document.createElement('tr');
+            const failed = x.send_key === 'fail' || x.sudo_fix === 'fail';
+            if (failed) tr.style.background = 'rgba(244,67,54,.08)';
+            tr.innerHTML =
+                `<td style="color:#ddd;">${x.hostname || ''}</td>` +
+                `<td style="color:#999;font-family:monospace;">${x.ip || ''}</td>` +
+                `<td title="${(x.send_key_msg || '').replace(/"/g, '&quot;')}">${keyIcon(x.send_key)} <span style="color:${keyColor(x.send_key)};">${x.send_key_msg || x.send_key}</span></td>` +
+                `<td title="${(x.sudo_fix_msg || '').replace(/"/g, '&quot;')}">${keyIcon(x.sudo_fix)} <span style="color:${keyColor(x.sudo_fix)};">${x.sudo_fix_msg || x.sudo_fix}</span></td>`;
+            body.appendChild(tr);
+        });
+        document.getElementById('key-results').style.display = 'table';
+        const sum = document.getElementById('key-summary');
+        sum.style.display = 'block';
+        sum.innerHTML = `<strong>${data.send_key_ok || 0}/${data.total || 0}</strong> devices have the key, ` +
+                        `<strong>${data.sudo_fix_ok || 0}/${data.total || 0}</strong> have passwordless sudo.`;
+        const allOk = (data.send_key_ok || 0) === (data.total || 0) && (data.total || 0) > 0;
+        setStatus('key-progress', allOk ? 'All devices reachable with the collector key \u2713' : 'Done — check failed rows below.', allOk ? 'ok' : 'info');
+        markDone('keys', (data.send_key_ok || 0) > 0);
+    } catch (e) {
+        setStatus('key-progress', 'Distribution failed: ' + e.message, 'err');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+/* ---- Step 5: Run LLDPq (lldpq -) with live output ---- */
+async function runLLDPq() {
+    const btn = document.getElementById('run-btn');
+    btn.disabled = true;
+    runActive = true;
+    setStatus('run-status', 'Starting LLDPq\u2026', 'info');
+    document.getElementById('run-output').textContent = 'Starting\u2026\n';
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run' }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) { setStatus('run-status', d.error || 'Failed to start', 'err'); btn.disabled = false; runActive = false; return; }
+        setStatus('run-status', 'Running\u2026 (this can take a while on large fabrics)', 'info');
+        pollRunLog();
+    } catch (e) {
+        setStatus('run-status', 'Failed to start: ' + e.message, 'err');
+        btn.disabled = false; runActive = false;
+    }
+}
+
+async function pollRunLog() {
+    if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run-log' }) });
+        const d = await r.json().catch(() => ({}));
+        const out = document.getElementById('run-output');
+        if (d.success) {
+            const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 50;
+            out.textContent = d.log || '(no output yet)';
+            if (atBottom) out.scrollTop = out.scrollHeight;
+            if (d.done) {
+                runActive = false;
+                document.getElementById('run-btn').disabled = false;
+                setStatus('run-status', 'Done \u2713 \u2014 Fabric / LLDP / Analysis pages are now up to date.', 'ok');
+                markDone('run', true);
+                return;
+            }
+        }
+    } catch (e) { /* transient — keep polling */ }
+    if (runActive) runPollTimer = setTimeout(pollRunLog, 2000);
+}
+
+async function showRunLog() {
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run-log' }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success && d.log) {
+            const out = document.getElementById('run-output');
+            out.textContent = d.log; out.scrollTop = out.scrollHeight;
+            if (!d.done) {
+                runActive = true;
+                document.getElementById('run-btn').disabled = true;
+                setStatus('run-status', 'A run is in progress\u2026', 'info');
+                pollRunLog();
+            } else {
+                setStatus('run-status', 'Last run finished.', 'info');
+                markDone('run', true);
+            }
+        }
+    } catch (e) { /* ignore */ }
+}
+
+/* ---- Step 6: Update LLDPq (git pull + ./install.sh) with live output ---- */
+async function updateLLDPq() {
+    const btn = document.getElementById('update-btn');
+    const backup = document.getElementById('update-backup').checked;
+    btn.disabled = true;
+    updateActive = true;
+    setStatus('update-status', 'Starting update' + (backup ? ' (with backup)' : '') + '\u2026', 'info');
+    document.getElementById('update-output').textContent = 'Starting\u2026\n';
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update', backup: backup }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); btn.disabled = false; updateActive = false; return; }
+        setStatus('update-status', 'Updating\u2026 (the UI may blink while services restart)', 'info');
+        pollUpdateLog();
+    } catch (e) {
+        setStatus('update-status', 'Failed to start: ' + e.message, 'err');
+        btn.disabled = false; updateActive = false;
+    }
+}
+
+async function pollUpdateLog() {
+    if (updatePollTimer) { clearTimeout(updatePollTimer); updatePollTimer = null; }
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-log' }) });
+        const d = await r.json().catch(() => ({}));
+        const out = document.getElementById('update-output');
+        if (d.success) {
+            const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 50;
+            out.textContent = d.log || '(no output yet)';
+            if (atBottom) out.scrollTop = out.scrollHeight;
+            if (d.done) {
+                updateActive = false;
+                document.getElementById('update-btn').disabled = false;
+                setStatus('update-status', 'Update finished \u2713 \u2014 reload the app if the UI looks stale.', 'ok');
+                markDone('update', true);
+                return;
+            }
+        }
+    } catch (e) {
+        // install.sh restarts nginx/fcgiwrap — the page's own server blinks here.
+        // Keep polling; the detached update continues and the log (in $HOME) survives.
+        setStatus('update-status', 'Reconnecting\u2026 (services restarting; the update is still running in the background)', 'info');
+    }
+    if (updateActive) updatePollTimer = setTimeout(pollUpdateLog, 2500);
+}
+
+async function showUpdateLog() {
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-log' }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success && d.log) {
+            const out = document.getElementById('update-output');
+            out.textContent = d.log; out.scrollTop = out.scrollHeight;
+            // Show the previous run's log for reference, but NEVER lock the button on a
+            // stale/incomplete log (an interrupted run leaves no DONE marker). The user can
+            // always start a fresh update; updateLLDPq() truncates the log first.
+            setStatus('update-status', d.done
+                ? 'Last update finished \u2713'
+                : 'Showing the last run log (may be incomplete) \u2014 click Update LLDPq to run again.', 'info');
+        }
+    } catch (e) { /* ignore */ }
+}
+
+/* ---- Schedules (cron) for the Run step ---- */
+async function loadSchedules() {
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-schedules' }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) {
+            const sl = document.getElementById('sched-lldpq');
+            const sg = document.getElementById('sched-getconf');
+            if (d.lldpq_minutes && sl && [...sl.options].some(o => +o.value === d.lldpq_minutes)) sl.value = String(d.lldpq_minutes);
+            if (d.getconf_hours && sg && [...sg.options].some(o => +o.value === d.getconf_hours)) sg.value = String(d.getconf_hours);
+        }
+    } catch (e) { /* ignore */ }
+}
+
+async function saveSchedules() {
+    const mins = parseInt(document.getElementById('sched-lldpq').value, 10);
+    const hours = parseInt(document.getElementById('sched-getconf').value, 10);
+    setStatus('sched-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-schedules', lldpq_minutes: mins, getconf_hours: hours }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) setStatus('sched-status', 'Saved \u2713  (lldpq: ' + d.lldpq_cron + ', get-conf: ' + d.getconf_cron + ')', 'ok');
+        else setStatus('sched-status', d.error || 'Save failed', 'err');
+    } catch (e) { setStatus('sched-status', 'Save failed: ' + e.message, 'err'); }
+}
+
+/* ---- Docker detection for the Update step (a container can't replace its own image) ---- */
+async function checkDockerForUpdate() {
+    let docker = false;
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'env' }) });
+        const d = await r.json().catch(() => ({}));
+        docker = !!(d && d.docker);
+    } catch (e) { /* default to bare-metal view */ }
+    const dk = document.getElementById('update-docker');
+    const bare = document.getElementById('update-bare');
+    if (dk) dk.style.display = docker ? 'block' : 'none';
+    if (bare) bare.style.display = docker ? 'none' : 'block';
+}
+function copyDockerCmd(btn) {
+    const t = (document.getElementById('docker-cmd').textContent || '').trim();
+    function ok() { if (btn) { const o = btn.innerHTML; btn.innerHTML = 'Copied \u2713'; setTimeout(function () { btn.innerHTML = o; }, 1500); } }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(ok).catch(function () { dkFallbackCopy(t, ok); });
+    else dkFallbackCopy(t, ok);
+}
+function dkFallbackCopy(text, cb) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.cssText = 'position:fixed;left:-9999px;';
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); if (cb) cb(); } catch (e) {}
+    ta.remove();
+}
+</script>
+</body>
+</html>
