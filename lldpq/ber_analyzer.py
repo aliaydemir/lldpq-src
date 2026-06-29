@@ -440,22 +440,38 @@ class BERAnalyzer:
             summary["total_ports"] += 1
             grade = stats.get('grade', 'unknown')
             
+            # Raw / pre-FEC physical BER (from l1-show). FEC can correct a marginal fiber so
+            # the frame BER (packet errors) reads ~0 while the raw BER is high — exactly the
+            # case HPC engineering tracks. Escalate the grade on raw BER so those links surface
+            # instead of all showing EXCELLENT.
+            device = port_name.split(':', 1)[0]
+            interface = port_name.split(':', 1)[1] if ':' in port_name else port_name
+            raw_ber = self._parse_raw_phy_ber_for_device(device).get(interface)
+            eff_grade = grade
+            if isinstance(raw_ber, (int, float)):
+                if raw_ber >= self.config["warning_ber_threshold"]:
+                    eff_grade = BERGrade.CRITICAL.value
+                elif raw_ber >= self.config["raw_ber_threshold"] and eff_grade != BERGrade.CRITICAL.value:
+                    eff_grade = BERGrade.WARNING.value
+
             port_info = {
                 "port": port_name,
                 "ber_value": stats.get('ber_value', 0),
+                "raw_ber": raw_ber if isinstance(raw_ber, (int, float)) else None,
+                "status": eff_grade,
                 "total_packets": stats.get('total_packets', 0),
                 "rx_errors": stats.get('rx_errors', 0),
                 "tx_errors": stats.get('tx_errors', 0),
                 "timestamp": stats.get('timestamp', time.time())
             }
             
-            if grade == BERGrade.EXCELLENT.value:
+            if eff_grade == BERGrade.EXCELLENT.value:
                 summary["excellent_ports"].append(port_info)
-            elif grade == BERGrade.GOOD.value:
+            elif eff_grade == BERGrade.GOOD.value:
                 summary["good_ports"].append(port_info)
-            elif grade == BERGrade.WARNING.value:
+            elif eff_grade == BERGrade.WARNING.value:
                 summary["warning_ports"].append(port_info)
-            elif grade == BERGrade.CRITICAL.value:
+            elif eff_grade == BERGrade.CRITICAL.value:
                 summary["critical_ports"].append(port_info)
             else:
                 summary["unknown_ports"].append(port_info)
@@ -753,17 +769,13 @@ class BERAnalyzer:
         
         # Sort ports by BER status priority (critical/warning first)
         def get_ber_priority(port_info):
-            ber_value = port_info['ber_value']
-            if ber_value >= self.config["critical_ber_threshold"]:
-                return 0  # Critical first
-            elif ber_value >= self.config["warning_ber_threshold"]:
-                return 1  # Warning second  
-            elif ber_value == 0:
-                return 3  # Excellent third (perfect quality)
-            elif ber_value < self.config["raw_ber_threshold"]:
-                return 2  # Good second (low error rate)
-            else:
-                return 4  # Marginal last
+            # Sort by the effective (raw-BER-escalated) status — worst first.
+            return {
+                BERGrade.CRITICAL.value: 0,
+                BERGrade.WARNING.value: 1,
+                BERGrade.GOOD.value: 2,
+                BERGrade.EXCELLENT.value: 3,
+            }.get(port_info.get('status'), 4)
         
         sorted_ports = sorted(all_ports, key=get_ber_priority)
         
@@ -772,27 +784,22 @@ class BERAnalyzer:
             device = port_name.split(':')[0] if ':' in port_name else "unknown"
             interface = port_name.split(':')[1] if ':' in port_name else port_name
             
-            # Determine status and badge class
+            # Status = effective grade (frame BER escalated by raw/physical BER), computed once
+            # in get_ber_summary so the summary cards and this table always agree.
             ber_value = port_info['ber_value']
-            if ber_value == 0:
-                status = "EXCELLENT"
-                badge_class = "badge badge-green"
-            elif ber_value < self.config["raw_ber_threshold"]:
-                status = "GOOD"
-                badge_class = "badge badge-green"
-            elif ber_value < self.config["warning_ber_threshold"]:
-                status = "WARNING"
-                badge_class = "badge badge-orange"
-            else:
-                status = "CRITICAL"
-                badge_class = "badge badge-red"
+            status = str(port_info.get('status') or 'excellent').upper()
+            badge_class = {
+                "EXCELLENT": "badge badge-green",
+                "GOOD": "badge badge-green",
+                "WARNING": "badge badge-orange",
+                "CRITICAL": "badge badge-red",
+            }.get(status, "badge badge-gray")
             
             ber_display = f"{ber_value:.2e}" if ber_value > 0 else "0"
             
-            # Lookup RAW PHY BER for this device/interface (if available)
-            raw_map = self._parse_raw_phy_ber_for_device(device)
-            raw_phy_val = raw_map.get(interface)
-            raw_phy_display = f"{raw_phy_val:.2e}" if isinstance(raw_phy_val, (int, float)) and raw_phy_val is not None else "N/A"
+            # RAW PHY BER (pre-FEC) — already parsed during classification.
+            raw_phy_val = port_info.get('raw_ber')
+            raw_phy_display = f"{raw_phy_val:.2e}" if isinstance(raw_phy_val, (int, float)) else "N/A"
 
             timestamp = datetime.fromtimestamp(port_info['timestamp']).strftime('%H:%M:%S')
             
