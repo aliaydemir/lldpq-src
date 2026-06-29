@@ -27,7 +27,9 @@ services:
       # - ./topology.dot:/var/www/html/topology.dot
       # - ./topology_config.yaml:/var/www/html/topology_config.yaml
 
-      # Optional: Ansible directory (enables VLAN/BGP reports, Fabric Config/Editor/Deploy)
+      # Optional: Ansible directory (enables VLAN/BGP reports, Fabric Config/Editor/Deploy).
+      # Ansible is OFF by default in Docker; uncomment the mount + the ANSIBLE_DIR env below
+      # to enable it (or toggle any time in the UI: Setup -> Integrate Ansible).
       # - ~/ansible:/home/lldpq/ansible:rw
 
       # Persistent monitoring data (survives container restart/recreation)

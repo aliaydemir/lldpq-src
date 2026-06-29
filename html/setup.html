@@ -200,9 +200,29 @@
                     <div class="status info" id="st-config"></div>
                 </div>
 
-                <!-- Step 5: Run LLDPq -->
+                <!-- Step 5: Integrate Ansible -->
                 <div class="su-panel" data-step="4">
-                    <h2>5. Run LLDPq</h2>
+                    <h2>5. Integrate Ansible <span class="p-file">optional</span></h2>
+                    <p class="p-desc">LLDPq can read your Ansible inventory to power the <strong>Ansible</strong> menu (VLAN Report, VRF Report, Fabric Exit/Config/Editor/Deploy). If you don't use Ansible, disable it here and those menu items disappear.</p>
+                    <div class="key-card">
+                        <div class="key-row"><span class="k">Status</span><span id="ans-state" class="badge gray">checking&hellip;</span></div>
+                        <div class="key-row"><span class="k">Directory</span><span id="ans-path" class="mono">&mdash;</span></div>
+                        <label class="key-lbl">Ansible directory (must contain an <code>inventory/</code> folder):</label>
+                        <input type="text" id="ans-input" class="sched-sel" style="width:100%; min-width:0;" placeholder="/home/USER/ansible" autocomplete="off" spellcheck="false">
+                        <div id="ans-candidates" class="p-desc" style="margin:8px 0 0;"></div>
+                        <div class="p-toolbar">
+                            <button class="btn primary" onclick="saveAnsible()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Use this directory</button>
+                            <button class="btn secondary" onclick="disableAnsible()">I don't use Ansible (disable)</button>
+                            <button class="btn secondary" onclick="loadAnsible()">Refresh</button>
+                        </div>
+                        <div class="status info" id="ans-status"></div>
+                    </div>
+                    <p class="p-desc" style="color:#888;">Changes take effect immediately; reload the app (or switch pages) to see the left menu update.</p>
+                </div>
+
+                <!-- Step 6: Run LLDPq -->
+                <div class="su-panel" data-step="5">
+                    <h2>6. Run LLDPq</h2>
                     <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
 
                     <div class="sched-card">
@@ -230,6 +250,20 @@
                         </div>
                     </div>
 
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Collection parallelism (max parallel SSH sessions)</span></div>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:6px 16px; margin-top:6px;">
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Monitor <select id="par-monitor" class="sched-sel" style="min-width:90px;"></select></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">LLDP check <select id="par-lldp" class="sched-sel" style="min-width:90px;"></select></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Assets <select id="par-assets" class="sched-sel" style="min-width:90px;"></select></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Get configs <select id="par-getconfigs" class="sched-sel" style="min-width:90px;"></select></label>
+                        </div>
+                        <div class="p-toolbar" style="margin-top:10px;">
+                            <button class="btn secondary" onclick="saveParallel()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save parallelism</button>
+                            <span class="status info" id="par-status" style="margin-top:0;"></span>
+                        </div>
+                    </div>
+
                     <div class="p-toolbar">
                         <button class="btn primary" id="run-btn" onclick="runLLDPq()"><svg viewBox="0 0 24 24"><path d="M8,5.14V19.14L19,12.14L8,5.14Z"/></svg>Run LLDPq</button>
                         <div class="spacer"></div>
@@ -239,9 +273,9 @@
                     <pre id="run-output" class="run-output">Click "Run LLDPq" to start a collection and stream the output here&hellip;</pre>
                 </div>
 
-                <!-- Step 6: Update LLDPq -->
-                <div class="su-panel" data-step="5">
-                    <h2>6. Update LLDPq</h2>
+                <!-- Step 7: Update LLDPq -->
+                <div class="su-panel" data-step="6">
+                    <h2>7. Update LLDPq</h2>
                     <p class="p-desc">Pull the latest LLDPq and reinstall. Configs, keys and monitoring data are preserved across the update.</p>
 
                     <!-- Docker deployments: a container can't replace its own image — update on the host. -->
@@ -255,6 +289,7 @@
                     </div>
 
                     <div id="update-bare">
+                    <div class="note">This online update needs <strong>internet access to <code>github.com</code></strong> &mdash; it runs <code>git pull</code> / <code>git clone</code> against the public LLDPq repository. On an air-gapped host (no internet / no GitHub access) this button won&rsquo;t work; use an offline update instead.</div>
                     <div class="note">Heads up: the update reinstalls and <strong>restarts nginx &amp; fcgiwrap</strong>, so this page briefly disconnects and reconnects &mdash; the update keeps running in the background and the log resumes. Requires the LLDPq service account to have passwordless <code>sudo</code>.</div>
                     <label style="display:flex; align-items:center; gap:8px; margin:6px 0 10px; color:#d4d4d4; font-size:13px; cursor:pointer;">
                         <input type="checkbox" id="update-backup" style="width:16px; height:16px; accent-color:#76b900;">
@@ -266,6 +301,30 @@
                     </div>
                     <div class="status info" id="update-status"></div>
                     <pre id="update-output" class="run-output">Click "Update LLDPq" to git pull + reinstall and stream the output here&hellip;</pre>
+
+                    <details style="margin-top:16px; border-top:1px solid #333; padding-top:12px;">
+                        <summary style="cursor:pointer; color:#76b900; font-size:13px; font-weight:600;">No internet on this host? Offline update &raquo;</summary>
+                        <div style="margin-top:12px;">
+                            <div class="note">Update without GitHub access using the source tarball &mdash; no network needed on this host:
+                                <ol style="margin:8px 0 0 18px; padding:0;">
+                                    <li>On a machine <strong>with</strong> internet, download <a href="https://aliaydemir.com/lldpq-src.tar.gz" target="_blank" rel="noopener" style="color:#76b900;">lldpq-src.tar.gz</a>.</li>
+                                    <li>Copy it to this host, e.g. <code>scp lldpq-src.tar.gz &lt;host&gt;:/tmp/</code> (make sure it&rsquo;s readable by the LLDPq service account).</li>
+                                    <li>Enter the path below and click <strong>Update from tarball</strong>. It runs <code>install.sh</code> in update mode (no apt/pip/GitHub).</li>
+                                </ol>
+                            </div>
+                            <div class="key-input">
+                                <input type="text" id="offline-path" value="/tmp/lldpq-src.tar.gz" placeholder="/tmp/lldpq-src.tar.gz" autocomplete="off" spellcheck="false">
+                            </div>
+                            <label style="display:flex; align-items:center; gap:8px; margin:6px 0 10px; color:#d4d4d4; font-size:13px; cursor:pointer;">
+                                <input type="checkbox" id="offline-backup" style="width:16px; height:16px; accent-color:#76b900;">
+                                Take a full backup (configs / keys / data) before updating
+                            </label>
+                            <div class="p-toolbar">
+                                <button class="btn primary" id="offline-btn" onclick="updateLLDPqOffline()"><svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M13,13V18H10V13H7L12,8L17,13H13Z"/></svg>Update from tarball</button>
+                                <div class="spacer"></div>
+                            </div>
+                        </div>
+                    </details>
                     </div>
                 </div>
             </div>
@@ -285,6 +344,7 @@ const STEPS = [
     { key:'keys',     label:'SSH Keys',         desc:'Authorize collector key + sudo' },
     { key:'topology', label:'Topology',         desc:'topology.dot — expected cabling' },
     { key:'config',   label:'Topology Config',  desc:'topology_config.yaml — layout rules' },
+    { key:'ansible',  label:'Integrate Ansible', desc:'Optional — VLAN/VRF/Fabric reports' },
     { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
     { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
 ];
@@ -302,6 +362,8 @@ let runActive = false;       // an lldpq run is in progress (drives polling)
 let runLogShown = false;     // run log fetched once on entering the step
 let runPollTimer = null;
 let schedLoaded = false;     // cron schedules fetched once on entering the run step
+let parallelLoaded = false;  // parallelism fetched once on entering the run step
+let ansibleLoaded = false;   // ansible status fetched once on entering its step
 let updateActive = false;    // an update is in progress (drives polling)
 let updateLogShown = false;  // update log fetched once on entering the step
 let updatePollTimer = null;
@@ -317,7 +379,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
     renderSteps();
-    goStep(0);
+    // Allow deep-linking to a step, e.g. setup.html?step=update (used by the index "Update Available" popup).
+    var startIdx = 0;
+    try {
+        var sp = new URLSearchParams(location.search).get('step') || (location.hash || '').replace('#', '');
+        if (sp) { var si = STEPS.findIndex(function (s) { return s.key === sp; }); if (si >= 0) startIdx = si; }
+    } catch (e) {}
+    goStep(startIdx);
 });
 
 function renderSteps() {
@@ -341,8 +409,10 @@ function goStep(i) {
     const key = STEPS[i].key;
     if (FILES[key] && !FILES[key].loaded) loadFile(key, false);
     if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
+    if (key === 'ansible' && !ansibleLoaded) { ansibleLoaded = true; loadAnsible(); }
     if (key === 'run' && !runLogShown) { runLogShown = true; showRunLog(); }
     if (key === 'run' && !schedLoaded) { schedLoaded = true; loadSchedules(); }
+    if (key === 'run' && !parallelLoaded) { parallelLoaded = true; loadParallel(); }
     if (key === 'update') {
         checkDockerForUpdate();
         if (!updateLogShown) { updateLogShown = true; showUpdateLog(); }
@@ -716,22 +786,45 @@ async function showRunLog() {
 }
 
 /* ---- Step 6: Update LLDPq (git pull + ./install.sh) with live output ---- */
+function setUpdateButtons(disabled) {
+    ['update-btn', 'offline-btn'].forEach(function (id) { const b = document.getElementById(id); if (b) b.disabled = disabled; });
+}
+
 async function updateLLDPq() {
-    const btn = document.getElementById('update-btn');
     const backup = document.getElementById('update-backup').checked;
-    btn.disabled = true;
+    setUpdateButtons(true);
     updateActive = true;
     setStatus('update-status', 'Starting update' + (backup ? ' (with backup)' : '') + '\u2026', 'info');
     document.getElementById('update-output').textContent = 'Starting\u2026\n';
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update', backup: backup }) });
         const d = await r.json().catch(() => ({}));
-        if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); btn.disabled = false; updateActive = false; return; }
+        if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); setUpdateButtons(false); updateActive = false; return; }
         setStatus('update-status', 'Updating\u2026 (the UI may blink while services restart)', 'info');
         pollUpdateLog();
     } catch (e) {
         setStatus('update-status', 'Failed to start: ' + e.message, 'err');
-        btn.disabled = false; updateActive = false;
+        setUpdateButtons(false); updateActive = false;
+    }
+}
+
+async function updateLLDPqOffline() {
+    const path = (document.getElementById('offline-path').value || '').trim();
+    if (!path) { setStatus('update-status', 'Enter the tarball path (e.g. /tmp/lldpq-src.tar.gz).', 'err'); return; }
+    const backup = document.getElementById('offline-backup').checked;
+    setUpdateButtons(true);
+    updateActive = true;
+    setStatus('update-status', 'Starting offline update from ' + path + (backup ? ' (with backup)' : '') + '\u2026', 'info');
+    document.getElementById('update-output').textContent = 'Starting\u2026\n';
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-offline', path: path, backup: backup }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); setUpdateButtons(false); updateActive = false; return; }
+        setStatus('update-status', 'Updating\u2026 (the UI may blink while services restart)', 'info');
+        pollUpdateLog();
+    } catch (e) {
+        setStatus('update-status', 'Failed to start: ' + e.message, 'err');
+        setUpdateButtons(false); updateActive = false;
     }
 }
 
@@ -747,7 +840,7 @@ async function pollUpdateLog() {
             if (atBottom) out.scrollTop = out.scrollHeight;
             if (d.done) {
                 updateActive = false;
-                document.getElementById('update-btn').disabled = false;
+                setUpdateButtons(false);
                 setStatus('update-status', 'Update finished \u2713 \u2014 reload the app if the UI looks stale.', 'ok');
                 markDone('update', true);
                 return;
@@ -829,6 +922,82 @@ function dkFallbackCopy(text, cb) {
     document.body.appendChild(ta); ta.select();
     try { document.execCommand('copy'); if (cb) cb(); } catch (e) {}
     ta.remove();
+}
+
+/* ---- Step 5: Integrate Ansible ---- */
+async function loadAnsible() {
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-ansible' }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) return;
+        const st = document.getElementById('ans-state');
+        if (d.disabled) { st.textContent = 'disabled'; st.className = 'badge gray'; }
+        else if (d.exists) { st.textContent = 'integrated'; st.className = 'badge green'; }
+        else { st.textContent = 'set, folder missing'; st.className = 'badge gray'; }
+        document.getElementById('ans-path').textContent = d.path || '\u2014';
+        document.getElementById('ans-input').value = d.path || '';
+        const cand = document.getElementById('ans-candidates');
+        if (d.candidates && d.candidates.length) {
+            cand.innerHTML = 'Detected: ' + d.candidates.map(function (c) {
+                return '<a href="#" data-ans="' + c.replace(/"/g, '&quot;') + '" onclick="document.getElementById(\'ans-input\').value=this.getAttribute(\'data-ans\');return false;" style="color:#76b900;">' + c + '</a>';
+            }).join(' &nbsp;|&nbsp; ');
+        } else { cand.textContent = ''; }
+    } catch (e) { /* ignore */ }
+}
+async function saveAnsible() {
+    const dir = document.getElementById('ans-input').value.trim();
+    if (!dir) { setStatus('ans-status', 'Enter a directory, or use "I don\u2019t use Ansible".', 'err'); return; }
+    setStatus('ans-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-ansible', ansible_dir: dir }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) { setStatus('ans-status', 'Ansible integrated \u2713 \u2014 reload the app to see the menu.', 'ok'); loadAnsible(); }
+        else setStatus('ans-status', d.error || 'Failed', 'err');
+    } catch (e) { setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+}
+async function disableAnsible() {
+    setStatus('ans-status', 'Disabling\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-ansible', disable: true }) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) { setStatus('ans-status', 'Ansible disabled \u2713 \u2014 reload the app; the Ansible menu will hide.', 'ok'); loadAnsible(); }
+        else setStatus('ans-status', d.error || 'Failed', 'err');
+    } catch (e) { setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+}
+
+/* ---- Collection parallelism (Run step) ---- */
+async function loadParallel() {
+    const opts = [50, 100, 150, 200, 250, 300, 500];
+    const sels = { monitor: 'par-monitor', lldp: 'par-lldp', assets: 'par-assets', getconfigs: 'par-getconfigs' };
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-parallel' }) });
+        const d = await r.json().catch(() => ({}));
+        Object.keys(sels).forEach(function (k) {
+            const s = document.getElementById(sels[k]);
+            if (!s) return;
+            const cur = (d && d[k]) ? d[k] : 100;
+            let list = opts.slice();
+            if (list.indexOf(cur) < 0) list.push(cur);
+            list.sort(function (a, b) { return a - b; });
+            s.innerHTML = list.map(function (v) { return '<option value="' + v + '"' + (v === cur ? ' selected' : '') + '>' + v + '</option>'; }).join('');
+        });
+    } catch (e) { /* ignore */ }
+}
+async function saveParallel() {
+    const body = {
+        action: 'set-parallel',
+        monitor: parseInt(document.getElementById('par-monitor').value, 10),
+        lldp: parseInt(document.getElementById('par-lldp').value, 10),
+        assets: parseInt(document.getElementById('par-assets').value, 10),
+        getconfigs: parseInt(document.getElementById('par-getconfigs').value, 10)
+    };
+    setStatus('par-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) setStatus('par-status', 'Saved \u2713 \u2014 applies on the next collection.', 'ok');
+        else setStatus('par-status', d.error || 'Save failed', 'err');
+    } catch (e) { setStatus('par-status', 'Save failed: ' + e.message, 'err'); }
 }
 </script>
 </body>

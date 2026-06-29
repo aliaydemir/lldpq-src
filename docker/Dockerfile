@@ -144,13 +144,13 @@ RUN printf '%s\n' \
     'DHCP_LEASES_FILE=/var/lib/dhcp/dhcpd.leases' \
     'ZTP_SCRIPT_FILE=/var/www/html/cumulus-ztp.sh' \
     'BASE_CONFIG_DIR=/home/lldpq/lldpq/sw-base' \
-    'ANSIBLE_DIR=/home/lldpq/ansible' \
+    'ANSIBLE_DIR=NoNe' \
     'EDITOR_ROOT=/home/lldpq' \
     'SKIP_L1=false' \
     'MONITOR_MAX_PARALLEL=100' \
     'LLDP_MAX_PARALLEL=100' \
-    'ASSETS_MAX_PARALLEL=50' \
-    'GET_CONFIGS_MAX_PARALLEL=50' \
+    'ASSETS_MAX_PARALLEL=100' \
+    'GET_CONFIGS_MAX_PARALLEL=100' \
     'SEND_CMD_MAX_PARALLEL=25' \
     'TELEMETRY_MAX_PARALLEL=25' \
     'TRANSCEIVER_FW_MAX_PARALLEL=10' \

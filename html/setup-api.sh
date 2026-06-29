@@ -233,6 +233,37 @@ lldpq_dir = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 action = post_data.get('action', 'setup')
 
+def read_conf():
+    """Read /etc/lldpq.conf into a dict (group-readable by www-data)."""
+    conf = {}
+    try:
+        with open('/etc/lldpq.conf') as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    conf[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return conf
+
+def write_conf(pairs):
+    """Update key=value pairs in /etc/lldpq.conf as the lldpq user (root-owned file)."""
+    if not pairs:
+        return True
+    keys_re = '|'.join(re.escape(k) for k in pairs)
+    parts = ["sudo sed -i -E '/^(" + keys_re + ")=/d' /etc/lldpq.conf 2>/dev/null || true"]
+    for k, v in pairs.items():
+        parts.append('echo ' + shlex.quote(k + '=' + str(v)) + ' | sudo tee -a /etc/lldpq.conf >/dev/null')
+    parts.append('sudo chown root:www-data /etc/lldpq.conf 2>/dev/null || true')
+    parts.append('sudo chmod 664 /etc/lldpq.conf 2>/dev/null || true')
+    try:
+        r = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c', ' && '.join(parts)],
+                           capture_output=True, text=True, timeout=15)
+        return r.returncode == 0
+    except Exception:
+        return False
+
 # ─── Action: Save existing private key ───
 if action == 'save-key':
     private_key = post_data.get('private_key', '').strip()
@@ -426,6 +457,81 @@ if action == 'run-log':
     print(json.dumps({'success': True, 'done': done, 'log': display}))
     sys.exit(0)
 
+# ─── Action: Ansible integration status (current dir, enabled?, auto-detected candidates) ───
+if action == 'get-ansible':
+    conf = read_conf()
+    raw = conf.get('ANSIBLE_DIR', '')
+    disabled = (raw == '' or raw == 'NoNe')
+    path = '' if disabled else raw
+    exists = bool(path) and os.path.isdir(path) and os.path.isdir(os.path.join(path, 'inventory'))
+    home = os.path.expanduser('~' + lldpq_user)
+    candidates = []
+    try:
+        for name in sorted(os.listdir(home)):
+            d = os.path.join(home, name)
+            if os.path.isdir(os.path.join(d, 'inventory')) and os.path.isdir(os.path.join(d, 'playbooks')):
+                candidates.append(d)
+    except Exception:
+        pass
+    print(json.dumps({'success': True, 'disabled': disabled, 'path': path,
+                      'exists': exists, 'candidates': candidates}))
+    sys.exit(0)
+
+# ─── Action: enable/point/disable Ansible integration (writes ANSIBLE_DIR, NoNe = off) ───
+if action == 'set-ansible':
+    disable = bool(post_data.get('disable'))
+    val = (post_data.get('ansible_dir') or '').strip()
+    if disable or not val:
+        new_val = 'NoNe'
+    else:
+        if not (os.path.isdir(val) and os.path.isdir(os.path.join(val, 'inventory'))):
+            print(json.dumps({'success': False, 'error': 'Directory not found or missing an inventory/ folder: ' + val}))
+            sys.exit(0)
+        new_val = val
+    if write_conf({'ANSIBLE_DIR': new_val}):
+        print(json.dumps({'success': True, 'disabled': new_val == 'NoNe',
+                          'path': '' if new_val == 'NoNe' else new_val}))
+    else:
+        print(json.dumps({'success': False, 'error': 'Failed to write config'}))
+    sys.exit(0)
+
+# ─── Action: read collection parallelism ───
+if action == 'get-parallel':
+    conf = read_conf()
+    def _pint(key, default):
+        try:
+            return int(conf.get(key, default))
+        except Exception:
+            return default
+    print(json.dumps({'success': True,
+                      'monitor': _pint('MONITOR_MAX_PARALLEL', 100),
+                      'lldp': _pint('LLDP_MAX_PARALLEL', 100),
+                      'assets': _pint('ASSETS_MAX_PARALLEL', 100),
+                      'getconfigs': _pint('GET_CONFIGS_MAX_PARALLEL', 100)}))
+    sys.exit(0)
+
+# ─── Action: set collection parallelism (presets only) ───
+if action == 'set-parallel':
+    ALLOWED = {50, 100, 150, 200, 250, 300, 500}
+    keymap = {'monitor': 'MONITOR_MAX_PARALLEL', 'lldp': 'LLDP_MAX_PARALLEL',
+              'assets': 'ASSETS_MAX_PARALLEL', 'getconfigs': 'GET_CONFIGS_MAX_PARALLEL'}
+    pairs = {}
+    for fk, ck in keymap.items():
+        try:
+            v = int(post_data.get(fk))
+        except Exception:
+            print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
+            sys.exit(0)
+        if v not in ALLOWED:
+            print(json.dumps({'success': False, 'error': 'Unsupported value for ' + fk}))
+            sys.exit(0)
+        pairs[ck] = v
+    if write_conf(pairs):
+        print(json.dumps({'success': True}))
+    else:
+        print(json.dumps({'success': False, 'error': 'Failed to write config'}))
+    sys.exit(0)
+
 # ─── Action: environment info (is this running inside Docker?) ───
 if action == 'env':
     print(json.dumps({'success': True, 'docker': os.path.exists('/.dockerenv')}))
@@ -500,6 +606,77 @@ echo __LLDPQ_DONE__ >> "$LOG"
                          start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(json.dumps({'success': True, 'message': 'Update started'}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': str(e)}))
+    sys.exit(0)
+
+# ─── Action: Offline Update (apply a source tarball already on the host; no network/GitHub) ───
+if action == 'update-offline':
+    # Docker: a container can't replace its own image — update is a host operation.
+    if os.path.exists('/.dockerenv'):
+        print(json.dumps({'success': False, 'docker': True,
+                          'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
+        sys.exit(0)
+    backup = bool(post_data.get('backup'))
+    tarball = (post_data.get('path') or '/tmp/lldpq-src.tar.gz').strip()
+    # Strict path: absolute, no traversal, no shell metacharacters (it is substituted into the
+    # runner script below, so this also prevents shell injection).
+    if not re.match(r'^/[A-Za-z0-9._/-]+$', tarball) or '..' in tarball:
+        print(json.dumps({'success': False, 'error': 'Enter a simple absolute path like /tmp/lldpq-src.tar.gz (letters, digits, . _ - / only).'}))
+        sys.exit(0)
+    home_dir = os.path.expanduser('~' + lldpq_user)
+    state_dir = os.path.join(home_dir, '.lldpq-state')
+    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
+                   capture_output=True, text=True, timeout=10)
+    script_path = os.path.join(state_dir, 'update-run.sh')
+    log_path = os.path.join(state_dir, 'update.log')
+    # Same log + systemd-run isolation as action=update, so the existing update-log polling
+    # and the UI live view work unchanged. The only difference is the source: extract a local
+    # tarball instead of git pull/clone, then run install.sh -y (update mode = offline-safe:
+    # it skips apt/pip/Monaco which only run on a fresh install).
+    SCRIPT = '''#!/usr/bin/env bash
+TARBALL="__TARBALL__"
+DEST="$HOME/lldpq-src"
+LOG="__LOG__"
+: > "$LOG"
+{
+  echo "=== LLDPq Offline Update $(date) ==="
+  echo "--- tarball: $TARBALL ---"
+  if [ ! -f "$TARBALL" ]; then echo "ERROR: tarball not found (or not readable by $(whoami)): $TARBALL"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  TMP="$(mktemp -d)"
+  echo "--- extracting ---"
+  if ! tar -xzf "$TARBALL" -C "$TMP" 2>&1; then echo "ERROR: extract failed (is this a valid .tar.gz?)"; rm -rf "$TMP"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  INSTALLER="$(find "$TMP" -maxdepth 2 -name install.sh -type f 2>/dev/null | head -1)"
+  if [ -z "$INSTALLER" ]; then echo "ERROR: install.sh not found inside the tarball"; rm -rf "$TMP"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  SRCDIR="$(dirname "$INSTALLER")"
+  echo "--- source: $SRCDIR ---"
+  if rm -rf "$DEST" && mkdir -p "$DEST" && cp -a "$SRCDIR/." "$DEST/"; then cd "$DEST" || cd "$SRCDIR"; else echo "(staging to $DEST failed; running from the extract dir)"; cd "$SRCDIR" || { echo __LLDPQ_DONE__ >> "$LOG"; exit 1; }; fi
+  chmod +x ./install.sh 2>/dev/null
+  echo "--- ./install.sh -y __BACKUP__ (offline) ---"
+  ./install.sh -y __BACKUP__ 2>&1
+  echo "--- install finished (exit $?) ---"
+  rm -rf "$TMP"
+} >> "$LOG" 2>&1
+echo __LLDPQ_DONE__ >> "$LOG"
+'''
+    script = (SCRIPT.replace('__TARBALL__', tarball)
+              .replace('__BACKUP__', '--backup' if backup else '')
+              .replace('__LOG__', log_path))
+    try:
+        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', script_path],
+                           input=script, capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
+            sys.exit(0)
+        launch = ('if sudo systemd-run --no-block --collect '
+                  '--uid=' + shlex.quote(lldpq_user) + ' '
+                  '--setenv=HOME=' + shlex.quote(home_dir) + ' '
+                  '/bin/bash ' + shlex.quote(script_path) + ' 2>/dev/null; then :; '
+                  'else nohup setsid /bin/bash ' + shlex.quote(script_path) + ' >/dev/null 2>&1 & fi')
+        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
+                         start_new_session=True, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(json.dumps({'success': True, 'message': 'Offline update started'}))
     except Exception as e:
         print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
