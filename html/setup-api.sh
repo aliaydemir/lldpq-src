@@ -15,6 +15,35 @@ fi
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
 
+# ─── Fast path: raw tarball upload (Setup → Update → Offline). The request body IS the file
+# (application/octet-stream), so stream stdin straight to disk in big chunks. The generic
+# byte-wise JSON reader below would be far too slow and would corrupt binary data. The
+# destination is fixed server-side (no path injection); the action comes via the query string.
+case "$QUERY_STRING" in
+  *action=upload-src*)
+    echo "Content-Type: application/json"
+    echo ""
+    if [ "$REQUEST_METHOD" != "POST" ]; then echo '{"success": false, "error": "POST required"}'; exit 0; fi
+    UP_DEST="/tmp/lldpq-upload-src.tar.gz"
+    rm -f "$UP_DEST" 2>/dev/null
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+        head -c "$CONTENT_LENGTH" > "$UP_DEST" 2>/dev/null
+    else
+        cat > "$UP_DEST" 2>/dev/null
+    fi
+    chmod 644 "$UP_DEST" 2>/dev/null
+    UP_SZ=$(wc -c < "$UP_DEST" 2>/dev/null | tr -d ' ')
+    UP_MAGIC=$(od -An -tx1 -N2 "$UP_DEST" 2>/dev/null | tr -d ' \n')
+    if [ "${UP_SZ:-0}" -gt 0 ] 2>/dev/null && [ "$UP_MAGIC" = "1f8b" ]; then
+        echo "{\"success\": true, \"path\": \"$UP_DEST\", \"size\": ${UP_SZ}}"
+    else
+        rm -f "$UP_DEST" 2>/dev/null
+        echo "{\"success\": false, \"error\": \"Upload is not a valid .tar.gz (gzip) file.\"}"
+    fi
+    exit 0
+    ;;
+esac
+
 # Output JSON header
 echo "Content-Type: application/json"
 echo ""

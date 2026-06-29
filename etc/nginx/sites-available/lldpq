@@ -214,7 +214,7 @@ server {
             fastcgi_read_timeout 120;
         }
         
-        # SSH Setup API endpoint (send-key + sudo-fix)
+        # SSH Setup API endpoint (send-key + sudo-fix + offline source-tarball upload)
         location = /setup-api.sh {
             fastcgi_pass unix:/var/run/fcgiwrap.socket;
             fastcgi_param SCRIPT_FILENAME /var/www/html/setup-api.sh;
@@ -225,7 +225,9 @@ server {
             fastcgi_param HTTP_COOKIE $http_cookie;
             
             # Longer timeout for parallel SSH operations across all devices
-            fastcgi_read_timeout 120;
+            fastcgi_read_timeout 300;
+            # Allow uploading the source tarball for offline updates (Setup → Update → Offline)
+            client_max_body_size 512m;
         }
         
         # AI Assistant API endpoint (LLM proxy + fabric context)
