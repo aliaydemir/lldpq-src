@@ -46,6 +46,7 @@ mkdir -p "$SCRIPT_DIR/monitor-results"
 mkdir -p "$SCRIPT_DIR/monitor-results/flap-data"
 mkdir -p "$SCRIPT_DIR/monitor-results/bgp-data"
 mkdir -p "$SCRIPT_DIR/monitor-results/evpn-data"
+mkdir -p "$SCRIPT_DIR/monitor-results/dup-data"
 mkdir -p "$SCRIPT_DIR/monitor-results/optical-data"
 mkdir -p "$SCRIPT_DIR/monitor-results/ber-data"
 mkdir -p "$SCRIPT_DIR/monitor-results/hardware-data"
@@ -235,6 +236,38 @@ EOF
         echo "=== EVPN TYPE COUNTS ==="
         sudo vtysh -c "show bgp l2vpn evpn" 2>/dev/null | grep -E '\[[1-5]\]:' | head -1000 || echo "No EVPN routes"
         echo "===EVPN_DATA_END==="
+        
+        # =====================================================================
+        # SECTION 2c: Duplicate IP/MAC Data (EVPN dup-detection + FDB + neighbours)
+        # =====================================================================
+        echo "===DUP_DATA_START==="
+        echo "=== DUP VNI MAP ==="
+        sudo vtysh -c "show evpn vni" 2>/dev/null
+        echo "=== DUP CONFIG ==="
+        sudo vtysh -c "show evpn" 2>/dev/null | grep -i -A1 "duplicate"
+        echo "=== DUP ARP ==="
+        sudo vtysh -c "show evpn arp-cache vni all duplicate" 2>/dev/null
+        echo "=== DUP MAC ==="
+        sudo vtysh -c "show evpn mac vni all duplicate" 2>/dev/null
+        echo "=== DUP LOG ==="
+        sudo grep -i "detected as duplicate" /var/log/frr/frr.log 2>/dev/null | tail -300
+        # MAC / IP mobility: entries whose EVPN sequence number is >= 10 (a 2+ digit local or
+        # remote seq). Works even where dup-address-detection is OFF (EVPN-MH), because the
+        # mobility sequence is ALWAYS tracked. Stable MACs (0/0) and normal failovers (<10)
+        # are filtered out on-device to keep this small.
+        echo "=== DUP MACMOB ==="
+        sudo vtysh -c "show evpn mac vni all" 2>/dev/null | grep -E "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" | head -800
+        echo "=== DUP ARPMOB ==="
+        sudo vtysh -c "show evpn arp-cache vni all" 2>/dev/null | grep -E "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" | head -800
+        echo "===DUP_DATA_END==="
+        
+        echo "===FDB_DATA_START==="
+        sudo /usr/sbin/bridge fdb show 2>/dev/null | grep -E -v "00:00:00:00:00:00"
+        echo "===FDB_DATA_END==="
+        
+        echo "===NEIGH_DATA_START==="
+        ip -4 neighbour show 2>/dev/null
+        echo "===NEIGH_DATA_END==="
         
         # =====================================================================
         # SECTION 3: Carrier Transitions (for flap analysis)
@@ -485,6 +518,14 @@ EOF
         sed -n '/===EVPN_DATA_START===/,/===EVPN_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
             grep -v "===EVPN_DATA" > "monitor-results/evpn-data/${hostname}_evpn.txt"
         
+        # Extract Duplicate IP/MAC data (EVPN dup-detection + FDB + neighbours)
+        sed -n '/===DUP_DATA_START===/,/===DUP_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+            grep -v "===DUP_DATA" > "monitor-results/dup-data/${hostname}_dup.txt"
+        sed -n '/===FDB_DATA_START===/,/===FDB_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+            grep -v "===FDB_DATA" > "monitor-results/dup-data/${hostname}_fdb.txt"
+        sed -n '/===NEIGH_DATA_START===/,/===NEIGH_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+            grep -v "===NEIGH_DATA" > "monitor-results/dup-data/${hostname}_neigh.txt"
+        
         # Extract Carrier data
         echo "=== CARRIER TRANSITIONS ===" > "monitor-results/flap-data/${hostname}_carrier_transitions.txt"
         sed -n '/===CARRIER_DATA_START===/,/===CARRIER_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
@@ -616,6 +657,7 @@ fi
 python3 process_ber_data.py >/dev/null 2>&1 &
 python3 process_hardware_data.py >/dev/null 2>&1 &
 python3 process_log_data.py >/dev/null 2>&1 &
+python3 process_duplicate_data.py >/dev/null 2>&1 &
 
 # Wait for all
 wait
