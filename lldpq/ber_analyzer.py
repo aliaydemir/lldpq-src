@@ -1409,6 +1409,7 @@ class BERAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/analysis-guard.js"></script>
 </body>
 </html>"""
         

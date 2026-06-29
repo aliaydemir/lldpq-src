@@ -245,6 +245,8 @@ EOF
         sudo vtysh -c "show evpn vni" 2>/dev/null
         echo "=== DUP CONFIG ==="
         sudo vtysh -c "show evpn" 2>/dev/null | grep -i -A1 "duplicate"
+        echo "=== DUP SELF ==="
+        sudo vtysh -c "show evpn vni detail" 2>/dev/null | grep -i "Local Vtep Ip" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | sort -u
         echo "=== DUP ARP ==="
         sudo vtysh -c "show evpn arp-cache vni all duplicate" 2>/dev/null
         echo "=== DUP MAC ==="
