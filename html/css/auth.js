@@ -14,6 +14,7 @@ const LLDPqAuth = {
             if (data.authenticated) {
                 this.user = data.username;
                 this.role = data.role;
+                try { localStorage.setItem('lldpq_role', data.role || ''); } catch (e) {}
                 return true;
             } else {
                 this.redirectToLogin();
@@ -53,6 +54,7 @@ const LLDPqAuth = {
         } catch (e) {
             console.error('Logout error:', e);
         }
+        try { localStorage.removeItem('lldpq_role'); } catch (e) {}
         this.getTopWindow().location.href = '/login.html';
     },
     
