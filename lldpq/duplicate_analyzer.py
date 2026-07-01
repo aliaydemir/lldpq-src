@@ -24,6 +24,7 @@ import os
 import re
 import json
 import html
+import time
 from datetime import datetime, timezone
 
 try:
@@ -44,8 +45,11 @@ LOG_RE = re.compile(
 # Severity thresholds
 ACTIVE_WINDOW_SEC = 3600       # a dup event within this window = actively flapping
 APIPA_CRITICAL = 50            # APIPA neighbours on one switch >= this = critical
-SEQ_WARN = 10                  # EVPN mobility seq >= this = notable mobility (WARNING) -- works with DAD off
-SEQ_HIGH = 1000                # EVPN mobility seq >= this = severe mobility (CRITICAL even if not climbing)
+SEQ_WARN = 10                  # EVPN mobility seq >= this = the entry has moved at all (collection floor)
+# A single-MAC, single-location, non-climbing entry is only treated as a (past) duplicate if its
+# sequence is this high -- real duplicate storms reach 100k+, whereas normal EVPN-MH failover churn
+# stays in the hundreds. This keeps genuine settled duplicates while dropping MH mobility noise.
+SEQ_STORM = 10000
 LOOP_MIN_MACS = 10             # >= this many MACs flapping between the SAME endpoint pair (no dup IP) = likely L2 loop
 
 
@@ -76,6 +80,7 @@ class DuplicateAnalyzer:
         self.mac_dups = {}             # (vlan, mac) -> record
         self.apipa = {}                # host -> {'total': int, 'per_vlan': {vlan: count}}
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}
+        self.if_desc = {}              # (host, port) -> interface description (ifalias)
         self.arp_pairs = {}            # (vlan, ip) -> {mac -> set(hosts)}
         self.mac_mob = {}              # (vlan, mac) -> {seq, hosts, vteps, ports, vni}  (EVPN mobility seq>=WARN)
         self.ip_mob = {}               # (vlan, ip)  -> {seq, macs, vteps, vni}
@@ -86,6 +91,11 @@ class DuplicateAnalyzer:
         self.global_now = None         # max log timestamp seen (clock-safe "now")
         self.prev_state = self._load_state()
         self.new_state = {}
+        # Cross-cycle memory of each duplicate IP's owner ports + MACs (fast flappers rarely have
+        # BOTH ends captured in one snapshot). Keyed "vlan|ip" -> {ports:{host:port}, macs:[], ts}.
+        self.ip_state_file = os.path.join(self.dup_dir, "dup_ip_state.json")
+        self.prev_ip_state = self._load_ip_state()
+        self.new_ip_state = {}
 
     # ------------------------------------------------------------------ state
     def _load_state(self):
@@ -95,10 +105,22 @@ class DuplicateAnalyzer:
         except Exception:
             return {}
 
+    def _load_ip_state(self):
+        try:
+            with open(self.ip_state_file) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
     def _save_state(self):
         try:
             with open(self.state_file, "w") as f:
                 json.dump(self.new_state, f)
+        except Exception:
+            pass
+        try:
+            with open(self.ip_state_file, "w") as f:
+                json.dump(self.new_ip_state, f)
         except Exception:
             pass
 
@@ -140,7 +162,7 @@ class DuplicateAnalyzer:
         cur = None
         buf = []
         for line in text.splitlines():
-            m = re.match(r'^===\s*DUP (VNI MAP|CONFIG|SELF|ARP|MAC|LOG|MACMOB|ARPMOB)\s*===\s*$', line)
+            m = re.match(r'^===\s*DUP (VNI MAP|CONFIG|SELF|ARP|MAC|LOG|MACMOB|ARPMOB|IFALIAS)\s*===\s*$', line)
             if m:
                 if cur is not None:
                     sections[cur] = buf
@@ -163,6 +185,7 @@ class DuplicateAnalyzer:
         self._parse_log(sec.get("LOG", []))
         self._parse_mac_mobility(host, sec.get("MACMOB", []))
         self._parse_ip_mobility(host, sec.get("ARPMOB", []))
+        self._parse_ifalias(host, sec.get("IFALIAS", []))
 
     def _parse_vni_map(self, lines):
         for line in lines:
@@ -187,6 +210,18 @@ class DuplicateAnalyzer:
         for line in lines:
             for ip in IPV4_RE.findall(line):
                 self.self_vteps.setdefault(host, set()).add(ip)
+
+    def _parse_ifalias(self, host, lines):
+        """Interface descriptions ('nv set interface swpX description ...' = kernel ifalias),
+        collected as 'port|description' lines. Lets each switch:port cell name the attached
+        device -> which physical box is duplicating."""
+        for line in lines:
+            if "|" not in line:
+                continue
+            port, desc = line.split("|", 1)
+            port, desc = port.strip(), desc.strip()
+            if port and desc:
+                self.if_desc[(host, port)] = desc
 
     def _vlan_of(self, vni):
         return self.vni_to_vlan.get(str(vni), str(vni))
@@ -474,10 +509,19 @@ class DuplicateAnalyzer:
         for (vlan, ip), mob in self.ip_mob.items():
             rec = self.ip_dups.get((vlan, ip))
             if rec is None:
+                # Mobility-only sighting. Treat as a duplicate only with corroboration: 2+ distinct
+                # MACs (real IP conflict), a climbing sequence (active), or an extreme sequence
+                # (a past storm). A single MAC with a modest stable seq is ordinary EVPN-MH
+                # mobility churn, NOT a duplicate -> skip it.
+                delta = self._seq_delta("ip", "%s|%s" % (mob["vni"], ip), mob["seq"])
+                climbing = delta is not None and delta > 0
+                if not (len(mob["macs"]) >= 2 or climbing or mob["seq"] >= SEQ_STORM):
+                    continue
                 rec = self._blank_ip(vlan, mob["vni"], ip)
                 rec["macs"].update(mob["macs"])
                 rec["vteps"].update(mob["vteps"])
                 rec["mobility"] = True
+                rec["delta"] = delta
                 self.ip_dups[(vlan, ip)] = rec
             rec["seq"] = max(rec["seq"], mob["seq"])
             if rec["delta"] is None:
@@ -487,10 +531,18 @@ class DuplicateAnalyzer:
         for (vlan, mac), mob in self.mac_mob.items():
             rec = self.mac_dups.get((vlan, mac))
             if rec is None:
+                # Mobility-only: keep only if LOCAL on 2+ switches (real MAC conflict), climbing,
+                # or an extreme seq (past storm). A MAC that is local on one switch (and remote via
+                # its normal VTEP everywhere else) with a modest stable seq is ordinary MH churn.
+                delta = self._seq_delta("mac", "%s|%s" % (mob["vni"], mac), mob["seq"])
+                climbing = delta is not None and delta > 0
+                if not (len(mob.get("ports", {})) >= 2 or climbing or mob["seq"] >= SEQ_STORM):
+                    continue
                 rec = self._blank_mac(vlan, mob["vni"], mac)
                 rec["local"] = dict(mob.get("ports", {}))
                 rec["vteps"].update(mob["vteps"])
                 rec["mobility"] = True
+                rec["delta"] = delta
                 self.mac_dups[(vlan, mac)] = rec
             rec["seq"] = max(rec["seq"], mob["seq"])
             if rec["delta"] is None:
@@ -502,12 +554,22 @@ class DuplicateAnalyzer:
         for (vlan, ip), rec in self.ip_dups.items():
             evm = self.log_events.get((rec["vni"], ip)) or self.log_events.get((vlan, ip))
             if evm:
+                # The zebra log carries the OTHER contender MAC(s) for this IP. Merge them so a
+                # mobility/arp-detected IP dup (which only knows the currently-winning MAC) still
+                # links to the conflicting device -> its port resolves below.
+                rec["macs"].update(evm["macs"])
                 rec["vteps"].update(evm["vteps"])
                 if not rec["events"]:
                     rec["events"] = evm["count"]
                 if rec["latest"] is None:
                     rec["latest"] = evm["latest"]
                     rec["recency"] = self._recency(evm["latest"])
+            # Resolve owner ports from FDB for ALL macs now assembled. Mobility/log-detected IP dups
+            # are added AFTER the early port pass, so without this they carry no port at all.
+            for mac in rec["macs"]:
+                for h, port in self.fdb_local.get((vlan, mac), {}).items():
+                    rec["local_hosts"].add(h)
+                    rec["ports"].add("%s:%s" % (h, port))
             rec["severity"] = self._ip_sev(rec)
         for (vlan, mac), rec in self.mac_dups.items():
             evm = self.log_events_mac.get((rec["vni"], mac))
@@ -518,6 +580,29 @@ class DuplicateAnalyzer:
                 rec["recency"] = self._recency(evm["latest"])
                 rec["flagged"] = True
             rec["severity"] = self._mac_sev(rec)
+
+        # Cross-cycle port/MAC memory for duplicate IPs: extreme flappers rarely have BOTH devices
+        # captured in one snapshot, so remember each duplicate IP's owner ports + MACs and merge
+        # with recent prior runs. This lets the Conflict column resolve the other end's port even
+        # when this run only caught one side.
+        now_ts = time.time()
+        for (vlan, ip), rec in self.ip_dups.items():
+            key = "%s|%s" % (vlan, ip)
+            ports = {}
+            for p in rec["ports"]:
+                if ":" in p:
+                    h, pt = p.split(":", 1)
+                    ports[h] = pt
+            prev = self.prev_ip_state.get(key, {})
+            if prev.get("ts", 0) >= now_ts - 21600:   # remember for up to 6h
+                for h, pt in (prev.get("ports") or {}).items():
+                    if h not in ports:
+                        ports[h] = pt
+                        rec["ports"].add("%s:%s" % (h, pt))
+                for m in (prev.get("macs") or []):
+                    rec["macs"].add(m)
+            self.new_ip_state[key] = {"ports": ports, "macs": sorted(rec["macs"]), "ts": now_ts}
+            rec["severity"] = self._ip_sev(rec)
 
         # Classify each MAC duplicate: "duplicate" device (a duplicated IP rides on this MAC,
         # e.g. two power shelves sharing MAC+IP) vs "loop" (many MACs flapping between the SAME
@@ -558,16 +643,22 @@ class DuplicateAnalyzer:
         self._save_state()
 
     def _ip_sev(self, rec):
-        if (rec["recency"] is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
-           (rec["delta"] is not None and rec["delta"] > 0) or rec["seq"] >= SEQ_HIGH:
+        # CRITICAL = a real, present conflict: two distinct MACs claim the same IP (two devices are
+        # up and fighting over it right now -> confirmed IP conflict), OR it is actively moving now
+        # (a duplicate event in the last hour, or a climbing sequence).
+        if len(rec["macs"]) >= 2 or \
+           (rec["recency"] is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
+           (rec["delta"] is not None and rec["delta"] > 0):
             return "CRITICAL"
-        if rec["flagged"] or len(rec["macs"]) >= 2 or rec["seq"] >= SEQ_WARN:
+        # WARNING = a confirmed-but-settled (EVPN-flagged, single owner now) or a suspected-historical
+        # duplicate (one owner now, extreme past sequence).
+        if rec["flagged"] or rec["seq"] >= SEQ_WARN:
             return "WARNING"
         return "OK"
 
     def _mac_sev(self, rec):
         if (rec.get("recency") is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
-           (rec.get("delta") is not None and rec["delta"] > 0) or rec.get("fdb_multi") or rec.get("seq", 0) >= SEQ_HIGH:
+           (rec.get("delta") is not None and rec["delta"] > 0) or rec.get("fdb_multi"):
             return "CRITICAL"
         if rec.get("flagged") or rec.get("seq", 0) >= SEQ_WARN:
             return "WARNING"
@@ -620,18 +711,32 @@ class DuplicateAnalyzer:
             out += ' <span class="delta-up">(+%s)</span>' % "{:,}".format(delta)
         return out
 
-    def _vtep_cell(self, vteps, owner_hosts):
+    def _port_label(self, host, port):
+        """'host:port' with the interface description (ifalias) dimmed on a line below, so each
+        cell names the physically attached device (which box is duplicating)."""
+        base = "%s:%s" % (html.escape(host), html.escape(port))
+        desc = self.if_desc.get((host, port))
+        if desc:
+            base += "<span class='pdesc'>%s</span>" % html.escape(desc)
+        return base
+
+    def _vtep_cell(self, vteps, owner_hosts, port_map=None):
         """Render the conflicting VTEPs as switch names (resolved via vtep2host), dropping the
-        owner's own VTEP so the column shows the OTHER end of the flap (the contender)."""
+        owner's own VTEP so the column shows the OTHER end of the flap (the contender). When the
+        conflicting MAC/IP was also captured LOCAL on that switch (port_map), show switch:port
+        plus that port's interface description."""
         seen = []
         for v in sorted(vteps):
             h = self.vtep2host.get(v)
             if h and h in owner_hosts:
                 continue
-            label = h if h else v
+            if h:
+                label = self._port_label(h, port_map[h]) if (port_map and port_map.get(h)) else html.escape(h)
+            else:
+                label = html.escape(v)
             if label not in seen:
                 seen.append(label)
-        return ", ".join(html.escape(x) for x in seen) or "&mdash;"
+        return "<br>".join(seen) or "&mdash;"
 
     def export_html(self, output_file):
         s = self.summary()
@@ -645,28 +750,63 @@ class DuplicateAnalyzer:
         ip_html = []
         for r in ip_rows:
             macs = "<br>".join(html.escape(m) for m in sorted(r["macs"])) or "&mdash;"
-            owner = "<br>".join(html.escape(p) for p in sorted(r["ports"])) or \
+            owner_parts = []
+            for p in sorted(r["ports"]):
+                if ":" in p:
+                    _h, _pt = p.split(":", 1)
+                    owner_parts.append(self._port_label(_h, _pt))
+                else:
+                    owner_parts.append(html.escape(p))
+            owner = "<br>".join(owner_parts) or \
                     ("<br>".join(html.escape(h) for h in sorted(r["local_hosts"])) or "&mdash;")
-            vteps = self._vtep_cell(r["vteps"], r["local_hosts"])
+            ip_ports = {}
+            for _m in r["macs"]:
+                for _h, _p in self.fdb_local.get((r["vlan"], _m), {}).items():
+                    ip_ports[_h] = _p
+            vteps = self._vtep_cell(r["vteps"], r["local_hosts"], ip_ports)
             vlanvni = "vlan %s<br><span class='dim'>VNI %s</span>" % (html.escape(r["vlan"]), html.escape(r["vni"]))
             devs = set(r["local_hosts"]) | set(p.split(":")[0] for p in r["ports"])
             all_devices |= devs
+            if len(r["macs"]) >= 2:
+                note = "Confirmed &mdash; IP conflict"
+            elif r["flagged"]:
+                note = "Confirmed &mdash; EVPN/log"
+            elif r.get("mobility"):
+                note = ("Suspected &mdash; active mobility"
+                        if (r.get("delta") is not None and r["delta"] > 0)
+                        else "Suspected &mdash; historical mobility")
+            else:
+                note = "&mdash;"
             ip_html.append(
                 "<tr data-sev='%d' data-devices='%s'><td>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
-                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono'>%s</td><td>%s</td><td>%s</td></tr>" % (
+                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
                     sev_rank.get(r["severity"], 3), html.escape(" ".join(sorted(devs))), self._sev_badge(r["severity"]), vlanvni,
                     html.escape(r["ip"]), macs, owner, vteps,
-                    self._seq_cell(r["seq"], r["delta"]), self._ago(r["recency"]), r["events"] or "&mdash;"))
+                    self._seq_cell(r["seq"], r["delta"]), self._ago(r["recency"]), r["events"] or "&mdash;", note))
         if not ip_html:
-            ip_html.append("<tr><td colspan='9' class='empty'>No duplicate IPs detected &#10003;</td></tr>")
+            ip_html.append("<tr><td colspan='10' class='empty'>No duplicate IPs detected &#10003;</td></tr>")
 
         # ---- MAC duplicate rows
+        # Port map from related duplicate IPs: for a duplicate MAC the "other end" is often a
+        # DIFFERENT MAC on the same IP, so pull that device's port from the IP-dup record -> the
+        # Conflict column can then show switch:port (not just switch).
+        mac_ip_ports = {}
+        for (ivlan, iip), irec in self.ip_dups.items():
+            ports = {}
+            for p in irec["ports"]:
+                if ":" in p:
+                    h, pt = p.split(":", 1)
+                    ports[h] = pt
+            for m in irec["macs"]:
+                mac_ip_ports.setdefault((ivlan, m), {}).update(ports)
         mac_rows = sorted(self.mac_dups.values(),
                           key=lambda r: (sev_rank.get(r["severity"], 3), -(r["seq"])))
         mac_html = []
         for r in mac_rows:
-            local = "<br>".join("%s:%s" % (html.escape(h), html.escape(p)) for h, p in sorted(r["local"].items())) or "&mdash;"
-            vteps = self._vtep_cell(r["vteps"], set(r["local"].keys()))
+            local = "<br>".join(self._port_label(h, p) for h, p in sorted(r["local"].items())) or "&mdash;"
+            cport = dict(self.fdb_local.get((r["vlan"], r["mac"]), {}))
+            cport.update(mac_ip_ports.get((r["vlan"], r["mac"]), {}))
+            vteps = self._vtep_cell(r["vteps"], set(r["local"].keys()), cport)
             vlanvni = "vlan %s<br><span class='dim'>VNI %s</span>" % (html.escape(r["vlan"]), html.escape(r["vni"]))
             if r.get("classification") == "duplicate":
                 note = "Duplicate device"
@@ -740,7 +880,7 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__APIPA_CRIT__", str(APIPA_CRITICAL))
         html_doc = html_doc.replace("__DAD_NOTE__", dad_note)
         html_doc = html_doc.replace("__SEQ_WARN__", str(SEQ_WARN))
-        html_doc = html_doc.replace("__SEQ_HIGH__", "{:,}".format(SEQ_HIGH))
+        html_doc = html_doc.replace("__SEQ_STORM__", "{:,}".format(SEQ_STORM))
         html_doc = html_doc.replace("__LOOP_MIN__", str(LOOP_MIN_MACS))
         html_doc = html_doc.replace("__CARDS__", cards_html)
         html_doc = html_doc.replace("__IP_ROWS__", "\n".join(ip_html))
@@ -787,6 +927,7 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
 .dup-table tbody tr:hover { background:#2d2d2d; }
 .mono { font-family:'Consolas','Courier New',monospace; font-size:12px; }
 .dim { color:#888; font-size:11px; }
+.pdesc { display:block; color:#c8964a; font-size:10px; font-style:italic; margin-top:1px; white-space:nowrap; }
 .empty { text-align:center; color:#76b900; padding:18px; }
 .delta-up { color:#ff6b6b; font-weight:bold; }
 .badge { display:inline-block; padding:3px 9px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; }
@@ -860,7 +1001,7 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
   <div class="section-header">Duplicate IPs (per VLAN / VNI)</div>
   <div class="section-content">
     <table class="dup-table" id="ipt">
-      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th></tr></thead>
+      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
       <tbody>__IP_ROWS__</tbody>
     </table>
   </div>
@@ -892,14 +1033,15 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
       <h4>Data sources (collected per switch each cycle)</h4>
       <code>show evpn arp-cache vni all duplicate</code> &mdash; authoritative duplicate IPs + EVPN mobility sequence.<br>
       <code>show evpn mac vni all duplicate</code> &mdash; duplicate MACs (when FRR latches them).<br>
-      <code>show evpn mac / arp-cache vni all</code> (seq &ge; __SEQ_WARN__) &mdash; mobility-based detection; works with DAD off.<br>
+      <code>show evpn mac / arp-cache vni all</code> &mdash; mobility-based detection (works with DAD off); a single-owner entry is only counted when climbing or seq &ge; __SEQ_STORM__.<br>
       <code>bridge fdb show</code> &mdash; same MAC LOCAL on &ge;2 <i>physical</i> ports (bonds excluded = EVPN-MH dual-homing).<br>
       <code>ip -4 neigh show</code> &mdash; APIPA (169.254/16 = DHCP failed) + IP&harr;multi-MAC.<br>
       zebra log <code>"detected as duplicate"</code> &mdash; timestamped event history (recency &amp; rate).
       <h4>Severity</h4>
-      <b>CRITICAL</b> &mdash; a duplicate event logged within the last hour, OR the EVPN sequence
-      <b>increased since the previous cycle</b> (actively flapping now), OR seq &ge; __SEQ_HIGH__.<br>
-      <b>WARNING</b> &mdash; flagged, or seq &ge; __SEQ_WARN__ but stable (quiesced / history of mobility).<br>
+      <b>CRITICAL (active)</b> &mdash; moving right now: a duplicate event in the last hour, OR the EVPN
+      sequence <b>increased since the previous cycle</b> (climbing &#916;).<br>
+      <b>WARNING (quiesced)</b> &mdash; a real duplicate that is currently settled: EVPN-flagged, 2+ MACs
+      on one IP, or a high but flat sequence. A flat high sequence is NOT "active".<br>
       APIPA &mdash; CRITICAL when &ge; __APIPA_CRIT__ APIPA addresses on one switch+VLAN, else WARNING.
       <h4>EVPN duplicate-address-detection (DAD) &amp; multihoming</h4>
       Configured threshold: <code>__CFG__</code> (max-moves / window). FRR <b>automatically disables DAD on
@@ -908,9 +1050,14 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
       duplicates are instead caught by the mobility sequence below (always tracked).__DAD_NOTE__
       <h4>Mobility sequence &amp; &#916; (works even with DAD off)</h4>
       Every MAC/IP carries an EVPN mobility <b>sequence</b> that increments each time it moves between
-      owners. A stable / dual-homed entry stays at <code>0/0</code>; a real duplicate shows a <b>high or
-      climbing</b> sequence. The <code>(+N)</code> next to a seq is the increase since the previous run &mdash;
-      a positive &#916; means it is actively moving <b>right now</b>.
+      owners. A stable / dual-homed entry stays at <code>0/0</code>. The <code>(+N)</code> next to a seq is
+      the increase since the previous run &mdash; a positive &#916; means it is moving <b>right now</b>.
+      To avoid false positives from ordinary EVPN-MH failover churn, a single-owner entry (one MAC, one
+      location, not climbing) is only reported when its sequence is extreme (&ge; __SEQ_STORM__).
+      <h4>Note column &mdash; confirmed vs suspected (IP table)</h4>
+      <b>Confirmed</b> &mdash; 2+ MACs claim the IP, or EVPN/zebra flagged it. <b>Suspected &mdash; active
+      mobility</b> &mdash; one owner seen but the sequence is climbing now. <b>Suspected &mdash; historical
+      mobility</b> &mdash; one owner now, with an extreme past sequence (a duplicate that has since settled).
       <h4>Note column &mdash; duplicate vs loop</h4>
       <b>Duplicate device</b> &mdash; the same MAC also owns a duplicated IP (two devices sharing MAC+IP,
       e.g. power shelves). <b>Possible loop</b> &mdash; &ge; __LOOP_MIN__ MACs flapping between the same
@@ -997,7 +1144,7 @@ function runAnalysis(){
 }
 function csvEsc(v){ v=(v==null?'':String(v)); return '"'+v.replace(/"/g,'""')+'"'; }
 function downloadCSV(){
-  var out=[['Severity','VLAN/VNI','IP','MAC(s)','Owner','Conflict VTEP(s)','EVPN Seq','Last Dup Event','Events']];
+  var out=[['Severity','VLAN/VNI','IP','MAC(s)','Owner','Conflict VTEP(s)','EVPN Seq','Last Dup Event','Events','Note']];
   Array.prototype.slice.call(document.querySelectorAll('#ipt tbody tr')).forEach(function(r){
     if(r.style.display==='none' || r.querySelector('.empty')) return;
     out.push(Array.prototype.slice.call(r.cells).map(function(c){ return (c.innerText||'').trim().replace(/\\s+/g,' '); }));

@@ -261,6 +261,10 @@ EOF
         sudo vtysh -c "show evpn mac vni all" 2>/dev/null | grep -E "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" | head -800
         echo "=== DUP ARPMOB ==="
         sudo vtysh -c "show evpn arp-cache vni all" 2>/dev/null | grep -E "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" | head -800
+        # Interface descriptions (nv set interface swpX description = kernel ifalias): names the
+        # device attached to each switch:port so the analysis can show WHICH box is duplicating.
+        echo "=== DUP IFALIAS ==="
+        for _f in /sys/class/net/*/ifalias; do _a=$(cat "$_f" 2>/dev/null); [ -n "$_a" ] && echo "$(basename "$(dirname "$_f")")|$_a"; done
         echo "===DUP_DATA_END==="
         
         echo "===FDB_DATA_START==="
