@@ -14,6 +14,7 @@ fi
 
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
+WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
 # ─── Fast path: raw tarball upload (Setup → Update → Offline). The request body IS the file
 # (application/octet-stream), so stream stdin straight to disk in big chunks. The generic
@@ -62,7 +63,7 @@ if [ "$REQUEST_METHOD" != "POST" ]; then
 fi
 
 # Export for Python
-export LLDPQ_DIR LLDPQ_USER POST_DATA
+export LLDPQ_DIR LLDPQ_USER WEB_ROOT POST_DATA
 
 python3 << 'PYTHON'
 import json
@@ -259,6 +260,7 @@ except:
 
 lldpq_user = os.environ.get('LLDPQ_USER', 'lldpq')
 lldpq_dir = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
+web_root = os.environ.get('WEB_ROOT', '/var/www/html')
 devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 action = post_data.get('action', 'setup')
 
@@ -985,6 +987,111 @@ if action == 'test-alert':
             print(json.dumps({'success': False, 'error': 'Slack returned HTTP ' + str(code)}))
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Send failed: ' + str(e)[:200]}))
+    sys.exit(0)
+
+# ─── Action: Export config bundle (devices/topology/topology_config/notifications) ───
+if action == 'backup-export':
+    import base64, io, tarfile, time as _t
+    wanted = [('devices.yaml', lldpq_dir), ('topology.dot', lldpq_dir),
+              ('topology_config.yaml', lldpq_dir), ('notifications.yaml', lldpq_dir),
+              ('display-aliases.json', web_root)]
+    buf = io.BytesIO()
+    added = []
+    try:
+        with tarfile.open(fileobj=buf, mode='w:gz') as tar:
+            for fn, base_dir in wanted:
+                p = os.path.join(base_dir, fn)
+                if os.path.isfile(p):
+                    tar.add(p, arcname=fn)
+                    added.append(fn)
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': 'Bundle failed: ' + str(e)}))
+        sys.exit(0)
+    if not added:
+        print(json.dumps({'success': False, 'error': 'No config files found to back up.'}))
+        sys.exit(0)
+    name = 'lldpq-config-%s.tar.gz' % _t.strftime('%Y%m%d-%H%M%S')
+    print(json.dumps({'success': True, 'filename': name, 'files': added,
+                      'data': base64.b64encode(buf.getvalue()).decode()}))
+    sys.exit(0)
+
+# ─── Action: Restore config bundle (upload) — only known config files, no path traversal ───
+if action == 'backup-import':
+    import base64, io, tarfile
+    b64 = post_data.get('data', '')
+    if not b64:
+        print(json.dumps({'success': False, 'error': 'No file data'}))
+        sys.exit(0)
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        print(json.dumps({'success': False, 'error': 'Invalid file (not base64)'}))
+        sys.exit(0)
+    allowed = {'devices.yaml': lldpq_dir, 'topology.dot': lldpq_dir,
+               'topology_config.yaml': lldpq_dir, 'notifications.yaml': lldpq_dir,
+               'display-aliases.json': web_root}
+    restored = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tar:
+            for m in tar.getmembers():
+                base = os.path.basename(m.name)
+                if not m.isfile() or base not in allowed:
+                    continue
+                content = tar.extractfile(m).read()
+                dest = os.path.join(allowed[base], base)
+                w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
+                                   input=content, capture_output=True, timeout=15)
+                if w.returncode == 0:
+                    restored.append(base)
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': 'Not a valid LLDPq config bundle: ' + str(e)[:150]}))
+        sys.exit(0)
+    if not restored:
+        print(json.dumps({'success': False, 'error': 'No recognized config files inside the archive.'}))
+        sys.exit(0)
+    print(json.dumps({'success': True, 'restored': restored}))
+    sys.exit(0)
+
+# ─── Action: Maintenance — disk usage + count of old update backups ───
+if action == 'get-maintenance':
+    def _run(cmd):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            return r.stdout.strip()
+        except Exception:
+            return ''
+    mr = os.path.join(lldpq_dir, 'monitor-results')
+    # monitor-results is group-readable by www-data ($USER:www-data, 775/664), so du runs directly
+    # as the CGI user. (Going through `sudo -u LLDPQ_USER du` fails: du is not in the sudoers
+    # whitelist, which only allows bash/ssh/tee/etc.)
+    mon = _run(['du', '-sm', mr]) if os.path.isdir(mr) else ''
+    mon_mb = int(mon.split()[0]) if mon and mon.split() and mon.split()[0].isdigit() else 0
+    info = _run(['sudo', '-u', lldpq_user, 'bash', '-c',
+                 'shopt -s nullglob; f=(~/lldpq-backup-*); echo -n "${#f[@]} "; '
+                 'if [ ${#f[@]} -gt 0 ]; then du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1; else echo 0; fi'])
+    parts = info.split()
+    bk_count = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
+    bk_mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    disk = _run(['bash', '-c', 'df -h ' + shlex.quote(lldpq_dir) +
+                 " | tail -1 | awk '{print $4\" free of \"$2\" (\"$5\" used)\"}'"])
+    print(json.dumps({'success': True, 'monitor_mb': mon_mb,
+                      'backup_count': bk_count, 'backup_mb': bk_mb, 'disk': disk}))
+    sys.exit(0)
+
+# ─── Action: Purge old update backups (~/lldpq-backup-*) — safe, service-user owned only ───
+if action == 'purge-data':
+    if post_data.get('target') != 'update_backups':
+        print(json.dumps({'success': False, 'error': 'Unknown purge target'}))
+        sys.exit(0)
+    r = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c',
+                        'shopt -s nullglob; f=(~/lldpq-backup-*); n=${#f[@]}; '
+                        'm=0; if [ $n -gt 0 ]; then m=$(du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1); '
+                        'rm -rf "${f[@]}"; fi; echo "$n ${m:-0}"'],
+                       capture_output=True, text=True, timeout=120)
+    parts = (r.stdout or '').split()
+    n = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
+    mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    print(json.dumps({'success': True, 'removed': n, 'freed_mb': mb}))
     sys.exit(0)
 
 # ─── Action: Generate new key + distribute with password ───

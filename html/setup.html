@@ -221,8 +221,8 @@
                 </div>
 
                 <!-- Step 6: Run LLDPq -->
-                <div class="su-panel" data-step="5">
-                    <h2>6. Run LLDPq</h2>
+                <div class="su-panel" data-step="6">
+                    <h2>7. Run LLDPq</h2>
                     <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
 
                     <div class="sched-card">
@@ -274,8 +274,8 @@
                 </div>
 
                 <!-- Step 7: Update LLDPq -->
-                <div class="su-panel" data-step="6">
-                    <h2>7. Update LLDPq</h2>
+                <div class="su-panel" data-step="9">
+                    <h2>10. Update LLDPq</h2>
                     <p class="p-desc">Pull the latest LLDPq and reinstall. Configs, keys and monitoring data are preserved across the update.</p>
 
                     <!-- Docker deployments: a container can't replace its own image — update on the host. -->
@@ -323,8 +323,8 @@
                 </div>
 
                 <!-- Step 8: Notifications & Alerting -->
-                <div class="su-panel" data-step="7">
-                    <h2>8. Notifications <span class="p-file">notifications.yaml</span></h2>
+                <div class="su-panel" data-step="5">
+                    <h2>6. Notifications <span class="p-file">notifications.yaml</span></h2>
                     <p class="p-desc">Configure Slack alerting for the pipeline's alert stage &mdash; master on/off, the Slack webhook, which categories fire and key thresholds. Use <strong>Send test alert</strong> to confirm the webhook works. (Runs every cycle after the collection stage.)</p>
 
                     <div class="sched-card">
@@ -379,6 +379,44 @@
                     </div>
                     <div class="status info" id="nf-status"></div>
                 </div>
+
+                <!-- Step 9: Backup & Restore -->
+                <div class="su-panel" data-step="7">
+                    <h2>8. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
+                    <p class="p-desc">Export all LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; as one <code>.tar.gz</code> to migrate to another host or keep as a restore point. Restore uploads a bundle and overwrites those files. <strong>The SSH key is intentionally excluded</strong> (security) &mdash; back it up in Step&nbsp;2.</p>
+                    <div class="sched-card">
+                        <div class="p-toolbar">
+                            <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download config bundle</button>
+                            <span class="status info" id="bk-export-msg"></span>
+                        </div>
+                    </div>
+                    <div class="sched-card">
+                        <label class="key-lbl">Restore from a bundle (overwrites the four config files):</label>
+                        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+                            <input type="file" id="bk-file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip" style="flex:1;min-width:240px;padding:8px;background:#1a1a1a;color:#d4d4d4;border:1px solid #404040;border-radius:6px;font-size:13px;">
+                            <button class="btn secondary" id="bk-import-btn" onclick="backupImport()"><svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M13,13V18H10V13H7L12,8L17,13H13Z"/></svg>Upload &amp; restore</button>
+                        </div>
+                        <div class="note">Restore replaces the config files immediately &mdash; run Step&nbsp;6 (Run LLDPq) afterwards to apply. Your SSH key is <strong>not</strong> in this bundle; back it up separately in Step&nbsp;2.</div>
+                        <div class="status info" id="bk-import-msg"></div>
+                    </div>
+                </div>
+
+                <!-- Step 10: Maintenance -->
+                <div class="su-panel" data-step="8">
+                    <h2>9. Maintenance <span class="p-file">disk &amp; cleanup</span></h2>
+                    <p class="p-desc">Disk usage and safe cleanup. Update backups (<code>~/lldpq-backup-*</code>) are created by the online/offline update and can pile up over time.</p>
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Disk</span><span id="mt-disk" class="mono">&mdash;</span></div>
+                        <div class="key-row"><span class="k">Monitoring data (monitor-results)</span><span id="mt-monitor" class="mono">&mdash;</span></div>
+                        <div class="key-row"><span class="k">Old update backups</span><span id="mt-backups" class="mono">&mdash;</span></div>
+                        <div class="p-toolbar">
+                            <button class="btn secondary" onclick="loadMaintenance()"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Refresh</button>
+                            <div class="spacer"></div>
+                            <button class="btn primary" id="mt-purge-btn" onclick="purgeBackups()"><svg viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></svg>Remove old update backups</button>
+                        </div>
+                        <div class="status info" id="mt-status"></div>
+                    </div>
+                </div>
             </div>
 
             <div class="su-nav">
@@ -397,9 +435,11 @@ const STEPS = [
     { key:'topology', label:'Topology',         desc:'topology.dot — expected cabling' },
     { key:'config',   label:'Topology Config',  desc:'topology_config.yaml — layout rules' },
     { key:'ansible',  label:'Integrate Ansible', desc:'Optional — VLAN/VRF/Fabric reports' },
-    { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
-    { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
     { key:'notifications', label:'Notifications', desc:'Slack alerts — webhook, types, thresholds' },
+    { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
+    { key:'backup',      label:'Backup & Restore', desc:'Export / import config bundle' },
+    { key:'maintenance', label:'Maintenance',      desc:'Disk usage & safe cleanup' },
+    { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
 ];
 const FILES = {
     devices:  { url:'/edit-devices',  file:'devices.yaml',          ta:'ta-devices',  st:'st-devices',  loaded:false },
@@ -409,6 +449,8 @@ const FILES = {
 let current = 0;
 const done = {};   // stepKey -> true
 let notifLoaded = false;     // notifications panel loaded once
+let maintLoaded = false;     // maintenance panel loaded once
+let purgeArmed = false;      // two-click guard before deleting update backups
 let keyInfoLoaded = false;   // SSH key panel loaded once
 let keyExists = false;       // a collector key currently exists
 let genArmed = false;        // two-click guard before replacing an existing key
@@ -472,6 +514,7 @@ function goStep(i) {
         if (!updateLogShown) { updateLogShown = true; showUpdateLog(); }
     }
     if (key === 'notifications' && !notifLoaded) { notifLoaded = true; loadNotifications(); }
+    if (key === 'maintenance' && !maintLoaded) { maintLoaded = true; loadMaintenance(); }
 }
 
 function markDone(stepKey, isDone) {
@@ -1116,6 +1159,66 @@ async function testAlert(){
         if(d.success) setStatus('nf-test','Sent \u2713 \u2014 check your Slack channel.','ok');
         else setStatus('nf-test', d.error||'Send failed','err');
     }catch(e){ setStatus('nf-test','Send failed: '+e.message,'err'); }
+}
+
+/* ---- Step 9: Backup & Restore ---- */
+async function backupExport(){
+    setStatus('bk-export-msg','Building bundle\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-export'})});
+        const d=await r.json().catch(()=>({}));
+        if(!d.success){ setStatus('bk-export-msg', d.error||'Export failed','err'); return; }
+        const bin=atob(d.data||''); const arr=new Uint8Array(bin.length);
+        for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+        const blob=new Blob([arr],{type:'application/gzip'}); const url=URL.createObjectURL(blob);
+        const a=document.createElement('a'); a.href=url; a.download=d.filename||'lldpq-config.tar.gz';
+        document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(url); a.remove();},100);
+        setStatus('bk-export-msg','Downloaded '+((d.files||[]).length)+' files \u2713','ok');
+    }catch(e){ setStatus('bk-export-msg','Export failed: '+e.message,'err'); }
+}
+
+async function backupImport(){
+    const fi=document.getElementById('bk-file'); const f=fi&&fi.files&&fi.files[0];
+    if(!f){ setStatus('bk-import-msg','Choose a .tar.gz bundle first.','err'); return; }
+    setStatus('bk-import-msg','Reading\u2026','info');
+    let b64;
+    try{
+        b64=await new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(String(rd.result).split(',')[1]||''); rd.onerror=rej; rd.readAsDataURL(f); });
+    }catch(e){ setStatus('bk-import-msg','Could not read file.','err'); return; }
+    setStatus('bk-import-msg','Restoring\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-import',data:b64})});
+        const d=await r.json().catch(()=>({}));
+        if(d.success) setStatus('bk-import-msg','Restored: '+((d.restored||[]).join(', '))+' \u2713 \u2014 run Step 6 to apply.','ok');
+        else setStatus('bk-import-msg', d.error||'Restore failed','err');
+    }catch(e){ setStatus('bk-import-msg','Restore failed: '+e.message,'err'); }
+}
+
+/* ---- Step 10: Maintenance ---- */
+async function loadMaintenance(){
+    setStatus('mt-status','Loading\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'get-maintenance'})});
+        const d=await r.json().catch(()=>({}));
+        if(!d.success){ setStatus('mt-status', d.error||'Failed to load','err'); return; }
+        document.getElementById('mt-disk').textContent=d.disk||'\u2014';
+        document.getElementById('mt-monitor').textContent=(d.monitor_mb||0)+' MB';
+        document.getElementById('mt-backups').textContent=(d.backup_count||0)+' backup(s), '+(d.backup_mb||0)+' MB';
+        const b=document.getElementById('mt-purge-btn'); if(b) b.disabled=!(d.backup_count>0);
+        setStatus('mt-status','','info');
+    }catch(e){ setStatus('mt-status','Failed: '+e.message,'err'); }
+}
+
+async function purgeBackups(){
+    if(!purgeArmed){ purgeArmed=true; setStatus('mt-status','This permanently deletes all ~/lldpq-backup-* directories. Click \u201cRemove old update backups\u201d again within 5s to confirm.','err'); setTimeout(()=>{purgeArmed=false;},5000); return; }
+    purgeArmed=false;
+    setStatus('mt-status','Removing\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'purge-data',target:'update_backups'})});
+        const d=await r.json().catch(()=>({}));
+        if(d.success){ setStatus('mt-status','Removed '+(d.removed||0)+' backup(s), freed '+(d.freed_mb||0)+' MB \u2713','ok'); loadMaintenance(); }
+        else setStatus('mt-status', d.error||'Failed','err');
+    }catch(e){ setStatus('mt-status','Failed: '+e.message,'err'); }
 }
 </script>
 </body>
