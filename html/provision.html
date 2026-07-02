@@ -1453,6 +1453,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Load initial data
     loadDiscoverySettings();
     loadDiscoveryCache();
+    // Load generated configs up-front so the Deploy button in the discovered table is deterministic.
+    // (Discover is the default tab; without this the button only appeared once some later render
+    //  happened to run after configs loaded — hence the "comes and goes" flicker.)
+    apiCall('list-generated-configs').then(d => { if (d.success) { generatedConfigs = d.configs || []; renderDiscovered(); } });
     loadDeviceList();
     loadKnownRoles();
     checkDHCPStatus();
@@ -1464,7 +1468,8 @@ function onTabSwitch(tab) {
     if (tab !== 'dhcpd') stopDhcpLog();   // stop log polling when leaving the DHCP tab
     if (tab === 'discover') {
         loadDiscoveryCache();
-        if (generatedConfigs.length === 0) apiCall('list-generated-configs').then(d => { if (d.success) generatedConfigs = d.configs || []; });
+        // Re-render after configs load so the Deploy button appears deterministically (no flicker).
+        if (generatedConfigs.length === 0) apiCall('list-generated-configs').then(d => { if (d.success) { generatedConfigs = d.configs || []; renderDiscovered(); } });
     }
     if (tab === 'dhcpd') { loadDHCPConfig(); loadDHCPHosts(); updateDhcpLiveBtn(); restartDhcpLogTimer(); }
     if (tab === 'bindings') {

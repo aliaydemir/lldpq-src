@@ -323,6 +323,12 @@
             </div>
             <div class="section-content">
             <div class="summary-grid">
+                <div class="summary-card" style="border-left-color: #78909c;" onclick="window.location.href='setup.html'">
+                    <div class="card-value" style="color: #b0bec5;">
+                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+                    </div>
+                    <div class="card-label">Setup</div>
+                </div>
                 <div class="summary-card" style="border-left-color: #ff9800;" onclick="window.location.href='provision.html'">
                     <div class="card-value" style="color: #ffb74d;">
                         <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
@@ -556,6 +562,40 @@
                 <div class="summary-card" style="border-left-color: #8bc34a;" onclick="window.location.href='monitor-results/bgp-analysis.html#evpn'">
                     <div class="card-value" style="color: #aed581;" id="evpn-type5">0</div>
                     <div class="card-label">Type-5 Routes (IP Prefix)</div>
+                </div>
+            </div>
+            </div>
+        </div>
+
+        <!-- Duplicate Address Analysis Section -->
+        <div class="analysis-section">
+            <div class="section-header">
+                <h2 class="section-title" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                    Duplicate Address Analysis
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <div class="summary-card card-critical" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <div class="card-value status-critical" id="dup-ip-active">--</div>
+                    <div class="card-label">Active IP Duplicates</div>
+                </div>
+                <div class="summary-card card-warning" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <div class="card-value status-warning" id="dup-ip-quiesced">--</div>
+                    <div class="card-label">Quiesced IP Duplicates</div>
+                </div>
+                <div class="summary-card card-critical" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <div class="card-value status-critical" id="dup-mac">--</div>
+                    <div class="card-label">MAC Duplicates</div>
+                </div>
+                <div class="summary-card card-warning" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <div class="card-value status-warning" id="dup-apipa">--</div>
+                    <div class="card-label">APIPA (DHCP Failed)</div>
+                </div>
+                <div class="summary-card card-info" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
+                    <div class="card-value status-info" id="dup-vlans">--</div>
+                    <div class="card-label">VLANs Affected</div>
                 </div>
             </div>
             </div>
@@ -918,6 +958,25 @@
                         };
                     }
                     
+                } else if (dataType === 'duplicate') {
+                    // Parse duplicate-analysis.html summary cards (.metric / .metric-label)
+                    const response = await fetch('monitor-results/duplicate-analysis.html');
+                    if (!response.ok) return summaryData;
+                    const html = await response.text();
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(html, 'text/html');
+                    summaryData.ipActive = 0; summaryData.ipQuiesced = 0;
+                    summaryData.macDup = 0; summaryData.apipa = 0; summaryData.vlans = 0;
+                    doc.querySelectorAll('.summary-card').forEach(card => {
+                        const label = (card.querySelector('.metric-label')?.textContent || '').toLowerCase();
+                        const value = parseInt(card.querySelector('.metric')?.textContent) || 0;
+                        if (label.includes('active ip')) summaryData.ipActive = value;
+                        else if (label.includes('quiesced ip')) summaryData.ipQuiesced = value;
+                        else if (label.includes('mac duplicate')) summaryData.macDup = value;
+                        else if (label.includes('apipa')) summaryData.apipa = value;
+                        else if (label.includes('vlans affected')) summaryData.vlans = value;
+                    });
+                    
                 } else {
                     // For other analysis pages (BGP, BER, Link Flap), parse table data
                     const pageMap = {
@@ -998,7 +1057,7 @@
         async function updateNetworkStats() {
             try {
                 // Fetch data directly from raw data files
-                const [assetsData, lldpData, bgpData, evpnData, opticalData, berData, flapData, hardwareData, logData] = await Promise.all([
+                const [assetsData, lldpData, bgpData, evpnData, opticalData, berData, flapData, hardwareData, logData, dupData] = await Promise.all([
                     fetchRawDataSummary('assets'),
                     fetchRawDataSummary('lldp'), 
                     fetchRawDataSummary('bgp'),
@@ -1007,7 +1066,8 @@
                     fetchRawDataSummary('ber'),
                     fetchRawDataSummary('flap'),
                     fetchRawDataSummary('hardware'),
-                    fetchRawDataSummary('log')
+                    fetchRawDataSummary('log'),
+                    fetchRawDataSummary('duplicate')
                 ]);
                 
                 // Data fetched successfully
@@ -1067,6 +1127,12 @@
                 updateDashboardCard('log-errors', logData.error);
                 updateDashboardCard('log-info', logData.info);
 
+                updateDashboardCard('dup-ip-active', dupData.ipActive);
+                updateDashboardCard('dup-ip-quiesced', dupData.ipQuiesced);
+                updateDashboardCard('dup-mac', dupData.macDup);
+                updateDashboardCard('dup-apipa', dupData.apipa);
+                updateDashboardCard('dup-vlans', dupData.vlans);
+
                 // Calculate overall network statistics
                 const totalDevices = assetsData.totalDevices || 0;
                 const totalInterfaces = Math.max(opticalData.totalPorts || 0, berData.totalPorts || 0);
@@ -1083,7 +1149,9 @@
                 'Hardware Critical': hardwareData.critical || 0,
                 'Hardware Warning': hardwareData.warning || 0,
                 'Log Critical': logData.critical || 0,
-                'Log Warning': logData.warning || 0
+                'Log Warning': logData.warning || 0,
+                'Duplicate Active IP': dupData.ipActive || 0,
+                'Duplicate MAC': dupData.macDup || 0
             };
             
             const criticalIssues = Object.values(criticalBreakdown).reduce((a, b) => a + b, 0);
