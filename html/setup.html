@@ -321,6 +321,64 @@
                     </details>
                     </div>
                 </div>
+
+                <!-- Step 8: Notifications & Alerting -->
+                <div class="su-panel" data-step="7">
+                    <h2>8. Notifications <span class="p-file">notifications.yaml</span></h2>
+                    <p class="p-desc">Configure Slack alerting for the pipeline's alert stage &mdash; master on/off, the Slack webhook, which categories fire and key thresholds. Use <strong>Send test alert</strong> to confirm the webhook works. (Runs every cycle after the collection stage.)</p>
+
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Notifications (master)</span>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-enabled" style="width:16px;height:16px;accent-color:#76b900;"> Enabled</label></div>
+                        <div class="key-row"><span class="k">Server URL <small style="color:#888;">(used for device links in alerts)</small></span>
+                            <input type="text" id="nf-server" class="sched-sel" style="width:320px;max-width:100%;" placeholder="http://SERVER_IP" autocomplete="off" spellcheck="false"></div>
+                    </div>
+
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Slack</span>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-slack" style="width:16px;height:16px;accent-color:#76b900;"> Enabled</label></div>
+                        <label class="key-lbl">Webhook URL &mdash; <a href="https://api.slack.com/messaging/webhooks" target="_blank" rel="noopener" style="color:#76b900;">how to create one</a></label>
+                        <input type="text" id="nf-webhook" class="sched-sel" style="width:100%;font-family:monospace;" placeholder="https://hooks.slack.com/services/T.../B.../..." autocomplete="off" spellcheck="false">
+                        <div class="key-row" style="margin-top:8px;"><span class="k">Channel</span>
+                            <input type="text" id="nf-channel" class="sched-sel" style="width:200px;" placeholder="#lldpq" autocomplete="off" spellcheck="false"></div>
+                        <div class="p-toolbar"><button class="btn secondary" onclick="testAlert()"><svg viewBox="0 0 24 24"><path d="M2,21L23,12L2,3V10L17,12L2,14V21Z"/></svg>Send test alert</button><span class="status info" id="nf-test"></span></div>
+                    </div>
+
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Alert mode</span>
+                            <select id="nf-mode" class="sched-sel"><option value="summary">summary (recommended)</option><option value="immediate">immediate</option><option value="change_only">change only</option></select></div>
+                        <div class="key-row"><span class="k">Min interval between repeats</span>
+                            <span style="color:#d4d4d4;font-size:13px;"><input type="number" id="nf-interval" class="sched-sel" min="1" style="width:90px;"> min</span></div>
+                        <label class="key-lbl">Alert categories</label>
+                        <div style="display:flex;flex-wrap:wrap;gap:16px;">
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-t-hardware" style="width:15px;height:15px;accent-color:#76b900;"> Hardware</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-t-network" style="width:15px;height:15px;accent-color:#76b900;"> Network</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-t-system" style="width:15px;height:15px;accent-color:#76b900;"> System</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-t-topology" style="width:15px;height:15px;accent-color:#76b900;"> Topology</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="nf-t-log" style="width:15px;height:15px;accent-color:#76b900;"> Logs</label>
+                        </div>
+                    </div>
+
+                    <div class="sched-card">
+                        <label class="key-lbl">Key thresholds</label>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px;margin-top:6px;">
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">BGP down (min)<input type="number" id="thr-bgp" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">Link flaps/hr &mdash; warn<input type="number" id="thr-flapw" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">Link flaps/hr &mdash; crit<input type="number" id="thr-flapc" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">Optical margin (dBm)<input type="number" id="thr-optical" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">CPU temp crit (&deg;C)<input type="number" id="thr-cpu" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">ASIC temp crit (&deg;C)<input type="number" id="thr-asic" class="sched-sel" style="width:100%;"></label>
+                            <label style="display:flex;flex-direction:column;gap:4px;color:#aaa;font-size:12px;">Disk usage crit (%)<input type="number" id="thr-disk" class="sched-sel" style="width:100%;"></label>
+                        </div>
+                    </div>
+
+                    <div class="p-toolbar">
+                        <button class="btn secondary" onclick="loadNotifications()"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <div class="spacer"></div>
+                        <button class="btn primary" onclick="saveNotifications()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save notifications.yaml</button>
+                    </div>
+                    <div class="status info" id="nf-status"></div>
+                </div>
             </div>
 
             <div class="su-nav">
@@ -341,6 +399,7 @@ const STEPS = [
     { key:'ansible',  label:'Integrate Ansible', desc:'Optional — VLAN/VRF/Fabric reports' },
     { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
     { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
+    { key:'notifications', label:'Notifications', desc:'Slack alerts — webhook, types, thresholds' },
 ];
 const FILES = {
     devices:  { url:'/edit-devices',  file:'devices.yaml',          ta:'ta-devices',  st:'st-devices',  loaded:false },
@@ -349,6 +408,7 @@ const FILES = {
 };
 let current = 0;
 const done = {};   // stepKey -> true
+let notifLoaded = false;     // notifications panel loaded once
 let keyInfoLoaded = false;   // SSH key panel loaded once
 let keyExists = false;       // a collector key currently exists
 let genArmed = false;        // two-click guard before replacing an existing key
@@ -411,16 +471,13 @@ function goStep(i) {
         checkDockerForUpdate();
         if (!updateLogShown) { updateLogShown = true; showUpdateLog(); }
     }
+    if (key === 'notifications' && !notifLoaded) { notifLoaded = true; loadNotifications(); }
 }
 
 function markDone(stepKey, isDone) {
-    const idx = STEPS.findIndex(s => s.key === stepKey);
-    if (idx < 0) return;
+    // Steps always show their number. The auto "done" checkmark/green state was misleading
+    // (it flipped on just from a file having content) and cluttered the wizard, so it's dropped.
     done[stepKey] = isDone;
-    const el = document.getElementById('step-' + idx);
-    const num = document.getElementById('num-' + idx);
-    if (el) el.classList.toggle('done', !!isDone);
-    if (num) num.innerHTML = isDone ? '&#10003;' : (idx + 1);
 }
 
 function setStatus(id, msg, cls) {
@@ -1006,6 +1063,59 @@ async function saveParallel() {
         if (d.success) setStatus('par-status', 'Saved \u2713 \u2014 applies on the next collection.', 'ok');
         else setStatus('par-status', d.error || 'Save failed', 'err');
     } catch (e) { setStatus('par-status', 'Save failed: ' + e.message, 'err'); }
+}
+
+/* ---- Step 8: Notifications & Alerting (notifications.yaml) ---- */
+function nfChk(id){ var e=document.getElementById(id); return !!(e && e.checked); }
+function nfSet(id,v){ var e=document.getElementById(id); if(e) e.checked=!!v; }
+function nfVal(id){ var e=document.getElementById(id); return e?e.value:''; }
+function nfPut(id,v){ var e=document.getElementById(id); if(e) e.value=(v==null?'':v); }
+
+async function loadNotifications(){
+    setStatus('nf-status','Loading\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'get-notifications'})});
+        const d=await r.json().catch(()=>({}));
+        if(!d.success){ setStatus('nf-status', d.error||'Failed to load notifications.yaml','err'); return; }
+        const n=d.notifications||{};
+        nfSet('nf-enabled', n.enabled); nfPut('nf-server', n.server_url);
+        nfSet('nf-slack', n.slack_enabled); nfPut('nf-webhook', n.webhook); nfPut('nf-channel', n.channel);
+        var m=document.getElementById('nf-mode'); if(m&&n.mode) m.value=n.mode;
+        nfPut('nf-interval', n.min_interval);
+        nfSet('nf-t-hardware', n.t_hardware); nfSet('nf-t-network', n.t_network); nfSet('nf-t-system', n.t_system); nfSet('nf-t-topology', n.t_topology); nfSet('nf-t-log', n.t_log);
+        var th=n.thresholds||{};
+        nfPut('thr-bgp',th.bgp); nfPut('thr-flapw',th.flap_warn); nfPut('thr-flapc',th.flap_crit); nfPut('thr-optical',th.optical); nfPut('thr-cpu',th.cpu); nfPut('thr-asic',th.asic); nfPut('thr-disk',th.disk);
+        setStatus('nf-status', d.exists===false ? 'notifications.yaml not found \u2014 saving will create it.' : 'Loaded notifications.yaml','info');
+    }catch(e){ setStatus('nf-status','Load failed: '+e.message,'err'); }
+}
+
+function nfPayload(){
+    return { action:'set-notifications',
+        enabled:nfChk('nf-enabled'), server_url:nfVal('nf-server').trim(),
+        slack_enabled:nfChk('nf-slack'), webhook:nfVal('nf-webhook').trim(), channel:nfVal('nf-channel').trim(),
+        mode:nfVal('nf-mode'), min_interval:nfVal('nf-interval'),
+        t_hardware:nfChk('nf-t-hardware'), t_network:nfChk('nf-t-network'), t_system:nfChk('nf-t-system'), t_topology:nfChk('nf-t-topology'), t_log:nfChk('nf-t-log'),
+        thresholds:{ bgp:nfVal('thr-bgp'), flap_warn:nfVal('thr-flapw'), flap_crit:nfVal('thr-flapc'), optical:nfVal('thr-optical'), cpu:nfVal('thr-cpu'), asic:nfVal('thr-asic'), disk:nfVal('thr-disk') } };
+}
+
+async function saveNotifications(){
+    setStatus('nf-status','Saving\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(nfPayload())});
+        const d=await r.json().catch(()=>({}));
+        if(d.success) setStatus('nf-status','Saved notifications.yaml \u2713','ok');
+        else setStatus('nf-status', d.error||'Save failed','err');
+    }catch(e){ setStatus('nf-status','Save failed: '+e.message,'err'); }
+}
+
+async function testAlert(){
+    setStatus('nf-test','Sending test message\u2026','info');
+    try{
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'test-alert', webhook:nfVal('nf-webhook').trim(), channel:nfVal('nf-channel').trim()})});
+        const d=await r.json().catch(()=>({}));
+        if(d.success) setStatus('nf-test','Sent \u2713 \u2014 check your Slack channel.','ok');
+        else setStatus('nf-test', d.error||'Send failed','err');
+    }catch(e){ setStatus('nf-test','Send failed: '+e.message,'err'); }
 }
 </script>
 </body>

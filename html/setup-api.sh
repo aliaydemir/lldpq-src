@@ -816,6 +816,177 @@ if action == 'set-schedules':
         print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
 
+# ─── Action: Read notifications.yaml (Slack/alerting config) ───
+if action == 'get-notifications':
+    import yaml
+    notif_yaml = os.path.join(lldpq_dir, 'notifications.yaml')
+    exists = os.path.exists(notif_yaml)
+    cfg = {}
+    if exists:
+        try:
+            with open(notif_yaml) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as e:
+            print(json.dumps({'success': False, 'error': 'Cannot parse notifications.yaml: ' + str(e)}))
+            sys.exit(0)
+    if not isinstance(cfg, dict):
+        cfg = {}
+    n = cfg.get('notifications') or {}
+    slack = n.get('slack') or {}
+    thr = cfg.get('thresholds') or {}
+    net = thr.get('network') or {}
+    hw = thr.get('hardware') or {}
+    sysd = thr.get('system') or {}
+    at = cfg.get('alert_types') or {}
+    strat = cfg.get('alert_strategy') or {}
+    freq = cfg.get('frequency') or {}
+    out = {
+        'enabled': bool(n.get('enabled', False)),
+        'server_url': n.get('server_url', '') or '',
+        'slack_enabled': bool(slack.get('enabled', False)),
+        'webhook': slack.get('webhook', '') or '',
+        'channel': slack.get('channel', '#lldpq') or '#lldpq',
+        'mode': strat.get('mode', 'summary') or 'summary',
+        'min_interval': freq.get('min_interval_minutes', 30),
+        't_hardware': bool(at.get('hardware_alerts', True)),
+        't_network': bool(at.get('network_alerts', True)),
+        't_system': bool(at.get('system_alerts', True)),
+        't_topology': bool(at.get('topology_alerts', True)),
+        't_log': bool(at.get('log_alerts', True)),
+        'thresholds': {
+            'bgp': net.get('bgp_down_minutes'),
+            'flap_warn': net.get('link_flaps_per_hour'),
+            'flap_crit': net.get('link_flaps_critical'),
+            'optical': net.get('optical_power_margin'),
+            'cpu': hw.get('cpu_temp_critical'),
+            'asic': hw.get('asic_temp_critical'),
+            'disk': sysd.get('disk_usage_critical'),
+        },
+    }
+    print(json.dumps({'success': True, 'exists': exists, 'notifications': out}))
+    sys.exit(0)
+
+# ─── Action: Write notifications.yaml (preserve unrelated keys; UI-managed) ───
+if action == 'set-notifications':
+    import yaml
+    notif_yaml = os.path.join(lldpq_dir, 'notifications.yaml')
+    cfg = {}
+    if os.path.exists(notif_yaml):
+        try:
+            with open(notif_yaml) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    def _sub(parent, key):
+        v = parent.get(key)
+        if not isinstance(v, dict):
+            v = {}
+            parent[key] = v
+        return v
+
+    def _num(v, default=None):
+        try:
+            f = float(v)
+            return int(f) if f == int(f) else f
+        except Exception:
+            return default
+
+    n = _sub(cfg, 'notifications')
+    slack = _sub(n, 'slack')
+    n['enabled'] = bool(post_data.get('enabled'))
+    n['server_url'] = str(post_data.get('server_url', '') or '')
+    slack['enabled'] = bool(post_data.get('slack_enabled'))
+    slack['webhook'] = str(post_data.get('webhook', '') or '')
+    slack['channel'] = str(post_data.get('channel', '') or '#lldpq')
+    slack.setdefault('username', 'LLDPq Bot')
+    slack.setdefault('icon_emoji', ':warning:')
+
+    at = _sub(cfg, 'alert_types')
+    at['hardware_alerts'] = bool(post_data.get('t_hardware'))
+    at['network_alerts'] = bool(post_data.get('t_network'))
+    at['system_alerts'] = bool(post_data.get('t_system'))
+    at['topology_alerts'] = bool(post_data.get('t_topology'))
+    at['log_alerts'] = bool(post_data.get('t_log'))
+
+    mode = str(post_data.get('mode', 'summary'))
+    if mode in ('summary', 'immediate', 'change_only'):
+        _sub(cfg, 'alert_strategy')['mode'] = mode
+    mi = _num(post_data.get('min_interval'))
+    if mi is not None:
+        _sub(cfg, 'frequency')['min_interval_minutes'] = mi
+
+    thr = _sub(cfg, 'thresholds')
+    net = _sub(thr, 'network')
+    hw = _sub(thr, 'hardware')
+    sysd = _sub(thr, 'system')
+    tin = post_data.get('thresholds') or {}
+
+    def _setnum(d, k, v):
+        val = _num(v)
+        if val is not None:
+            d[k] = val
+
+    _setnum(net, 'bgp_down_minutes', tin.get('bgp'))
+    _setnum(net, 'link_flaps_per_hour', tin.get('flap_warn'))
+    _setnum(net, 'link_flaps_critical', tin.get('flap_crit'))
+    _setnum(net, 'optical_power_margin', tin.get('optical'))
+    _setnum(hw, 'cpu_temp_critical', tin.get('cpu'))
+    _setnum(hw, 'asic_temp_critical', tin.get('asic'))
+    _setnum(sysd, 'disk_usage_critical', tin.get('disk'))
+
+    header = ("# LLDPq Notification Configuration — managed via the Setup page (Notifications).\n"
+              "# Slack incoming-webhook guide: https://api.slack.com/messaging/webhooks\n")
+    try:
+        body = yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': 'YAML serialize failed: ' + str(e)}))
+        sys.exit(0)
+    try:
+        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', notif_yaml],
+                           input=header + body, capture_output=True, text=True, timeout=10)
+        if w.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Write failed: ' + (w.stderr or '').strip()[:200]}))
+            sys.exit(0)
+        print(json.dumps({'success': True}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': str(e)}))
+    sys.exit(0)
+
+# ─── Action: Send a test Slack message to confirm the webhook works ───
+if action == 'test-alert':
+    webhook = str(post_data.get('webhook', '') or '').strip()
+    channel = str(post_data.get('channel', '') or '').strip()
+    if not webhook:
+        try:
+            import yaml
+            with open(os.path.join(lldpq_dir, 'notifications.yaml')) as f:
+                c = yaml.safe_load(f) or {}
+            webhook = (((c.get('notifications') or {}).get('slack') or {}).get('webhook') or '').strip()
+        except Exception:
+            pass
+    if not webhook.startswith('https://hooks.slack.com/'):
+        print(json.dumps({'success': False, 'error': 'Enter a valid Slack webhook URL (https://hooks.slack.com/…) first.'}))
+        sys.exit(0)
+    import urllib.request
+    payload = {'text': ':white_check_mark: LLDPq test alert — your Slack webhook is working.'}
+    if channel:
+        payload['channel'] = channel
+    try:
+        req = urllib.request.Request(webhook, data=json.dumps(payload).encode(),
+                                     headers={'Content-Type': 'application/json'})
+        resp = urllib.request.urlopen(req, timeout=10)
+        code = resp.getcode()
+        if code == 200:
+            print(json.dumps({'success': True}))
+        else:
+            print(json.dumps({'success': False, 'error': 'Slack returned HTTP ' + str(code)}))
+    except Exception as e:
+        print(json.dumps({'success': False, 'error': 'Send failed: ' + str(e)[:200]}))
+    sys.exit(0)
+
 # ─── Action: Generate new key + distribute with password ───
 password = post_data.get('password', '')
 retry_devices = post_data.get('retry_devices', [])  # List of IPs for retry
