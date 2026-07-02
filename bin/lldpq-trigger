@@ -4,7 +4,9 @@
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
 # Load config
-source /etc/lldpq.conf 2>/dev/null || true
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 LLDP_TRIGGER_FILE="/tmp/.lldp_web_trigger"
 MONITOR_TRIGGER_FILE="/tmp/.monitor_web_trigger"
@@ -14,6 +16,7 @@ DAEMON_PID_FILE="/tmp/lldp_trigger_daemon.pid"
 LLDP_LOCK_FILE="/tmp/lldp_running.lock"
 ASSETS_LOCK_FILE="/tmp/assets_running.lock"
 CONFIGS_LOCK_FILE="/tmp/configs_running.lock"
+MONITOR_LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
 
 # Exit if daemon already running
 if [ -f "$DAEMON_PID_FILE" ]; then
@@ -49,6 +52,36 @@ wait_until_not_running() {
     done
 }
 
+run_under_monitor_lock() {
+    (
+        command -v flock >/dev/null 2>&1 || return 1
+        exec 9>"$MONITOR_LOCK_FILE" || return 1
+        flock -n 9 || return 75
+        "$@"
+    )
+}
+
+refresh_lldp() {
+    cd "$LLDPQ_DIR" || return 1
+    wait_until_not_running "./assets.sh"
+    ./assets.sh >/dev/null 2>&1 || return 1
+    wait_until_not_running "./check-lldp.sh"
+    ./check-lldp.sh >/dev/null 2>&1
+}
+
+refresh_assets() {
+    cd "$LLDPQ_DIR" || return 1
+    wait_until_not_running "./assets.sh"
+    ./assets.sh >/dev/null 2>&1
+}
+
+refresh_monitor() {
+    cd "$LLDPQ_DIR" || return 1
+    wait_until_not_running "./assets.sh"
+    ./assets.sh >/dev/null 2>&1 || return 1
+    LLDPQ_MONITOR_LOCK_HELD=1 ./monitor.sh >/dev/null 2>&1
+}
+
 # Main daemon loop - check every 5 seconds
 LLDP_LAST_CHECK_FILE="$LLDPQ_DIR/.last_lldp_trigger_check"
 MONITOR_LAST_CHECK_FILE="$LLDPQ_DIR/.last_monitor_trigger_check"
@@ -69,18 +102,11 @@ while true; do
             if [ -f "$LLDP_LOCK_FILE" ] && kill -0 "$(cat "$LLDP_LOCK_FILE")" 2>/dev/null; then
                 : # LLDP check already running, skipping trigger
             else
-                {                    
-                    echo $$ > "$LLDP_LOCK_FILE"
+                echo $$ > "$LLDP_LOCK_FILE"
+                if run_under_monitor_lock refresh_lldp; then
                     echo "$LLDP_TRIGGER_TIME" > "$LLDP_LAST_CHECK_FILE"
-                    cd "$LLDPQ_DIR"
-
-                    wait_until_not_running "./assets.sh"
-                    ./assets.sh >/dev/null 2>&1
-                    wait_until_not_running "./check-lldp.sh"
-                    ./check-lldp.sh >/dev/null 2>&1
-                    
-                    rm -f "$LLDP_LOCK_FILE"
-                }
+                fi
+                rm -f "$LLDP_LOCK_FILE"
             fi
         fi
     fi
@@ -95,10 +121,9 @@ while true; do
         MONITOR_TRIGGER_TIME=$(stat -c %Y "$MONITOR_TRIGGER_FILE" 2>/dev/null || stat -f %m "$MONITOR_TRIGGER_FILE" 2>/dev/null || echo 0)
         
         if [ "$MONITOR_TRIGGER_TIME" -gt "$MONITOR_LAST_CHECK" ]; then
-            echo "$MONITOR_TRIGGER_TIME" > "$MONITOR_LAST_CHECK_FILE"
-            cd "$LLDPQ_DIR"
-            wait_until_not_running "monitor.sh"
-            ./monitor.sh >/dev/null 2>&1
+            if run_under_monitor_lock refresh_monitor; then
+                echo "$MONITOR_TRIGGER_TIME" > "$MONITOR_LAST_CHECK_FILE"
+            fi
         fi
     fi
 
@@ -115,14 +140,11 @@ while true; do
             if [ -f "$ASSETS_LOCK_FILE" ] && kill -0 "$(cat "$ASSETS_LOCK_FILE")" 2>/dev/null; then
                 : # Assets refresh already running, skipping trigger
             else
-                {
-                    echo $$ > "$ASSETS_LOCK_FILE"
+                echo $$ > "$ASSETS_LOCK_FILE"
+                if run_under_monitor_lock refresh_assets; then
                     echo "$ASSETS_TRIGGER_TIME" > "$ASSETS_LAST_CHECK_FILE"
-                    cd "$LLDPQ_DIR"
-                    wait_until_not_running "./assets.sh"
-                    ./assets.sh >/dev/null 2>&1
-                    rm -f "$ASSETS_LOCK_FILE"
-                }
+                fi
+                rm -f "$ASSETS_LOCK_FILE"
             fi
         fi
     fi

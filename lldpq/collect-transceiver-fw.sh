@@ -9,16 +9,13 @@
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$SCRIPT_DIR"
 
-source /etc/lldpq.conf 2>/dev/null || true
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
-parse_devices_output=$(python3 "$SCRIPT_DIR/parse_devices.py")
-parse_devices_status=$?
-if [ $parse_devices_status -ne 0 ]; then
-    echo "ERROR: Unable to parse devices.yaml" >&2
-    exit 1
-fi
-if ! eval "$parse_devices_output"; then
+source "$SCRIPT_DIR/load_devices.sh"
+if ! load_devices "$SCRIPT_DIR/parse_devices.py"; then
     echo "ERROR: Unable to load parsed device list" >&2
     exit 1
 fi

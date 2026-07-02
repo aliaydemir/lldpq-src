@@ -11,6 +11,7 @@ import os
 import sys
 import subprocess
 from datetime import datetime
+from collection_freshness import is_current_collection, read_asset_snapshot
 
 
 def main():
@@ -23,14 +24,23 @@ def main():
     if not os.path.exists(data_dir):
         print(f"❌ Data directory not found: {data_dir}")
         print("💡 Run monitor.sh first to collect data")
-        sys.exit(1)
+        return 1
     
     # Check for hardware data files  
     hardware_data_dir = f"{data_dir}/hardware-data"
     processed_count = 0
     
     if os.path.exists(hardware_data_dir):
-        hardware_files = [f for f in os.listdir(hardware_data_dir) if f.endswith('_hardware.txt')]
+        asset_snapshot = read_asset_snapshot()
+        hardware_files = [
+            f for f in os.listdir(hardware_data_dir)
+            if f.endswith('_hardware.txt')
+            and is_current_collection(
+                os.path.join(hardware_data_dir, f),
+                f.removesuffix('_hardware.txt'),
+                asset_snapshot,
+            )
+        ]
         processed_count = len(hardware_files)
         if processed_count > 0:
             print(f"Found {processed_count} hardware data files")
@@ -39,7 +49,11 @@ def main():
     else:
         print("Hardware data directory doesn't exist yet.")
     
-    # Always generate the BER-style HTML from existing hardware_history.json
+    if processed_count == 0:
+        print("❌ No current hardware collection files found")
+        return 1
+
+    # Generate the BER-style HTML from the current collection plus history.
     try:
         print("Generating BER-style hardware analysis HTML...")
         result = subprocess.run([sys.executable, "generate_hardware_html.py"], 
@@ -49,8 +63,10 @@ def main():
             print(result.stdout.strip())
         else:
             print(f"❌ Error generating HTML: {result.stderr}")
+            return result.returncode or 1
     except Exception as e:
         print(f"❌ Error running generate_hardware_html.py: {e}")
+        return 1
     
     print(f"[{datetime.now()}] Hardware data processing completed")
     
@@ -60,7 +76,8 @@ def main():
         print("   2. This will be added in the next step")
         print("   3. After updating monitor.sh, run it to collect hardware data")
         print("   4. Then run this script again to generate hardware analysis")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

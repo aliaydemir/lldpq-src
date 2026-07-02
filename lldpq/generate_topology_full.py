@@ -13,6 +13,9 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import json
+import stat
+import sys
+import tempfile
 import yaml
 from datetime import datetime
 
@@ -704,15 +707,46 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
     # Add timestamp
     topology_data["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+    output_dir = os.path.dirname(os.path.abspath(output_filename))
+    temp_path = None
     try:
-        with open(output_filename, "w") as file:
+        existing_stat = os.stat(output_filename)
+    except FileNotFoundError:
+        existing_stat = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_dir,
+            prefix=".topology.js.",
+            delete=False,
+        ) as file:
+            temp_path = file.name
+            os.fchmod(
+                file.fileno(),
+                stat.S_IMODE(existing_stat.st_mode) if existing_stat else 0o664,
+            )
+            if existing_stat and hasattr(os, "fchown"):
+                try:
+                    os.fchown(file.fileno(), existing_stat.st_uid, existing_stat.st_gid)
+                except PermissionError:
+                    pass
             file.write("var topologyData = ")
             json.dump(topology_data, file, indent=4)
             file.write(";")
-    except IOError as e:
-        pass
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, output_filename)
+        return True
+    except Exception:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        raise
 
-if __name__ == "__main__":
+def main():
     lldp_results_directory = "lldp-results"
     assets_file_path = "assets.ini"
     devices_yaml_path = "devices.yaml"
@@ -722,8 +756,18 @@ if __name__ == "__main__":
     WEB_ROOT = get_web_root()
     output_file = f"{WEB_ROOT}/topology/topology.js"
 
-    append_creation_time_to_html(f"{WEB_ROOT}/topology/main.html")
     if not os.path.isdir(lldp_results_directory):
-        exit(1)
+        print(f"Error: LLDP results directory not found: {lldp_results_directory}")
+        return 1
 
-    generate_topology_file(output_file, lldp_results_directory, assets_file_path, devices_yaml_path, dot_file_path)
+    try:
+        generate_topology_file(output_file, lldp_results_directory, assets_file_path, devices_yaml_path, dot_file_path)
+        append_creation_time_to_html(f"{WEB_ROOT}/topology/main.html")
+        return 0
+    except Exception as exc:
+        print(f"Error generating topology: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

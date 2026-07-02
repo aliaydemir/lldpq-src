@@ -12,7 +12,7 @@
 # What it removes:
 #   - LLDPq cron entries (/etc/crontab + /etc/cron.d/lldpq)
 #   - lldpq-trigger daemon process
-#   - /usr/local/bin/{lldpq, lldpq-trigger, lldpq-ai-analyze, zzh, pping, send-cmd, get-conf}
+#   - /usr/local/bin/{lldpq, lldpq-config, lldpq-trigger, lldpq-ai-analyze, zzh, pping, send-cmd, get-conf}
 #   - /var/www/html web content (nginx + fcgiwrap site removed)
 #   - $LLDPQ_INSTALL_DIR (default ~/lldpq)
 #   - /etc/lldpq.conf, /etc/lldpq.conf.lock, /etc/lldpq-users.conf
@@ -25,6 +25,129 @@
 
 set -u
 set -o pipefail
+
+load_lldpq_uninstall_config() {
+    local config_file="${1:-/etc/lldpq.conf}"
+    local line key raw value
+
+    [[ -f "$config_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        case "$key" in
+            LLDPQ_DIR|LLDPQ_USER|WEB_ROOT) ;;
+            *) continue ;;
+        esac
+        raw="${BASH_REMATCH[2]}"
+        value="$raw"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+            if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]] || \
+               [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+        printf -v "$key" '%s' "$value"
+    done < "$config_file"
+}
+
+canonical_path() {
+    local path="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$path"
+    else
+        python3 -c 'import os,sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "$path"
+    fi
+}
+
+guard_destructive_path() {
+    local label="$1" path="$2" min_depth="${3:-2}"
+    local canonical relative depth
+
+    # uninstall.sh still has a legacy command runner for fixed administrative
+    # commands, so managed path values use a deliberately narrow character set.
+    if [[ -z "$path" || ! "$path" =~ ^/[A-Za-z0-9._/+:-]+$ ]]; then
+        echo "Refusing unsafe $label path: '$path'" >&2
+        return 1
+    fi
+    canonical=$(canonical_path "$path") || return 1
+    case "$canonical" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/www|"$HOME")
+            echo "Refusing unsafe $label path: '$canonical'" >&2
+            return 1
+            ;;
+    esac
+    relative="${canonical#/}"
+    depth=$(awk -F/ '{print NF}' <<< "$relative")
+    if (( depth < min_depth )); then
+        echo "Refusing shallow $label path: '$canonical'" >&2
+        return 1
+    fi
+    printf '%s\n' "$canonical"
+}
+
+guard_recursive_target() {
+    local label="$1" canonical="$2" allow_var_www="${3:-false}"
+    local canonical_home
+    canonical_home=$(canonical_path "$HOME") || return 1
+    case "$canonical" in
+        /home/*|/root/*)
+            if [[ "$canonical" != "$canonical_home"/* ]]; then
+                echo "Refusing $label under another user's home: '$canonical'" >&2
+                return 1
+            fi
+            ;;
+    esac
+    if [[ "$allow_var_www" == "true" && "$canonical" == /var/www/* ]]; then
+        printf '%s\n' "$canonical"
+        return 0
+    fi
+    case "$canonical" in
+        /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/run/*|/sbin/*|/sys/*|/usr/*|/var/*)
+            echo "Refusing $label inside protected system tree: '$canonical'" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$canonical"
+}
+
+paths_overlap() {
+    local first="${1%/}" second="${2%/}"
+    [[ "$first" == "$second" || "$first" == "$second"/* || "$second" == "$first"/* ]]
+}
+
+assert_lldpq_install_tree() {
+    local path="$1"
+    [[ -d "$path" ]] || return 0
+    [[ -f "$path/devices.yaml" && -f "$path/monitor.sh" ]] || {
+        echo "Refusing uninstall of unrecognized directory: '$path'" >&2
+        return 1
+    }
+}
+
+filter_legacy_lldpq_crontab() {
+    local input_file="$1" output_file="$2" install_dir="$3"
+    awk -v install_dir="$install_dir" '
+        function owned(line) {
+            return line ~ /\/usr\/local\/bin\/lldpq([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/lldpq-trigger([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/lldpq-ai-analyze([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/get-conf([[:space:]]|$)/ ||
+                   index(line, install_dir "/fabric-scan.sh") > 0 ||
+                   (index(line, "cd " install_dir) > 0 && index(line, "./fabric-scan.sh") > 0) ||
+                   index(line, install_dir "/fabric-scan-cron.sh") > 0 ||
+                   (index(line, install_dir) > 0 && index(line, "topology.dot.bkp") > 0)
+        }
+        !owned($0) { print }
+    ' "$input_file" > "$output_file"
+}
+
+if [[ "${LLDPQ_UNINSTALL_LIB_ONLY:-false}" == "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # ─── Args ──────────────────────────────────────────────────────────────
 AUTO_YES=false
@@ -73,13 +196,11 @@ LLDPQ_INSTALL_DIR=""
 LLDPQ_USER=""
 WEB_ROOT="/var/www/html"
 
-if [[ -f /etc/lldpq.conf ]]; then
-    # shellcheck disable=SC1091
-    source /etc/lldpq.conf 2>/dev/null || true
-    LLDPQ_INSTALL_DIR="${LLDPQ_DIR:-}"
-    LLDPQ_USER="${LLDPQ_USER:-}"
-    WEB_ROOT="${WEB_ROOT:-/var/www/html}"
-fi
+LLDPQ_CONFIG_FILE="${LLDPQ_CONFIG_FILE:-/etc/lldpq.conf}"
+load_lldpq_uninstall_config "$LLDPQ_CONFIG_FILE"
+LLDPQ_INSTALL_DIR="${LLDPQ_DIR:-}"
+LLDPQ_USER="${LLDPQ_USER:-}"
+WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
 if [[ -z "$LLDPQ_INSTALL_DIR" ]]; then
     if [[ $EUID -eq 0 ]]; then
@@ -90,6 +211,20 @@ if [[ -z "$LLDPQ_INSTALL_DIR" ]]; then
 fi
 
 [[ -z "$LLDPQ_USER" ]] && LLDPQ_USER="$(whoami)"
+
+LLDPQ_INSTALL_DIR=$(guard_destructive_path "LLDPq install" "$LLDPQ_INSTALL_DIR" 2) || exit 1
+WEB_ROOT=$(guard_destructive_path "web root" "$WEB_ROOT" 2) || exit 1
+LLDPQ_INSTALL_DIR=$(guard_recursive_target "LLDPq install" "$LLDPQ_INSTALL_DIR" false) || exit 1
+WEB_ROOT=$(guard_recursive_target "web root" "$WEB_ROOT" true) || exit 1
+if paths_overlap "$LLDPQ_INSTALL_DIR" "$WEB_ROOT"; then
+    echo "Refusing uninstall: LLDPQ_DIR and WEB_ROOT overlap" >&2
+    exit 1
+fi
+assert_lldpq_install_tree "$LLDPQ_INSTALL_DIR" || exit 1
+if [[ ! "$LLDPQ_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+    echo "Refusing invalid LLDPQ_USER: '$LLDPQ_USER'" >&2
+    exit 1
+fi
 
 # ─── Banner ───────────────────────────────────────────────────────────
 echo -e "${YELLOW}LLDPq Uninstall${NC}"
@@ -135,8 +270,17 @@ fi
 # ─── 3. Cron jobs ─────────────────────────────────────────────────────
 step "Removing LLDPq cron jobs..."
 if [[ -f /etc/crontab ]]; then
-    run "sudo sed -i '/lldpq\\|monitor\\|get-conf\\|fabric-scan\\|ai-analyze/d' /etc/crontab"
-    echo "  /etc/crontab cleaned"
+    if $DRY_RUN; then
+        echo "DRY-RUN  remove only legacy LLDPq command paths from /etc/crontab"
+    else
+        _legacy_cron_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-uninstall-cron.XXXXXX")
+        filter_legacy_lldpq_crontab /etc/crontab "$_legacy_cron_tmp" "$LLDPQ_INSTALL_DIR"
+        if ! cmp -s /etc/crontab "$_legacy_cron_tmp"; then
+            sudo install -o root -g root -m 644 "$_legacy_cron_tmp" /etc/crontab
+        fi
+        rm -f "$_legacy_cron_tmp"
+    fi
+    echo "  legacy LLDPq entries removed from /etc/crontab"
 fi
 if [[ -f /etc/cron.d/lldpq ]]; then
     run "sudo rm -f /etc/cron.d/lldpq"
@@ -145,7 +289,7 @@ fi
 
 # ─── 4. Bin scripts ───────────────────────────────────────────────────
 step "Removing CLI tools..."
-for bin in lldpq lldpq-trigger lldpq-ai-analyze zzh pping send-cmd get-conf netprobe-ai; do
+for bin in lldpq lldpq-config lldpq-trigger lldpq-ai-analyze zzh pping send-cmd get-conf netprobe-ai; do
     if [[ -e "/usr/local/bin/$bin" ]]; then
         run "sudo rm -f /usr/local/bin/$bin"
         echo "  removed /usr/local/bin/$bin"

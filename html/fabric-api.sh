@@ -6196,7 +6196,9 @@ PYTHON_END
         # Admin only (default auth gate at top of file). Generic: no naming hardcoded.
         read -r POST_DATA
         export POST_DATA
-        source /etc/lldpq.conf 2>/dev/null || true
+        if [[ -x /usr/local/bin/lldpq-config ]]; then
+            eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+        fi
         WEB_ROOT="${WEB_ROOT:-/var/www/html}"
         ALIAS_FILE="$WEB_ROOT/display-aliases.json"
         CLEAN_JSON=$(python3 -c '

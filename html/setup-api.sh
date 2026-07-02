@@ -7,9 +7,9 @@
 source "$(dirname "$0")/auth-guard.sh"
 require_admin
 
-# Load config
-if [[ -f /etc/lldpq.conf ]]; then
-    source /etc/lldpq.conf
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
@@ -601,7 +601,9 @@ if action == 'update':
                    capture_output=True, text=True, timeout=10)
     script_path = os.path.join(state_dir, 'update-run.sh')
     SCRIPT = '''#!/usr/bin/env bash
-source /etc/lldpq.conf 2>/dev/null
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 SRC="${LLDPQ_SRC:-}"
 HOMESRC="$HOME/lldpq-src"
 URL="__URL__"

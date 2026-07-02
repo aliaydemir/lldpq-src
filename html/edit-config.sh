@@ -6,7 +6,9 @@ source "$(dirname "$0")/auth-guard.sh"
 require_admin
 
 # Load config with fallback
-source /etc/lldpq.conf 2>/dev/null || true
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 LLDPQ_DIR="${LLDPQ_DIR:-/opt/lldpq}"
 # NoNe = explicitly disabled, treat as empty

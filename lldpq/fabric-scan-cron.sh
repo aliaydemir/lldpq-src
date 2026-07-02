@@ -2,7 +2,9 @@
 # Fabric Scan Cron Job - runs diff playbook daily
 # Scheduled: 03:33
 
-source /etc/lldpq.conf 2>/dev/null
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 
 CACHE_FILE="$WEB_ROOT/fabric-scan-cache.json"
 

@@ -5,10 +5,13 @@ set -euo pipefail
 
 #### CONFIGURATION
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-eval "$(python3 "$SCRIPT_DIR/parse_devices.py")"
+source "$SCRIPT_DIR/load_devices.sh"
+load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
-# Load config with fallback
-source /etc/lldpq.conf 2>/dev/null || true
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 ASSETS_MAX_PARALLEL="${ASSETS_MAX_PARALLEL:-50}"
 case "$ASSETS_MAX_PARALLEL" in

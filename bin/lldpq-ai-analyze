@@ -3,8 +3,8 @@
 # Called by cron hourly (or as configured)
 # Calls ai-api.sh analyze action via curl
 
-if [[ -f /etc/lldpq.conf ]]; then
-    source /etc/lldpq.conf
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"

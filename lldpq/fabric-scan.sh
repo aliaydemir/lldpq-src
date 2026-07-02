@@ -2,8 +2,10 @@
 # Fabric Table Scanner - Collects MAC/ARP/Route tables from all devices
 # Results stored in monitor-results/fabric-tables/ for fast search
 
-# Load config
-source /etc/lldpq.conf 2>/dev/null || true
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 cd "$LLDPQ_DIR"
 

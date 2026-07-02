@@ -69,6 +69,57 @@ class LLDPqAlerts:
                 f.write(state)
         except Exception as e:
             print(f"❌ Error saving state: {e}")
+
+    def _alert_marker_file(self, device, alert_type, marker):
+        """Return a state marker path for an alert."""
+        return self.state_dir / f"{device}_{alert_type}.{marker}"
+
+    def _read_marker_time(self, device, alert_type, marker):
+        marker_file = self._alert_marker_file(device, alert_type, marker)
+        try:
+            return float(marker_file.read_text().strip())
+        except (OSError, TypeError, ValueError):
+            return None
+
+    def _write_marker_time(self, device, alert_type, marker):
+        marker_file = self._alert_marker_file(device, alert_type, marker)
+        try:
+            marker_file.write_text(str(time.time()))
+        except OSError as e:
+            print(f"❌ Error saving alert {marker}: {e}")
+
+    def record_alert_attempt(self, device, alert_type):
+        """Record a delivery attempt without claiming the alert was delivered."""
+        self._write_marker_time(device, alert_type, "attempt")
+
+    def record_alert_delivery(self, device, alert_type, current_state):
+        """Persist state and rate-limit timestamp only after successful delivery."""
+        self.set_alert_state(device, alert_type, current_state)
+        self._write_marker_time(device, alert_type, "timestamp")
+        self._clear_alert_attempt(device, alert_type)
+
+    def _clear_alert_attempt(self, device, alert_type):
+        try:
+            self._alert_marker_file(device, alert_type, "attempt").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"❌ Error clearing alert attempt marker: {e}")
+
+    def record_state_without_delivery(self, device, alert_type, current_state):
+        """Advance an intentionally silent state transition (for disabled recovery)."""
+        self.set_alert_state(device, alert_type, current_state)
+        self._clear_alert_attempt(device, alert_type)
+
+    def get_frequency_seconds(self, key, default_minutes):
+        """Read a non-negative frequency setting while accepting YAML numbers/strings."""
+        try:
+            minutes = float(
+                self.config.get('frequency', {}).get(key, default_minutes)
+            )
+        except (TypeError, ValueError):
+            minutes = default_minutes
+        return max(minutes, 0) * 60
     
     def should_send_alert(self, device, alert_type, current_state):
         """Check if we should send an alert based on state changes and frequency limits"""
@@ -82,31 +133,24 @@ class LLDPqAlerts:
             return False
             
         # Check minimum interval (prevent spam)
-        timestamp_file = self.state_dir / f"{device}_{alert_type}.timestamp"
-        min_interval = self.config.get('frequency', {}).get('min_interval_minutes', 30) * 60
-        
-        if timestamp_file.exists():
-            try:
-                with open(timestamp_file, 'r') as f:
-                    last_time = float(f.read().strip())
-                if time.time() - last_time < min_interval:
-                    return False
-            except:
-                pass
-        
-        # Update timestamp
-        try:
-            with open(timestamp_file, 'w') as f:
-                f.write(str(time.time()))
-        except:
-            pass
+        min_interval = self.get_frequency_seconds('min_interval_minutes', 30)
+        last_delivery = self._read_marker_time(device, alert_type, "timestamp")
+        if last_delivery is not None and time.time() - last_delivery < min_interval:
+            return False
+
+        # A failed webhook remains pending, but rapid/manual invocations should not
+        # hammer Slack. This marker is deliberately separate from last delivery.
+        retry_interval = self.get_frequency_seconds('retry_interval_minutes', 5)
+        last_attempt = self._read_marker_time(device, alert_type, "attempt")
+        if last_attempt is not None and time.time() - last_attempt < retry_interval:
+            return False
             
         return True
     
     def send_notification(self, title, message, severity, device, alert_type=""):
-        """Send notification to configured channels"""
+        """Send notification to configured channels and report delivery success."""
         if not self.config:
-            return
+            return False
             
         # Color mapping
         colors = {
@@ -121,8 +165,25 @@ class LLDPqAlerts:
         
         # Send to Slack
         slack_config = self.config.get('notifications', {}).get('slack', {})
-        if slack_config.get('enabled') and slack_config.get('webhook'):
-            self.send_slack_message(title, message, color, device, timestamp, slack_config)
+        if not slack_config.get('enabled'):
+            # Preserve the existing disabled-channel behavior: there is no
+            # requested delivery to retry.
+            return True
+        if not slack_config.get('webhook'):
+            print("❌ Slack notification enabled but webhook is empty")
+            return False
+        return self.send_slack_message(title, message, color, device, timestamp, slack_config)
+
+    def send_stateful_notification(self, title, message, severity, device,
+                                   alert_type, current_state):
+        """Attempt an alert and advance its state only after delivery succeeds."""
+        self.record_alert_attempt(device, alert_type)
+        delivered = self.send_notification(
+            title, message, severity, device, alert_type
+        )
+        if delivered:
+            self.record_alert_delivery(device, alert_type, current_state)
+        return delivered
     
 
     def send_slack_message(self, title, message, color, device, timestamp, slack_config):
@@ -150,13 +211,16 @@ class LLDPqAlerts:
             }
             
             response = requests.post(slack_config['webhook'], json=payload, timeout=10)
-            if response.status_code == 200:
+            if 200 <= response.status_code < 300:
                 print(f"Slack alert sent: {title}")
+                return True
             else:
                 print(f"❌ Slack alert failed: {response.status_code}")
+                return False
                 
         except Exception as e:
             print(f"❌ Slack notification error: {e}")
+            return False
     
     def check_hardware_alerts(self, device):
         """Check hardware-related alerts (CPU temp, fans, memory, etc.)"""
@@ -192,27 +256,28 @@ class LLDPqAlerts:
             else:
                 current_state = "OK"
             
-            if self.should_send_alert(device, "cpu_temp", current_state):
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(device, "cpu_temp", current_state)
+            elif self.should_send_alert(device, "cpu_temp", current_state):
                 if current_state == "CRITICAL":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"🔥 Critical CPU Temperature",
                         f"CPU temperature: {cpu_temp}°C (threshold: {cpu_critical}°C)",
-                        "CRITICAL", device, "cpu_temp"
+                        "CRITICAL", device, "cpu_temp", current_state
                     )
                 elif current_state == "WARNING":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"⚠️ High CPU Temperature",
                         f"CPU temperature: {cpu_temp}°C (threshold: {cpu_warning}°C)",
-                        "WARNING", device, "cpu_temp"
+                        "WARNING", device, "cpu_temp", current_state
                     )
-                elif current_state == "OK" and self.config.get('frequency', {}).get('send_recovery', True):
-                    self.send_notification(
+                elif current_state == "OK":
+                    self.send_stateful_notification(
                         f"CPU Temperature Recovered",
                         f"CPU temperature: {cpu_temp}°C (back to normal)",
-                        "RECOVERED", device, "cpu_temp"
+                        "RECOVERED", device, "cpu_temp", current_state
                     )
-                
-                self.set_alert_state(device, "cpu_temp", current_state)
         
         # Check ASIC temperature
         asic_temp_match = re.search(r'ASIC.*temp.*:\s*\+?([0-9.]+)°C', hardware_data)
@@ -228,27 +293,28 @@ class LLDPqAlerts:
             else:
                 current_state = "OK"
                 
-            if self.should_send_alert(device, "asic_temp", current_state):
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(device, "asic_temp", current_state)
+            elif self.should_send_alert(device, "asic_temp", current_state):
                 if current_state == "CRITICAL":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"🔥 Critical ASIC Temperature",
                         f"ASIC temperature: {asic_temp}°C (threshold: {asic_critical}°C)",
-                        "CRITICAL", device, "asic_temp"
+                        "CRITICAL", device, "asic_temp", current_state
                     )
                 elif current_state == "WARNING":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"⚠️ High ASIC Temperature",
                         f"ASIC temperature: {asic_temp}°C (threshold: {asic_warning}°C)",
-                        "WARNING", device, "asic_temp"
+                        "WARNING", device, "asic_temp", current_state
                     )
-                elif current_state == "OK" and self.config.get('frequency', {}).get('send_recovery', True):
-                    self.send_notification(
+                elif current_state == "OK":
+                    self.send_stateful_notification(
                         f"ASIC Temperature Recovered",
                         f"ASIC temperature: {asic_temp}°C (back to normal)",
-                        "RECOVERED", device, "asic_temp"
+                        "RECOVERED", device, "asic_temp", current_state
                     )
-                
-                self.set_alert_state(device, "asic_temp", current_state)
         
         # Check fan speeds
         fan_matches = re.findall(r'fan\d+:\s*(\d+)\s*RPM', hardware_data, re.IGNORECASE)
@@ -273,27 +339,28 @@ class LLDPqAlerts:
             else:
                 current_state = "OK"
             
-            if self.should_send_alert(device, "fan_speed", current_state):
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(device, "fan_speed", current_state)
+            elif self.should_send_alert(device, "fan_speed", current_state):
                 if current_state == "CRITICAL":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"🌀 Critical Fan Failure",
                         f"Fan(s) below critical threshold: {', '.join(failed_fans)}",
-                        "CRITICAL", device, "fan_speed"
+                        "CRITICAL", device, "fan_speed", current_state
                     )
                 elif current_state == "WARNING":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"⚠️ Fan Speed Warning",
                         f"Fan(s) below warning threshold: {', '.join(warning_fans)}",
-                        "WARNING", device, "fan_speed"
+                        "WARNING", device, "fan_speed", current_state
                     )
-                elif current_state == "OK" and self.config.get('frequency', {}).get('send_recovery', True):
-                    self.send_notification(
+                elif current_state == "OK":
+                    self.send_stateful_notification(
                         f"Fan Speeds Recovered",
                         f"All fans operating normally",
-                        "RECOVERED", device, "fan_speed"
+                        "RECOVERED", device, "fan_speed", current_state
                     )
-                
-                self.set_alert_state(device, "fan_speed", current_state)
 
     def check_network_alerts(self, device):
         """Check network-related alerts (BGP, link flaps, optical)"""
@@ -302,7 +369,13 @@ class LLDPqAlerts:
             
         # Check BGP status
         bgp_file = self.monitor_results / "bgp-data" / f"{device}_bgp.txt"
-        if bgp_file.exists():
+        processed_bgp_status = self.get_device_bgp_status(device)
+        if processed_bgp_status in {"stale", "unknown"}:
+            print(
+                f"    ⚠️ Skipping BGP neighbor state for {device}: "
+                f"collection is {processed_bgp_status}"
+            )
+        elif bgp_file.exists():
             try:
                 with open(bgp_file, 'r') as f:
                     bgp_data = f.read()
@@ -315,22 +388,22 @@ class LLDPqAlerts:
                     neighbor_list = [f"{ip} ({state})" for ip, state in down_neighbors]
                     
                     if self.should_send_alert(device, "bgp_neighbors", current_state):
-                        self.send_notification(
+                        self.send_stateful_notification(
                             f"BGP Neighbors Down",
                             f"BGP neighbors down: {', '.join(neighbor_list)}",
-                            "CRITICAL", device, "bgp_neighbors"
+                            "CRITICAL", device, "bgp_neighbors", current_state
                         )
-                        self.set_alert_state(device, "bgp_neighbors", current_state)
                 else:
                     current_state = "OK"
-                    if self.should_send_alert(device, "bgp_neighbors", current_state):
-                        if self.config.get('frequency', {}).get('send_recovery', True):
-                            self.send_notification(
-                                f"BGP Neighbors Recovered",
-                                f"All BGP neighbors established",
-                                "RECOVERED", device, "bgp_neighbors"
-                            )
-                        self.set_alert_state(device, "bgp_neighbors", current_state)
+                    send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+                    if not send_recovery:
+                        self.record_state_without_delivery(device, "bgp_neighbors", current_state)
+                    elif self.should_send_alert(device, "bgp_neighbors", current_state):
+                        self.send_stateful_notification(
+                            f"BGP Neighbors Recovered",
+                            f"All BGP neighbors established",
+                            "RECOVERED", device, "bgp_neighbors", current_state
+                        )
             except:
                 pass
         
@@ -364,27 +437,28 @@ class LLDPqAlerts:
             else:
                 current_state = "OK"
             
-            if self.should_send_alert(device, "link_flaps", current_state):
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(device, "link_flaps", current_state)
+            elif self.should_send_alert(device, "link_flaps", current_state):
                 if current_state == "CRITICAL":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"⚡ Critical Link Flapping",
                         f"Interfaces with excessive flaps: {', '.join(critical_flap_interfaces)}",
-                        "CRITICAL", device, "link_flaps"
+                        "CRITICAL", device, "link_flaps", current_state
                     )
                 elif current_state == "WARNING":
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"⚠️ High Link Flapping",
                         f"Interfaces with high flaps: {', '.join(high_flap_interfaces)}",
-                        "WARNING", device, "link_flaps"
+                        "WARNING", device, "link_flaps", current_state
                     )
-                elif current_state == "OK" and self.config.get('frequency', {}).get('send_recovery', True):
-                    self.send_notification(
+                elif current_state == "OK":
+                    self.send_stateful_notification(
                         f"Link Flaps Stabilized",
                         f"All interfaces stable",
-                        "RECOVERED", device, "link_flaps"
+                        "RECOVERED", device, "link_flaps", current_state
                     )
-                
-                self.set_alert_state(device, "link_flaps", current_state)
 
     def check_log_alerts(self, device):
         """Check for critical system logs"""
@@ -416,24 +490,152 @@ class LLDPqAlerts:
             if len(critical_logs) > 0:
                 current_state = "CRITICAL"
                 if self.should_send_alert(device, "system_logs", current_state):
-                    self.send_notification(
+                    self.send_stateful_notification(
                         f"Critical System Logs",
                         f"Found {len(critical_logs)} critical log entries",
-                        "CRITICAL", device, "system_logs"
+                        "CRITICAL", device, "system_logs", current_state
                     )
-                    self.set_alert_state(device, "system_logs", current_state)
             else:
                 current_state = "OK"
-                if self.should_send_alert(device, "system_logs", current_state):
-                    if self.config.get('frequency', {}).get('send_recovery', True):
-                        self.send_notification(
-                            f"System Logs Clear",
-                            f"No critical system issues detected",
-                            "RECOVERED", device, "system_logs"
-                        )
-                    self.set_alert_state(device, "system_logs", current_state)
+                send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+                if not send_recovery:
+                    self.record_state_without_delivery(device, "system_logs", current_state)
+                elif self.should_send_alert(device, "system_logs", current_state):
+                    self.send_stateful_notification(
+                        f"System Logs Clear",
+                        f"No critical system issues detected",
+                        "RECOVERED", device, "system_logs", current_state
+                    )
         except:
             pass
+
+    def get_inventory_devices(self):
+        """Return every configured hostname from devices.yaml in inventory order."""
+        devices_file = self.script_dir / "devices.yaml"
+        try:
+            with open(devices_file, 'r') as f:
+                config = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as e:
+            print(f"❌ Error reading device inventory: {e}")
+            return []
+
+        configured = config.get('devices', {})
+        if not isinstance(configured, dict):
+            print("❌ Invalid devices.yaml: 'devices' must be a mapping")
+            return []
+
+        hostnames = []
+        for ip, device_config in configured.items():
+            if isinstance(device_config, str):
+                hostname = re.sub(
+                    r'\s+@[A-Za-z0-9_.-]+\s*$', '', device_config
+                ).strip()
+            elif isinstance(device_config, dict):
+                hostname = str(device_config.get('hostname', '')).strip()
+            else:
+                hostname = ''
+
+            if not hostname:
+                print(f"⚠️ Device {ip} has no hostname; excluding it from alert labels")
+                continue
+            if hostname not in hostnames:
+                hostnames.append(hostname)
+
+        return hostnames
+
+    def get_asset_stats(self, devices):
+        """Classify every inventory device using the latest assets collection.
+
+        Existing ``successful``/``failed`` fields are retained for message
+        compatibility. ``unknown`` and ``stale`` make missing/old evidence
+        explicit instead of silently treating it as a success.
+        """
+        stats = {
+            "successful": 0,
+            "failed": 0,
+            "unreachable": 0,
+            "unknown": 0,
+            "stale": 0,
+            "total": len(devices),
+            "statuses": {},
+        }
+        assets_file = self.script_dir / "assets.ini"
+        if not assets_file.exists():
+            stats["unknown"] = len(devices)
+            stats["statuses"] = {device: "unknown" for device in devices}
+            return stats
+
+        try:
+            stale_minutes = float(
+                self.config.get('frequency', {}).get('data_stale_minutes', 30)
+            )
+        except (TypeError, ValueError):
+            stale_minutes = 30
+
+        try:
+            snapshot_time = assets_file.stat().st_mtime
+            rows = {}
+            with open(assets_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('Created on '):
+                        try:
+                            created = datetime.datetime.strptime(
+                                line.removeprefix('Created on ').strip(),
+                                "%Y-%m-%d %H-%M-%S"
+                            )
+                            snapshot_time = created.timestamp()
+                        except ValueError:
+                            pass
+                        continue
+                    if line.startswith('DEVICE-NAME'):
+                        continue
+
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    status = next(
+                        (part.upper() for part in parts[1:]
+                         if part.upper() in {"OK", "UNREACHABLE", "SSH-FAILED", "NO-INFO"}),
+                        None
+                    )
+                    if status:
+                        rows[parts[0]] = status
+        except OSError as e:
+            print(f"❌ Error reading assets status: {e}")
+            stats["unknown"] = len(devices)
+            stats["statuses"] = {device: "unknown" for device in devices}
+            return stats
+
+        snapshot_stale = time.time() - snapshot_time > max(stale_minutes, 0) * 60
+        for device in devices:
+            raw_status = rows.get(device)
+            if raw_status is None:
+                status = "unknown"
+            elif snapshot_stale:
+                status = "stale"
+            elif raw_status == "OK":
+                status = "successful"
+            elif raw_status in {"UNREACHABLE", "SSH-FAILED"}:
+                status = "unreachable"
+            else:
+                status = "unknown"
+
+            stats["statuses"][device] = status
+            if status == "successful":
+                stats["successful"] += 1
+            elif status == "unreachable":
+                # ``failed`` is the legacy field consumed by the summary.
+                stats["failed"] += 1
+                stats["unreachable"] += 1
+            elif status == "stale":
+                stats["stale"] += 1
+            else:
+                stats["unknown"] += 1
+
+        return stats
 
     def check_all_devices(self):
         """Check alerts for all monitored devices"""
@@ -447,17 +649,18 @@ class LLDPqAlerts:
         
         print(f"Checking alerts for all devices (mode: {mode})...")
         
-        # Get list of devices from hardware data
-        hardware_dir = self.monitor_results / "hardware-data"
-        if not hardware_dir.exists():
-            print("❌ No hardware data directory found")
-            return
-            
-        device_files = glob.glob(str(hardware_dir / "*_hardware.txt"))
-        devices = [os.path.basename(f).replace('_hardware.txt', '') for f in device_files]
+        # devices.yaml is the source of truth. Fall back to collected files only
+        # for older/misconfigured installations where inventory cannot be read.
+        devices = self.get_inventory_devices()
+        if not devices:
+            hardware_dir = self.monitor_results / "hardware-data"
+            device_files = glob.glob(str(hardware_dir / "*_hardware.txt"))
+            devices = [os.path.basename(f).replace('_hardware.txt', '') for f in device_files]
+            if devices:
+                print("⚠️ Using collected hardware files because devices.yaml is empty")
         
         if not devices:
-            print("❌ No device hardware files found")
+            print("❌ No devices found in inventory or collected hardware data")
             return
             
         print(f"Found {len(devices)} devices to check")
@@ -497,9 +700,9 @@ class LLDPqAlerts:
         
         bgp_stats = self.get_stats_from_html("bgp-analysis.html")
         if not bgp_stats:
-            bgp_stats = {"established": 0, "down": 0}
+            bgp_stats = {"established": 0, "down": 0, "stale": 0, "unknown": 0}
         
-        asset_stats = {"successful": total_devices, "failed": 0}  # Simple assumption for now
+        asset_stats = self.get_asset_stats(devices)
         
         ber_stats = self.get_stats_from_html("ber-analysis.html")
         if not ber_stats:
@@ -524,6 +727,10 @@ class LLDPqAlerts:
         
         if bgp_stats.get('down', 0) > 0:
             critical_issues.append(f"BGP: {bgp_stats['down']} neighbors down")
+        if bgp_stats.get('stale', 0) > 0:
+            critical_issues.append(f"BGP: {bgp_stats['stale']} device collections stale")
+        if bgp_stats.get('unknown', 0) > 0:
+            critical_issues.append(f"BGP: {bgp_stats['unknown']} device collections unknown")
         
         if optical_stats.get('critical', 0) > 0:
             critical_issues.append(f"Optical: {optical_stats['critical']} ports with critical issues")
@@ -533,6 +740,19 @@ class LLDPqAlerts:
         
         if flap_stats.get('critical', 0) > 0:
             critical_issues.append(f"Link Flap: {flap_stats['critical']} problematic ports")
+
+        if asset_stats.get('unreachable', 0) > 0:
+            critical_issues.append(
+                f"Assets: {asset_stats['unreachable']} devices unreachable"
+            )
+        if asset_stats.get('unknown', 0) > 0:
+            critical_issues.append(
+                f"Assets: {asset_stats['unknown']} devices have unknown status"
+            )
+        if asset_stats.get('stale', 0) > 0:
+            critical_issues.append(
+                f"Assets: {asset_stats['stale']} devices have stale status data"
+            )
         
         # Analyze LLDP topology (global analysis, not per device)
         lldp_stats = self.get_lldp_stats_from_ini()
@@ -544,7 +764,7 @@ class LLDPqAlerts:
             critical_issues.append(f"🔗 LLDP Topology: {lldp_stats['failed']} failed connections")
         
         # Create summary signature for state tracking (include optical and LLDP)
-        summary_signature = f"{total_devices}_{hardware_stats['excellent']}_{hardware_stats['good']}_{hardware_stats['warnings']}_{hardware_stats['critical']}_{log_stats['critical']}_{log_stats['warnings']}_{bgp_stats['down']}_{asset_stats['failed']}_{ber_stats['excellent']}_{ber_stats['critical']}_{flap_stats['critical']}_{optical_stats['critical']}_{lldp_stats['failed']}"
+        summary_signature = f"{total_devices}_{hardware_stats['excellent']}_{hardware_stats['good']}_{hardware_stats['warnings']}_{hardware_stats['critical']}_{log_stats['critical']}_{log_stats['warnings']}_{bgp_stats['down']}_{bgp_stats.get('stale', 0)}_{bgp_stats.get('unknown', 0)}_{asset_stats['failed']}_{asset_stats['unknown']}_{asset_stats['stale']}_{ber_stats['excellent']}_{ber_stats['critical']}_{flap_stats['critical']}_{optical_stats['critical']}_{lldp_stats['failed']}"
         
         # Check if summary changed or it's scheduled time (critical issues don't force immediate send in summary mode)
         if self.should_send_summary_alert(summary_signature):
@@ -577,7 +797,7 @@ Critical: {log_stats['critical']}     Warnings: {log_stats['warnings']}     🔵
 Asset Analysis Results:
 
 
-Successful: {asset_stats['successful']}     Failed: {asset_stats['failed']}
+Successful: {asset_stats['successful']}     Failed: {asset_stats['failed']}     Unknown: {asset_stats['unknown']}     Stale: {asset_stats['stale']}
 
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
@@ -593,7 +813,7 @@ Successful: {lldp_stats['successful']}     Failed: {lldp_stats['failed']}     Wa
 BGP Analysis Results:
 
 
-Established: {bgp_stats['established']}     Down: {bgp_stats['down']}
+Established: {bgp_stats['established']}     Down: {bgp_stats['down']}     Stale: {bgp_stats.get('stale', 0)}     Unknown: {bgp_stats.get('unknown', 0)}
 
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
@@ -629,15 +849,34 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             # Send notification
             color = "#FF0000" if critical_issues else "#00AA00"
             severity = "CRITICAL" if critical_issues else "INFO"
-            self.send_notification(title, message, severity, "Network Summary")
-            
-            # Save summary state
-            self.set_alert_state("network_summary", "last_summary", summary_signature)
+            self.record_alert_attempt("network_summary", "last_summary")
+            delivered = self.send_notification(
+                title, message, severity, "Network Summary"
+            )
+
+            # A failed summary remains pending and will be retried. Neither its
+            # signature nor its schedule marker may claim a delivery occurred.
+            if delivered:
+                self.record_alert_delivery(
+                    "network_summary", "last_summary", summary_signature
+                )
+                if self.is_summary_time():
+                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                    self.set_alert_state(
+                        "network_summary", "last_summary_time", current_time
+                    )
             
         
 
     def should_send_summary_alert(self, current_signature):
         """Check if summary should be sent based on changes or schedule"""
+        retry_interval = self.get_frequency_seconds('retry_interval_minutes', 5)
+        last_attempt = self._read_marker_time(
+            "network_summary", "last_summary", "attempt"
+        )
+        if last_attempt is not None and time.time() - last_attempt < retry_interval:
+            return False
+
         last_signature = self.get_alert_state("network_summary", "last_summary")
         
         # Send if data changed
@@ -650,7 +889,6 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             
             if current_time != last_summary_time:
-                self.set_alert_state("network_summary", "last_summary_time", current_time)
                 return True
                 
         return False
@@ -708,21 +946,24 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             # Read from processed bgp_history.json
             bgp_history_file = self.monitor_results / "bgp_history.json"
             if not bgp_history_file.exists():
-                return "established"  # Default to healthy if no data
+                return "unknown"
                 
             with open(bgp_history_file, 'r') as f:
                 bgp_data = json.load(f)
             
-            # Get latest BGP stats for this device
-            device_bgp = bgp_data.get(device, {})
+            # Get latest BGP stats for this device. Older files may not contain
+            # data_status; those remain compatible and are treated as current.
+            device_bgp = bgp_data.get("current_bgp_stats", {}).get(device, {})
             if device_bgp:
-                latest_stats = device_bgp.get("current_stats", {})
-                down_neighbors = latest_stats.get("down_neighbors", 0)
+                data_status = device_bgp.get("data_status", "current")
+                if data_status in {"stale", "unknown"}:
+                    return data_status
+                down_neighbors = device_bgp.get("down_neighbors", 0)
                 return "down" if down_neighbors > 0 else "established"
             
-            return "established"
+            return "unknown"
         except:
-            return "established"
+            return "unknown"
 
     def get_device_asset_status(self, device):
         """Get asset status for a device"""
@@ -981,10 +1222,14 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 # BGP stats from element IDs
                 established = self.extract_element_value(content, 'established-neighbors')
                 down = self.extract_element_value(content, 'down-neighbors')
+                stale = self.extract_element_value(content, 'stale-devices')
+                unknown = self.extract_element_value(content, 'unknown-devices')
                 
                 stats = {
                     "established": established,
-                    "down": down
+                    "down": down,
+                    "stale": stale,
+                    "unknown": unknown
                 }
             
             return stats

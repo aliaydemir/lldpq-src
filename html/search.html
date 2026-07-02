@@ -837,6 +837,18 @@
     <script>
         let currentMacData = [];
         let currentArpData = [];
+
+        // Network data is untrusted text. Keep the existing HTML templates for
+        // layout, but encode every dynamic value before it reaches innerHTML.
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, character => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[character]);
+        }
         
         function setLastUpdated() {
             const now = new Date();
@@ -998,11 +1010,11 @@
                     entries.forEach(entry => {
                         const bondPorts = entry.bond_ports ? entry.bond_ports.join(', ') : '';
                         html += '<tr>';
-                        if (!device) html += '<td class="device">' + (entry.device || '-') + '</td>';
-                        html += '<td class="mac">' + entry.mac + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        html += '<td style="color: #4fc3f7;">' + bondPorts + '</td>';
-                        html += '<td class="text-right">' + (entry.vlan || '-') + '</td>';
+                        if (!device) html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
+                        html += '<td class="mac">' + escapeHtml(entry.mac) + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        html += '<td style="color: #4fc3f7;">' + escapeHtml(bondPorts) + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.vlan || '-') + '</td>';
                         html += '</tr>';
                     });
                     
@@ -1010,10 +1022,10 @@
                     results.innerHTML = html;
                     attachSortHandlers(document.getElementById('macTable'));
                 } else {
-                    results.innerHTML = '<div class="error-message">' + (data.error || 'Failed to load') + '</div>';
+                    results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
-                results.innerHTML = '<div class="error-message">Error: ' + e.message + '</div>';
+                results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1056,12 +1068,12 @@
                     data.entries.forEach(entry => {
                         const stateClass = entry.state ? 'badge badge-state-' + entry.state : '';
                         html += '<tr>';
-                        if (!device) html += '<td class="device">' + (entry.device || '-') + '</td>';
-                        html += '<td class="ip">' + entry.ip + '</td>';
-                        html += '<td class="mac">' + entry.mac + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        html += '<td>' + (entry.vrf || 'default') + '</td>';
-                        html += '<td class="text-right"><span class="' + stateClass + '">' + (entry.state || '-') + '</span></td>';
+                        if (!device) html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.ip) + '</td>';
+                        html += '<td class="mac">' + escapeHtml(entry.mac) + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.vrf || 'default') + '</td>';
+                        html += '<td class="text-right"><span class="' + escapeHtml(stateClass) + '">' + escapeHtml(entry.state || '-') + '</span></td>';
                         html += '</tr>';
                     });
                     
@@ -1069,10 +1081,10 @@
                     results.innerHTML = html;
                     attachSortHandlers(document.getElementById('arpTable'));
                 } else {
-                    results.innerHTML = '<div class="error-message">' + (data.error || 'Failed to load') + '</div>';
+                    results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
-                results.innerHTML = '<div class="error-message">Error: ' + e.message + '</div>';
+                results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1119,12 +1131,12 @@
                         const stateClass = entry.state === 'permanent' ? 'badge badge-green' : 
                                           entry.state === 'offload' ? 'badge badge-cyan' : '';
                         html += '<tr>';
-                        html += '<td class="ip">' + entry.vtep + '</td>';
-                        html += '<td class="mac">' + (entry.mac || '-') + '</td>';
-                        html += '<td>' + (entry.vni || '-') + '</td>';
-                        html += '<td><span class="' + typeClass + '">' + (entry.type || '-') + '</span></td>';
-                        html += '<td>' + (stateClass ? '<span class="' + stateClass + '">' + entry.state + '</span>' : entry.state || '-') + '</td>';
-                        html += '<td class="text-right">' + (entry.interface || '-') + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.vtep) + '</td>';
+                        html += '<td class="mac">' + escapeHtml(entry.mac || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.vni || '-') + '</td>';
+                        html += '<td><span class="' + typeClass + '">' + escapeHtml(entry.type || '-') + '</span></td>';
+                        html += '<td>' + (stateClass ? '<span class="' + stateClass + '">' + escapeHtml(entry.state) + '</span>' : escapeHtml(entry.state || '-')) + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.interface || '-') + '</td>';
                         html += '</tr>';
                     });
                     
@@ -1132,10 +1144,10 @@
                     results.innerHTML = html;
                     attachSortHandlers(document.getElementById('vtepTable'));
                 } else {
-                    results.innerHTML = '<div class="error-message">' + (data.error || 'Failed to load') + '</div>';
+                    results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
-                results.innerHTML = '<div class="error-message">Error: ' + e.message + '</div>';
+                results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1178,7 +1190,7 @@
                 return;
             }
             
-            resultsDiv.innerHTML = '<div class="loading-message">Searching for "' + searchTerm + '"...</div>';
+            resultsDiv.innerHTML = '<div class="loading-message">Searching for "' + escapeHtml(searchTerm) + '"...</div>';
             resultsDiv.style.display = 'block';
             
             try {
@@ -1290,9 +1302,9 @@
                     html += '<div style="color: #76b900; font-weight: 600; margin-bottom: 8px;">Cross Reference</div>';
                     sortedMappings.forEach(info => {
                         if (info.type === 'ip-to-mac') {
-                            html += '<div style="margin: 3px 0;"><span class="ip">' + info.ip + '</span> <span style="color: #888;">↔</span> <span class="mac">' + info.mac + '</span></div>';
+                            html += '<div style="margin: 3px 0;"><span class="ip">' + escapeHtml(info.ip) + '</span> <span style="color: #888;">↔</span> <span class="mac">' + escapeHtml(info.mac) + '</span></div>';
                         } else {
-                            html += '<div style="margin: 3px 0;"><span class="mac">' + info.mac + '</span> <span style="color: #888;">↔</span> <span class="ip">' + info.ip + '</span></div>';
+                            html += '<div style="margin: 3px 0;"><span class="mac">' + escapeHtml(info.mac) + '</span> <span style="color: #888;">↔</span> <span class="ip">' + escapeHtml(info.ip) + '</span></div>';
                         }
                     });
                     html += '</div>';
@@ -1366,10 +1378,10 @@
                     html += '<div style="margin-bottom: 12px; padding: 10px 15px; background: linear-gradient(90deg, #1c3d4a, #1e1e1e); border-left: 3px solid #4fc3f7; border-radius: 4px;">';
                     html += '<div style="color: #4fc3f7; font-weight: 600; margin-bottom: 8px;">Multihoming (ESI Peers)</div>';
                     multihomingPeers.forEach(info => {
-                        html += '<div style="margin: 5px 0;"><span style="color: #888;">Bond:</span> <span style="color: #fff; font-weight: 500;">' + info.bond + '</span></div>';
+                        html += '<div style="margin: 5px 0;"><span style="color: #888;">Bond:</span> <span style="color: #fff; font-weight: 500;">' + escapeHtml(info.bond) + '</span></div>';
                         info.devices.forEach((devInfo, device) => {
                             const portStr = devInfo.ports.length > 0 ? devInfo.ports.join(', ') : '-';
-                            html += '<div style="margin: 3px 0 3px 15px;"><span class="device">' + device + '</span> → <span style="color: #4fc3f7;">' + portStr + '</span></div>';
+                            html += '<div style="margin: 3px 0 3px 15px;"><span class="device">' + escapeHtml(device) + '</span> → <span style="color: #4fc3f7;">' + escapeHtml(portStr) + '</span></div>';
                         });
                     });
                     html += '</div>';
@@ -1387,11 +1399,11 @@
                     entriesToShow.forEach(entry => {
                         const bondPorts = entry.bond_ports ? entry.bond_ports.join(', ') : '';
                         html += '<tr>';
-                        html += '<td class="device">' + (entry.device || '-') + '</td>';
-                        html += '<td class="mac">' + entry.mac + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        html += '<td style="color: #4fc3f7;">' + bondPorts + '</td>';
-                        html += '<td class="text-right">' + (entry.vlan || '-') + '</td>';
+                        html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
+                        html += '<td class="mac">' + escapeHtml(entry.mac) + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        html += '<td style="color: #4fc3f7;">' + escapeHtml(bondPorts) + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.vlan || '-') + '</td>';
                         html += '</tr>';
                     });
                     html += '</tbody></table></div>';
@@ -1436,11 +1448,11 @@
                     const arpEntriesToShow = arpToShow.slice(0, 100);
                     arpEntriesToShow.forEach(entry => {
                         html += '<tr>';
-                        html += '<td class="device">' + (entry.device || '-') + '</td>';
-                        html += '<td class="mac">' + entry.mac + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        html += '<td class="ip">' + entry.ip + '</td>';
-                        html += '<td class="text-right">' + (entry.vrf || 'default') + '</td>';
+                        html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
+                        html += '<td class="mac">' + escapeHtml(entry.mac) + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.ip) + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.vrf || 'default') + '</td>';
                         html += '</tr>';
                     });
                     html += '</tbody></table></div>';
@@ -1463,7 +1475,7 @@
                             html += '<div class="best-match-container" style="margin-bottom: 15px; padding: 12px 16px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;">';
                             html += '<div style="color: #f0ad4e; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">';
                             html += '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
-                            html += 'No exact match for <span class="ip">' + searchTerm + '</span>. Showing best matching route(s):';
+                            html += 'No exact match for <span class="ip">' + escapeHtml(searchTerm) + '</span>. Showing best matching route(s):';
                             html += '</div>';
                             
                             html += '<table class="data-table" style="margin: 0;"><thead><tr>';
@@ -1475,7 +1487,7 @@
                                 
                                 if (isNoRoute) {
                                     html += '<tr style="opacity: 0.6;">';
-                                    html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + vrf + '</span></td>';
+                                    html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
                                     html += '<td style="color: #888;">No Route</td>';
                                     html += '<td>-</td><td>-</td><td>-</td>';
                                     html += '<td style="text-align: right; color: #888;">-</td>';
@@ -1490,11 +1502,11 @@
                                     const nexthopDisplay = nexthops.size > 1 ? nexthops.size + ' next-hop' : (r.nexthop || '-');
                                     
                                     html += '<tr>';
-                                    html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + vrf + '</span></td>';
-                                    html += '<td style="color: #f0ad4e;">' + r.prefix + '</td>';
-                                    html += '<td class="ip">' + nexthopDisplay + '</td>';
-                                    html += '<td>' + (r.interface || '-') + '</td>';
-                                    html += '<td>' + (r.protocol || '-') + '</td>';
+                                    html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
+                                    html += '<td style="color: #f0ad4e;">' + escapeHtml(r.prefix) + '</td>';
+                                    html += '<td class="ip">' + escapeHtml(nexthopDisplay) + '</td>';
+                                    html += '<td>' + escapeHtml(r.interface || '-') + '</td>';
+                                    html += '<td>' + escapeHtml(r.protocol || '-') + '</td>';
                                     html += '<td style="text-align: right; color: #76b900;">✓ ' + deviceCount + ' device</td>';
                                     html += '</tr>';
                                 }
@@ -1508,18 +1520,18 @@
                 }
                 
                 if (totalResults === 0 && crossRefInfo.length === 0 && !hasRouteBestMatch) {
-                    html = '<div class="status-message">No results found for "' + searchTerm + '"</div>';
+                    html = '<div class="status-message">No results found for "' + escapeHtml(searchTerm) + '"</div>';
                 } else if (totalResults > 0) {
                     html = '<div style="margin-bottom: 10px; color: #76b900; font-weight: 600;">' + totalResults + ' total matches found</div>' + html;
                 } else if (hasRouteBestMatch && totalResults === 0) {
                     // Only route best match found
-                    html = '<div style="margin-bottom: 10px; padding: 10px 15px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;"><span style="color: #f0ad4e;">No exact match for <span class="ip">' + searchTerm + '</span> in MAC/ARP tables. Showing best matching routes:</span></div>' + html;
+                    html = '<div style="margin-bottom: 10px; padding: 10px 15px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;"><span style="color: #f0ad4e;">No exact match for <span class="ip">' + escapeHtml(searchTerm) + '</span> in MAC/ARP tables. Showing best matching routes:</span></div>' + html;
                 }
                 
                 resultsDiv.innerHTML = html;
                 
             } catch (e) {
-                resultsDiv.innerHTML = '<div class="error-message">Search failed: ' + e.message + '</div>';
+                resultsDiv.innerHTML = '<div class="error-message">Search failed: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1622,13 +1634,13 @@
         function renderBestMatchResults(searchIp, bestMatches, container) {
             const vrfs = sortVrfs(Object.keys(bestMatches));
             if (vrfs.length === 0) {
-                return '<div class="status-message">No routes found for ' + searchIp + '</div>';
+                return '<div class="status-message">No routes found for ' + escapeHtml(searchIp) + '</div>';
             }
             
             let html = '<div class="best-match-container" style="margin-bottom: 15px; padding: 12px 16px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;">';
             html += '<div style="color: #f0ad4e; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">';
             html += '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
-            html += 'No exact match for <span class="ip">' + searchIp + '</span>. Showing best matching route(s):';
+            html += 'No exact match for <span class="ip">' + escapeHtml(searchIp) + '</span>. Showing best matching route(s):';
             html += '</div>';
             
             html += '<table class="data-table" style="margin: 0;"><thead><tr>';
@@ -1638,11 +1650,11 @@
                 const route = bestMatches[vrf];
                 const isNoRoute = route.no_route;
                 html += '<tr' + (isNoRoute ? ' style="opacity: 0.6;"' : '') + '>';
-                html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + vrf + '</span></td>';
-                html += '<td style="color: ' + (isNoRoute ? '#888' : '#f0ad4e') + ';">' + route.prefix + '</td>';
-                html += '<td class="ip">' + (route.nexthop || '-') + '</td>';
-                html += '<td>' + (route.interface || '-') + '</td>';
-                html += '<td>' + (route.protocol || '-') + '</td>';
+                html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
+                html += '<td style="color: ' + (isNoRoute ? '#888' : '#f0ad4e') + ';">' + escapeHtml(route.prefix) + '</td>';
+                html += '<td class="ip">' + escapeHtml(route.nexthop || '-') + '</td>';
+                html += '<td>' + escapeHtml(route.interface || '-') + '</td>';
+                html += '<td>' + escapeHtml(route.protocol || '-') + '</td>';
                 html += '</tr>';
             });
             
@@ -1710,23 +1722,37 @@
                         return;
                     }
                     
-                    // Build VRF tabs
-                    let tabsHtml = '<button class="vrf-tab active" onclick="filterRoutesByVrf(\'all\')">All<span class="route-count">(' + data.total + ')</span></button>';
+                    // Build VRF tabs with DOM APIs so VRF names never enter an
+                    // inline event handler or HTML string.
+                    vrfTabs.replaceChildren();
+                    const addVrfTab = (vrf, label, count, active = false) => {
+                        const button = document.createElement('button');
+                        button.className = 'vrf-tab' + (active ? ' active' : '');
+                        button.dataset.vrf = vrf;
+                        button.appendChild(document.createTextNode(label));
+
+                        const routeCount = document.createElement('span');
+                        routeCount.className = 'route-count';
+                        routeCount.textContent = '(' + count + ')';
+                        button.appendChild(routeCount);
+                        button.addEventListener('click', () => filterRoutesByVrf(vrf));
+                        vrfTabs.appendChild(button);
+                    };
+
+                    addVrfTab('all', 'All', data.total, true);
                     data.vrf_order.forEach(vrf => {
-                        const count = (data.vrf_tables[vrf] || []).length;
-                        tabsHtml += '<button class="vrf-tab" onclick="filterRoutesByVrf(\'' + vrf + '\')">' + vrf + '<span class="route-count">(' + count + ')</span></button>';
+                        addVrfTab(vrf, vrf, (data.vrf_tables[vrf] || []).length);
                     });
-                    vrfTabs.innerHTML = tabsHtml;
                     vrfTabsContainer.style.display = 'block';
                     
                     // Render all routes
                     renderRouteTable(data, 'all', search);
                 } else {
-                    results.innerHTML = '<div class="error-message">' + (data.error || 'Failed to load') + '</div>';
+                    results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                     vrfTabsContainer.style.display = 'none';
                 }
             } catch (e) {
-                results.innerHTML = '<div class="error-message">Error: ' + e.message + '</div>';
+                results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
                 document.getElementById('vrfTabsContainer').style.display = 'none';
             }
         }
@@ -1738,7 +1764,7 @@
             // Update tab styles
             document.querySelectorAll('.vrf-tab').forEach(tab => {
                 tab.classList.remove('active');
-                if (tab.textContent.startsWith(vrf === 'all' ? 'All' : vrf)) {
+                if (tab.dataset.vrf === vrf) {
                     tab.classList.add('active');
                 }
             });
@@ -1777,14 +1803,14 @@
                     const routes = data.vrf_tables[vrf] || [];
                     routes.forEach(entry => {
                         html += '<tr>';
-                        html += '<td class="ip">' + entry.prefix + '</td>';
-                        html += '<td class="ip">' + (entry.nexthop || '-') + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        if (selectedVrf === 'all') html += '<td><span class="badge badge-cyan">' + vrf + '</span></td>';
-                        html += '<td>' + (entry.protocol || '-') + '</td>';
-                        html += '<td>' + (entry.ad || '-') + '/' + (entry.metric || '-') + '</td>';
-                        html += '<td>' + (entry.ecmp > 1 ? '<span class="badge badge-green">' + entry.ecmp + '</span>' : '1') + '</td>';
-                        html += '<td class="text-right">' + (entry.age || '-') + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.prefix) + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.nexthop || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        if (selectedVrf === 'all') html += '<td><span class="badge badge-cyan">' + escapeHtml(vrf) + '</span></td>';
+                        html += '<td>' + escapeHtml(entry.protocol || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.ad || '-') + '/' + escapeHtml(entry.metric || '-') + '</td>';
+                        html += '<td>' + (entry.ecmp > 1 ? '<span class="badge badge-green">' + escapeHtml(entry.ecmp) + '</span>' : '1') + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.age || '-') + '</td>';
                         html += '</tr>';
                     });
                 });
@@ -1797,7 +1823,7 @@
                     if (routes.length === 0) return;
                     
                     html += '<div class="vrf-section">';
-                    html += '<div class="section-header"><span class="section-title" style="color: var(--primary-green);">VRF: ' + vrf + '</span>';
+                    html += '<div class="section-header"><span class="section-title" style="color: var(--primary-green);">VRF: ' + escapeHtml(vrf) + '</span>';
                     html += '<span class="result-count">' + routes.length + ' routes</span></div>';
                     html += '<table class="data-table" id="routeTable' + tableIdx + '"><thead><tr>';
                     html += '<th>Prefix<span class="sort-icon"></span></th>';
@@ -1810,13 +1836,13 @@
                     
                     routes.forEach(entry => {
                         html += '<tr>';
-                        html += '<td class="ip">' + entry.prefix + '</td>';
-                        html += '<td class="ip">' + (entry.nexthop || '-') + '</td>';
-                        html += '<td>' + (entry.interface || '-') + '</td>';
-                        html += '<td>' + (entry.protocol || '-') + '</td>';
-                        html += '<td>' + (entry.ad || '-') + '/' + (entry.metric || '-') + '</td>';
-                        html += '<td>' + (entry.ecmp > 1 ? '<span class="badge badge-green">' + entry.ecmp + '</span>' : '1') + '</td>';
-                        html += '<td class="text-right">' + (entry.age || '-') + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.prefix) + '</td>';
+                        html += '<td class="ip">' + escapeHtml(entry.nexthop || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.interface || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.protocol || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.ad || '-') + '/' + escapeHtml(entry.metric || '-') + '</td>';
+                        html += '<td>' + (entry.ecmp > 1 ? '<span class="badge badge-green">' + escapeHtml(entry.ecmp) + '</span>' : '1') + '</td>';
+                        html += '<td class="text-right">' + escapeHtml(entry.age || '-') + '</td>';
                         html += '</tr>';
                     });
                     
@@ -1870,10 +1896,10 @@
                     
                     data.entries.forEach(entry => {
                         html += '<tr>';
-                        html += '<td>' + entry.local_port + '</td>';
-                        html += '<td class="device">' + entry.neighbor + '</td>';
-                        html += '<td>' + (entry.remote_port || '-') + '</td>';
-                        html += '<td class="ip text-right">' + (entry.mgmt_ip || '-') + '</td>';
+                        html += '<td>' + escapeHtml(entry.local_port) + '</td>';
+                        html += '<td class="device">' + escapeHtml(entry.neighbor) + '</td>';
+                        html += '<td>' + escapeHtml(entry.remote_port || '-') + '</td>';
+                        html += '<td class="ip text-right">' + escapeHtml(entry.mgmt_ip || '-') + '</td>';
                         html += '</tr>';
                     });
                     
@@ -1881,10 +1907,10 @@
                     results.innerHTML = html;
                     attachSortHandlers(document.getElementById('lldpTable'));
                 } else {
-                    results.innerHTML = '<div class="error-message">' + (data.error || 'Failed to load') + '</div>';
+                    results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
-                results.innerHTML = '<div class="error-message">Error: ' + e.message + '</div>';
+                results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1939,7 +1965,7 @@
                     else if (ageMin < 60) ageText = ageMin + 'm ago';
                     else ageText = Math.floor(ageMin / 60) + 'h ago';
                     
-                    statusSpan.innerHTML = '<span style="color:#76b900;">' + data.device_count + ' devices</span> • ' + ageText;
+                    statusSpan.innerHTML = '<span style="color:#76b900;">' + escapeHtml(data.device_count) + ' devices</span> • ' + escapeHtml(ageText);
                 } else {
                     statusSpan.innerHTML = '<span style="color:#f59e0b;">No cached data</span>';
                 }

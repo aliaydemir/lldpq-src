@@ -5,17 +5,44 @@
 # Copyright (c) 2024 LLDPq Project
 # Licensed under MIT License - see LICENSE file for details
 
+set -o pipefail
+
+# The wrapper holds this lock for the full collection pipeline. Direct callers
+# of monitor.sh acquire the same lock here. Trust the inherited marker only
+# when its lock descriptor is actually open.
+lock_is_inherited=false
+if [[ "${LLDPQ_MONITOR_LOCK_HELD:-0}" == "1" ]] && { : >&9; } 2>/dev/null; then
+    lock_is_inherited=true
+fi
+if [[ "$lock_is_inherited" != "true" ]]; then
+    LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "Error: flock is required for safe monitoring" >&2
+        exit 1
+    fi
+    exec 9>"$LOCK_FILE" || exit 1
+    if ! flock -n 9; then
+        echo "Monitoring is already running; this invocation was skipped." >&2
+        exit 75
+    fi
+    export LLDPQ_MONITOR_LOCK_HELD=1
+fi
+
 # Start timing
 START_TIME=$(date +%s)
 echo "Starting monitoring at $(date)"
 
 DATE=$(date '+%Y-%m-%d %H-%M-%S')
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-eval "$(python3 "$SCRIPT_DIR/parse_devices.py")"
+source "$SCRIPT_DIR/load_devices.sh"
+load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
-# Load config with fallback
-source /etc/lldpq.conf 2>/dev/null || true
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+cd "$SCRIPT_DIR" || exit 1
 
 normalize_bool() {
     case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
@@ -42,18 +69,108 @@ case "$MAX_PARALLEL" in
 esac
 SSH_TIMEOUT=60   # SSH connection timeout in seconds
 
-mkdir -p "$SCRIPT_DIR/monitor-results"
-mkdir -p "$SCRIPT_DIR/monitor-results/flap-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/bgp-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/evpn-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/dup-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/optical-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/ber-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/hardware-data"
-mkdir -p "$SCRIPT_DIR/monitor-results/log-data"
+mkdir -p \
+    "$SCRIPT_DIR/monitor-results/flap-data" \
+    "$SCRIPT_DIR/monitor-results/bgp-data" \
+    "$SCRIPT_DIR/monitor-results/evpn-data" \
+    "$SCRIPT_DIR/monitor-results/dup-data" \
+    "$SCRIPT_DIR/monitor-results/optical-data" \
+    "$SCRIPT_DIR/monitor-results/ber-data" \
+    "$SCRIPT_DIR/monitor-results/hardware-data" \
+    "$SCRIPT_DIR/monitor-results/log-data" || exit 1
 
-unreachable_hosts_file=$(mktemp)
-active_jobs_file=$(mktemp)
+unreachable_hosts_file=$(mktemp) || exit 1
+active_jobs_file=$(mktemp) || {
+    rm -f "$unreachable_hosts_file"
+    exit 1
+}
+completed_file=""
+analysis_log_dir=""
+
+cleanup_monitor_temp() {
+    [[ -n "$unreachable_hosts_file" ]] && rm -f "$unreachable_hosts_file"
+    [[ -n "$active_jobs_file" ]] && rm -f "$active_jobs_file"
+    [[ -n "$completed_file" ]] && rm -f "$completed_file"
+    [[ -n "$analysis_log_dir" ]] && rm -rf "$analysis_log_dir"
+}
+trap cleanup_monitor_temp EXIT
+
+stale_marker="$SCRIPT_DIR/monitor-results/.lldpq-stale"
+
+mark_reports_stale() {
+    local reason=$1
+    local failure_time
+    failure_time=$(date -Is)
+    {
+        printf 'status=stale\n'
+        printf 'timestamp=%s\n' "$failure_time"
+        printf 'reason=%s\n' "$reason"
+    } > "$stale_marker"
+    printf '%s %s\n' "$failure_time" "$reason" >> "$SCRIPT_DIR/monitor-failures.log"
+    echo "Monitoring failed; last-known-good web reports were preserved: $reason" >&2
+    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
+        sudo cp "$stale_marker" "$WEB_ROOT/monitor-results/.lldpq-stale" 2>/dev/null || true
+    fi
+}
+
+clear_stale_marker() {
+    rm -f "$stale_marker" || return 1
+    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
+        sudo rm -f "$WEB_ROOT/monitor-results/.lldpq-stale" 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+publish_monitor_results() {
+    local source_dir="$SCRIPT_DIR/monitor-results"
+    local destination_dir="$WEB_ROOT/monitor-results"
+    local source_real destination_real stage_dir backup_dir=""
+
+    source_real=$(readlink -f "$source_dir" 2>/dev/null || realpath "$source_dir") || return 1
+    destination_real=$(readlink -f "$destination_dir" 2>/dev/null || true)
+
+    # Docker points the web path at the source directory. There is nothing to
+    # copy or swap in that layout; only normalize its permissions.
+    if [[ -n "$destination_real" && "$source_real" == "$destination_real" ]]; then
+        sudo chown -R "${LLDPQ_USER:-$(whoami)}:www-data" "$source_dir" || return 1
+        sudo find "$source_dir" -type d -exec chmod 775 {} \; || return 1
+        sudo find "$source_dir" -type f -exec chmod 664 {} \; || return 1
+        return 0
+    fi
+
+    # Copy into a complete sibling tree first. A failed/partial copy never
+    # touches the currently served directory. The final moves stay on the web
+    # filesystem and rollback the old directory if activation fails.
+    stage_dir=$(sudo mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
+    if ! sudo cp -a "$source_dir/." "$stage_dir/" ||
+       ! sudo chown -R "${LLDPQ_USER:-$(whoami)}:www-data" "$stage_dir" ||
+       ! sudo find "$stage_dir" -type d -exec chmod 775 {} \; ||
+       ! sudo find "$stage_dir" -type f -exec chmod 664 {} \;; then
+        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    if [[ -e "$destination_dir" || -L "$destination_dir" ]]; then
+        backup_dir="${stage_dir}.previous"
+        if ! sudo mv -T "$destination_dir" "$backup_dir"; then
+            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    if ! sudo mv -T "$stage_dir" "$destination_dir"; then
+        if [[ -n "$backup_dir" ]]; then
+            sudo mv -T "$backup_dir" "$destination_dir" 2>/dev/null || true
+        fi
+        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    if [[ -n "$backup_dir" ]]; then
+        sudo rm -rf "$backup_dir" || return 1
+    fi
+    return 0
+}
 
 # SSH options with multiplexing
 SSH_OPTS="-o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60 -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT"
@@ -73,6 +190,42 @@ ping_test() {
     return 0
 }
 
+clear_current_device_artifacts() {
+    local hostname=$1
+    rm -f -- \
+        "$SCRIPT_DIR/monitor-results/${hostname}.html" \
+        "$SCRIPT_DIR/monitor-results/bgp-data/${hostname}_bgp.txt" \
+        "$SCRIPT_DIR/monitor-results/evpn-data/${hostname}_evpn.txt" \
+        "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_dup.txt" \
+        "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_fdb.txt" \
+        "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_neigh.txt" \
+        "$SCRIPT_DIR/monitor-results/flap-data/${hostname}_"* \
+        "$SCRIPT_DIR/monitor-results/optical-data/${hostname}_optical.txt" \
+        "$SCRIPT_DIR/monitor-results/ber-data/${hostname}_interface_errors.txt" \
+        "$SCRIPT_DIR/monitor-results/ber-data/${hostname}_detailed_counters.txt" \
+        "$SCRIPT_DIR/monitor-results/ber-data/${hostname}_l1_show.txt" \
+        "$SCRIPT_DIR/monitor-results/hardware-data/${hostname}_hardware.txt" \
+        "$SCRIPT_DIR/monitor-results/log-data/${hostname}_logs.txt"
+}
+
+write_unreachable_device_report() {
+    local device=$1 hostname=$2
+    local html_file="$SCRIPT_DIR/monitor-results/${hostname}.html"
+    local html_temp="${html_file}.tmp.${BASHPID:-$$}"
+    cat > "$html_temp" <<EOF
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Monitor Results - ${hostname}</title>
+<link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
+<body><h1>Monitor Results - ${hostname}</h1>
+<p style="color:#ff9800;font-weight:bold">Current collection unavailable</p>
+<p>Device ${hostname} (${device}) did not respond during the collection at ${DATE}.</p>
+<p>Previous measurements were intentionally not presented as current.</p>
+</body></html>
+EOF
+    [[ -s "$html_temp" ]] || { rm -f "$html_temp"; return 1; }
+    mv -f "$html_temp" "$html_file"
+}
+
 # ============================================================================
 # OPTIMIZED: Single SSH session collects ALL data
 # ============================================================================
@@ -81,6 +234,9 @@ execute_commands_optimized() {
     local user=$2
     local hostname=$3
     local device_start=$(date +%s)
+    local html_file="monitor-results/${hostname}.html"
+    local html_temp="${html_file}.tmp.${BASHPID:-$$}"
+    local raw_file="monitor-results/${hostname}_raw_data.tmp.${BASHPID:-$$}"
     
     # Arrays to store timing data for summary
     declare -a section_names
@@ -89,7 +245,7 @@ execute_commands_optimized() {
     # Progress output removed for performance
     
     # Create HTML header
-    cat > monitor-results/${hostname}.html << EOF
+    cat > "$html_temp" << EOF
 <!DOCTYPE html>
 <html>
 <head>
@@ -132,6 +288,12 @@ execute_commands_optimized() {
 
 EOF
 
+    if [[ ! -s "$html_temp" ]]; then
+        echo "Could not create staged HTML report for ${hostname}" >&2
+        rm -f "$html_temp"
+        return 1
+    fi
+
     # =========================================================================
     # SINGLE SSH SESSION - Collect ALL data at once
     # =========================================================================
@@ -157,6 +319,9 @@ EOF
                 color=$([ "$link_status" = "up" ] && echo "lime" || echo "red")
                 description=$(ip link show "$interface" | grep -o "alias.*" | sed "s/alias //")
                 [ -z "$description" ] && description="No description"
+                # Interface aliases are configuration data, not HTML. Encode
+                # the text before it is appended to the generated report.
+                description=$(printf "%s" "$description" | sed "s/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g")
                 printf "<span style=\"color:steelblue;\">%-14s</span> <span style=\"color:%s;\">%-12s</span> <span style=\"color:%s;\">%-12s</span> %s\n" "$interface" "$color" "$state" "$color" "$link_status" "$description"
             fi
         done
@@ -499,7 +664,19 @@ EOF
         echo "===LOG_DATA_END==="
         
         
-    ' > "monitor-results/${hostname}_raw_data.txt" 2>/dev/null
+    ' > "$raw_file" 2>/dev/null
+    local ssh_status=$?
+
+    if [[ $ssh_status -ne 0 ]] ||
+       ! grep -q '^===HTML_OUTPUT_END===$' "$raw_file" 2>/dev/null ||
+       ! grep -q '^===LOG_DATA_END===$' "$raw_file" 2>/dev/null; then
+        echo "Data collection failed for ${hostname} (ssh status ${ssh_status})" >&2
+        rm -f "$raw_file" "$html_temp"
+        if [[ $ssh_status -ne 0 ]]; then
+            return "$ssh_status"
+        fi
+        return 1
+    fi
     
     local ssh_end=$(date +%s)
     local ssh_duration=$((ssh_end - ssh_start))
@@ -511,55 +688,55 @@ EOF
     # =========================================================================
     local parse_start=$(date +%s)
     
-    if [ -f "monitor-results/${hostname}_raw_data.txt" ]; then
+    if [ -f "$raw_file" ]; then
         # Extract HTML output
-        sed -n '/===HTML_OUTPUT_START===/,/===HTML_OUTPUT_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
-            grep -v "===HTML_OUTPUT" >> "monitor-results/${hostname}.html"
+        sed -n '/===HTML_OUTPUT_START===/,/===HTML_OUTPUT_END===/p' "$raw_file" | \
+            grep -v "===HTML_OUTPUT" >> "$html_temp"
         
         # Extract BGP data
-        sed -n '/===BGP_DATA_START===/,/===BGP_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===BGP_DATA_START===/,/===BGP_DATA_END===/p' "$raw_file" | \
             grep -v "===BGP_DATA" > "monitor-results/bgp-data/${hostname}_bgp.txt"
         
         # Extract EVPN data
-        sed -n '/===EVPN_DATA_START===/,/===EVPN_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===EVPN_DATA_START===/,/===EVPN_DATA_END===/p' "$raw_file" | \
             grep -v "===EVPN_DATA" > "monitor-results/evpn-data/${hostname}_evpn.txt"
         
         # Extract Duplicate IP/MAC data (EVPN dup-detection + FDB + neighbours)
-        sed -n '/===DUP_DATA_START===/,/===DUP_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===DUP_DATA_START===/,/===DUP_DATA_END===/p' "$raw_file" | \
             grep -v "===DUP_DATA" > "monitor-results/dup-data/${hostname}_dup.txt"
-        sed -n '/===FDB_DATA_START===/,/===FDB_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===FDB_DATA_START===/,/===FDB_DATA_END===/p' "$raw_file" | \
             grep -v "===FDB_DATA" > "monitor-results/dup-data/${hostname}_fdb.txt"
-        sed -n '/===NEIGH_DATA_START===/,/===NEIGH_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===NEIGH_DATA_START===/,/===NEIGH_DATA_END===/p' "$raw_file" | \
             grep -v "===NEIGH_DATA" > "monitor-results/dup-data/${hostname}_neigh.txt"
         
         # Extract Carrier data
         echo "=== CARRIER TRANSITIONS ===" > "monitor-results/flap-data/${hostname}_carrier_transitions.txt"
-        sed -n '/===CARRIER_DATA_START===/,/===CARRIER_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===CARRIER_DATA_START===/,/===CARRIER_DATA_END===/p' "$raw_file" | \
             grep -v "===CARRIER_DATA" >> "monitor-results/flap-data/${hostname}_carrier_transitions.txt"
         
         # Extract Optical data
         echo "=== OPTICAL DIAGNOSTICS ===" > "monitor-results/optical-data/${hostname}_optical.txt"
-        sed -n '/===OPTICAL_DATA_START===/,/===OPTICAL_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===OPTICAL_DATA_START===/,/===OPTICAL_DATA_END===/p' "$raw_file" | \
             grep -v "===OPTICAL_DATA" >> "monitor-results/optical-data/${hostname}_optical.txt"
         
         # Extract BER data
-        sed -n '/===BER_DATA_START===/,/===BER_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===BER_DATA_START===/,/===BER_DATA_END===/p' "$raw_file" | \
             grep -v "===BER_DATA" > "monitor-results/ber-data/${hostname}_interface_errors.txt"
         
         # Extract L1 data
-        sed -n '/===L1_DATA_START===/,/===L1_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===L1_DATA_START===/,/===L1_DATA_END===/p' "$raw_file" | \
             grep -v "===L1_DATA" > "monitor-results/ber-data/${hostname}_l1_show.txt"
         
         # Extract Hardware data
-        sed -n '/===HARDWARE_DATA_START===/,/===HARDWARE_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===HARDWARE_DATA_START===/,/===HARDWARE_DATA_END===/p' "$raw_file" | \
             grep -v "===HARDWARE_DATA" > "monitor-results/hardware-data/${hostname}_hardware.txt"
         
         # Extract Log data
-        sed -n '/===LOG_DATA_START===/,/===LOG_DATA_END===/p' "monitor-results/${hostname}_raw_data.txt" | \
+        sed -n '/===LOG_DATA_START===/,/===LOG_DATA_END===/p' "$raw_file" | \
             grep -v "===LOG_DATA" > "monitor-results/log-data/${hostname}_logs.txt"
         
         # Cleanup raw file
-        rm -f "monitor-results/${hostname}_raw_data.txt"
+        rm -f "$raw_file"
     fi
     
     local parse_end=$(date +%s)
@@ -570,28 +747,28 @@ EOF
     # Add config section to HTML
     local config_start=$(date +%s)
     
-    cat >> monitor-results/${hostname}.html << EOF
+    cat >> "$html_temp" << EOF
 
 <h1></h1><h1><font color="#b57614">Device Configuration - ${hostname}</font></h1><h3></h3>
 EOF
 
     if [ -f "$WEB_ROOT/configs/${hostname}.txt" ]; then
-        echo "<h2><font color='steelblue'>NV Set Commands</font></h2>" >> monitor-results/${hostname}.html
-        echo "<div class='config-content' id='config-content'>" >> monitor-results/${hostname}.html
+        echo "<h2><font color='steelblue'>NV Set Commands</font></h2>" >> "$html_temp"
+        echo "<div class='config-content' id='config-content'>" >> "$html_temp"
         cat "$WEB_ROOT/configs/${hostname}.txt" | sed '
             s/</\&lt;/g; s/>/\&gt;/g;
             s/^#.*/<span class="comment">&<\/span>/;
             /description/ {
                 s/\(.*\)\(description\s\+\)\(.*\)$/\1\2<span class="comment">\3<\/span>/;
             }
-        ' >> monitor-results/${hostname}.html
-        echo "</div>" >> monitor-results/${hostname}.html
+        ' >> "$html_temp"
+        echo "</div>" >> "$html_temp"
     else
-        echo "<p><span style='color: orange;'>⚠️  Configuration not available for ${hostname}</span></p>" >> monitor-results/${hostname}.html
+        echo "<p><span style='color: orange;'>⚠️  Configuration not available for ${hostname}</span></p>" >> "$html_temp"
     fi
     
     # Close HTML
-    cat >> monitor-results/${hostname}.html << EOF
+    cat >> "$html_temp" << EOF
     </pre>
     </h3>
     <span style="color:tomato;">Created on $DATE</span>
@@ -599,12 +776,24 @@ EOF
 </html>
 EOF
 
+    if ! grep -q '</html>' "$html_temp"; then
+        echo "Staged HTML report is incomplete for ${hostname}" >&2
+        rm -f "$html_temp"
+        return 1
+    fi
+
     local config_end=$(date +%s)
     local config_duration=$((config_end - config_start))
     section_names+=("Configuration Section")
     section_times+=("$config_duration")
 
+    if ! mv -f "$html_temp" "$html_file"; then
+        rm -f "$html_temp"
+        return 1
+    fi
+
     # Silent completion - no per-device output for performance
+    return 0
 }
 
 process_device() {
@@ -614,7 +803,13 @@ process_device() {
     ping_test "$device" "$hostname"
     if [ $? -eq 0 ]; then
         execute_commands_optimized "$device" "$user" "$hostname"
+        return $?
     fi
+    # Do not let a previous raw snapshot or per-device page look current. The
+    # aggregate run may still succeed for the rest of the fabric, while this
+    # device gets an explicit unavailable page and asset status.
+    clear_current_device_artifacts "$hostname" || return 1
+    write_unreachable_device_report "$device" "$hostname"
 }
 
 # ============================================================================
@@ -626,27 +821,56 @@ completed_file="/tmp/monitor_completed_$$"
 echo "0" > "$completed_file"
 
 # Simple parallel execution without animation (animation causes hangs)
-job_count=0
+declare -a collection_pids=()
+declare -a collection_labels=()
+declare -a collection_failures=()
+next_collection_wait=0
+active_collection_jobs=0
 device_count=0
+
+wait_for_collection_job() {
+    local index=$1
+    local status
+    if wait "${collection_pids[$index]}"; then
+        status=0
+    else
+        status=$?
+        collection_failures+=("${collection_labels[$index]}:${status}")
+    fi
+    return 0
+}
+
 for device in "${!devices[@]}"; do
     IFS=' ' read -r user hostname <<< "${devices[$device]}"
     
     process_device "$device" "$user" "$hostname" &
-    ((job_count++))
+    collection_pids+=("$!")
+    collection_labels+=("$hostname")
+    ((active_collection_jobs++))
     ((device_count++))
     
     # Wait if we hit the parallel limit
-    if [ $job_count -ge $MAX_PARALLEL ]; then
-        wait -n 2>/dev/null || wait
-        ((job_count--))
+    if [ "$active_collection_jobs" -ge "$MAX_PARALLEL" ]; then
+        wait_for_collection_job "$next_collection_wait"
+        ((next_collection_wait++))
+        ((active_collection_jobs--))
     fi
 done
 
 # Wait for all remaining jobs
-wait
+while [ "$next_collection_wait" -lt "${#collection_pids[@]}" ]; do
+    wait_for_collection_job "$next_collection_wait"
+    ((next_collection_wait++))
+done
 echo "Collected $device_count devices"
 data_collection_end=$(date +%s)
 data_collection_duration=$((data_collection_end - START_TIME))
+
+if [ "${#collection_failures[@]}" -gt 0 ]; then
+    failure_text="collection jobs failed: ${collection_failures[*]}"
+    mark_reports_stale "$failure_text"
+    exit 1
+fi
 
 # ============================================================================
 # PARALLEL ANALYSIS PHASE
@@ -654,33 +878,65 @@ data_collection_duration=$((data_collection_end - START_TIME))
 echo "Analyzing..."
 analysis_start=$(date +%s)
 
-# Run all analyses in parallel (suppress all output)
-python3 process_bgp_data.py >/dev/null 2>&1 &
-python3 process_flap_data.py >/dev/null 2>&1 &
-if [[ "$SKIP_OPTICAL" != "true" ]]; then
-    python3 process_optical_data.py >/dev/null 2>&1 &
-fi
-python3 process_ber_data.py >/dev/null 2>&1 &
-python3 process_hardware_data.py >/dev/null 2>&1 &
-python3 process_log_data.py >/dev/null 2>&1 &
-python3 process_duplicate_data.py >/dev/null 2>&1 &
+# Run all analyses in parallel and retain each status/log independently.
+analysis_log_dir=$(mktemp -d "${TMPDIR:-/tmp}/lldpq-analysis.XXXXXX") || exit 1
+declare -a analysis_pids=()
+declare -a analysis_labels=()
+declare -a analysis_logs=()
+declare -a analysis_failures=()
 
-# Wait for all
-wait
+start_analysis() {
+    local label=$1
+    shift
+    local log_file="$analysis_log_dir/${label}.log"
+    "$@" >"$log_file" 2>&1 &
+    analysis_pids+=("$!")
+    analysis_labels+=("$label")
+    analysis_logs+=("$log_file")
+}
+
+start_analysis bgp python3 process_bgp_data.py
+start_analysis flap python3 process_flap_data.py
+if [[ "$SKIP_OPTICAL" != "true" ]]; then
+    start_analysis optical python3 process_optical_data.py
+fi
+start_analysis ber python3 process_ber_data.py
+start_analysis hardware python3 process_hardware_data.py
+start_analysis log python3 process_log_data.py
+start_analysis duplicate python3 process_duplicate_data.py
+
+for index in "${!analysis_pids[@]}"; do
+    if wait "${analysis_pids[$index]}"; then
+        status=0
+    else
+        status=$?
+        analysis_failures+=("${analysis_labels[$index]}:${status}")
+        echo "Analysis '${analysis_labels[$index]}' failed with status ${status}:" >&2
+        tail -20 "${analysis_logs[$index]}" >&2 || true
+    fi
+done
 
 analysis_end=$(date +%s)
 analysis_duration=$((analysis_end - analysis_start))
 
+if [ "${#analysis_failures[@]}" -gt 0 ]; then
+    failure_text="analysis jobs failed: ${analysis_failures[*]}"
+    mark_reports_stale "$failure_text"
+    exit 1
+fi
+
 # ============================================================================
 # COPY RESULTS
 # ============================================================================
-sudo cp -r monitor-results "$WEB_ROOT/"
-sudo chown -R "${LLDPQ_USER:-$(whoami)}:www-data" "$WEB_ROOT/monitor-results/"
-sudo find "$WEB_ROOT/monitor-results/" -type d -exec chmod 775 {} \;
-sudo find "$WEB_ROOT/monitor-results/" -type f -exec chmod 664 {} \;
-
-rm -f "$unreachable_hosts_file"
-rm -f "$active_jobs_file"
+rm -f "$stale_marker" || exit 1
+if ! publish_monitor_results; then
+    mark_reports_stale "report publication failed"
+    exit 1
+fi
+if ! clear_stale_marker; then
+    mark_reports_stale "could not clear stale report marker"
+    exit 1
+fi
 
 # Calculate execution time
 END_TIME=$(date +%s)

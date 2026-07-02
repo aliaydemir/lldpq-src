@@ -12,7 +12,10 @@ Licensed under MIT License - see LICENSE file for details
 """
 import os
 import re
+import stat
 import subprocess
+import sys
+import tempfile
 import yaml
 
 def load_topology_config(config_path="topology_config.yaml"):
@@ -220,39 +223,76 @@ def check_connections(topology_file, device_neighbors, device_port_status):
         results[device] = device_results
     return results
 
-if __name__ == "__main__":
+def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     lldp_results_folder = os.path.join(script_dir, "lldp-results")
     topology_file = os.path.join(script_dir, "topology.dot")
-    device_neighbors, device_port_status, files_in_order = get_device_neighbors(lldp_results_folder)
-    results = check_connections(topology_file, device_neighbors, device_port_status)
     output_file_path = os.path.join(lldp_results_folder, "lldp_results.ini")
-    date_str = subprocess.getoutput("date '+%Y-%m-%d %H-%M-%S'")
-    script_name = get_topology_script_name()
-    generate_topology_script = os.path.join(os.path.dirname(__file__), script_name)
-    with open(output_file_path, 'w') as output_file:
-        output_file.write(f"Created on {date_str}\n\n")
+    temp_output_path = None
+
+    try:
+        device_neighbors, device_port_status, files_in_order = get_device_neighbors(lldp_results_folder)
+        results = check_connections(topology_file, device_neighbors, device_port_status)
+        date_str = subprocess.getoutput("date '+%Y-%m-%d %H-%M-%S'")
+        script_name = get_topology_script_name()
+        generate_topology_script = os.path.join(os.path.dirname(__file__), script_name)
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=lldp_results_folder,
+            prefix=".lldp_results.ini.",
+            delete=False,
+        ) as output_file:
+            temp_output_path = output_file.name
+            try:
+                report_mode = stat.S_IMODE(os.stat(output_file_path).st_mode)
+            except FileNotFoundError:
+                report_mode = 0o664
+            os.fchmod(output_file.fileno(), report_mode)
+            output_file.write(f"Created on {date_str}\n\n")
+            for filename in files_in_order:
+                if filename.endswith("_lldp_result.ini"):
+                    device = filename.replace("_lldp_result.ini", "")
+                    if device in results:
+                        total_length = 96
+                        device_length = len(device)
+                        equal_count = (total_length - device_length - 2) // 2
+                        equal_str = "=" * equal_count
+                        header = f"{equal_str} {device} {equal_str}"
+                        if len(header) < total_length:
+                            header += "=" * (total_length - len(header))
+                        output_file.write(header + "\n\n")
+                        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
+                        output_file.write(f"{'Port':<10} {'Status':<10} {'Exp-Nbr':<28} {'Exp-Nbr-Port':<16} {'Act-Nbr':<28} {'Act-Nbr-Port':<12} {'Port-Status'}\n")
+                        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
+                        for res in results[device]:
+                            output_file.write(f"{res['Port']:<10} {res['Status']:<10} {res['Exp-Nbr']:<28} {res['Exp-Nbr-Port']:<16} {res['Act-Nbr']:<28} {res['Act-Nbr-Port']:<12} {res['Port-Status']}\n")
+                        output_file.write("\n\n")
+            output_file.flush()
+            os.fsync(output_file.fileno())
+
+        # The topology generator writes atomically and exits nonzero on failure.
+        # Do not publish the validation report or delete its raw inputs until it
+        # has completed successfully.
+        subprocess.run(["sudo", "python3", generate_topology_script], check=True)
+        os.replace(temp_output_path, output_file_path)
+        temp_output_path = None
+
         for filename in files_in_order:
             if filename.endswith("_lldp_result.ini"):
-                device = filename.replace("_lldp_result.ini", "")
-                if device in results:
-                    total_length = 96
-                    device_length = len(device)
-                    equal_count = (total_length - device_length - 2) // 2
-                    equal_str = "=" * equal_count
-                    header = f"{equal_str} {device} {equal_str}"
-                    if len(header) < total_length:
-                        header += "=" * (total_length - len(header))
-                    output_file.write(header + "\n\n")
-                    output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
-                    output_file.write(f"{'Port':<10} {'Status':<10} {'Exp-Nbr':<28} {'Exp-Nbr-Port':<16} {'Act-Nbr':<28} {'Act-Nbr-Port':<12} {'Port-Status'}\n")
-                    output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
-                    for res in results[device]:
-                        output_file.write(f"{res['Port']:<10} {res['Status']:<10} {res['Exp-Nbr']:<28} {res['Exp-Nbr-Port']:<16} {res['Act-Nbr']:<28} {res['Act-Nbr-Port']:<12} {res['Port-Status']}\n")
-                    output_file.write("\n\n")
-    subprocess.run(["sudo", "python3", generate_topology_script], check=True)
-    # Clean up raw files
-    for filename in files_in_order:
-        if filename.endswith("_lldp_result.ini"):
-            os.remove(os.path.join(lldp_results_folder, filename))
+                os.remove(os.path.join(lldp_results_folder, filename))
+        return 0
+    except Exception as exc:
+        print(f"Error validating LLDP data: {exc}")
+        return 1
+    finally:
+        if temp_output_path:
+            try:
+                os.unlink(temp_output_path)
+            except FileNotFoundError:
+                pass
 
+
+if __name__ == "__main__":
+    sys.exit(main())

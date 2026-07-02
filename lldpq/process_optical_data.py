@@ -11,6 +11,7 @@ import re
 import sys
 from datetime import datetime
 from optical_analyzer import OpticalAnalyzer
+from collection_freshness import is_current_collection, read_asset_snapshot
 
 def parse_optical_diagnostics_file(filepath):
     """Parse optical diagnostics file"""
@@ -48,6 +49,9 @@ def parse_optical_diagnostics_file(filepath):
 def process_optical_data_files(data_dir="monitor-results/optical-data"):
     """Process optical data files and update optical analyzer"""
     optical_analyzer = OpticalAnalyzer("monitor-results")
+    # Historical readings remain in optical_history; only files from this
+    # successful collection may populate the current snapshot.
+    optical_analyzer.current_optical_stats = {}
 
     print("Processing optical diagnostics data")
     print(f"Data directory: {data_dir}")
@@ -60,15 +64,29 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
 
     if not os.path.exists(data_dir):
         print(f"❌ Optical data directory {data_dir} not found")
-        return
+        return False
 
     # List files in directory
-    files = os.listdir(data_dir)
+    asset_snapshot = read_asset_snapshot()
+    files = [
+        filename for filename in os.listdir(data_dir)
+        if filename.endswith("_optical.txt")
+        and is_current_collection(
+            os.path.join(data_dir, filename),
+            filename.removesuffix("_optical.txt"),
+            asset_snapshot,
+        )
+    ]
     print(f"Found {len(files)} optical data files")
+
+    if not files:
+        print("❌ No current optical collection files found")
+        optical_analyzer.save_optical_history()
+        return False
 
     # Process all optical diagnostic files
     total_processed = 0
-    for filename in os.listdir(data_dir):
+    for filename in files:
         if filename.endswith("_optical.txt"):
             hostname = filename.replace("_optical.txt", "")
             filepath = os.path.join(data_dir, filename)
@@ -94,7 +112,7 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                     # Add unplugged port to stats with special status
                     optical_analyzer.current_optical_stats[port_name] = {
                         'port': port_name,
-                        'device': device_name,
+                        'device': hostname,
                         'health_status': 'unplugged',
                         'rx_power_dbm': None,
                         'tx_power_dbm': None,
@@ -116,7 +134,7 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                         voltage_match = re.search(r'voltage\s*:\s*([\d.]+)', optical_data)
                         optical_analyzer.current_optical_stats[port_name] = {
                             'port': port_name,
-                            'device': device_name,
+                            'device': hostname,
                             'health_status': 'down',
                             'rx_power_dbm': rx_power_dbm,
                             'tx_power_dbm': None,
@@ -213,11 +231,13 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     # Check for excellent performers
     if summary['excellent_ports']:
         print(f"\nExcellent Optical Health: {len(summary['excellent_ports'])} ports performing optimally")
+    return True
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(script_dir)
 
     print(f"[{datetime.now()}] Starting optical data processing")
-    process_optical_data_files()
+    success = process_optical_data_files()
     print(f"[{datetime.now()}] Optical data processing completed")
+    sys.exit(0 if success else 1)

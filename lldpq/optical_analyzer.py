@@ -26,7 +26,24 @@ class OpticalHealth(Enum):
     GOOD = "good"
     WARNING = "warning"
     CRITICAL = "critical"
+    DOWN = "down"
+    UNPLUGGED = "unplugged"
     UNKNOWN = "unknown"
+
+
+def coerce_optical_health(value: Any) -> OpticalHealth:
+    """Return a known health enum for current and historical status values."""
+    if isinstance(value, OpticalHealth):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized.startswith("opticalhealth."):
+            normalized = normalized.split(".", 1)[1]
+        try:
+            return OpticalHealth(normalized)
+        except ValueError:
+            pass
+    return OpticalHealth.UNKNOWN
 
 class OpticalAnalyzer:
     # Industry standard optical power thresholds (dBm)
@@ -162,13 +179,19 @@ class OpticalAnalyzer:
                 except ValueError:
                     pass
 
-        # Average multi-channel values
+        # Keep the displayed scalar values as channel averages for backwards
+        # compatibility, but retain lane readings internally so one bad lane
+        # cannot be hidden by otherwise healthy lanes.
         if rx_powers:
             optical_params['rx_power_dbm'] = sum(rx_powers) / len(rx_powers)
         if tx_powers:
             optical_params['tx_power_dbm'] = sum(tx_powers) / len(tx_powers)
         if bias_currents:
             optical_params['bias_current_ma'] = sum(bias_currents) / len(bias_currents)
+
+        optical_params['_rx_power_lanes_dbm'] = rx_powers
+        optical_params['_tx_power_lanes_dbm'] = tx_powers
+        optical_params['_bias_current_lanes_ma'] = bias_currents
 
         # Fallback: parse on full blob if line-by-line missed values (ethtool formatting variations)
         # Enhanced to handle both "Channel 1" and "(Channel 1)" formats
@@ -178,18 +201,21 @@ class OpticalAnalyzer:
                 rx_vals = [float(v) for v in rx_all if float(v) > -35.0]
                 if rx_vals:
                     optical_params['rx_power_dbm'] = sum(rx_vals) / len(rx_vals)
+                    optical_params['_rx_power_lanes_dbm'] = rx_vals
         if optical_params['tx_power_dbm'] is None:
             tx_all = re.findall(r'(?:Transmit\s+avg\s+optical\s+power\s*\(?\s*Channel\s*\d+\s*\)?|ch-\d+-tx-power)\s*:\s*[\d.-]+\s*mW\s*/\s*([-\d.]+)\s*dBm', optical_data, flags=re.IGNORECASE)
             if tx_all:
                 tx_vals = [float(v) for v in tx_all if float(v) > -35.0]
                 if tx_vals:
                     optical_params['tx_power_dbm'] = sum(tx_vals) / len(tx_vals)
+                    optical_params['_tx_power_lanes_dbm'] = tx_vals
         if optical_params['bias_current_ma'] is None:
             bias_all = re.findall(r'(?:Laser\s+tx\s+bias\s+current\s*\(?\s*Channel\s*\d+\s*\)?|ch-\d+-tx-bias-current)\s*:\s*([\d.-]+)\s*mA', optical_data, flags=re.IGNORECASE)
             if bias_all:
                 bias_vals = [float(v) for v in bias_all if float(v) > 0.1]
                 if bias_vals:
                     optical_params['bias_current_ma'] = sum(bias_vals) / len(bias_vals)
+                    optical_params['_bias_current_lanes_ma'] = bias_vals
 
         return optical_params
 
@@ -210,16 +236,25 @@ class OpticalAnalyzer:
         temperature = optical_params.get('temperature_c')
         voltage = optical_params.get('voltage_v')
         bias_current = optical_params.get('bias_current_ma')
+        rx_lanes = optical_params.get('_rx_power_lanes_dbm') or (
+            [rx_power] if rx_power is not None else []
+        )
+        tx_lanes = optical_params.get('_tx_power_lanes_dbm') or (
+            [tx_power] if tx_power is not None else []
+        )
+        bias_lanes = optical_params.get('_bias_current_lanes_ma') or (
+            [bias_current] if bias_current is not None else []
+        )
 
         # No optical data available
         if all(v is None for v in [rx_power, tx_power, temperature]):
             return OpticalHealth.UNKNOWN
 
         # Critical conditions (any one triggers critical status)
-        if rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm']:
+        if any(value < self.thresholds['rx_power_min_dbm'] for value in rx_lanes):
             return OpticalHealth.CRITICAL
-        if rx_power is not None and \
-           rx_power > self.thresholds.get('rx_power_critical_high_dbm', 7.0):
+        if any(value > self.thresholds.get('rx_power_critical_high_dbm', 7.0)
+               for value in rx_lanes):
             return OpticalHealth.CRITICAL
         if temperature is not None and temperature > self.thresholds['temperature_max_c']:
             return OpticalHealth.CRITICAL
@@ -227,26 +262,29 @@ class OpticalAnalyzer:
             return OpticalHealth.CRITICAL
         if voltage is not None and (voltage < self.thresholds['voltage_min_v'] or voltage > self.thresholds['voltage_max_v']):
             return OpticalHealth.CRITICAL
-        if bias_current is not None and bias_current > self.thresholds['bias_current_max_ma']:
+        if any(value > self.thresholds['bias_current_max_ma'] for value in bias_lanes):
             return OpticalHealth.CRITICAL
 
         # Warning conditions
         warning_count = 0
 
         # Low link margin warning
-        if rx_power is not None:
-            link_margin = self.calculate_link_margin(rx_power)
-            if link_margin < self.thresholds['link_margin_min_db']:
-                warning_count += 1
+        if rx_lanes and any(
+            self.calculate_link_margin(value) < self.thresholds['link_margin_min_db']
+            for value in rx_lanes
+        ):
+            warning_count += 1
 
         # High RX power warning (above warning high but below critical high)
-        if rx_power is not None and \
-           rx_power > self.thresholds.get('rx_power_warning_high_dbm', 5.0):
+        if any(value > self.thresholds.get('rx_power_warning_high_dbm', 5.0)
+               for value in rx_lanes):
             warning_count += 1
 
         # TX power near limits
-        if tx_power is not None:
-            if tx_power < self.thresholds['tx_power_min_dbm'] + 1.0 or tx_power > self.thresholds['tx_power_max_dbm'] - 1.0:
+        if tx_lanes:
+            if any(value < self.thresholds['tx_power_min_dbm'] + 1.0 or
+                   value > self.thresholds['tx_power_max_dbm'] - 1.0
+                   for value in tx_lanes):
                 warning_count += 1
 
         # Temperature approaching limits
@@ -326,6 +364,7 @@ class OpticalAnalyzer:
 
         for port_name, stats in self.current_optical_stats.items():
             health = stats.get('health_status', 'unknown')
+            health_enum = coerce_optical_health(health)
 
             port_info = {
                 "port": port_name,
@@ -338,13 +377,14 @@ class OpticalAnalyzer:
                 "bias_current_ma": stats.get('bias_current_ma')
             }
 
-            if health == OpticalHealth.EXCELLENT.value:
+            if health_enum == OpticalHealth.EXCELLENT:
                 summary["excellent_ports"].append(port_info)
-            elif health == OpticalHealth.GOOD.value:
+            elif health_enum == OpticalHealth.GOOD:
                 summary["good_ports"].append(port_info)
-            elif health == OpticalHealth.WARNING.value:
+            elif health_enum == OpticalHealth.WARNING:
                 summary["warning_ports"].append(port_info)
-            elif health == OpticalHealth.CRITICAL.value:
+            elif health_enum in (OpticalHealth.CRITICAL, OpticalHealth.DOWN,
+                                  OpticalHealth.UNPLUGGED):
                 summary["critical_ports"].append(port_info)
             else:
                 summary["unknown_ports"].append(port_info)
@@ -362,7 +402,28 @@ class OpticalAnalyzer:
         anomalies = []
 
         for port_name, stats in self.current_optical_stats.items():
-            health = OpticalHealth(stats.get('health_status', 'unknown'))
+            health = coerce_optical_health(stats.get('health_status', 'unknown'))
+
+            if health == OpticalHealth.DOWN:
+                anomalies.append({
+                    "port": port_name,
+                    "type": "OPTICAL_LINK_DOWN",
+                    "severity": "critical",
+                    "message": "Optical link is down",
+                    "action": "Check fiber connection, peer state, and transceiver",
+                    "rx_power_dbm": stats.get('rx_power_dbm')
+                })
+                continue
+
+            if health == OpticalHealth.UNPLUGGED:
+                anomalies.append({
+                    "port": port_name,
+                    "type": "OPTICAL_MODULE_UNPLUGGED",
+                    "severity": "critical",
+                    "message": "Optical module is unplugged",
+                    "action": "Install or reseat the expected optical module"
+                })
+                continue
 
             if health == OpticalHealth.CRITICAL:
                 # Critical optical issues
@@ -407,6 +468,12 @@ class OpticalAnalyzer:
     def get_recommended_action(self, port_info: Dict[str, Any]) -> str:
         """Get recommended action for a port based on its health status and parameters"""
         health = port_info.get('health', 'unknown')
+
+        if health == OpticalHealth.DOWN.value:
+            return "Check fiber connection, peer state, and transceiver"
+
+        if health == OpticalHealth.UNPLUGGED.value:
+            return "Install or reseat the expected optical module"
 
         if health == OpticalHealth.EXCELLENT.value:
             return ""  # No action needed for excellent health
@@ -995,13 +1062,15 @@ class OpticalAnalyzer:
         function compareOpticalHealth(a, b) {
             const priority = {
                 'CRITICAL': 0,
+                'DOWN': 0,
+                'UNPLUGGED': 0,
                 'WARNING': 1,
                 'GOOD': 2,
                 'EXCELLENT': 3,
                 'UNKNOWN': 4
             };
 
-            return (priority[a] || 5) - (priority[b] || 5);
+            return (priority[a] ?? 5) - (priority[b] ?? 5);
         }
 
         function compareOpticalValue(a, b) {

@@ -14,7 +14,9 @@ source "$(dirname "$0")/auth-guard.sh"
 require_admin
 
 # Load config with fallback
-source /etc/lldpq.conf 2>/dev/null || true
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 
 # EDITOR_ROOT: directory shown in Fabric Editor (falls back to ANSIBLE_DIR)

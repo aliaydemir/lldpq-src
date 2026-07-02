@@ -3,7 +3,9 @@
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$BASH_SOURCE")")
-source /etc/lldpq.conf 2>/dev/null || true
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 
 show_help() {
     cat << EOF
@@ -73,16 +75,16 @@ while getopts "hlec:r:f:" opt; do
     esac
 done
 
-# Parse devices.yaml using Python parser (same as other lldpq scripts)
-file_arg=""
-[[ -n "$devices_file" ]] && file_arg="-f $devices_file"
+# Parse devices.yaml without evaluating YAML-derived shell code.
+source "$SCRIPT_DIR/load_devices.sh"
+device_args=()
+[[ -n "$devices_file" ]] && device_args+=("-f" "$devices_file")
 
 if [[ -n "$role_filter" ]]; then
     echo -e "\e[0;35mFiltering by role: @$role_filter\e[0m"
-    eval "$(python3 "$SCRIPT_DIR/parse_devices.py" -r "$role_filter" $file_arg)" || exit 1
-else
-    eval "$(python3 "$SCRIPT_DIR/parse_devices.py" $file_arg)"
+    device_args+=("-r" "$role_filter")
 fi
+load_devices "$SCRIPT_DIR/parse_devices.py" "${device_args[@]}" || exit 1
 
 # Check if devices array is populated
 if [[ ${#devices[@]} -eq 0 ]]; then

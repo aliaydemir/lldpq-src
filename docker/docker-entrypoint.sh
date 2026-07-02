@@ -179,8 +179,10 @@ echo "✓ Authentication ready"
 # ─── Cron Setup ───
 # lldpq = assets.sh + check-lldp.sh + monitor.sh + fabric-scan.sh + alerts
 # lldpq-trigger = web UI refresh buttons (Refresh Assets, Refresh LLDP, etc.)
-# Honor schedules from lldpq.conf if present (editable from Setup), else defaults.
-source /etc/lldpq.conf 2>/dev/null || true
+# Honor allowlisted schedules from lldpq.conf when the fixed helper is present.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 LLDPQ_CRON="${LLDPQ_CRON:-*/10 * * * *}"
 GETCONF_CRON="${GETCONF_CRON:-0 */12 * * *}"
 cat > /etc/cron.d/lldpq << CRON

@@ -2,21 +2,46 @@
 # LLDPq Network Monitoring - Main execution script
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
-# Load config with fallback
-source /etc/lldpq.conf 2>/dev/null || true
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+fi
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 
 # Parse flags: lldpq - (verbose), lldpq -s (skip optical)
-QUIET=">/dev/null 2>&1"
-MONITOR_FLAGS=""
+QUIET=true
+MONITOR_FLAGS=()
 for arg in "$@"; do
     case "$arg" in
-        -) QUIET="" ;;
-        -s) MONITOR_FLAGS="$MONITOR_FLAGS -s" ;;
+        -) QUIET=false ;;
+        -s) MONITOR_FLAGS+=("-s") ;;
     esac
 done
 
-cd "$LLDPQ_DIR"
+cd "$LLDPQ_DIR" || exit 1
+
+# One lock covers asset discovery, LLDP validation, monitoring, and report
+# publication. monitor.sh uses the same lock when invoked directly.
+LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+if ! command -v flock >/dev/null 2>&1; then
+    echo "Error: flock is required for safe monitoring" >&2
+    exit 1
+fi
+exec 9>"$LOCK_FILE" || exit 1
+if ! flock -n 9; then
+    echo "Monitoring is already running; this invocation was skipped." >&2
+    exit 75
+fi
+export LLDPQ_MONITOR_LOCK_HELD=1
+
+run_command() {
+    if [[ "$QUIET" == "true" ]]; then
+        "$@" >/dev/null 2>&1
+    else
+        "$@"
+    fi
+}
+
 wait_until_not_running() {
     script_name="$1"
     while pgrep -f "$script_name" >/dev/null; do
@@ -26,18 +51,39 @@ wait_until_not_running() {
 
 # Run asset discovery and LLDP checks
 wait_until_not_running "assets.sh"
-eval "./assets.sh $QUIET"
+if ! run_command ./assets.sh; then
+    echo "Asset discovery failed; monitoring was not published." >&2
+    exit 1
+fi
 wait_until_not_running "check-lldp.sh"
-eval "./check-lldp.sh $QUIET"
-eval "./monitor.sh $MONITOR_FLAGS $QUIET"
+if ! run_command ./check-lldp.sh; then
+    echo "LLDP collection failed; monitoring was not published." >&2
+    exit 1
+fi
+# lldp-validate.py intentionally leaves raw inputs in place on a topology
+# generation failure. check-lldp.sh predates strict exit propagation, so use
+# that invariant to prevent the rest of the run from looking successful.
+if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
+    echo "LLDP validation/topology generation did not complete; raw inputs were preserved." >&2
+    exit 1
+fi
+run_command ./monitor.sh "${MONITOR_FLAGS[@]}"
+status=$?
+if [[ $status -ne 0 ]]; then
+    echo "Monitoring analysis failed; last-known-good reports were preserved." >&2
+    exit "$status"
+fi
 
 # Fabric table scan for search
 wait_until_not_running "fabric-scan.sh"
-eval "./fabric-scan.sh $QUIET"
+if ! run_command ./fabric-scan.sh; then
+    echo "Fabric scan failed." >&2
+    exit 1
+fi
 
 # Check for network alerts (only if monitoring data exists)
 if [[ -d "monitor-results" ]] && [[ -f "notifications.yaml" ]]; then
-    eval "python3 ./check_alerts.py $QUIET" || echo "⚠️  Alert check failed (non-critical)"
+    run_command python3 ./check_alerts.py || echo "⚠️  Alert check failed (non-critical)"
 fi
 
 exit 0

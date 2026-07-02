@@ -15,6 +15,7 @@ import json
 import os
 import re
 from datetime import datetime
+from collection_freshness import is_current_collection, read_asset_snapshot
 
 try:
     from device_names import canonical
@@ -439,6 +440,7 @@ def grade_load_per_core(cpu_load, cpu_cores):
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
+    required_telemetry_missing = False
     priority = {"CRITICAL": 4, "WARNING": 3, "GOOD": 2, "EXCELLENT": 1}
     
     # CPU Temperature grade
@@ -470,8 +472,10 @@ def calculate_device_health_grade(device_name, device_data):
     memory_usage = device_data.get("resources", {}).get("memory", {}).get("usage_percent", None)
     if memory_usage is None:
         parsed_resources = parse_resources_from_hardware_file(device_name)
-        memory_usage = parsed_resources.get('memory_usage', 0)
-    if memory_usage < 60:
+        memory_usage = parsed_resources.get('memory_usage')
+    if not isinstance(memory_usage, (int, float)):
+        required_telemetry_missing = True
+    elif memory_usage < 60:
         health_grades.append("EXCELLENT")
     elif memory_usage < 75:
         health_grades.append("GOOD")
@@ -485,7 +489,7 @@ def calculate_device_health_grade(device_name, device_data):
     if cpu_load is None:
         if not parsed_resources:
             parsed_resources = parse_resources_from_hardware_file(device_name)
-        cpu_load = parsed_resources.get('cpu_load', 0)
+        cpu_load = parsed_resources.get('cpu_load')
     # Normalize the load average by CPU core count (see grade_load_per_core).
     cpu_cores = device_data.get("resources", {}).get("cpu", {}).get("cores", None)
     if not cpu_cores:
@@ -495,6 +499,8 @@ def calculate_device_health_grade(device_name, device_data):
     load_grade = grade_load_per_core(cpu_load, cpu_cores)
     if load_grade:
         health_grades.append(load_grade)
+    else:
+        required_telemetry_missing = True
     
     # PSU Efficiency grade
     psu_efficiency = parse_psu_efficiency_from_hardware_file(device_name) or 0.0
@@ -528,9 +534,13 @@ def calculate_device_health_grade(device_name, device_data):
     
     # Calculate overall health grade (worst case)
     if health_grades:
-        return max(health_grades, key=lambda x: priority.get(x, 0))
-    else:
-        return "UNKNOWN"
+        worst_known = max(health_grades, key=lambda x: priority.get(x, 0))
+        # Do not advertise an incomplete sample as healthy. A known warning or
+        # critical condition still takes precedence over missing telemetry.
+        if required_telemetry_missing and worst_known not in ("WARNING", "CRITICAL"):
+            return "UNKNOWN"
+        return worst_known
+    return "UNKNOWN"
 
 def generate_hardware_html():
     """Generate hardware analysis HTML using existing data"""
@@ -554,44 +564,49 @@ def generate_hardware_html():
         print("Proceeding with empty history data")
         hardware_history = {}
     
-    # Get latest data for each device
+    # Build current devices from fresh raw files. History may enrich those
+    # devices, but can never resurrect an unreachable/retired device as current.
     latest_devices = {}
-    for device_name, history in hardware_history.items():
-        if history:  # If device has history entries
-            latest_devices[device_name] = history[-1]  # Get the most recent entry
-    
-    # If no historical data, create basic entries from current hardware files
-    if not latest_devices:
-        print("No historical data - analyzing current hardware files directly")
-        hardware_data_dir = "monitor-results/hardware-data"
-        if os.path.exists(hardware_data_dir):
-            for filename in os.listdir(hardware_data_dir):
-                if filename.endswith('_hardware.txt'):
-                    device_name = filename.replace('_hardware.txt', '')
-                    # Create basic device entry with minimal data for initial run
-                    latest_devices[device_name] = {
-                        'device': device_name,
-                        'timestamp': datetime.now().isoformat(),
-                        'fans': {},  # Will be filled if needed
-                        'memory_usage': 'N/A',
-                        'cpu_load': 'N/A',
-                        'uptime': 'N/A'
-                    }
-            print(f"Created basic entries for {len(latest_devices)} devices")
+    hardware_data_dir = "monitor-results/hardware-data"
+    asset_snapshot = read_asset_snapshot()
+    current_device_files = []
+    if os.path.exists(hardware_data_dir):
+        current_device_files = [
+            filename for filename in os.listdir(hardware_data_dir)
+            if filename.endswith('_hardware.txt')
+            and is_current_collection(
+                os.path.join(hardware_data_dir, filename),
+                filename.removesuffix('_hardware.txt'),
+                asset_snapshot,
+            )
+        ]
+    for filename in current_device_files:
+        device_name = filename.removesuffix('_hardware.txt')
+        history = hardware_history.get(device_name, [])
+        if history:
+            latest_devices[device_name] = history[-1]
+        else:
+            latest_devices[device_name] = {
+                'device': device_name,
+                'timestamp': datetime.now().isoformat(),
+                'fans': {},
+                'memory_usage': 'N/A',
+                'cpu_load': 'N/A',
+                'uptime': 'N/A'
+            }
+    print(f"Analyzing {len(latest_devices)} devices from the current collection")
     
     # Calculate summary
     summary = {
         'excellent_devices': [],
         'good_devices': [],
         'warning_devices': [],
-        'critical_devices': []
+        'critical_devices': [],
+        'unknown_devices': []
     }
     
     # Count devices with current hardware files
-    hardware_data_dir = "monitor-results/hardware-data"
-    current_device_files = 0
-    if os.path.exists(hardware_data_dir):
-        current_device_files = len([f for f in os.listdir(hardware_data_dir) if f.endswith('_hardware.txt')])
+    current_device_count = len(current_device_files)
     
     for device_name, device_data in latest_devices.items():
         # Use our own health calculation instead of JSON's overall_grade
@@ -610,9 +625,11 @@ def generate_hardware_html():
             summary['warning_devices'].append(device_info)
         elif overall_grade == "CRITICAL":
             summary['critical_devices'].append(device_info)
+        else:
+            summary['unknown_devices'].append(device_info)
     
     # Use current device files count instead of historical count
-    total_devices = current_device_files
+    total_devices = current_device_count
     
     # Generate dark theme HTML
     html_content = f"""<!DOCTYPE html>
@@ -785,8 +802,9 @@ def generate_hardware_html():
 """
     
     # Add all devices to table (sorted by health - problems first)
-    all_devices = (summary['critical_devices'] + summary['warning_devices'] + 
-                  summary['good_devices'] + summary['excellent_devices'])
+    all_devices = (summary['critical_devices'] + summary['warning_devices'] +
+                  summary['good_devices'] + summary['excellent_devices'] +
+                  summary['unknown_devices'])
     
     for device_info in all_devices:
         device_name = device_info['device']
@@ -808,9 +826,9 @@ def generate_hardware_html():
         if memory_usage is None or cpu_load is None or cpu_cores is None or not uptime:
             parsed = parse_resources_from_hardware_file(device_name)
             if memory_usage is None:
-                memory_usage = parsed.get('memory_usage', 0.0)
+                memory_usage = parsed.get('memory_usage')
             if cpu_load is None:
-                cpu_load = parsed.get('cpu_load', 0.0)
+                cpu_load = parsed.get('cpu_load')
             if cpu_cores is None:
                 cpu_cores = parsed.get('cpu_cores')
             # do not set uptime anymore
@@ -947,6 +965,10 @@ def generate_hardware_html():
 
         # Get model information from assets
         device_model = assets_data.get(device_name, {}).get("model", "N/A")
+        memory_usage_str = (f"{memory_usage:.1f}%"
+                            if isinstance(memory_usage, (int, float)) else "N/A")
+        cpu_load_str = (f"{cpu_load:.2f}"
+                        if isinstance(cpu_load, (int, float)) else "N/A")
         
         html_content += f"""
                 <tr data-status="{health_grade.lower()}">
@@ -954,8 +976,8 @@ def generate_hardware_html():
                     <td><span class="{health_badge_class}">{health_grade.upper()}</span></td>
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
                     <td>{asic_temp_str}{asic_cell_suffix}</td>
-                    <td>{memory_usage if isinstance(memory_usage, (int, float)) else 0.0:.1f}%{mem_cell_suffix}</td>
-                    <td>{cpu_load if isinstance(cpu_load, (int, float)) else 0.0:.2f}{load_cell_suffix}</td>
+                    <td>{memory_usage_str}{mem_cell_suffix}</td>
+                    <td>{cpu_load_str}{load_cell_suffix}</td>
                     <td><span class="{fan_badge_class}">{fan_status}</span>{fan_cell_suffix}</td>
                     <td>{psu_efficiency:.1f}%{psu_cell_suffix}</td>
                     <td>{psu_in_out_str}</td>

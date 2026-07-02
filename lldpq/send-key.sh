@@ -15,7 +15,8 @@
 #   ./send-key.sh -h                           # Help
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-eval "$(python3 "$SCRIPT_DIR/parse_devices.py")"
+source "$SCRIPT_DIR/load_devices.sh"
+load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
 DEFAULT_SSH_KEY="$HOME/.ssh/id_rsa.pub"
 SSH_KEY=""

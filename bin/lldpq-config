@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+"""Render LLDPq runtime configuration as safe shell assignments.
+
+The shared /etc/lldpq.conf file is data, not a shell program.  This helper is
+installed at a fixed root-owned path and is the only bridge used by shell
+entrypoints.  Values are decoded without parameter, command, glob, or
+arithmetic expansion and then quoted again for a single controlled ``eval``.
+"""
+
+import argparse
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Dict
+
+
+DEFAULT_CONFIG = Path("/etc/lldpq.conf")
+KEY_VALUE_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+
+# Keep this intentionally explicit.  In particular, shell/runtime controls
+# such as PATH, BASH_ENV, ENV, SHELLOPTS, IFS, and PYTHONPATH must never be
+# assignable through the group-writable application configuration.
+ALLOWED_KEYS = frozenset({
+    # Installation identity and managed paths.
+    "LLDPQ_DIR",
+    "LLDPQ_USER",
+    "LLDPQ_SRC",
+    "WEB_ROOT",
+    "ANSIBLE_DIR",
+    "EDITOR_ROOT",
+    "PROJECT_DIR",
+    "DHCP_HOSTS_FILE",
+    "DHCP_CONF_FILE",
+    "DHCP_LEASES_FILE",
+    "ZTP_SCRIPT_FILE",
+    "BASE_CONFIG_DIR",
+    # Schedules, feature flags, and collection tuning.
+    "LLDPQ_CRON",
+    "GETCONF_CRON",
+    "SKIP_OPTICAL",
+    "SKIP_L1",
+    "MONITOR_MAX_PARALLEL",
+    "LLDP_MAX_PARALLEL",
+    "ASSETS_MAX_PARALLEL",
+    "GET_CONFIGS_MAX_PARALLEL",
+    "SEND_CMD_MAX_PARALLEL",
+    "TELEMETRY_MAX_PARALLEL",
+    "AUTO_BASE_CONFIG",
+    "AUTO_ZTP_DISABLE",
+    "AUTO_SET_HOSTNAME",
+    "DISCOVERY_RANGE",
+    "SCAN_INTERVAL",
+    # Transceiver firmware collection.
+    "TRANSCEIVER_FW_SKIP_MODELS",
+    "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY",
+    "TRANSCEIVER_FW_MAX_PARALLEL",
+    "TRANSCEIVER_FW_MIN_INTERVAL",
+    "TRANSCEIVER_FW_SSH_TIMEOUT",
+    # Telemetry.
+    "TELEMETRY_ENABLED",
+    "PROMETHEUS_URL",
+    "TELEMETRY_COLLECTOR_IP",
+    "TELEMETRY_COLLECTOR_PORT",
+    "TELEMETRY_COLLECTOR_VRF",
+    # AI provider and optional search backend.
+    "AI_PROVIDER",
+    "AI_MODEL",
+    "AI_API_KEY",
+    "AI_API_URL",
+    "OLLAMA_URL",
+    "AI_PROXY_URL",
+    "AI_SEARCH_MODEL",
+    "AI_SEARCH_URL",
+    "AI_SEARCH_KEY",
+})
+
+
+def decode_value(raw: str) -> str:
+    """Decode simple shell quoting while keeping all expansions literal."""
+    value = raw.strip()
+    if not value:
+        return ""
+
+    # shlex only tokenizes; it never performs shell expansion.  A single token
+    # handles the quoted forms written by the installer (including cron values
+    # and strings with spaces).  Legacy unquoted multi-word values are retained
+    # verbatim for compatibility rather than interpreted as shell syntax.
+    try:
+        tokens = shlex.split(value, comments=False, posix=True)
+    except ValueError as exc:
+        raise ValueError(f"invalid quoting: {exc}") from exc
+    return tokens[0] if len(tokens) == 1 else value
+
+
+def parse_config(path: Path) -> Dict[str, str]:
+    """Parse allowlisted KEY=value records; later duplicates win."""
+    values: Dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return values
+    except (OSError, UnicodeError) as exc:
+        print(f"lldpq-config: cannot read {path}: {exc}", file=sys.stderr)
+        return values
+
+    for line_number, line in enumerate(lines, 1):
+        if not line or line.lstrip().startswith("#"):
+            continue
+        match = KEY_VALUE_RE.fullmatch(line)
+        if not match:
+            continue
+        key, raw = match.groups()
+        if key not in ALLOWED_KEYS:
+            continue
+        try:
+            values[key] = decode_value(raw)
+        except ValueError as exc:
+            print(
+                f"lldpq-config: ignoring {path}:{line_number}: {exc}",
+                file=sys.stderr,
+            )
+    return values
+
+
+def render_shell(values: Dict[str, str]) -> str:
+    """Return assignments safe to evaluate as one shell fragment."""
+    return "\n".join(
+        f"{key}={shlex.quote(value)}" for key, value in values.items()
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Safely render /etc/lldpq.conf for LLDPq shell entrypoints"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args()
+    output = render_shell(parse_config(args.config))
+    if output:
+        print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

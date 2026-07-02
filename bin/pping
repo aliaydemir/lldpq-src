@@ -26,9 +26,9 @@ trap cleanup EXIT INT TERM
 
 # Find LLDPQ directory
 find_lldpq_dir() {
-    # Try config file first
-    if [[ -f /etc/lldpq.conf ]]; then
-        source /etc/lldpq.conf 2>/dev/null
+    # Try allowlisted config data first.
+    if [[ -x /usr/local/bin/lldpq-config ]]; then
+        eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
     fi
     LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 }
@@ -158,16 +158,21 @@ load_from_devices_yaml() {
         exit 1
     fi
     
-    # Parse devices.yaml and convert to ip_list format
-    local file_arg=""
-    [[ -n "$custom_file" ]] && file_arg="-f $yaml_file"
+    # Parse devices.yaml as data, never as generated shell code.
+    local loader="$LLDPQ_DIR/load_devices.sh"
+    if [[ ! -f "$loader" ]]; then
+        echo -e "\e[91mError: load_devices.sh not found at $loader\e[0m"
+        exit 1
+    fi
+    source "$loader"
+    local -a device_args=()
+    [[ -n "$custom_file" ]] && device_args+=("-f" "$yaml_file")
     
     if [[ -n "$role_filter" ]]; then
         echo -e "\e[35mFiltering by role: @$role_filter\e[0m"
-        eval "$(python3 "$parser" -r "$role_filter" $file_arg)" || exit 1
-    else
-        eval "$(python3 "$parser" $file_arg)"
+        device_args+=("-r" "$role_filter")
     fi
+    load_devices "$parser" "${device_args[@]}" || exit 1
     
     if [[ ${#devices[@]} -eq 0 ]]; then
         echo -e "\e[91mError: No devices found in devices.yaml\e[0m"

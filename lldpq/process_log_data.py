@@ -10,14 +10,26 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import json
+import html
 from datetime import datetime, timedelta
 from collections import defaultdict
+from collection_freshness import is_current_collection, read_asset_snapshot
 
 try:
     from device_names import canonical
 except Exception:
     def canonical(_n):
         return _n
+
+
+def json_for_inline_script(value):
+    """Serialize JSON without allowing data to terminate the script element."""
+    return (
+        json.dumps(value, indent=2)
+        .replace('&', r'\u0026')
+        .replace('<', r'\u003c')
+        .replace('>', r'\u003e')
+    )
 
 class LogAnalyzer:
     def __init__(self, data_dir="monitor-results"):
@@ -494,6 +506,8 @@ class LogAnalyzer:
         
         for device_name, counts in sorted_devices:
             total_count = sum(counts.values())
+            device_label = html.escape(str(canonical(device_name)))
+            device_attr = html.escape(str(device_name), quote=True)
             
             # Color code total count like other analysis pages
             if total_count == 0:
@@ -507,55 +521,55 @@ class LogAnalyzer:
             
             html_content += f"""
                     <tr>
-                        <td>{canonical(device_name)}</td>
+                        <td>{device_label}</td>
                         <td>
                             <span class="severity-count critical {'zero' if counts['critical'] == 0 else ''}" 
-                                  data-device="{device_name}" data-severity="critical"
-                                  id="critical-{device_name}">
+                                  data-device="{device_attr}" data-severity="critical"
+                                  id="critical-{device_attr}">
                                 {counts['critical']}
                             </span>
                         </td>
                         <td>
                             <span class="severity-count warning {'zero' if counts['warning'] == 0 else ''}" 
-                                  data-device="{device_name}" data-severity="warning"
-                                  id="warning-{device_name}">
+                                  data-device="{device_attr}" data-severity="warning"
+                                  id="warning-{device_attr}">
                                 {counts['warning']}
                             </span>
                         </td>
                         <td>
                             <span class="severity-count error {'zero' if counts['error'] == 0 else ''}" 
-                                  data-device="{device_name}" data-severity="error"
-                                  id="error-{device_name}">
+                                  data-device="{device_attr}" data-severity="error"
+                                  id="error-{device_attr}">
                                 {counts['error']}
                             </span>
                         </td>
                         <td>
                             <span class="severity-count info {'zero' if counts['info'] == 0 else ''}" 
-                                  data-device="{device_name}" data-severity="info"
-                                  id="info-{device_name}">
+                                  data-device="{device_attr}" data-severity="info"
+                                  id="info-{device_attr}">
                                 {counts['info']}
                             </span>
                         </td>
                         <td><span class="{total_class}">{total_count}</span></td>
                     </tr>
-                    <tr id="details-{device_name}-critical" class="log-details">
+                    <tr id="details-{device_attr}-critical" class="log-details">
                         <td colspan="6">
-                            <div id="content-{device_name}-critical"></div>
+                            <div id="content-{device_attr}-critical"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_name}-warning" class="log-details">
+                    <tr id="details-{device_attr}-warning" class="log-details">
                         <td colspan="6">
-                            <div id="content-{device_name}-warning"></div>
+                            <div id="content-{device_attr}-warning"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_name}-error" class="log-details">
+                    <tr id="details-{device_attr}-error" class="log-details">
                         <td colspan="6">
-                            <div id="content-{device_name}-error"></div>
+                            <div id="content-{device_attr}-error"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_name}-info" class="log-details">
+                    <tr id="details-{device_attr}-info" class="log-details">
                         <td colspan="6">
-                            <div id="content-{device_name}-info"></div>
+                            <div id="content-{device_attr}-info"></div>
                         </td>
                     </tr>"""
         
@@ -571,7 +585,7 @@ class LogAnalyzer:
     
     <script>
         // Log data embedded in the page
-        const logData = """ + json.dumps(dict(self.log_analysis), indent=2) + """;
+        const logData = """ + json_for_inline_script(dict(self.log_analysis)) + """;
         
         // Initialize page functionality
         let deviceSearchActive = false;
@@ -848,15 +862,33 @@ class LogAnalyzer:
                 return; // Don't show anything for zero counts
             }
             
-            // Populate content if not already done
-            if (contentDiv.innerHTML === '') {
-                contentDiv.innerHTML = logs.map(log => `
-                    <div class="log-entry">
-                        ${log.timestamp ? `<span class="log-timestamp">${log.timestamp}</span>` : ''}
-                        <span class="log-section">${log.section}</span>
-                        <span class="log-message">${log.message}</span>
-                    </div>
-                `).join('');
+            // Log fields are untrusted text. Build their DOM nodes explicitly
+            // so markup in a device log can never become executable HTML.
+            if (!contentDiv.hasChildNodes()) {
+                const fragment = document.createDocumentFragment();
+                logs.forEach(log => {
+                    const entry = document.createElement('div');
+                    entry.className = 'log-entry';
+
+                    if (log.timestamp) {
+                        const timestamp = document.createElement('span');
+                        timestamp.className = 'log-timestamp';
+                        timestamp.textContent = String(log.timestamp);
+                        entry.appendChild(timestamp);
+                    }
+
+                    const section = document.createElement('span');
+                    section.className = 'log-section';
+                    section.textContent = String(log.section ?? '');
+                    entry.appendChild(section);
+
+                    const message = document.createElement('span');
+                    message.className = 'log-message';
+                    message.textContent = String(log.message ?? '');
+                    entry.appendChild(message);
+                    fragment.appendChild(entry);
+                });
+                contentDiv.replaceChildren(fragment);
             }
             
             detailsRow.style.display = 'table-row';
@@ -1153,7 +1185,16 @@ class LogAnalyzer:
             return False
         
         # Process all log files
-        log_files = [f for f in os.listdir(self.log_data_dir) if f.endswith('_logs.txt')]
+        asset_snapshot = read_asset_snapshot()
+        log_files = [
+            f for f in os.listdir(self.log_data_dir)
+            if f.endswith('_logs.txt')
+            and is_current_collection(
+                os.path.join(self.log_data_dir, f),
+                f.removesuffix('_logs.txt'),
+                asset_snapshot,
+            )
+        ]
         
         if not log_files:
             print("⚠️  No log files found")

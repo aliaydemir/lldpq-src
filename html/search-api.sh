@@ -5,9 +5,9 @@
 source "$(dirname "$0")/auth-guard.sh"
 require_auth
 
-# Load config
-if [[ -f /etc/lldpq.conf ]]; then
-    source /etc/lldpq.conf
+# Load allowlisted config data through the fixed, root-owned parser.
+if [[ -x /usr/local/bin/lldpq-config ]]; then
+    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 
 # Set defaults (use $HOME for portable fallback)
@@ -35,21 +35,43 @@ parse_query() {
 get_ssh_target() {
     local ip="$1"
     local username
-    username=$(python3 -c "
-import yaml, os
+    if ! username=$(python3 - "$ip" <<'PYTHON'
+import os
+import re
+import sys
+
+import yaml
+
+ip = sys.argv[1]
 try:
-    with open(os.environ.get('LLDPQ_DIR','$HOME/lldpq') + '/devices.yaml') as f:
+    # The request may select only a syntactically safe, configured inventory key.
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:%-]{0,252}', ip):
+        raise ValueError('invalid device')
+    with open(os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq')) + '/devices.yaml') as f:
         d = yaml.safe_load(f)
+    if not isinstance(d, dict):
+        raise ValueError('invalid inventory')
     default_user = d.get('defaults', {}).get('username', '')
     devs = d.get('devices', d)
-    info = devs.get('$ip', {})
+    if not isinstance(devs, dict) or ip not in devs:
+        raise ValueError('unknown device')
+    info = devs.get(ip, {})
     if isinstance(info, dict):
-        print(info.get('username', default_user))
+        username = info.get('username', default_user)
     else:
-        print(default_user)
-except:
-    print('')
-" 2>/dev/null)
+        username = default_user
+    if username and (
+        not isinstance(username, str)
+        or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]{0,63}', username)
+    ):
+        raise ValueError('invalid username')
+    print(username or '')
+except Exception:
+    sys.exit(1)
+PYTHON
+    ); then
+        return 1
+    fi
     if [[ -n "$username" ]]; then
         echo "${username}@${ip}"
     else
@@ -116,7 +138,11 @@ get_mac_table() {
     fi
     
     # SSH to device using LLDPQ user's SSH keys
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         # Get bridge FDB (MAC table)
@@ -128,13 +154,13 @@ get_mac_table() {
         return
     fi
     
-    # Parse output with Python
-    python3 << PYTHON
+    # Keep SSH output on stdin so device-controlled text is never Python source.
+    printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
 import sys
 
-output = '''$ssh_output'''
-search = '''$search'''.lower()
+output = sys.stdin.read()
+search = sys.argv[1].lower()
 
 entries = []
 for line in output.strip().split('\n'):
@@ -182,7 +208,11 @@ get_arp_table() {
     fi
     
     # SSH to device - get ARP entries and interface VRF mappings
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         # Get ARP table (single query, no duplicates)
@@ -204,13 +234,14 @@ get_arp_table() {
         return
     fi
     
-    # Parse output with Python
-    python3 << PYTHON
+    # Keep SSH output on stdin so device-controlled text is never Python source.
+    printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
 import re
+import sys
 
-output = '''$ssh_output'''
-search = '''$search'''.lower()
+output = sys.stdin.read()
+search = sys.argv[1].lower()
 
 # Parse sections
 sections = output.split("---VRF_MAP---")
@@ -286,13 +317,14 @@ get_all_tables() {
     local table_type="$1"  # mac or arp
     local search="$2"
     
-    python3 << PYTHON
+    python3 - "$table_type" "$search" <<'PYTHON'
 import json
 import yaml
 import subprocess
 import concurrent.futures
 import os
 import re
+import sys
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 devices_file = f"{lldpq_dir}/devices.yaml"
@@ -300,8 +332,8 @@ devices_file = f"{lldpq_dir}/devices.yaml"
 if not os.path.exists(devices_file):
     devices_file = os.path.expanduser("~/lldpq/devices.yaml")
 
-table_type = "$table_type"
-search = "$search".lower()
+table_type = sys.argv[1]
+search = sys.argv[2].lower()
 default_ssh_user = ""
 
 def ssh_target(ip, info):
@@ -329,7 +361,7 @@ def get_device_table(device_info):
             ]
             result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
         else:  # arp - get ARP with interface VRF mappings
-            remote_script = '/usr/sbin/ip neigh show 2>/dev/null | head -200; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/vlan*/master /sys/class/net/eth*/master; do n=\$(basename \$(dirname \$i)); m=\$(readlink \$i | xargs basename); [ -n "\$m" ] && echo \$n \$m; done 2>/dev/null'
+            remote_script = '/usr/sbin/ip neigh show 2>/dev/null | head -200; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/vlan*/master /sys/class/net/eth*/master; do n=$(basename $(dirname $i)); m=$(readlink $i | xargs basename); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
             cmd_parts = [
                 "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
@@ -448,7 +480,11 @@ get_vtep_table() {
         return
     fi
     
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         /usr/sbin/bridge fdb show 2>/dev/null | grep "dst " | head -1000
@@ -459,11 +495,13 @@ get_vtep_table() {
         return
     fi
     
-    python3 << PYTHON
+    # Keep SSH output on stdin so device-controlled text is never Python source.
+    printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
+import sys
 
-output = '''$ssh_output'''
-search = '''$search'''.lower()
+output = sys.stdin.read()
+search = sys.argv[1].lower()
 
 entries = []
 vtep_summary = {}  # VTEP IP -> {vni_count, mac_count}
@@ -548,7 +586,11 @@ get_route_table() {
         return
     fi
     
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 45 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         sudo vtysh -c "show ip route vrf all" 2>/dev/null | head -5000
@@ -559,12 +601,14 @@ get_route_table() {
         return
     fi
     
-    python3 << PYTHON
+    # Keep SSH output on stdin so device-controlled text is never Python source.
+    printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
 import re
+import sys
 
-output = '''$ssh_output'''
-search = '''$search'''.lower()
+output = sys.stdin.read()
+search = sys.argv[1].lower()
 
 # Parse vtysh output
 # Format: VRF xxx:
@@ -778,7 +822,11 @@ get_bond_members() {
         return
     fi
     
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 10 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" "
         cat /sys/class/net/$bond/bonding/slaves 2>/dev/null || echo ''
@@ -804,7 +852,11 @@ get_lldp_neighbors() {
         return
     fi
     
-    local ssh_target=$(get_ssh_target "$device")
+    local ssh_target
+    if ! ssh_target=$(get_ssh_target "$device"); then
+        echo '{"success": false, "error": "Invalid or unknown device"}'
+        return
+    fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         sudo lldpctl -f json 2>/dev/null || echo "{}"
@@ -815,11 +867,13 @@ get_lldp_neighbors() {
         return
     fi
     
-    python3 << PYTHON
+    # Keep SSH output on stdin so device-controlled text is never Python source.
+    printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
+import sys
 
-output = '''$ssh_output'''
-search = '''$search'''.lower()
+output = sys.stdin.read()
+search = sys.argv[1].lower()
 
 entries = []
 
@@ -956,15 +1010,16 @@ run_fabric_scan() {
 search_cached_routes() {
     local search_ip="$1"
     
-    python3 << PYTHON
+    python3 - "$search_ip" <<'PYTHON'
 import json
 import os
 import struct
 import socket
+import sys
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
-search_ip = "$search_ip"
+search_ip = sys.argv[1]
 
 def ip_to_int(ip):
     try:
@@ -1110,12 +1165,13 @@ PYTHON
 find_ip_vrf() {
     local ip="$1"
     
-    python3 << PYTHON
+    python3 - "$ip" <<'PYTHON'
 import json
 import os
 import ipaddress
+import sys
 
-search_ip = "$ip"
+search_ip = sys.argv[1]
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
@@ -1182,16 +1238,17 @@ trace_path_ip() {
     local vrf="$3"
     local dst_vrf_param="$4"
     
-    python3 << PYTHON
+    python3 - "$source_ip" "$dest_ip" "$vrf" "$dst_vrf_param" <<'PYTHON'
 import json
 import os
 import re
 import ipaddress
+import sys
 
-source_ip = "$source_ip"
-dest_ip = "$dest_ip"
-vrf_hint = "$vrf"
-dst_vrf_hint = "$dst_vrf_param"
+source_ip = sys.argv[1]
+dest_ip = sys.argv[2]
+vrf_hint = sys.argv[3]
+dst_vrf_hint = sys.argv[4]
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
@@ -2025,13 +2082,14 @@ detect_vrfs() {
     local device="$1"
     local dest_ip="$2"
     
-    python3 << PYTHON
+    python3 - "$device" "$dest_ip" <<'PYTHON'
 import json
 import os
 import ipaddress
+import sys
 
-device = "$device"
-dest_ip = "$dest_ip"
+device = sys.argv[1]
+dest_ip = sys.argv[2]
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
@@ -2083,14 +2141,15 @@ trace_path() {
     local vrf="$2"
     local source="$3"
     
-    python3 << PYTHON
+    python3 - "$dest_ip" "$vrf" "$source" <<'PYTHON'
 import json
 import os
 import ipaddress
+import sys
 
-dest_ip = "$dest_ip"
-vrf = "$vrf" or "default"
-source_device = "$source"
+dest_ip = sys.argv[1]
+vrf = sys.argv[2] or "default"
+source_device = sys.argv[3]
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
@@ -2309,15 +2368,16 @@ search_cached_tables() {
     local table_type="$1"
     local search="$2"
     
-    python3 << PYTHON
+    python3 - "$table_type" "$search" <<'PYTHON'
 import json
 import os
 import re
+import sys
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
-table_type = "$table_type"
-search = "$search".lower()
+table_type = sys.argv[1]
+search = sys.argv[2].lower()
 
 # Detect if search is a full IP (4 octets) → use exact match on IP/ip fields
 is_full_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', search))

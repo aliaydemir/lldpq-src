@@ -9,9 +9,13 @@
 #   Existing install    → Update mode (backup, preserve configs, update files)
 #
 # Usage: ./install.sh [-y] [--enable-telemetry] [--disable-telemetry]
+#                     [--replace-dhcp-config]
 #   -y                  Auto-yes to all prompts (non-interactive mode, uses defaults)
 #   --enable-telemetry  Enable streaming telemetry support (installs Docker)
 #   --disable-telemetry Disable streaming telemetry support
+#   --replace-dhcp-config
+#                       Replace a pre-existing non-LLDPq dhcpd.conf after
+#                       validating the replacement and taking a backup
 #
 # ALGORITHM:
 # ┌─────────────────────────────────────────────────────────┐
@@ -33,10 +37,9 @@
 # │   • pip install (requests, ruamel.yaml)                  │
 # ├──────────────────────────────────────────────────────────┤
 # │ UPDATE MODE ONLY:                                        │
-# │   • source /etc/lldpq.conf → save existing settings      │
-# │   • Full backup → ~/lldpq-backup-YYYY-MM-DD_HH-MM/      │
-# │     (devices.yaml, topology, configs, DHCP, SSH keys,    │
-# │      monitoring data, .git history)                      │
+# │   • Safely parse /etc/lldpq.conf → save existing settings│
+# │   • Optional full snapshot with --backup                 │
+# │   • Always preserve runtime/config data through update   │
 # │   • Stop running LLDPq processes                         │
 # │   • Preserve user configs + .git to temp dir             │
 # │   • Remove old lldpq directory                           │
@@ -76,6 +79,491 @@
 
 set -e
 
+# Read legacy KEY=value configuration without executing it as shell code.  The
+# file is intentionally writable by the shared web/CLI group, so `source` would
+# turn a configuration write into arbitrary code execution during install.
+load_lldpq_config() {
+    local config_file="${1:-/etc/lldpq.conf}"
+    local line key raw value
+
+    [[ -f "$config_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        raw="${BASH_REMATCH[2]}"
+
+        # Only variables that LLDPq itself writes/consumes are accepted.  This
+        # also prevents assignment to shell internals such as PATH or BASH_ENV.
+        case "$key" in
+            LLDPQ_DIR|LLDPQ_USER|LLDPQ_SRC|LLDPQ_CRON|GETCONF_CRON|WEB_ROOT|\
+            ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR|DHCP_HOSTS_FILE|DHCP_CONF_FILE|\
+            DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
+            AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|\
+            MONITOR_MAX_PARALLEL|LLDP_MAX_PARALLEL|ASSETS_MAX_PARALLEL|\
+            GET_CONFIGS_MAX_PARALLEL|SEND_CMD_MAX_PARALLEL|TELEMETRY_MAX_PARALLEL|\
+            TRANSCEIVER_FW_SKIP_MODELS|TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY|\
+            TRANSCEIVER_FW_MAX_PARALLEL|TRANSCEIVER_FW_MIN_INTERVAL|\
+            TRANSCEIVER_FW_SSH_TIMEOUT|TELEMETRY_ENABLED|PROMETHEUS_URL|\
+            TELEMETRY_COLLECTOR_IP|TELEMETRY_COLLECTOR_PORT|\
+            TELEMETRY_COLLECTOR_VRF|DISCOVERY_RANGE|AI_PROVIDER|AI_MODEL|\
+            AI_API_KEY|AI_API_URL|OLLAMA_URL|AI_PROXY_URL|AI_SEARCH_MODEL|\
+            AI_SEARCH_URL|AI_SEARCH_KEY)
+                ;;
+            *) continue ;;
+        esac
+
+        # Trim outer whitespace and the simple single/double quotes emitted by
+        # older installers.  No command, parameter or backslash expansion is
+        # performed: values such as $(command) remain literal data.
+        value="$raw"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+            if [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]] || \
+               [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+        printf -v "$key" '%s' "$value"
+    done < "$config_file"
+}
+
+canonical_path() {
+    local path="$1"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath -m -- "$path"
+    else
+        python3 -c 'import os,sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "$path"
+    fi
+}
+
+# Guard paths that later feed recursive ownership/removal operations.  The
+# canonical path must be absolute, below a meaningful directory, and must not
+# be a system root or the invoking user's home directory itself.
+guard_managed_path() {
+    local label="$1" path="$2" min_depth="${3:-2}"
+    local canonical relative depth
+
+    if [[ -z "$path" || "$path" != /* || "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
+        echo "[!] Refusing unsafe $label path: '$path'" >&2
+        return 1
+    fi
+    canonical=$(canonical_path "$path") || return 1
+    case "$canonical" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/www|"$HOME")
+            echo "[!] Refusing unsafe $label path: '$canonical'" >&2
+            return 1
+            ;;
+    esac
+    relative="${canonical#/}"
+    depth=$(awk -F/ '{print NF}' <<< "$relative")
+    if (( depth < min_depth )); then
+        echo "[!] Refusing shallow $label path: '$canonical'" >&2
+        return 1
+    fi
+    printf '%s\n' "$canonical"
+}
+
+# Recursive install/chown targets must not live inside operating-system trees.
+# WEB_ROOT is the sole exception for descendants of /var/www.
+guard_recursive_target() {
+    local label="$1" canonical="$2" allow_var_www="${3:-false}"
+    local canonical_home
+    canonical_home=$(canonical_path "$HOME") || return 1
+    case "$canonical" in
+        /home/*|/root/*)
+            if [[ "$canonical" != "$canonical_home"/* ]]; then
+                echo "[!] Refusing $label under another user's home: '$canonical'" >&2
+                return 1
+            fi
+            ;;
+    esac
+    if [[ "$allow_var_www" == "true" && "$canonical" == /var/www/* ]]; then
+        printf '%s\n' "$canonical"
+        return 0
+    fi
+    case "$canonical" in
+        /bin/*|/boot/*|/dev/*|/etc/*|/lib/*|/lib64/*|/proc/*|/run/*|/sbin/*|/sys/*|/usr/*|/var/*)
+            echo "[!] Refusing $label inside protected system tree: '$canonical'" >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$canonical"
+}
+
+paths_overlap() {
+    local first="${1%/}" second="${2%/}"
+    [[ "$first" == "$second" || "$first" == "$second"/* || "$second" == "$first"/* ]]
+}
+
+assert_lldpq_install_tree() {
+    local path="$1"
+    [[ -d "$path" ]] || return 0
+    if [[ ! -f "$path/devices.yaml" || ! -f "$path/monitor.sh" ]]; then
+        echo "[!] Refusing recursive replacement of unrecognized directory: '$path'" >&2
+        return 1
+    fi
+}
+
+validate_cron_schedule() {
+    local schedule="$1" field
+    local -a fields
+    read -r -a fields <<< "$schedule"
+    [[ ${#fields[@]} -eq 5 ]] || return 1
+    for field in "${fields[@]}"; do
+        [[ "$field" =~ ^[A-Za-z0-9*/?,#_-]+$ ]] || return 1
+    done
+}
+
+shell_single_quote() {
+    local value="$1"
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+# Remove only commands installed by historical LLDPq releases.  Generic words
+# such as "monitor" are deliberately not matched.
+filter_legacy_lldpq_crontab() {
+    local input_file="$1" output_file="$2" install_dir="$3"
+    awk -v install_dir="$install_dir" '
+        function owned(line) {
+            return line ~ /\/usr\/local\/bin\/lldpq([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/lldpq-trigger([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/lldpq-ai-analyze([[:space:]]|$)/ ||
+                   line ~ /\/usr\/local\/bin\/get-conf([[:space:]]|$)/ ||
+                   index(line, install_dir "/fabric-scan.sh") > 0 ||
+                   (index(line, "cd " install_dir) > 0 && index(line, "./fabric-scan.sh") > 0) ||
+                   index(line, install_dir "/fabric-scan-cron.sh") > 0 ||
+                   (index(line, install_dir) > 0 && index(line, "topology.dot.bkp") > 0)
+        }
+        !owned($0) { print }
+    ' "$input_file" > "$output_file"
+}
+
+render_lldpq_cron_file() {
+    local output_file="$1" user="$2" install_dir="$3" web_root="$4"
+    local lldpq_schedule="$5" getconf_schedule="$6" include_fabric_cron="$7"
+    local q_install q_web
+
+    [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || {
+        echo "[!] Invalid LLDPq cron user: '$user'" >&2
+        return 1
+    }
+    validate_cron_schedule "$lldpq_schedule" || {
+        echo "[!] Invalid LLDPQ_CRON schedule: '$lldpq_schedule'" >&2
+        return 1
+    }
+    validate_cron_schedule "$getconf_schedule" || {
+        echo "[!] Invalid GETCONF_CRON schedule: '$getconf_schedule'" >&2
+        return 1
+    }
+    q_install=$(shell_single_quote "$install_dir")
+    q_web=$(shell_single_quote "$web_root")
+
+    {
+        echo "# Managed by LLDPq. Local changes may be replaced by install.sh."
+        echo "SHELL=/bin/sh"
+        echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        echo "$lldpq_schedule $user /usr/local/bin/lldpq"
+        echo "$getconf_schedule $user /usr/local/bin/get-conf"
+        echo "* * * * * $user /usr/local/bin/lldpq-trigger"
+        echo "* * * * * $user cd $q_install && ./fabric-scan.sh >/dev/null 2>&1"
+        echo "0 0 * * * $user cd $q_install && cp $q_web/topology.dot topology.dot.bkp 2>/dev/null; cp $q_web/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m 'auto: \$(date +\\%Y-\\%m-\\%d)'"
+        echo "0 * * * * $user /usr/local/bin/lldpq-ai-analyze"
+        if [[ "$include_fabric_cron" == "true" ]]; then
+            echo "33 3 * * * $user $q_install/fabric-scan-cron.sh"
+        fi
+    } > "$output_file"
+}
+
+validate_lldpq_cron_file() {
+    local cron_file="$1" line minute hour dom month dow user command job_count=0
+    [[ -s "$cron_file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* || "$line" == SHELL=* || "$line" == PATH=* ]] && continue
+        read -r minute hour dom month dow user command <<< "$line"
+        [[ -n "$command" ]] || return 1
+        validate_cron_schedule "$minute $hour $dom $month $dow" || return 1
+        [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || return 1
+        job_count=$((job_count + 1))
+    done < "$cron_file"
+    (( job_count >= 6 ))
+}
+
+rollback_cron_target() {
+    local target="$1" had_previous="$2" backup="$3"
+    if [[ "$had_previous" == "true" ]]; then
+        root_run cp "$backup" "$target"
+        root_run chmod 644 "$target"
+    else
+        root_run rm -f "$target"
+    fi
+}
+
+# Install the already-rendered/validated cron.d file first.  Only after that
+# succeeds are legacy /etc/crontab entries migrated.  Any migration failure
+# restores the previous cron.d state, preventing a half-applied schedule.
+install_lldpq_cron_transaction() {
+    local rendered="$1" system_crontab="$2" cron_target="$3" install_dir="$4"
+    local target_stage crontab_stage filtered backup had_previous=false
+
+    validate_lldpq_cron_file "$rendered" || {
+        echo "[!] Refusing invalid LLDPq cron file" >&2
+        return 1
+    }
+    backup=$(mktemp "${TMPDIR:-/tmp}/lldpq-cron-backup.XXXXXX")
+    if [[ -e "$cron_target" ]]; then
+        root_run cp "$cron_target" "$backup" || { rm -f "$backup"; return 1; }
+        had_previous=true
+    fi
+    target_stage=$(root_run mktemp "$(dirname "$cron_target")/.lldpq-cron.XXXXXXXXXX") || {
+        rm -f "$backup"; return 1;
+    }
+    if ! root_run cp "$rendered" "$target_stage" || \
+       ! root_run chmod 644 "$target_stage" || \
+       ! root_run mv -fT "$target_stage" "$cron_target"; then
+        root_run rm -f "$target_stage" 2>/dev/null || true
+        rm -f "$backup"
+        return 1
+    fi
+
+    if [[ -f "$system_crontab" ]]; then
+        filtered=$(mktemp "${TMPDIR:-/tmp}/lldpq-crontab-filtered.XXXXXX")
+        if ! filter_legacy_lldpq_crontab "$system_crontab" "$filtered" "$install_dir"; then
+            rollback_cron_target "$cron_target" "$had_previous" "$backup" || true
+            rm -f "$filtered" "$backup"
+            return 1
+        fi
+        if ! cmp -s "$system_crontab" "$filtered"; then
+            crontab_stage=$(root_run mktemp "$(dirname "$system_crontab")/.lldpq-crontab.XXXXXXXXXX") || {
+                rollback_cron_target "$cron_target" "$had_previous" "$backup" || true
+                rm -f "$filtered" "$backup"
+                return 1
+            }
+            if ! root_run cp "$filtered" "$crontab_stage" || \
+               ! root_run chmod 644 "$crontab_stage" || \
+               ! root_run mv -fT "$crontab_stage" "$system_crontab"; then
+                root_run rm -f "$crontab_stage" 2>/dev/null || true
+                rollback_cron_target "$cron_target" "$had_previous" "$backup" || true
+                rm -f "$filtered" "$backup"
+                return 1
+            fi
+        fi
+        rm -f "$filtered"
+    fi
+    rm -f "$backup"
+}
+
+root_run() {
+    if [[ "${LLDPQ_TEST_NO_SUDO:-false}" == "true" ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+render_ai_config() {
+    local provider="$1" model="$2" api_key="$3" api_url="$4" ollama_url="$5"
+    local proxy_url="$6" search_model="$7" search_url="$8" search_key="$9"
+    printf 'AI_PROVIDER=%s\n' "$provider"
+    printf 'AI_MODEL=%s\n' "$model"
+    printf 'AI_API_KEY=%s\n' "$api_key"
+    printf 'AI_API_URL=%s\n' "$api_url"
+    printf 'OLLAMA_URL=%s\n' "$ollama_url"
+    printf 'AI_PROXY_URL=%s\n' "$proxy_url"
+    printf 'AI_SEARCH_MODEL=%s\n' "$search_model"
+    printf 'AI_SEARCH_URL=%s\n' "$search_url"
+    printf 'AI_SEARCH_KEY=%s\n' "$search_key"
+}
+
+render_runtime_tuning_config() {
+    local lldpq_cron="$1" getconf_cron="$2" skip_optical="$3" skip_l1="$4"
+    local monitor_parallel="$5" lldp_parallel="$6" assets_parallel="$7"
+    local getconfigs_parallel="$8" send_parallel="$9" telemetry_parallel="${10}"
+    printf 'LLDPQ_CRON="%s"\n' "$lldpq_cron"
+    printf 'GETCONF_CRON="%s"\n' "$getconf_cron"
+    printf 'SKIP_OPTICAL=%s\n' "$skip_optical"
+    printf 'SKIP_L1=%s\n' "$skip_l1"
+    printf 'MONITOR_MAX_PARALLEL=%s\n' "$monitor_parallel"
+    printf 'LLDP_MAX_PARALLEL=%s\n' "$lldp_parallel"
+    printf 'ASSETS_MAX_PARALLEL=%s\n' "$assets_parallel"
+    printf 'GET_CONFIGS_MAX_PARALLEL=%s\n' "$getconfigs_parallel"
+    printf 'SEND_CMD_MAX_PARALLEL=%s\n' "$send_parallel"
+    printf 'TELEMETRY_MAX_PARALLEL=%s\n' "$telemetry_parallel"
+}
+
+render_preserved_provisioning_config() {
+    local auto_base="$1" auto_ztp="$2" auto_hostname="$3"
+    local skip_models="$4" unknown_policy="$5" max_parallel="$6"
+    local min_interval="$7" ssh_timeout="$8"
+    printf 'AUTO_BASE_CONFIG=%s\n' "$auto_base"
+    printf 'AUTO_ZTP_DISABLE=%s\n' "$auto_ztp"
+    printf 'AUTO_SET_HOSTNAME=%s\n' "$auto_hostname"
+    printf 'TRANSCEIVER_FW_SKIP_MODELS=%s\n' "$skip_models"
+    printf 'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=%s\n' "$unknown_policy"
+    printf 'TRANSCEIVER_FW_MAX_PARALLEL=%s\n' "$max_parallel"
+    printf 'TRANSCEIVER_FW_MIN_INTERVAL=%s\n' "$min_interval"
+    printf 'TRANSCEIVER_FW_SSH_TIMEOUT=%s\n' "$ssh_timeout"
+}
+
+render_default_dhcp_config() {
+    local output_file="$1" server_ip="$2" hosts_file="$3"
+    local subnet gateway
+    subnet=$(sed 's/\.[0-9]*$/.0/' <<< "$server_ip")
+    gateway=$(sed 's/\.[0-9]*$/.1/' <<< "$server_ip")
+
+    cat > "$output_file" <<DHCPEOF
+# /etc/dhcp/dhcpd.conf - Generated by LLDPq
+
+ddns-update-style none;
+authoritative;
+log-facility local7;
+
+option www-server code 72 = ip-address;
+option default-url code 114 = text;
+option cumulus-provision-url code 239 = text;
+option space onie code width 1 length width 1;
+option onie.installer_url code 1 = text;
+option onie.updater_url   code 2 = text;
+option onie.machine       code 3 = text;
+option onie.arch          code 4 = text;
+option onie.machine_rev   code 5 = text;
+
+option space vivso code width 4 length width 1;
+option vivso.onie code 42623 = encapsulate onie;
+option vivso.iana code 0 = string;
+option op125 code 125 = encapsulate vivso;
+
+class "onie-vendor-classes" {
+  match if substring(option vendor-class-identifier, 0, 11) = "onie_vendor";
+  option vivso.iana 01:01:01;
+}
+
+# OOB Management subnet
+shared-network OOB {
+  subnet ${subnet} netmask 255.255.255.0 {
+    range ${subnet%.*}.210 ${subnet%.*}.249;
+    option routers ${gateway};
+    option domain-name "example.com";
+    option domain-name-servers ${gateway};
+    option www-server ${server_ip};
+    option default-url "http://${server_ip}/";
+    option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
+    default-lease-time 172800;
+    max-lease-time     345600;
+  }
+}
+
+include "${hosts_file}";
+DHCPEOF
+}
+
+# Return codes: 0 = created/replaced, 10 = existing LLDPq config kept,
+# 11 = existing foreign config preserved because no explicit opt-in was given.
+prepare_default_dhcp_config() {
+    local conf_file="$1" hosts_file="$2" replace_foreign="$3"
+    local owner="${4:-}" group="${5:-}" server_ip="$6"
+    local temp_file validation_hosts="" backup_file staged_file validator
+
+    if [[ -f "$conf_file" ]] && grep -q 'cumulus-provision-url\|Generated by LLDPq' "$conf_file" 2>/dev/null; then
+        echo "  DHCP config already managed by LLDPq, keeping"
+        return 10
+    fi
+    if [[ -e "$conf_file" && "$replace_foreign" != "true" ]]; then
+        echo "  [!] Existing non-LLDPq DHCP config preserved: $conf_file"
+        echo "      Re-run with --replace-dhcp-config to validate, back up and replace it."
+        return 11
+    fi
+
+    temp_file=$(mktemp "${TMPDIR:-/tmp}/lldpq-dhcp.XXXXXX")
+    validation_hosts="$hosts_file"
+    if [[ ! -e "$hosts_file" ]]; then
+        validation_hosts=$(mktemp "${TMPDIR:-/tmp}/lldpq-dhcp-hosts.XXXXXX")
+    fi
+    render_default_dhcp_config "$temp_file" "$server_ip" "$validation_hosts"
+
+    validator="${DHCPD_VALIDATOR:-dhcpd}"
+    if command -v "$validator" >/dev/null 2>&1; then
+        if ! "$validator" -t -cf "$temp_file" >/dev/null 2>&1; then
+            echo "  [!] Generated DHCP config failed validation; existing config was not changed" >&2
+            rm -f "$temp_file"
+            [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
+            return 1
+        fi
+    else
+        echo "  [!] dhcpd validator not found; refusing to activate an unvalidated config" >&2
+        rm -f "$temp_file"
+        [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
+        return 1
+    fi
+
+    # The validation-only include may live in /tmp.  Render the exact final
+    # include path only after syntax validation succeeds.
+    render_default_dhcp_config "$temp_file" "$server_ip" "$hosts_file"
+    [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
+
+    if ! root_run mkdir -p "$(dirname "$conf_file")" "$(dirname "$hosts_file")"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    if [[ ! -e "$hosts_file" ]]; then
+        if ! root_run touch "$hosts_file"; then
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+    if ! root_run chmod 664 "$hosts_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    if [[ -n "$owner" && -n "$group" ]]; then
+        root_run chown "$owner:$group" "$hosts_file" || {
+            rm -f "$temp_file"
+            return 1
+        }
+    fi
+
+    if [[ -e "$conf_file" ]]; then
+        backup_file="${conf_file}.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
+        if ! root_run cp -p "$conf_file" "$backup_file"; then
+            echo "  [!] Could not back up existing DHCP config; replacement aborted" >&2
+            rm -f "$temp_file"
+            return 1
+        fi
+        echo "  Existing DHCP config backed up to: $backup_file"
+    fi
+
+    # Stage beside the target and rename only after permissions are ready, so a
+    # failed copy/chown cannot leave a truncated active configuration.
+    staged_file="${conf_file}.lldpq-new.$$"
+    if ! root_run cp "$temp_file" "$staged_file" || \
+       ! root_run chmod 664 "$staged_file"; then
+        root_run rm -f "$staged_file" 2>/dev/null || true
+        rm -f "$temp_file"
+        return 1
+    fi
+    if [[ -n "$owner" && -n "$group" ]]; then
+        if ! root_run chown "$owner:$group" "$staged_file"; then
+            root_run rm -f "$staged_file" 2>/dev/null || true
+            rm -f "$temp_file"
+            return 1
+        fi
+    fi
+    if ! root_run mv -f "$staged_file" "$conf_file"; then
+        root_run rm -f "$staged_file" 2>/dev/null || true
+        rm -f "$temp_file"
+        return 1
+    fi
+    rm -f "$temp_file"
+    return 0
+}
+
+# Test harnesses source the helpers without executing installer side effects.
+if [[ "${LLDPQ_INSTALL_LIB_ONLY:-false}" == "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Step counter for progress display
 STEP=0
 step() { STEP=$((STEP + 1)); printf "\n[%02d] %s\n" "$STEP" "$1"; }
@@ -87,6 +575,7 @@ AUTO_YES=false
 ENABLE_TELEMETRY=false
 DISABLE_TELEMETRY=false
 FORCE_BACKUP=false
+REPLACE_DHCP_CONFIG=false
 # Remember where we were installed FROM (the source repo) so the web "Update"
 # button can later git pull + reinstall from here (stored as LLDPQ_SRC in lldpq.conf).
 LLDPQ_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -95,10 +584,11 @@ for arg in "$@"; do
     case $arg in
         -y) AUTO_YES=true ;;
         --backup) FORCE_BACKUP=true ;;
+        --replace-dhcp-config) REPLACE_DHCP_CONFIG=true ;;
         --enable-telemetry) ENABLE_TELEMETRY=true ;;
         --disable-telemetry) DISABLE_TELEMETRY=true ;;
         -h|--help)
-            echo "Usage: ./install.sh [-y] [--backup] [--enable-telemetry] [--disable-telemetry]"
+            echo "Usage: ./install.sh [-y] [--backup] [--replace-dhcp-config] [--enable-telemetry] [--disable-telemetry]"
             echo ""
             echo "Automatically detects existing installation:"
             echo "  No existing install → Fresh install (packages, configs, everything)"
@@ -107,6 +597,8 @@ for arg in "$@"; do
             echo "Options:"
             echo "  -y                  Auto-yes to all prompts"
             echo "  --backup            (update mode) take a full backup before updating"
+            echo "  --replace-dhcp-config"
+            echo "                      Replace a non-LLDPq dhcpd.conf after validation + backup"
             echo "  --enable-telemetry  Enable streaming telemetry (requires Docker)"
             echo "  --disable-telemetry Disable streaming telemetry"
             exit 0
@@ -114,14 +606,15 @@ for arg in "$@"; do
     esac
 done
 
+LLDPQ_CONFIG_FILE="${LLDPQ_CONFIG_FILE:-/etc/lldpq.conf}"
+load_lldpq_config "$LLDPQ_CONFIG_FILE"
+
 # ============================================================================
 # TELEMETRY-ONLY MODE (early exit — no other changes needed)
 # ============================================================================
 if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; then
-    # Read LLDPQ_INSTALL_DIR from config
-    if [[ -f /etc/lldpq.conf ]]; then
-        LLDPQ_INSTALL_DIR=$(grep "^LLDPQ_DIR=" /etc/lldpq.conf 2>/dev/null | cut -d'=' -f2 || echo "")
-    fi
+    # LLDPQ_DIR was loaded as data above; do not source the group-writable file.
+    LLDPQ_INSTALL_DIR="${LLDPQ_DIR:-}"
     if [[ -z "$LLDPQ_INSTALL_DIR" ]]; then
         if [[ $EUID -eq 0 ]]; then
             LLDPQ_INSTALL_DIR="/opt/lldpq"
@@ -129,6 +622,8 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
             LLDPQ_INSTALL_DIR="$HOME/lldpq"
         fi
     fi
+    LLDPQ_INSTALL_DIR=$(guard_managed_path "LLDPq install" "$LLDPQ_INSTALL_DIR" 2) || exit 1
+    LLDPQ_INSTALL_DIR=$(guard_recursive_target "LLDPq install" "$LLDPQ_INSTALL_DIR" false) || exit 1
 
     if [[ "$ENABLE_TELEMETRY" == "true" ]]; then
         echo "Enabling Streaming Telemetry..."
@@ -265,11 +760,8 @@ fi
 # DIRECTORY SETUP
 # ============================================================================
 
-# Read LLDPQ_INSTALL_DIR from existing config (if available)
-LLDPQ_INSTALL_DIR=""
-if [[ -f /etc/lldpq.conf ]]; then
-    LLDPQ_INSTALL_DIR=$(grep "^LLDPQ_DIR=" /etc/lldpq.conf 2>/dev/null | cut -d'=' -f2 || echo "")
-fi
+# Read LLDPQ_INSTALL_DIR from the safely parsed existing config (if available).
+LLDPQ_INSTALL_DIR="${LLDPQ_DIR:-}"
 
 # Default based on user
 if [[ -z "$LLDPQ_INSTALL_DIR" ]]; then
@@ -280,8 +772,21 @@ if [[ -z "$LLDPQ_INSTALL_DIR" ]]; then
     fi
 fi
 
-LLDPQ_USER="$(whoami)"
-WEB_ROOT="/var/www/html"
+LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
+WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+
+LLDPQ_INSTALL_DIR=$(guard_managed_path "LLDPq install" "$LLDPQ_INSTALL_DIR" 2) || exit 1
+WEB_ROOT=$(guard_managed_path "web root" "$WEB_ROOT" 2) || exit 1
+LLDPQ_INSTALL_DIR=$(guard_recursive_target "LLDPq install" "$LLDPQ_INSTALL_DIR" false) || exit 1
+WEB_ROOT=$(guard_recursive_target "web root" "$WEB_ROOT" true) || exit 1
+if paths_overlap "$LLDPQ_INSTALL_DIR" "$WEB_ROOT"; then
+    echo "[!] LLDPQ_DIR and WEB_ROOT must not overlap" >&2
+    exit 1
+fi
+if [[ ! "$LLDPQ_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+    echo "[!] Invalid LLDPQ_USER in configuration: '$LLDPQ_USER'" >&2
+    exit 1
+fi
 
 # Running as root advisory
 if [[ $EUID -eq 0 ]]; then
@@ -417,8 +922,8 @@ fi
 _preserved_dir=""
 
 if [[ "$INSTALL_MODE" == "update" ]]; then
-    # Load existing config (sets ANSIBLE_DIR, TELEMETRY_ENABLED, PROMETHEUS_URL, etc.)
-    source /etc/lldpq.conf 2>/dev/null || true
+    # Allow-listed values were loaded once before mode detection.  Do not
+    # re-read a group-writable file after validating its managed paths.
     WEB_ROOT="${WEB_ROOT:-/var/www/html}"
     LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 
@@ -510,9 +1015,7 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # Preserve runtime data across the rm+recopy (ALWAYS — independent of the optional
     # backup above). Uses sudo because monitor-results may contain root-owned files
     # written by cron; a rename keeps it on the same filesystem (fast, no big copy).
-    _DATA_PRESERVE="$HOME/.lldpq-data-preserve-$$"
-    sudo rm -rf "$_DATA_PRESERVE" 2>/dev/null || true
-    mkdir -p "$_DATA_PRESERVE"
+    _DATA_PRESERVE=$(mktemp -d "$HOME/.lldpq-data-preserve.XXXXXX")
     for _d in monitor-results lldp-results alert-states; do
         [[ -e "$LLDPQ_INSTALL_DIR/$_d" ]] && sudo mv "$LLDPQ_INSTALL_DIR/$_d" "$_DATA_PRESERVE/" 2>/dev/null || true
     done
@@ -535,10 +1038,11 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
 
     # Remove old lldpq directory (sudo fallback: may contain root-owned files)
     echo "  Removing old lldpq directory..."
+    assert_lldpq_install_tree "$LLDPQ_INSTALL_DIR" || exit 1
     rm -rf "$LLDPQ_INSTALL_DIR" 2>/dev/null || sudo rm -rf "$LLDPQ_INSTALL_DIR"
     echo "  Ready for update"
 
-    # Save config vars from sourced config (before /etc/lldpq.conf is overwritten)
+    # Save safely parsed config values before /etc/lldpq.conf is overwritten.
     _SAVE_TELEMETRY_ENABLED="${TELEMETRY_ENABLED:-}"
     _SAVE_PROMETHEUS_URL="${PROMETHEUS_URL:-}"
     _SAVE_TELEMETRY_COLLECTOR_IP="${TELEMETRY_COLLECTOR_IP:-}"
@@ -546,7 +1050,6 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     _SAVE_AUTO_BASE_CONFIG="${AUTO_BASE_CONFIG:-true}"
     _SAVE_AUTO_ZTP_DISABLE="${AUTO_ZTP_DISABLE:-true}"
     _SAVE_AUTO_SET_HOSTNAME="${AUTO_SET_HOSTNAME:-true}"
-    _SAVE_SKIP_OPTICAL="${SKIP_OPTICAL:-false}"
     _SAVE_TRANSCEIVER_FW_SKIP_MODELS="${TRANSCEIVER_FW_SKIP_MODELS:-}"
     _SAVE_TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY="${TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY:-skip}"
     _SAVE_TRANSCEIVER_FW_MAX_PARALLEL="${TRANSCEIVER_FW_MAX_PARALLEL:-10}"
@@ -559,6 +1062,10 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     _SAVE_AI_API_KEY="${AI_API_KEY:-}"
     _SAVE_AI_API_URL="${AI_API_URL:-https://api.openai.com/v1}"
     _SAVE_OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+    _SAVE_AI_PROXY_URL="${AI_PROXY_URL:-}"
+    _SAVE_AI_SEARCH_MODEL="${AI_SEARCH_MODEL:-}"
+    _SAVE_AI_SEARCH_URL="${AI_SEARCH_URL:-}"
+    _SAVE_AI_SEARCH_KEY="${AI_SEARCH_KEY:-}"
     # Save Ansible dir and Editor root from sourced config
     _SAVE_ANSIBLE_DIR="${ANSIBLE_DIR:-}"
     _SAVE_EDITOR_ROOT="${EDITOR_ROOT:-}"
@@ -821,6 +1328,18 @@ else
     fi
 fi
 
+# ANSIBLE_DIR is later used by recursive chmod/chown and git operations.  Treat
+# a configured or interactively supplied value with the same root-deny policy
+# as the install and web roots.
+if [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]]; then
+    ANSIBLE_DIR=$(guard_managed_path "Ansible project" "$ANSIBLE_DIR" 2) || exit 1
+    ANSIBLE_DIR=$(guard_recursive_target "Ansible project" "$ANSIBLE_DIR" false) || exit 1
+fi
+if [[ "${EDITOR_ROOT:-}" != "NoNe" ]] && [[ -n "${EDITOR_ROOT:-}" ]]; then
+    EDITOR_ROOT=$(guard_managed_path "editor root" "$EDITOR_ROOT" 2) || exit 1
+    EDITOR_ROOT=$(guard_recursive_target "editor root" "$EDITOR_ROOT" false) || exit 1
+fi
+
 # Configure Ansible directory permissions (if not NoNe and exists)
 if [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR" ]]; then
     echo "  Configuring web access permissions..."
@@ -883,9 +1402,6 @@ echo "# LLDPq Configuration" | sudo tee /etc/lldpq.conf > /dev/null
 echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "LLDPQ_USER=$LLDPQ_USER" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
-# Cron schedules (editable from Setup; preserved across updates via the sourced config)
-echo "LLDPQ_CRON=\"${LLDPQ_CRON:-*/10 * * * *}\"" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "GETCONF_CRON=\"${GETCONF_CRON:-0 */12 * * *}\"" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "WEB_ROOT=$WEB_ROOT" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "ANSIBLE_DIR=$ANSIBLE_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | sudo tee -a /etc/lldpq.conf > /dev/null
@@ -897,24 +1413,25 @@ echo "BASE_CONFIG_DIR=$LLDPQ_INSTALL_DIR/sw-base" | sudo tee -a /etc/lldpq.conf 
 echo "AUTO_BASE_CONFIG=true" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AUTO_ZTP_DISABLE=true" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "AUTO_SET_HOSTNAME=true" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "SKIP_OPTICAL=false" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "SKIP_L1=false" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "MONITOR_MAX_PARALLEL=${MONITOR_MAX_PARALLEL:-100}" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "LLDP_MAX_PARALLEL=${LLDP_MAX_PARALLEL:-100}" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "ASSETS_MAX_PARALLEL=${ASSETS_MAX_PARALLEL:-100}" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "GET_CONFIGS_MAX_PARALLEL=${GET_CONFIGS_MAX_PARALLEL:-100}" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "SEND_CMD_MAX_PARALLEL=25" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TELEMETRY_MAX_PARALLEL=25" | sudo tee -a /etc/lldpq.conf > /dev/null
+render_runtime_tuning_config \
+    "${LLDPQ_CRON:-*/10 * * * *}" \
+    "${GETCONF_CRON:-0 */12 * * *}" \
+    "${SKIP_OPTICAL:-false}" \
+    "${SKIP_L1:-false}" \
+    "${MONITOR_MAX_PARALLEL:-100}" \
+    "${LLDP_MAX_PARALLEL:-100}" \
+    "${ASSETS_MAX_PARALLEL:-100}" \
+    "${GET_CONFIGS_MAX_PARALLEL:-100}" \
+    "${SEND_CMD_MAX_PARALLEL:-25}" \
+    "${TELEMETRY_MAX_PARALLEL:-25}" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_SKIP_MODELS=\"\"" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=skip" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_MAX_PARALLEL=10" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_MIN_INTERVAL=1800" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_SSH_TIMEOUT=300" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AI_PROVIDER=ollama" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AI_MODEL=llama3.2" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AI_API_KEY=" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AI_API_URL=https://api.openai.com/v1" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "OLLAMA_URL=http://localhost:11434" | sudo tee -a /etc/lldpq.conf > /dev/null
+render_ai_config \
+    ollama llama3.2 "" https://api.openai.com/v1 http://localhost:11434 \
+    "" "" "" "" | sudo tee -a /etc/lldpq.conf > /dev/null
 
 # Preserve telemetry settings (update mode)
 if [[ "$INSTALL_MODE" == "update" ]]; then
@@ -931,28 +1448,34 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # Preserve discovery settings
     [[ -n "$_SAVE_DISCOVERY_RANGE" ]] && \
         echo "DISCOVERY_RANGE=$_SAVE_DISCOVERY_RANGE" | sudo tee -a /etc/lldpq.conf > /dev/null
-    # Overwrite auto-provision toggles with preserved values
-    sudo sed -i "s/^AUTO_BASE_CONFIG=.*/AUTO_BASE_CONFIG=$_SAVE_AUTO_BASE_CONFIG/" /etc/lldpq.conf
-    sudo sed -i "s/^AUTO_ZTP_DISABLE=.*/AUTO_ZTP_DISABLE=$_SAVE_AUTO_ZTP_DISABLE/" /etc/lldpq.conf
-    sudo sed -i "s/^AUTO_SET_HOSTNAME=.*/AUTO_SET_HOSTNAME=$_SAVE_AUTO_SET_HOSTNAME/" /etc/lldpq.conf
-    sudo sed -i "s/^SKIP_OPTICAL=.*/SKIP_OPTICAL=$_SAVE_SKIP_OPTICAL/" /etc/lldpq.conf
-    sudo sed -i "s|^TRANSCEIVER_FW_SKIP_MODELS=.*|TRANSCEIVER_FW_SKIP_MODELS=\"$_SAVE_TRANSCEIVER_FW_SKIP_MODELS\"|" /etc/lldpq.conf
-    sudo sed -i "s/^TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=.*/TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=$_SAVE_TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY/" /etc/lldpq.conf
-    sudo sed -i "s/^TRANSCEIVER_FW_MAX_PARALLEL=.*/TRANSCEIVER_FW_MAX_PARALLEL=$_SAVE_TRANSCEIVER_FW_MAX_PARALLEL/" /etc/lldpq.conf
-    sudo sed -i "s/^TRANSCEIVER_FW_MIN_INTERVAL=.*/TRANSCEIVER_FW_MIN_INTERVAL=$_SAVE_TRANSCEIVER_FW_MIN_INTERVAL/" /etc/lldpq.conf
-    sudo sed -i "s/^TRANSCEIVER_FW_SSH_TIMEOUT=.*/TRANSCEIVER_FW_SSH_TIMEOUT=$_SAVE_TRANSCEIVER_FW_SSH_TIMEOUT/" /etc/lldpq.conf
+    # Replace preserved values as data. Never interpolate group-writable config
+    # into a sed program: GNU sed's `e` flag could otherwise turn a crafted
+    # value into command execution during a privileged update.
+    sudo sed -i '/^AUTO_BASE_CONFIG=/d;/^AUTO_ZTP_DISABLE=/d;/^AUTO_SET_HOSTNAME=/d;/^TRANSCEIVER_FW_SKIP_MODELS=/d;/^TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=/d;/^TRANSCEIVER_FW_MAX_PARALLEL=/d;/^TRANSCEIVER_FW_MIN_INTERVAL=/d;/^TRANSCEIVER_FW_SSH_TIMEOUT=/d' /etc/lldpq.conf
+    render_preserved_provisioning_config \
+        "$_SAVE_AUTO_BASE_CONFIG" \
+        "$_SAVE_AUTO_ZTP_DISABLE" \
+        "$_SAVE_AUTO_SET_HOSTNAME" \
+        "$_SAVE_TRANSCEIVER_FW_SKIP_MODELS" \
+        "$_SAVE_TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY" \
+        "$_SAVE_TRANSCEIVER_FW_MAX_PARALLEL" \
+        "$_SAVE_TRANSCEIVER_FW_MIN_INTERVAL" \
+        "$_SAVE_TRANSCEIVER_FW_SSH_TIMEOUT" | sudo tee -a /etc/lldpq.conf > /dev/null
     # Preserve AI settings. Values (API key, model like "openai/gpt-5.5", URLs) often
     # contain '/', '|', '&' which break `sed s///` ("unknown option to s"), so delete
     # the freshly-written default lines and re-append the preserved values with echo
     # (safe for ANY value).
-    sudo sed -i '/^AI_PROVIDER=/d;/^AI_MODEL=/d;/^AI_API_KEY=/d;/^AI_API_URL=/d;/^OLLAMA_URL=/d' /etc/lldpq.conf
-    {
-        echo "AI_PROVIDER=$_SAVE_AI_PROVIDER"
-        echo "AI_MODEL=$_SAVE_AI_MODEL"
-        echo "AI_API_KEY=$_SAVE_AI_API_KEY"
-        echo "AI_API_URL=$_SAVE_AI_API_URL"
-        echo "OLLAMA_URL=$_SAVE_OLLAMA_URL"
-    } | sudo tee -a /etc/lldpq.conf > /dev/null
+    sudo sed -i '/^AI_PROVIDER=/d;/^AI_MODEL=/d;/^AI_API_KEY=/d;/^AI_API_URL=/d;/^OLLAMA_URL=/d;/^AI_PROXY_URL=/d;/^AI_SEARCH_MODEL=/d;/^AI_SEARCH_URL=/d;/^AI_SEARCH_KEY=/d' /etc/lldpq.conf
+    render_ai_config \
+        "$_SAVE_AI_PROVIDER" \
+        "$_SAVE_AI_MODEL" \
+        "$_SAVE_AI_API_KEY" \
+        "$_SAVE_AI_API_URL" \
+        "$_SAVE_OLLAMA_URL" \
+        "$_SAVE_AI_PROXY_URL" \
+        "$_SAVE_AI_SEARCH_MODEL" \
+        "$_SAVE_AI_SEARCH_URL" \
+        "$_SAVE_AI_SEARCH_KEY" | sudo tee -a /etc/lldpq.conf > /dev/null
 fi
 
 # Create cache and data files with correct permissions
@@ -996,67 +1519,40 @@ step "Preparing DHCP/Provision directories..."
 
 sudo mkdir -p /etc/dhcp /var/lib/dhcp
 sudo touch /var/lib/dhcp/dhcpd.leases
-[ ! -f /etc/dhcp/dhcpd.hosts ] && sudo touch /etc/dhcp/dhcpd.hosts
-sudo chown "$LLDPQ_USER:www-data" /etc/dhcp/dhcpd.hosts
-sudo chmod 664 /etc/dhcp/dhcpd.hosts
 
-# Default dhcpd.conf if not configured yet (same template as Docker entrypoint)
-if ! grep -q 'cumulus-provision-url\|LLDPq' /etc/dhcp/dhcpd.conf 2>/dev/null; then
-    OUR_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    OUR_IP="${OUR_IP:-127.0.0.1}"
-    OUR_SUBNET=$(echo "$OUR_IP" | sed 's/\.[0-9]*$/.0/')
-    OUR_GW=$(echo "$OUR_IP" | sed 's/\.[0-9]*$/.1/')
-
-    sudo tee /etc/dhcp/dhcpd.conf > /dev/null << DHCPEOF
-# /etc/dhcp/dhcpd.conf - Generated by LLDPq
-
-ddns-update-style none;
-authoritative;
-log-facility local7;
-
-option www-server code 72 = ip-address;
-option default-url code 114 = text;
-option cumulus-provision-url code 239 = text;
-option space onie code width 1 length width 1;
-option onie.installer_url code 1 = text;
-option onie.updater_url   code 2 = text;
-option onie.machine       code 3 = text;
-option onie.arch          code 4 = text;
-option onie.machine_rev   code 5 = text;
-
-option space vivso code width 4 length width 1;
-option vivso.onie code 42623 = encapsulate onie;
-option vivso.iana code 0 = string;
-option op125 code 125 = encapsulate vivso;
-
-class "onie-vendor-classes" {
-  match if substring(option vendor-class-identifier, 0, 11) = "onie_vendor";
-  option vivso.iana 01:01:01;
-}
-
-# OOB Management subnet
-shared-network OOB {
-  subnet ${OUR_SUBNET} netmask 255.255.255.0 {
-    range ${OUR_SUBNET%.*}.210 ${OUR_SUBNET%.*}.249;
-    option routers ${OUR_GW};
-    option domain-name "example.com";
-    option domain-name-servers ${OUR_GW};
-    option www-server ${OUR_IP};
-    option default-url "http://${OUR_IP}/";
-    option cumulus-provision-url "http://${OUR_IP}/cumulus-ztp.sh";
-    default-lease-time 172800;
-    max-lease-time     345600;
-  }
-}
-
-include "/etc/dhcp/dhcpd.hosts";
-DHCPEOF
-    sudo chown "$LLDPQ_USER:www-data" /etc/dhcp/dhcpd.conf
-    sudo chmod 664 /etc/dhcp/dhcpd.conf
-    echo "  Default DHCP config created (subnet: ${OUR_SUBNET}/24, server: ${OUR_IP})"
-else
-    echo "  DHCP config already exists, keeping"
-fi
+# A foreign DHCP configuration belongs to the operator.  Auto-yes deliberately
+# does not authorize replacing it; only --replace-dhcp-config does.  New or
+# explicitly replaced templates are syntax-checked before activation and an
+# existing file is always copied to a timestamped backup first.
+OUR_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print; exit}')
+OUR_IP="${OUR_IP:-127.0.0.1}"
+_dhcp_status=0
+prepare_default_dhcp_config \
+    /etc/dhcp/dhcpd.conf \
+    /etc/dhcp/dhcpd.hosts \
+    "$REPLACE_DHCP_CONFIG" \
+    "$LLDPQ_USER" \
+    www-data \
+    "$OUR_IP" || _dhcp_status=$?
+case "$_dhcp_status" in
+    0)
+        echo "  Default DHCP config validated and installed (server: ${OUR_IP})"
+        ;;
+    10)
+        # LLDPq already owns this config, so ensure its include exists and has
+        # the expected shared web/CLI permissions.
+        [ ! -f /etc/dhcp/dhcpd.hosts ] && sudo touch /etc/dhcp/dhcpd.hosts
+        sudo chown "$LLDPQ_USER:www-data" /etc/dhcp/dhcpd.hosts
+        sudo chmod 664 /etc/dhcp/dhcpd.hosts
+        ;;
+    11)
+        echo "  DHCP provisioning integration skipped; existing config was not changed"
+        ;;
+    *)
+        echo "  [!] Unable to prepare a validated DHCP configuration" >&2
+        exit "$_dhcp_status"
+        ;;
+esac
 
 # ZTP script with serial-based config resolution (if not exists)
 if [ ! -f "$WEB_ROOT/cumulus-ztp.sh" ]; then
@@ -1311,27 +1807,33 @@ echo "  console-pty service enabled (127.0.0.1:8765)"
 # ============================================================================
 step "Configuring cron jobs..."
 
-# Remove existing LLDPq cron jobs and re-add (ensures latest)
-sudo sed -i '/lldpq\|monitor\|get-conf\|fabric-scan\|ai-analyze/d' /etc/crontab
-
-echo "${LLDPQ_CRON:-*/10 * * * *} $LLDPQ_USER /usr/local/bin/lldpq" | sudo tee -a /etc/crontab > /dev/null
-echo "${GETCONF_CRON:-0 */12 * * *} $LLDPQ_USER /usr/local/bin/get-conf" | sudo tee -a /etc/crontab > /dev/null
-echo "* * * * * $LLDPQ_USER /usr/local/bin/lldpq-trigger" | sudo tee -a /etc/crontab > /dev/null
-echo "* * * * * $LLDPQ_USER cd $LLDPQ_INSTALL_DIR && ./fabric-scan.sh >/dev/null 2>&1" | sudo tee -a /etc/crontab > /dev/null
-echo "0 0 * * * $LLDPQ_USER cd $LLDPQ_INSTALL_DIR && cp /var/www/html/topology.dot topology.dot.bkp 2>/dev/null; cp /var/www/html/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m 'auto: \$(date +\\%Y-\\%m-\\%d)'" | sudo tee -a /etc/crontab > /dev/null
-echo "0 * * * * $LLDPQ_USER /usr/local/bin/lldpq-ai-analyze" | sudo tee -a /etc/crontab > /dev/null
-
+_include_fabric_cron=false
 if [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -d "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR/playbooks" ]]; then
-    echo "33 3 * * * $LLDPQ_USER $LLDPQ_INSTALL_DIR/fabric-scan-cron.sh" | sudo tee -a /etc/crontab > /dev/null
+    _include_fabric_cron=true
     chmod +x "$LLDPQ_INSTALL_DIR/fabric-scan-cron.sh" 2>/dev/null || true
     echo "  - fabric-scan: daily at 03:33 (Ansible diff check)"
 fi
+
+_cron_file_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-cron.d.XXXXXX")
+render_lldpq_cron_file \
+    "$_cron_file_tmp" \
+    "$LLDPQ_USER" \
+    "$LLDPQ_INSTALL_DIR" \
+    "$WEB_ROOT" \
+    "${LLDPQ_CRON:-*/10 * * * *}" \
+    "${GETCONF_CRON:-0 */12 * * *}" \
+    "$_include_fabric_cron"
+install_lldpq_cron_transaction \
+    "$_cron_file_tmp" /etc/crontab /etc/cron.d/lldpq "$LLDPQ_INSTALL_DIR"
+rm -f "$_cron_file_tmp"
+echo "  - installed /etc/cron.d/lldpq, then migrated exact legacy entries"
 
 echo "  Cron jobs configured:"
 echo "    - lldpq:           every 10 minutes"
 echo "    - get-conf:        every 12 hours"
 echo "    - web triggers:    every minute (enables Run LLDP Check button)"
 echo "    - git auto-commit: daily at midnight"
+echo "    - ownership:       /etc/cron.d/lldpq"
 
 # ============================================================================
 # UPDATE-ONLY: Restore monitoring data & summary

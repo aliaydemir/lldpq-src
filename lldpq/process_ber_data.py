@@ -13,6 +13,7 @@ import sys
 import time
 from datetime import datetime
 from ber_analyzer import BERAnalyzer
+from collection_freshness import is_current_collection, read_asset_snapshot
 
 def parse_proc_net_dev(content):
     """Parse /proc/net/dev content to extract interface statistics"""
@@ -88,6 +89,9 @@ def process_detailed_counters(content, hostname):
 def process_ber_data_files(data_dir="monitor-results/ber-data"):
     """Process BER data files and update BER analyzer"""
     ber_analyzer = BERAnalyzer("monitor-results")
+    # Keep historical/baseline data, but rebuild the current snapshot solely
+    # from this run's successful raw files.
+    ber_analyzer.current_ber_stats = {}
     
     print(f"Processing BER analysis data")
     print(f"Using thresholds: Good < {ber_analyzer.config['raw_ber_threshold']:.2e}, "
@@ -96,13 +100,25 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     
     if not os.path.exists(data_dir):
         print(f"❌ BER data directory {data_dir} not found")
-        return
+        return False
     
     processed_devices = 0
     total_interfaces_processed = 0
+    processing_errors = 0
     
-    # Process all interface error files
-    for filename in os.listdir(data_dir):
+    asset_snapshot = read_asset_snapshot()
+    current_files = [
+        filename for filename in os.listdir(data_dir)
+        if filename.endswith("_interface_errors.txt")
+        and is_current_collection(
+            os.path.join(data_dir, filename),
+            filename.removesuffix("_interface_errors.txt"),
+            asset_snapshot,
+        )
+    ]
+
+    # Process all current interface error files
+    for filename in current_files:
         if filename.endswith("_interface_errors.txt"):
             hostname = filename.replace("_interface_errors.txt", "")
             filepath = os.path.join(data_dir, filename)
@@ -113,6 +129,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 if not content:
                     print(f"⚠️  Empty file: {filename}")
+                    processing_errors += 1
                     continue
                 
                 processed_devices += 1
@@ -122,6 +139,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 if not interfaces:
                     print(f"⚠️  No interface data found in {filename}")
+                    processing_errors += 1
                     continue
                 
                 # Process detailed counters if available
@@ -134,6 +152,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                         detailed_stats = process_detailed_counters(detailed_content, hostname)
                     except Exception as e:
                         print(f"⚠️  Error processing detailed counters for {hostname}: {e}")
+                        processing_errors += 1
                 
                 # Process each interface with delta-based calculation
                 processed_interfaces = 0
@@ -208,10 +227,12 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
             except Exception as e:
                 print(f"❌ Error processing {filename}: {e}")
+                processing_errors += 1
     
     if processed_devices == 0:
         print("❌ No BER data files found to process")
-        return
+        ber_analyzer.save_ber_history()
+        return False
     
     # Save baseline data once after all interfaces processed
     ber_analyzer.save_baseline_data()
@@ -262,17 +283,20 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     
     print(f"BER history saved")
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] BER data processing completed")
+    return processing_errors == 0
 
 def main():
     """Main function"""
     try:
-        process_ber_data_files()
+        return 0 if process_ber_data_files() else 1
     except KeyboardInterrupt:
         print("\n⚠️  BER analysis interrupted by user")
+        return 130
     except Exception as e:
         print(f"❌ Unexpected error in BER analysis: {e}")
         import traceback
         traceback.print_exc()
+        return 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

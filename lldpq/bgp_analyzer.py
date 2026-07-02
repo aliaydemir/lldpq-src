@@ -41,6 +41,21 @@ class BGPHealth(Enum):
     CRITICAL = "critical"
     UNKNOWN = "unknown"
 
+
+def coerce_bgp_state(value: Any) -> BGPState:
+    """Normalize serialized/current BGP states without guessing established."""
+    if isinstance(value, BGPState):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace("_", "")
+        if normalized.startswith("bgpstate."):
+            normalized = normalized.split(".", 1)[1]
+        try:
+            return BGPState(normalized)
+        except ValueError:
+            pass
+    return BGPState.UNKNOWN
+
 def get_enum_value(obj):
     """Safely get value from enum or return string as-is"""
     if hasattr(obj, 'value'):
@@ -217,15 +232,12 @@ class BGPAnalyzer:
                         description = parts[11] if len(parts) > 11 else "N/A"
                         
                         # Determine state and prefix count
-                        if state_pfx.lower() in ['idle', 'active', 'connect']:
-                            state = BGPState(state_pfx.lower())
-                            pfx_rcvd = 0
-                        else:
+                        try:
+                            pfx_rcvd = int(state_pfx)
                             state = BGPState.ESTABLISHED
-                            try:
-                                pfx_rcvd = int(state_pfx)
-                            except ValueError:
-                                pfx_rcvd = 0
+                        except ValueError:
+                            state = coerce_bgp_state(state_pfx)
+                            pfx_rcvd = 0
                         
                         # Extract interface from neighbor name if present
                         interface = None
@@ -374,7 +386,7 @@ class BGPAnalyzer:
             "neighbors": neighbor_dicts,
             "total_neighbors": len(neighbors),
             "established_neighbors": len([n for n in neighbors if n.state == BGPState.ESTABLISHED]),
-            "down_neighbors": len([n for n in neighbors if n.state in [BGPState.IDLE, BGPState.ACTIVE, BGPState.CONNECT]]),
+            "down_neighbors": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
             "last_update": datetime.now().isoformat()
         }
         
@@ -386,7 +398,7 @@ class BGPAnalyzer:
             "timestamp": datetime.now().isoformat(),
             "total_neighbors": len(neighbors),
             "established_count": len([n for n in neighbors if n.state == BGPState.ESTABLISHED]),
-            "down_count": len([n for n in neighbors if n.state in [BGPState.IDLE, BGPState.ACTIVE, BGPState.CONNECT]]),
+            "down_count": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
             "neighbors": neighbor_dicts  # Use the same serialized data
         }
         
@@ -500,6 +512,14 @@ class BGPAnalyzer:
         total_neighbors = sum(stats["total_neighbors"] for stats in self.current_bgp_stats.values())
         total_established = sum(stats["established_neighbors"] for stats in self.current_bgp_stats.values())
         total_down = sum(stats["down_neighbors"] for stats in self.current_bgp_stats.values())
+        stale_devices = sum(
+            1 for stats in self.current_bgp_stats.values()
+            if stats.get("data_status") == "stale"
+        )
+        unknown_devices = sum(
+            1 for stats in self.current_bgp_stats.values()
+            if stats.get("data_status") == "unknown"
+        )
         
         # Get problem neighbors
         problem_neighbors = []
@@ -507,8 +527,7 @@ class BGPAnalyzer:
             for neighbor_data in stats["neighbors"]:
                 # Handle both enum and string state values
                 neighbor_dict = neighbor_data.copy()
-                if isinstance(neighbor_dict['state'], str):
-                    neighbor_dict['state'] = BGPState(neighbor_dict['state'])
+                neighbor_dict['state'] = coerce_bgp_state(neighbor_dict.get('state'))
                 
                 neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
@@ -526,6 +545,8 @@ class BGPAnalyzer:
             "total_neighbors": total_neighbors,
             "established_neighbors": total_established,
             "down_neighbors": total_down,
+            "stale_devices": stale_devices,
+            "unknown_devices": unknown_devices,
             "problem_neighbors": problem_neighbors,
             "health_ratio": (total_established / total_neighbors * 100) if total_neighbors > 0 else 0,
             "timestamp": datetime.now().isoformat()
@@ -536,8 +557,30 @@ class BGPAnalyzer:
         anomalies = []
         
         for hostname, stats in self.current_bgp_stats.items():
+            data_status = stats.get("data_status")
+            if data_status in {"stale", "unknown"}:
+                last_update = stats.get("last_update") or "never"
+                anomalies.append({
+                    "device": hostname,
+                    "neighbor": "collection",
+                    "type": "BGP_DATA_UNAVAILABLE",
+                    "severity": "warning",
+                    "message": (
+                        f"BGP collection is {data_status}; "
+                        f"last successful update: {last_update}"
+                    ),
+                    "details": {
+                        "data_status": data_status,
+                        "last_update": stats.get("last_update"),
+                        "collection_error": stats.get("collection_error"),
+                    },
+                    "action": "Check device reachability and rerun BGP collection",
+                })
+
             for neighbor_data in stats["neighbors"]:
-                neighbor = BGPNeighbor(**neighbor_data)
+                neighbor_dict = neighbor_data.copy()
+                neighbor_dict['state'] = coerce_bgp_state(neighbor_dict.get('state'))
+                neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
                 
                 # Critical: Down neighbors
@@ -555,6 +598,22 @@ class BGPAnalyzer:
                             "interface": neighbor.interface
                         },
                         "action": f"Check physical connectivity and BGP configuration for {neighbor.neighbor_name}"
+                    })
+
+                elif neighbor.state in [BGPState.OPENSENT, BGPState.OPENCONFIRM]:
+                    anomalies.append({
+                        "device": hostname,
+                        "neighbor": neighbor.neighbor_name,
+                        "type": "BGP_NEIGHBOR_NOT_ESTABLISHED",
+                        "severity": "warning",
+                        "message": f"BGP neighbor {neighbor.neighbor_name} is in {get_enum_value(neighbor.state).upper()} state",
+                        "details": {
+                            "state": get_enum_value(neighbor.state),
+                            "uptime": neighbor.uptime,
+                            "asn": neighbor.asn,
+                            "interface": neighbor.interface
+                        },
+                        "action": f"Check BGP negotiation and authentication for {neighbor.neighbor_name}"
                     })
                 
                 # Warning: High queue depths
@@ -751,6 +810,7 @@ class BGPAnalyzer:
         .evpn-badge-l2 {{ background: #9c27b0; color: #fff; }}
         .evpn-badge-l3 {{ background: #ff9800; color: #000; }}
         .card-critical {{ border-left-color: #f44336; }}
+        .card-warning {{ border-left-color: #ff9800; }}
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
         .metric-label {{ font-size: 12px; color: #888; margin-top: 4px; }}
@@ -926,6 +986,14 @@ class BGPAnalyzer:
                 <div class="summary-card card-critical" id="down-card">
                     <div class="metric bgp-critical" id="down-neighbors">{summary['down_neighbors']}</div>
                     <div class="metric-label">Down/Problem</div>
+                </div>
+                <div class="summary-card card-warning" id="stale-devices-card">
+                    <div class="metric bgp-warning" id="stale-devices">{summary['stale_devices']}</div>
+                    <div class="metric-label">Stale Collections</div>
+                </div>
+                <div class="summary-card card-info" id="unknown-devices-card">
+                    <div class="metric bgp-unknown" id="unknown-devices">{summary['unknown_devices']}</div>
+                    <div class="metric-label">Unknown Collections</div>
                 </div>
                 <div class="summary-card" id="health-card">
                     <div class="metric" id="health-ratio">{summary['health_ratio']:.1f}%</div>

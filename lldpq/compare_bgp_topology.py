@@ -256,7 +256,7 @@ def main():
         print(f"  STATUS: [!] {issues} issue(s) found - Review above sections")
     print("=" * 70 + "\n")
     
-    sys.exit(1 if (missing_devices or missing_links) else 0)
+    sys.exit(1 if (missing_devices or missing_links or idle_in_topo) else 0)
 
 if __name__ == '__main__':
     main()
