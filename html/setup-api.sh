@@ -992,11 +992,13 @@ if action == 'test-alert':
 # ─── Action: Export config bundle (devices/topology/topology_config/notifications) ───
 if action == 'backup-export':
     import base64, io, tarfile, time as _t
+    include_key = bool(post_data.get('include_key'))
     wanted = [('devices.yaml', lldpq_dir), ('topology.dot', lldpq_dir),
               ('topology_config.yaml', lldpq_dir), ('notifications.yaml', lldpq_dir),
               ('display-aliases.json', web_root)]
     buf = io.BytesIO()
     added = []
+    has_key = False
     try:
         with tarfile.open(fileobj=buf, mode='w:gz') as tar:
             for fn, base_dir in wanted:
@@ -1004,14 +1006,28 @@ if action == 'backup-export':
                 if os.path.isfile(p):
                     tar.add(p, arcname=fn)
                     added.append(fn)
+            # Collector SSH key (private + public). Opt-in — makes the bundle SECRET, but lets a
+            # restore reach the switches immediately (true "move to another host" bundle).
+            if include_key:
+                for key_name in ('id_ed25519', 'id_rsa'):
+                    kp = os.path.expanduser('~%s/.ssh/%s' % (lldpq_user, key_name))
+                    r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', kp], capture_output=True, timeout=5)
+                    if r.returncode == 0 and b'PRIVATE KEY' in r.stdout:
+                        ti = tarfile.TarInfo('ssh/%s' % key_name); ti.size = len(r.stdout); ti.mode = 0o600
+                        tar.addfile(ti, io.BytesIO(r.stdout)); added.append('ssh/%s' % key_name); has_key = True
+                        rp = subprocess.run(['sudo', '-u', lldpq_user, 'cat', kp + '.pub'], capture_output=True, timeout=5)
+                        if rp.returncode == 0 and rp.stdout.strip():
+                            tip = tarfile.TarInfo('ssh/%s.pub' % key_name); tip.size = len(rp.stdout); tip.mode = 0o644
+                            tar.addfile(tip, io.BytesIO(rp.stdout)); added.append('ssh/%s.pub' % key_name)
+                        break
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Bundle failed: ' + str(e)}))
         sys.exit(0)
     if not added:
         print(json.dumps({'success': False, 'error': 'No config files found to back up.'}))
         sys.exit(0)
-    name = 'lldpq-config-%s.tar.gz' % _t.strftime('%Y%m%d-%H%M%S')
-    print(json.dumps({'success': True, 'filename': name, 'files': added,
+    name = ('lldpq-backup-%s.tar.gz' if has_key else 'lldpq-config-%s.tar.gz') % _t.strftime('%Y%m%d-%H%M%S')
+    print(json.dumps({'success': True, 'filename': name, 'files': added, 'has_key': has_key,
                       'data': base64.b64encode(buf.getvalue()).decode()}))
     sys.exit(0)
 
@@ -1030,26 +1046,45 @@ if action == 'backup-import':
     allowed = {'devices.yaml': lldpq_dir, 'topology.dot': lldpq_dir,
                'topology_config.yaml': lldpq_dir, 'notifications.yaml': lldpq_dir,
                'display-aliases.json': web_root}
+    key_names = {'id_ed25519', 'id_ed25519.pub', 'id_rsa', 'id_rsa.pub'}
+    ssh_dir = os.path.expanduser('~%s/.ssh' % lldpq_user)
     restored = []
+    keys = []
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tar:
             for m in tar.getmembers():
-                base = os.path.basename(m.name)
-                if not m.isfile() or base not in allowed:
+                if not m.isfile():
                     continue
-                content = tar.extractfile(m).read()
-                dest = os.path.join(allowed[base], base)
-                w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
-                                   input=content, capture_output=True, timeout=15)
-                if w.returncode == 0:
-                    restored.append(base)
+                name = m.name.replace('\\', '/')
+                base = os.path.basename(name)
+                # SSH key files (ssh/id_ed25519[.pub]) -> service user's ~/.ssh with strict perms
+                if name.startswith('ssh/') and base in key_names:
+                    content = tar.extractfile(m).read()
+                    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', ssh_dir], capture_output=True, timeout=10)
+                    dest = os.path.join(ssh_dir, base)
+                    w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
+                                       input=content, capture_output=True, timeout=10)
+                    if w.returncode == 0:
+                        mode = '644' if base.endswith('.pub') else '600'
+                        subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c',
+                                        'chmod %s %s' % (mode, shlex.quote(dest))], capture_output=True, timeout=10)
+                        keys.append(base)
+                    continue
+                # Config files
+                if base in allowed:
+                    content = tar.extractfile(m).read()
+                    dest = os.path.join(allowed[base], base)
+                    w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
+                                       input=content, capture_output=True, timeout=15)
+                    if w.returncode == 0:
+                        restored.append(base)
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Not a valid LLDPq config bundle: ' + str(e)[:150]}))
         sys.exit(0)
-    if not restored:
+    if not restored and not keys:
         print(json.dumps({'success': False, 'error': 'No recognized config files inside the archive.'}))
         sys.exit(0)
-    print(json.dumps({'success': True, 'restored': restored}))
+    print(json.dumps({'success': True, 'restored': restored, 'keys': keys}))
     sys.exit(0)
 
 # ─── Action: Maintenance — disk usage + count of old update backups ───

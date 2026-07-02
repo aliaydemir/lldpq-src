@@ -383,10 +383,11 @@
                 <!-- Step 9: Backup & Restore -->
                 <div class="su-panel" data-step="7">
                     <h2>8. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
-                    <p class="p-desc">Export all LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; as one <code>.tar.gz</code> to migrate to another host or keep as a restore point. Restore uploads a bundle and overwrites those files. <strong>The SSH key is intentionally excluded</strong> (security) &mdash; back it up in Step&nbsp;2.</p>
+                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. Restore uploads a bundle and overwrites those files.</p>
                     <div class="sched-card">
+                        <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(bundle becomes secret: it holds the private key)</strong></label>
                         <div class="p-toolbar">
-                            <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download config bundle</button>
+                            <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download bundle</button>
                             <span class="status info" id="bk-export-msg"></span>
                         </div>
                     </div>
@@ -396,7 +397,7 @@
                             <input type="file" id="bk-file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip" style="flex:1;min-width:240px;padding:8px;background:#1a1a1a;color:#d4d4d4;border:1px solid #404040;border-radius:6px;font-size:13px;">
                             <button class="btn secondary" id="bk-import-btn" onclick="backupImport()"><svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M13,13V18H10V13H7L12,8L17,13H13Z"/></svg>Upload &amp; restore</button>
                         </div>
-                        <div class="note">Restore replaces the config files immediately &mdash; run Step&nbsp;6 (Run LLDPq) afterwards to apply. Your SSH key is <strong>not</strong> in this bundle; back it up separately in Step&nbsp;2.</div>
+                        <div class="note">Restore overwrites the config files (and the SSH key, if the bundle contains one) immediately &mdash; run Step&nbsp;7 (Run LLDPq) afterwards to apply.</div>
                         <div class="status info" id="bk-import-msg"></div>
                     </div>
                 </div>
@@ -1163,9 +1164,10 @@ async function testAlert(){
 
 /* ---- Step 9: Backup & Restore ---- */
 async function backupExport(){
+    const ik=document.getElementById('bk-include-key'); const withKey=ik?ik.checked:false;
     setStatus('bk-export-msg','Building bundle\u2026','info');
     try{
-        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-export'})});
+        const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-export', include_key:withKey})});
         const d=await r.json().catch(()=>({}));
         if(!d.success){ setStatus('bk-export-msg', d.error||'Export failed','err'); return; }
         const bin=atob(d.data||''); const arr=new Uint8Array(bin.length);
@@ -1173,7 +1175,7 @@ async function backupExport(){
         const blob=new Blob([arr],{type:'application/gzip'}); const url=URL.createObjectURL(blob);
         const a=document.createElement('a'); a.href=url; a.download=d.filename||'lldpq-config.tar.gz';
         document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(url); a.remove();},100);
-        setStatus('bk-export-msg','Downloaded '+((d.files||[]).length)+' files \u2713','ok');
+        setStatus('bk-export-msg','Downloaded bundle'+(d.has_key?' \u2014 includes SSH key, keep it secret':'')+' \u2713','ok');
     }catch(e){ setStatus('bk-export-msg','Export failed: '+e.message,'err'); }
 }
 
@@ -1189,7 +1191,7 @@ async function backupImport(){
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-import',data:b64})});
         const d=await r.json().catch(()=>({}));
-        if(d.success) setStatus('bk-import-msg','Restored: '+((d.restored||[]).join(', '))+' \u2713 \u2014 run Step 6 to apply.','ok');
+        if(d.success){ var parts=(d.restored||[]).slice(); if((d.keys||[]).length) parts.push('SSH key'); setStatus('bk-import-msg','Restored: '+(parts.join(', ')||'nothing')+' \u2713 \u2014 run Step 7 (Run LLDPq) to apply.','ok'); }
         else setStatus('bk-import-msg', d.error||'Restore failed','err');
     }catch(e){ setStatus('bk-import-msg','Restore failed: '+e.message,'err'); }
 }
