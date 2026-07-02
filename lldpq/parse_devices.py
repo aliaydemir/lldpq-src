@@ -26,7 +26,7 @@ DEVICE FORMAT:
                  role: spine
 
 REQUIREMENTS:
-    - Python 3.6+ with PyYAML (pip install pyyaml)
+    - Python 3.9+ with PyYAML (pip install pyyaml)
     - devices.yaml in same directory
 
 Copyright (c) 2024 LLDPq Project

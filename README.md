@@ -150,7 +150,7 @@ sudo docker ps -a --filter name=lldpq          # Container status
 
 ## Requirements (non-Docker install)
 
-- **Ubuntu Server** 20.04+ (tested on 22.04, 24.04)
+- **Ubuntu Server** 22.04+ (tested on 22.04, 24.04) — Python 3.9+ required
 - SSH key-based access to Cumulus switches
 - Sudo privileges on target switches
 
@@ -471,10 +471,10 @@ the original is saved beside it as a timestamped
 
 ## [06] requirements
 
-- **Linux server** (Ubuntu 20.04+ recommended, tested on 22.04 and 24.04)
+- **Linux server** (Ubuntu 22.04+ recommended, tested on 22.04 and 24.04) — Python 3.9+ required
 - **NVIDIA Cumulus Linux 5.x switches** with management IP access
 - **SSH key auth** to all switches (setup via web UI — see [SSH Setup](#08-ssh-setup))
-- All other dependencies (nginx, fcgiwrap, python3, etc.) are installed automatically by `install.sh`
+- All other dependencies (nginx, fcgiwrap, python3 ≥ 3.9, etc.) are installed automatically by `install.sh`
 
 ## [07] disk usage
 
