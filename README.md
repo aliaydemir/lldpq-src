@@ -56,6 +56,8 @@ Then open `http://localhost`.
 5. Click **Run Setup** → SSH keys are generated and distributed to all devices automatically
 6. Failed devices can be retried with a different password
 
+> Prefer a guided flow? The admin **Setup** page chains inventory → SSH keys → topology → notifications → run (and adds backup & maintenance) in the recommended order — see [[03b] guided web setup](#03b-guided-web-setup-setup-page).
+
 **What you need:**
 - Your switch hostnames and management IPs — entered via the web UI
 - That's it. SSH keys are generated and distributed from the web UI.
@@ -174,9 +176,10 @@ cd lldpq-src
 
 - **bgp neighbors**: state, uptime, prefix counts, health status
 - **evpn summary**: VNI counts (L2/L3), Type-2/Type-5 route analysis
+- **duplicate address detection**: duplicate IP/MAC detection via EVPN DAD + MAC-mobility sequences, with severity, quiesced/aged lifecycle, and per-port interface descriptions (see [02e])
 - **optical diagnostics**: power levels, temperature, bias current, link margins  
-- **link flap detection**: carrier transitions on all interfaces (including breakouts)
-- **bit error rate**: comprehensive error statistics with industry thresholds
+- **link flap detection**: carrier transitions on all interfaces (including breakouts), with time-windowed flap counts (1h / 12h / 24h)
+- **bit error rate**: comprehensive error statistics with industry thresholds — raw BER, effective BER, and PHY symbol errors
 - **hardware health**: cpu/asic temperatures, memory usage, fan speeds, psu efficiency
 - **topology validation**: lldp neighbor verification against expected topology
 
@@ -305,6 +308,26 @@ all path discovery is based on graph analysis — no hardcoded hostnames, IPs, o
 
 works with any Clos topology: 2-tier (leaf-spine), 3-tier (leaf-spine-core), or N-tier.
 
+## [02e] duplicate address detection
+
+access via web UI: **Duplicate** menu (`/monitor-results/duplicate-analysis.html`)
+
+Detects duplicate IPs and MACs across the fabric by correlating EVPN duplicate-address-detection (DAD) flags, MAC-mobility sequence numbers, FDB/ARP snapshots, and switch logs. Designed to separate genuinely harmful conflicts from benign, settled duplicates (e.g. storage VIPs) so the dashboard stays low-noise.
+
+### severity
+
+| Severity | Meaning |
+|----------|---------|
+| **CRITICAL** | Actively moving — a recent EVPN event or a climbing mobility sequence |
+| **WARNING (quiesced)** | Confirmed / flagged duplicate that has settled (no active flapping) |
+| **Aged** | Quiesced with no sequence movement for 7+ days — hidden by default, toggle to show |
+
+### features
+- **conflict ports + interface descriptions**: shows `switch:port` together with the port's description (ifalias) so the colliding physical devices are immediately obvious (e.g. two "Power Shelf-07" units claiming one IP)
+- **cross-cycle port memory**: retains port/MAC mapping across runs, so even fast-flapping endpoints still show where they live when a single snapshot misses one side
+- **flapping endpoint labelling**: single-MAC entries bouncing between VTEPs are flagged as EVPN mobility rather than a static conflict
+- **CSV export** (excludes aged rows), sortable columns, and a threshold-explanation modal
+
 ## [03] configuration files
 
 edit these files:
@@ -351,6 +374,48 @@ endpoint_hosts:
 ```
 
 patterns are matched against devices found in LLDP neighbor data.
+
+## [03b] guided web setup (Setup page)
+
+Admin-only **Setup** page (`http://<server>/setup.html`) — a guided, 10-step wizard that walks you through the whole lifecycle, from a fresh install to day-2 maintenance. A numbered progress rail marks completed steps. Every step is also reachable on its own, but the wizard chains them in the recommended order.
+
+| # | Step | What it does |
+|---|------|--------------|
+| 1 | Inventory | Edit `devices.yaml` — switches & credentials |
+| 2 | SSH Keys | Generate the collector key, authorize it on devices + passwordless sudo |
+| 3 | Topology | Edit `topology.dot` — expected cabling |
+| 4 | Topology Config | Edit `topology_config.yaml` — layout / layer / icon rules |
+| 5 | Integrate Ansible | Optional — point to the Ansible dir for VLAN/VRF/Fabric features |
+| 6 | Notifications | Slack alerts — webhook, channel, alert types, thresholds, Test button |
+| 7 | Run LLDPq | Collect data & validate, with live streaming output |
+| 8 | Backup & Restore | Export / import a full config bundle |
+| 9 | Maintenance | Disk-usage report & safe cleanup of old update backups |
+| 10 | Update LLDPq | `git pull` + reinstall, with live streaming output |
+
+### Notifications (step 6)
+
+Configure Slack alerting entirely from the web UI — no manual YAML editing:
+- **Master enable/disable** toggle
+- **Slack webhook URL** + channel
+- **Alert mode** and **minimum interval** between repeat alerts
+- **Per-type toggles** (hardware, network, system, recovery, …)
+- **Key thresholds** (temperature, link-flap count, …) editable inline
+- **Test alert** button — sends a sample message to verify the webhook end-to-end
+
+Changes are written back to `notifications.yaml` with existing comments preserved.
+
+### Backup & Restore (step 8)
+
+Export a portable configuration bundle (`.tar.gz`) and re-import it on a new install for painless migration:
+- **Included:** `devices.yaml`, `topology.dot`, `topology_config.yaml`, `notifications.yaml`, `display-aliases.json`, and a whitelist of **portable** `/etc/lldpq.conf` preferences (schedules, parallelism, feature toggles, AI settings)
+- **Excluded from portable prefs:** host-specific paths and secrets (e.g. the AI API key)
+- **SSH key** (optional checkbox, on by default): includes the collector key pair so the restored install can reach devices immediately. *The bundle becomes sensitive when the key is included — store it securely.*
+- **Import** restores every file to the right location, merges the portable prefs into `/etc/lldpq.conf`, and applies any schedule changes to cron.
+
+### Maintenance (step 9)
+
+- **Disk usage** report for `monitor-results/` and the old update backups, plus total free space
+- **Safe purge** of old update backups (the `~/lldpq-backup-*` snapshots `install.sh` creates on every update — see [05]) behind a two-click guard: frees space without touching live config or monitoring data
 
 ## [04] cron jobs (auto setup)
 
@@ -528,7 +593,13 @@ operator / operator   # limited access
 
 ## [11] alerts & notifications
 
-get real-time alerts for network issues via Slack:
+get real-time alerts for network issues via Slack.
+
+### web UI (recommended)
+
+The **Setup → Notifications** step (see [03b]) configures everything from the browser: master enable/disable, webhook URL + channel, alert mode, minimum repeat interval, per-type toggles, key thresholds, and a **Test alert** button. Changes are saved back to `notifications.yaml` (comments preserved).
+
+### manual (CLI)
 
 ```
 cd ~/lldpq
@@ -803,7 +874,7 @@ Manage the Zero Touch Provisioning script (`cumulus-ztp.sh`):
 - **SSH Key**: generate, import, or copy the public key used for provisioning
 - **Quick Settings**: target OS version, default password, image server IP
 - **Apply to Script**: auto-generates full ZTP template or updates existing script via regex
-- **OS Image**: upload/delete Cumulus Linux `.bin` images for ZTP OS upgrades
+- **OS Image**: upload/delete Cumulus Linux `.bin` images for ZTP OS upgrades. When an OS upgrade is started, generic ONIE serving aliases (`onie-installer-x86_64`, `onie-installer-x86_64-mlnx`, `onie-installer`) are auto-created/refreshed in the web root pointing at the selected image, so ONIE's HTTP waterfall discovery finds it across Spectrum platforms
 - **Script Editor**: collapsible Monaco-style editor with Reload/Save
 
 The ZTP script handles: OS version check + upgrade, password change, sudo fix, SSH key installation.
