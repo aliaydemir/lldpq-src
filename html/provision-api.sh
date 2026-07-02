@@ -2315,6 +2315,45 @@ def update_upgrade_job(job):
         job['completed_at'] = int(now)
     return job
 
+def ensure_onie_symlinks(image_name):
+    """Point the generic ONIE HTTP-discovery fallback names at the selected upgrade image.
+
+    Some switches, after `onie-install -fa`, reboot into ONIE and re-run the default HTTP
+    "waterfall" discovery against the image-server root instead of using the -i URL. That waterfall
+    always descends to the arch / silicon-vendor / generic names, so serving those (as symlinks to
+    the chosen image) makes the upgrade robust. Generic only — NO per-platform hardcoding — so it
+    covers every x86_64 NVIDIA/Mellanox switch (SN2201, SN5600D, ...) uniformly:
+      onie-installer-x86_64-mlnx  (silicon-vendor fallback — all Spectrum switches)
+      onie-installer-x86_64       (arch fallback — all x86_64)
+      onie-installer              (final generic)  [+ each with a .bin variant]
+    """
+    if not re.match(r'^[A-Za-z0-9_.-]+\.(bin|img|iso)$', image_name or ''):
+        return []
+    if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
+        return []
+    names = [
+        'onie-installer-x86_64', 'onie-installer-x86_64.bin',
+        'onie-installer-x86_64-mlnx', 'onie-installer-x86_64-mlnx.bin',
+        'onie-installer', 'onie-installer.bin',
+    ]
+    created = []
+    for n in names:
+        link = os.path.join(WEB_ROOT, n)
+        try:
+            if os.path.islink(link) or os.path.exists(link):
+                os.remove(link)
+            os.symlink(image_name, link)          # relative target (same dir as the image)
+            created.append(n)
+        except Exception:
+            # www-data may not own the web root -> create via the service user (bash is whitelisted)
+            rc = subprocess.run(['sudo', '-u', LLDPQ_USER, 'bash', '-c',
+                                 'ln -sfn "%s" "%s"' % (image_name, link)],
+                                capture_output=True, timeout=10)
+            if rc.returncode == 0:
+                created.append(n)
+    return created
+
+
 def action_upgrade_start():
     try:
         data = json.loads(POST_DATA)
@@ -2332,6 +2371,9 @@ def action_upgrade_start():
         error_json('Invalid image server. Set a real ZTP IMAGE SERVER IP first.')
     if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
         error_json('Selected image not found on server')
+    # Point the generic ONIE discovery fallback names at this image, so switches whose ONIE re-runs
+    # HTTP waterfall discovery during the -fa install still find it (see ensure_onie_symlinks).
+    ensure_onie_symlinks(image_name)
     if not os.path.exists(ZTP_SCRIPT_FILE):
         error_json('cumulus-ztp.sh not found in web root')
     with open(ZTP_SCRIPT_FILE, 'r') as f:
