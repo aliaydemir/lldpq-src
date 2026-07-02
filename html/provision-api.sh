@@ -2397,7 +2397,7 @@ def action_upgrade_start():
         'target_version': target_version,
         'image_name': image_name,
         'server_ip': server_ip,
-        'batch_size': max(1, min(int(data.get('batch_size', 1) or 1), 10)),
+        'batch_size': max(1, min(int(data.get('batch_size', 1) or 1), 100)),
         'stop_on_failure': data.get('stop_on_failure', True),
         'base_config_after': data.get('base_config_after', True),
         'timeout_seconds': 3600,
