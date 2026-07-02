@@ -2048,6 +2048,10 @@ def list_os_image_objects():
     for ext in ['*.bin', '*.img', '*.iso']:
         for f in g.glob(os.path.join(WEB_ROOT, ext)):
             name = os.path.basename(f)
+            # Skip the ONIE HTTP-discovery serving aliases (symlinks to the active image) — they are
+            # not uploadable OS images and must not clutter / be selectable in this list.
+            if name.startswith('onie-installer'):
+                continue
             size_bytes = os.path.getsize(f)
             images.append({
                 'name': name,
@@ -2325,16 +2329,21 @@ def ensure_onie_symlinks(image_name):
     covers every x86_64 NVIDIA/Mellanox switch (SN2201, SN5600D, ...) uniformly:
       onie-installer-x86_64-mlnx  (silicon-vendor fallback — all Spectrum switches)
       onie-installer-x86_64       (arch fallback — all x86_64)
-      onie-installer              (final generic)  [+ each with a .bin variant]
+      onie-installer              (final generic)
+    Extension-less only: ONIE tries "<name>" before "<name>.bin" at every level, so these are
+    served first — and they don't collide with the OS-image list (which globs *.bin).
     """
     if not re.match(r'^[A-Za-z0-9_.-]+\.(bin|img|iso)$', image_name or ''):
         return []
     if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
         return []
+    # Only the extension-less names: ONIE requests "<name>" before "<name>.bin" at every waterfall
+    # level, so the plain names are always served first. Skipping the .bin variants also keeps them
+    # out of the OS-image list (which globs *.bin).
     names = [
-        'onie-installer-x86_64', 'onie-installer-x86_64.bin',
-        'onie-installer-x86_64-mlnx', 'onie-installer-x86_64-mlnx.bin',
-        'onie-installer', 'onie-installer.bin',
+        'onie-installer-x86_64',
+        'onie-installer-x86_64-mlnx',
+        'onie-installer',
     ]
     created = []
     for n in names:
