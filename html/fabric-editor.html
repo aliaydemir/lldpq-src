@@ -1398,8 +1398,8 @@
                     return;
                 }
                 if (data.role !== 'admin') {
-                    alert('Access denied. Admin privileges required.');
-                    _topWindow().location.href = '/';
+                    if (window.lldpqToast) lldpqToast('Access denied — admin privileges required', 'error');
+                    setTimeout(function () { _topWindow().location.href = '/'; }, 1200);
                     return;
                 }
                 
@@ -2797,11 +2797,10 @@
             
             const file = state.files[path];
             
-            // If file is modified, ask for confirmation
+            // If file is modified, ask for confirmation (dark modal)
             if (file.modified) {
-                if (!confirm('File has unsaved changes. Reload and discard changes?')) {
-                    return;
-                }
+                const confirmed = await confirmAsync('Unsaved Changes', 'File has unsaved changes.<br><br>Reload and discard changes?');
+                if (!confirmed) return;
             }
             
             try {
@@ -3439,7 +3438,7 @@
                     }, 2000);
                 } catch (err) {
                     console.error('Copy failed:', err);
-                    alert('Copy failed');
+                    if (window.lldpqToast) lldpqToast('Copy failed', 'error'); else alert('Copy failed');
                 }
                 
                 document.body.removeChild(textarea);
@@ -3577,9 +3576,9 @@
             // Use lastFolder (set when opening files/folders)
             let folder = state.lastFolder || '';
             
-            // Ask for filename
+            // Ask for filename (dark prompt modal)
             const folderDisplay = folder || '(root)';
-            const userInput = prompt(`New filename (in ${folderDisplay}):`, 'new-file.yaml');
+            const userInput = await promptAsync('New File', `New filename (in ${folderDisplay}):`, 'new-file.yaml');
             
             if (!userInput) {
                 return; // User cancelled
@@ -3630,8 +3629,8 @@
             if (match) {
                 newName = match[1].trim();
             } else {
-                // Try prompt (may be blocked)
-                const input = window.prompt ? prompt('New filename:', oldName) : null;
+                // Ask via dark prompt modal
+                const input = await promptAsync('Rename File', 'New filename:', oldName);
                 if (input) {
                     newName = input;
                 } else {
@@ -3971,6 +3970,17 @@
         // Async confirm helper
         async function confirmAsync(title, message) {
             return showConfirmModal(title, message);
+        }
+
+        // Dark-themed text prompt (wraps the shared lldpqPrompt) — resolves to entered value or null.
+        function promptAsync(title, label, defaultValue) {
+            return new Promise(function (resolve) {
+                if (window.lldpqPrompt) {
+                    lldpqPrompt(title, label, defaultValue, function (v) { resolve(v); }, { onCancel: function () { resolve(null); } });
+                } else {
+                    resolve(null);
+                }
+            });
         }
     </script>
     

@@ -1,6 +1,22 @@
 // LLDPq Authentication Module
 // Include this in all protected pages
 
+// Ensure the shared dark-themed dialogs (lldpqToast / lldpqConfirm / lldpqPrompt) are available
+// on every page that loads auth.js. Loaded from the same directory as this script so it works
+// from sub-directory pages too. This also routes any native alert() through our dark UI.
+(function () {
+    if (window.__lldpqDialogsLoaded || window.__lldpqDialogsRequested) return;
+    window.__lldpqDialogsRequested = true;
+    try {
+        var base = 'css/';
+        var cur = document.currentScript;
+        if (cur && cur.src) base = cur.src.replace(/[^\/]*$/, '');
+        var s = document.createElement('script');
+        s.src = base + 'ui-dialogs.js';
+        (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+})();
+
 const LLDPqAuth = {
     user: null,
     role: null,
@@ -332,12 +348,18 @@ const LLDPqAuth = {
         }
     },
     
-    // Delete user
-    async deleteUser(username) {
-        if (!confirm(`Are you sure you want to delete user "${username}"?`)) {
-            return;
+    // Delete user (dark confirm modal, then perform)
+    deleteUser(username) {
+        const run = () => this._performDeleteUser(username);
+        if (window.lldpqConfirm) {
+            const safe = String(username).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+            lldpqConfirm('Delete User', `Delete user <strong>${safe}</strong>? This cannot be undone.`, run);
+        } else {
+            run();
         }
-        
+    },
+
+    async _performDeleteUser(username) {
         const errorDiv = document.getElementById('um-error');
         const successDiv = document.getElementById('um-success');
         

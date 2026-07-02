@@ -12,6 +12,18 @@
  * no redirect, and on any failure / unknown role the button is left as-is, so
  * non-auth deployments keep working.
  */
+// Load the shared dark-themed dialogs on every analysis page so any native alert()
+// (e.g. "Failed to trigger analysis", CSV export errors) is rendered in our dark UI.
+(function () {
+    if (window.__lldpqDialogsLoaded || window.__lldpqDialogsRequested) return;
+    window.__lldpqDialogsRequested = true;
+    try {
+        var s = document.createElement('script');
+        s.src = '/css/ui-dialogs.js';
+        (document.head || document.documentElement).appendChild(s);
+    } catch (e) {}
+})();
+
 (function () {
     function setHidden(hidden) {
         var b = document.getElementById('run-analysis');
