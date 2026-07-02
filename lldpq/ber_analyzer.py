@@ -48,6 +48,7 @@ class BERAnalyzer:
         self.current_ber_stats = {}  # port -> current ber status
         self.config = self.DEFAULT_CONFIG.copy()
         self._raw_phy_ber_cache = {}  # hostname -> { interface: raw_ber_float }
+        self._l1_extras_cache = {}  # hostname -> { interface: {effective_ber, symbol_errors} }
         self.baseline_data = {}  # hostname -> { interface: {counters, timestamp} }
         
         # Ensure ber-data directory exists
@@ -181,6 +182,76 @@ class BERAnalyzer:
                 pass
 
         self._raw_phy_ber_cache[hostname] = result
+        return result
+
+    def _parse_l1_extras_for_device(self, hostname: str) -> Dict[str, Dict[str, Any]]:
+        """Parse Effective (post-FEC) PHY BER and PHY symbol errors per interface from l1-show.
+
+        Effective BER = effective_ber_coef * 10^effective_ber_magnitude (same encoding as raw BER).
+        Symbol errors = phy_symbol_errors (direct counter). Both come from the same
+        `l1-show all -p` output already collected per cycle -- no extra collection needed.
+        Returns { interface: {'effective_ber': float|None, 'symbol_errors': int|None} }.
+        """
+        if hostname in self._l1_extras_cache:
+            return self._l1_extras_cache[hostname]
+
+        result: Dict[str, Dict[str, Any]] = {}
+
+        def parse_content(content: str):
+            cur = None
+            eff_coef = eff_mag = sym = None
+
+            def flush():
+                nonlocal cur, eff_coef, eff_mag, sym
+                if cur:
+                    d: Dict[str, Any] = {}
+                    if eff_coef is not None and eff_mag is not None:
+                        try:
+                            d['effective_ber'] = float(eff_coef) * (10.0 ** float(eff_mag))
+                        except Exception:
+                            pass
+                    if sym is not None:
+                        d['symbol_errors'] = sym
+                    if d:
+                        result[cur] = d
+                cur = None
+                eff_coef = eff_mag = sym = None
+
+            for line in content.splitlines():
+                s = line.strip()
+                if not s:
+                    continue
+                if s.startswith("Port:") or s.startswith("Interface:"):
+                    flush()
+                    try:
+                        cur = s.split(":", 1)[1].strip()
+                    except Exception:
+                        cur = None
+                    continue
+                if ":" in s and cur:
+                    key, val = s.split(":", 1)
+                    key = key.strip().lower().replace(" ", "_")
+                    val = val.strip()
+                    try:
+                        if key == "effective_ber_coef":
+                            eff_coef = int(val)
+                        elif key == "effective_ber_magnitude":
+                            eff_mag = int(val)
+                        elif key == "phy_symbol_errors":
+                            sym = int(val)
+                    except Exception:
+                        pass
+            flush()
+
+        l1_path = f"{self.data_dir}/ber-data/{hostname}_l1_show.txt"
+        try:
+            if os.path.exists(l1_path):
+                with open(l1_path, "r") as f:
+                    parse_content(f.read())
+        except Exception:
+            pass
+
+        self._l1_extras_cache[hostname] = result
         return result
     
     def save_ber_history(self):
@@ -454,10 +525,13 @@ class BERAnalyzer:
                 elif raw_ber >= self.config["raw_ber_threshold"] and eff_grade != BERGrade.CRITICAL.value:
                     eff_grade = BERGrade.WARNING.value
 
+            l1_extras = self._parse_l1_extras_for_device(device).get(interface, {})
             port_info = {
                 "port": port_name,
                 "ber_value": stats.get('ber_value', 0),
                 "raw_ber": raw_ber if isinstance(raw_ber, (int, float)) else None,
+                "effective_ber": l1_extras.get('effective_ber'),
+                "symbol_errors": l1_extras.get('symbol_errors'),
                 "status": eff_grade,
                 "total_packets": stats.get('total_packets', 0),
                 "rx_errors": stats.get('rx_errors', 0),
@@ -754,10 +828,12 @@ class BERAnalyzer:
                         <th class="sortable" data-column="2" data-type="ber-status">Status <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="3" data-type="ber-value">Frame BER <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="4" data-type="ber-value">Physical BER <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="5" data-type="number">Total Pkt <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="6" data-type="number">RX Err <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="7" data-type="number">TX Err <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="8" data-type="time">Updated <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="5" data-type="ber-value">Effective BER <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="6" data-type="number">PHY Symbol Errors <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="7" data-type="number">Total Pkt <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="8" data-type="number">RX Err <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="9" data-type="number">TX Err <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="10" data-type="time">Updated <span class="sort-arrow">▲▼</span></th>
                     </tr>
                 </thead>
                 <tbody id="ber-data">
@@ -801,6 +877,13 @@ class BERAnalyzer:
             raw_phy_val = port_info.get('raw_ber')
             raw_phy_display = f"{raw_phy_val:.2e}" if isinstance(raw_phy_val, (int, float)) else "N/A"
 
+            # Effective (post-FEC) PHY BER + PHY symbol errors (from l1-show) — what HPC engineering
+            # tracks day-to-day.
+            eff_val = port_info.get('effective_ber')
+            eff_display = f"{eff_val:.2e}" if isinstance(eff_val, (int, float)) else "N/A"
+            sym_val = port_info.get('symbol_errors')
+            sym_display = f"{sym_val:,}" if isinstance(sym_val, int) else "N/A"
+
             timestamp = datetime.fromtimestamp(port_info['timestamp']).strftime('%H:%M:%S')
             
             html_content += f"""
@@ -810,6 +893,8 @@ class BERAnalyzer:
                     <td><span class="{badge_class}">{status}</span></td>
                     <td>{ber_display}</td>
                     <td>{raw_phy_display}</td>
+                    <td>{eff_display}</td>
+                    <td>{sym_display}</td>
                     <td>{port_info['total_packets']:,}</td>
                     <td>{port_info['rx_errors']:,}</td>
                     <td>{port_info['tx_errors']:,}</td>
@@ -853,6 +938,8 @@ class BERAnalyzer:
             <ul style="margin-left: 20px; line-height: 1.8;">
                 <li><strong style="color: #d4d4d4;">Frame BER</strong>: Computed from interface error counters to show overall link quality. Uses delta measurement (new errors since last check) for accurate current status.</li>
                 <li><strong style="color: #d4d4d4;">Physical BER</strong>: Physical layer bit error rate from l1-show/PCS layer. Shows actual fiber and optics health including FEC-corrected errors.</li>
+                <li><strong style="color: #d4d4d4;">Effective BER</strong>: Post-FEC bit error rate from l1-show (<code>effective_ber_coef × 10^effective_ber_magnitude</code>). This is the error rate the traffic actually sees after FEC correction — the primary day-to-day health metric.</li>
+                <li><strong style="color: #d4d4d4;">PHY Symbol Errors</strong>: Physical-layer symbol error count (<code>phy_symbol_errors</code> from l1-show). A rising count indicates a degrading lane/fiber even while FEC still hides it from the frame BER.</li>
                 <li><strong style="color: #d4d4d4;">Delta-based measurement</strong>: Both metrics use only new errors since the last measurement to avoid showing accumulated historical errors. First measurement establishes baseline.</li>
             </ul>
         </div>
@@ -1288,22 +1375,13 @@ class BERAnalyzer:
                 const timeStr = now.toTimeString().slice(0, 5).replace(':', '-'); // HH-MM
                 const filename = `BER_Analysis_Report_${dateStr}_${timeStr}.csv`;
                 
-                // Create CSV header
-                const headers = [
-                    'Port',
-                    'Health Status',
-                    'BER Value',
-                    'RX Errors',
-                    'TX Errors',
-                    'Total Frames',
-                    'Error Rate',
-                    'Last Scan'
-                ];
-                
-                let csvContent = headers.join(',') + '\\n';
-                
-                // Get table data (only visible rows)
+                // Header + rows are read straight from the table so any columns (Effective BER,
+                // PHY Symbol Errors, ...) are picked up automatically and stay in sync with the view.
                 const table = document.getElementById('ber-table');
+                const headers = Array.from(table.querySelectorAll('thead th')).map(function(th){
+                    return th.textContent.replace('▲▼', '').trim();
+                });
+                let csvContent = headers.join(',') + '\\n';
                 const tbody = table.querySelector('tbody');
                 const rows = tbody.querySelectorAll('tr');
                 
@@ -1317,33 +1395,22 @@ class BERAnalyzer:
                 csvContent += `# Critical: ${document.getElementById('critical-ports').textContent}\\n`;
                 csvContent += `#\\n`;
                 
-                // Process each visible row
+                // Process each visible row (all columns, dynamically)
                 rows.forEach(row => {
-                    if (row.style.display !== 'none') {
-                        const cells = row.querySelectorAll('td');
-                        if (cells.length >= 8) {
-                            const rowData = [
-                                cells[0].textContent.trim(), // Port
-                                cells[1].querySelector('span') ? cells[1].querySelector('span').textContent.trim() : cells[1].textContent.trim(), // Health Status
-                                cells[2].textContent.trim(), // BER Value
-                                cells[3].textContent.trim(), // RX Errors
-                                cells[4].textContent.trim(), // TX Errors
-                                cells[5].textContent.trim(), // Total Frames
-                                cells[6].textContent.trim(), // Error Rate
-                                cells[7].textContent.trim()  // Last Scan
-                            ];
-                            
-                            // Escape commas and quotes in data
-                            const escapedData = rowData.map(field => {
-                                if (field.includes(',') || field.includes('"') || field.includes('\\n')) {
-                                    return '"' + field.replace(/"/g, '""') + '"';
-                                }
-                                return field;
-                            });
-                            
-                            csvContent += escapedData.join(',') + '\\n';
+                    if (row.style.display === 'none') return;
+                    const cells = row.querySelectorAll('td');
+                    if (!cells.length) return;
+                    const rowData = Array.from(cells).map(function(td){
+                        const span = td.querySelector('span');
+                        return (span ? span.textContent : td.textContent).trim();
+                    });
+                    const escapedData = rowData.map(field => {
+                        if (field.includes(',') || field.includes('"') || field.includes('\\n')) {
+                            return '"' + field.replace(/"/g, '""') + '"';
                         }
-                    }
+                        return field;
+                    });
+                    csvContent += escapedData.join(',') + '\\n';
                 });
                 
                 // Create and trigger download

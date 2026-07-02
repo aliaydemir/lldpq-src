@@ -61,6 +61,7 @@ class LinkFlapAnalyzer:
         self.carrier_transitions_lookback = {}  # port -> deque of (time, transitions)
         self.flapping_hist = {}  # port -> deque of (time, transitions, flap_count)
         self.carrier_transitions_stats = {}  # port -> current transition count
+        self.prev_cumulative = {}  # port -> last cycle's cumulative carrier_changes (persisted baseline)
         self.flapping_counters = {}  # port -> {period: count}
         self._port_cache = {}  # Cache for calculated port status/counters
         
@@ -80,6 +81,7 @@ class LinkFlapAnalyzer:
                     self.flapping_hist[port] = collections.deque(hist, maxlen=1000)
                 for port, lookback in data.get("carrier_transitions_lookback", {}).items():
                     self.carrier_transitions_lookback[port] = collections.deque(lookback, maxlen=100)
+                self.prev_cumulative = dict(data.get("prev_cumulative", {}))
         except (FileNotFoundError, json.JSONDecodeError):
             pass
     
@@ -89,6 +91,7 @@ class LinkFlapAnalyzer:
             data = {
                 "flapping_hist": {port: list(deq) for port, deq in self.flapping_hist.items()},
                 "carrier_transitions_lookback": {port: list(deq) for port, deq in self.carrier_transitions_lookback.items()},
+                "prev_cumulative": self.prev_cumulative,
                 "last_update": time.time()
             }
             with open(f"{self.data_dir}/flap_history.json", "w") as f:
@@ -97,18 +100,38 @@ class LinkFlapAnalyzer:
             print(f"Error saving flap history: {e}")
     
     def update_carrier_transitions(self, port_name: str, current_transitions: int):
-        """Update carrier transition count for a port"""
+        """Update carrier transition count for a port, and record any NEW flaps since the previous
+        cycle.
+
+        carrier_changes is a cumulative kernel counter and the monitor runs every few minutes -- far
+        longer than any short lookback window -- so flaps are detected by the delta against the
+        PREVIOUS cycle's cumulative value (a persisted baseline), not by trying to keep two samples
+        inside a 125s window. Each detected delta is timestamped so the 1h/12h/24h buckets populate.
+        (The old code compared two samples that never coexisted at a 10-min cadence -> windows were
+        always 0 while the raw Total counter still showed a value.)"""
         curr_time = time.time()
-        
+
         # Initialize if new port
         if port_name not in self.carrier_transitions_lookback:
             self.carrier_transitions_lookback[port_name] = collections.deque(maxlen=100)
+        if port_name not in self.flapping_hist:
             self.flapping_hist[port_name] = collections.deque(maxlen=1000)
-        
-        # Add current reading
+
+        # Cycle-over-cycle delta vs the persisted previous cumulative reading.
+        prev = self.prev_cumulative.get(port_name)
+        if prev is not None and current_transitions >= prev:
+            delta = current_transitions - prev
+            if delta >= self.MIN_CARRIER_TRANSITION_DELTA:
+                # delta transitions = delta//2 up-down flap cycles, attributed to "now" (we only know
+                # they happened somewhere within the last poll interval).
+                self.flapping_hist[port_name].append((curr_time, current_transitions, delta // 2))
+        # current < prev => counter reset (e.g. reboot); skip this cycle and just re-baseline below.
+        self.prev_cumulative[port_name] = current_transitions
+
+        # Keep lookback/stats for the rest of the report (Total column = current cumulative counter).
         self.carrier_transitions_lookback[port_name].append((curr_time, current_transitions))
         self.carrier_transitions_stats[port_name] = current_transitions
-        
+
         # Clean old entries
         self._cleanup_old_entries(curr_time)
     
@@ -125,29 +148,20 @@ class LinkFlapAnalyzer:
                 flap_hist_queue.popleft()
     
     def check_flapping(self) -> bool:
-        """Check for link flapping - returns True if any flaps detected"""
-        flap_detected = False
+        """Return True if any port recorded a flap within the most recent detection window.
+
+        Detection itself now happens per-cycle in update_carrier_transitions (delta vs the previous
+        cumulative reading). This is read-only: it must NOT mutate the lookback or append history
+        (doing so previously double-counted / cleared the baseline)."""
         curr_time = time.time()
-        
-        for port_name, ct_lookback in self.carrier_transitions_lookback.items():
-            if len(ct_lookback) > 1:
-                # Calculate delta in transitions over the monitoring period
-                delta = ct_lookback[-1][1] - ct_lookback[0][1]
-                
-                if delta >= self.MIN_CARRIER_TRANSITION_DELTA:
-                    # Flap detected! Record it
-                    flap_count = delta // 2  # Each flap is up/down cycle
-                    self.flapping_hist[port_name].append((curr_time, ct_lookback[-1][1], flap_count))
-                    
-                    # Clear the lookback to start fresh detection
-                    elements_to_delete = len(ct_lookback) - 1
-                    for _ in range(elements_to_delete):
-                        ct_lookback.popleft()
-                    
-                    flap_detected = True
+        detected = False
+        for port_name, flaps in self.flapping_hist.items():
+            for flap_time, _, flap_count in flaps:
+                if curr_time - flap_time <= self.FLAPPING_INTERVAL:
                     print(f"Flap detected on {port_name}: {flap_count} flaps")
-        
-        return flap_detected
+                    detected = True
+                    break
+        return detected
     
     def calculate_flapping_rate(self, port_name: str) -> Dict[str, int]:
         """Calculate flapping rates for different time periods"""
