@@ -262,6 +262,19 @@ lldpq_user = os.environ.get('LLDPQ_USER', 'lldpq')
 lldpq_dir = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 web_root = os.environ.get('WEB_ROOT', '/var/www/html')
 devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
+
+# /etc/lldpq.conf keys that are portable (safe to carry in a backup): tunable knobs only.
+# NEVER include host paths/identity (LLDPQ_DIR/USER/SRC, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE)
+# or secrets (AI_API_KEY).
+LLDPQ_PREF_KEYS = (
+    'LLDPQ_CRON', 'GETCONF_CRON', 'SKIP_OPTICAL', 'SKIP_L1',
+    'MONITOR_MAX_PARALLEL', 'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
+    'GET_CONFIGS_MAX_PARALLEL', 'SEND_CMD_MAX_PARALLEL', 'TELEMETRY_MAX_PARALLEL',
+    'AUTO_BASE_CONFIG', 'AUTO_ZTP_DISABLE', 'AUTO_SET_HOSTNAME',
+    'TRANSCEIVER_FW_SKIP_MODELS', 'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY',
+    'TRANSCEIVER_FW_MAX_PARALLEL', 'TRANSCEIVER_FW_MIN_INTERVAL', 'TRANSCEIVER_FW_SSH_TIMEOUT',
+    'TELEMETRY_ENABLED', 'PROMETHEUS_URL', 'AI_PROVIDER', 'AI_MODEL', 'AI_API_URL', 'OLLAMA_URL',
+)
 action = post_data.get('action', 'setup')
 
 def read_conf():
@@ -1020,6 +1033,23 @@ if action == 'backup-export':
                             tip = tarfile.TarInfo('ssh/%s.pub' % key_name); tip.size = len(rp.stdout); tip.mode = 0o644
                             tar.addfile(tip, io.BytesIO(rp.stdout)); added.append('ssh/%s.pub' % key_name)
                         break
+            # Portable preferences from /etc/lldpq.conf: ONLY tunable knobs (schedules, parallelism,
+            # toggles, AI provider/model). Deliberately excludes host paths/identity (LLDPQ_DIR,
+            # LLDPQ_USER, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE) and secrets (AI_API_KEY).
+            PREF_KEYS = LLDPQ_PREF_KEYS
+            try:
+                conf_lines = open('/etc/lldpq.conf').read().splitlines()
+            except Exception:
+                conf_lines = []
+            pref_lines = [s.strip() for s in conf_lines
+                          if s.strip() and not s.strip().startswith('#') and '=' in s
+                          and s.split('=', 1)[0].strip() in PREF_KEYS]
+            if pref_lines:
+                pdata = ('# LLDPq portable preferences — schedules / parallelism / toggles.\n'
+                         '# No host paths, no secrets. Re-applied by key on restore.\n'
+                         + '\n'.join(pref_lines) + '\n').encode()
+                ti = tarfile.TarInfo('prefs/lldpq.conf'); ti.size = len(pdata); ti.mode = 0o644
+                tar.addfile(ti, io.BytesIO(pdata)); added.append('prefs/lldpq.conf')
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Bundle failed: ' + str(e)}))
         sys.exit(0)
@@ -1050,6 +1080,38 @@ if action == 'backup-import':
     ssh_dir = os.path.expanduser('~%s/.ssh' % lldpq_user)
     restored = []
     keys = []
+    prefs_applied = []
+
+    def _apply_cron_from_conf(vals):
+        # Schedules live in the cron file too (that's what actually runs), so mirror them there.
+        def _clean(x):
+            return x.strip().strip('"').strip("'") if x else None
+        lc, gc = _clean(vals.get('LLDPQ_CRON')), _clean(vals.get('GETCONF_CRON'))
+        if not lc and not gc:
+            return
+        cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
+        try:
+            orig = open(cron_file).read().splitlines(True)
+        except Exception:
+            return
+        outl = []
+        for line in orig:
+            parts = line.split()
+            if (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq' and lc:
+                outl.append(lc + ' ' + ' '.join(parts[5:]) + '\n')
+            elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf' and gc:
+                outl.append(gc + ' ' + ' '.join(parts[5:]) + '\n')
+            else:
+                outl.append(line)
+        # cron file is not tee-able via sudoers: stage as the service user, then `sudo cp` (allowed).
+        tmp = os.path.join(lldpq_dir, '.cron.restore.tmp')
+        st = subprocess.run(['sudo', '-u', lldpq_user, 'tee', tmp], input=''.join(outl),
+                            capture_output=True, text=True, timeout=10)
+        if st.returncode == 0:
+            subprocess.run(['sudo', 'cp', tmp, cron_file], capture_output=True, timeout=10)
+            subprocess.run(['sudo', 'chmod', '644', cron_file], capture_output=True, timeout=5)
+            subprocess.run(['sudo', '-u', lldpq_user, 'rm', '-f', tmp], capture_output=True, timeout=5)
+
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tar:
             for m in tar.getmembers():
@@ -1057,6 +1119,44 @@ if action == 'backup-import':
                     continue
                 name = m.name.replace('\\', '/')
                 base = os.path.basename(name)
+                # Portable preferences -> merge ONLY whitelisted keys into /etc/lldpq.conf (never
+                # touch host paths/identity), and reflect schedules into the live cron file.
+                if name == 'prefs/lldpq.conf':
+                    try:
+                        txt = tar.extractfile(m).read().decode('utf-8', 'replace')
+                    except Exception:
+                        txt = ''
+                    newvals = {}
+                    for line in txt.splitlines():
+                        s = line.strip()
+                        if s and not s.startswith('#') and '=' in s:
+                            k, v = s.split('=', 1)
+                            k = k.strip()
+                            if k in LLDPQ_PREF_KEYS:
+                                newvals[k] = v.strip()
+                    if newvals:
+                        try:
+                            cur = open('/etc/lldpq.conf').read().splitlines()
+                        except Exception:
+                            cur = []
+                        seen = set()
+                        outc = []
+                        for line in cur:
+                            s = line.strip()
+                            if s and not s.startswith('#') and '=' in s and s.split('=', 1)[0].strip() in newvals:
+                                k = s.split('=', 1)[0].strip()
+                                outc.append('%s=%s' % (k, newvals[k])); seen.add(k)
+                            else:
+                                outc.append(line)
+                        for k, v in newvals.items():
+                            if k not in seen:
+                                outc.append('%s=%s' % (k, v))
+                        w = subprocess.run(['sudo', 'tee', '/etc/lldpq.conf'],
+                                           input='\n'.join(outc) + '\n', capture_output=True, text=True, timeout=10)
+                        if w.returncode == 0:
+                            prefs_applied = sorted(newvals.keys())
+                            _apply_cron_from_conf(newvals)
+                    continue
                 # SSH key files (ssh/id_ed25519[.pub]) -> service user's ~/.ssh with strict perms
                 if name.startswith('ssh/') and base in key_names:
                     content = tar.extractfile(m).read()
@@ -1081,10 +1181,10 @@ if action == 'backup-import':
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Not a valid LLDPq config bundle: ' + str(e)[:150]}))
         sys.exit(0)
-    if not restored and not keys:
+    if not restored and not keys and not prefs_applied:
         print(json.dumps({'success': False, 'error': 'No recognized config files inside the archive.'}))
         sys.exit(0)
-    print(json.dumps({'success': True, 'restored': restored, 'keys': keys}))
+    print(json.dumps({'success': True, 'restored': restored, 'keys': keys, 'prefs': prefs_applied}))
     sys.exit(0)
 
 # ─── Action: Maintenance — disk usage + count of old update backups ───

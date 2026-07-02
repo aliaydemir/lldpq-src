@@ -383,7 +383,7 @@
                 <!-- Step 9: Backup & Restore -->
                 <div class="su-panel" data-step="7">
                     <h2>8. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
-                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. Restore uploads a bundle and overwrites those files.</p>
+                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus your tunable <strong>settings</strong> (schedules, parallelism, toggles) and (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. On restore, settings are merged back <em>by key</em> &mdash; host paths &amp; secrets (e.g. AI key) are never carried or overwritten.</p>
                     <div class="sched-card">
                         <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(bundle becomes secret: it holds the private key)</strong></label>
                         <div class="p-toolbar">
@@ -1191,7 +1191,7 @@ async function backupImport(){
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-import',data:b64})});
         const d=await r.json().catch(()=>({}));
-        if(d.success){ var parts=(d.restored||[]).slice(); if((d.keys||[]).length) parts.push('SSH key'); setStatus('bk-import-msg','Restored: '+(parts.join(', ')||'nothing')+' \u2713 \u2014 run Step 7 (Run LLDPq) to apply.','ok'); }
+        if(d.success){ var parts=(d.restored||[]).slice(); if((d.keys||[]).length) parts.push('SSH key'); if((d.prefs||[]).length) parts.push('settings ('+d.prefs.length+')'); setStatus('bk-import-msg','Restored: '+(parts.join(', ')||'nothing')+' \u2713 \u2014 run Step 7 (Run LLDPq) to apply.','ok'); }
         else setStatus('bk-import-msg', d.error||'Restore failed','err');
     }catch(e){ setStatus('bk-import-msg','Restore failed: '+e.message,'err'); }
 }
