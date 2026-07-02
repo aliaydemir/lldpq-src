@@ -255,7 +255,21 @@ assets_file = os.environ.get('FINAL', '')
 if not assets_file or not os.path.exists(assets_file):
     sys.exit(0)
 
+# Start from the EXISTING cache and MERGE — so a device that is merely DOWN this run keeps its
+# last-known data instead of being dropped to "Never". (Previously the cache was rebuilt from
+# scratch each run: a single run where a down device's cached row was missed — e.g. a transient
+# read, or an overlapping assets run during a mass reboot — permanently lost that device until it
+# next came back up. Merging makes the cache resilient to those hiccups.)
 cache = {}
+try:
+    with open(cache_file) as f:
+        _prev = json.load(f)
+    if isinstance(_prev, dict):
+        cache = _prev
+except Exception:
+    cache = {}
+
+seen = set()
 try:
     with open(assets_file, 'r') as f:
         for line in f:
@@ -274,6 +288,7 @@ try:
             uptime = parts[6]
             status = parts[7]
             last_seen = parts[8] if len(parts) > 8 else ''
+            seen.add(hostname)
 
             if status == 'OK':
                 cache[hostname] = {
@@ -300,6 +315,13 @@ try:
                     "last_seen": last_seen.replace('_', ' '),
                     "status": "unreachable"
                 }
+            # status == 'NO-INFO' (never yet collected while up): do NOT drop — keep any existing
+            # cache entry so a currently-down device retains its last-known data.
+
+    # Prune only devices that no longer appear in the run at all (e.g. removed from devices.yaml).
+    # Every inventory device produces a row (OK / UNREACHABLE / NO-INFO), so a merely-down device
+    # is in `seen` and is retained; only truly-removed devices are dropped.
+    cache = {h: v for h, v in cache.items() if h in seen}
 
     with open(cache_file, 'w') as f:
         json.dump(cache, f, indent=2)
