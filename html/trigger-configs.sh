@@ -17,19 +17,17 @@ if [[ "$REQUEST_METHOD" == "OPTIONS" ]]; then
     exit 0
 fi
 
-# Load config
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
-fi
-LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
-LLDPQ_USER="${LLDPQ_USER:-lldpq}"
-
 # The lldpq-trigger daemon runs as LLDPQ_USER and handles the actual collection.
 TRIGGER_FILE="/tmp/.configs_web_trigger"
-echo "$(date +%s)" > "$TRIGGER_FILE" 2>/dev/null
+TRIGGER_NOW=$(date +%s%N 2>/dev/null || true)
+[[ "$TRIGGER_NOW" =~ ^[0-9]+$ ]] || TRIGGER_NOW="$(date +%s)000000000"
+TRIGGER_VALUE="${TRIGGER_NOW}.$$.$RANDOM"
+TRIGGER_TEMP="${TRIGGER_FILE}.tmp.$$.$RANDOM"
 
-if [ -f "$TRIGGER_FILE" ]; then
+if printf '%s\n' "$TRIGGER_VALUE" > "$TRIGGER_TEMP" 2>/dev/null &&
+   mv -f "$TRIGGER_TEMP" "$TRIGGER_FILE" 2>/dev/null; then
     echo '{"status": "started", "message": "Config collection queued", "note": "Configs will be available within 1-2 minutes."}'
 else
+    rm -f "$TRIGGER_TEMP" 2>/dev/null || true
     echo '{"status": "error", "message": "Failed to create config collection trigger"}'
 fi

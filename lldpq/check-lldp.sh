@@ -6,6 +6,27 @@
 
 set -o pipefail
 
+# Share the pipeline lock with bin/lldpq and monitor.sh.  The wrapper exports
+# the inherited marker while keeping descriptor 9 open; a direct invocation
+# takes the same non-blocking lock instead of racing report publication.
+lock_is_inherited=false
+if [[ "${LLDPQ_MONITOR_LOCK_HELD:-0}" == "1" ]] && { : >&9; } 2>/dev/null; then
+    lock_is_inherited=true
+fi
+if [[ "$lock_is_inherited" != "true" ]]; then
+    LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "Error: flock is required for safe LLDP collection" >&2
+        exit 1
+    fi
+    exec 9>"$LOCK_FILE" || exit 1
+    if ! flock -n 9; then
+        echo "Monitoring is already running; this LLDP invocation was skipped." >&2
+        exit 75
+    fi
+    export LLDPQ_MONITOR_LOCK_HELD=1
+fi
+
 # Start timing
 START_TIME=$(date +%s)
 echo "Starting LLDP check at $(date)"
@@ -14,13 +35,6 @@ DATE=$(date '+%Y-%m-%d--%H-%M')
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/load_devices.sh"
-load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
-
-# Load allowlisted config data through the fixed, root-owned parser.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
-fi
-WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
 # === TUNING PARAMETERS ===
 MAX_PARALLEL="${LLDP_MAX_PARALLEL:-100}"  # Maximum parallel SSH connections
@@ -29,18 +43,299 @@ case "$MAX_PARALLEL" in
 esac
 SSH_TIMEOUT=30    # SSH connection timeout in seconds
 
-mkdir -p "$SCRIPT_DIR/lldp-results"
+recover_lldp_outputs() {
+    local recovery_marker="$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery"
+    sudo python3 - "$recovery_marker" "$SCRIPT_DIR" <<'PYTHON'
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+marker = os.path.abspath(sys.argv[1])
+script_dir = os.path.abspath(sys.argv[2])
+marker_parent = os.path.dirname(marker)
+marker_name = os.path.basename(marker)
+marker_parent_fd = None
+trusted_marker_fd = None
+trusted_marker_stat = None
+trusted_marker_bytes = None
+
+def lexists(path):
+    # exists() follows links and would misclassify a dangling backup symlink as
+    # absent. Recovery must instead stop on every ambiguous filesystem object.
+    return os.path.lexists(path)
+
+def regular(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode) and not os.path.islink(path)
+    except FileNotFoundError:
+        return False
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+def fsync_file(path):
+    with open(path, "rb") as handle:
+        os.fsync(handle.fileno())
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def fail(message):
+    raise RuntimeError(message)
+
+def trusted_read_authority():
+    """Open, authorize and read one immutable marker descriptor."""
+    global marker_parent_fd, trusted_marker_fd
+    global trusted_marker_stat, trusted_marker_bytes
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    marker_parent_fd = os.open(marker_parent, directory_flags)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    trusted_marker_fd = os.open(marker_name, flags, dir_fd=marker_parent_fd)
+    trusted_marker_stat = os.fstat(trusted_marker_fd)
+    current = os.stat(marker_name, dir_fd=marker_parent_fd, follow_symlinks=False)
+    if ((current.st_dev, current.st_ino) !=
+            (trusted_marker_stat.st_dev, trusted_marker_stat.st_ino)):
+        fail("LLDP recovery marker changed while it was opened")
+    if not stat.S_ISREG(trusted_marker_stat.st_mode):
+        fail("LLDP recovery marker is not a regular file")
+    if trusted_marker_stat.st_uid != os.geteuid():
+        fail("LLDP recovery marker owner is not authoritative")
+    if trusted_marker_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        fail("LLDP recovery marker is writable by an untrusted principal")
+    if trusted_marker_stat.st_size <= 0 or trusted_marker_stat.st_size > 2 * 1024 * 1024:
+        fail("LLDP recovery marker size is invalid")
+    with os.fdopen(os.dup(trusted_marker_fd), "rb") as handle:
+        trusted_marker_bytes = handle.read(2 * 1024 * 1024 + 1)
+    if len(trusted_marker_bytes) != trusted_marker_stat.st_size:
+        fail("LLDP recovery marker changed while it was read")
+    return json.loads(trusted_marker_bytes.decode("utf-8"))
+
+def clear_trusted_authority():
+    """Unlink only the inode read above and prove the unlink is durable."""
+    current = os.stat(marker_name, dir_fd=marker_parent_fd, follow_symlinks=False)
+    if ((current.st_dev, current.st_ino) !=
+            (trusted_marker_stat.st_dev, trusted_marker_stat.st_ino)):
+        fail("LLDP recovery marker was swapped before authority removal")
+    os.unlink(marker_name, dir_fd=marker_parent_fd)
+    try:
+        os.fsync(marker_parent_fd)
+    except OSError as sync_error:
+        # Keep a live authority when unlink durability is unknown. The next
+        # invocation can verify the already-restored generation and retry.
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+            descriptor = os.open(marker_name, flags, 0o600, dir_fd=marker_parent_fd)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(trusted_marker_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except BaseException as restore_error:
+            raise RuntimeError(
+                f"LLDP marker unlink was not durable and authority recreation failed: "
+                f"{sync_error}; {restore_error}"
+            ) from sync_error
+        raise RuntimeError(
+            f"LLDP marker unlink was not durable; authority was retained: {sync_error}"
+        ) from sync_error
+
+try:
+    expected_marker = os.path.join(
+        script_dir, "lldp-results", ".lldpq-lldp-recovery"
+    )
+    if marker != expected_marker:
+        fail("LLDP recovery marker is outside the installation result tree")
+    # Production publication runs under sudo. The descriptor remains open
+    # until removal so path swaps cannot change which authority was trusted.
+    payload = trusted_read_authority()
+    if set(payload) != {"version", "status", "web_root", "records"}:
+        fail("LLDP recovery marker has an unexpected schema")
+    if payload["version"] != 2 or payload["status"] != "rollback-required":
+        fail("LLDP recovery marker has an unsupported state")
+    web_root = payload["web_root"]
+    if (not isinstance(web_root, str) or not os.path.isabs(web_root)
+            or web_root != os.path.normpath(web_root) or web_root == os.sep
+            or "\x00" in web_root):
+        fail("LLDP recovery marker has an unsafe recorded web root")
+    local_root = os.path.join(script_dir, "lldp-results")
+    expected_destinations = [
+        os.path.join(local_root, "lldp_results.ini"),
+        os.path.join(local_root, "raw-problems-lldp_results.ini"),
+        os.path.join(local_root, "problems-lldp_results.ini"),
+        os.path.join(local_root, "down-lldp_results.ini"),
+        os.path.join(web_root, "lldp_results.ini"),
+        os.path.join(web_root, "problems-lldp_results.ini"),
+        os.path.join(web_root, "topology", "topology.js"),
+    ]
+    records = payload["records"]
+    if not isinstance(records, list) or len(records) != len(expected_destinations):
+        fail("LLDP recovery journal is incomplete")
+
+    required = {
+        "index", "stage", "destination", "backup", "original",
+        "original_sha256", "stage_sha256",
+    }
+    checksum = re.compile(r"[0-9a-f]{64}")
+    prepared = []
+    for index, (record, expected_destination) in enumerate(
+            zip(records, expected_destinations)
+    ):
+        if not isinstance(record, dict) or set(record) != required:
+            fail(f"invalid LLDP recovery record {index}")
+        if record["index"] != index or record["destination"] != expected_destination:
+            fail(f"LLDP recovery destination mismatch in record {index}")
+        destination_parent = os.path.dirname(expected_destination)
+        destination_name = os.path.basename(expected_destination)
+        if (not os.path.isdir(destination_parent)
+                or os.path.islink(destination_parent)):
+            fail(f"unsafe LLDP destination directory in record {index}")
+        stage = record["stage"]
+        backup = record["backup"]
+        if (not isinstance(stage, str) or not os.path.isabs(stage)
+                or os.path.dirname(stage) != destination_parent
+                or not os.path.basename(stage).startswith(
+                    f".{destination_name}.lldpq-new."
+                )):
+            fail(f"unsafe LLDP stage path in record {index}")
+        staged_hash = record["stage_sha256"]
+        if not isinstance(staged_hash, str) or not checksum.fullmatch(staged_hash):
+            fail(f"invalid LLDP staged checksum in record {index}")
+
+        original = record["original"]
+        original_hash = record["original_sha256"]
+        if original == "present":
+            if (not isinstance(original_hash, str)
+                    or not checksum.fullmatch(original_hash)
+                    or not isinstance(backup, str) or not os.path.isabs(backup)
+                    or os.path.dirname(backup) != destination_parent
+                    or not os.path.basename(backup).startswith(
+                        f".{destination_name}.lldpq-old."
+                    )):
+                fail(f"invalid LLDP original journal in record {index}")
+        elif original == "missing":
+            if original_hash is not None or backup is not None:
+                fail(f"invalid missing-state journal in record {index}")
+        else:
+            fail(f"invalid LLDP presence journal in record {index}")
+
+        backup_exists = backup is not None and lexists(backup)
+        destination_exists = lexists(expected_destination)
+        stage_exists = lexists(stage)
+
+        # This is a complete preflight: no rollback path changes until every
+        # record, backup, destination and leftover stage is provably ours.
+        if backup_exists:
+            if (not regular(backup) or digest(backup) != original_hash
+                    or (destination_exists and not regular(expected_destination))):
+                fail(f"invalid LLDP backup in record {index}")
+        elif original == "present":
+            if (not destination_exists or not regular(expected_destination)
+                    or digest(expected_destination) != original_hash):
+                fail(f"LLDP original cannot be proven in record {index}")
+        elif destination_exists:
+            if (not regular(expected_destination)
+                    or digest(expected_destination) != staged_hash):
+                fail(f"unexpected originally-missing LLDP destination {index}")
+        if stage_exists and (not regular(stage) or digest(stage) != staged_hash):
+            fail(f"invalid LLDP stage in record {index}")
+
+        prepared.append({
+            "original": original,
+            "destination": expected_destination,
+            "backup": backup,
+            "backup_exists": backup_exists,
+            "stage": stage,
+            "stage_exists": stage_exists,
+        })
+
+    # os.replace/unlink make each step repeatable. If this process is killed,
+    # the untouched marker drives the same validation and remaining operations.
+    for record in reversed(prepared):
+        if record["original"] == "present" and record["backup_exists"]:
+            os.replace(record["backup"], record["destination"])
+        elif record["original"] == "missing" and lexists(record["destination"]):
+            os.unlink(record["destination"])
+    for record in prepared:
+        if record["stage_exists"] and lexists(record["stage"]):
+            os.unlink(record["stage"])
+
+    directories = {os.path.dirname(value) for value in expected_destinations}
+    for record in prepared:
+        destination = record["destination"]
+        if record["original"] == "present":
+            if not regular(destination):
+                fail(f"restored LLDP destination disappeared: {destination}")
+            fsync_file(destination)
+        elif lexists(destination):
+            fail(f"originally-missing LLDP destination remains: {destination}")
+    for directory in directories:
+        fsync_directory(directory)
+    fsync_directory(os.path.dirname(marker))
+
+    clear_trusted_authority()
+except BaseException as exc:
+    print(f"CRITICAL: LLDP publication recovery failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+PYTHON
+}
+
+mkdir -p "$SCRIPT_DIR/lldp-results" || exit 1
+if [[ -e "$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery" ||
+      -L "$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery" ]]; then
+    echo "Recovering interrupted LLDP publication..." >&2
+    if ! recover_lldp_outputs; then
+        echo "CRITICAL: unresolved LLDP publication recovery remains at" >&2
+        echo "  $SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery" >&2
+        exit 1
+    fi
+fi
+if [[ "${LLDPQ_RECOVERY_ONLY:-0}" == "1" ]]; then
+    exit 0
+fi
+
+# Parse the current runtime configuration only after a retained journal has
+# restored the destinations it recorded. A changed/malformed WEB_ROOT must not
+# strand or redirect an older transaction.
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+if [[ -z "${WEB_ROOT:-}" ]]; then
+    if [[ ! -x "$LLDPQ_CONFIG_HELPER" ]]; then
+        echo "Error: runtime config helper is missing: $LLDPQ_CONFIG_HELPER" >&2
+        exit 1
+    fi
+    if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+            --require-key WEB_ROOT --require-key LLDPQ_USER 2>/dev/null); then
+        echo "Error: required runtime configuration is missing or invalid" >&2
+        exit 1
+    fi
+    eval "$LLDPQ_CONFIG_ASSIGNMENTS" || exit 1
+    unset LLDPQ_CONFIG_ASSIGNMENTS
+fi
+[[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
+LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
+load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
 unreachable_hosts_file=$(mktemp)
 active_jobs_file=$(mktemp)
 completed_count_file=$(mktemp)
 echo "0" > "$completed_count_file"
 postprocess_dir=""
+collection_dir=""
 
 cleanup_check_lldp() {
     rm -f "$unreachable_hosts_file" "$active_jobs_file" \
         "$completed_count_file" "$completed_count_file.lock"
     [[ -n "$postprocess_dir" ]] && rm -rf "$postprocess_dir"
+    [[ -n "$collection_dir" ]] && rm -rf "$collection_dir"
 }
 trap cleanup_check_lldp EXIT
 
@@ -54,6 +349,386 @@ publish_web_file() {
         sudo rm -f "$temp_file" 2>/dev/null || true
         return 1
     fi
+}
+
+commit_lldp_outputs() {
+    local recovery_marker="$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery"
+    sudo python3 - "$LLDPQ_USER" "$recovery_marker" "$WEB_ROOT" \
+        "$collection_dir/lldp_results.ini" "$SCRIPT_DIR/lldp-results/lldp_results.ini" \
+        "$raw_problems" "$SCRIPT_DIR/lldp-results/raw-problems-lldp_results.ini" \
+        "$problems" "$SCRIPT_DIR/lldp-results/problems-lldp_results.ini" \
+        "$down" "$SCRIPT_DIR/lldp-results/down-lldp_results.ini" \
+        "$collection_dir/lldp_results.ini" "$WEB_ROOT/lldp_results.ini" \
+        "$problems" "$WEB_ROOT/problems-lldp_results.ini" \
+        "$collection_dir/topology.js" "$WEB_ROOT/topology/topology.js" <<'PYTHON'
+import grp
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import signal
+import stat
+import sys
+import tempfile
+
+user = sys.argv[1]
+recovery_marker = os.path.abspath(sys.argv[2])
+recorded_web_root = os.path.abspath(sys.argv[3])
+items = [
+    (os.path.abspath(source), os.path.abspath(destination))
+    for source, destination in zip(sys.argv[4::2], sys.argv[5::2])
+]
+if not items or len(sys.argv[4:]) % 2:
+    raise SystemExit("invalid LLDP publication list")
+local_root = os.path.dirname(recovery_marker)
+expected_destinations = [
+    os.path.join(local_root, "lldp_results.ini"),
+    os.path.join(local_root, "raw-problems-lldp_results.ini"),
+    os.path.join(local_root, "problems-lldp_results.ini"),
+    os.path.join(local_root, "down-lldp_results.ini"),
+    os.path.join(recorded_web_root, "lldp_results.ini"),
+    os.path.join(recorded_web_root, "problems-lldp_results.ini"),
+    os.path.join(recorded_web_root, "topology", "topology.js"),
+]
+if ([destination for _source, destination in items] != expected_destinations
+        or recorded_web_root == os.sep):
+    raise SystemExit("unsafe LLDP publication destination set")
+
+user_entry = pwd.getpwnam(user)
+uid = user_entry.pw_uid
+try:
+    gid = grp.getgrnam("www-data").gr_gid
+except KeyError:
+    # Isolated non-Linux test hosts need not provide the web-service group.
+    gid = user_entry.pw_gid
+records = []
+authority_owned = False
+
+class AuthorityClearError(RuntimeError):
+    """Authority could not be removed with proven directory durability."""
+
+def lexists(path):
+    return os.path.lexists(path)
+
+def regular(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode) and not os.path.islink(path)
+    except FileNotFoundError:
+        return False
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+def fsync_file(path):
+    with open(path, "rb") as handle:
+        os.fsync(handle.fileno())
+
+def fsync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+def cleanup_path(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+def write_recovery_authority():
+    global authority_owned
+    marker_parent = os.path.dirname(recovery_marker)
+    os.makedirs(marker_parent, exist_ok=True)
+    if lexists(recovery_marker):
+        raise RuntimeError("existing LLDP recovery authority must not be overwritten")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=".lldpq-lldp-recovery.", dir=marker_parent
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({
+                "version": 2,
+                "status": "rollback-required",
+                "web_root": recorded_web_root,
+                "records": records,
+            }, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # link(2) creates the authority only when the destination does not
+        # already exist. Unlike replace(), this is an atomic no-overwrite
+        # transition even if another actor races the earlier lexists check.
+        os.link(temporary, recovery_marker, follow_symlinks=False)
+        authority_owned = True
+        fsync_directory(marker_parent)
+        os.unlink(temporary)
+        fsync_directory(marker_parent)
+    except BaseException:
+        cleanup_path(temporary)
+        raise
+
+def clear_recovery_authority():
+    global authority_owned
+    marker_parent = os.path.dirname(recovery_marker)
+    marker_name = os.path.basename(recovery_marker)
+    directory_fd = None
+    marker_fd = None
+    try:
+        directory_fd = os.open(
+            marker_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        marker_fd = os.open(
+            marker_name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        trusted_stat = os.fstat(marker_fd)
+        current = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+        if ((trusted_stat.st_dev, trusted_stat.st_ino) !=
+                (current.st_dev, current.st_ino)
+                or not stat.S_ISREG(trusted_stat.st_mode)
+                or trusted_stat.st_uid != os.geteuid()
+                or trusted_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            raise AuthorityClearError("LLDP authority changed before commit")
+        with os.fdopen(os.dup(marker_fd), "rb") as handle:
+            marker_bytes = handle.read(2 * 1024 * 1024 + 1)
+        if len(marker_bytes) != trusted_stat.st_size:
+            raise AuthorityClearError("LLDP authority changed while being read")
+        marker_payload = json.loads(marker_bytes.decode("utf-8"))
+        if marker_payload != {
+            "version": 2,
+            "status": "rollback-required",
+            "web_root": recorded_web_root,
+            "records": records,
+        }:
+            raise AuthorityClearError("LLDP authority content no longer matches the transaction")
+        current = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+        if ((trusted_stat.st_dev, trusted_stat.st_ino) !=
+                (current.st_dev, current.st_ino)):
+            raise AuthorityClearError("LLDP authority was swapped before unlink")
+        os.unlink(marker_name, dir_fd=directory_fd)
+        try:
+            os.fsync(directory_fd)
+        except OSError as sync_error:
+            # Recreate a live, fsynced marker and leave every backup untouched.
+            # The next locked invocation will perform the idempotent rollback.
+            try:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+                descriptor = os.open(marker_name, flags, 0o600, dir_fd=directory_fd)
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(marker_bytes)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except BaseException as restore_error:
+                raise AuthorityClearError(
+                    f"LLDP authority unlink was not durable and recreation failed: "
+                    f"{sync_error}; {restore_error}"
+                ) from sync_error
+            raise AuthorityClearError(
+                f"LLDP authority unlink was not durable; recovery payload retained: {sync_error}"
+            ) from sync_error
+        authority_owned = False
+    except AuthorityClearError:
+        raise
+    except BaseException as exc:
+        raise AuthorityClearError(f"LLDP authority could not be cleared: {exc}") from exc
+    finally:
+        if marker_fd is not None:
+            os.close(marker_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+def rollback_records():
+    prepared = []
+    # Validate all remaining transaction objects before modifying any path.
+    for record in records:
+        original = record["original"]
+        destination = record["destination"]
+        backup = record["backup"]
+        stage = record["stage"]
+        backup_exists = backup is not None and lexists(backup)
+        destination_exists = lexists(destination)
+        stage_exists = lexists(stage)
+        if backup_exists:
+            if (original != "present" or not regular(backup)
+                    or digest(backup) != record["original_sha256"]
+                    or (destination_exists and not regular(destination))):
+                raise RuntimeError(f"invalid LLDP rollback backup: {backup}")
+        elif original == "present":
+            if (not destination_exists or not regular(destination)
+                    or digest(destination) != record["original_sha256"]):
+                raise RuntimeError(f"LLDP original cannot be proven: {destination}")
+        elif destination_exists:
+            if not regular(destination) or digest(destination) != record["stage_sha256"]:
+                raise RuntimeError(f"unexpected LLDP rollback destination: {destination}")
+        if stage_exists and (
+                not regular(stage) or digest(stage) != record["stage_sha256"]
+        ):
+            raise RuntimeError(f"invalid LLDP rollback stage: {stage}")
+        prepared.append((record, backup_exists, stage_exists))
+
+    for record, backup_exists, _stage_exists in reversed(prepared):
+        if record["original"] == "present" and backup_exists:
+            os.replace(record["backup"], record["destination"])
+        elif record["original"] == "missing" and lexists(record["destination"]):
+            os.unlink(record["destination"])
+    for record, _backup_exists, stage_exists in prepared:
+        if stage_exists and lexists(record["stage"]):
+            os.unlink(record["stage"])
+
+    for record, _backup_exists, _stage_exists in prepared:
+        if record["original"] == "present":
+            fsync_file(record["destination"])
+        elif lexists(record["destination"]):
+            raise RuntimeError(
+                f"originally-missing LLDP destination remains: {record['destination']}"
+            )
+    for directory in {os.path.dirname(record["destination"]) for record in records}:
+        fsync_directory(directory)
+    fsync_directory(os.path.dirname(recovery_marker))
+    clear_recovery_authority()
+
+def verify_committed_generation():
+    for record in records:
+        destination = record["destination"]
+        backup = record["backup"]
+        if (lexists(record["stage"]) or not regular(destination)
+                or digest(destination) != record["stage_sha256"]):
+            raise RuntimeError(f"incomplete LLDP activation: {destination}")
+        if record["original"] == "present":
+            if (backup is None or not lexists(backup) or not regular(backup)
+                    or digest(backup) != record["original_sha256"]):
+                raise RuntimeError(f"invalid LLDP rollback copy: {backup}")
+        elif backup is not None:
+            raise RuntimeError("unexpected LLDP backup for a missing destination")
+        fsync_file(destination)
+    for directory in {os.path.dirname(record["destination"]) for record in records}:
+        fsync_directory(directory)
+
+def sync_backup_phase():
+    """Make every old->backup rename durable before new-file activation."""
+    directories = set()
+    for record in records:
+        destination = record["destination"]
+        directories.add(os.path.dirname(destination))
+        if lexists(destination):
+            raise RuntimeError(f"LLDP old destination still exists: {destination}")
+        if record["original"] == "present":
+            backup = record["backup"]
+            if (backup is None or not lexists(backup) or not regular(backup)
+                    or digest(backup) != record["original_sha256"]):
+                raise RuntimeError(f"LLDP backup phase is incomplete: {backup}")
+            fsync_file(backup)
+    for directory in directories:
+        fsync_directory(directory)
+
+for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(signum, signal.SIG_IGN)
+
+if lexists(recovery_marker):
+    raise SystemExit("unresolved LLDP recovery authority already exists")
+
+try:
+    # Prepare every replacement beside its destination before moving any LKG
+    # path. Activation then consists only of same-filesystem renames.
+    for index, (source, destination) in enumerate(items):
+        if not regular(source) or os.stat(source).st_size == 0:
+            raise RuntimeError(f"invalid staged LLDP output: {source}")
+        destination_parent = os.path.dirname(destination)
+        os.makedirs(destination_parent, exist_ok=True)
+        if os.path.islink(destination_parent) or not os.path.isdir(destination_parent):
+            raise RuntimeError(f"unsafe LLDP destination directory: {destination_parent}")
+        if lexists(destination) and not regular(destination):
+            raise RuntimeError(f"LLDP destination is not a regular file: {destination}")
+
+        descriptor, stage = tempfile.mkstemp(
+            prefix=f".{os.path.basename(destination)}.lldpq-new.",
+            dir=destination_parent,
+        )
+        os.close(descriptor)
+        shutil.copyfile(source, stage)
+        os.chmod(stage, 0o664)
+        os.chown(stage, uid, gid)
+        fsync_file(stage)
+
+        if lexists(destination):
+            original = "present"
+            original_hash = digest(destination)
+            descriptor, backup = tempfile.mkstemp(
+                prefix=f".{os.path.basename(destination)}.lldpq-old.",
+                dir=destination_parent,
+            )
+            os.close(descriptor)
+            os.unlink(backup)
+        else:
+            original = "missing"
+            original_hash = None
+            backup = None
+        records.append({
+            "index": index,
+            "stage": stage,
+            "destination": destination,
+            "backup": backup,
+            "original": original,
+            "original_sha256": original_hash,
+            "stage_sha256": digest(stage),
+        })
+
+    # The complete JSON authority is flushed before the first destination
+    # rename, which makes a SIGKILL at every subsequent instruction recoverable.
+    write_recovery_authority()
+
+    for record in records:
+        if record["original"] == "present":
+            os.replace(record["destination"], record["backup"])
+    sync_backup_phase()
+    for record in records:
+        os.replace(record["stage"], record["destination"])
+
+    verify_committed_generation()
+    clear_recovery_authority()
+except BaseException as exc:
+    rollback_error = None
+    if isinstance(exc, AuthorityClearError):
+        rollback_error = "authority durability is unresolved; recovery payload retained"
+    elif authority_owned and lexists(recovery_marker):
+        try:
+            rollback_records()
+        except BaseException as recovery_exc:
+            rollback_error = recovery_exc
+    elif not authority_owned:
+        for record in records:
+            try:
+                if lexists(record["stage"]):
+                    cleanup_path(record["stage"])
+            except OSError:
+                pass
+    if rollback_error is not None:
+        print(
+            f"CRITICAL: LLDP rollback is incomplete; recovery marker: "
+            f"{recovery_marker}: {rollback_error}",
+            file=sys.stderr,
+        )
+    print(f"LLDP publication failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+# The new generation is fully active. Old copies are cleanup-only now.
+for record in records:
+    backup = record["backup"]
+    if backup is not None and lexists(backup):
+        try:
+            if not regular(backup):
+                raise OSError("backup is no longer a regular file")
+            os.unlink(backup)
+        except OSError as exc:
+            print(f"Warning: obsolete LLDP backup remains at {backup}: {exc}", file=sys.stderr)
+PYTHON
 }
 
 # Total device count for progress
@@ -85,13 +760,16 @@ execute_commands_optimized() {
     local user=$2
     local hostname=$3
     
-    # Single SSH connection collects everything
-    ssh $SSH_OPTS -T -q "$user@$device" "
+    local output_file="$collection_dir/${hostname}_lldp_result.ini"
+    local temporary_file="$collection_dir/.${hostname}.tmp.$$"
+
+    # Single SSH connection collects everything into this run's private tree.
+    if timeout 180 ssh $SSH_OPTS -T -q "$user@$device" "
         echo '=========================================${hostname}========================================='
         echo ''
         
         # LLDP data
-        sudo lldpctl 2>/dev/null
+        sudo lldpctl 2>/dev/null || echo '__LLDPQ_LLDP_COLLECTION_ERROR__'
         
         # Port status
         echo ''
@@ -125,7 +803,26 @@ execute_commands_optimized() {
         done | sort -V
         echo '===PORT_SPEED_END==='
         echo ''
-    " > "lldp-results/${hostname}_lldp_result.ini" 2>/dev/null
+    " > "$temporary_file" 2>/dev/null &&
+       ! grep -q '__LLDPQ_LLDP_COLLECTION_ERROR__' "$temporary_file" &&
+       grep -q '===PORT_STATUS_END===' "$temporary_file"; then
+        mv "$temporary_file" "$output_file"
+        return 0
+    fi
+
+    rm -f "$temporary_file"
+    write_unavailable_lldp_input "$hostname"
+}
+
+write_unavailable_lldp_input() {
+    local hostname="$1"
+    cat > "$collection_dir/${hostname}_lldp_result.ini" <<EOF
+=========================================${hostname}=========================================
+
+__LLDPQ_LLDP_UNAVAILABLE__
+===PORT_STATUS_START===
+===PORT_STATUS_END===
+EOF
 }
 
 process_device() {
@@ -133,9 +830,12 @@ process_device() {
     local user=$2
     local hostname=$3
     
-    ping_test "$device" "$hostname"
-    if [ $? -eq 0 ]; then
-        execute_commands_optimized "$device" "$user" "$hostname"
+    if ping_test "$device" "$hostname"; then
+        execute_commands_optimized "$device" "$user" "$hostname" || return 1
+    else
+        # Keep this inventory member in the current validation input so every
+        # configured topology edge is reported as No-Info, never stale Pass.
+        write_unavailable_lldp_input "$hostname" || return 1
     fi
     
     # Update progress counter (thread-safe with flock)
@@ -151,6 +851,8 @@ process_device() {
 # ============================================================================
 # PARALLEL EXECUTION WITH LIMITS
 # ============================================================================
+collection_dir=$(mktemp -d "$SCRIPT_DIR/lldp-results/.collection.XXXXXX") || exit 1
+chmod 700 "$collection_dir" || exit 1
 echo "Devices: $TOTAL_DEVICES"
 
 job_count=0
@@ -158,7 +860,7 @@ for device in "${!devices[@]}"; do
     IFS=' ' read -r user hostname <<< "${devices[$device]}"
     
     # Start job in background
-    process_device "$device" "$user" "$hostname" &
+    process_device "$device" "$user" "$hostname" 9>&- &
     
     job_count=$((job_count + 1))
     
@@ -175,6 +877,25 @@ wait
 echo ""
 echo ""
 
+# Background exit statuses are not sufficient on every supported Bash
+# version. Verify one complete current input for every inventory member before
+# the validator can replace the aggregate report.
+collection_incomplete=0
+for device in "${!devices[@]}"; do
+    IFS=' ' read -r _user hostname <<< "${devices[$device]}"
+    input_file="$collection_dir/${hostname}_lldp_result.ini"
+    if [[ ! -f "$input_file" || ! -s "$input_file" ]] ||
+       [[ $(grep -Fxc '===PORT_STATUS_START===' "$input_file" 2>/dev/null) -ne 1 ]] ||
+       [[ $(grep -Fxc '===PORT_STATUS_END===' "$input_file" 2>/dev/null) -ne 1 ]]; then
+        echo "Incomplete LLDP collection input for $hostname" >&2
+        collection_incomplete=1
+    fi
+done
+if [[ $collection_incomplete -ne 0 ]]; then
+    echo "LLDP collection was incomplete; previous reports were preserved." >&2
+    exit 1
+fi
+
 # Show unreachable hosts
 if [ -s "$unreachable_hosts_file" ]; then
     echo -e "\e[0;36mUnreachable hosts:\e[0m"
@@ -188,19 +909,20 @@ fi
 
 # Run validation
 echo "Validating..."
-if ! /usr/bin/python3 ./lldp-validate.py; then
+if ! LLDPQ_LLDP_INPUT_DIR="$collection_dir" LLDPQ_LLDP_STAGE_ONLY=1 \
+        /usr/bin/python3 ./lldp-validate.py; then
     echo "LLDP validation/topology generation failed; existing reports and raw inputs were preserved." >&2
     exit 1
 fi
 
-# Process results in private staging; leave previous derived reports intact on
-# any grep/awk/disk failure.
+# Process the staged aggregate; no canonical or web path is touched until every
+# derived report and topology file is ready for one rollback-capable commit.
 postprocess_dir=$(mktemp -d "$SCRIPT_DIR/lldp-results/.post.XXXXXX") || exit 1
 raw_problems="$postprocess_dir/raw-problems-lldp_results.ini"
 problems="$postprocess_dir/problems-lldp_results.ini"
 down="$postprocess_dir/down-lldp_results.ini"
 
-if ! awk '!/Pass/' lldp-results/lldp_results.ini > "$raw_problems"; then
+if ! awk '!/Pass/' "$collection_dir/lldp_results.ini" > "$raw_problems"; then
     echo "Failed to derive LLDP problem input" >&2
     exit 1
 fi
@@ -234,22 +956,25 @@ if ! grep -q "Created on" "$down"; then
     mv "$down.with-header" "$down" || exit 1
 fi
 
-mv "$raw_problems" lldp-results/raw-problems-lldp_results.ini || exit 1
-mv "$problems" lldp-results/problems-lldp_results.ini || exit 1
-mv "$down" lldp-results/down-lldp_results.ini || exit 1
-
-# Copy results to web server
-echo "Copying to web..."
+# Archive the previous problem report before activation. An archive copy is
+# additive; a later transaction failure still leaves every served LKG file.
+echo "Publishing LLDP generation..."
 sudo mkdir -p "$WEB_ROOT/hstr" || exit 1
 if [[ -f "$WEB_ROOT/problems-lldp_results.ini" ]]; then
     publish_web_file \
         "$WEB_ROOT/problems-lldp_results.ini" \
         "$WEB_ROOT/hstr/Problems-${DATE}.ini" || exit 1
 fi
-publish_web_file lldp-results/lldp_results.ini "$WEB_ROOT/lldp_results.ini" || exit 1
-publish_web_file \
-    lldp-results/problems-lldp_results.ini \
-    "$WEB_ROOT/problems-lldp_results.ini" || exit 1
+if ! commit_lldp_outputs; then
+    echo "LLDP generation was not activated; last-known-good files were preserved." >&2
+    exit 1
+fi
+
+# Remove obsolete top-level raw inputs from versions predating private staging,
+# but only after the new local+web+topology generation is fully active.
+find "$SCRIPT_DIR/lldp-results" -maxdepth 1 -type f \
+    -name '*_lldp_result.ini' -delete || \
+    echo "Warning: one or more legacy LLDP raw files could not be removed" >&2
 
 # Cleanup old history files (keep 1 per day for last 30 days)
 folder_path="$WEB_ROOT/hstr"

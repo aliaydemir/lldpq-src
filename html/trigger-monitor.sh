@@ -26,11 +26,17 @@ fi
 
 # Create trigger file for monitor.sh
 TRIGGER_FILE="/tmp/.monitor_web_trigger"
+TRIGGER_NOW=$(date +%s%N 2>/dev/null || true)
+[[ "$TRIGGER_NOW" =~ ^[0-9]+$ ]] || TRIGGER_NOW="$(date +%s)000000000"
+TRIGGER_VALUE="${TRIGGER_NOW}.$$.$RANDOM"
+TRIGGER_TEMP="${TRIGGER_FILE}.tmp.$$.$RANDOM"
 
 # Try to create the trigger file
-if echo "$(date +%s)" > "$TRIGGER_FILE" 2>/dev/null; then
+if printf '%s\n' "$TRIGGER_VALUE" > "$TRIGGER_TEMP" 2>/dev/null &&
+   mv -f "$TRIGGER_TEMP" "$TRIGGER_FILE" 2>/dev/null; then
     echo '{"status": "success", "message": "Monitor analysis triggered successfully"}'
 else
+    rm -f "$TRIGGER_TEMP" 2>/dev/null || true
     echo '{"status": "error", "message": "Failed to create trigger file"}'
     exit 1
-fi 
+fi

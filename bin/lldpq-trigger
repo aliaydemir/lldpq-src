@@ -3,20 +3,86 @@
 # Add to crontab: * * * * * /usr/local/bin/lldpq-trigger
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
-# Load config
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Load config.  This daemon controls every web-triggered refresh, so continuing
+# with $HOME/lldpq after a partial upgrade makes the UI appear to accept work
+# that can never run.  Treat the installed helper and config as required.
+trigger_fatal() {
+    printf 'lldpq-trigger: ERROR: %s\n' "$*" >&2
+    exit 1
+}
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+[[ -x "$LLDPQ_CONFIG_HELPER" ]] || \
+    trigger_fatal "required config helper is missing: $LLDPQ_CONFIG_HELPER"
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
+    2>/dev/null); then
+    trigger_fatal "required runtime configuration is missing or unreadable"
 fi
+eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
+    trigger_fatal "runtime configuration could not be applied"
+unset LLDPQ_CONFIG_ASSIGNMENTS
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
 LLDP_TRIGGER_FILE="/tmp/.lldp_web_trigger"
 MONITOR_TRIGGER_FILE="/tmp/.monitor_web_trigger"
 ASSETS_TRIGGER_FILE="/tmp/.assets_web_trigger"
 CONFIGS_TRIGGER_FILE="/tmp/.configs_web_trigger"
+TRANSCEIVER_TRIGGER_FILE="/tmp/.transceiver_web_trigger"
 DAEMON_PID_FILE="/tmp/lldp_trigger_daemon.pid"
 LLDP_LOCK_FILE="/tmp/lldp_running.lock"
 ASSETS_LOCK_FILE="/tmp/assets_running.lock"
 CONFIGS_LOCK_FILE="/tmp/configs_running.lock"
 MONITOR_LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+
+# Failed config collections remain pending, but use a bounded exponential
+# backoff instead of launching a full-fabric ping/SSH sweep every three seconds.
+CONFIGS_RETRY_BASE_SECONDS="${LLDPQ_CONFIG_RETRY_BASE_SECONDS:-30}"
+CONFIGS_RETRY_MAX_SECONDS="${LLDPQ_CONFIG_RETRY_MAX_SECONDS:-300}"
+case "$CONFIGS_RETRY_BASE_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_CONFIG_RETRY_BASE_SECONDS" ;;
+esac
+case "$CONFIGS_RETRY_MAX_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_CONFIG_RETRY_MAX_SECONDS" ;;
+esac
+if (( CONFIGS_RETRY_MAX_SECONDS < CONFIGS_RETRY_BASE_SECONDS )); then
+    CONFIGS_RETRY_MAX_SECONDS="$CONFIGS_RETRY_BASE_SECONDS"
+fi
+
+next_config_retry_delay() {
+    local current="$1" maximum="$2" doubled
+    doubled=$((current * 2))
+    if (( doubled > maximum || doubled < current )); then
+        printf '%s\n' "$maximum"
+    else
+        printf '%s\n' "$doubled"
+    fi
+}
+
+# Trigger identities are opaque, atomic tokens.  Seconds-only mtimes collapse
+# two clicks made in the same second; storing the producer token losslessly
+# also lets a click during a long-running refresh remain pending for the next
+# loop iteration.
+write_trigger_timestamp() {
+    local destination="$1" value="$2" temporary
+    temporary="${destination}.tmp.$$"
+    if ! printf '%s\n' "$value" > "$temporary" ||
+       ! mv -f "$temporary" "$destination"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+read_trigger_timestamp() {
+    local source_file="$1" value=0
+    if [[ -f "$source_file" ]]; then
+        value=$(cat "$source_file" 2>/dev/null) || value=0
+    fi
+    [[ "$value" =~ ^[0-9]+([.:-][0-9]+)*$ ]] || value=0
+    printf '%s\n' "$value"
+}
+
+if [[ "${LLDPQ_TRIGGER_LIB_ONLY:-false}" == "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # Exit if daemon already running
 if [ -f "$DAEMON_PID_FILE" ]; then
@@ -34,6 +100,9 @@ echo $$ > "$DAEMON_PID_FILE"
 
 # Cleanup function - only remove PID file if it belongs to us
 cleanup() {
+    if [ -f "$CONFIGS_LOCK_FILE" ] && [ "$(cat "$CONFIGS_LOCK_FILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$CONFIGS_LOCK_FILE"
+    fi
     if [ -f "$DAEMON_PID_FILE" ] && [ "$(cat "$DAEMON_PID_FILE" 2>/dev/null)" = "$$" ]; then
         rm -f "$DAEMON_PID_FILE"
     fi
@@ -77,9 +146,31 @@ refresh_assets() {
 
 refresh_monitor() {
     cd "$LLDPQ_DIR" || return 1
+    export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+    export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
     wait_until_not_running "./assets.sh"
     ./assets.sh >/dev/null 2>&1 || return 1
+    wait_until_not_running "./check-lldp.sh"
+    ./check-lldp.sh >/dev/null 2>&1 || return 1
+    if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
+        return 1
+    fi
     LLDPQ_MONITOR_LOCK_HELD=1 ./monitor.sh >/dev/null 2>&1
+}
+
+refresh_configs() {
+    cd "$LLDPQ_DIR" || return 1
+    # The collector's full-run flock is authoritative. A concurrent cron or
+    # manual run returns 75 here and remains pending for bounded retry.
+    ./get-configs.sh >/dev/null 2>&1
+}
+
+refresh_transceiver() {
+    cd "$LLDPQ_DIR" || return 1
+    # On-demand transceiver firmware sweep. collect-transceiver-fw.sh holds its
+    # own flock + minimum-interval and runs independently of the monitor lock,
+    # so a long mlxlink pass never blocks the LLDP/monitor/assets/configs paths.
+    ./collect-transceiver-fw.sh >/dev/null 2>&1
 }
 
 # Main daemon loop - check every 5 seconds
@@ -87,24 +178,25 @@ LLDP_LAST_CHECK_FILE="$LLDPQ_DIR/.last_lldp_trigger_check"
 MONITOR_LAST_CHECK_FILE="$LLDPQ_DIR/.last_monitor_trigger_check"
 ASSETS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_assets_trigger_check"
 CONFIGS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_configs_trigger_check"
+TRANSCEIVER_LAST_CHECK_FILE="$LLDPQ_DIR/.last_transceiver_trigger_check"
+CONFIGS_PENDING_TRIGGER_TIME=0
+CONFIGS_NEXT_RETRY_AT=0
+CONFIGS_RETRY_DELAY="$CONFIGS_RETRY_BASE_SECONDS"
 
 while true; do
     # Check LLDP trigger
-    LLDP_LAST_CHECK=0
-    if [ -f "$LLDP_LAST_CHECK_FILE" ]; then
-        LLDP_LAST_CHECK=$(cat "$LLDP_LAST_CHECK_FILE")
-    fi
+    LLDP_LAST_CHECK=$(read_trigger_timestamp "$LLDP_LAST_CHECK_FILE")
 
     if [ -f "$LLDP_TRIGGER_FILE" ]; then
-        LLDP_TRIGGER_TIME=$(stat -c %Y "$LLDP_TRIGGER_FILE" 2>/dev/null || stat -f %m "$LLDP_TRIGGER_FILE" 2>/dev/null || echo 0)
+        LLDP_TRIGGER_TIME=$(read_trigger_timestamp "$LLDP_TRIGGER_FILE")
         
-        if [ "$LLDP_TRIGGER_TIME" -gt "$LLDP_LAST_CHECK" ]; then
+        if [[ "$LLDP_TRIGGER_TIME" != "0" && "$LLDP_TRIGGER_TIME" != "$LLDP_LAST_CHECK" ]]; then
             if [ -f "$LLDP_LOCK_FILE" ] && kill -0 "$(cat "$LLDP_LOCK_FILE")" 2>/dev/null; then
                 : # LLDP check already running, skipping trigger
             else
                 echo $$ > "$LLDP_LOCK_FILE"
                 if run_under_monitor_lock refresh_lldp; then
-                    echo "$LLDP_TRIGGER_TIME" > "$LLDP_LAST_CHECK_FILE"
+                    write_trigger_timestamp "$LLDP_LAST_CHECK_FILE" "$LLDP_TRIGGER_TIME"
                 fi
                 rm -f "$LLDP_LOCK_FILE"
             fi
@@ -112,37 +204,31 @@ while true; do
     fi
 
     # Check Monitor trigger
-    MONITOR_LAST_CHECK=0
-    if [ -f "$MONITOR_LAST_CHECK_FILE" ]; then
-        MONITOR_LAST_CHECK=$(cat "$MONITOR_LAST_CHECK_FILE")
-    fi
+    MONITOR_LAST_CHECK=$(read_trigger_timestamp "$MONITOR_LAST_CHECK_FILE")
 
     if [ -f "$MONITOR_TRIGGER_FILE" ]; then
-        MONITOR_TRIGGER_TIME=$(stat -c %Y "$MONITOR_TRIGGER_FILE" 2>/dev/null || stat -f %m "$MONITOR_TRIGGER_FILE" 2>/dev/null || echo 0)
+        MONITOR_TRIGGER_TIME=$(read_trigger_timestamp "$MONITOR_TRIGGER_FILE")
         
-        if [ "$MONITOR_TRIGGER_TIME" -gt "$MONITOR_LAST_CHECK" ]; then
+        if [[ "$MONITOR_TRIGGER_TIME" != "0" && "$MONITOR_TRIGGER_TIME" != "$MONITOR_LAST_CHECK" ]]; then
             if run_under_monitor_lock refresh_monitor; then
-                echo "$MONITOR_TRIGGER_TIME" > "$MONITOR_LAST_CHECK_FILE"
+                write_trigger_timestamp "$MONITOR_LAST_CHECK_FILE" "$MONITOR_TRIGGER_TIME"
             fi
         fi
     fi
 
     # Check Assets trigger
-    ASSETS_LAST_CHECK=0
-    if [ -f "$ASSETS_LAST_CHECK_FILE" ]; then
-        ASSETS_LAST_CHECK=$(cat "$ASSETS_LAST_CHECK_FILE")
-    fi
+    ASSETS_LAST_CHECK=$(read_trigger_timestamp "$ASSETS_LAST_CHECK_FILE")
 
     if [ -f "$ASSETS_TRIGGER_FILE" ]; then
-        ASSETS_TRIGGER_TIME=$(stat -c %Y "$ASSETS_TRIGGER_FILE" 2>/dev/null || stat -f %m "$ASSETS_TRIGGER_FILE" 2>/dev/null || echo 0)
+        ASSETS_TRIGGER_TIME=$(read_trigger_timestamp "$ASSETS_TRIGGER_FILE")
         
-        if [ "$ASSETS_TRIGGER_TIME" -gt "$ASSETS_LAST_CHECK" ]; then
+        if [[ "$ASSETS_TRIGGER_TIME" != "0" && "$ASSETS_TRIGGER_TIME" != "$ASSETS_LAST_CHECK" ]]; then
             if [ -f "$ASSETS_LOCK_FILE" ] && kill -0 "$(cat "$ASSETS_LOCK_FILE")" 2>/dev/null; then
                 : # Assets refresh already running, skipping trigger
             else
                 echo $$ > "$ASSETS_LOCK_FILE"
                 if run_under_monitor_lock refresh_assets; then
-                    echo "$ASSETS_TRIGGER_TIME" > "$ASSETS_LAST_CHECK_FILE"
+                    write_trigger_timestamp "$ASSETS_LAST_CHECK_FILE" "$ASSETS_TRIGGER_TIME"
                 fi
                 rm -f "$ASSETS_LOCK_FILE"
             fi
@@ -150,30 +236,59 @@ while true; do
     fi
 
     # Check Config collection trigger
-    CONFIGS_LAST_CHECK=0
-    if [ -f "$CONFIGS_LAST_CHECK_FILE" ]; then
-        CONFIGS_LAST_CHECK=$(cat "$CONFIGS_LAST_CHECK_FILE")
-    fi
+    CONFIGS_LAST_CHECK=$(read_trigger_timestamp "$CONFIGS_LAST_CHECK_FILE")
 
     if [ -f "$CONFIGS_TRIGGER_FILE" ]; then
-        CONFIGS_TRIGGER_TIME=$(stat -c %Y "$CONFIGS_TRIGGER_FILE" 2>/dev/null || stat -f %m "$CONFIGS_TRIGGER_FILE" 2>/dev/null || echo 0)
+        CONFIGS_TRIGGER_TIME=$(read_trigger_timestamp "$CONFIGS_TRIGGER_FILE")
 
-        if [ "$CONFIGS_TRIGGER_TIME" -gt "$CONFIGS_LAST_CHECK" ]; then
-            if [ -f "$CONFIGS_LOCK_FILE" ] && kill -0 "$(cat "$CONFIGS_LOCK_FILE")" 2>/dev/null; then
+        if [[ "$CONFIGS_TRIGGER_TIME" != "0" && "$CONFIGS_TRIGGER_TIME" != "$CONFIGS_LAST_CHECK" ]]; then
+            if [ "$CONFIGS_PENDING_TRIGGER_TIME" != "$CONFIGS_TRIGGER_TIME" ]; then
+                # A new click is attempted immediately even if an older failed
+                # request is currently in its retry window.
+                CONFIGS_PENDING_TRIGGER_TIME="$CONFIGS_TRIGGER_TIME"
+                CONFIGS_NEXT_RETRY_AT=0
+                CONFIGS_RETRY_DELAY="$CONFIGS_RETRY_BASE_SECONDS"
+            fi
+            CONFIGS_NOW=$(date +%s)
+            if (( CONFIGS_NOW < CONFIGS_NEXT_RETRY_AT )); then
+                : # Pending; bounded retry window has not elapsed yet
+            elif [ -f "$CONFIGS_LOCK_FILE" ] && kill -0 "$(cat "$CONFIGS_LOCK_FILE")" 2>/dev/null; then
                 : # Config collection already running, skipping trigger
             else
-                {
-                    echo $$ > "$CONFIGS_LOCK_FILE"
-                    echo "$CONFIGS_TRIGGER_TIME" > "$CONFIGS_LAST_CHECK_FILE"
-                    cd "$LLDPQ_DIR"
-                    wait_until_not_running "get-configs.sh"
-                    ./get-configs.sh >/dev/null 2>&1
-                    rm -f "$CONFIGS_LOCK_FILE"
-                }
+                echo $$ > "$CONFIGS_LOCK_FILE"
+                if refresh_configs && \
+                   write_trigger_timestamp "$CONFIGS_LAST_CHECK_FILE" "$CONFIGS_TRIGGER_TIME"; then
+                    CONFIGS_PENDING_TRIGGER_TIME=0
+                    CONFIGS_NEXT_RETRY_AT=0
+                    CONFIGS_RETRY_DELAY="$CONFIGS_RETRY_BASE_SECONDS"
+                else
+                    CONFIGS_NOW=$(date +%s)
+                    CONFIGS_NEXT_RETRY_AT=$((CONFIGS_NOW + CONFIGS_RETRY_DELAY))
+                    printf 'lldpq-trigger: config refresh failed; retrying in %ss\n' \
+                        "$CONFIGS_RETRY_DELAY" >&2
+                    CONFIGS_RETRY_DELAY=$(next_config_retry_delay \
+                        "$CONFIGS_RETRY_DELAY" "$CONFIGS_RETRY_MAX_SECONDS")
+                fi
+                rm -f "$CONFIGS_LOCK_FILE"
             fi
         fi
     fi
     
+    # Check Transceiver firmware trigger (on-demand, out-of-band mlxlink sweep)
+    TRANSCEIVER_LAST_CHECK=$(read_trigger_timestamp "$TRANSCEIVER_LAST_CHECK_FILE")
+
+    if [ -f "$TRANSCEIVER_TRIGGER_FILE" ]; then
+        TRANSCEIVER_TRIGGER_TIME=$(read_trigger_timestamp "$TRANSCEIVER_TRIGGER_FILE")
+
+        if [[ "$TRANSCEIVER_TRIGGER_TIME" != "0" && "$TRANSCEIVER_TRIGGER_TIME" != "$TRANSCEIVER_LAST_CHECK" ]]; then
+            # Consume the click immediately; the collector enforces its own lock
+            # and minimum interval and runs in the background so it never blocks
+            # the other triggers during a potentially minutes-long sweep.
+            write_trigger_timestamp "$TRANSCEIVER_LAST_CHECK_FILE" "$TRANSCEIVER_TRIGGER_TIME"
+            refresh_transceiver &
+        fi
+    fi
+
     # Sleep for 3 seconds before next check
     sleep 3
 done

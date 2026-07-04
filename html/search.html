@@ -6,6 +6,7 @@
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <script src="/css/ui-dialogs.js"></script>
+    <script src="/css/auth.js"></script>
     <style>
         * {
             margin: 0;
@@ -431,6 +432,13 @@
             margin: 10px;
             border-radius: 6px;
         }
+
+        .page-error {
+            display: none;
+            margin: 0 0 15px;
+            text-align: left;
+            padding: 12px 15px;
+        }
         
         /* VRF Tabs at top of route table */
         .vrf-tabs-container {
@@ -606,6 +614,7 @@
         </div>
         <div id="scanStatus" class="scan-status"></div>
     </div>
+    <div id="pageError" class="error-message page-error" role="alert"></div>
     
     <!-- Global Search -->
     <div class="global-search-container">
@@ -627,31 +636,31 @@
     
     <!-- Tabs -->
     <div class="tabs">
-        <button class="tab active" onclick="switchTab('mac')">
+        <button class="tab active" onclick="switchTab(event, 'mac')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M4 1h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1m0 8h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1m0 8h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/>
             </svg>
             MAC
         </button>
-        <button class="tab" onclick="switchTab('arp')">
+        <button class="tab" onclick="switchTab(event, 'arp')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
             </svg>
             ARP
         </button>
-        <button class="tab" onclick="switchTab('vtep')">
+        <button class="tab" onclick="switchTab(event, 'vtep')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
             VTEP
         </button>
-        <button class="tab" onclick="switchTab('route')">
+        <button class="tab" onclick="switchTab(event, 'route')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22L14 6z"/>
             </svg>
             Routes
         </button>
-        <button class="tab" onclick="switchTab('lldp')">
+        <button class="tab" onclick="switchTab(event, 'lldp')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
             </svg>
@@ -849,6 +858,46 @@
                 "'": '&#39;'
             })[character]);
         }
+
+        function showPageError(message) {
+            const pageError = document.getElementById('pageError');
+            pageError.textContent = message;
+            pageError.style.display = 'block';
+        }
+
+        function clearPageError() {
+            const pageError = document.getElementById('pageError');
+            pageError.textContent = '';
+            pageError.style.display = 'none';
+        }
+
+        async function apiFetchJson(url, options = {}) {
+            const response = await fetch(url, options);
+            let data;
+            try {
+                data = await response.json();
+            } catch (error) {
+                throw new Error('The server returned an invalid response.');
+            }
+
+            const sessionFailure = response.status === 401 ||
+                (data && data.success === false &&
+                 (data.error === 'Not authenticated' || data.error === 'Session expired'));
+            if (sessionFailure) {
+                const error = new Error(data.error || 'Session expired');
+                error.isAuthError = true;
+                showPageError('Your session has expired. Redirecting to login...');
+                LLDPqAuth.redirectToLogin();
+                throw error;
+            }
+            if (response.status === 403) {
+                throw new Error(data.error || 'You do not have permission for this action.');
+            }
+            if (!response.ok) {
+                throw new Error(data.error || `Request failed (HTTP ${response.status}).`);
+            }
+            return data;
+        }
         
         function setLastUpdated() {
             const now = new Date();
@@ -859,7 +908,7 @@
             document.getElementById('last-updated').textContent = now.toLocaleString('en-US', options);
         }
         
-        function switchTab(tabName) {
+        function switchTab(event, tabName) {
             // Update tab buttons
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             event.target.closest('.tab').classList.add('active');
@@ -937,25 +986,26 @@
         // Load device list for dropdowns
         async function loadDeviceList() {
             try {
-                const response = await fetch('search-api.sh?action=list-devices');
-                const data = await response.json();
-                
-                if (data.success && data.devices) {
-                    const selects = ['macDeviceSelect', 'arpDeviceSelect', 'vtepDeviceSelect', 'routeDeviceSelect', 'lldpDeviceSelect'];
-                    
-                    selects.forEach(selectId => {
-                        const select = document.getElementById(selectId);
-                        if (select) {
-                            data.devices.forEach(device => {
-                                select.add(new Option(device.hostname, device.ip));
-                            });
-                            // Sync device selection across all tabs
-                            select.addEventListener('change', () => syncDeviceSelect(selectId));
-                        }
-                    });
+                const data = await apiFetchJson('search-api.sh?action=list-devices');
+                if (!data.success || !Array.isArray(data.devices)) {
+                    throw new Error(data.error || 'Device inventory could not be loaded.');
                 }
+
+                const selects = ['macDeviceSelect', 'arpDeviceSelect', 'vtepDeviceSelect', 'routeDeviceSelect', 'lldpDeviceSelect'];
+                selects.forEach(selectId => {
+                    const select = document.getElementById(selectId);
+                    if (!select) return;
+                    data.devices.forEach(device => {
+                        select.add(new Option(device.hostname, device.ip));
+                    });
+                    // Sync device selection across all tabs
+                    select.addEventListener('change', () => syncDeviceSelect(selectId));
+                });
             } catch (error) {
                 console.error('Failed to load device list:', error);
+                if (!error.isAuthError) {
+                    showPageError('Device inventory could not be loaded: ' + error.message);
+                }
             }
         }
         
@@ -986,8 +1036,7 @@
                             (device ? '&device=' + encodeURIComponent(device) : '') +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
-                const response = await fetch(url);
-                const data = await response.json();
+                const data = await apiFetchJson(url);
                 
                 if (data.success) {
                     // Filter out vxlan interfaces (remote learned MACs)
@@ -1045,8 +1094,7 @@
                             (device ? '&device=' + encodeURIComponent(device) : '') +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
-                const response = await fetch(url);
-                const data = await response.json();
+                const data = await apiFetchJson(url);
                 
                 if (data.success) {
                     currentArpData = data.entries;
@@ -1106,8 +1154,7 @@
                 const url = 'search-api.sh?action=get-vtep&device=' + encodeURIComponent(device) +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
-                const response = await fetch(url);
-                const data = await response.json();
+                const data = await apiFetchJson(url);
                 
                 if (data.success) {
                     const summary = data.summary || {};
@@ -1201,12 +1248,10 @@
                 const isFullIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(searchTerm);
                 const isSubnetSearch = /^\d+\.\d+/.test(searchTerm) && !isFullIp;
                 
-                const [macResponse, arpResponse] = await Promise.all([
-                    fetch('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(searchTerm)),
-                    fetch('search-api.sh?action=search-cached-arp&search=' + encodeURIComponent(searchTerm))
+                [macData, arpData] = await Promise.all([
+                    apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(searchTerm)),
+                    apiFetchJson('search-api.sh?action=search-cached-arp&search=' + encodeURIComponent(searchTerm))
                 ]);
-                macData = await macResponse.json();
-                arpData = await arpResponse.json();
                 
                 // Filter interfaces - vxlan from MAC, VRR from ARP
                 const filterMac = (entries) => entries.filter(e => {
@@ -1265,12 +1310,13 @@
                 if (crossRefMacs.size > 0) {
                     for (const mac of crossRefMacs) {
                         try {
-                            const resp = await fetch('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(mac));
-                            const data = await resp.json();
+                            const data = await apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(mac));
                             if (data.success && data.entries) {
                                 crossRefMacResults.push(...filterMac(data.entries));
                             }
-                        } catch (e) {}
+                        } catch (e) {
+                            if (e.isAuthError) throw e;
+                        }
                     }
                 }
                 
@@ -1335,8 +1381,7 @@
                 let multihomingPeers = [];
                 for (const bondName of (isSubnetSearch ? [] : bondInterfaces)) {
                     try {
-                        const resp = await fetch('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(bondName));
-                        const data = await resp.json();
+                        const data = await apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(bondName));
                         if (data.success && data.entries) {
                             // Get devices that have this bond
                             const bondDevices = new Map();
@@ -1370,7 +1415,9 @@
                                 }
                             }
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        if (e.isAuthError) throw e;
+                    }
                 }
                 
                 // Show multihoming info
@@ -1463,8 +1510,7 @@
                 let hasRouteBestMatch = false;
                 if (isIpSearch) {
                     try {
-                        const routeResp = await fetch('search-api.sh?action=search-cached-routes&search=' + encodeURIComponent(searchTerm));
-                        const routeData = await routeResp.json();
+                        const routeData = await apiFetchJson('search-api.sh?action=search-cached-routes&search=' + encodeURIComponent(searchTerm));
                         
                         if (routeData.success && routeData.vrf_routes && Object.keys(routeData.vrf_routes).length > 0) {
                             hasRouteBestMatch = true;
@@ -1515,6 +1561,7 @@
                             html += '</tbody></table></div>';
                         }
                     } catch (e) {
+                        if (e.isAuthError) throw e;
                         console.error('Route search failed:', e);
                     }
                 }
@@ -1539,7 +1586,6 @@
         // Store route data for VRF filtering
         let currentRouteData = null;
         let currentRouteVrf = 'all';
-        let fullRouteData = null; // Store full route table for best match search
         
         // VRF sorting function - default first, then alphabetical
         function sortVrfs(vrfNames) {
@@ -1569,70 +1615,10 @@
             return colors[Math.abs(hash) % colors.length];
         }
         
-        // IP prefix matching helper functions
-        function ipToLong(ip) {
-            const parts = ip.split('.').map(Number);
-            return ((parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
-        }
-        
-        function isIpInPrefix(ip, prefix) {
-            // Parse prefix like "192.168.1.0/24"
-            const [network, maskStr] = prefix.split('/');
-            if (!maskStr) return false;
-            
-            const mask = parseInt(maskStr);
-            if (mask < 0 || mask > 32) return false;
-            
-            const ipLong = ipToLong(ip);
-            const networkLong = ipToLong(network);
-            const maskBits = mask === 0 ? 0 : (0xFFFFFFFF << (32 - mask)) >>> 0;
-            
-            return (ipLong & maskBits) === (networkLong & maskBits);
-        }
-        
-        function findBestMatchRoutes(searchIp, routeData) {
-            // Find the best matching route (longest prefix match) per VRF
-            // Show all VRFs, with "No Route" for those without a match
-            const bestMatches = {};
-            
-            if (!routeData || !routeData.vrf_tables) return bestMatches;
-            
-            // Check if searchIp is a valid IP (not a prefix search)
-            const ipMatch = searchIp.match(/^(\d+\.\d+\.\d+\.\d+)/);
-            if (!ipMatch) return bestMatches;
-            
-            const ip = ipMatch[1];
-            
-            for (const vrf of (routeData.vrf_order || [])) {
-                const routes = routeData.vrf_tables[vrf] || [];
-                let bestMatch = null;
-                let longestPrefix = -1;
-                
-                for (const route of routes) {
-                    if (!route.prefix) continue;
-                    
-                    const [, maskStr] = route.prefix.split('/');
-                    const mask = parseInt(maskStr || '32');
-                    
-                    if (isIpInPrefix(ip, route.prefix) && mask > longestPrefix) {
-                        longestPrefix = mask;
-                        bestMatch = { ...route, vrf };
-                    }
-                }
-                
-                if (bestMatch) {
-                    bestMatches[vrf] = bestMatch;
-                } else {
-                    // No matching route for this VRF - mark as "No Route"
-                    bestMatches[vrf] = { prefix: 'No Route', nexthop: '-', interface: '-', protocol: '-', vrf, no_route: true };
-                }
-            }
-            
-            return bestMatches;
-        }
-        
-        function renderBestMatchResults(searchIp, bestMatches, container) {
-            const vrfs = sortVrfs(Object.keys(bestMatches));
+        function renderBestMatchResults(searchIp, bestMatches, bestMatchOrder = []) {
+            const vrfs = bestMatchOrder.length > 0
+                ? bestMatchOrder.filter(vrf => Object.prototype.hasOwnProperty.call(bestMatches, vrf))
+                : sortVrfs(Object.keys(bestMatches));
             if (vrfs.length === 0) {
                 return '<div class="status-message">No routes found for ' + escapeHtml(searchIp) + '</div>';
             }
@@ -1683,39 +1669,24 @@
                 const url = 'search-api.sh?action=get-route&device=' + encodeURIComponent(device) +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
-                const response = await fetch(url);
-                const data = await response.json();
+                const data = await apiFetchJson(url);
                 
                 if (data.success) {
                     currentRouteData = data;
                     currentRouteVrf = 'all';
                     
-                    resultCount.textContent = data.total + ' routes';
-                    
                     if (data.total === 0 || !data.vrf_order || data.vrf_order.length === 0) {
-                        // No exact match - try to find best match
-                        if (search && /^\d+\.\d+\.\d+\.\d+/.test(search)) {
-                            // Load full routing table for best match search
-                            results.innerHTML = '<div class="loading-message">Searching for best matching route...</div>';
-                            try {
-                                const fullUrl = 'search-api.sh?action=get-route&device=' + encodeURIComponent(device);
-                                const fullResp = await fetch(fullUrl);
-                                const fullData = await fullResp.json();
-                                
-                                if (fullData.success && fullData.total > 0) {
-                                    fullRouteData = fullData;
-                                    const bestMatches = findBestMatchRoutes(search, fullData);
-                                    
-                                    if (Object.keys(bestMatches).length > 0) {
-                                        results.innerHTML = renderBestMatchResults(search, bestMatches);
-                                        resultCount.textContent = 'Best match';
-                                        vrfTabsContainer.style.display = 'none';
-                                        return;
-                                    }
-                                }
-                            } catch (e) {
-                                console.error('Best match search failed:', e);
-                            }
+                        // The API computes LPM from the complete collected route
+                        // set and returns only one bounded result per VRF.
+                        if (search && data.best_matches && Object.keys(data.best_matches).length > 0) {
+                            results.innerHTML = renderBestMatchResults(
+                                search,
+                                data.best_matches,
+                                data.best_match_order || []
+                            );
+                            resultCount.textContent = 'Best match';
+                            vrfTabsContainer.style.display = 'none';
+                            return;
                         }
                         results.innerHTML = '<div class="status-message">No routes found</div>';
                         vrfTabsContainer.style.display = 'none';
@@ -1741,7 +1712,10 @@
 
                     addVrfTab('all', 'All', data.total, true);
                     data.vrf_order.forEach(vrf => {
-                        addVrfTab(vrf, vrf, (data.vrf_tables[vrf] || []).length);
+                        const count = data.vrf_counts && Number.isFinite(data.vrf_counts[vrf])
+                            ? data.vrf_counts[vrf]
+                            : (data.vrf_tables[vrf] || []).length;
+                        addVrfTab(vrf, vrf, count);
                     });
                     vrfTabsContainer.style.display = 'block';
                     
@@ -1778,12 +1752,22 @@
             const resultCount = document.getElementById('routeResultCount');
             
             let vrfsToShow = selectedVrf === 'all' ? data.vrf_order : [selectedVrf];
-            let totalRoutes = 0;
-            vrfsToShow.forEach(vrf => {
-                totalRoutes += (data.vrf_tables[vrf] || []).length;
-            });
-            
-            resultCount.textContent = totalRoutes + ' routes' + (selectedVrf !== 'all' ? ' in ' + selectedVrf : '');
+            const returnedRoutes = vrfsToShow.reduce(
+                (count, vrf) => count + (data.vrf_tables[vrf] || []).length,
+                0
+            );
+            const totalRoutes = vrfsToShow.reduce(
+                (count, vrf) => count + (
+                    data.vrf_counts && Number.isFinite(data.vrf_counts[vrf])
+                        ? data.vrf_counts[vrf]
+                        : (data.vrf_tables[vrf] || []).length
+                ),
+                0
+            );
+            const routeScope = selectedVrf !== 'all' ? ' in ' + selectedVrf : '';
+            resultCount.textContent = returnedRoutes < totalRoutes
+                ? `Showing ${returnedRoutes} of ${totalRoutes} routes${routeScope}`
+                : `${totalRoutes} routes${routeScope}`;
             
             let html = '';
             
@@ -1821,10 +1805,17 @@
                 data.vrf_order.forEach(vrf => {
                     const routes = data.vrf_tables[vrf] || [];
                     if (routes.length === 0) return;
+                    const vrfTotal = data.vrf_counts && Number.isFinite(data.vrf_counts[vrf])
+                        ? data.vrf_counts[vrf]
+                        : routes.length;
                     
                     html += '<div class="vrf-section">';
                     html += '<div class="section-header"><span class="section-title" style="color: var(--primary-green);">VRF: ' + escapeHtml(vrf) + '</span>';
-                    html += '<span class="result-count">' + routes.length + ' routes</span></div>';
+                    html += '<span class="result-count">' + (
+                        routes.length < vrfTotal
+                            ? 'Showing ' + routes.length + ' of ' + vrfTotal + ' routes'
+                            : routes.length + ' routes'
+                    ) + '</span></div>';
                     html += '<table class="data-table" id="routeTable' + tableIdx + '"><thead><tr>';
                     html += '<th>Prefix<span class="sort-icon"></span></th>';
                     html += '<th>Next Hop<span class="sort-icon"></span></th>';
@@ -1877,8 +1868,7 @@
                 const url = 'search-api.sh?action=get-lldp&device=' + encodeURIComponent(device) +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
-                const response = await fetch(url);
-                const data = await response.json();
+                const data = await apiFetchJson(url);
                 
                 if (data.success) {
                     resultCount.textContent = data.entries.length + ' neighbors';
@@ -1954,8 +1944,7 @@
         // Check scan status
         async function checkScanStatus() {
             try {
-                const response = await fetch('search-api.sh?action=scan-status');
-                const data = await response.json();
+                const data = await apiFetchJson('search-api.sh?action=scan-status');
                 const statusSpan = document.getElementById('scanStatus');
                 
                 if (data.success && data.timestamp) {
@@ -1970,15 +1959,18 @@
                     statusSpan.innerHTML = '<span style="color:#f59e0b;">No cached data</span>';
                 }
             } catch (e) {
-                document.getElementById('scanStatus').innerHTML = '';
+                if (!e.isAuthError) {
+                    document.getElementById('scanStatus').textContent = 'Status unavailable';
+                }
             }
         }
         
         // Init
-        window.onload = function() {
+        window.onload = async function() {
             setLastUpdated();
-            loadDeviceList();
-            checkScanStatus();
+            if (!await LLDPqAuth.check()) return;
+            clearPageError();
+            await Promise.all([loadDeviceList(), checkScanStatus()]);
         };
     </script>
 </body>

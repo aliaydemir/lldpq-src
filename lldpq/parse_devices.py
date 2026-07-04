@@ -99,14 +99,14 @@ def get_all_devices(config):
             if role:
                 role = str(role).lower()
         else:
-            print(f"WARNING: Invalid device config for {ip}, skipping", file=sys.stderr)
-            continue
+            print(f"ERROR: Invalid device config for {ip}", file=sys.stderr)
+            sys.exit(1)
         
         fields = {
-            'address': str(ip),
-            'username': str(username),
-            'hostname': str(hostname),
-            'role': str(role) if role is not None else '',
+            'address': str(ip).strip(),
+            'username': str(username).strip(),
+            'hostname': str(hostname).strip(),
+            'role': str(role).strip() if role is not None else '',
         }
         invalid_field = next(
             (name for name, value in fields.items()
@@ -115,8 +115,8 @@ def get_all_devices(config):
         )
         if invalid_field:
             print(
-                f"ERROR: Device {fields['address']!r} has unsupported control characters "
-                f"in {invalid_field}",
+                f"ERROR: Device {fields['address']!r} has unsupported control "
+                f"characters in {invalid_field}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -127,13 +127,19 @@ def get_all_devices(config):
                 file=sys.stderr,
             )
             sys.exit(1)
-        if not re.fullmatch(r'[A-Za-z0-9_.@-]+', fields['username']):
+        # Keep common legacy SSH principals such as DOMAIN\user and user+tag.
+        # Values are transported as NUL-delimited data and passed as quoted
+        # argv, so these characters no longer require generated-shell output.
+        if not re.fullmatch(r'[A-Za-z0-9_.@+\\-]+', fields['username']):
             print(
                 f"ERROR: Invalid SSH username for device {fields['address']!r}",
                 file=sys.stderr,
             )
             sys.exit(1)
-        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', fields['hostname'])
+        # Parentheses are safe in quoted argv/file operations and occurred in
+        # older inventories. Whitespace remains rejected because assets.ini and
+        # freshness/report parsers use whitespace-delimited hostname fields.
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', fields['hostname'])
                 or '..' in fields['hostname']):
             print(
                 f"ERROR: Invalid hostname for device {fields['address']!r}: "

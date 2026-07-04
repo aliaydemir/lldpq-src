@@ -166,6 +166,10 @@
             color: #f44336;
         }
         
+        .tooltip-row.is-warning {
+            color: #ff9800;
+        }
+        
         .tooltip-row .source {
             color: #888;
         }
@@ -203,6 +207,20 @@
         .section-title:hover {
             color: #8bd400;
         }
+
+        .section-title-link {
+            color: inherit;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            text-decoration: none;
+        }
+
+        .section-title-link:focus-visible,
+        .summary-card:focus-visible {
+            outline: 2px solid #76b900;
+            outline-offset: 2px;
+        }
         
         .section-content {
             padding: 16px;
@@ -216,11 +234,14 @@
         }
         
         .summary-card {
+            display: block;
             background: #252526;
             padding: 15px;
             border-radius: 6px;
             border-left: 3px solid #76b900;
+            color: inherit;
             cursor: pointer;
+            text-decoration: none;
             transition: all 0.2s ease;
         }
         
@@ -309,7 +330,7 @@
                 </div>
                 <div class="stat-item" id="critical-issues-container" onclick="window.location.href='lldp-problem.html'" style="position: relative; cursor: pointer;">
                     <div class="stat-value" id="critical-issues">--</div>
-                    <div class="stat-label">Critical Issues</div>
+                    <div class="stat-label">Open Issues</div>
                     <div class="critical-tooltip" id="critical-tooltip"></div>
                 </div>
             </div>
@@ -570,33 +591,27 @@
         <!-- Duplicate Address Analysis Section -->
         <div class="analysis-section">
             <div class="section-header">
-                <h2 class="section-title" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
-                    Duplicate Address Analysis
+                <h2 class="section-title">
+                    <a class="section-title-link" href="/monitor-results/duplicate-analysis.html">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
+                        Duplicate Address Analysis
+                    </a>
                 </h2>
             </div>
             <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card card-critical" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <div class="card-value status-critical" id="dup-ip-active">--</div>
+                <a class="summary-card card-critical" href="/monitor-results/duplicate-analysis.html">
+                    <div class="card-value status-critical" id="dup-active-ip">--</div>
                     <div class="card-label">Active IP Duplicates</div>
-                </div>
-                <div class="summary-card card-warning" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <div class="card-value status-warning" id="dup-ip-quiesced">--</div>
+                </a>
+                <a class="summary-card card-warning" href="/monitor-results/duplicate-analysis.html">
+                    <div class="card-value status-warning" id="dup-quiesced-ip">--</div>
                     <div class="card-label">Quiesced IP Duplicates</div>
-                </div>
-                <div class="summary-card card-critical" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <div class="card-value status-critical" id="dup-mac">--</div>
+                </a>
+                <a class="summary-card card-info" id="dup-mac-card" href="/monitor-results/duplicate-analysis.html">
+                    <div class="card-value status-info" id="dup-mac">--</div>
                     <div class="card-label">MAC Duplicates</div>
-                </div>
-                <div class="summary-card card-warning" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <div class="card-value status-warning" id="dup-apipa">--</div>
-                    <div class="card-label">APIPA (DHCP Failed)</div>
-                </div>
-                <div class="summary-card card-info" onclick="window.location.href='/monitor-results/duplicate-analysis.html'">
-                    <div class="card-value status-info" id="dup-vlans">--</div>
-                    <div class="card-label">VLANs Affected</div>
-                </div>
+                </a>
             </div>
             </div>
         </div>
@@ -661,6 +676,10 @@
                     <div class="card-value status-warning" id="optical-warning">0</div>
                     <div class="card-label">Warning</div>
                 </div>
+                <div class="summary-card card-warning" onclick="window.location.href='monitor-results/optical-analysis.html'">
+                    <div class="card-value status-warning" id="optical-down">0</div>
+                    <div class="card-label">Down</div>
+                </div>
                 <div class="summary-card card-critical" onclick="window.location.href='monitor-results/optical-analysis.html'">
                     <div class="card-value status-critical" id="optical-critical">187</div>
                     <div class="card-label">Critical</div>
@@ -707,9 +726,41 @@
     </div>
 
     <script>
-        // Set last updated time
-        function setLastUpdated() {
-            const now = new Date();
+        let dashboardPipelineState = { marker: null, manifest: null };
+
+        function noCacheUrl(path) {
+            return path + (path.includes('?') ? '&' : '?') + '_=' + Date.now();
+        }
+
+        function parsePipelineMarker(text) {
+            const marker = {};
+            String(text || '').split(/\r?\n/).forEach(line => {
+                const separator = line.indexOf('=');
+                if (separator > 0) marker[line.slice(0, separator)] = line.slice(separator + 1);
+            });
+            return marker;
+        }
+
+        async function readDashboardPipelineState() {
+            let marker = null;
+            let manifest = null;
+            try {
+                const response = await fetch(noCacheUrl('monitor-results/.lldpq-stale'), { cache: 'no-store' });
+                if (response.ok) marker = parsePipelineMarker(await response.text());
+            } catch (error) {}
+            try {
+                const response = await fetch(noCacheUrl('monitor-results/.lldpq-current.json'), { cache: 'no-store' });
+                if (response.ok) manifest = await response.json();
+            } catch (error) {}
+            dashboardPipelineState = { marker, manifest };
+            return dashboardPipelineState;
+        }
+
+        // Show the report generation time, not the viewer's current clock.
+        async function setLastUpdated() {
+            const state = await readDashboardPipelineState();
+            const completedAt = state.manifest && state.manifest.completed_at;
+            const reportDate = completedAt ? new Date(completedAt) : null;
             const options = { 
                 year: 'numeric', 
                 month: '2-digit', 
@@ -719,8 +770,229 @@
                 second: '2-digit',
                 hour12: true
             };
-            const formattedDate = now.toLocaleString('en-US', options);
+            let formattedDate = reportDate && !Number.isNaN(reportDate.getTime())
+                ? reportDate.toLocaleString('en-US', options)
+                : 'N/A';
+            if (state.marker && state.marker.status === 'collecting') {
+                formattedDate += ' — collection in progress; showing previous report';
+            } else if (state.marker && state.marker.status === 'stale') {
+                formattedDate += ' — latest collection failed; showing previous report';
+            }
             document.getElementById('last-updated-time').textContent = formattedDate;
+        }
+
+        function reportCollectionState(doc) {
+            const unavailable = Boolean(doc && doc.querySelector(
+                '[data-collection-status="unavailable"], [data-analysis-status="skipped"]'
+            ));
+            if (!doc) return { unavailable: true, coveragePartial: true };
+            const root = doc.body || doc.documentElement;
+            const metadata = doc.querySelector('[data-analysis-summary], [data-coverage-status]') || root;
+            const coverageStatus = String(
+                metadata?.dataset?.coverageStatus || metadata?.dataset?.collectionStatus ||
+                root?.dataset?.coverageStatus || root?.dataset?.collectionStatus || ''
+            ).toLowerCase();
+            const coveragePartial = unavailable || coverageStatus === 'partial' ||
+                metadata?.dataset?.coveragePartial === 'true' ||
+                root?.dataset?.coveragePartial === 'true' || Boolean(doc.querySelector(
+                    '[data-collection-status="partial"], [data-coverage-partial="true"], ' +
+                    '[data-evpn-route-coverage="partial"]'
+                ));
+            return { unavailable, coveragePartial };
+        }
+
+        function reportCollectionUnavailable(doc) {
+            return reportCollectionState(doc).unavailable;
+        }
+
+        function copyReportState(summaryData, doc) {
+            const state = reportCollectionState(doc);
+            summaryData.unavailable = state.unavailable;
+            summaryData.coveragePartial = state.coveragePartial;
+            const root = doc && (doc.body || doc.documentElement);
+            const metadata = doc && (doc.querySelector('[data-analysis-summary], [data-coverage-status]') || root);
+            const expectedText = metadata?.dataset?.coverageExpected ??
+                metadata?.dataset?.expectedDevices ?? root?.dataset?.coverageExpected;
+            const currentText = metadata?.dataset?.coverageCurrent ??
+                metadata?.dataset?.currentDevices ?? metadata?.dataset?.currentBgpDevices ??
+                root?.dataset?.coverageCurrent;
+            const expected = expectedText === undefined ? NaN : Number(expectedText);
+            const current = currentText === undefined ? NaN : Number(currentText);
+            if (Number.isFinite(expected)) summaryData.coverageExpected = expected;
+            if (Number.isFinite(current)) summaryData.coverageCurrent = current;
+            if (Number.isFinite(expected) && Number.isFinite(current) && current < expected) {
+                summaryData.coveragePartial = true;
+            }
+            return summaryData;
+        }
+
+        function dashboardMetric(data, value) {
+            return data && data.unavailable ? 'N/A' : value;
+        }
+
+        function duplicateDashboardMetric(data, value) {
+            if (!data || data.unavailable || value === null || value === undefined) return 'N/A';
+            return value;
+        }
+
+        function normalizeDuplicateMetricKey(value) {
+            return String(value || '')
+                .trim()
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, '_')
+                .replace(/^_+|_+$/g, '');
+        }
+
+        function duplicateMetricNumber(value) {
+            if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+            const text = String(value === null || value === undefined ? '' : value)
+                .trim()
+                .replace(/,/g, '');
+            if (!/^-?\d+(?:\.\d+)?$/.test(text)) return null;
+            const parsed = Number(text);
+            return Number.isFinite(parsed) ? parsed : null;
+        }
+
+        function duplicateMetricBoolean(value) {
+            if (typeof value === 'boolean') return value;
+            const normalized = String(value === null || value === undefined ? '' : value)
+                .trim()
+                .toLowerCase();
+            if (['true', '1', 'yes', 'partial'].includes(normalized)) return true;
+            if (['false', '0', 'no', 'current', 'complete'].includes(normalized)) return false;
+            return null;
+        }
+
+        function parseDuplicateSummary(doc) {
+            const metrics = {};
+
+            function putMetric(key, value) {
+                const normalized = normalizeDuplicateMetricKey(key);
+                if (!normalized || value === null || value === undefined || value === '') return;
+                metrics[normalized] = value;
+            }
+
+            // Preferred machine-readable contract. It lets the analysis page change
+            // display labels without silently changing dashboard semantics.
+            doc.querySelectorAll('[data-metric-key], [data-duplicate-metric]').forEach(card => {
+                const key = card.getAttribute('data-metric-key') ||
+                    card.getAttribute('data-duplicate-metric');
+                const valueNode = card.querySelector('.metric, [data-metric-value]');
+                const value = card.getAttribute('data-metric-value') ||
+                    (valueNode && valueNode.getAttribute('data-metric-value')) ||
+                    (valueNode ? valueNode.textContent : card.textContent);
+                putMetric(key, value);
+            });
+
+            // Optional JSON metadata is supported for reports that do not render every
+            // metric as a card. Attribute, script and meta forms are intentionally read-only.
+            doc.querySelectorAll('[data-duplicate-summary]').forEach(node => {
+                const raw = node.getAttribute('data-duplicate-summary') ||
+                    (node.tagName === 'SCRIPT' ? node.textContent : '');
+                if (!raw) return;
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed === 'object') {
+                        Object.keys(parsed).forEach(key => putMetric(key, parsed[key]));
+                    }
+                } catch (error) {
+                    console.warn('Ignoring malformed duplicate summary metadata:', error);
+                }
+            });
+            const summaryMeta = doc.querySelector('meta[name="lldpq-duplicate-summary"]');
+            if (summaryMeta) {
+                try {
+                    const parsed = JSON.parse(summaryMeta.getAttribute('content') || '{}');
+                    Object.keys(parsed).forEach(key => putMetric(key, parsed[key]));
+                } catch (error) {
+                    console.warn('Ignoring malformed duplicate summary meta tag:', error);
+                }
+            }
+
+            // The Duplicate report intentionally has a small dashboard contract: active
+            // IP duplicates, quiesced IP duplicates and optional collection coverage.
+            // Ignore MAC, APIPA, mobility and loop cards; those are report details, not
+            // top-level health signals.
+            doc.querySelectorAll('.summary-card').forEach(card => {
+                const label = (card.querySelector('.metric-label')?.textContent || '').trim().toLowerCase();
+                const value = (card.querySelector('.metric')?.textContent || '').trim();
+                if (!label) return;
+                if (label.includes('active ip duplicate')) putMetric('ip_active', value);
+                else if (label.includes('quiesced ip')) putMetric('ip_quiesced', value);
+                else if (label.includes('mac duplicate')) putMetric('mac_duplicates', value);
+                else if (label.includes('coverage') && label.includes('current') && label.includes('expected')) {
+                    const ratio = value.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+                    if (ratio) {
+                        putMetric('coverage_current_hosts', ratio[1]);
+                        putMetric('coverage_expected_hosts', ratio[2]);
+                    }
+                } else if (label.includes('coverage') && label.includes('expected')) {
+                    putMetric('coverage_expected_hosts', value);
+                } else if (label.includes('coverage') && label.includes('current')) {
+                    putMetric('coverage_current_hosts', value);
+                } else if (label.includes('coverage') && label.includes('failure')) {
+                    putMetric('coverage_failures', value);
+                }
+            });
+
+            function numberFor() {
+                for (let i = 0; i < arguments.length; i++) {
+                    const value = duplicateMetricNumber(metrics[normalizeDuplicateMetricKey(arguments[i])]);
+                    if (value !== null) return value;
+                }
+                return null;
+            }
+
+            const root = doc.body || doc.documentElement;
+            const metadata = doc.querySelector('[data-analysis-summary], [data-coverage-status]') || root;
+            const confirmedIpActive = numberFor(
+                'confirmed_ip_active', 'ip_active', 'active_ip_duplicates'
+            ) ?? duplicateMetricNumber(metadata?.dataset?.confirmedIpActive);
+            const quiescedIp = numberFor('ip_quiesced', 'quiesced_ip_duplicates') ??
+                duplicateMetricNumber(metadata?.dataset?.ipQuiesced);
+            const macDuplicates = numberFor('mac_duplicates', 'mac_duplicate_count') ??
+                duplicateMetricNumber(metadata?.dataset?.macDuplicates);
+            const coverageExpected = numberFor('coverage_expected_hosts', 'coverage_expected') ??
+                duplicateMetricNumber(metadata?.dataset?.coverageExpected);
+            const coverageCurrent = numberFor('coverage_current_hosts', 'coverage_current') ??
+                duplicateMetricNumber(metadata?.dataset?.coverageCurrent);
+            const coverageFailures = numberFor('coverage_failures') ??
+                duplicateMetricNumber(metadata?.dataset?.coverageFailures);
+            const reportState = reportCollectionState(doc);
+            let coveragePartial = duplicateMetricBoolean(metrics.coverage_partial);
+            if (coveragePartial === null) {
+                coveragePartial = duplicateMetricBoolean(metadata?.dataset?.coveragePartial);
+            }
+            const coverageContractComplete = coverageExpected !== null &&
+                coverageCurrent !== null && coverageFailures !== null &&
+                coveragePartial !== null;
+            // The simplified Duplicate report does not publish the optional coverage
+            // contract; its absence must NOT mark the report "partial" (that used to
+            // force Overall Health to N/A). Only a genuinely unavailable/partial
+            // collection should count toward coverage problems.
+            coveragePartial = reportState.coveragePartial || coveragePartial === true;
+            if (coverageExpected !== null && coverageCurrent !== null) {
+                if (coverageCurrent < coverageExpected) coveragePartial = true;
+            }
+            if ((coverageFailures || 0) > 0) coveragePartial = true;
+
+            const coverageText = coverageExpected !== null && coverageCurrent !== null
+                ? `${coverageCurrent}/${coverageExpected}`
+                : 'N/A';
+            const metricsAvailable = confirmedIpActive !== null;
+
+            return {
+                confirmedIpActive,
+                quiescedIp,
+                macDuplicates,
+                coverageExpected,
+                coverageCurrent,
+                coverageFailures,
+                coveragePartial: coveragePartial === true,
+                coverageText,
+                semanticComplete: metricsAvailable && coverageContractComplete,
+                unavailable: reportState.unavailable || !metricsAvailable
+            };
         }
 
         // Fetch summary data directly from data files
@@ -731,6 +1003,7 @@
                 if (dataType === 'assets') {
                     // Parse assets.ini file with same logic as assets.html
                     const assetsResponse = await fetch('assets.ini');
+                    if (!assetsResponse.ok) return { unavailable: true, coveragePartial: true };
                     const assetsText = await assetsResponse.text();
                     const assetsLines = assetsText.split('\n').filter(line => 
                         line.trim() && 
@@ -782,6 +1055,7 @@
                 } else if (dataType === 'lldp') {
                     // Parse lldp_results.ini with same logic as lldp.html for calculating warnings
                     const response = await fetch('lldp_results.ini');
+                    if (!response.ok) return { unavailable: true, coveragePartial: true };
                     const text = await response.text();
                     const lines = text.split('\n');
                     
@@ -829,43 +1103,26 @@
                 } else if (dataType === 'evpn') {
                     // Parse EVPN data from bgp-analysis.html summary cards
                     const response = await fetch('monitor-results/bgp-analysis.html');
-                    
-                    if (!response.ok) {
-                        return { totalVnis: 0, l2Vnis: 0, l3Vnis: 0, type2Routes: 0, type5Routes: 0 };
-                    }
-                    
+                    if (!response.ok) return { unavailable: true, coveragePartial: true };
                     const html = await response.text();
-                    
-                    // Parse EVPN metrics from the HTML using regex (more reliable than DOM parsing for inline values)
-                    const totalVnisMatch = html.match(/id="evpn-total-vnis"[^>]*>(\d+)</);
-                    const l2VnisMatch = html.match(/id="evpn-l2-vnis"[^>]*>(\d+)</);
-                    const l3VnisMatch = html.match(/id="evpn-l3-vnis"[^>]*>(\d+)</);
-                    const type2Match = html.match(/id="evpn-type2-routes"[^>]*>(\d+)</);
-                    const type5Match = html.match(/id="evpn-type5-routes"[^>]*>(\d+)</);
-                    
-                    // Also try parsing from the metric divs if IDs aren't found
-                    if (!totalVnisMatch) {
-                        const parser = new DOMParser();
-                        const doc = parser.parseFromString(html, 'text/html');
-                        const metricDivs = doc.querySelectorAll('.summary-card .metric');
-                        const labels = doc.querySelectorAll('.summary-card .metric-label');
-                        
-                        metricDivs.forEach((div, idx) => {
-                            const label = labels[idx]?.textContent?.toLowerCase() || '';
-                            const value = parseInt(div.textContent) || 0;
-                            
-                            if (label.includes('total vni')) summaryData.totalVnis = value;
-                            else if (label.includes('l2 vni')) summaryData.l2Vnis = value;
-                            else if (label.includes('l3 vni')) summaryData.l3Vnis = value;
-                            else if (label.includes('type-2') || label.includes('mac/ip')) summaryData.type2Routes = value;
-                            else if (label.includes('type-5') || label.includes('ip prefix')) summaryData.type5Routes = value;
-                        });
-                    } else {
-                        summaryData.totalVnis = totalVnisMatch ? parseInt(totalVnisMatch[1]) : 0;
-                        summaryData.l2Vnis = l2VnisMatch ? parseInt(l2VnisMatch[1]) : 0;
-                        summaryData.l3Vnis = l3VnisMatch ? parseInt(l3VnisMatch[1]) : 0;
-                        summaryData.type2Routes = type2Match ? parseInt(type2Match[1]) : 0;
-                        summaryData.type5Routes = type5Match ? parseInt(type5Match[1]) : 0;
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(html, 'text/html');
+                    copyReportState(summaryData, doc);
+                    const metric = id => {
+                        const text = String(doc.querySelector(id)?.textContent || '').replace(/,/g, '').trim();
+                        if (!text) return null;
+                        const value = Number(text);
+                        return Number.isFinite(value) ? value : null;
+                    };
+                    summaryData.totalVnis = metric('#evpn-total-vnis');
+                    summaryData.l2Vnis = metric('#evpn-l2-vnis');
+                    summaryData.l3Vnis = metric('#evpn-l3-vnis');
+                    summaryData.type2Routes = metric('#evpn-type2-routes');
+                    summaryData.type5Routes = metric('#evpn-type5-routes');
+                    if ([summaryData.totalVnis, summaryData.l2Vnis, summaryData.l3Vnis,
+                         summaryData.type2Routes, summaryData.type5Routes].some(value => value === null)) {
+                        summaryData.unavailable = true;
+                        summaryData.coveragePartial = true;
                     }
                     
                 } else if (dataType === 'optical') {
@@ -873,12 +1130,14 @@
                     const response = await fetch('monitor-results/optical-analysis.html');
                     
                     if (!response.ok) {
-                        return summaryData;
+                        return { unavailable: true, coveragePartial: true };
                     }
                     
                     const html = await response.text();
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(html, 'text/html');
+                    copyReportState(summaryData, doc);
+                    if (summaryData.unavailable) return summaryData;
                     
                     // Parse summary cards for optical (they have the correct total ports count)
                     const totalPortsElement = doc.querySelector('#total-ports');
@@ -886,12 +1145,18 @@
                     const goodElement = doc.querySelector('#good-ports');
                     const warningElement = doc.querySelector('#warning-ports');
                     const criticalElement = doc.querySelector('#critical-ports');
+                    const downElement = doc.querySelector('#down-ports');
                     
                     summaryData.totalPorts = totalPortsElement ? parseInt(totalPortsElement.textContent) : 0;
                     summaryData.excellent = excellentElement ? parseInt(excellentElement.textContent) : 0;
                     summaryData.good = goodElement ? parseInt(goodElement.textContent) : 0;
                     summaryData.warning = warningElement ? parseInt(warningElement.textContent) : 0;
                     summaryData.critical = criticalElement ? parseInt(criticalElement.textContent) : 0;
+                    summaryData.down = downElement ? parseInt(downElement.textContent) : 0;
+                    summaryData.unknown = Math.max(0, summaryData.totalPorts -
+                        summaryData.excellent - summaryData.good -
+                        summaryData.warning - summaryData.critical - summaryData.down);
+                    if (summaryData.unknown > 0) summaryData.coveragePartial = true;
                     
                     // Count unique devices from table for optical (if needed)
                     const rows = doc.querySelectorAll('tbody tr[data-health]');
@@ -902,12 +1167,14 @@
                     const response = await fetch('monitor-results/hardware-analysis.html');
                     
                     if (!response.ok) {
-                        return summaryData;
+                        return { unavailable: true, coveragePartial: true };
                     }
                     
                     const html = await response.text();
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(html, 'text/html');
+                    copyReportState(summaryData, doc);
+                    if (summaryData.unavailable) return summaryData;
                     
                     // Parse summary cards for hardware
                     const totalDevicesElement = doc.querySelector('#total-devices');
@@ -915,12 +1182,20 @@
                     const goodElement = doc.querySelector('#good-devices');
                     const warningElement = doc.querySelector('#warning-devices');
                     const criticalElement = doc.querySelector('#critical-devices');
+                    const unknownElement = doc.querySelector('#unknown-devices');
                     
                     summaryData.totalDevices = totalDevicesElement ? parseInt(totalDevicesElement.textContent) : 0;
                     summaryData.excellent = excellentElement ? parseInt(excellentElement.textContent) : 0;
                     summaryData.good = goodElement ? parseInt(goodElement.textContent) : 0;
                     summaryData.warning = warningElement ? parseInt(warningElement.textContent) : 0;
                     summaryData.critical = criticalElement ? parseInt(criticalElement.textContent) : 0;
+                    summaryData.unknown = unknownElement ? parseInt(unknownElement.textContent) : 0;
+                    if (!unknownElement) {
+                        summaryData.unknown = Math.max(0, summaryData.totalDevices -
+                            summaryData.excellent - summaryData.good -
+                            summaryData.warning - summaryData.critical);
+                    }
+                    if (summaryData.unknown > 0) summaryData.coveragePartial = true;
                     
                 } else if (dataType === 'log') {
                     // Parse log summary data from log_summary.json
@@ -928,57 +1203,51 @@
                         const response = await fetch('monitor-results/log_summary.json');
                         
                         if (!response.ok) {
-                            // Return default values if log summary doesn't exist yet
-                            return {
-                                totalDevices: 0,
-                                critical: 0,
-                                warning: 0,
-                                error: 0,
-                                info: 0
-                            };
+                            return { unavailable: true, coveragePartial: true };
                         }
                         
                         const logSummaryData = await response.json();
+                        if (logSummaryData.collection_status !== 'current') {
+                            return { unavailable: true };
+                        }
                         
                         summaryData.totalDevices = logSummaryData.total_devices || 0;
                         summaryData.critical = logSummaryData.totals?.critical || 0;
                         summaryData.warning = logSummaryData.totals?.warning || 0;
                         summaryData.error = logSummaryData.totals?.error || 0;
                         summaryData.info = logSummaryData.totals?.info || 0;
+                        const coverage = logSummaryData.coverage || {};
+                        const coverageCount = value => Array.isArray(value) ? value.length : Number(value);
+                        summaryData.coverageExpected = coverageCount(coverage.expected_devices);
+                        summaryData.coverageCurrent = coverageCount(coverage.current_devices);
+                        summaryData.coveragePartial = Boolean(coverage.partial) ||
+                            (Number.isFinite(summaryData.coverageExpected) &&
+                             Number.isFinite(summaryData.coverageCurrent) &&
+                             summaryData.coverageCurrent < summaryData.coverageExpected);
                         
                     } catch (error) {
                         console.warn('Failed to fetch log summary data:', error);
-                        // Return default values
-                        summaryData = {
-                            totalDevices: 0,
-                            critical: 0,
-                            warning: 0,
-                            error: 0,
-                            info: 0
-                        };
+                        summaryData = { unavailable: true, coveragePartial: true };
                     }
                     
                 } else if (dataType === 'duplicate') {
-                    // Parse duplicate-analysis.html summary cards (.metric / .metric-label)
+                    // Duplicate exposes only the two IP states needed by the dashboard.
+                    // MAC/APIPA diagnostics remain available on the analysis page.
                     const response = await fetch('monitor-results/duplicate-analysis.html');
-                    if (!response.ok) return summaryData;
+                    if (!response.ok) return {
+                        unavailable: true,
+                        coveragePartial: true,
+                        reason: 'report-fetch-failed'
+                    };
                     const html = await response.text();
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(html, 'text/html');
-                    summaryData.ipActive = 0; summaryData.ipQuiesced = 0;
-                    summaryData.macDup = 0; summaryData.apipa = 0; summaryData.vlans = 0;
-                    doc.querySelectorAll('.summary-card').forEach(card => {
-                        const label = (card.querySelector('.metric-label')?.textContent || '').toLowerCase();
-                        const value = parseInt(card.querySelector('.metric')?.textContent) || 0;
-                        if (label.includes('active ip')) summaryData.ipActive = value;
-                        else if (label.includes('quiesced ip')) summaryData.ipQuiesced = value;
-                        else if (label.includes('mac duplicate')) summaryData.macDup = value;
-                        else if (label.includes('apipa')) summaryData.apipa = value;
-                        else if (label.includes('vlans affected')) summaryData.vlans = value;
-                    });
+                    summaryData = parseDuplicateSummary(doc);
                     
                 } else {
-                    // For other analysis pages (BGP, BER, Link Flap), parse table data
+                    // BGP, BER and Link Flap expose summary cards as the report
+                    // contract.  Re-counting only rendered table rows loses stale,
+                    // unknown and currently-flapping states.
                     const pageMap = {
                         'bgp': 'monitor-results/bgp-analysis.html',
                         'ber': 'monitor-results/ber-analysis.html',
@@ -988,60 +1257,68 @@
                     const pageUrl = pageMap[dataType];
                     if (pageUrl) {
                         const response = await fetch(pageUrl);
-                        
-                        if (!response.ok) {
-                            return summaryData;
-                        }
-                        
+                        if (!response.ok) return { unavailable: true, coveragePartial: true };
                         const html = await response.text();
                         const parser = new DOMParser();
                         const doc = parser.parseFromString(html, 'text/html');
-                        
-                        // Parse table rows instead of summary cards
+                        copyReportState(summaryData, doc);
+                        if (summaryData.unavailable) return summaryData;
+                        const reportMeta = doc.querySelector('[data-analysis-summary]');
+                        const metadataNumber = name => {
+                            const text = reportMeta?.dataset?.[name];
+                            if (text === undefined || text === '') return null;
+                            const value = Number(text);
+                            return Number.isFinite(value) ? value : null;
+                        };
+                        const metric = selector => {
+                            const text = String(doc.querySelector(selector)?.textContent || '')
+                                .replace(/,/g, '').replace(/%/g, '').trim();
+                            if (!text) return null;
+                            const value = Number(text);
+                            return Number.isFinite(value) ? value : null;
+                        };
                         const rows = doc.querySelectorAll('tbody tr[data-health], tbody tr[data-status], tbody tr[data-state]');
-                        
-                        summaryData.totalPorts = rows.length;
-                        summaryData.totalDevices = new Set(Array.from(rows).map(row => row.cells[0]?.textContent.trim())).size;
-                        summaryData.totalNeighbors = rows.length; // BGP neighbors = rows
-                        summaryData.excellent = 0;
-                        summaryData.good = 0;
-                        summaryData.warning = 0;
-                        summaryData.critical = 0;
-                        summaryData.established = 0;
-                        summaryData.failed = 0;
-                        summaryData.stable = 0;
-                        summaryData.problematic = 0;
-                        
-                        rows.forEach(row => {
-                            const health = row.getAttribute('data-health') || '';
-                            const status = row.getAttribute('data-status') || '';
-                            const state = row.getAttribute('data-state') || '';
-                            
-                            // Count by health/status
-                            if (health === 'excellent' || status === 'excellent') summaryData.excellent++;
-                            else if (health === 'good' || status === 'good') summaryData.good++;
-                            else if (health === 'warning' || status === 'warning') summaryData.warning++;
-                            else if (health === 'critical' || status === 'critical') summaryData.critical++;
-                            
-                            // Count by state (BGP)
-                            if (state === 'established') summaryData.established++;
-                            else if (state === 'idle' || state === 'active' || state === 'connect' || state === 'down') summaryData.failed++;
-                            
-                            // Count by stability (Link Flap uses 'ok' not 'stable')
-                            if (status === 'stable' || status === 'ok') summaryData.stable++;
-                            else if (status === 'problematic' || status === 'flapped') summaryData.problematic++;
-                        });
-                        
-                        // Calculate percentages based on data type
-                        if (dataType === 'bgp' && summaryData.totalNeighbors > 0) {
-                            summaryData.healthPercent = ((summaryData.established / summaryData.totalNeighbors) * 100).toFixed(1);
+                        if (dataType === 'bgp') {
+                            summaryData.totalDevices = metric('#total-devices');
+                            summaryData.totalNeighbors = metric('#total-neighbors');
+                            summaryData.established = metric('#established-neighbors');
+                            summaryData.failed = metric('#down-neighbors');
+                            summaryData.stale = metric('#stale-devices') || 0;
+                            summaryData.unknown = metric('#unknown-devices') || 0;
+                            summaryData.warning = metadataNumber('warningNeighbors') || 0;
+                            summaryData.critical = metadataNumber('criticalNeighbors') || 0;
+                            summaryData.healthPercent = metric('#health-ratio');
+                            summaryData.coveragePartial = summaryData.coveragePartial ||
+                                summaryData.stale > 0 || summaryData.unknown > 0;
+                        } else if (dataType === 'ber') {
+                            summaryData.totalPorts = metric('#total-ports');
+                            summaryData.excellent = metric('#excellent-ports') || 0;
+                            summaryData.good = metric('#good-ports') || 0;
+                            summaryData.warning = metric('#warning-ports') || 0;
+                            summaryData.critical = metric('#critical-ports') || 0;
+                            summaryData.unknown = metric('#unknown-ports') || 0;
+                            summaryData.coveragePartial = summaryData.coveragePartial || summaryData.unknown > 0;
+                        } else if (dataType === 'flap') {
+                            summaryData.totalDevices = metric('#total-devices');
+                            summaryData.totalPorts = metric('#total-ports');
+                            summaryData.stable = metric('#stable-ports') || 0;
+                            summaryData.problematic = metric('#problematic-ports') || 0;
+                            summaryData.critical = metadataNumber('criticalPorts') || 0;
+                            summaryData.warning = metadataNumber('warningPorts') || 0;
+                            if (summaryData.critical || summaryData.warning) {
+                                summaryData.problematic = summaryData.critical + summaryData.warning;
+                            }
+                            summaryData.stabilityPercent = summaryData.totalPorts > 0
+                                ? ((summaryData.stable / summaryData.totalPorts) * 100).toFixed(1)
+                                : null;
                         }
-                        
-                        if (dataType === 'flap' && summaryData.totalPorts > 0) {
-                            summaryData.stabilityPercent = ((summaryData.stable / summaryData.totalPorts) * 100).toFixed(1);
+                        const requiredTotal = dataType === 'bgp'
+                            ? summaryData.totalNeighbors
+                            : summaryData.totalPorts;
+                        if (requiredTotal === null) {
+                            summaryData.unavailable = true;
+                            summaryData.coveragePartial = true;
                         }
-                        
-                        // Analysis data parsed from table
                     }
                 }
                 
@@ -1049,13 +1326,14 @@
                 
             } catch (error) {
                 console.warn(`Failed to fetch ${dataType} data:`, error);
-                return {};
+                return { unavailable: true, coveragePartial: true };
             }
         }
 
         // Calculate overall network stats with real-time data
         async function updateNetworkStats() {
             try {
+                const pipelineState = await readDashboardPipelineState();
                 // Fetch data directly from raw data files
                 const [assetsData, lldpData, bgpData, evpnData, opticalData, berData, flapData, hardwareData, logData, dupData] = await Promise.all([
                     fetchRawDataSummary('assets'),
@@ -1085,113 +1363,189 @@
                 updateDashboardCard('lldp-warning', lldpData.warning);
                 updateDashboardCard('lldp-no-info', lldpData.noInfo);
 
-                updateDashboardCard('bgp-devices', bgpData.totalDevices);
-                updateDashboardCard('bgp-neighbors', bgpData.totalNeighbors);
-                updateDashboardCard('bgp-established', bgpData.established);
-                updateDashboardCard('bgp-down', bgpData.failed);
-                updateDashboardCard('bgp-health', bgpData.healthPercent ? bgpData.healthPercent + '%' : '0.0%');
+                updateDashboardCard('bgp-devices', dashboardMetric(bgpData, bgpData.totalDevices));
+                updateDashboardCard('bgp-neighbors', dashboardMetric(bgpData, bgpData.totalNeighbors));
+                updateDashboardCard('bgp-established', dashboardMetric(bgpData, bgpData.established));
+                updateDashboardCard('bgp-down', dashboardMetric(bgpData, bgpData.failed));
+                updateDashboardCard('bgp-health', dashboardMetric(
+                    bgpData,
+                    bgpData.healthPercent !== null && bgpData.healthPercent !== undefined
+                        ? bgpData.healthPercent + '%'
+                        : 'N/A'
+                ));
 
-                updateDashboardCard('evpn-total-vnis', evpnData.totalVnis);
-                updateDashboardCard('evpn-l2-vnis', evpnData.l2Vnis);
-                updateDashboardCard('evpn-l3-vnis', evpnData.l3Vnis);
-                updateDashboardCard('evpn-type2', evpnData.type2Routes);
-                updateDashboardCard('evpn-type5', evpnData.type5Routes);
+                updateDashboardCard('evpn-total-vnis', dashboardMetric(evpnData, evpnData.totalVnis));
+                updateDashboardCard('evpn-l2-vnis', dashboardMetric(evpnData, evpnData.l2Vnis));
+                updateDashboardCard('evpn-l3-vnis', dashboardMetric(evpnData, evpnData.l3Vnis));
+                updateDashboardCard('evpn-type2', dashboardMetric(evpnData, evpnData.type2Routes));
+                updateDashboardCard('evpn-type5', dashboardMetric(evpnData, evpnData.type5Routes));
 
-                updateDashboardCard('optical-total', opticalData.totalPorts);
-                updateDashboardCard('optical-excellent', opticalData.excellent);
-                updateDashboardCard('optical-good', opticalData.good);
-                updateDashboardCard('optical-warning', opticalData.warning);
-                updateDashboardCard('optical-critical', opticalData.critical);
+                updateDashboardCard('optical-total', dashboardMetric(opticalData, opticalData.totalPorts));
+                updateDashboardCard('optical-excellent', dashboardMetric(opticalData, opticalData.excellent));
+                updateDashboardCard('optical-good', dashboardMetric(opticalData, opticalData.good));
+                updateDashboardCard('optical-warning', dashboardMetric(opticalData, opticalData.warning));
+                updateDashboardCard('optical-down', dashboardMetric(opticalData, opticalData.down));
+                updateDashboardCard('optical-critical', dashboardMetric(opticalData, opticalData.critical));
 
-                updateDashboardCard('ber-total', berData.totalPorts);
-                updateDashboardCard('ber-excellent', berData.excellent);
-                updateDashboardCard('ber-good', berData.good);
-                updateDashboardCard('ber-warning', berData.warning);
-                updateDashboardCard('ber-critical', berData.critical);
+                updateDashboardCard('ber-total', dashboardMetric(berData, berData.totalPorts));
+                updateDashboardCard('ber-excellent', dashboardMetric(berData, berData.excellent));
+                updateDashboardCard('ber-good', dashboardMetric(berData, berData.good));
+                updateDashboardCard('ber-warning', dashboardMetric(berData, berData.warning));
+                updateDashboardCard('ber-critical', dashboardMetric(berData, berData.critical));
 
-                updateDashboardCard('flap-devices', flapData.totalDevices);
-                updateDashboardCard('flap-ports', flapData.totalPorts);
-                updateDashboardCard('flap-stable', flapData.stable);
-                updateDashboardCard('flap-problematic', flapData.problematic);
-                updateDashboardCard('flap-stability', flapData.stabilityPercent ? flapData.stabilityPercent + '%' : '0.0%');
+                updateDashboardCard('flap-devices', dashboardMetric(flapData, flapData.totalDevices));
+                updateDashboardCard('flap-ports', dashboardMetric(flapData, flapData.totalPorts));
+                updateDashboardCard('flap-stable', dashboardMetric(flapData, flapData.stable));
+                updateDashboardCard('flap-problematic', dashboardMetric(flapData, flapData.problematic));
+                updateDashboardCard('flap-stability', dashboardMetric(flapData, flapData.stabilityPercent ? flapData.stabilityPercent + '%' : '0.0%'));
 
-                updateDashboardCard('hardware-total', hardwareData.totalDevices);
-                updateDashboardCard('hardware-excellent', hardwareData.excellent);
-                updateDashboardCard('hardware-good', hardwareData.good);
-                updateDashboardCard('hardware-warnings', hardwareData.warning);
-                updateDashboardCard('hardware-critical', hardwareData.critical);
+                updateDashboardCard('hardware-total', dashboardMetric(hardwareData, hardwareData.totalDevices));
+                updateDashboardCard('hardware-excellent', dashboardMetric(hardwareData, hardwareData.excellent));
+                updateDashboardCard('hardware-good', dashboardMetric(hardwareData, hardwareData.good));
+                updateDashboardCard('hardware-warnings', dashboardMetric(hardwareData, hardwareData.warning));
+                updateDashboardCard('hardware-critical', dashboardMetric(hardwareData, hardwareData.critical));
 
-                updateDashboardCard('log-devices', logData.totalDevices);
-                updateDashboardCard('log-critical', logData.critical);
-                updateDashboardCard('log-warnings', logData.warning);
-                updateDashboardCard('log-errors', logData.error);
-                updateDashboardCard('log-info', logData.info);
+                updateDashboardCard('log-devices', dashboardMetric(logData, logData.totalDevices));
+                updateDashboardCard('log-critical', dashboardMetric(logData, logData.critical));
+                updateDashboardCard('log-warnings', dashboardMetric(logData, logData.warning));
+                updateDashboardCard('log-errors', dashboardMetric(logData, logData.error));
+                updateDashboardCard('log-info', dashboardMetric(logData, logData.info));
 
-                updateDashboardCard('dup-ip-active', dupData.ipActive);
-                updateDashboardCard('dup-ip-quiesced', dupData.ipQuiesced);
-                updateDashboardCard('dup-mac', dupData.macDup);
-                updateDashboardCard('dup-apipa', dupData.apipa);
-                updateDashboardCard('dup-vlans', dupData.vlans);
+                updateDashboardCard('dup-active-ip', duplicateDashboardMetric(dupData, dupData.confirmedIpActive));
+                updateDashboardCard('dup-quiesced-ip', duplicateDashboardMetric(dupData, dupData.quiescedIp));
+                updateDashboardCard('dup-mac', duplicateDashboardMetric(dupData, dupData.macDuplicates));
+
+                const duplicateMacCard = document.getElementById('dup-mac-card');
+                if (duplicateMacCard) {
+                    duplicateMacCard.title = dupData.unavailable
+                        ? 'Duplicate analysis is unavailable'
+                        : 'MAC address duplicates seen across the fabric (mobility + conflicts)';
+                }
 
                 // Calculate overall network statistics
-                const totalDevices = assetsData.totalDevices || 0;
-                const totalInterfaces = Math.max(opticalData.totalPorts || 0, berData.totalPorts || 0);
+                const totalDevices = Number.isFinite(Number(assetsData.totalDevices))
+                    ? Number(assetsData.totalDevices)
+                    : null;
+                const bgpEvpnState = {
+                    unavailable: Boolean(bgpData.unavailable || evpnData.unavailable),
+                    coveragePartial: Boolean(bgpData.coveragePartial || evpnData.coveragePartial)
+                };
+                const nonDuplicateReports = [bgpEvpnState, opticalData, berData,
+                    flapData, hardwareData, logData];
+                const analysisReports = [...nonDuplicateReports, dupData];
+                const unavailableAnalyses = analysisReports.filter(data =>
+                    !data || data.unavailable
+                ).length;
+                const partialAnalyses = analysisReports.filter(data =>
+                    data && !data.unavailable && data.coveragePartial
+                ).length;
+                const otherPartialAnalyses = nonDuplicateReports.filter(data =>
+                    data && !data.unavailable && data.coveragePartial
+                ).length;
+                const markerStatus = pipelineState.marker && pipelineState.marker.status;
+                const manifestCurrent = pipelineState.manifest &&
+                    pipelineState.manifest.status === 'current' &&
+                    pipelineState.manifest.pipeline_complete === true;
+                const pipelineNotCurrent = Boolean(markerStatus) || !manifestCurrent;
+                const analysisCoverageProblems = unavailableAnalyses + partialAnalyses +
+                    (pipelineNotCurrent ? 1 : 0);
+                const interfaceSources = [opticalData, berData].filter(data =>
+                    data && !data.unavailable && Number.isFinite(Number(data.totalPorts))
+                );
+                const totalInterfaces = interfaceSources.length
+                    ? Math.max(...interfaceSources.map(data => Number(data.totalPorts)))
+                    : null;
                 
-            // Calculate critical issues with breakdown for tooltip
+            // Calculate open issues with breakdown for tooltip. This includes
+            // warning-class operational signals as well as critical failures.
             const criticalBreakdown = {
                 'Assets Failed': assetsData.failed || 0,
                 'LLDP Failed Ports': lldpData.failed || 0,
                 'LLDP No Info': lldpData.noInfo || 0,
                 'BGP Failed': bgpData.failed || 0,
                 'Optical Critical': opticalData.critical || 0,
+                'Optical Warning': opticalData.warning || 0,
+                'Optical Down': opticalData.down || 0,
                 'BER Critical': berData.critical || 0,
+                'BER Warning': berData.warning || 0,
                 'Link Flaps': flapData.problematic || 0,
                 'Hardware Critical': hardwareData.critical || 0,
                 'Hardware Warning': hardwareData.warning || 0,
                 'Log Critical': logData.critical || 0,
                 'Log Warning': logData.warning || 0,
-                'Duplicate Active IP': dupData.ipActive || 0,
-                'Duplicate MAC': dupData.macDup || 0
+                'Active IP Duplicates': dupData.confirmedIpActive || 0,
+                'Duplicate Coverage Partial': (!dupData.unavailable && dupData.coveragePartial) ? 1 : 0,
+                'Partial Analyses': otherPartialAnalyses,
+                'Unavailable Analyses': unavailableAnalyses,
+                'Pipeline Not Current': pipelineNotCurrent ? 1 : 0
             };
             
             const criticalIssues = Object.values(criticalBreakdown).reduce((a, b) => a + b, 0);
             
             // Build tooltip HTML
-            let tooltipHtml = '<div class="tooltip-title">Critical Issues Breakdown</div>';
+            // Hard failures render red; advisory / warning-severity signals render yellow.
+            const CRITICAL_SOURCES = new Set([
+                'Assets Failed', 'LLDP Failed Ports', 'BGP Failed',
+                'Optical Critical', 'BER Critical', 'Link Flaps',
+                'Hardware Critical', 'Log Critical', 'Active IP Duplicates'
+            ]);
+            let tooltipHtml = '<div class="tooltip-title">Open Issues Breakdown</div>';
             for (const [source, count] of Object.entries(criticalBreakdown)) {
-                const hasIssues = count > 0 ? 'has-issues' : '';
-                tooltipHtml += `<div class="tooltip-row ${hasIssues}"><span class="source">${source}</span><span class="count">${count}</span></div>`;
+                const severityClass = count > 0
+                    ? (CRITICAL_SOURCES.has(source) ? 'has-issues' : 'is-warning')
+                    : '';
+                tooltipHtml += `<div class="tooltip-row ${severityClass}"><span class="source">${source}</span><span class="count">${count}</span></div>`;
             }
             document.getElementById('critical-tooltip').innerHTML = tooltipHtml;
                 
-                const healthyItems = 
-                    (assetsData.successful || 0) +
-                    (lldpData.successful || 0) +
-                    (opticalData.excellent || 0) +
-                    (flapData.stable || 0) +
-                    (hardwareData.excellent || 0) +
-                    (hardwareData.good || 0) +
-                    (logData.info || 0);
-                
-                const totalAssessments = 
-                    totalDevices + 
-                    (lldpData.totalConnections || 0) + 
-                    (opticalData.totalPorts || 0) + 
-                    (flapData.totalPorts || 0) +
-                    (hardwareData.totalDevices || 0) +
-                    ((logData.critical || 0) + (logData.warning || 0) + (logData.info || 0));
-                
-            const overallHealth = totalAssessments > 0 ? Math.round((healthyItems / totalAssessments) * 100) : 0;
+            // Average comparable domain health ratios.  Raw log-message volume
+            // is an issue signal, not a population of healthy network objects.
+            const healthDomains = [];
+            function addHealthDomain(healthy, total, data) {
+                const healthyNumber = Number(healthy);
+                const totalNumber = Number(total);
+                if (data?.unavailable || data?.coveragePartial ||
+                    !Number.isFinite(healthyNumber) || !Number.isFinite(totalNumber) ||
+                    totalNumber <= 0) return;
+                healthDomains.push(Math.max(0, Math.min(1, healthyNumber / totalNumber)));
+            }
+            // Only hard failures (the red breakdown rows) lower health; warning-class
+            // signals (optical/BER/hardware warnings, LLDP no-info, optical down) count
+            // as healthy so they never drag the percentage down.
+            addHealthDomain(assetsData.totalDevices - (assetsData.failed || 0), assetsData.totalDevices, assetsData);
+            addHealthDomain(lldpData.totalConnections - (lldpData.failed || 0), lldpData.totalConnections, lldpData);
+            addHealthDomain(bgpData.totalNeighbors - (bgpData.failed || 0), bgpData.totalNeighbors, bgpData);
+            addHealthDomain(opticalData.totalPorts - (opticalData.critical || 0), opticalData.totalPorts, opticalData);
+            addHealthDomain(berData.totalPorts - (berData.critical || 0), berData.totalPorts, berData);
+            addHealthDomain(flapData.totalPorts - (flapData.problematic || 0), flapData.totalPorts, flapData);
+            addHealthDomain(hardwareData.totalDevices - (hardwareData.critical || 0), hardwareData.totalDevices, hardwareData);
+
+            // Sum the hard-failure (red) breakdown rows; a perfect 100% must never
+            // show while any of these are open, even if the domain ratios round up.
+            const criticalOnlyCount = Object.entries(criticalBreakdown)
+                .filter(([source]) => CRITICAL_SOURCES.has(source))
+                .reduce((sum, [, count]) => sum + (count || 0), 0);
+            let overallHealth = analysisCoverageProblems
+                ? null
+                : (healthDomains.length
+                    ? Math.floor(healthDomains.reduce((sum, value) => sum + value, 0) /
+                        healthDomains.length * 100)
+                    : null);
+            if (overallHealth !== null && criticalOnlyCount > 0) {
+                overallHealth = Math.min(overallHealth, 99);
+            }
             
             // Update dashboard stats
-            document.getElementById('total-network-devices').textContent = totalDevices;
-            document.getElementById('total-interfaces').textContent = totalInterfaces;
-            document.getElementById('overall-health').textContent = overallHealth + '%';
+            document.getElementById('total-network-devices').textContent = totalDevices === null ? 'N/A' : totalDevices;
+            document.getElementById('total-interfaces').textContent = totalInterfaces === null ? 'N/A' : totalInterfaces;
+            document.getElementById('overall-health').textContent = overallHealth === null ? 'N/A' : overallHealth + '%';
             document.getElementById('critical-issues').textContent = criticalIssues;
             
             // Color code the health percentage
             const healthElement = document.getElementById('overall-health');
-            if (overallHealth >= 95) {
+            if (overallHealth === null) {
+                healthElement.style.color = '#ff9800';
+            } else if (overallHealth >= 95) {
                 healthElement.style.color = '#4caf50';
             } else if (overallHealth >= 85) {
                 healthElement.style.color = '#8bc34a';
@@ -1220,18 +1574,20 @@
         function updateDashboardCard(elementId, value) {
             const element = document.getElementById(elementId);
             if (element) {
-                element.textContent = value !== undefined && value !== null ? value : 0;
+                const missing = value === undefined || value === null ||
+                    (typeof value === 'number' && !Number.isFinite(value));
+                element.textContent = missing ? 'N/A' : value;
             }
         }
 
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', function() {
-            setLastUpdated();
+            setLastUpdated().catch(error => console.warn('Failed to load report timestamp:', error));
             updateNetworkStats();
             
             // Update every 2 minutes (large data files)
             setInterval(function() {
-                setLastUpdated();
+                setLastUpdated().catch(error => console.warn('Failed to load report timestamp:', error));
                 updateNetworkStats();
             }, 120000);
         });

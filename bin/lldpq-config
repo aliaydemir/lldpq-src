@@ -8,11 +8,12 @@ arithmetic expansion and then quoted again for a single controlled ``eval``.
 """
 
 import argparse
+import fcntl
 import re
 import shlex
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 
 DEFAULT_CONFIG = Path("/etc/lldpq.conf")
@@ -44,6 +45,7 @@ ALLOWED_KEYS = frozenset({
     "LLDP_MAX_PARALLEL",
     "ASSETS_MAX_PARALLEL",
     "GET_CONFIGS_MAX_PARALLEL",
+    "GET_CONFIGS_SSH_TIMEOUT",
     "SEND_CMD_MAX_PARALLEL",
     "TELEMETRY_MAX_PARALLEL",
     "AUTO_BASE_CONFIG",
@@ -76,6 +78,83 @@ ALLOWED_KEYS = frozenset({
 })
 
 
+CRON_MONTH_NAMES = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+CRON_WEEKDAY_NAMES = {
+    "sun": 0, "mon": 1, "tue": 2, "wed": 3,
+    "thu": 4, "fri": 5, "sat": 6,
+}
+
+
+def _cron_atom(value: str, minimum: int, maximum: int, names: Dict[str, int]) -> int:
+    """Parse one numeric/name cron atom and enforce its field range."""
+    lowered = value.lower()
+    if lowered in names:
+        number = names[lowered]
+    elif value.isdigit():
+        number = int(value, 10)
+    else:
+        raise ValueError(f"invalid cron atom: {value}")
+    if not minimum <= number <= maximum:
+        raise ValueError(f"cron atom out of range: {value}")
+    return number
+
+
+def _validate_cron_field(
+    field: str,
+    minimum: int,
+    maximum: int,
+    names: Optional[Dict[str, int]] = None,
+) -> None:
+    """Validate lists, ranges and steps accepted by Debian/Vixie cron."""
+    names = names or {}
+    if not field:
+        raise ValueError("empty cron field")
+    for item in field.split(","):
+        if not item:
+            raise ValueError("empty cron list item")
+        if item.count("/") > 1:
+            raise ValueError(f"invalid cron step: {item}")
+        base, separator, step_text = item.partition("/")
+        if separator:
+            if not step_text.isdigit() or int(step_text, 10) < 1:
+                raise ValueError(f"invalid cron step: {item}")
+        if base == "*":
+            continue
+        if base.count("-") > 1:
+            raise ValueError(f"invalid cron range: {item}")
+        if "-" in base:
+            start_text, end_text = base.split("-", 1)
+            start = _cron_atom(start_text, minimum, maximum, names)
+            end = _cron_atom(end_text, minimum, maximum, names)
+            if start > end:
+                raise ValueError(f"descending cron range: {item}")
+        else:
+            _cron_atom(base, minimum, maximum, names)
+
+
+def validate_cron_schedule(schedule: str) -> bool:
+    """Return True only for one semantically valid five-field cron schedule."""
+    fields = schedule.split()
+    if len(fields) != 5:
+        return False
+    specifications = (
+        (0, 59, {}),
+        (0, 23, {}),
+        (1, 31, {}),
+        (1, 12, CRON_MONTH_NAMES),
+        (0, 7, CRON_WEEKDAY_NAMES),
+    )
+    try:
+        for field, (minimum, maximum, names) in zip(fields, specifications):
+            _validate_cron_field(field, minimum, maximum, names)
+    except ValueError:
+        return False
+    return True
+
+
 def decode_value(raw: str) -> str:
     """Decode simple shell quoting while keeping all expansions literal."""
     value = raw.strip()
@@ -93,16 +172,32 @@ def decode_value(raw: str) -> str:
     return tokens[0] if len(tokens) == 1 else value
 
 
-def parse_config(path: Path) -> Dict[str, str]:
+def parse_config(path: Path, required: bool = False) -> Dict[str, str]:
     """Parse allowlisted KEY=value records; later duplicates win."""
     values: Dict[str, str] = {}
+    lock_handle = None
     try:
+        lock_path = Path(str(path) + ".lock")
+        try:
+            lock_handle = lock_path.open("r", encoding="utf-8")
+        except FileNotFoundError:
+            lock_handle = None
+        if lock_handle is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
+        if required:
+            raise
         return values
     except (OSError, UnicodeError) as exc:
+        if required:
+            raise
         print(f"lldpq-config: cannot read {path}: {exc}", file=sys.stderr)
         return values
+
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
 
     for line_number, line in enumerate(lines, 1):
         if not line or line.lstrip().startswith("#"):
@@ -140,8 +235,61 @@ def main() -> int:
         default=DEFAULT_CONFIG,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--require-config",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--require-key",
+        action="append",
+        default=[],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--validate-cron",
+        metavar="SCHEDULE",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
-    output = render_shell(parse_config(args.config))
+    if args.validate_cron is not None:
+        return 0 if validate_cron_schedule(args.validate_cron) else 2
+    try:
+        values = parse_config(args.config, required=args.require_config)
+    except FileNotFoundError:
+        print(
+            f"lldpq-config: required config is missing: {args.config}",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, UnicodeError) as exc:
+        print(
+            f"lldpq-config: required config is unreadable: {args.config}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.require_config and not values:
+        print(
+            f"lldpq-config: required config has no valid LLDPq settings: {args.config}",
+            file=sys.stderr,
+        )
+        return 1
+    unknown_required = [key for key in args.require_key if key not in ALLOWED_KEYS]
+    if unknown_required:
+        print(
+            "lldpq-config: unknown required key(s): " + ", ".join(unknown_required),
+            file=sys.stderr,
+        )
+        return 2
+    missing_required = [key for key in args.require_key if not values.get(key)]
+    if missing_required:
+        print(
+            "lldpq-config: required key(s) missing or empty: "
+            + ", ".join(missing_required),
+            file=sys.stderr,
+        )
+        return 1
+    output = render_shell(values)
     if output:
         print(output)
     return 0

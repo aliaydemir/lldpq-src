@@ -73,12 +73,39 @@ nv set acl acl-default-whitelist rule 210 action permit
 nv config apply -y
 ```
 
-**Persistent data** (optional — keeps monitoring data across restarts):
+**Persistent data and settings** (recommended — survives container recreation):
 ```bash
 sudo docker run -d --name lldpq --network host \
+  --privileged \
   -v lldpq-data:/home/lldpq/lldpq/monitor-results \
+  -v lldpq-lldp-data:/home/lldpq/lldpq/lldp-results \
+  -v lldpq-alert-state:/home/lldpq/lldpq/alert-states \
+  -v lldpq-dhcp-state:/var/lib/dhcp \
+  -v lldpq-configs:/var/www/html/configs \
+  -v lldpq-hstr:/var/www/html/hstr \
+  -v lldpq-generated-configs:/var/www/html/generated_config_folder \
+  -v lldpq-provision-files:/var/www/html/provision-uploads \
+  -v lldpq-system-config:/home/lldpq/lldpq/system-config \
+  -v lldpq-app-config:/home/lldpq/lldpq/config \
+  -v lldpq-ssh:/home/lldpq/.ssh \
+  -v lldpq-ansible:/home/lldpq/ansible \
   lldpq:latest
 ```
+
+`lldpq-system-config` stores `/etc/lldpq.conf`, `dhcpd.conf`, `dhcpd.hosts`
+and the ISC DHCP interface setting. The entrypoint keeps their normal `/etc`
+paths as symlinks. `lldpq-app-config` stores inventory, topology, notification,
+login, ZTP, serial-mapping and display-alias settings; `lldpq-ssh` stores switch
+SSH keys, and `lldpq-ansible` stores inventory/playbooks/host and group vars.
+`lldpq-lldp-data` stores the current LLDP validation result and
+`lldpq-alert-state` stores notification history/deduplication state, preventing
+duplicate recovery/outage notifications after a container replacement.
+`lldpq-dhcp-state` retains the DHCP lease database. Generated NVUE ZTP files
+and uploaded OS images/ONIE aliases live in `lldpq-generated-configs` and
+`lldpq-provision-files` respectively.
+Existing direct file mounts remain supported. The web report tree is
+intentionally separate from raw monitoring data and is re-seeded from the
+last-known-good source data when a container is recreated.
 
 **Ansible support** (optional — enables VLAN/BGP reports, Fabric Config/Editor):
 
@@ -102,19 +129,237 @@ rsync -avz -e 'ssh -p 2033' ~/my_ansible_project/ lldpq@<host-ip>:/home/lldpq/an
 See [Ansible Integration](#ansible-integration) section below for directory structure requirements.
 
 **Update/Rebuild Docker:**
-```bash
-# Stop and remove old container + image
-sudo docker stop lldpq && sudo docker rm lldpq && sudo docker rmi lldpq:latest
 
-# Load new image and run
-sudo docker load < lldpq-amd64.tar.gz   # or lldpq-arm64.tar.gz
-sudo docker run -d --name lldpq --network host lldpq:latest
+Never delete the old container first. The migration below loads the image and
+captures both data and the complete old `docker inspect` configuration before
+the outage. It keeps the stopped old container under a rollback name until the
+new container has started and answered an HTTP readiness check.
+
+```bash
+# One-time migration backup + rollback-capable replacement
+set -Eeuo pipefail
+container=lldpq
+stamp=$(date +%Y%m%d-%H%M%S)
+old_container="${container}-pre-upgrade-${stamp}"
+backup="$HOME/lldpq-container-backup-$stamp"
+image_archive=lldpq-amd64.tar.gz             # use lldpq-arm64.tar.gz on ARM64
+mkdir -p "$backup/app-config" "$backup/ssh" "$backup/ansible" \
+  "$backup/web-root" "$backup/dhcp-state"
+sudo docker container inspect "$container" >/dev/null
+sudo docker inspect "$container" > "$backup/container-inspect.json"
+sudo docker inspect --format \
+  'Restart={{json .HostConfig.RestartPolicy}} Env={{json .Config.Env}} Mounts={{json .Mounts}} Network={{json .HostConfig.NetworkMode}} Ports={{json .HostConfig.PortBindings}}' \
+  "$container" > "$backup/container-options.txt"
+
+# Load and verify the replacement image while the live container is untouched.
+test -s "$image_archive"
+sudo docker load < "$image_archive"
+sudo docker image inspect lldpq:latest >/dev/null
+
+copy_required() {
+  src=$1 dest=$2
+  # -L follows application symlinks such as /etc/lldpq.conf.
+  sudo docker cp -L "$container:$src" "$dest"
+  test -e "$dest"
+}
+copy_tree_required() {
+  src=$1 dest=$2
+  sudo docker cp "$container:$src" "$dest"
+}
+copy_optional() {
+  src=$1 dest=$2
+  error_file=$(mktemp)
+  if sudo docker cp -L "$container:$src" "$dest" 2>"$error_file"; then
+    rm -f "$error_file"
+    test -e "$dest"
+    return
+  fi
+  # docker cp works for both running and stopped containers. Only a confirmed
+  # missing optional path may be skipped; daemon/storage/permission failures
+  # abort the migration and leave the old container untouched.
+  if grep -Eqi 'no such file or directory|could not find the file' "$error_file"; then
+    rm -f "$error_file"
+    return 0
+  fi
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  return 1
+}
+copy_tree_optional() {
+  src=$1 dest=$2
+  error_file=$(mktemp)
+  if sudo docker cp "$container:$src" "$dest" 2>"$error_file"; then
+    rm -f "$error_file"
+    return
+  fi
+  if grep -Eqi 'no such file or directory|could not find the file' "$error_file"; then
+    rm -f "$error_file"
+    return 0
+  fi
+  cat "$error_file" >&2
+  rm -f "$error_file"
+  return 1
+}
+
+# Core identity is required; every other existing path must copy successfully.
+copy_required /etc/lldpq.conf "$backup/lldpq.conf"
+copy_optional /etc/dhcp/dhcpd.conf "$backup/dhcpd.conf"
+copy_optional /etc/dhcp/dhcpd.hosts "$backup/dhcpd.hosts"
+copy_optional /etc/default/isc-dhcp-server "$backup/isc-dhcp-server"
+copy_optional /home/lldpq/lldpq/monitor-results "$backup/monitor-results"
+copy_optional /home/lldpq/lldpq/lldp-results "$backup/lldp-results"
+copy_optional /home/lldpq/lldpq/alert-states "$backup/alert-states"
+copy_optional /var/www/html/configs "$backup/configs"
+copy_optional /var/www/html/hstr "$backup/hstr"
+copy_tree_optional /home/lldpq/.ssh/. "$backup/ssh/"
+copy_tree_optional /home/lldpq/ansible/. "$backup/ansible/"
+copy_tree_optional /var/lib/dhcp/. "$backup/dhcp-state/"
+# Preserve root-level uploaded images/ONIE aliases and every other dynamic web
+# artifact. Static application files are retained in the backup but are not
+# copied over the replacement image.
+copy_tree_required /var/www/html/. "$backup/web-root/"
+copy_optional /home/lldpq/lldpq/devices.yaml "$backup/app-config/devices.yaml"
+copy_optional /home/lldpq/lldpq/notifications.yaml "$backup/app-config/notifications.yaml"
+copy_optional /var/www/html/topology.dot "$backup/app-config/topology.dot"
+copy_optional /var/www/html/topology_config.yaml "$backup/app-config/topology_config.yaml"
+copy_optional /etc/lldpq-users.conf "$backup/app-config/lldpq-users.conf"
+copy_optional /var/www/html/cumulus-ztp.sh "$backup/app-config/cumulus-ztp.sh"
+copy_optional /var/www/html/serial-mapping.txt "$backup/app-config/serial-mapping.txt"
+copy_optional /var/www/html/display-aliases.json "$backup/app-config/display-aliases.json"
+test -s "$backup/lldpq.conf"
+printf 'backup completed for %s at %s\n' "$container" "$(date -Is)" > "$backup/COMPLETE"
+
+# Review the captured options before allowing the short outage. Add every
+# deployment-specific -e/-v/-p/--network/--restart option to extra_args below.
+# If Ansible was a host bind mount, remove the lldpq-ansible named-volume entry
+# from persistent_args and put that bind mount in extra_args instead.
+cat "$backup/container-options.txt"
+extra_args=(--network host --privileged --restart unless-stopped)
+persistent_args=(
+  -v lldpq-data:/home/lldpq/lldpq/monitor-results
+  -v lldpq-lldp-data:/home/lldpq/lldpq/lldp-results
+  -v lldpq-alert-state:/home/lldpq/lldpq/alert-states
+  -v lldpq-dhcp-state:/var/lib/dhcp
+  -v lldpq-configs:/var/www/html/configs
+  -v lldpq-hstr:/var/www/html/hstr
+  -v lldpq-generated-configs:/var/www/html/generated_config_folder
+  -v lldpq-provision-files:/var/www/html/provision-uploads
+  -v lldpq-system-config:/home/lldpq/lldpq/system-config
+  -v lldpq-app-config:/home/lldpq/lldpq/config
+  -v lldpq-ssh:/home/lldpq/.ssh
+  -v lldpq-ansible:/home/lldpq/ansible
+)
+if [[ ${LLDPQ_MIGRATION_OPTIONS_CONFIRMED:-false} != true ]]; then
+  echo "No live change made. Review $backup/container-options.txt, edit extra_args/persistent_args, export LLDPQ_MIGRATION_OPTIONS_CONFIRMED=true, then rerun." >&2
+  exit 2
+fi
+
+test -s "$backup/COMPLETE"
+
+rollback_container() {
+  rc=$?
+  trap - ERR INT TERM
+  set +e
+  if [[ ${old_rename_intent:-false} == true ]] && \
+     sudo docker container inspect "$old_container" >/dev/null 2>&1; then
+    sudo docker rm -f "$container" >/dev/null 2>&1
+    sudo docker rename "$old_container" "$container"
+    sudo docker start "$container"
+    echo "Replacement failed; the previous container was restored and restarted." >&2
+  else
+    # Failure before/while rename: the live container still has its original
+    # name and may only need to be started again.
+    sudo docker start "$container" >/dev/null 2>&1 || true
+    echo "Replacement failed before the rollback rename completed; the original container was left in place." >&2
+  fi
+  exit "$rc"
+}
+
+# Keep the old container intact under a rollback name.
+if sudo docker container inspect "$old_container" >/dev/null 2>&1; then
+  echo "Rollback name already exists: $old_container" >&2
+  exit 1
+fi
+old_rename_intent=true
+trap rollback_container ERR INT TERM
+sudo docker stop "$container"
+sudo docker rename "$container" "$old_container"
+sudo docker create --name "$container" \
+  "${extra_args[@]}" "${persistent_args[@]}" \
+  lldpq:latest
+
+# Import the legacy data into the new named volumes while the container is stopped.
+sudo docker cp "$backup/lldpq.conf" "$container":/home/lldpq/lldpq/system-config/lldpq.conf
+test ! -f "$backup/dhcpd.conf" || sudo docker cp "$backup/dhcpd.conf" "$container":/home/lldpq/lldpq/system-config/dhcpd.conf
+test ! -f "$backup/dhcpd.hosts" || sudo docker cp "$backup/dhcpd.hosts" "$container":/home/lldpq/lldpq/system-config/dhcpd.hosts
+test ! -f "$backup/isc-dhcp-server" || sudo docker cp "$backup/isc-dhcp-server" "$container":/home/lldpq/lldpq/system-config/isc-dhcp-server
+test ! -d "$backup/monitor-results" || sudo docker cp "$backup/monitor-results/." "$container":/home/lldpq/lldpq/monitor-results/
+test ! -d "$backup/lldp-results" || sudo docker cp "$backup/lldp-results/." "$container":/home/lldpq/lldpq/lldp-results/
+test ! -d "$backup/alert-states" || sudo docker cp "$backup/alert-states/." "$container":/home/lldpq/lldpq/alert-states/
+test ! -d "$backup/configs" || sudo docker cp "$backup/configs/." "$container":/var/www/html/configs/
+test ! -d "$backup/hstr" || sudo docker cp "$backup/hstr/." "$container":/var/www/html/hstr/
+sudo docker cp "$backup/app-config/." "$container":/home/lldpq/lldpq/config/
+sudo docker cp "$backup/ssh/." "$container":/home/lldpq/.ssh/
+sudo docker cp "$backup/ansible/." "$container":/home/lldpq/ansible/
+sudo docker cp "$backup/dhcp-state/." "$container":/var/lib/dhcp/
+test ! -d "$backup/web-root/generated_config_folder" || sudo docker cp "$backup/web-root/generated_config_folder/." "$container":/var/www/html/generated_config_folder/
+test ! -d "$backup/web-root/provision-uploads" || sudo docker cp "$backup/web-root/provision-uploads/." "$container":/var/www/html/provision-uploads/
+
+# Legacy images lived directly in WEB_ROOT. Store them in the new provision volume.
+shopt -s nullglob
+for image in "$backup/web-root"/*.bin "$backup/web-root"/*.img "$backup/web-root"/*.iso; do
+  [[ -L "$image" ]] && continue
+  sudo docker cp "$image" "$container":/var/www/html/provision-uploads/
+done
+for alias in onie-installer-x86_64 onie-installer-x86_64-mlnx onie-installer; do
+  if [[ -L "$backup/web-root/$alias" ]]; then
+    target=$(basename "$(readlink "$backup/web-root/$alias")")
+    alias_stage=$(mktemp -d)
+    ln -s "$target" "$alias_stage/$alias"
+    sudo docker cp "$alias_stage/$alias" "$container":/var/www/html/provision-uploads/
+    rm -rf "$alias_stage"
+  elif [[ -f "$backup/web-root/$alias" ]]; then
+    sudo docker cp "$backup/web-root/$alias" "$container":/var/www/html/provision-uploads/
+  fi
+done
+shopt -u nullglob
+
+sudo docker start "$container"
+ready=false
+for _ in {1..30}; do
+  if [[ $(sudo docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null) == true ]] && \
+     sudo docker exec "$container" curl -fsS http://127.0.0.1/login.html >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ $ready != true ]]; then
+  sudo docker logs --tail 100 "$container" >&2 || true
+  false
+fi
+
+trap - ERR INT TERM
+echo "Upgrade verified. Rollback container retained as: $old_container"
+echo "After final acceptance: sudo docker rm $old_container"
+```
+
+If you need to roll back after the readiness check, the old container is still
+intact. In the same shell run:
+
+```bash
+sudo docker rm -f lldpq
+sudo docker rename "$old_container" lldpq
+sudo docker start lldpq
 ```
 
 **Remove completely:**
 ```bash
 sudo docker stop lldpq && sudo docker rm lldpq && sudo docker rmi lldpq:latest
-sudo docker volume rm lldpq-data lldpq-configs lldpq-hstr 2>/dev/null
+sudo docker volume rm lldpq-data lldpq-configs lldpq-hstr lldpq-system-config \
+  lldpq-app-config lldpq-ssh lldpq-lldp-data lldpq-alert-state \
+  lldpq-dhcp-state lldpq-generated-configs lldpq-provision-files \
+  lldpq-ansible 2>/dev/null
 rm -f ~/lldpq-*.tar.gz
 ```
 
@@ -179,7 +424,7 @@ cd lldpq-src
 - **duplicate address detection**: duplicate IP/MAC detection via EVPN DAD + MAC-mobility sequences, with severity, quiesced/aged lifecycle, and per-port interface descriptions (see [02e])
 - **optical diagnostics**: power levels, temperature, bias current, link margins  
 - **link flap detection**: carrier transitions on all interfaces (including breakouts), with time-windowed flap counts (1h / 12h / 24h)
-- **bit error rate**: comprehensive error statistics with industry thresholds — raw BER, effective BER, and PHY symbol errors
+- **Link error / BER**: directional frame-error density from interface counters, plus separately graded raw/effective PHY BER and PHY symbol-error deltas
 - **hardware health**: cpu/asic temperatures, memory usage, fan speeds, psu efficiency
 - **topology validation**: lldp neighbor verification against expected topology
 
@@ -312,21 +557,27 @@ works with any Clos topology: 2-tier (leaf-spine), 3-tier (leaf-spine-core), or 
 
 access via web UI: **Duplicate** menu (`/monitor-results/duplicate-analysis.html`)
 
-Detects duplicate IPs and MACs across the fabric by correlating EVPN duplicate-address-detection (DAD) flags, MAC-mobility sequence numbers, FDB/ARP snapshots, and switch logs. Designed to separate genuinely harmful conflicts from benign, settled duplicates (e.g. storage VIPs) so the dashboard stays low-noise.
+Correlates EVPN duplicate-address-detection (DAD) flags, per-observer MAC-mobility sequences, FDB/neighbor snapshots, and sampled switch logs. The report keeps confirmed address conflicts, DAD evidence, endpoint mobility, possible loops, and IPv4 link-local health as separate incident types; headline conflict counts never include mobility-only or replicated neighbor observations. Active IP conflicts and standalone MAC conflicts are disjoint, so the combined conflict-incident total cannot count the same event twice.
 
 ### severity
 
 | Severity | Meaning |
 |----------|---------|
-| **CRITICAL** | Actively moving — a recent EVPN event or a climbing mobility sequence |
-| **WARNING (quiesced)** | Confirmed / flagged duplicate that has settled (no active flapping) |
-| **Aged** | Quiesced with no sequence movement for 7+ days — hidden by default, toggle to show |
+| **Confirmed conflict** | Current corroborating evidence shows one IP with multiple MAC claims, or one MAC at multiple non-MH attachment points |
+| **DAD-only finding** | A current/recent FRR DAD signal exists without enough corroboration to call it a confirmed address conflict; shown separately as an operational warning |
+| **Active mobility** | Movement rate reaches the switch DAD moves/window policy; a `+1` sequence change alone is not active flapping |
+| **Possible loop incident** | At least ten MAC signals move across the same endpoint set in one scope; the headline counts the endpoint-set incident, not every associated MAC row |
+| **Settled / historical** | DAD or mobility evidence remains, but it is not moving at the configured rate; historical location evidence is shown separately and expires |
 
 ### features
 - **conflict ports + interface descriptions**: shows `switch:port` together with the port's description (ifalias) so the colliding physical devices are immediately obvious (e.g. two "Power Shelf-07" units claiming one IP)
-- **cross-cycle port memory**: retains port/MAC mapping across runs, so even fast-flapping endpoints still show where they live when a single snapshot misses one side
-- **flapping endpoint labelling**: single-MAC entries bouncing between VTEPs are flagged as EVPN mobility rather than a static conflict
-- **CSV export** (excludes aged rows), sortable columns, and a threshold-explanation modal
+- **VNI-scoped identity**: incidents are keyed by the fabric broadcast domain; host-local VLAN numbers remain evidence instead of being treated as globally unique
+- **timestamped evidence memory**: each historical MAC/port has its own `last_seen`; old evidence cannot refresh itself or become a current conflict
+- **rate-aware, correlated mobility**: deltas are calculated once per observer after all sources merge, with collection interval and moves/min shown; IP and MAC signals sharing the same scope+MAC are one headline mobility incident
+- **safe mobility baselines**: a state-format upgrade or newly observed switch first creates a per-observer baseline; that run is marked partial and cannot manufacture a movement delta
+- **IPv4LL/APIPA transparency**: unique scope+IP+MAC claims and raw per-switch observations are separate; EVPN replicas, neighbor state, and non-VLAN sightings are visible, and IPv4LL is not asserted to prove DHCP failure
+- **coverage honesty**: expected/current devices, command/schema failures, stale collection timestamps, emitted-vs-actual sample counts, and explicit truncation are reported; partial input cannot be presented as a clean scan
+- **canonical CSV exports**: export all records or the filtered view across IP, MAC, mobility, loop, and IPv4LL tables; canonical names, mobility/loop correlation IDs, DAD policy, report UTC, and coverage metadata remain available while P2P aliases are displayed separately
 
 ## [03] configuration files
 
@@ -449,14 +700,23 @@ git pull                    # get latest code
 ```
 
 Runtime monitoring data and user configuration are preserved automatically.
-An optional full rollback snapshot can be requested with `./install.sh --backup`
-and is created at `~/lldpq-backup-YYYY-MM-DD_HH-MM/`:
+Every update also creates a temporary same-filesystem rollback snapshot of the
+previous runtime plus critical system configuration. If a later DHCP, service
+or cron step fails, the installer restores that snapshot automatically. It is
+deleted after a successful update.
+An optional full data/configuration snapshot can be requested with
+`./install.sh --backup` and is created at
+`~/lldpq-backup-YYYY-MM-DD_HH-MM-SS/`. A `COMPLETE` marker is written only
+after every requested copy succeeds; any copy failure aborts before the live
+installation is stopped:
 
 ### what gets backed up & preserved:
 - **config files**: devices.yaml, notifications.yaml, topology.dot, topology_config.yaml
 - **monitoring data**: monitor-results/, lldp-results/, alert-states/
 - **system configs**: /etc/lldpq.conf, /etc/lldpq-users.conf
 - **DHCP configs**: /etc/dhcp/dhcpd.conf, /etc/dhcp/dhcpd.hosts
+- **provisioning state**: DHCP leases, ZTP/serial/display-alias settings,
+  generated NVUE configs, uploaded OS images and ONIE aliases
 - **SSH keys**: ~/.ssh/id_*
 - **git history**: .git/ (config change tracking)
 
@@ -468,6 +728,11 @@ installer preserves it—even with `-y`. To replace it deliberately, use
 `dhcpd -t` validation (and is refused if the validator is unavailable), then
 the original is saved beside it as a timestamped
 `.pre-lldpq-*.bak` file before activation.
+
+The uninstaller can clean known system components from a partial installation
+without recursively deleting an unrecognized install directory. After
+verifying that guarded path manually, `./uninstall.sh --force-partial` also
+removes the remaining partial tree.
 
 ## [06] requirements
 

@@ -23,6 +23,7 @@ DHCP_LEASES_FILE="${DHCP_LEASES_FILE:-/var/lib/dhcp/dhcpd.leases}"
 DHCP_LOG_FILE="${DHCP_LOG_FILE:-/var/log/lldpq/dhcpd.log}"
 ZTP_SCRIPT_FILE="${ZTP_SCRIPT_FILE:-${WEB_ROOT}/cumulus-ztp.sh}"
 BASE_CONFIG_DIR="${BASE_CONFIG_DIR:-${LLDPQ_DIR}/sw-base}"
+PROVISION_UPLOAD_DIR="${PROVISION_UPLOAD_DIR:-${WEB_ROOT}/provision-uploads}"
 
 # Output JSON header
 echo "Content-Type: application/json"
@@ -51,6 +52,7 @@ AUTO_SET_HOSTNAME="${AUTO_SET_HOSTNAME:-true}"
 # Export for Python
 export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE DHCP_LOG_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
+export PROVISION_UPLOAD_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
 export POST_DATA ACTION LINES_PARAM
 
@@ -59,6 +61,7 @@ import json
 import sys
 import os
 import re
+import shlex
 import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,6 +78,7 @@ DHCP_LEASES_FILE = os.environ.get('DHCP_LEASES_FILE', '/var/lib/dhcp/dhcpd.lease
 DHCP_LOG_FILE = os.environ.get('DHCP_LOG_FILE', '/var/log/lldpq/dhcpd.log')
 ZTP_SCRIPT_FILE = os.environ.get('ZTP_SCRIPT_FILE', f'{WEB_ROOT}/cumulus-ztp.sh')
 BASE_CONFIG_DIR = os.environ.get('BASE_CONFIG_DIR', f'{LLDPQ_DIR}/sw-base')
+PROVISION_UPLOAD_DIR = os.environ.get('PROVISION_UPLOAD_DIR', f'{WEB_ROOT}/provision-uploads')
 DISCOVERY_RANGE = os.environ.get('DISCOVERY_RANGE', '')
 AUTO_BASE_CONFIG = os.environ.get('AUTO_BASE_CONFIG', 'true') == 'true'
 AUTO_ZTP_DISABLE = os.environ.get('AUTO_ZTP_DISABLE', 'true') == 'true'
@@ -2042,24 +2046,70 @@ def image_version_from_name(name):
     m = re.search(r'cumulus-linux-([0-9][A-Za-z0-9._-]*?)-', name)
     return m.group(1) if m else ''
 
+
+def valid_os_image_name(name):
+    return bool(re.fullmatch(r'[A-Za-z0-9_.-]+\.(?:bin|img|iso)', name or ''))
+
+
+def resolve_os_image_path(name):
+    """Prefer persistent storage while retaining native legacy compatibility."""
+    if not valid_os_image_name(name):
+        return None
+    persistent = os.path.join(PROVISION_UPLOAD_DIR, name)
+    if os.path.isfile(persistent):
+        return persistent
+    legacy = os.path.join(WEB_ROOT, name)
+    if os.path.isfile(legacy):
+        return legacy
+    return None
+
+
+def publish_provision_root_link(name):
+    """Expose a persistent upload at the historical web-root URL."""
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', name or ''):
+        return False
+    stored = os.path.join(PROVISION_UPLOAD_DIR, name)
+    if not os.path.lexists(stored):
+        return False
+    link = os.path.join(WEB_ROOT, name)
+    relative_target = os.path.relpath(stored, WEB_ROOT)
+    try:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(relative_target, link)
+        return True
+    except Exception:
+        command = 'ln -sfn -- %s %s' % (
+            shlex.quote(relative_target), shlex.quote(link)
+        )
+        result = subprocess.run(
+            ['sudo', '-u', LLDPQ_USER, 'bash', '-c', command],
+            capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+
+
 def list_os_image_objects():
     images = []
+    seen = set()
     import glob as g
-    for ext in ['*.bin', '*.img', '*.iso']:
-        for f in g.glob(os.path.join(WEB_ROOT, ext)):
-            name = os.path.basename(f)
-            # Skip the ONIE HTTP-discovery serving aliases (symlinks to the active image) — they are
-            # not uploadable OS images and must not clutter / be selectable in this list.
-            if name.startswith('onie-installer'):
-                continue
-            size_bytes = os.path.getsize(f)
-            images.append({
-                'name': name,
-                'size': f'{size_bytes / 1048576:.0f} MB' if size_bytes > 1048576 else f'{size_bytes / 1024:.0f} KB',
-                'size_bytes': size_bytes,
-                'version': image_version_from_name(name),
-                'path': f,
-            })
+    for image_root in (PROVISION_UPLOAD_DIR, WEB_ROOT):
+        for ext in ['*.bin', '*.img', '*.iso']:
+            for f in g.glob(os.path.join(image_root, ext)):
+                name = os.path.basename(f)
+                # Root-level compatibility links point back into persistent
+                # storage; list each image once from its canonical location.
+                if name.startswith('onie-installer') or name in seen or not os.path.isfile(f):
+                    continue
+                seen.add(name)
+                size_bytes = os.path.getsize(f)
+                images.append({
+                    'name': name,
+                    'size': f'{size_bytes / 1048576:.0f} MB' if size_bytes > 1048576 else f'{size_bytes / 1024:.0f} KB',
+                    'size_bytes': size_bytes,
+                    'version': image_version_from_name(name),
+                    'path': f,
+                })
     images.sort(key=lambda x: x['name'])
     return images
 
@@ -2161,7 +2211,7 @@ def run_upgrade_precheck(device, target_version, image_name, server_ip):
         checks.append('Already at target')
     if not info.get('startup_config'):
         checks.append('startup.yaml missing')
-    if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
+    if not resolve_os_image_path(image_name):
         checks.append('Image missing on server')
     if not is_valid_server_ref(server_ip):
         checks.append('Invalid image server')
@@ -2195,7 +2245,7 @@ def action_upgrade_precheck():
     server_ip = data.get('server_ip', '').strip()
     if not devices or not target_version or not image_name or not server_ip:
         error_json('devices, target_version, image_name and server_ip are required')
-    if not re.match(r'^[A-Za-z0-9_.-]+\.(bin|img|iso)$', image_name):
+    if not valid_os_image_name(image_name):
         error_json('Invalid image filename')
     if not is_valid_server_ref(server_ip):
         error_json('Invalid image server. Set a real ZTP IMAGE SERVER IP first.')
@@ -2333,9 +2383,10 @@ def ensure_onie_symlinks(image_name):
     Extension-less only: ONIE tries "<name>" before "<name>.bin" at every level, so these are
     served first — and they don't collide with the OS-image list (which globs *.bin).
     """
-    if not re.match(r'^[A-Za-z0-9_.-]+\.(bin|img|iso)$', image_name or ''):
+    if not valid_os_image_name(image_name):
         return []
-    if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
+    image_path = resolve_os_image_path(image_name)
+    if not image_path:
         return []
     # Only the extension-less names: ONIE requests "<name>" before "<name>.bin" at every waterfall
     # level, so the plain names are always served first. Skipping the .bin variants also keeps them
@@ -2346,18 +2397,44 @@ def ensure_onie_symlinks(image_name):
         'onie-installer',
     ]
     created = []
+    persistent_image = os.path.dirname(os.path.realpath(image_path)) == os.path.realpath(PROVISION_UPLOAD_DIR)
+    if persistent_image and not publish_provision_root_link(image_name):
+        return []
     for n in names:
+        if persistent_image:
+            link = os.path.join(PROVISION_UPLOAD_DIR, n)
+            try:
+                if os.path.lexists(link):
+                    os.remove(link)
+                os.symlink(image_name, link)
+                if publish_provision_root_link(n):
+                    created.append(n)
+                continue
+            except Exception:
+                command = 'ln -sfn -- %s %s' % (
+                    shlex.quote(image_name), shlex.quote(link)
+                )
+                rc = subprocess.run(
+                    ['sudo', '-u', LLDPQ_USER, 'bash', '-c', command],
+                    capture_output=True, timeout=10,
+                )
+                if rc.returncode == 0 and publish_provision_root_link(n):
+                    created.append(n)
+                continue
+
         link = os.path.join(WEB_ROOT, n)
         try:
-            if os.path.islink(link) or os.path.exists(link):
+            if os.path.lexists(link):
                 os.remove(link)
             os.symlink(image_name, link)          # relative target (same dir as the image)
             created.append(n)
         except Exception:
             # www-data may not own the web root -> create via the service user (bash is whitelisted)
-            rc = subprocess.run(['sudo', '-u', LLDPQ_USER, 'bash', '-c',
-                                 'ln -sfn "%s" "%s"' % (image_name, link)],
-                                capture_output=True, timeout=10)
+            command = 'ln -sfn -- %s %s' % (shlex.quote(image_name), shlex.quote(link))
+            rc = subprocess.run(
+                ['sudo', '-u', LLDPQ_USER, 'bash', '-c', command],
+                capture_output=True, timeout=10,
+            )
             if rc.returncode == 0:
                 created.append(n)
     return created
@@ -2374,11 +2451,11 @@ def action_upgrade_start():
     server_ip = data.get('server_ip', '').strip()
     if not devices or not target_version or not image_name or not server_ip:
         error_json('devices, target_version, image_name and server_ip are required')
-    if not re.match(r'^[A-Za-z0-9_.-]+\.(bin|img|iso)$', image_name):
+    if not valid_os_image_name(image_name):
         error_json('Invalid image filename')
     if not is_valid_server_ref(server_ip):
         error_json('Invalid image server. Set a real ZTP IMAGE SERVER IP first.')
-    if not os.path.exists(os.path.join(WEB_ROOT, image_name)):
+    if not resolve_os_image_path(image_name):
         error_json('Selected image not found on server')
     # Point the generic ONIE discovery fallback names at this image, so switches whose ONIE re-runs
     # HTTP waterfall discovery during the -fa install still find it (see ensure_onie_symlinks).
@@ -2642,8 +2719,8 @@ def action_upload_os_image():
             error_json("No filename in upload")
         filename = os.path.basename(fn_match.group(1).decode('latin-1'))
         
-        # Validate extension
-        if not any(filename.endswith(ext) for ext in ['.bin', '.img', '.iso']):
+        # Validate the complete basename, not only its extension.
+        if not valid_os_image_name(filename):
             try: os.unlink(tmp_upload.name)
             except: pass
             error_json(f"Invalid file type: {filename}. Only .bin, .img, .iso allowed.")
@@ -2664,10 +2741,15 @@ def action_upload_os_image():
     if file_size < 0:
         file_size = total_size - body_start
     
-    # Stream file body from temp to destination (chunk by chunk, no full RAM load)
-    dest = os.path.join(WEB_ROOT, filename)
+    # Extract a clean body file first. The old fallback copied the original
+    # multipart envelope when a direct destination write was denied, producing
+    # a corrupt image while reporting success.
+    body_temp = None
+    stage = None
+    dest = os.path.join(PROVISION_UPLOAD_DIR, filename)
     try:
-        with open(tmp_upload.name, 'rb') as src, open(dest, 'wb') as dst:
+        body_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.' + filename)
+        with open(tmp_upload.name, 'rb') as src, body_temp as dst:
             src.seek(body_start)
             written = 0
             while written < file_size:
@@ -2678,32 +2760,75 @@ def action_upload_os_image():
                 written += len(chunk)
         # Trim any trailing boundary bytes from the end of the file
         # (read last 256 bytes and check for boundary)
-        with open(dest, 'r+b') as f:
+        with open(body_temp.name, 'r+b') as f:
             f.seek(max(0, written - 256))
             tail = f.read()
             boundary_idx = tail.rfind(b'\r\n' + boundary_bytes)
             if boundary_idx >= 0:
                 f.seek(max(0, written - 256) + boundary_idx)
                 f.truncate()
+
+        os.makedirs(PROVISION_UPLOAD_DIR, mode=0o775, exist_ok=True)
+        stage = os.path.join(
+            PROVISION_UPLOAD_DIR, f'.{filename}.upload-{os.getpid()}-{uuid.uuid4().hex}'
+        )
+        with open(body_temp.name, 'rb') as src, open(stage, 'wb') as dst:
+            while True:
+                chunk = src.read(65536)
+                if not chunk:
+                    break
+                dst.write(chunk)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.chmod(stage, 0o664)
+        os.replace(stage, dest)
+        stage = None
         os.chmod(dest, 0o664)
         final_size = os.path.getsize(dest)
+        if not publish_provision_root_link(filename):
+            raise RuntimeError('image was stored but its web-root compatibility link could not be published')
         try: os.unlink(tmp_upload.name)
+        except: pass
+        try: os.unlink(body_temp.name)
         except: pass
         result_json({"success": True, "message": f"Uploaded {filename}", "size": final_size})
     except PermissionError:
-        # Fallback: use sudo cp from temp file (body already extracted)
-        subprocess.run(['sudo', 'cp', tmp_upload.name, dest], capture_output=True, timeout=300)
-        subprocess.run(['sudo', 'chown', f'{LLDPQ_USER}:www-data', dest], capture_output=True, timeout=5)
-        subprocess.run(['sudo', 'chmod', '664', dest], capture_output=True, timeout=5)
+        # Fallback installs the already-extracted body, never the multipart input.
+        if stage:
+            try: os.unlink(stage)
+            except: pass
+        if not body_temp or not os.path.isfile(body_temp.name):
+            error_json("Write failed before the uploaded image body could be extracted")
+        mkdir_result = subprocess.run(
+            ['sudo', 'mkdir', '-p', PROVISION_UPLOAD_DIR], capture_output=True, timeout=10
+        )
+        copy_result = subprocess.run(
+            ['sudo', 'cp', body_temp.name, dest], capture_output=True, timeout=300
+        ) if mkdir_result.returncode == 0 else mkdir_result
+        chown_result = subprocess.run(
+            ['sudo', 'chown', f'{LLDPQ_USER}:www-data', dest], capture_output=True, timeout=5
+        ) if copy_result.returncode == 0 else copy_result
+        chmod_result = subprocess.run(
+            ['sudo', 'chmod', '664', dest], capture_output=True, timeout=5
+        ) if chown_result.returncode == 0 else chown_result
         try: os.unlink(tmp_upload.name)
         except: pass
-        if os.path.exists(dest):
-            result_json({"success": True, "message": f"Uploaded {filename} (via sudo)"})
+        try: os.unlink(body_temp.name)
+        except: pass
+        if chmod_result.returncode == 0 and os.path.isfile(dest) and publish_provision_root_link(filename):
+            result_json({"success": True, "message": f"Uploaded {filename} (via sudo)",
+                         "size": os.path.getsize(dest)})
         else:
             error_json("Write failed: permission denied")
     except Exception as e:
+        if stage:
+            try: os.unlink(stage)
+            except: pass
         try: os.unlink(tmp_upload.name)
         except: pass
+        if body_temp:
+            try: os.unlink(body_temp.name)
+            except: pass
         error_json(f"Upload failed: {e}")
     
     if tmp_upload:
@@ -2718,17 +2843,40 @@ def action_delete_os_image():
         error_json("Invalid JSON data")
     
     name = data.get('name', '')
-    if not name or '/' in name or '..' in name:
+    if not valid_os_image_name(name):
         error_json("Invalid filename")
-    
-    filepath = os.path.join(WEB_ROOT, name)
-    if not os.path.exists(filepath):
+
+    filepath = resolve_os_image_path(name)
+    if not filepath:
         error_json(f"File not found: {name}")
-    
-    try:
-        os.remove(filepath)
-    except PermissionError:
-        subprocess.run(['sudo', 'rm', '-f', filepath], capture_output=True, timeout=5)
+
+    def remove_path(path):
+        if not os.path.lexists(path):
+            return True
+        try:
+            os.remove(path)
+            return True
+        except PermissionError:
+            result = subprocess.run(
+                ['sudo', 'rm', '-f', path], capture_output=True, timeout=5
+            )
+            return result.returncode == 0 and not os.path.lexists(path)
+
+    if not remove_path(filepath):
+        error_json(f"Could not delete {name}")
+    root_link = os.path.join(WEB_ROOT, name)
+    if os.path.abspath(filepath) != os.path.abspath(root_link) and not remove_path(root_link):
+        error_json(f"Image deleted but web link could not be removed: {name}")
+
+    # Remove persistent/root ONIE aliases only when they selected this image.
+    for alias in ('onie-installer-x86_64', 'onie-installer-x86_64-mlnx', 'onie-installer'):
+        persistent_alias = os.path.join(PROVISION_UPLOAD_DIR, alias)
+        if os.path.islink(persistent_alias) and os.path.basename(os.readlink(persistent_alias)) == name:
+            remove_path(persistent_alias)
+            remove_path(os.path.join(WEB_ROOT, alias))
+        root_alias = os.path.join(WEB_ROOT, alias)
+        if os.path.islink(root_alias) and os.path.basename(os.readlink(root_alias)) == name:
+            remove_path(root_alias)
     
     result_json({"success": True, "message": f"Deleted {name}"})
 

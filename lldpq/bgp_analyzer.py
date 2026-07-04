@@ -12,10 +12,16 @@ import os
 import re
 import json
 import time
+import html
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass
+
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 try:
     from device_names import canonical
@@ -81,6 +87,9 @@ class BGPNeighbor:
     prefixes_sent: int
     description: str
     interface: Optional[str] = None
+    vrf: str = "default"
+    address_family: str = "unknown"
+    down_since: Optional[float] = None
 
 @dataclass
 class EVPNStats:
@@ -92,6 +101,11 @@ class EVPNStats:
     type2_routes: int = 0  # MAC/IP routes
     type5_routes: int = 0  # IP prefix routes
     vni_details: List[Dict] = None
+    route_rows_emitted: int = 0
+    route_rows_total: Optional[int] = None
+    route_cap: Optional[int] = None
+    routes_truncated: bool = False
+    route_metadata_status: str = "legacy"
     
     def __post_init__(self):
         if self.vni_details is None:
@@ -103,12 +117,12 @@ class BGPAnalyzer:
     
     # BGP health thresholds
     DEFAULT_THRESHOLDS = {
-        "critical_down_hours": 1.0,        # Critical if down > 1 hour
-        "warning_down_minutes": 30,        # Warning if down > 30 minutes
-        "high_queue_threshold": 10,        # Warning if queue > 10
-        "low_prefix_threshold": 1,         # Warning if prefixes < 1
-        "uptime_stability_days": 1,        # Expect > 1 day uptime for good health
-        "message_ratio_threshold": 0.8,    # Warning if sent/received ratio < 0.8
+        "bgp_down_minutes": 5.0,           # Configured transient/down boundary
+        "high_queue_threshold": 10,        # Warning if queue >= 10
+        # Prefix and message-ratio expectations are topology/policy specific.
+        # Keep them disabled unless an operator explicitly opts in via env.
+        "low_prefix_threshold": 0,
+        "message_ratio_threshold": 0.0,
         "history_retention_hours": 24       # Keep 24 hours of historical data
     }
     
@@ -118,6 +132,14 @@ class BGPAnalyzer:
         self.current_bgp_stats = {}  # hostname -> current BGP neighbors
         self.current_evpn_stats = {}  # hostname -> EVPN statistics
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
+        self.collection_coverage = {
+            "expected_devices": 0,
+            "current_bgp_devices": 0,
+            "current_evpn_devices": 0,
+            "unavailable_bgp_devices": [],
+            "unavailable_evpn_devices": [],
+        }
+        self._load_configured_thresholds()
         
         # Ensure bgp-data and evpn-data directories exist
         os.makedirs(f"{self.data_dir}/bgp-data", exist_ok=True)
@@ -125,6 +147,44 @@ class BGPAnalyzer:
         
         # Load historical data
         self.load_bgp_history()
+
+    def _load_configured_thresholds(self):
+        """Load operational thresholds without depending on notification enablement."""
+        candidates = [
+            os.environ.get("LLDPQ_NOTIFICATIONS_FILE"),
+            os.path.join(os.path.dirname(os.path.abspath(self.data_dir)), "notifications.yaml"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "notifications.yaml"),
+        ]
+        if yaml is not None:
+            for path in candidates:
+                if not path or not os.path.isfile(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        config = yaml.safe_load(handle) or {}
+                    network = config.get("thresholds", {}).get("network", {})
+                    value = float(network.get("bgp_down_minutes", self.thresholds["bgp_down_minutes"]))
+                    if value >= 0:
+                        self.thresholds["bgp_down_minutes"] = value
+                    break
+                except (OSError, TypeError, ValueError, AttributeError):
+                    continue
+
+        for env_name, key in (
+            ("BGP_DOWN_MINUTES", "bgp_down_minutes"),
+            ("BGP_HIGH_QUEUE_THRESHOLD", "high_queue_threshold"),
+            ("BGP_LOW_PREFIX_THRESHOLD", "low_prefix_threshold"),
+            ("BGP_MESSAGE_RATIO_THRESHOLD", "message_ratio_threshold"),
+        ):
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+                if value >= 0:
+                    self.thresholds[key] = value
+            except ValueError:
+                continue
     
     def load_bgp_history(self):
         """Load historical BGP data"""
@@ -133,6 +193,9 @@ class BGPAnalyzer:
                 data = json.load(f)
                 self.bgp_history = data.get("bgp_history", {})
                 self.current_bgp_stats = data.get("current_bgp_stats", {})
+                saved_coverage = data.get("collection_coverage")
+                if isinstance(saved_coverage, dict):
+                    self.collection_coverage.update(saved_coverage)
                 
                 # Clean old data (older than retention period)
                 self.cleanup_old_history()
@@ -145,6 +208,7 @@ class BGPAnalyzer:
             data = {
                 "bgp_history": self.bgp_history,
                 "current_bgp_stats": self.current_bgp_stats,
+                "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
             }
             with open(f"{self.data_dir}/bgp_history.json", "w") as f:
@@ -189,30 +253,53 @@ class BGPAnalyzer:
     def parse_bgp_output(self, bgp_data: str) -> List[BGPNeighbor]:
         """Parse BGP neighbor output from vtysh command"""
         neighbors = []
-        neighbor_dict = {}  # Track unique neighbors by IP, keep last seen
+        neighbor_dict = {}  # Track unique neighbors per VRF, keep last seen
         
         lines = bgp_data.strip().split('\n')
         current_vrf = "default"
+        current_address_family = "unknown"
         local_asn = None
         
         for i, line in enumerate(lines):
             line = line.strip()
             
-            # Extract VRF information
-            vrf_match = re.search(r'Summary \(VRF\s+([^\)]+)\)', line)
-            if vrf_match:
-                current_vrf = vrf_match.group(1)
+            # FRR omits ``(VRF ...)`` from default-VRF headings, for example
+            # ``IPv4 Unicast Summary:`` and ``L2VPN EVPN Summary:``.  Reset
+            # both dimensions at every heading so the same peer in different
+            # address families is not collapsed under ``default/unknown``.
+            summary_match = re.fullmatch(
+                r'(.+?)\s+Summary(?:\s+\(VRF\s+([^\)]+)\))?:?',
+                line,
+                re.IGNORECASE,
+            )
+            if summary_match:
+                current_address_family = summary_match.group(1).strip()
+                current_vrf = (
+                    summary_match.group(2).strip()
+                    if summary_match.group(2) else "default"
+                )
                 continue
             
             # Extract local AS number
             asn_match = re.search(r'local AS number (\d+)', line)
             if asn_match:
                 local_asn = int(asn_match.group(1))
+                # Some FRR versions put the VRF only on the router-identifier
+                # line rather than in the preceding summary heading.
+                router_vrf_match = re.search(
+                    r'\bVRF\s+([^\s,)]+)', line, re.IGNORECASE
+                )
+                if router_vrf_match:
+                    current_vrf = router_vrf_match.group(1).rstrip(':')
                 continue
             
             # Parse neighbor entries (skip header lines)
-            if re.match(r'^[A-Za-z0-9._-]+.*\s+\d+\s+\d+\s+\d+\s+\d+', line):
+            # Let integer conversion below identify summary rows.  Restricting
+            # the first token to hostname characters drops valid IPv6 peers.
+            if line:
                 parts = line.split()
+                if parts and parts[0].lower() == "neighbor":
+                    continue
                 if len(parts) >= 10:
 
                     try:
@@ -228,8 +315,20 @@ class BGPAnalyzer:
                         
                         # Parse state and prefix count
                         state_pfx = parts[9] if len(parts) > 9 else "Unknown"
-                        pfx_sent = int(parts[10]) if len(parts) > 10 else 0
-                        description = parts[11] if len(parts) > 11 else "N/A"
+                        pfx_sent = 0
+                        description_start = 10
+                        if len(parts) > 10:
+                            try:
+                                pfx_sent = int(parts[10])
+                                description_start = 11
+                            except ValueError:
+                                # Older FRR output omits PfxSnt; token 10 is
+                                # already the optional description.
+                                pass
+                        description = (
+                            " ".join(parts[description_start:])
+                            if len(parts) > description_start else "N/A"
+                        )
                         
                         # Determine state and prefix count
                         try:
@@ -265,60 +364,91 @@ class BGPAnalyzer:
                             prefixes_received=pfx_rcvd,
                             prefixes_sent=pfx_sent,
                             description=description,
-                            interface=interface
+                            interface=interface,
+                            vrf=current_vrf,
+                            address_family=current_address_family,
                         )
                         
-                        # Use neighbor IP as unique key, overwrite duplicates
-                        neighbor_dict[neighbor_name] = neighbor
+                        # A peer can legitimately appear in multiple VRFs and
+                        # multiple address-family summary sections.
+                        neighbor_dict[(
+                            current_vrf,
+                            current_address_family,
+                            neighbor_name,
+                        )] = neighbor
                         
                     except (ValueError, IndexError) as e:
                         print(f"Error parsing BGP neighbor line: {line}, Error: {e}")
                         continue
         
-        # Return unique neighbors (duplicates by IP are filtered out)
+        # Return unique rows within each VRF and address-family summary.
         return list(neighbor_dict.values())
+
+    @staticmethod
+    def declared_neighbor_total(bgp_data: str) -> Optional[int]:
+        """Return the sum of FRR per-summary totals, or None when absent."""
+        totals = re.findall(
+            r"Total number of neighbors\s+(\d+)\b", bgp_data, re.IGNORECASE
+        )
+        if not totals:
+            return None
+        return sum(int(value) for value in totals)
     
     def assess_neighbor_health(self, neighbor: BGPNeighbor) -> BGPHealth:
         """Assess health of a BGP neighbor"""
-        
-        # Critical: Neighbor in Idle, Active, or Connect state
-        if neighbor.state in [BGPState.IDLE, BGPState.ACTIVE, BGPState.CONNECT]:
-            return BGPHealth.CRITICAL
-        
-        # Unknown state
+
         if neighbor.state == BGPState.UNKNOWN:
             return BGPHealth.UNKNOWN
-        
-        # For established neighbors, check other metrics
-        if neighbor.state == BGPState.ESTABLISHED:
-            issues = 0
-            
-            # Check queue depths
-            if neighbor.in_queue > self.thresholds["high_queue_threshold"] or \
-               neighbor.out_queue > self.thresholds["high_queue_threshold"]:
-                issues += 1
-            
-            # Check prefix counts
-            if neighbor.prefixes_received < self.thresholds["low_prefix_threshold"]:
-                issues += 1
-            
-            # Check message ratio (basic health indicator)
-            if neighbor.messages_sent > 0 and neighbor.messages_received > 0:
-                ratio = min(neighbor.messages_sent, neighbor.messages_received) / \
-                       max(neighbor.messages_sent, neighbor.messages_received)
-                if ratio < self.thresholds["message_ratio_threshold"]:
-                    issues += 1
-            
-            # Determine health based on issues
-            if issues == 0:
-                return BGPHealth.EXCELLENT
-            elif issues == 1:
-                return BGPHealth.GOOD
-            else:
-                return BGPHealth.WARNING
-        
-        # Other connecting states
-        return BGPHealth.WARNING
+
+        if neighbor.state != BGPState.ESTABLISHED:
+            duration = (
+                None
+                if neighbor.uptime.lower() == "never"
+                else self.parse_uptime(neighbor.uptime)
+            )
+            if duration is None and neighbor.down_since is not None:
+                try:
+                    duration = timedelta(
+                        seconds=max(0.0, time.time() - float(neighbor.down_since))
+                    )
+                except (TypeError, ValueError):
+                    duration = None
+            threshold = timedelta(minutes=self.thresholds["bgp_down_minutes"])
+            if duration is not None and duration >= threshold:
+                return BGPHealth.CRITICAL
+            return BGPHealth.WARNING
+
+        return (
+            BGPHealth.WARNING
+            if self.established_neighbor_issues(neighbor)
+            else BGPHealth.EXCELLENT
+        )
+
+    def established_neighbor_issues(self, neighbor: BGPNeighbor) -> List[str]:
+        """Return policy-enabled health signals for an established neighbor."""
+        issues = []
+        queue_threshold = self.thresholds["high_queue_threshold"]
+        if queue_threshold > 0 and (
+            neighbor.in_queue >= queue_threshold or neighbor.out_queue >= queue_threshold
+        ):
+            issues.append("high_queue")
+
+        prefix_threshold = self.thresholds["low_prefix_threshold"]
+        if prefix_threshold > 0 and neighbor.prefixes_received < prefix_threshold:
+            issues.append("low_prefixes")
+
+        ratio_threshold = self.thresholds["message_ratio_threshold"]
+        if (
+            ratio_threshold > 0
+            and neighbor.messages_sent > 0
+            and neighbor.messages_received > 0
+        ):
+            ratio = min(neighbor.messages_sent, neighbor.messages_received) / max(
+                neighbor.messages_sent, neighbor.messages_received
+            )
+            if ratio < ratio_threshold:
+                issues.append("message_ratio")
+        return issues
     
     def parse_uptime(self, uptime_str: str) -> Optional[timedelta]:
         """Parse BGP uptime string to timedelta"""
@@ -327,9 +457,13 @@ class BGPAnalyzer:
             if uptime_str.lower() == "never":
                 return timedelta(0)
             
-            # Format: "01w2d22h" 
-            if 'w' in uptime_str or 'd' in uptime_str or 'h' in uptime_str:
+            # Formats such as "1y02w", "01w2d22h", or "4m12s".
+            if re.search(r'[ywdhms]', uptime_str, re.IGNORECASE):
                 total_seconds = 0
+
+                year_match = re.search(r'(\d+)y', uptime_str)
+                if year_match:
+                    total_seconds += int(year_match.group(1)) * 365 * 24 * 3600
                 
                 # Extract weeks
                 week_match = re.search(r'(\d+)w', uptime_str)
@@ -350,6 +484,10 @@ class BGPAnalyzer:
                 min_match = re.search(r'(\d+)m', uptime_str)
                 if min_match:
                     total_seconds += int(min_match.group(1)) * 60
+
+                sec_match = re.search(r'(\d+)s', uptime_str)
+                if sec_match:
+                    total_seconds += int(sec_match.group(1))
                 
                 return timedelta(seconds=total_seconds)
             
@@ -367,13 +505,70 @@ class BGPAnalyzer:
         except Exception:
             return None
     
-    def update_bgp_stats(self, hostname: str, bgp_data: str):
+    def update_bgp_stats(
+        self,
+        hostname: str,
+        bgp_data: str,
+        previous_stats: Optional[Dict[str, Any]] = None,
+    ):
         """Update BGP statistics for a device"""
         neighbors = self.parse_bgp_output(bgp_data)
+        current_time = time.time()
+
+        if previous_stats is None:
+            previous_stats = self.current_bgp_stats.get(hostname, {})
+        previous_neighbors = {}
+        if isinstance(previous_stats, dict):
+            for item in previous_stats.get("neighbors", []):
+                if not isinstance(item, dict):
+                    continue
+                identity = (
+                    item.get("vrf", "default"),
+                    item.get("address_family", "unknown"),
+                    item.get("neighbor_name"),
+                )
+                previous_neighbors[identity] = item
         
         # Set hostname for all neighbors
         for neighbor in neighbors:
             neighbor.hostname = hostname
+            if neighbor.state == BGPState.ESTABLISHED:
+                neighbor.down_since = None
+                continue
+
+            parsed_duration = (
+                None
+                if neighbor.uptime.lower() == "never"
+                else self.parse_uptime(neighbor.uptime)
+            )
+            if parsed_duration is not None:
+                neighbor.down_since = max(
+                    0.0, current_time - parsed_duration.total_seconds()
+                )
+                continue
+
+            previous = previous_neighbors.get((
+                neighbor.vrf,
+                neighbor.address_family,
+                neighbor.neighbor_name,
+            ), {})
+            previous_state = coerce_bgp_state(previous.get("state"))
+            previous_down_since = previous.get("down_since")
+            if (
+                previous_state != BGPState.ESTABLISHED
+                and previous_state != BGPState.UNKNOWN
+                and previous_down_since is not None
+            ):
+                try:
+                    candidate = float(previous_down_since)
+                    neighbor.down_since = (
+                        candidate if 0 <= candidate <= current_time + 300
+                        else current_time
+                    )
+                except (TypeError, ValueError):
+                    neighbor.down_since = current_time
+            else:
+                neighbor.down_since = current_time
         
         # Update current stats (convert enums to strings for JSON serialization)
         neighbor_dicts = []
@@ -381,12 +576,23 @@ class BGPAnalyzer:
             neighbor_dict = neighbor.__dict__.copy()
             neighbor_dict['state'] = get_enum_value(neighbor.state)
             neighbor_dicts.append(neighbor_dict)
+
+        neighbor_health = [self.assess_neighbor_health(neighbor) for neighbor in neighbors]
+        warning_neighbors = sum(
+            health in {BGPHealth.WARNING, BGPHealth.UNKNOWN}
+            for health in neighbor_health
+        )
+        critical_neighbors = sum(
+            health == BGPHealth.CRITICAL for health in neighbor_health
+        )
         
         self.current_bgp_stats[hostname] = {
             "neighbors": neighbor_dicts,
             "total_neighbors": len(neighbors),
             "established_neighbors": len([n for n in neighbors if n.state == BGPState.ESTABLISHED]),
             "down_neighbors": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
+            "warning_neighbors": warning_neighbors,
+            "critical_neighbors": critical_neighbors,
             "last_update": datetime.now().isoformat()
         }
         
@@ -399,6 +605,8 @@ class BGPAnalyzer:
             "total_neighbors": len(neighbors),
             "established_count": len([n for n in neighbors if n.state == BGPState.ESTABLISHED]),
             "down_count": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
+            "warning_neighbors": warning_neighbors,
+            "critical_neighbors": critical_neighbors,
             "neighbors": neighbor_dicts  # Use the same serialized data
         }
         
@@ -414,9 +622,39 @@ class BGPAnalyzer:
         
         lines = evpn_data.strip().split('\n')
         current_section = None
+        route_meta_seen = False
+        exact_route_counts = {}
         
         for line in lines:
             line = line.strip()
+
+            exact_count = re.match(
+                r"^__LLDPQ_EVPN_ROUTE_COUNT__:(2|5):(\d+)$", line
+            )
+            if exact_count:
+                exact_route_counts[exact_count.group(1)] = int(exact_count.group(2))
+                continue
+
+            route_meta = re.match(
+                r"^__LLDPQ_EVPN_ROUTE_META__:MATCHES=(\d+|UNKNOWN):"
+                r"EMITTED=(\d+):CAP=(\d+):TRUNCATED=(YES|NO|UNKNOWN)$",
+                line,
+                re.IGNORECASE,
+            )
+            if route_meta:
+                route_meta_seen = True
+                stats.route_rows_total = (
+                    int(route_meta.group(1))
+                    if route_meta.group(1).upper() != "UNKNOWN"
+                    else None
+                )
+                stats.route_rows_emitted = int(route_meta.group(2))
+                stats.route_cap = int(route_meta.group(3))
+                stats.routes_truncated = route_meta.group(4).upper() != "NO"
+                stats.route_metadata_status = (
+                    "complete" if route_meta.group(4).upper() == "NO" else "partial"
+                )
+                continue
             
             # Detect section markers
             if "=== EVPN VNI SUMMARY ===" in line:
@@ -468,7 +706,28 @@ class BGPAnalyzer:
                 # Count Type-5 (IP prefix) routes - lines with [5]:
                 elif '[5]:' in line:
                     stats.type5_routes += 1
-        
+
+        parsed_route_rows = stats.type2_routes + stats.type5_routes
+        if exact_route_counts:
+            if "2" in exact_route_counts:
+                stats.type2_routes = exact_route_counts["2"]
+            if "5" in exact_route_counts:
+                stats.type5_routes = exact_route_counts["5"]
+            stats.route_rows_total = stats.type2_routes + stats.type5_routes
+            stats.route_rows_emitted = parsed_route_rows
+            stats.routes_truncated = not {"2", "5"}.issubset(exact_route_counts)
+            stats.route_metadata_status = (
+                "complete" if not stats.routes_truncated else "partial-count-markers"
+            )
+        elif not route_meta_seen:
+            stats.route_rows_emitted = parsed_route_rows
+            # Legacy collectors cap the combined route sample at 1000 without
+            # metadata. Exactly hitting that boundary is therefore incomplete.
+            if parsed_route_rows >= 1000:
+                stats.route_cap = 1000
+                stats.routes_truncated = True
+                stats.route_metadata_status = "legacy-cap-inferred"
+
         return stats
     
     def update_evpn_stats(self, hostname: str, evpn_data: str):
@@ -483,17 +742,47 @@ class BGPAnalyzer:
             "type2_routes": stats.type2_routes,
             "type5_routes": stats.type5_routes,
             "vni_details": stats.vni_details,
+            "route_rows_emitted": stats.route_rows_emitted,
+            "route_rows_total": stats.route_rows_total,
+            "route_cap": stats.route_cap,
+            "routes_truncated": stats.routes_truncated,
+            "route_metadata_status": stats.route_metadata_status,
             "last_update": datetime.now().isoformat()
         }
     
     def get_evpn_summary(self) -> Dict[str, Any]:
         """Get network-wide EVPN summary"""
         total_devices = len(self.current_evpn_stats)
-        total_vnis = sum(s.get("total_vnis", 0) for s in self.current_evpn_stats.values())
-        total_l2_vnis = sum(s.get("l2_vnis", 0) for s in self.current_evpn_stats.values())
-        total_l3_vnis = sum(s.get("l3_vnis", 0) for s in self.current_evpn_stats.values())
+        unique_vnis = {}
+        for device, stats in self.current_evpn_stats.items():
+            for detail in stats.get("vni_details", []):
+                key = (detail.get("vni"), detail.get("type"))
+                aggregate = unique_vnis.setdefault(
+                    key,
+                    {
+                        **detail,
+                        "observers": [],
+                        "macs": 0,
+                        "arps": 0,
+                        "remote_vteps": 0,
+                    },
+                )
+                aggregate["observers"].append(device)
+                # Per-device counts are observations, not additive network-wide
+                # uniques. Max is deterministic and avoids multiplying replicas.
+                for field in ("macs", "arps", "remote_vteps"):
+                    aggregate[field] = max(
+                        aggregate[field], int(detail.get(field, 0) or 0)
+                    )
+        total_vnis = len(unique_vnis)
+        total_l2_vnis = sum(1 for value in unique_vnis.values() if value.get("type") == "L2")
+        total_l3_vnis = sum(1 for value in unique_vnis.values() if value.get("type") == "L3")
         total_type2 = sum(s.get("type2_routes", 0) for s in self.current_evpn_stats.values())
         total_type5 = sum(s.get("type5_routes", 0) for s in self.current_evpn_stats.values())
+        truncated_devices = sorted(
+            device for device, stats in self.current_evpn_stats.items()
+            if stats.get("routes_truncated")
+        )
         
         return {
             "total_devices": total_devices,
@@ -502,8 +791,29 @@ class BGPAnalyzer:
             "l3_vnis": total_l3_vnis,
             "type2_routes": total_type2,
             "type5_routes": total_type5,
+            "route_observation_semantics": True,
+            "route_counts_partial": bool(truncated_devices),
+            "truncated_devices": truncated_devices,
+            "unique_vni_details": list(unique_vnis.values()),
             "per_device": self.current_evpn_stats,
             "timestamp": datetime.now().isoformat()
+        }
+
+    def set_collection_coverage(
+        self,
+        expected_devices,
+        current_bgp_devices,
+        current_evpn_devices,
+    ):
+        expected = set(expected_devices)
+        current_bgp = set(current_bgp_devices)
+        current_evpn = set(current_evpn_devices)
+        self.collection_coverage = {
+            "expected_devices": len(expected),
+            "current_bgp_devices": len(current_bgp),
+            "current_evpn_devices": len(current_evpn),
+            "unavailable_bgp_devices": sorted(expected - current_bgp),
+            "unavailable_evpn_devices": sorted(expected - current_evpn),
         }
     
     def get_bgp_summary(self) -> Dict[str, Any]:
@@ -512,6 +822,14 @@ class BGPAnalyzer:
         total_neighbors = sum(stats["total_neighbors"] for stats in self.current_bgp_stats.values())
         total_established = sum(stats["established_neighbors"] for stats in self.current_bgp_stats.values())
         total_down = sum(stats["down_neighbors"] for stats in self.current_bgp_stats.values())
+        total_warning = sum(
+            int(stats.get("warning_neighbors", 0) or 0)
+            for stats in self.current_bgp_stats.values()
+        )
+        total_critical = sum(
+            int(stats.get("critical_neighbors", 0) or 0)
+            for stats in self.current_bgp_stats.values()
+        )
         stale_devices = sum(
             1 for stats in self.current_bgp_stats.values()
             if stats.get("data_status") == "stale"
@@ -523,6 +841,7 @@ class BGPAnalyzer:
         
         # Get problem neighbors
         problem_neighbors = []
+        healthy_neighbors = 0
         for hostname, stats in self.current_bgp_stats.items():
             for neighbor_data in stats["neighbors"]:
                 # Handle both enum and string state values
@@ -531,7 +850,9 @@ class BGPAnalyzer:
                 
                 neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
-                if health in [BGPHealth.CRITICAL, BGPHealth.WARNING]:
+                if health in [BGPHealth.EXCELLENT, BGPHealth.GOOD]:
+                    healthy_neighbors += 1
+                if health in [BGPHealth.CRITICAL, BGPHealth.WARNING, BGPHealth.UNKNOWN]:
                     problem_neighbors.append({
                         "hostname": hostname,
                         "neighbor": neighbor.neighbor_name,
@@ -545,10 +866,16 @@ class BGPAnalyzer:
             "total_neighbors": total_neighbors,
             "established_neighbors": total_established,
             "down_neighbors": total_down,
+            "warning_neighbors": total_warning,
+            "critical_neighbors": total_critical,
             "stale_devices": stale_devices,
             "unknown_devices": unknown_devices,
             "problem_neighbors": problem_neighbors,
-            "health_ratio": (total_established / total_neighbors * 100) if total_neighbors > 0 else 0,
+            "health_ratio": (
+                healthy_neighbors / total_neighbors * 100
+                if total_neighbors > 0 else None
+            ),
+            "collection_coverage": dict(self.collection_coverage),
             "timestamp": datetime.now().isoformat()
         }
     
@@ -582,43 +909,53 @@ class BGPAnalyzer:
                 neighbor_dict['state'] = coerce_bgp_state(neighbor_dict.get('state'))
                 neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
-                
-                # Critical: Down neighbors
-                if neighbor.state in [BGPState.IDLE, BGPState.ACTIVE, BGPState.CONNECT]:
-                    anomalies.append({
-                        "device": hostname,
-                        "neighbor": neighbor.neighbor_name,
-                        "type": "BGP_NEIGHBOR_DOWN",
-                        "severity": "critical",
-                        "message": f"BGP neighbor {neighbor.neighbor_name} is in {get_enum_value(neighbor.state).upper()} state",
-                        "details": {
-                            "state": get_enum_value(neighbor.state),
-                            "uptime": neighbor.uptime,
-                            "asn": neighbor.asn,
-                            "interface": neighbor.interface
-                        },
-                        "action": f"Check physical connectivity and BGP configuration for {neighbor.neighbor_name}"
-                    })
 
-                elif neighbor.state in [BGPState.OPENSENT, BGPState.OPENCONFIRM]:
+                if neighbor.state == BGPState.UNKNOWN:
                     anomalies.append({
                         "device": hostname,
                         "neighbor": neighbor.neighbor_name,
-                        "type": "BGP_NEIGHBOR_NOT_ESTABLISHED",
+                        "type": "BGP_STATE_UNKNOWN",
                         "severity": "warning",
+                        "message": f"BGP neighbor {neighbor.neighbor_name} has an unrecognized state",
+                        "details": {
+                            "state": get_enum_value(neighbor.state),
+                            "uptime": neighbor.uptime,
+                            "asn": neighbor.asn,
+                            "interface": neighbor.interface,
+                            "vrf": neighbor.vrf,
+                            "address_family": neighbor.address_family,
+                        },
+                        "action": "Verify the FRR summary format and neighbor state",
+                    })
+                    continue
+
+                if neighbor.state != BGPState.ESTABLISHED:
+                    severity = "critical" if health == BGPHealth.CRITICAL else "warning"
+                    anomalies.append({
+                        "device": hostname,
+                        "neighbor": neighbor.neighbor_name,
+                        "type": (
+                            "BGP_NEIGHBOR_DOWN"
+                            if severity == "critical"
+                            else "BGP_NEIGHBOR_TRANSIENT"
+                        ),
+                        "severity": severity,
                         "message": f"BGP neighbor {neighbor.neighbor_name} is in {get_enum_value(neighbor.state).upper()} state",
                         "details": {
                             "state": get_enum_value(neighbor.state),
                             "uptime": neighbor.uptime,
                             "asn": neighbor.asn,
-                            "interface": neighbor.interface
+                            "interface": neighbor.interface,
+                            "vrf": neighbor.vrf,
+                            "address_family": neighbor.address_family,
+                            "critical_after_minutes": self.thresholds["bgp_down_minutes"],
                         },
-                        "action": f"Check BGP negotiation and authentication for {neighbor.neighbor_name}"
+                        "action": f"Check connectivity and BGP configuration for {neighbor.neighbor_name}",
                     })
-                
-                # Warning: High queue depths
-                elif neighbor.in_queue > self.thresholds["high_queue_threshold"] or \
-                     neighbor.out_queue > self.thresholds["high_queue_threshold"]:
+                    continue
+
+                issues = self.established_neighbor_issues(neighbor)
+                if "high_queue" in issues:
                     anomalies.append({
                         "device": hostname,
                         "neighbor": neighbor.neighbor_name,
@@ -632,10 +969,7 @@ class BGPAnalyzer:
                         },
                         "action": "Monitor for potential congestion or processing delays"
                     })
-                
-                # Warning: Low prefix count
-                elif neighbor.prefixes_received < self.thresholds["low_prefix_threshold"] and \
-                     neighbor.state == BGPState.ESTABLISHED:
+                if "low_prefixes" in issues:
                     anomalies.append({
                         "device": hostname,
                         "neighbor": neighbor.neighbor_name,
@@ -649,6 +983,23 @@ class BGPAnalyzer:
                         },
                         "action": "Verify route advertisements and filtering policies"
                     })
+                if "message_ratio" in issues:
+                    ratio = min(neighbor.messages_sent, neighbor.messages_received) / max(
+                        neighbor.messages_sent, neighbor.messages_received
+                    )
+                    anomalies.append({
+                        "device": hostname,
+                        "neighbor": neighbor.neighbor_name,
+                        "type": "BGP_MESSAGE_RATIO",
+                        "severity": "warning",
+                        "message": f"Message RX/TX ratio is {ratio:.1%}",
+                        "details": {
+                            "messages_received": neighbor.messages_received,
+                            "messages_sent": neighbor.messages_sent,
+                            "state": get_enum_value(neighbor.state),
+                        },
+                        "action": "Review message flow only if this directional ratio is expected to be balanced",
+                    })
         
         return anomalies
     
@@ -659,7 +1010,35 @@ class BGPAnalyzer:
         anomalies = self.detect_bgp_anomalies()
         
         # Serialize EVPN per-device data for JavaScript
-        evpn_per_device_json = json.dumps(evpn_summary.get('per_device', {}))
+        evpn_per_device_json = json.dumps(evpn_summary.get('per_device', {})).replace(
+            "<", "\\u003c"
+        )
+        evpn_unique_vnis_json = json.dumps(
+            evpn_summary.get("unique_vni_details", [])
+        ).replace("<", "\\u003c")
+        coverage = summary.get("collection_coverage", {})
+        expected_devices = int(coverage.get("expected_devices", 0) or 0)
+        current_bgp_devices = int(coverage.get("current_bgp_devices", 0) or 0)
+        current_evpn_devices = int(coverage.get("current_evpn_devices", 0) or 0)
+        if expected_devices and current_bgp_devices == 0:
+            coverage_status = "unavailable"
+        elif expected_devices and (
+            current_bgp_devices < expected_devices
+            or current_evpn_devices < expected_devices
+        ):
+            coverage_status = "partial"
+        else:
+            coverage_status = "current"
+        route_coverage = (
+            "partial" if evpn_summary.get("route_counts_partial") else "complete"
+        )
+        truncated_devices = html.escape(
+            ",".join(evpn_summary.get("truncated_devices", [])), quote=True
+        )
+        health_ratio_display = (
+            f"{summary['health_ratio']:.1f}%"
+            if summary["health_ratio"] is not None else "N/A"
+        )
         
         html_content = f"""
 <!DOCTYPE html>
@@ -929,6 +1308,17 @@ class BGPAnalyzer:
     </style>
 </head>
 <body>
+    <div data-analysis-summary="bgp" data-collection-status="{coverage_status}"
+         data-expected-devices="{expected_devices}"
+         data-current-bgp-devices="{current_bgp_devices}"
+         data-current-evpn-devices="{current_evpn_devices}"
+         data-warning-neighbors="{summary['warning_neighbors']}"
+         data-critical-neighbors="{summary['critical_neighbors']}"
+         data-evpn-route-coverage="{route_coverage}"
+         data-evpn-truncated-devices="{truncated_devices}" style="display:none">
+        <span id="warning-neighbors">{summary['warning_neighbors']}</span>
+        <span id="critical-neighbors">{summary['critical_neighbors']}</span>
+    </div>
     <!-- Page Header -->
     <div class="page-header">
         <div>
@@ -971,32 +1361,32 @@ class BGPAnalyzer:
         </div>
         <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card card-info" id="total-devices-card">
+                <div class="summary-card card-info" id="total-devices-card" data-metric-key="bgp_expected_devices" data-metric-value="{summary['total_devices']}">
                     <div class="metric" id="total-devices">{summary['total_devices']}</div>
                     <div class="metric-label">BGP Devices</div>
                 </div>
-                <div class="summary-card card-info" id="total-neighbors-card">
+                <div class="summary-card card-info" id="total-neighbors-card" data-metric-key="bgp_total_neighbors" data-metric-value="{summary['total_neighbors']}">
                     <div class="metric" id="total-neighbors">{summary['total_neighbors']}</div>
                     <div class="metric-label">Total Neighbors</div>
                 </div>
-                <div class="summary-card card-excellent" id="established-card">
+                <div class="summary-card card-excellent" id="established-card" data-metric-key="bgp_established_neighbors" data-metric-value="{summary['established_neighbors']}">
                     <div class="metric bgp-excellent" id="established-neighbors">{summary['established_neighbors']}</div>
                     <div class="metric-label">Established</div>
                 </div>
-                <div class="summary-card card-critical" id="down-card">
+                <div class="summary-card card-critical" id="down-card" data-metric-key="bgp_non_established_neighbors" data-metric-value="{summary['down_neighbors']}">
                     <div class="metric bgp-critical" id="down-neighbors">{summary['down_neighbors']}</div>
                     <div class="metric-label">Down/Problem</div>
                 </div>
-                <div class="summary-card card-warning" id="stale-devices-card">
+                <div class="summary-card card-warning" id="stale-devices-card" data-metric-key="bgp_stale_devices" data-metric-value="{summary['stale_devices']}">
                     <div class="metric bgp-warning" id="stale-devices">{summary['stale_devices']}</div>
                     <div class="metric-label">Stale Collections</div>
                 </div>
-                <div class="summary-card card-info" id="unknown-devices-card">
+                <div class="summary-card card-info" id="unknown-devices-card" data-metric-key="bgp_unknown_devices" data-metric-value="{summary['unknown_devices']}">
                     <div class="metric bgp-unknown" id="unknown-devices">{summary['unknown_devices']}</div>
                     <div class="metric-label">Unknown Collections</div>
                 </div>
-                <div class="summary-card" id="health-card">
-                    <div class="metric" id="health-ratio">{summary['health_ratio']:.1f}%</div>
+                <div class="summary-card" id="health-card" data-metric-key="bgp_health_ratio" data-metric-value="{health_ratio_display}">
+                    <div class="metric" id="health-ratio">{health_ratio_display}</div>
                     <div class="metric-label">Health Ratio</div>
                 </div>
             </div>
@@ -1013,23 +1403,23 @@ class BGPAnalyzer:
         </div>
         <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card card-info evpn-clickable" onclick="showEvpnModal('all')" title="Click to see VNI details">
+                <div class="summary-card card-info evpn-clickable" data-metric-key="evpn_unique_vnis" data-metric-value="{evpn_summary['total_vnis']}" onclick="showEvpnModal('all')" title="Click to see VNI details">
                     <div class="metric" id="evpn-total-vnis" style="color: #4fc3f7;">{evpn_summary['total_vnis']}</div>
-                    <div class="metric-label">Total VNIs</div>
+                    <div class="metric-label">Unique VNIs</div>
                 </div>
-                <div class="summary-card evpn-clickable" style="border-left-color: #9c27b0;" onclick="showEvpnModal('L2')" title="Click to see L2 VNIs">
+                <div class="summary-card evpn-clickable" data-metric-key="evpn_unique_l2_vnis" data-metric-value="{evpn_summary['l2_vnis']}" style="border-left-color: #9c27b0;" onclick="showEvpnModal('L2')" title="Click to see unique L2 VNIs">
                     <div class="metric" id="evpn-l2-vnis" style="color: #ce93d8;">{evpn_summary['l2_vnis']}</div>
                     <div class="metric-label">L2 VNIs</div>
                 </div>
-                <div class="summary-card evpn-clickable" style="border-left-color: #ff9800;" onclick="showEvpnModal('L3')" title="Click to see L3 VNIs">
+                <div class="summary-card evpn-clickable" data-metric-key="evpn_unique_l3_vnis" data-metric-value="{evpn_summary['l3_vnis']}" style="border-left-color: #ff9800;" onclick="showEvpnModal('L3')" title="Click to see unique L3 VNIs">
                     <div class="metric" id="evpn-l3-vnis" style="color: #ffb74d;">{evpn_summary['l3_vnis']}</div>
                     <div class="metric-label">L3 VNIs</div>
                 </div>
-                <div class="summary-card evpn-clickable" style="border-left-color: #00bcd4;" onclick="showEvpnModal('type2')" title="Click to see Type-2 route breakdown">
+                <div class="summary-card evpn-clickable" data-metric-key="evpn_type2_route_observations" data-metric-value="{evpn_summary['type2_routes']}" data-route-semantics="per-device-rib-observations-summed" style="border-left-color: #00bcd4;" onclick="showEvpnModal('type2')" title="Per-device RIB observations summed; click for device breakdown">
                     <div class="metric" id="evpn-type2-routes" style="color: #4dd0e1;">{evpn_summary['type2_routes']}</div>
                     <div class="metric-label">Type-2 Routes (MAC/IP)</div>
                 </div>
-                <div class="summary-card evpn-clickable" style="border-left-color: #8bc34a;" onclick="showEvpnModal('type5')" title="Click to see Type-5 route breakdown">
+                <div class="summary-card evpn-clickable" data-metric-key="evpn_type5_route_observations" data-metric-value="{evpn_summary['type5_routes']}" data-route-semantics="per-device-rib-observations-summed" style="border-left-color: #8bc34a;" onclick="showEvpnModal('type5')" title="Per-device RIB observations summed; click for device breakdown">
                     <div class="metric" id="evpn-type5-routes" style="color: #aed581;">{evpn_summary['type5_routes']}</div>
                     <div class="metric-label">Type-5 Routes (IP Prefix)</div>
                 </div>
@@ -1045,8 +1435,7 @@ class BGPAnalyzer:
             for neighbor_data in stats["neighbors"]:
                 # Handle both enum and string state values
                 neighbor_dict = neighbor_data.copy()
-                if isinstance(neighbor_dict['state'], str):
-                    neighbor_dict['state'] = BGPState(neighbor_dict['state'])
+                neighbor_dict['state'] = coerce_bgp_state(neighbor_dict.get('state'))
                 
                 neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
@@ -1058,6 +1447,12 @@ class BGPAnalyzer:
                 }
                 
                 all_neighbors.append(neighbor_info)
+
+        neighbor_occurrences = {}
+        for item in all_neighbors:
+            peer = item["neighbor"]
+            identity = (item["hostname"], peer.vrf, peer.neighbor_name)
+            neighbor_occurrences[identity] = neighbor_occurrences.get(identity, 0) + 1
         
         # Add anomalies section if any exist
         if anomalies:
@@ -1074,11 +1469,15 @@ class BGPAnalyzer:
 """
             for anomaly in anomalies:
                 severity_class = "warning" if anomaly['severity'] == 'warning' else ""
+                anomaly_device = html.escape(str(anomaly['device']))
+                anomaly_neighbor = html.escape(str(anomaly['neighbor']))
+                anomaly_message = html.escape(str(anomaly['message']))
+                anomaly_action = html.escape(str(anomaly['action']))
                 html_content += f"""
             <div class="anomaly-card {severity_class}">
-                <h4>{anomaly['device']} - {anomaly['neighbor']}</h4>
-                <p><strong>Issue:</strong> {anomaly['message']}</p>
-                <p><strong>Recommended Action:</strong> {anomaly['action']}</p>
+                <h4>{anomaly_device} - {anomaly_neighbor}</h4>
+                <p><strong>Issue:</strong> {anomaly_message}</p>
+                <p><strong>Recommended Action:</strong> {anomaly_action}</p>
             </div>
 """
             html_content += """
@@ -1123,8 +1522,9 @@ class BGPAnalyzer:
         sorted_neighbors = sorted(all_neighbors, key=lambda x: (
             0 if x['health'] == BGPHealth.CRITICAL else
             1 if x['health'] == BGPHealth.WARNING else
-            2 if x['health'] == BGPHealth.GOOD else
-            3 if x['health'] == BGPHealth.EXCELLENT else 4
+            2 if x['health'] == BGPHealth.UNKNOWN else
+            3 if x['health'] == BGPHealth.GOOD else
+            4
         ))
         
         for neighbor_info in sorted_neighbors:
@@ -1138,7 +1538,7 @@ class BGPAnalyzer:
             # Badge class based on state
             if state_val == 'established':
                 state_badge_class = 'badge badge-green'
-            elif state_val in ['idle', 'active', 'connect']:
+            elif health_val == 'critical':
                 state_badge_class = 'badge badge-red'
             else:
                 state_badge_class = 'badge badge-orange'
@@ -1154,15 +1554,32 @@ class BGPAnalyzer:
                 health_badge_class = 'badge badge-red'
             else:
                 health_badge_class = 'badge badge-gray'
+
+            dashboard_state = 'established' if state_val == 'established' else 'down'
+            vrf = neighbor.vrf or 'default'
+            address_family = neighbor.address_family or 'unknown'
+            neighbor_display = (
+                neighbor.neighbor_name
+                if vrf == 'default'
+                else f"{vrf} / {neighbor.neighbor_name}"
+            )
+            if neighbor_occurrences.get((hostname, vrf, neighbor.neighbor_name), 0) > 1:
+                neighbor_display = f"{neighbor_display} [{address_family}]"
+            display_hostname = html.escape(str(canonical(hostname)))
+            display_neighbor = html.escape(str(neighbor_display))
+            display_interface = html.escape(str(neighbor.interface or 'N/A'))
+            display_vrf = html.escape(str(vrf), quote=True)
+            display_address_family = html.escape(str(address_family), quote=True)
+            display_uptime = html.escape(str(neighbor.uptime))
             
             html_content += f"""
-        <tr data-health="{health_val}" data-state="{state_val}">
-            <td>{canonical(hostname)}</td>
-            <td>{neighbor.neighbor_name}</td>
-            <td>{neighbor.interface or 'N/A'}</td>
+        <tr data-health="{health_val}" data-state="{dashboard_state}" data-bgp-state="{state_val}" data-vrf="{display_vrf}" data-address-family="{display_address_family}">
+            <td>{display_hostname}</td>
+            <td>{display_neighbor}</td>
+            <td>{display_interface}</td>
             <td><span class="{state_badge_class}">{state_val.upper()}</span></td>
             <td>{neighbor.asn}</td>
-            <td>{neighbor.uptime}</td>
+            <td>{display_uptime}</td>
             <td>{neighbor.prefixes_received}/{neighbor.prefixes_sent}</td>
             <td>{neighbor.messages_received}/{neighbor.messages_sent}</td>
             <td>{neighbor.in_queue}/{neighbor.out_queue}</td>
@@ -1190,10 +1607,10 @@ class BGPAnalyzer:
                     <tr><th>Parameter</th><th>Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>Critical Down Time</td><td>1+ hours</td><td>Neighbor down for extended period</td></tr>
-                    <tr><td>High Queue Depth</td><td>10+ messages</td><td>Processing delays or congestion</td></tr>
-                    <tr><td>Low Prefix Count</td><td>&lt; 1 prefix</td><td>Potential route advertisement issues</td></tr>
-                    <tr><td>Message Ratio</td><td>&lt; 80%</td><td>Imbalanced message exchange</td></tr>
+                    <tr><td>Critical Down Time</td><td>__BGP_DOWN_THRESHOLD__</td><td>Shorter non-established periods remain warnings</td></tr>
+                    <tr><td>High Queue Depth</td><td>__BGP_QUEUE_THRESHOLD__</td><td>Processing delays or congestion</td></tr>
+                    <tr><td>Low Prefix Count</td><td>__BGP_PREFIX_THRESHOLD__</td><td>Disabled by default; policy-specific opt-in</td></tr>
+                    <tr><td>Message Ratio</td><td>__BGP_RATIO_THRESHOLD__</td><td>Disabled by default; directional-policy opt-in</td></tr>
                 </tbody>
             </table>
         </div>
@@ -1219,6 +1636,7 @@ class BGPAnalyzer:
     <script>
         // EVPN per-device data
         const evpnPerDevice = __EVPN_DATA_PLACEHOLDER__;
+        const evpnUniqueVnis = __EVPN_UNIQUE_VNI_PLACEHOLDER__;
         
         // EVPN Modal functions
         function showEvpnModal(filterType) {
@@ -1254,27 +1672,9 @@ class BGPAnalyzer:
                 let vniFilter = filterType; // 'all', 'L2', or 'L3'
                 title.textContent = vniFilter === 'all' ? 'All VNIs' : vniFilter + ' VNIs';
                 
-                // Collect all VNIs from all devices
-                let allVnis = [];
-                Object.entries(evpnPerDevice).forEach(([device, data]) => {
-                    if (data.vni_details) {
-                        data.vni_details.forEach(vni => {
-                            if (vniFilter === 'all' || vni.type === vniFilter) {
-                                allVnis.push(Object.assign({}, vni, {device: device}));
-                            }
-                        });
-                    }
-                });
-                
-                // Remove duplicates (same VNI from multiple devices) - keep first occurrence
-                const uniqueVnis = [];
-                const seenVnis = new Set();
-                allVnis.forEach(vni => {
-                    if (!seenVnis.has(vni.vni)) {
-                        seenVnis.add(vni.vni);
-                        uniqueVnis.push(vni);
-                    }
-                });
+                const uniqueVnis = evpnUniqueVnis
+                    .filter(vni => vniFilter === 'all' || vni.type === vniFilter)
+                    .map(vni => Object.assign({}, vni));
                 
                 // Sort by Type (L3 first), then VNI number
                 uniqueVnis.sort((a, b) => {
@@ -1643,21 +2043,29 @@ class BGPAnalyzer:
                 'IDLE': 0,
                 'ACTIVE': 1,
                 'CONNECT': 2,
-                'ESTABLISHED': 3
+                'OPENSENT': 3,
+                'OPENCONFIRM': 4,
+                'UNKNOWN': 5,
+                'ESTABLISHED': 6
             };
             
-            return (priority[a] || 4) - (priority[b] || 4);
+            const aPriority = Object.prototype.hasOwnProperty.call(priority, a) ? priority[a] : 99;
+            const bPriority = Object.prototype.hasOwnProperty.call(priority, b) ? priority[b] : 99;
+            return aPriority - bPriority;
         }
         
         function compareBGPHealth(a, b) {
             const priority = {
                 'CRITICAL': 0,
                 'WARNING': 1,
-                'GOOD': 2,
-                'EXCELLENT': 3
+                'UNKNOWN': 2,
+                'GOOD': 3,
+                'EXCELLENT': 4
             };
             
-            return (priority[a] || 4) - (priority[b] || 4);
+            const aPriority = Object.prototype.hasOwnProperty.call(priority, a) ? priority[a] : 99;
+            const bPriority = Object.prototype.hasOwnProperty.call(priority, b) ? priority[b] : 99;
+            return aPriority - bPriority;
         }
         
         function compareRatio(a, b) {
@@ -1671,7 +2079,7 @@ class BGPAnalyzer:
         }
 
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
             
@@ -1683,6 +2091,10 @@ class BGPAnalyzer:
                 </svg>
                 Running...
             `;
+            let baseline = null;
+            if (typeof window.lldpqCapturePipelineState === 'function') {
+                try { baseline = await window.lldpqCapturePipelineState(); } catch (error) { baseline = null; }
+            }
             
             // Send POST request to trigger monitor
             fetch('/trigger-monitor', {
@@ -1714,13 +2126,21 @@ class BGPAnalyzer:
                     notification.innerHTML = `
                         <strong style="color: #76b900;">✅ Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small style="color: #888;">Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small style="color: #888;">Waiting for the current pipeline to complete before refreshing.</small>
                     `;
                     document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 35000);
+                    const completion = typeof window.waitForLldpqAnalysisCompletion === 'function'
+                        ? window.waitForLldpqAnalysisCompletion(baseline)
+                        : new Promise(resolve => setTimeout(resolve, 35000));
+                    Promise.resolve(completion)
+                        .then(() => window.location.reload())
+                        .catch(error => {
+                            console.error('Analysis did not complete successfully:', error);
+                            notification.remove();
+                            alert('Analysis did not complete successfully. The previous report was kept.');
+                            button.disabled = false;
+                            button.innerHTML = originalText;
+                        });
                 } else {
                     console.error('❌ Failed to trigger monitor analysis:', data.message);
                     alert('Failed to trigger analysis. Please try again.');
@@ -1750,6 +2170,8 @@ class BGPAnalyzer:
                 // Create CSV header
                 const headers = [
                     'Device',
+                    'VRF',
+                    'Address Family',
                     'Neighbor', 
                     'Interface',
                     'State',
@@ -1775,6 +2197,8 @@ class BGPAnalyzer:
                 csvContent += `# Total Neighbors: ${document.getElementById('total-neighbors').textContent}\\n`;
                 csvContent += `# Established: ${document.getElementById('established-neighbors').textContent}\\n`;
                 csvContent += `# Down/Problem: ${document.getElementById('down-neighbors').textContent}\\n`;
+                csvContent += `# Stale Collections: ${document.getElementById('stale-devices').textContent}\\n`;
+                csvContent += `# Unknown Collections: ${document.getElementById('unknown-devices').textContent}\\n`;
                 csvContent += `# Health Ratio: ${document.getElementById('health-ratio').textContent}\\n`;
                 csvContent += `#\\n`;
                 
@@ -1785,6 +2209,8 @@ class BGPAnalyzer:
                         if (cells.length >= 10) {
                             const rowData = [
                                 cells[0].textContent.trim(), // Device
+                                row.dataset.vrf || 'default', // VRF
+                                row.dataset.addressFamily || 'unknown', // Address Family
                                 cells[1].textContent.trim(), // Neighbor
                                 cells[2].textContent.trim(), // Interface
                                 cells[3].textContent.trim(), // State
@@ -1880,6 +2306,23 @@ class BGPAnalyzer:
         
         # Replace EVPN data placeholder with actual JSON
         html_content = html_content.replace('__EVPN_DATA_PLACEHOLDER__', evpn_per_device_json)
+        html_content = html_content.replace(
+            '__EVPN_UNIQUE_VNI_PLACEHOLDER__', evpn_unique_vnis_json
+        )
+        prefix_threshold = self.thresholds["low_prefix_threshold"]
+        ratio_threshold = self.thresholds["message_ratio_threshold"]
+        replacements = {
+            "__BGP_DOWN_THRESHOLD__": f'{self.thresholds["bgp_down_minutes"]:g}+ minutes',
+            "__BGP_QUEUE_THRESHOLD__": f'{self.thresholds["high_queue_threshold"]:g}+ messages',
+            "__BGP_PREFIX_THRESHOLD__": (
+                f'&lt; {prefix_threshold:g} prefixes' if prefix_threshold > 0 else 'Disabled'
+            ),
+            "__BGP_RATIO_THRESHOLD__": (
+                f'&lt; {ratio_threshold:.0%}' if ratio_threshold > 0 else 'Disabled'
+            ),
+        }
+        for marker, value in replacements.items():
+            html_content = html_content.replace(marker, value)
         
         with open(output_file, "w") as f:
             f.write(html_content)

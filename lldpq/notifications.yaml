@@ -69,7 +69,7 @@ thresholds:
     link_flaps_per_hour: 10   # Count - Link flaps in 1 hour (warning)
     link_flaps_critical: 20   # Count - Link flaps in 1 hour (critical)
     optical_power_margin: 3   # dBm - Minimum optical power margin
-    ber_error_rate: 1e-12     # BER threshold for errors
+    ber_error_rate: 1e-12     # Effective/post-FEC BER warning; critical is 10x
     
   # System monitoring  
   system:

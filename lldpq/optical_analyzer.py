@@ -11,9 +11,15 @@ import json
 import time
 import re
 import os
+import math
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 try:
     from device_names import canonical
@@ -62,15 +68,69 @@ class OpticalAnalyzer:
         "bias_current_max_ma": 100.0,   # Maximum laser bias current
         "link_margin_min_db": 3.0       # Minimum acceptable link margin
     }
+    # Several drivers report a dark optical lane as -40 dBm (or -inf).  Keep
+    # those readings as evidence; dropping them can turn a failed lane into a
+    # healthy-looking average.
+    DARK_POWER_DBM = -35.0
+    NEGATIVE_INFINITY_FLOOR_DBM = -40.0
+    # Match the optical media standard reported by common ethtool/NVUE
+    # variants, for example ``100G Base-DR`` and ``100GBASE-DR``.  The lane
+    # suffix describes optical lanes (DR4/SR4/etc.), not the host electrical
+    # width of the pluggable module.
+    OPTICAL_MEDIA_STANDARD_RE = re.compile(
+        r'\b\d+\s*G(?:\s*[-_ ]?\s*BASE)?\s*[-_ ]*'
+        r'(?P<family>DR|FR|SR|LR|ER|ZR|PSM|CWDM)'
+        r'(?P<lanes>\d+)?\b',
+        re.IGNORECASE,
+    )
+    # DR and FR without a numeric suffix are defined as a single optical
+    # lane.  Other families are only treated as single-lane when the media
+    # string explicitly says so (LR1/ER1/ZR1, for example).
+    UNNUMBERED_SINGLE_LANE_MEDIA = frozenset({'DR', 'FR'})
 
     def __init__(self, data_dir="monitor-results"):
         self.data_dir = data_dir
         self.optical_history = {}  # port -> historical readings
         self.current_optical_stats = {}  # port -> current optical status
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
+        self._load_network_thresholds()
 
         # Load historical data
         self.load_optical_history()
+
+    def _load_network_thresholds(self) -> None:
+        """Load the configurable margin while retaining safe defaults.
+
+        Module-specific alarm tables are not collected yet, so all other
+        optical limits remain the documented conservative defaults above.
+        """
+        if yaml is None:
+            return
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'notifications.yaml'),
+            os.path.join(os.path.dirname(os.path.abspath(self.data_dir)),
+                         'notifications.yaml'),
+        ]
+        for path in dict.fromkeys(candidates):
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, 'r') as stream:
+                    config = yaml.safe_load(stream) or {}
+                value = config.get('thresholds', {}).get('network', {}).get(
+                    'optical_power_margin'
+                )
+                if value is None:
+                    return
+                margin = float(value)
+                if math.isfinite(margin) and margin >= 0:
+                    self.thresholds['link_margin_min_db'] = margin
+                return
+            except (OSError, TypeError, ValueError, yaml.YAMLError):
+                # Invalid or unreadable configuration deliberately keeps the
+                # documented 3 dB default.
+                return
 
     def load_optical_history(self):
         """Load historical optical data"""
@@ -95,7 +155,7 @@ class OpticalAnalyzer:
         except Exception as e:
             print(f"Error saving optical history: {e}")
 
-    def parse_optical_data(self, optical_data: str) -> Dict[str, float]:
+    def parse_optical_data(self, optical_data: str) -> Optional[Dict[str, Any]]:
         """Parse optical output (NVUE transceiver commands) for optical parameters
         
         Returns None if this is a DAC/Copper cable (not optical)
@@ -124,16 +184,54 @@ class OpticalAnalyzer:
             'bias_current_ma': None
         }
 
-        # Track channel data for averaging
-        rx_powers = []
-        tx_powers = []
-        bias_currents = []
+        # Preserve lane identity.  The scalar values exposed to the report are
+        # selected from the worst lane below rather than averaged, so the
+        # displayed value explains the resulting severity.
+        rx_readings = []
+        tx_readings = []
+        bias_readings = []
+
+        number = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)'
+        power_value = rf'(?P<value>-?inf|{number})'
+        rx_pattern = re.compile(
+            rf'(?:ch-(?P<nvue_lane>\d+)-rx-power|'
+            rf'(?:Rcvr|Receiver)\s+signal\s+(?:avg|average)\s+optical\s+power'
+            rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
+            rf'\s*:\s*(?:-?inf|{number})\s*mW\s*/\s*{power_value}\s*dBm',
+            re.IGNORECASE,
+        )
+        tx_pattern = re.compile(
+            rf'(?:ch-(?P<nvue_lane>\d+)-tx-power|'
+            rf'(?:Transmit\s+avg\s+optical\s+power|Laser\s+output\s+power)'
+            rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
+            rf'\s*:\s*(?:-?inf|{number})\s*mW\s*/\s*{power_value}\s*dBm',
+            re.IGNORECASE,
+        )
+        bias_pattern = re.compile(
+            rf'(?:ch-(?P<nvue_lane>\d+)-tx-bias-current|'
+            rf'Laser\s+tx\s+bias\s+current'
+            rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
+            rf'\s*:\s*(?P<value>{number})\s*mA',
+            re.IGNORECASE,
+        )
+
+        def lane_number(match, readings):
+            value = match.groupdict().get('nvue_lane') or match.groupdict().get('ethtool_lane')
+            return int(value) if value is not None else len(readings) + 1
+
+        def power_from_match(match):
+            value = match.group('value').lower()
+            if value == '-inf':
+                return self.NEGATIVE_INFINITY_FLOOR_DBM
+            if value == 'inf':
+                return abs(self.NEGATIVE_INFINITY_FLOOR_DBM)
+            return float(value)
 
         lines = optical_data.strip().split('\n')
         for line in lines:
             line = line.strip()
 
-                        # Parse temperature (NVUE format: "temperature : 48.71 degrees C" or ethtool: "Module temperature : 48.85 degrees C")
+            # Parse temperature (NVUE format: "temperature : 48.71 degrees C" or ethtool: "Module temperature : 48.85 degrees C")
             temp_match = re.search(r'(?:Module\s+)?temperature\s*:\s*([\d.-]+)\s*degrees?\s*C', line)
             if temp_match:
                 optical_params['temperature_c'] = float(temp_match.group(1))
@@ -143,81 +241,166 @@ class OpticalAnalyzer:
             if voltage_match:
                 optical_params['voltage_v'] = float(voltage_match.group(1))
 
-            # Parse RX power (NVUE: "ch-1-rx-power : 1.7055 mW / 2.32 dBm" or ethtool: "Rcvr signal avg optical power(Channel 1) : 1.5601 mW / 1.93 dBm")
-            # Enhanced regex to handle parentheses around Channel
-            rx_power_match = re.search(r'(?:ch-\d+-rx-power|Rcvr\s+signal\s+avg\s+optical\s+power\s*\(?\s*Channel\s+\d+\s*\)?)\s*:\s*[\d.-]+\s*mW\s*/\s*([-\d.]+)\s*dBm', line)
+            rx_power_match = rx_pattern.search(line)
             if rx_power_match:
                 try:
-                    rx_dbm = float(rx_power_match.group(1))
-                    # Ignore placeholder lanes commonly reported as -40 dBm on unused channels
-                    if rx_dbm > -35.0:
-                        rx_powers.append(rx_dbm)
+                    rx_readings.append((
+                        lane_number(rx_power_match, rx_readings),
+                        power_from_match(rx_power_match),
+                    ))
                 except ValueError:
                     pass
 
-            # Parse TX power (NVUE: "ch-1-tx-power : 1.1706 mW / 0.68 dBm" or ethtool: "Transmit avg optical power (Channel 1) : 1.0466 mW / 0.20 dBm")
-            # Enhanced regex to handle parentheses around Channel
-            tx_power_match = re.search(r'(?:ch-\d+-tx-power|Transmit\s+avg\s+optical\s+power\s*\(?\s*Channel\s+\d+\s*\)?)\s*:\s*[\d.-]+\s*mW\s*/\s*([-\d.]+)\s*dBm', line)
+            tx_power_match = tx_pattern.search(line)
             if tx_power_match:
                 try:
-                    tx_dbm = float(tx_power_match.group(1))
-                    # Ignore unused lanes at ~-40 dBm
-                    if tx_dbm > -35.0:
-                        tx_powers.append(tx_dbm)
+                    tx_readings.append((
+                        lane_number(tx_power_match, tx_readings),
+                        power_from_match(tx_power_match),
+                    ))
                 except ValueError:
                     pass
 
-            # Parse bias current (NVUE: "ch-1-tx-bias-current : 7.056 mA" or ethtool: "Laser tx bias current (Channel 1) : 72.500 mA")
-            # Enhanced regex to handle parentheses around Channel
-            bias_match = re.search(r'(?:ch-\d+-tx-bias-current|Laser\s+tx\s+bias\s+current\s*\(?\s*Channel\s+\d+\s*\)?)\s*:\s*([\d.-]+)\s*mA', line)
+            bias_match = bias_pattern.search(line)
             if bias_match:
                 try:
-                    bias_ma = float(bias_match.group(1))
-                    # Ignore zero bias reported on unused lanes
-                    if bias_ma > 0.1:
-                        bias_currents.append(bias_ma)
+                    bias_readings.append((
+                        lane_number(bias_match, bias_readings),
+                        float(bias_match.group('value')),
+                    ))
                 except ValueError:
                     pass
 
-        # Keep the displayed scalar values as channel averages for backwards
-        # compatibility, but retain lane readings internally so one bad lane
-        # cannot be hidden by otherwise healthy lanes.
-        if rx_powers:
-            optical_params['rx_power_dbm'] = sum(rx_powers) / len(rx_powers)
-        if tx_powers:
-            optical_params['tx_power_dbm'] = sum(tx_powers) / len(tx_powers)
-        if bias_currents:
-            optical_params['bias_current_ma'] = sum(bias_currents) / len(bias_currents)
-
-        optical_params['_rx_power_lanes_dbm'] = rx_powers
-        optical_params['_tx_power_lanes_dbm'] = tx_powers
-        optical_params['_bias_current_lanes_ma'] = bias_currents
-
-        # Fallback: parse on full blob if line-by-line missed values (ethtool formatting variations)
-        # Enhanced to handle both "Channel 1" and "(Channel 1)" formats
-        if optical_params['rx_power_dbm'] is None:
-            rx_all = re.findall(r'(?:Rcvr\s+signal\s+avg\s+optical\s+power\s*\(?\s*Channel\s*\d+\s*\)?|ch-\d+-rx-power)\s*:\s*[\d.-]+\s*mW\s*/\s*([-\d.]+)\s*dBm', optical_data, flags=re.IGNORECASE)
-            if rx_all:
-                rx_vals = [float(v) for v in rx_all if float(v) > -35.0]
-                if rx_vals:
-                    optical_params['rx_power_dbm'] = sum(rx_vals) / len(rx_vals)
-                    optical_params['_rx_power_lanes_dbm'] = rx_vals
-        if optical_params['tx_power_dbm'] is None:
-            tx_all = re.findall(r'(?:Transmit\s+avg\s+optical\s+power\s*\(?\s*Channel\s*\d+\s*\)?|ch-\d+-tx-power)\s*:\s*[\d.-]+\s*mW\s*/\s*([-\d.]+)\s*dBm', optical_data, flags=re.IGNORECASE)
-            if tx_all:
-                tx_vals = [float(v) for v in tx_all if float(v) > -35.0]
-                if tx_vals:
-                    optical_params['tx_power_dbm'] = sum(tx_vals) / len(tx_vals)
-                    optical_params['_tx_power_lanes_dbm'] = tx_vals
-        if optical_params['bias_current_ma'] is None:
-            bias_all = re.findall(r'(?:Laser\s+tx\s+bias\s+current\s*\(?\s*Channel\s*\d+\s*\)?|ch-\d+-tx-bias-current)\s*:\s*([\d.-]+)\s*mA', optical_data, flags=re.IGNORECASE)
-            if bias_all:
-                bias_vals = [float(v) for v in bias_all if float(v) > 0.1]
-                if bias_vals:
-                    optical_params['bias_current_ma'] = sum(bias_vals) / len(bias_vals)
-                    optical_params['_bias_current_lanes_ma'] = bias_vals
+        self._set_lane_readings(optical_params, 'rx_power', rx_readings)
+        self._set_lane_readings(optical_params, 'tx_power', tx_readings)
+        self._set_lane_readings(optical_params, 'bias_current', bias_readings)
+        self._select_declared_optical_lanes(optical_data, optical_params)
 
         return optical_params
+
+    def _declared_optical_lane_count(self, optical_data: str) -> Optional[int]:
+        """Return an unambiguous optical lane count from module media text.
+
+        A QSFP host can expose four diagnostic channels even when its optical
+        media is single-lane PAM4.  In that case unused channels are commonly
+        rendered as ``-40 dBm``/``0 mA`` placeholders.  Conversely, standards
+        such as DR4, SR4 and LR4 have genuinely independent optical lanes and
+        must retain worst-lane analysis.
+
+        If the raw block advertises conflicting media standards, return
+        ``None`` rather than guessing and potentially hiding a failed lane.
+        """
+        lane_counts = set()
+        for match in self.OPTICAL_MEDIA_STANDARD_RE.finditer(optical_data):
+            family = match.group('family').upper()
+            suffix = match.group('lanes')
+            if suffix is not None:
+                count = int(suffix)
+                if count > 0:
+                    lane_counts.add(count)
+            elif family in self.UNNUMBERED_SINGLE_LANE_MEDIA:
+                lane_counts.add(1)
+
+        if len(lane_counts) == 1:
+            return next(iter(lane_counts))
+        return None
+
+    def _select_declared_optical_lanes(
+            self, optical_data: str,
+            optical_params: Dict[str, Any]) -> None:
+        """Drop driver placeholder channels for declared single-lane media.
+
+        Filtering is intentionally metadata-driven.  A dark reading or zero
+        bias alone is never considered proof that a channel is unused.  Lane
+        1 must also be present; otherwise all readings are preserved so an
+        unfamiliar channel numbering scheme cannot mask a fault.
+        """
+        optical_lane_count = self._declared_optical_lane_count(optical_data)
+        optical_params['_declared_optical_lane_count'] = optical_lane_count
+        if optical_lane_count != 1:
+            return
+
+        for metric in ('rx_power', 'tx_power', 'bias_current'):
+            lanes_key = (f'_{metric}_lanes_dbm' if metric != 'bias_current'
+                         else '_bias_current_lanes_ma')
+            ids_key = f'_{metric}_lane_ids'
+            values = optical_params.get(lanes_key) or []
+            lane_ids = optical_params.get(ids_key) or []
+            if len(values) <= 1:
+                continue
+            readings = list(zip(lane_ids, values))
+            lane_one = [item for item in readings if item[0] == 1]
+            if lane_one:
+                self._set_lane_readings(optical_params, metric, lane_one)
+
+    def _lane_risk(self, metric: str, value: float) -> tuple:
+        """Return a sortable risk tuple used to select the displayed lane."""
+        if metric == 'rx_power':
+            low = self.thresholds['rx_power_min_dbm']
+            high = self.thresholds['rx_power_critical_high_dbm']
+            if value <= self.DARK_POWER_DBM:
+                return (4, low - value)
+            if value < low or value > high:
+                return (3, max(low - value, value - high))
+            if (self.calculate_link_margin(value) < self.thresholds['link_margin_min_db'] or
+                    value > self.thresholds['rx_power_warning_high_dbm']):
+                return (2, max(low + self.thresholds['link_margin_min_db'] - value,
+                               value - self.thresholds['rx_power_warning_high_dbm']))
+            return (1, -min(value - low, high - value))
+        if metric == 'tx_power':
+            low = self.thresholds['tx_power_min_dbm']
+            high = self.thresholds['tx_power_max_dbm']
+            if value < low or value > high:
+                return (3, max(low - value, value - high))
+            if value < low + 1.0 or value > high - 1.0:
+                return (2, max(low + 1.0 - value, value - (high - 1.0)))
+            return (1, -min(value - low, high - value))
+        # High bias is the only currently defined bias risk.
+        return (1, value)
+
+    def _set_lane_readings(self, optical_params: Dict[str, Any], metric: str,
+                           readings: List[tuple]) -> None:
+        value_key = f'{metric}_dbm' if metric != 'bias_current' else 'bias_current_ma'
+        lanes_key = f'_{metric}_lanes_dbm' if metric != 'bias_current' else '_bias_current_lanes_ma'
+        ids_key = f'_{metric}_lane_ids'
+        lane_key = f'{metric}_lane'
+
+        optical_params[lanes_key] = [value for _lane, value in readings]
+        optical_params[ids_key] = [lane for lane, _value in readings]
+        optical_params[lane_key] = None
+        if not readings:
+            optical_params[value_key] = None
+            return
+
+        lane, value = max(readings, key=lambda item: self._lane_risk(metric, item[1]))
+        optical_params[value_key] = value
+        optical_params[lane_key] = lane
+
+    def _select_breakout_lane(self, port_name: str,
+                              optical_params: Dict[str, Any]) -> None:
+        """Limit a breakout interface to its matching physical channel.
+
+        Drivers often return all cage lanes for every `swpNsM` interface.  In
+        that case channel M+1 is the only lane owned by the logical interface.
+        A single returned lane is already interface-scoped and is left intact.
+        """
+        interface = port_name.split(':', 1)[-1]
+        match = re.fullmatch(r'swp\d+s(\d+)', interface)
+        if not match:
+            return
+        wanted_lane = int(match.group(1)) + 1
+
+        for metric in ('rx_power', 'tx_power', 'bias_current'):
+            lanes_key = f'_{metric}_lanes_dbm' if metric != 'bias_current' else '_bias_current_lanes_ma'
+            ids_key = f'_{metric}_lane_ids'
+            values = optical_params.get(lanes_key) or []
+            lane_ids = optical_params.get(ids_key) or []
+            if len(values) <= 1:
+                continue
+            readings = list(zip(lane_ids, values))
+            selected = [item for item in readings if item[0] == wanted_lane]
+            if selected:
+                self._set_lane_readings(optical_params, metric, selected)
 
     def calculate_link_margin(self, rx_power_dbm: float) -> float:
         """Calculate optical link margin"""
@@ -229,7 +412,7 @@ class OpticalAnalyzer:
         min_sensitivity = self.thresholds['rx_power_min_dbm']
         return rx_power_dbm - min_sensitivity
 
-    def assess_optical_health(self, optical_params: Dict[str, float]) -> OpticalHealth:
+    def assess_optical_health(self, optical_params: Dict[str, Any]) -> OpticalHealth:
         """Assess optical health based on parameters"""
         rx_power = optical_params.get('rx_power_dbm')
         tx_power = optical_params.get('tx_power_dbm')
@@ -246,15 +429,27 @@ class OpticalAnalyzer:
             [bias_current] if bias_current is not None else []
         )
 
-        # No optical data available
-        if all(v is None for v in [rx_power, tx_power, temperature]):
+        # No optical data available.  Voltage alone is useful inventory
+        # evidence, but it is not enough to claim a healthy optical path.
+        if all(v is None for v in [rx_power, tx_power, temperature, voltage,
+                                   bias_current]):
             return OpticalHealth.UNKNOWN
+
+        # Preserve an explicit link-down state when every relevant receive lane
+        # is dark.  A single dark lane on a non-breakout multi-lane link remains
+        # CRITICAL below, while breakout interfaces are lane-filtered first.
+        if rx_lanes and all(value <= self.DARK_POWER_DBM for value in rx_lanes):
+            return OpticalHealth.DOWN
 
         # Critical conditions (any one triggers critical status)
         if any(value < self.thresholds['rx_power_min_dbm'] for value in rx_lanes):
             return OpticalHealth.CRITICAL
         if any(value > self.thresholds.get('rx_power_critical_high_dbm', 7.0)
                for value in rx_lanes):
+            return OpticalHealth.CRITICAL
+        if any(value < self.thresholds['tx_power_min_dbm'] or
+               value > self.thresholds['tx_power_max_dbm']
+               for value in tx_lanes):
             return OpticalHealth.CRITICAL
         if temperature is not None and temperature > self.thresholds['temperature_max_c']:
             return OpticalHealth.CRITICAL
@@ -264,6 +459,9 @@ class OpticalAnalyzer:
             return OpticalHealth.CRITICAL
         if any(value > self.thresholds['bias_current_max_ma'] for value in bias_lanes):
             return OpticalHealth.CRITICAL
+
+        if not rx_lanes and not tx_lanes:
+            return OpticalHealth.UNKNOWN
 
         # Warning conditions
         warning_count = 0
@@ -292,13 +490,12 @@ class OpticalAnalyzer:
             if temperature > self.thresholds['temperature_max_c'] - 10.0:
                 warning_count += 1
 
-        # Return health status
-        if warning_count >= 2:
+        # Any independently meaningful threshold violation is a warning.  The
+        # previous two-warning rule hid a real low-margin/high-power condition
+        # behind a GOOD badge.
+        if warning_count:
             return OpticalHealth.WARNING
-        elif warning_count == 1:
-            return OpticalHealth.GOOD
-        else:
-            return OpticalHealth.EXCELLENT
+        return OpticalHealth.EXCELLENT
 
     def update_optical_stats(self, port_name: str, optical_data: str):
         """Update optical statistics for a port
@@ -310,12 +507,18 @@ class OpticalAnalyzer:
         # Skip DAC/Copper cables - parse_optical_data returns None for these
         if optical_params is None:
             return False
+
+        self._select_breakout_lane(port_name, optical_params)
         
         health = self.assess_optical_health(optical_params)
 
         # Calculate additional metrics
         link_margin_db = None
-        if optical_params['rx_power_dbm'] is not None:
+        rx_lanes = optical_params.get('_rx_power_lanes_dbm') or []
+        if rx_lanes:
+            link_margin_db = min(self.calculate_link_margin(value)
+                                 for value in rx_lanes)
+        elif optical_params['rx_power_dbm'] is not None:
             link_margin_db = self.calculate_link_margin(optical_params['rx_power_dbm'])
 
         # Store current stats
@@ -326,6 +529,12 @@ class OpticalAnalyzer:
             'temperature_c': optical_params['temperature_c'],
             'voltage_v': optical_params['voltage_v'],
             'bias_current_ma': optical_params['bias_current_ma'],
+            'rx_power_lane': optical_params.get('rx_power_lane'),
+            'tx_power_lane': optical_params.get('tx_power_lane'),
+            'bias_current_lane': optical_params.get('bias_current_lane'),
+            'rx_power_lanes_dbm': optical_params.get('_rx_power_lanes_dbm', []),
+            'tx_power_lanes_dbm': optical_params.get('_tx_power_lanes_dbm', []),
+            'bias_current_lanes_ma': optical_params.get('_bias_current_lanes_ma', []),
             'link_margin_db': link_margin_db,
             'last_updated': time.time(),
             'raw_data': optical_data[:500]  # Store first 500 chars for debugging
@@ -342,7 +551,10 @@ class OpticalAnalyzer:
             'rx_power_dbm': optical_params['rx_power_dbm'],
             'tx_power_dbm': optical_params['tx_power_dbm'],
             'temperature_c': optical_params['temperature_c'],
-            'link_margin_db': link_margin_db
+            'link_margin_db': link_margin_db,
+            'rx_power_lane': optical_params.get('rx_power_lane'),
+            'tx_power_lane': optical_params.get('tx_power_lane'),
+            'bias_current_lane': optical_params.get('bias_current_lane')
         }
 
         self.optical_history[port_name].append(history_entry)
@@ -354,11 +566,13 @@ class OpticalAnalyzer:
     def get_optical_summary(self) -> Dict[str, Any]:
         """Get optical analysis summary"""
         summary = {
-            "total_ports": 0,  # Will calculate as sum of classified ports
+            "total_ports": 0,
             "excellent_ports": [],
             "good_ports": [],
             "warning_ports": [],
             "critical_ports": [],
+            "down_ports": [],
+            "unplugged_ports": [],
             "unknown_ports": []
         }
 
@@ -374,7 +588,10 @@ class OpticalAnalyzer:
                 "temperature_c": stats.get('temperature_c'),
                 "link_margin_db": stats.get('link_margin_db'),
                 "voltage_v": stats.get('voltage_v'),
-                "bias_current_ma": stats.get('bias_current_ma')
+                "bias_current_ma": stats.get('bias_current_ma'),
+                "rx_power_lane": stats.get('rx_power_lane'),
+                "tx_power_lane": stats.get('tx_power_lane'),
+                "bias_current_lane": stats.get('bias_current_lane')
             }
 
             if health_enum == OpticalHealth.EXCELLENT:
@@ -383,17 +600,27 @@ class OpticalAnalyzer:
                 summary["good_ports"].append(port_info)
             elif health_enum == OpticalHealth.WARNING:
                 summary["warning_ports"].append(port_info)
-            elif health_enum in (OpticalHealth.CRITICAL, OpticalHealth.DOWN,
-                                  OpticalHealth.UNPLUGGED):
+            elif health_enum == OpticalHealth.CRITICAL:
                 summary["critical_ports"].append(port_info)
+            elif health_enum == OpticalHealth.DOWN:
+                summary["down_ports"].append(port_info)
+            elif health_enum == OpticalHealth.UNPLUGGED:
+                # An absent module is an availability/inventory state, not a
+                # failed optical measurement.  Keep it visible in the table
+                # without inflating either Critical or Down.
+                summary["unplugged_ports"].append(port_info)
             else:
                 summary["unknown_ports"].append(port_info)
 
-        # Calculate total as sum of classified ports (exclude unknown)
+        # UNKNOWN is a monitored port with incomplete diagnostics, not an
+        # absent port.  Include it in coverage and in the detailed table.
         summary["total_ports"] = (len(summary["excellent_ports"]) +
                                  len(summary["good_ports"]) +
                                  len(summary["warning_ports"]) +
-                                 len(summary["critical_ports"]))
+                                 len(summary["critical_ports"]) +
+                                 len(summary["down_ports"]) +
+                                 len(summary["unplugged_ports"]) +
+                                 len(summary["unknown_ports"]))
 
         return summary
 
@@ -408,8 +635,8 @@ class OpticalAnalyzer:
                 anomalies.append({
                     "port": port_name,
                     "type": "OPTICAL_LINK_DOWN",
-                    "severity": "critical",
-                    "message": "Optical link is down",
+                    "severity": "warning",
+                    "message": "No receive light on the selected active optical lane",
                     "action": "Check fiber connection, peer state, and transceiver",
                     "rx_power_dbm": stats.get('rx_power_dbm')
                 })
@@ -419,7 +646,7 @@ class OpticalAnalyzer:
                 anomalies.append({
                     "port": port_name,
                     "type": "OPTICAL_MODULE_UNPLUGGED",
-                    "severity": "critical",
+                    "severity": "warning",
                     "message": "Optical module is unplugged",
                     "action": "Install or reseat the expected optical module"
                 })
@@ -427,7 +654,9 @@ class OpticalAnalyzer:
 
             if health == OpticalHealth.CRITICAL:
                 # Critical optical issues
+                anomaly_count = len(anomalies)
                 rx_power = stats.get('rx_power_dbm')
+                tx_power = stats.get('tx_power_dbm')
                 temperature = stats.get('temperature_c')
 
                 if rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm']:
@@ -440,6 +669,18 @@ class OpticalAnalyzer:
                         "rx_power_dbm": rx_power
                     })
 
+                if tx_power is not None and (
+                        tx_power < self.thresholds['tx_power_min_dbm'] or
+                        tx_power > self.thresholds['tx_power_max_dbm']):
+                    anomalies.append({
+                        "port": port_name,
+                        "type": "TX_POWER_OUT_OF_RANGE",
+                        "severity": "critical",
+                        "message": f"TX power out of range: {tx_power:.2f} dBm",
+                        "action": "Inspect or replace the transceiver and verify module compatibility",
+                        "tx_power_dbm": tx_power
+                    })
+
                 if temperature is not None and temperature > self.thresholds['temperature_max_c']:
                     anomalies.append({
                         "port": port_name,
@@ -450,10 +691,20 @@ class OpticalAnalyzer:
                         "temperature_c": temperature
                     })
 
+                if len(anomalies) == anomaly_count:
+                    anomalies.append({
+                        "port": port_name,
+                        "type": "CRITICAL_OPTICAL_PARAMETER",
+                        "severity": "critical",
+                        "message": "A voltage, bias, high-RX, or lane threshold is critical",
+                        "action": "Inspect the displayed worst-lane values and transceiver diagnostics"
+                    })
+
             elif health == OpticalHealth.WARNING:
                 # Warning level issues
-                link_margin = stats.get('link_margin_db', 0)
-                if link_margin < self.thresholds['link_margin_min_db']:
+                link_margin = stats.get('link_margin_db')
+                if (isinstance(link_margin, (int, float)) and
+                        link_margin < self.thresholds['link_margin_min_db']):
                     anomalies.append({
                         "port": port_name,
                         "type": "LOW_LINK_MARGIN",
@@ -461,6 +712,14 @@ class OpticalAnalyzer:
                         "message": f"Low link margin: {link_margin:.2f} dB (threshold: {self.thresholds['link_margin_min_db']} dB)",
                         "action": "Monitor closely, schedule proactive maintenance",
                         "link_margin_db": link_margin
+                    })
+                else:
+                    anomalies.append({
+                        "port": port_name,
+                        "type": "OPTICAL_PARAMETER_WARNING",
+                        "severity": "warning",
+                        "message": "An optical power or temperature value is near its limit",
+                        "action": "Review the displayed worst-lane value and monitor the port"
                     })
 
         return anomalies
@@ -490,8 +749,9 @@ class OpticalAnalyzer:
                 return "Investigate critical optical parameters immediately"
 
         if health == OpticalHealth.WARNING.value:
-            link_margin = port_info.get('link_margin_db', 0)
-            if link_margin < self.thresholds['link_margin_min_db']:
+            link_margin = port_info.get('link_margin_db')
+            if (isinstance(link_margin, (int, float)) and
+                    link_margin < self.thresholds['link_margin_min_db']):
                 return "Monitor closely, schedule proactive maintenance"
             else:
                 return "Monitor optical parameters regularly"
@@ -505,6 +765,18 @@ class OpticalAnalyzer:
         """Export optical data for web display - EXACT same styling as BGP/Link Flap"""
         summary = self.get_optical_summary()
         anomalies = self.detect_optical_anomalies()
+        expected_hosts = getattr(self, 'coverage_expected_hosts', None)
+        current_hosts = getattr(self, 'coverage_current_hosts', None)
+        coverage_attrs = ''
+        if isinstance(expected_hosts, int) and isinstance(current_hosts, int):
+            coverage_status = (
+                'complete' if current_hosts >= expected_hosts else 'partial'
+            )
+            coverage_attrs = (
+                f' data-coverage-status="{coverage_status}"'
+                f' data-coverage-expected="{expected_hosts}"'
+                f' data-coverage-current="{current_hosts}"'
+            )
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -532,6 +804,7 @@ class OpticalAnalyzer:
         .card-good {{ border-left-color: #8bc34a; }}
         .card-warning {{ border-left-color: #ff9800; }}
         .card-critical {{ border-left-color: #f44336; }}
+        .card-down {{ border-left-color: #ff9800; }}
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
         .metric-label {{ font-size: 12px; color: #888; margin-top: 4px; }}
@@ -544,6 +817,7 @@ class OpticalAnalyzer:
         .optical-good {{ color: #8bc34a; font-weight: bold; }}
         .optical-warning {{ color: #ff9800; font-weight: bold; }}
         .optical-critical {{ color: #f44336; font-weight: bold; }}
+        .optical-down {{ color: #ff9800; font-weight: bold; }}
         .optical-unknown {{ color: #888; }}
         .optical-table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
         .optical-table th, .optical-table td {{ border: 1px solid #404040; padding: 10px 12px; text-align: left; }}
@@ -585,7 +859,7 @@ class OpticalAnalyzer:
         @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
     </style>
 </head>
-<body>
+<body{coverage_attrs}>
     <div class="page-header">
         <div>
             <div class="page-title">Optical Diagnostics Analysis</div>
@@ -638,14 +912,22 @@ class OpticalAnalyzer:
                     <div class="metric optical-critical" id="critical-ports">{len(summary['critical_ports'])}</div>
                     <div class="metric-label">Critical</div>
                 </div>
+                <div class="summary-card card-down" id="down-card">
+                    <div class="metric optical-down" id="down-ports">{len(summary['down_ports'])}</div>
+                    <div class="metric-label">Down</div>
+                </div>
             </div>
         </div>
     </div>
     
 """
 
-        # Create one unified table for all ports (sorted by health - problems first)
-        all_ports = summary['critical_ports'] + summary['warning_ports'] + summary['good_ports'] + summary['excellent_ports']
+        # Create one unified table for all monitored ports.  UNKNOWN rows are
+        # retained so missing diagnostics cannot improve the visible coverage.
+        all_ports = (summary['critical_ports'] + summary['down_ports'] +
+                     summary['warning_ports'] + summary['unplugged_ports'] +
+                     summary['unknown_ports'] + summary['good_ports'] +
+                     summary['excellent_ports'])
 
         html_content += f"""
     <div class="dashboard-section">
@@ -685,12 +967,21 @@ class OpticalAnalyzer:
                 device_name = "unknown"
                 interface_name = port_name
             
+            rx_lane = port.get('rx_power_lane')
+            tx_lane = port.get('tx_power_lane')
+            bias_lane = port.get('bias_current_lane')
             rx_power = f"{port['rx_power_dbm']:.2f}" if port['rx_power_dbm'] is not None else "N/A"
             tx_power = f"{port['tx_power_dbm']:.2f}" if port['tx_power_dbm'] is not None else "N/A"
+            if rx_lane is not None:
+                rx_power += f" (L{rx_lane})"
+            if tx_lane is not None:
+                tx_power += f" (L{tx_lane})"
             temperature = f"{port['temperature_c']:.1f}" if port['temperature_c'] is not None else "N/A"
             link_margin = f"{port['link_margin_db']:.2f}" if port['link_margin_db'] is not None else "N/A"
             voltage = f"{port['voltage_v']:.2f}" if port['voltage_v'] is not None else "N/A"
             bias_current = f"{port['bias_current_ma']:.2f}" if port['bias_current_ma'] is not None else "N/A"
+            if bias_lane is not None:
+                bias_current += f" (L{bias_lane})"
             recommended_action = self.get_recommended_action(port)
             # Badge class based on health
             health = port['health']
@@ -702,6 +993,10 @@ class OpticalAnalyzer:
                 badge_class = 'badge badge-orange'
             elif health == 'critical':
                 badge_class = 'badge badge-red'
+            elif health == 'down':
+                badge_class = 'badge badge-orange'
+            elif health == 'unplugged':
+                badge_class = 'badge badge-gray'
             else:
                 badge_class = 'badge badge-gray'
 
@@ -737,12 +1032,13 @@ class OpticalAnalyzer:
                     <tr><th>Parameter</th><th>Min Threshold</th><th>Max Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Received optical power range (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm)</td></tr>
+                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Received power on active optical lanes only (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm); media-declared inactive placeholder channels are excluded</td></tr>
                     <tr><td>TX Power</td><td>{self.thresholds['tx_power_min_dbm']} dBm</td><td>{self.thresholds['tx_power_max_dbm']} dBm</td><td>Transmitted optical power range</td></tr>
                     <tr><td>Temperature</td><td>{self.thresholds['temperature_min_c']}°C</td><td>{self.thresholds['temperature_max_c']}°C</td><td>SFP/QSFP operating temperature</td></tr>
                     <tr><td>Voltage</td><td>{self.thresholds['voltage_min_v']}V</td><td>{self.thresholds['voltage_max_v']}V</td><td>Supply voltage range</td></tr>
-                    <tr><td>Link Margin</td><td>{self.thresholds['link_margin_min_db']} dB</td><td>-</td><td>Minimum acceptable link budget margin</td></tr>
+                    <tr><td>Link Margin</td><td>{self.thresholds['link_margin_min_db']} dB</td><td>-</td><td>Minimum margin from notifications.yaml; based on the current generic RX sensitivity until module-specific limits are collected</td></tr>
                     <tr><td>Bias Current</td><td>-</td><td>{self.thresholds['bias_current_max_ma']} mA</td><td>Maximum laser bias current</td></tr>
+                    <tr><td>Down</td><td>-</td><td>{self.DARK_POWER_DBM} dBm RX</td><td>No receive light on every selected active optical lane; reported separately from Critical threshold violations</td></tr>
                 </tbody>
             </table>
         </div>
@@ -806,6 +1102,12 @@ class OpticalAnalyzer:
                     filterPorts('CRITICAL');
                 }
             });
+
+            document.getElementById('down-card').addEventListener('click', function() {
+                if (parseInt(document.getElementById('down-ports').textContent) > 0) {
+                    filterPorts('DOWN');
+                }
+            });
         }
 
         function filterPorts(filterType) {
@@ -843,6 +1145,10 @@ class OpticalAnalyzer:
                 filteredRows = allRows.filter(row => row.dataset.health === 'critical');
                 filterText = `Showing ${filteredRows.length} Critical Ports`;
                 document.getElementById('critical-card').classList.add('active');
+            } else if (filterType === 'DOWN') {
+                filteredRows = allRows.filter(row => row.dataset.health === 'down');
+                filterText = `Showing ${filteredRows.length} Down Ports`;
+                document.getElementById('down-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
                 filteredRows = allRows;
                 document.getElementById('total-ports-card').classList.add('active');
@@ -1062,12 +1368,12 @@ class OpticalAnalyzer:
         function compareOpticalHealth(a, b) {
             const priority = {
                 'CRITICAL': 0,
-                'DOWN': 0,
-                'UNPLUGGED': 0,
-                'WARNING': 1,
-                'GOOD': 2,
-                'EXCELLENT': 3,
-                'UNKNOWN': 4
+                'DOWN': 1,
+                'UNPLUGGED': 2,
+                'WARNING': 3,
+                'GOOD': 4,
+                'EXCELLENT': 5,
+                'UNKNOWN': 6
             };
 
             return (priority[a] ?? 5) - (priority[b] ?? 5);
@@ -1091,9 +1397,10 @@ class OpticalAnalyzer:
         }
 
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
+            let notification = null;
 
             // Disable button and show loading
             button.disabled = true;
@@ -1104,19 +1411,26 @@ class OpticalAnalyzer:
                 Running...
             `;
 
-            // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
+            try {
+                // Capture the current pipeline generation before triggering a
+                // new one.  The shared analysis guard resolves only after a
+                // newer complete generation has been published.
+                let baseline = null;
+                if (typeof window.lldpqCapturePipelineState === 'function') {
+                    baseline = await window.lldpqCapturePipelineState();
                 }
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    console.log('✅ Monitor analysis triggered successfully');
-                    // Show notification
-                    const notification = document.createElement('div');
+
+                const response = await fetch('/trigger-monitor', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Failed to trigger monitor analysis');
+                }
+
+                console.log('✅ Monitor analysis triggered successfully');
+                notification = document.createElement('div');
                     notification.style.cssText = `
                         position: fixed;
                         top: 20px;
@@ -1134,28 +1448,26 @@ class OpticalAnalyzer:
                     notification.innerHTML = `
                         <strong>✅ Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small>Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small>Page will refresh after the new analysis is completely published.</small>
                     `;
-                    document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 35000);
+                document.body.appendChild(notification);
+
+                if (typeof window.waitForLldpqAnalysisCompletion === 'function') {
+                    await window.waitForLldpqAnalysisCompletion(baseline);
                 } else {
-                    console.error('❌ Failed to trigger monitor analysis:', data.message);
-                    alert('Failed to trigger analysis. Please try again.');
-                    // Restore button
-                    button.disabled = false;
-                    button.innerHTML = originalText;
+                    // Compatibility fallback for older installations that do
+                    // not yet provide analysis-guard.js completion polling.
+                    await new Promise(resolve => setTimeout(resolve, 35000));
                 }
-            })
-            .catch(error => {
+
+                window.location.reload();
+            } catch (error) {
                 console.error('❌ Error triggering analysis:', error);
-                alert('Error triggering analysis. Please try again.');
-                // Restore button
+                if (notification) notification.remove();
+                alert('Analysis did not complete: ' + (error.message || error));
                 button.disabled = false;
                 button.innerHTML = originalText;
-            });
+            }
         }
 
         // CSV Download Function
@@ -1167,23 +1479,15 @@ class OpticalAnalyzer:
                 const timeStr = now.toTimeString().slice(0, 5).replace(':', '-'); // HH-MM
                 const filename = `Optical_Analysis_Report_${dateStr}_${timeStr}.csv`;
 
-                // Create CSV header
-                const headers = [
-                    'Port',
-                    'Health',
-                    'Rx Power (dBm)',
-                    'Tx Power (dBm)',
-                    'Temperature (°C)',
-                    'Link Margin (dB)',
-                    'Voltage (V)',
-                    'Bias Current (mA)',
-                    'Recommended Action'
-                ];
-
+                // Read headers and cells from the same table so Device/Action
+                // and future columns cannot become shifted or truncated.
+                const table = document.getElementById('optical-table');
+                const headers = Array.from(table.querySelectorAll('thead th')).map(th =>
+                    th.textContent.replace('▲▼', '').trim()
+                );
                 let csvContent = headers.join(',') + '\\n';
 
                 // Get table data (only visible rows)
-                const table = document.getElementById('optical-table');
                 const tbody = table.querySelector('tbody');
                 const rows = tbody.querySelectorAll('tr');
 
@@ -1195,24 +1499,17 @@ class OpticalAnalyzer:
                 csvContent += `# Good: ${document.getElementById('good-ports').textContent}\\n`;
                 csvContent += `# Warning: ${document.getElementById('warning-ports').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-ports').textContent}\\n`;
+                csvContent += `# Down: ${document.getElementById('down-ports').textContent}\\n`;
                 csvContent += `#\\n`;
 
                 // Process each visible row
                 rows.forEach(row => {
                     if (row.style.display !== 'none') {
                         const cells = row.querySelectorAll('td');
-                        if (cells.length >= 9) {
-                            const rowData = [
-                                cells[0].textContent.trim(), // Port
-                                cells[1].querySelector('span') ? cells[1].querySelector('span').textContent.trim() : cells[1].textContent.trim(), // Health
-                                cells[2].textContent.trim(), // Rx Power
-                                cells[3].textContent.trim(), // Tx Power
-                                cells[4].textContent.trim(), // Temperature
-                                cells[5].textContent.trim(), // Link Margin
-                                cells[6].textContent.trim(), // Voltage
-                                cells[7].textContent.trim(), // Bias Current
-                                cells[8].textContent.trim()  // Recommended Action
-                            ];
+                        if (cells.length) {
+                            const rowData = Array.from(cells).map(cell =>
+                                cell.textContent.trim()
+                            );
 
                             // Escape commas and quotes in data
                             const escapedData = rowData.map(field => {

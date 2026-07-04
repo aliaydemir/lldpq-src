@@ -33,6 +33,12 @@ except Exception:
     def canonical(_n):
         return _n
 
+try:
+    from collection_freshness import asset_snapshot_is_valid, read_asset_snapshot
+except Exception:
+    asset_snapshot_is_valid = None
+    read_asset_snapshot = None
+
 MAC_RE = re.compile(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
 IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 SEQ_RE = re.compile(r'(\d+)\s*/\s*(\d+)\s*$')
@@ -79,6 +85,7 @@ class DuplicateAnalyzer:
         self.vni_to_vlan = {}          # vni(str) -> vlan(str)
         self.dup_config = {}           # host -> {'enabled': bool, 'max_moves': int, 'time': int}
         self.ip_dups = {}              # (vlan, ip) -> record
+        self.authoritative_ip_pairs = {}  # (vni, ip) -> hosts reporting current FRR duplicate
         self.mac_dups = {}             # (vlan, mac) -> record
         self.apipa = {}                # host -> {'total': int, 'per_vlan': {vlan: count}}
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}
@@ -90,7 +97,13 @@ class DuplicateAnalyzer:
         self.log_events_mac = {}       # (vni, mac) -> {'count': int, 'latest': dt, 'vteps': set, 'ips': set}  (last VTEP = contender)
         self.self_vteps = {}           # host -> set(local VTEP ip)   ; used to resolve a VTEP IP -> switch name
         self.vtep2host = {}            # vtep ip -> host
-        self.global_now = None         # max log timestamp seen (clock-safe "now")
+        # Event age must be measured against a real clock.  Using the newest
+        # line in the log as "now" made an entirely old log look current.
+        self.analysis_now = datetime.now(timezone.utc)
+        self.collection_meta = {}      # host -> collector timestamp/source status
+        self.coverage = {
+            "expected": set(), "current": set(), "failures": [], "partial": True,
+        }
         self.prev_state = self._load_state()
         self.new_state = {}
         # Cross-cycle memory of each duplicate IP's owner ports + MACs (fast flappers rarely have
@@ -141,12 +154,16 @@ class DuplicateAnalyzer:
     def parse_all(self):
         for host, files in self._hosts().items():
             ch = canonical(host)
+            self.collection_meta.setdefault(ch, {
+                "timestamp": None, "sources": {}, "samples": {},
+            })
             if "_dup.txt" in files:
                 self._parse_dup(ch, self._read(files["_dup.txt"]))
             if "_fdb.txt" in files:
                 self._parse_fdb(ch, self._read(files["_fdb.txt"]))
             if "_neigh.txt" in files:
                 self._parse_neigh(ch, self._read(files["_neigh.txt"]))
+        self._finalize_coverage()
         self._merge_arp_conflicts()
         self._finalize()
 
@@ -178,16 +195,139 @@ class DuplicateAnalyzer:
         return sections
 
     def _parse_dup(self, host, text):
+        self._parse_collection_meta(host, text)
         sec = self._split_sections(text)
+        self.collection_meta[host]["arp_section_present"] = "ARP" in sec
         self._parse_vni_map(sec.get("VNI MAP", []))
         self._parse_config(host, sec.get("CONFIG", []))
         self._parse_self(host, sec.get("SELF", []))
-        self._parse_arp_dup(host, sec.get("ARP", []))
+        # Only the explicit, successful FRR duplicate command is authoritative
+        # for the IP-duplicate total.  Do not turn stale/pre-marker/error output
+        # into a current duplicate.
+        if self.collection_meta[host]["sources"].get("ARP_DUPLICATES") == "OK":
+            self._parse_arp_dup(host, sec.get("ARP", []))
         self._parse_mac_dup(host, sec.get("MAC", []))
         self._parse_log(sec.get("LOG", []))
         self._parse_mac_mobility(host, sec.get("MACMOB", []))
         self._parse_ip_mobility(host, sec.get("ARPMOB", []))
         self._parse_ifalias(host, sec.get("IFALIAS", []))
+
+    def _parse_collection_meta(self, host, text):
+        """Read the collector's explicit status markers without showing them."""
+        meta = self.collection_meta.setdefault(host, {
+            "timestamp": None, "sources": {}, "samples": {},
+        })
+        for line in text.splitlines():
+            if line.startswith("__LLDPQ_DUP_COLLECTION_UTC__:"):
+                value = line.split(":", 1)[1].strip()
+                ts = _parse_ts(value) if value != "UNKNOWN" else None
+                if ts is not None and ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                meta["timestamp"] = ts
+                continue
+            match = re.fullmatch(
+                r"__LLDPQ_DUP_COVERAGE__:([A-Z0-9_]+):(OK|ERROR|TRUNCATED)",
+                line.strip(),
+            )
+            if match:
+                meta["sources"][match.group(1)] = match.group(2)
+                continue
+            match = re.fullmatch(
+                r"__LLDPQ_DUP_SAMPLE_META__:([A-Z0-9_]+):"
+                r"MATCHES=([^:]+):EMITTED=([^:]+):CAP=([^:]+):TRUNCATED=([^:]+)",
+                line.strip(),
+            )
+            if match:
+                meta["samples"][match.group(1)] = {
+                    "matches": match.group(2), "emitted": match.group(3),
+                    "cap": match.group(4), "truncated": match.group(5),
+                }
+
+    def _finalize_coverage(self):
+        """Summarize whether zero duplicates really means a complete sample."""
+        expected = set(self.collection_meta)
+        asset_statuses = {}
+        snapshot_problem = None
+        if read_asset_snapshot is not None and asset_snapshot_is_valid is not None:
+            assets_path = os.path.join(
+                os.path.dirname(os.path.abspath(self.data_dir)), "assets.ini"
+            )
+            snapshot = read_asset_snapshot(assets_path)
+            statuses, _mtime, assets_available = snapshot
+            if asset_snapshot_is_valid(snapshot):
+                asset_statuses = {
+                    canonical(host): status for host, status in statuses.items()
+                }
+                expected = set(asset_statuses)
+            elif assets_available:
+                snapshot_problem = "SNAPSHOT_INVALID"
+            else:
+                snapshot_problem = "SNAPSHOT_MISSING"
+        else:
+            snapshot_problem = "SNAPSHOT_UNAVAILABLE"
+
+        try:
+            max_age = max(float(os.environ.get("DUP_DATA_MAX_AGE_MINUTES", "30")), 0) * 60
+        except ValueError:
+            max_age = 30 * 60
+
+        current = set()
+        failures = []
+        required = ("COLLECTION_TIMESTAMP", "ARP_DUPLICATES")
+        for host in sorted(expected):
+            status = asset_statuses.get(host)
+            if status is not None and status != "OK":
+                failures.append("%s:ASSET_%s" % (host, status))
+                continue
+
+            meta = self.collection_meta.get(host)
+            if not meta:
+                failures.append("%s:COLLECTION_MISSING" % host)
+                continue
+
+            timestamp = meta.get("timestamp")
+            timestamp_ok = timestamp is not None
+            if timestamp is None and meta.get("sources", {}).get("COLLECTION_TIMESTAMP") == "OK":
+                failures.append("%s:COLLECTION_TIME_INVALID" % host)
+            if timestamp is not None:
+                age = (self.analysis_now - timestamp).total_seconds()
+                if age > max_age:
+                    timestamp_ok = False
+                    failures.append("%s:COLLECTION_STALE" % host)
+                elif age < -300:
+                    timestamp_ok = False
+                    failures.append("%s:COLLECTION_TIME_FUTURE" % host)
+
+            sources = meta.get("sources", {})
+            core_ok = timestamp_ok
+            for source in required:
+                source_status = sources.get(source)
+                if source_status != "OK":
+                    core_ok = False
+                    failures.append("%s:%s_%s" % (
+                        host, source, source_status or "MISSING",
+                    ))
+            if not meta.get("arp_section_present"):
+                core_ok = False
+                failures.append("%s:ARP_SECTION_MISSING" % host)
+
+            if core_ok:
+                current.add(host)
+
+        # Inventory is the authority for expected devices.  Without a valid
+        # snapshot we may parse rows for diagnostics, but must not publish a
+        # trustworthy zero/current count.
+        if snapshot_problem:
+            failures.append("inventory:%s" % snapshot_problem)
+            current.clear()
+
+        failures = sorted(set(failures))
+        self.coverage = {
+            "expected": expected,
+            "current": current,
+            "failures": failures,
+            "partial": bool(failures or current != expected),
+        }
 
     def _parse_vni_map(self, lines):
         for line in lines:
@@ -257,6 +397,8 @@ class DuplicateAnalyzer:
             rec["macs"].add(mac)
             rec["seq"] = max(rec["seq"], seq)
             rec["flagged"] = True
+            rec["authoritative_hosts"].add(host)
+            self.authoritative_ip_pairs.setdefault((str(vni), neighbor), set()).add(host)
             if typ == "local":
                 rec["local_hosts"].add(host)
             if vtep:
@@ -265,6 +407,7 @@ class DuplicateAnalyzer:
     def _blank_ip(self, vlan, vni, ip):
         return {"vlan": vlan, "vni": str(vni), "ip": ip, "macs": set(), "seq": 0,
                 "flagged": False, "local_hosts": set(), "vteps": set(),
+                "authoritative_hosts": set(),
                 "ports": set(), "apipa": False, "recency": None, "delta": None,
                 "events": 0, "latest": None, "mobility": False}
 
@@ -323,8 +466,6 @@ class DuplicateAnalyzer:
                 for e in (ev, evm):
                     if e["latest"] is None or ts > e["latest"]:
                         e["latest"] = ts
-                if self.global_now is None or ts > self.global_now:
-                    self.global_now = ts
 
     def _parse_mac_mobility(self, host, lines):
         """Parse non-zero-seq lines from 'show evpn mac vni all' (works even with DAD off)."""
@@ -447,9 +588,10 @@ class DuplicateAnalyzer:
     def _recency(self, latest):
         if not latest:
             return None
-        now = self.global_now or datetime.now(timezone.utc)
         try:
-            return (now - latest).total_seconds()
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            return (self.analysis_now - latest).total_seconds()
         except Exception:
             return None
 
@@ -673,6 +815,10 @@ class DuplicateAnalyzer:
         self._save_state()
 
     def _ip_sev(self, rec):
+        # A row returned by the successful, current FRR
+        # ``show ... duplicate`` command is the active duplicate truth.
+        if rec.get("authoritative_hosts", set()) & self.coverage["current"]:
+            return "CRITICAL"
         # "Active now" = a duplicate/mobility event within the last hour, or a sequence that climbed
         # THIS collection cycle. Only an actively-moving duplicate is an urgent (CRITICAL) fire.
         active = (rec["recency"] is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
@@ -694,21 +840,34 @@ class DuplicateAnalyzer:
             return "WARNING"
         return "OK"
 
+    def _is_confirmed_ip(self, rec):
+        """Current authoritative FRR rows only; mobility/logs are context."""
+        return bool(rec.get("authoritative_hosts", set()) & self.coverage["current"])
+
     # -------------------------------------------------------------- summary
     def summary(self):
-        ip_active = sum(1 for r in self.ip_dups.values() if r["severity"] == "CRITICAL")
-        ip_quiesced = sum(1 for r in self.ip_dups.values() if r["severity"] == "WARNING")
+        confirmed_ips = [r for r in self.ip_dups.values() if self._is_confirmed_ip(r)]
+        ip_active = sum(
+            1 for hosts in self.authoritative_ip_pairs.values()
+            if hosts & self.coverage["current"]
+        )
+        ip_quiesced = 0
         mac_total = len(self.mac_dups)
         apipa_total = sum(a["total"] for a in self.apipa.values())
-        vlans = set(r["vlan"] for r in self.ip_dups.values()) | set(r["vlan"] for r in self.mac_dups.values())
+        vlans = set(r["vlan"] for r in confirmed_ips) | set(r["vlan"] for r in self.mac_dups.values())
         for h, a in self.apipa.items():
             vlans |= set(a["per_vlan"].keys())
         disabled = [h for h, c in self.dup_config.items() if c.get("enabled") is False]
         return {
             "ip_active": ip_active, "ip_quiesced": ip_quiesced,
+            "confirmed_ip_active": ip_active,
             "mac_total": mac_total, "apipa_total": apipa_total,
             "vlans": len(vlans), "disabled": disabled,
-            "ip_total": len(self.ip_dups),
+            "ip_total": ip_active,
+            "coverage_expected": len(self.coverage["expected"]),
+            "coverage_current": len(self.coverage["current"]),
+            "coverage_failures": len(self.coverage["failures"]),
+            "coverage_partial": self.coverage["partial"],
         }
 
     # ---------------------------------------------------------------- web
@@ -775,7 +934,7 @@ class DuplicateAnalyzer:
         all_devices = set()
 
         # ---- IP duplicate rows
-        ip_rows = sorted(self.ip_dups.values(),
+        ip_rows = sorted((r for r in self.ip_dups.values() if self._is_confirmed_ip(r)),
                          key=lambda r: (sev_rank.get(r["severity"], 3), -(r["seq"]), -(r["events"])))
         ip_html = []
         for r in ip_rows:
@@ -916,7 +1075,8 @@ class DuplicateAnalyzer:
                 v, l)
             for c, v, l, act in cards)
 
-        stale_count = sum(1 for r in self.ip_dups.values() if r.get("stale")) + \
+        stale_count = sum(1 for r in self.ip_dups.values()
+                          if self._is_confirmed_ip(r) and r.get("stale")) + \
                       sum(1 for r in self.mac_dups.values() if r.get("stale"))
         aged_btn = ("" if not stale_count else
                     "<button id='agedBtn' class='btn btn-secondary' onclick='toggleAged()' "
@@ -924,6 +1084,30 @@ class DuplicateAnalyzer:
                     % (STALE_AGE_SEC // 86400, stale_count))
 
         html_doc = _PAGE_TEMPLATE
+        if not s["coverage_expected"] or not s["coverage_current"]:
+            collection_status = "unavailable"
+        elif s["coverage_partial"]:
+            collection_status = "partial"
+        else:
+            collection_status = "current"
+        machine_summary = (
+            '<div data-analysis-summary="duplicate"'
+            ' data-collection-status="%s"'
+            ' data-confirmed-ip-active="%d"'
+            ' data-ip-quiesced="%d"'
+            ' data-coverage-expected="%d"'
+            ' data-coverage-current="%d"'
+            ' data-coverage-failures="%d"'
+            ' data-coverage-partial="%s"'
+            ' data-coverage-failure-details="%s" style="display:none"></div>'
+        ) % (
+            collection_status,
+            s["confirmed_ip_active"], s["ip_quiesced"],
+            s["coverage_expected"], s["coverage_current"],
+            s["coverage_failures"], str(s["coverage_partial"]).lower(),
+            html.escape(json.dumps(self.coverage["failures"]), quote=True),
+        )
+        html_doc = html_doc.replace("__MACHINE_SUMMARY__", machine_summary)
         html_doc = html_doc.replace("__NOW__", html.escape(now))
         html_doc = html_doc.replace("__AGED_BTN__", aged_btn)
         html_doc = html_doc.replace("__STALE_COUNT__", str(stale_count))
@@ -1025,6 +1209,7 @@ body:not(.show-aged) tr.stale-row { display:none !important; }
 </style>
 </head>
 <body>
+__MACHINE_SUMMARY__
 <div class="page-header">
   <div>
     <div class="page-title">Duplicate IP / MAC Analysis</div>
@@ -1232,4 +1417,3 @@ document.addEventListener('DOMContentLoaded', function(){
 <script src="/css/analysis-guard.js"></script>
 </body>
 </html>"""
-

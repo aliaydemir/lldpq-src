@@ -5,10 +5,29 @@
 source "$(dirname "$0")/auth-guard.sh"
 require_auth
 
-# Load allowlisted config data through the fixed, root-owned parser.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Load allowlisted config data through the fixed, root-owned parser.  A partial
+# upgrade must fail explicitly: silently falling back to the CGI user's HOME
+# makes every device lookup use the wrong inventory while still returning 200.
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+config_bootstrap_error() {
+    echo "Status: 500 Internal Server Error"
+    echo "Content-Type: application/json"
+    echo ""
+    printf '%s\n' '{"success": false, "error": "LLDPq runtime configuration is unavailable; complete or repair the installation"}'
+    exit 0
+}
+if [[ ! -x "$LLDPQ_CONFIG_HELPER" ]]; then
+    config_bootstrap_error
 fi
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
+    2>/dev/null); then
+    config_bootstrap_error
+fi
+if ! eval "$LLDPQ_CONFIG_ASSIGNMENTS"; then
+    config_bootstrap_error
+fi
+unset LLDPQ_CONFIG_ASSIGNMENTS
 
 # Set defaults (use $HOME for portable fallback)
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
@@ -16,7 +35,7 @@ LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # Export for Python scripts
-export LLDPQ_DIR LLDPQ_USER
+export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 
 # Output JSON header
 echo "Content-Type: application/json"
@@ -30,101 +49,65 @@ parse_query() {
     SEARCH=$(echo "$query" | grep -oP 'search=\K[^&]*' | head -1 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
 }
 
-# Resolve SSH target (username@ip) from devices.yaml
-# Usage: ssh_target=$(get_ssh_target "$DEVICE")
-get_ssh_target() {
-    local ip="$1"
-    local username
-    if ! username=$(python3 - "$ip" <<'PYTHON'
-import os
-import re
-import sys
-
-import yaml
-
-ip = sys.argv[1]
-try:
-    # The request may select only a syntactically safe, configured inventory key.
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:%-]{0,252}', ip):
-        raise ValueError('invalid device')
-    with open(os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq')) + '/devices.yaml') as f:
-        d = yaml.safe_load(f)
-    if not isinstance(d, dict):
-        raise ValueError('invalid inventory')
-    default_user = d.get('defaults', {}).get('username', '')
-    devs = d.get('devices', d)
-    if not isinstance(devs, dict) or ip not in devs:
-        raise ValueError('unknown device')
-    info = devs.get(ip, {})
-    if isinstance(info, dict):
-        username = info.get('username', default_user)
-    else:
-        username = default_user
-    if username and (
-        not isinstance(username, str)
-        or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]{0,63}', username)
-    ):
-        raise ValueError('invalid username')
-    print(username or '')
-except Exception:
-    sys.exit(1)
-PYTHON
-    ); then
-        return 1
-    fi
-    if [[ -n "$username" ]]; then
-        echo "${username}@${ip}"
-    else
-        echo "$ip"
-    fi
+# Search and the collectors must consume one inventory contract.  Calling the
+# canonical parser here keeps type normalization, legacy usernames (for
+# example DOMAIN\user and user+tag), validation and error handling identical.
+inventory_json() {
+    local parser="$LLDPQ_DIR/parse_devices.py"
+    local inventory="$LLDPQ_DIR/devices.yaml"
+    [[ -f "$parser" && -f "$inventory" ]] || return 1
+    python3 "$parser" --format json --file "$inventory"
 }
 
-# List available devices from devices.yaml
-list_devices() {
-    python3 << 'PYTHON'
+# Resolve SSH target (username@address) from the validated inventory JSON.
+# Usage: ssh_target=$(get_ssh_target "$DEVICE")
+get_ssh_target() {
+    local address="$1"
+    local target
+    if ! target=$(inventory_json | python3 -c '
 import json
-import yaml
-import os
+import sys
 
-lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
-devices_file = f"{lldpq_dir}/devices.yaml"
+requested = sys.argv[1]
+try:
+    records = json.load(sys.stdin)
+    matches = [record for record in records if record.get("address") == requested]
+    if len(matches) != 1:
+        raise ValueError("unknown device")
+    record = matches[0]
+    username = record.get("username", "")
+    address = record["address"]
+    print(f"{username}@{address}" if username else address)
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+' "$address"); then
+        return 1
+    fi
+    printf '%s\n' "$target"
+}
 
-# Fallback paths
-if not os.path.exists(devices_file):
-    devices_file = os.path.expanduser("~/lldpq/devices.yaml")
+# List devices from the same normalized parser output used by every collector.
+list_devices() {
+    local records
+    if ! records=$(inventory_json 2>/dev/null); then
+        printf '%s\n' '{"success": false, "error": "Device inventory is invalid or unavailable"}'
+        return
+    fi
+    printf '%s' "$records" | python3 -c '
+import json
+import sys
 
 try:
-    with open(devices_file, 'r') as f:
-        devices_data = yaml.safe_load(f)
-    
-    devices = []
-    
-    # Get devices from 'devices' section
-    devices_section = devices_data.get('devices', {})
-    if not devices_section:
-        # Fallback: treat entire file as devices (old format)
-        devices_section = devices_data
-    
-    for ip, info in devices_section.items():
-        # Skip non-device entries
-        if ip in ['defaults', 'endpoint_hosts']:
-            continue
-        
-        if isinstance(info, dict):
-            hostname = info.get('hostname', ip)
-        else:
-            # Format: hostname as string
-            hostname = str(info) if info else ip
-        
-        devices.append({"ip": ip, "hostname": hostname})
-    
-    # Sort by hostname
-    devices.sort(key=lambda x: x['hostname'])
-    
+    records = json.load(sys.stdin)
+    devices = [
+        {"ip": record["address"], "hostname": record["hostname"]}
+        for record in records
+    ]
+    devices.sort(key=lambda item: (item["hostname"].casefold(), item["ip"]))
     print(json.dumps({"success": True, "devices": devices}))
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
-PYTHON
+except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(json.dumps({"success": False, "error": f"Invalid device inventory: {exc}"}))
+'
 }
 
 # Get MAC table from a device
@@ -316,42 +299,40 @@ PYTHON
 get_all_tables() {
     local table_type="$1"  # mac or arp
     local search="$2"
-    
-    python3 - "$table_type" "$search" <<'PYTHON'
+    local records
+
+    if ! records=$(inventory_json 2>/dev/null); then
+        printf '%s\n' '{"success": false, "error": "Device inventory is invalid or unavailable"}'
+        return
+    fi
+
+    # Feed canonical normalized records on stdin; keep Python source on fd 3.
+    printf '%s' "$records" | python3 /dev/fd/3 \
+        "$table_type" "$search" "$LLDPQ_USER" 3<<'PYTHON'
 import json
-import yaml
 import subprocess
 import concurrent.futures
-import os
 import re
 import sys
 
-lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
-devices_file = f"{lldpq_dir}/devices.yaml"
-
-if not os.path.exists(devices_file):
-    devices_file = os.path.expanduser("~/lldpq/devices.yaml")
-
 table_type = sys.argv[1]
 search = sys.argv[2].lower()
-default_ssh_user = ""
+lldpq_user = sys.argv[3]
 
-def ssh_target(ip, info):
-    username = default_ssh_user
-    if isinstance(info, dict):
-        username = info.get('username') or default_ssh_user
-    return f"{username}@{ip}" if username else ip
+try:
+    device_list = json.load(sys.stdin)
+    if not isinstance(device_list, list) or not device_list:
+        raise ValueError("empty device inventory")
+except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    print(json.dumps({"success": False, "error": f"Invalid device inventory: {exc}"}))
+    raise SystemExit(0)
 
-def get_device_table(device_info):
-    ip, info = device_info
-    if isinstance(info, dict):
-        hostname = info.get('hostname', ip)
-    else:
-        hostname = str(info) if info else ip
-    
+def get_device_table(record):
     try:
-        lldpq_user = os.environ.get('LLDPQ_USER', os.environ.get('USER', 'root'))
-        target = ssh_target(ip, info)
+        ip = record['address']
+        hostname = record['hostname']
+        username = record.get('username', '')
+        target = f"{username}@{ip}" if username else ip
         if table_type == "mac":
             remote_script = "/usr/sbin/bridge fdb show 2>/dev/null | grep -v permanent | head -200"
             cmd_parts = [
@@ -368,9 +349,10 @@ def get_device_table(device_info):
                 remote_script
             ]
             result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
-        
+        if result.returncode != 0:
+            return [], hostname
+
         entries = []
-        
         if table_type == "mac":
             for line in result.stdout.strip().split('\n'):
                 if not line.strip():
@@ -386,10 +368,14 @@ def get_device_table(device_info):
                         if p == "vlan" and i + 1 < len(parts):
                             vlan = parts[i + 1]
                     
-                    entry = {"device": hostname, "mac": mac, "interface": iface, "vlan": vlan}
+                    entry = {
+                        "device": hostname,
+                        "mac": mac,
+                        "interface": iface,
+                        "vlan": vlan,
+                    }
                     if not search or search in mac.lower() or search in iface.lower() or search in hostname.lower():
                         entries.append(entry)
-        
         elif table_type == "arp":
             # Parse ARP with VRF info from interface masters
             output = result.stdout.strip()
@@ -423,6 +409,9 @@ def get_device_table(device_info):
                 ip_addr = parts[0]
                 mac = ""
                 iface = ""
+                state = parts[-1] if parts[-1] in {
+                    "REACHABLE", "STALE", "DELAY", "PROBE", "FAILED", "PERMANENT"
+                } else ""
                 for i, p in enumerate(parts):
                     if p == "dev" and i + 1 < len(parts):
                         iface = parts[i + 1]
@@ -433,37 +422,47 @@ def get_device_table(device_info):
                     if iface and re.search(r'-v\d+$', iface):
                         continue
                     vrf = iface_to_vrf.get(iface, "default")
-                    entry = {"device": hostname, "ip": ip_addr, "mac": mac, "interface": iface, "vrf": vrf}
-                    if not search or search in ip_addr.lower() or search in mac.lower() or search in hostname.lower():
+                    entry = {
+                        "device": hostname,
+                        "ip": ip_addr,
+                        "mac": mac,
+                        "interface": iface,
+                        "vrf": vrf,
+                        "state": state,
+                    }
+                    if (not search or search in ip_addr.lower() or
+                            search in mac.lower() or search in hostname.lower() or
+                            search in iface.lower() or search in vrf.lower()):
                         entries.append(entry)
-        
-        return entries
-    except Exception as e:
-        return []
+        return entries, None
+    except Exception:
+        return [], str(record.get('hostname', record.get('address', 'unknown')))
 
 try:
-    with open(devices_file, 'r') as f:
-        devices_data = yaml.safe_load(f)
-    default_ssh_user = devices_data.get('defaults', {}).get('username', '')
-    
-    # Get devices from 'devices' section
-    devices_section = devices_data.get('devices', {})
-    if not devices_section:
-        devices_section = devices_data
-    
-    # Filter out non-device entries
-    device_list = [(ip, info) for ip, info in devices_section.items() 
-                   if ip not in ['defaults', 'endpoint_hosts']]
-    
     all_entries = []
-    
-    # Parallel execution - increase workers for faster search
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+    failed_devices = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(50, len(device_list))) as executor:
         results = executor.map(get_device_table, device_list)
-        for entries in results:
+        for entries, failed_device in results:
             all_entries.extend(entries)
-    
-    print(json.dumps({"success": True, "entries": all_entries[:500], "total": len(all_entries)}))
+            if failed_device:
+                failed_devices.append(failed_device)
+
+    successful_devices = len(device_list) - len(failed_devices)
+    if successful_devices == 0:
+        print(json.dumps({
+            "success": False,
+            "error": "Failed to query every configured device",
+            "failed_devices": failed_devices,
+        }))
+    else:
+        print(json.dumps({
+            "success": True,
+            "entries": all_entries[:500],
+            "total": len(all_entries),
+            "successful_device_count": successful_devices,
+            "failed_devices": failed_devices,
+        }))
 
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
@@ -593,7 +592,7 @@ get_route_table() {
     fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 45 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
-        sudo vtysh -c "show ip route vrf all" 2>/dev/null | head -5000
+        sudo vtysh -c "show ip route vrf all" 2>/dev/null
     ' 2>/dev/null)
     
     if [[ $? -ne 0 ]]; then
@@ -604,6 +603,7 @@ get_route_table() {
     # Keep SSH output on stdin so device-controlled text is never Python source.
     printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
+import ipaddress
 import re
 import sys
 
@@ -737,15 +737,67 @@ for vrf, routes in vrf_data.items():
         r['vrf'] = vrf
         entries.append(r)
 
-# Apply search filter
+# Compute longest-prefix matches from the complete collected table before the
+# display filter/limit is applied.  The response stays bounded (one result per
+# VRF), while searches remain correct when the matching route is beyond the
+# first 100 display rows.
+best_matches = {}
+best_match_order = []
+try:
+    search_ip = ipaddress.IPv4Address(search) if search else None
+except ipaddress.AddressValueError:
+    search_ip = None
+
+if search_ip is not None:
+    for vrf, routes in vrf_data.items():
+        best_route = None
+        best_prefixlen = -1
+        for route in routes:
+            try:
+                network = ipaddress.IPv4Network(route['prefix'], strict=False)
+            except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, KeyError, ValueError):
+                continue
+            if search_ip in network and network.prefixlen > best_prefixlen:
+                best_route = dict(route)
+                best_route['vrf'] = vrf
+                best_prefixlen = network.prefixlen
+        if best_route is None:
+            best_route = {
+                'prefix': 'No Route',
+                'nexthop': '-',
+                'interface': '-',
+                'protocol': '-',
+                'vrf': vrf,
+                'no_route': True,
+            }
+        best_matches[vrf] = best_route
+
+    best_match_order = list(vrf_data)
+    best_match_order.sort(key=lambda vrf: (
+        0 if vrf == 'default' else 2 if vrf == 'mgmt' else 1,
+        vrf,
+    ))
+
+# Apply search filter for the bounded display table.
 if search:
     filtered = []
     for e in entries:
-        # Search in prefix, nexthop, interface, protocol
-        if (search in e['prefix'].lower() or 
-            search in e['nexthop'].lower() or 
-            search in e['interface'].lower() or
-            search in e['protocol'].lower()):
+        # A complete IP uses exact field matching so 10.0.0.1 does not match
+        # 10.0.0.10 and accidentally suppress the LPM response. Partial/text
+        # searches retain the existing substring behavior.
+        if search_ip is not None:
+            field_match = (
+                e['prefix'].split('/', 1)[0].lower() == search or
+                e['nexthop'].lower() == search
+            )
+        else:
+            field_match = (
+                search in e['prefix'].lower() or
+                search in e['nexthop'].lower() or
+                search in e['interface'].lower() or
+                search in e['protocol'].lower()
+            )
+        if field_match:
             filtered.append(e)
         # VRF exact match or starts with
         elif e['vrf'].lower() == search or e['vrf'].lower().startswith(search):
@@ -798,11 +850,22 @@ for v in sorted(vrf_tables.keys()):
 if 'mgmt' in vrf_tables:
     vrf_order.append('mgmt')
 
+per_vrf_limit = 100
+limited_tables = {v: vrf_tables[v][:per_vrf_limit] for v in vrf_order}
+vrf_counts = {v: len(vrf_tables[v]) for v in vrf_order}
+returned_total = sum(len(routes) for routes in limited_tables.values())
+
 print(json.dumps({
-    "success": True, 
-    "vrf_tables": {v: vrf_tables[v][:100] for v in vrf_order},
+    "success": True,
+    "vrf_tables": limited_tables,
     "vrf_order": vrf_order,
-    "total": len(entries)
+    "vrf_counts": vrf_counts,
+    "total": len(entries),
+    "returned_total": returned_total,
+    "truncated": returned_total < len(entries),
+    "per_vrf_limit": per_vrf_limit,
+    "best_matches": best_matches,
+    "best_match_order": best_match_order,
 }))
 PYTHON
 }
@@ -1252,7 +1315,8 @@ dst_vrf_hint = sys.argv[4]
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
-lldp_file = '/var/www/html/lldp_results.ini'
+web_root = os.environ.get('WEB_ROOT', '/var/www/html')
+lldp_file = os.path.join(web_root, 'lldp_results.ini')
 
 # ─── Utility functions ───
 

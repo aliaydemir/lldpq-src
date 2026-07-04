@@ -11,9 +11,14 @@ import os
 import re
 import json
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
-from collection_freshness import is_current_collection, read_asset_snapshot
+from collection_freshness import (
+    asset_snapshot_is_valid,
+    is_current_collection,
+    mark_html_collection_unavailable,
+    read_asset_snapshot,
+)
 
 try:
     from device_names import canonical
@@ -37,6 +42,11 @@ class LogAnalyzer:
         self.log_data_dir = os.path.join(data_dir, "log-data")
         self.log_analysis = defaultdict(lambda: {"critical": [], "warning": [], "error": [], "info": []})
         self.log_counts = defaultdict(lambda: {"critical": 0, "warning": 0, "error": 0, "info": 0})
+        self.seen_events = defaultdict(set)
+        self.source_status = defaultdict(dict)
+        self.expected_devices = set()
+        self.current_devices = set()
+        self.collection_status = "current"
         
         # Patterns that should NOT be critical (demoted to warning)
         # These are transient issues, not real critical problems
@@ -64,11 +74,11 @@ class LogAnalyzer:
         # Enhanced severity patterns for network infrastructure
         self.severity_patterns = {
             'critical': [
-                r'\b(critical|emergency|panic|fatal|disaster|catastrophic)\b',
+                r'\b(emerg(?:ency)?|alert|crit(?:ical)?|panic|fatal|disaster|catastrophic)\b',
                 r'\b(failed|failure|error|exception|crash|abort)\b.*\b(critical|severe)\b',
                 r'\b(down|offline|unreachable|disconnected)\b.*\b(interface|link|connection|peer|neighbor)\b',
+                r'\b(interface|link|connection|peer|neighbor)\b.*\b(down|offline|unreachable|disconnected)\b',
                 r'\b(kernel panic|segmentation fault|out of memory|disk full)\b',
-                r'priority:\s*[0-2]',  # Emergency, Alert, Critical
                 # Network-specific critical patterns
                 r'\b(bgp.*down|ospf.*down|routing.*failed|switching.*failed)\b',
                 r'\b(mlag.*failed|clag.*conflict|spanning.*tree.*blocked)\b',
@@ -76,11 +86,10 @@ class LogAnalyzer:
                 r'\b(hardware.*fault|transceiver.*failed|port.*failed)\b',
             ],
             'warning': [
-                r'\b(warning|warn|caution|alert)\b',
+                r'\b(warning|warn|caution)\b',
                 r'\b(high|elevated|unusual|abnormal)\b.*\b(usage|load|temperature|traffic)\b',
                 r'\b(timeout|retry|retransmit|flap|unstable)\b',
                 r'\b(deprecat|obsolet|unsupport)\b',
-                r'priority:\s*[3-4]',  # Error, Warning
                 # Network-specific warning patterns
                 r'\b(bgp.*flap|neighbor.*timeout|routing.*convergence)\b',
                 r'\b(stp.*topology.*change|vlan.*inconsistent)\b',
@@ -89,11 +98,10 @@ class LogAnalyzer:
                 r'\b(authentication.*failed|permission.*denied)\b',
             ],
             'error': [
-                r'\b(error|err|exception|fault|fail)\b',
+                r'\b(error|err|exception|fault|fail(?:ed|ure)?)\b',
                 r'\b(invalid|illegal|unauthorized|forbidden|denied)\b',
                 r'\b(corrupt|damaged|broken|malformed)\b',
                 r'\b(cannot|unable|refused|rejected)\b',
-                r'priority:\s*[5-6]',  # Notice, Info (errors in context)
                 # Network-specific error patterns
                 r'\b(config.*error|nv.*set.*failed|commit.*failed)\b',
                 r'\b(route.*unreachable|arp.*failed|mac.*learning.*failed)\b',
@@ -104,7 +112,6 @@ class LogAnalyzer:
                 r'\b(start|started|stop|stopped|restart|reload)\b',
                 r'\b(up|online|connected|established|ready)\b',
                 r'\b(configured|enabled|disabled|updated)\b',
-                r'priority:\s*[7]',  # Debug
                 # Network-specific info patterns
                 r'\b(bgp.*established|neighbor.*up|route.*learned)\b',
                 r'\b(interface.*up|link.*up|carrier.*detected)\b',
@@ -112,6 +119,34 @@ class LogAnalyzer:
                 r'\b(config.*applied|nv.*set.*success|commit.*complete)\b',
             ]
         }
+
+        self.section_names = (
+            'FRR_ROUTING_LOGS',
+            'SWITCHD_LOGS',
+            'NVUE_CONFIG_LOGS',
+            'MSTPD_STP_LOGS',
+            'CLAGD_MLAG_LOGS',
+            'AUTH_SECURITY_LOGS',
+            'SYSTEM_CRITICAL_LOGS',
+            'JOURNALCTL_PRIORITY_LOGS',
+            'DMESG_HARDWARE_LOGS',
+            'NETWORK_INTERFACE_LOGS',
+        )
+
+    @staticmethod
+    def _syslog_priority_severity(line):
+        """Return RFC 5424 severity for an explicit PRIORITY value."""
+        match = re.search(r'\bpriority\s*[:=]\s*([0-7])\b', line, re.IGNORECASE)
+        if not match:
+            return None
+        priority = int(match.group(1))
+        if priority <= 2:
+            return 'critical'
+        if priority == 3:
+            return 'error'
+        if priority == 4:
+            return 'warning'
+        return 'info'
     
     def categorize_log_line(self, line):
         """Categorize a log line by severity"""
@@ -127,21 +162,27 @@ class LogAnalyzer:
         for pattern in self.excluded_from_critical:
             if re.search(pattern, line_lower):
                 return 'info'     # These are just noise, not real warnings
+
+        # An explicit syslog priority is authoritative.  In particular,
+        # priority 3 is Error and must not be grouped with Warning.
+        priority_severity = self._syslog_priority_severity(line)
+        if priority_severity:
+            return priority_severity
         
         # Check critical patterns first (highest priority)
         for pattern in self.severity_patterns['critical']:
             if re.search(pattern, line_lower):
                 return 'critical'
         
-        # Then warning patterns
-        for pattern in self.severity_patterns['warning']:
-            if re.search(pattern, line_lower):
-                return 'warning'
-        
-        # Then error patterns
+        # Error outranks Warning.  Checking Warning first caused strings such
+        # as "error ... warning threshold" to be understated.
         for pattern in self.severity_patterns['error']:
             if re.search(pattern, line_lower):
                 return 'error'
+
+        for pattern in self.severity_patterns['warning']:
+            if re.search(pattern, line_lower):
+                return 'warning'
         
         # Default to info if no specific pattern matches
         return 'info'
@@ -150,8 +191,9 @@ class LogAnalyzer:
         """Extract timestamp from log line if available"""
         # Common timestamp patterns
         timestamp_patterns = [
+            # ISO-8601, preserving an optional timezone for display/export.
+            r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)',
             r'(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})',  # Nov 15 14:30:22
-            r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})',  # 2024-11-15T14:30:22
             r'(\d{2}:\d{2}:\d{2})',                     # 14:30:22
         ]
         
@@ -162,54 +204,99 @@ class LogAnalyzer:
         return None
     
     def parse_timestamp_to_datetime(self, line):
-        """Extract timestamp from log line and convert to datetime object"""
-        now = datetime.now()
-        
-        # Pattern 1: "Jan 13 18:37:49" format
-        match = re.search(r'(\w{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})', line)
-        if match:
-            try:
-                month_str, day, hour, minute, second = match.groups()
-                month_map = {'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
-                            'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12}
-                month = month_map.get(month_str, 1)
-                year = now.year
-                log_dt = datetime(year, month, int(day), int(hour), int(minute), int(second))
-                # Handle year rollover (if log is from December and now is January)
-                if log_dt > now + timedelta(days=1):
-                    log_dt = datetime(year - 1, month, int(day), int(hour), int(minute), int(second))
-                return log_dt
-            except:
-                pass
-        
-        # Pattern 2: "2024-01-13T18:37:49" format
-        match = re.search(r'(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})', line)
-        if match:
-            try:
-                year, month, day, hour, minute, second = match.groups()
-                return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
-            except:
-                pass
-        
-        # Pattern 3: Just time "18:37:49" - assume today
-        match = re.search(r'(\d{2}):(\d{2}):(\d{2})', line)
-        if match:
-            try:
-                hour, minute, second = match.groups()
-                return datetime(now.year, now.month, now.day, int(hour), int(minute), int(second))
-            except:
-                pass
-        
-        return None
+        """Return only an unambiguous, timezone-aware ISO timestamp.
+
+        Syslog month/day timestamps have no year or timezone, and bare times
+        have neither.  Guessing their age can silently demote a fresh incident,
+        especially around year rollover or when the switch timezone differs
+        from the report host.
+        """
+        match = re.search(
+            r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}'
+            r'(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2}))',
+            line,
+        )
+        if not match:
+            return None
+        value = match.group(1).replace(',', '.')
+        if value.endswith('Z'):
+            value = value[:-1] + '+00:00'
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
+
+    @staticmethod
+    def _normalized_event_line(line):
+        """Normalize insignificant whitespace for cross-section deduplication."""
+        return re.sub(r'\s+', ' ', line).strip()
+
+    @staticmethod
+    def _section_marker(line):
+        """Recognize only an exact collector section heading.
+
+        A normal log message is allowed to end in a colon; the old broad
+        ``line.endswith(':')`` test discarded those messages.
+        """
+        candidate = line.strip()
+        candidate = re.sub(r'^=+\s*', '', candidate)
+        candidate = re.sub(r'\s*=+$', '', candidate)
+        candidate = candidate.rstrip(':').strip()
+        return candidate
+
+    def _record_source_status(self, device_name, line):
+        match = re.fullmatch(
+            r'__LLDPQ_LOG_SOURCE_STATUS__:([A-Za-z0-9_.-]+):(OK|ERROR|UNAVAILABLE)',
+            line.strip(),
+            re.IGNORECASE,
+        )
+        if not match:
+            return False
+        source, status = (part.upper() for part in match.groups())
+        previous = self.source_status[device_name].get(source)
+        precedence = {'OK': 1, 'UNAVAILABLE': 2, 'ERROR': 3}
+        if previous is None or precedence[status] >= precedence.get(previous, 0):
+            self.source_status[device_name][source] = status
+        return True
+
+    @staticmethod
+    def _is_placeholder_line(line):
+        """Skip collector placeholders without swallowing real error text."""
+        normalized = re.sub(r'\s+', ' ', line).strip().lower()
+        if normalized in {
+            '-- no entries --',
+            'no entries',
+            'not available',
+            'no system critical logs',
+            'no high priority journal logs',
+            'no critical hardware logs',
+            'no interface state changes',
+        }:
+            return True
+        return bool(re.fullmatch(
+            r'(?:no recent .+|no .+ (?:issues|entries)|'
+            r'(?:frr service/|switchd service/)?log not available|'
+            r'.+ log not found|log not found)',
+            normalized,
+        ))
     
     def adjust_severity_by_age(self, severity, log_datetime):
         """Adjust severity based on log age - older logs are less critical"""
         if log_datetime is None:
             return severity  # Can't determine age, keep original
         
-        now = datetime.now()
-        age = now - log_datetime
+        if log_datetime.tzinfo is None:
+            return severity
+
+        now = datetime.now(timezone.utc)
+        age = now - log_datetime.astimezone(timezone.utc)
         age_minutes = age.total_seconds() / 60
+
+        # Clock skew or a future-dated event must never make an incident look
+        # less severe.
+        if age_minutes < 0:
+            return severity
         
         # Time-based severity adjustment:
         # - Last 30 minutes: Keep original severity
@@ -219,11 +306,11 @@ class LogAnalyzer:
         if age_minutes < 30:
             return severity  # Fresh log, keep original
         elif age_minutes < 120:  # 30 min - 2 hours
-            if severity == 'critical':
+            if severity in ('critical', 'error'):
                 return 'warning'  # Demote critical to warning
             return severity
         else:  # Over 2 hours
-            if severity in ('critical', 'warning'):
+            if severity in ('critical', 'error', 'warning'):
                 return 'info'  # Demote to info (historical)
             return severity
     
@@ -231,7 +318,7 @@ class LogAnalyzer:
         """Process logs for a single device"""
         if not os.path.exists(log_file_path):
             print(f"⚠️  Log file not found: {log_file_path}")
-            return
+            return False
         
         
         try:
@@ -239,18 +326,7 @@ class LogAnalyzer:
                 content = f.read()
                 
             # Split into sections based on log type markers
-            sections = {
-                'FRR_ROUTING_LOGS': [],
-                'SWITCHD_LOGS': [],
-                'NVUE_CONFIG_LOGS': [],
-                'MSTPD_STP_LOGS': [],
-                'CLAGD_MLAG_LOGS': [],
-                'AUTH_SECURITY_LOGS': [],
-                'SYSTEM_CRITICAL_LOGS': [],
-                'JOURNALCTL_PRIORITY_LOGS': [],
-                'DMESG_HARDWARE_LOGS': [],
-                'NETWORK_INTERFACE_LOGS': []
-            }
+            sections = {section: [] for section in self.section_names}
             
             current_section = None
             for line in content.split('\n'):
@@ -258,34 +334,19 @@ class LogAnalyzer:
                 if not line:
                     continue
                 
-                # Check for section markers
-                if line.startswith('===') or line.endswith(':'):
-                    if 'FRR_ROUTING_LOGS' in line:
-                        current_section = 'FRR_ROUTING_LOGS'
-                    elif 'SWITCHD_LOGS' in line:
-                        current_section = 'SWITCHD_LOGS'
-                    elif 'NVUE_CONFIG_LOGS' in line:
-                        current_section = 'NVUE_CONFIG_LOGS'
-                    elif 'MSTPD_STP_LOGS' in line:
-                        current_section = 'MSTPD_STP_LOGS'
-                    elif 'CLAGD_MLAG_LOGS' in line:
-                        current_section = 'CLAGD_MLAG_LOGS'
-                    elif 'AUTH_SECURITY_LOGS' in line:
-                        current_section = 'AUTH_SECURITY_LOGS'
-                    elif 'SYSTEM_CRITICAL_LOGS' in line:
-                        current_section = 'SYSTEM_CRITICAL_LOGS'
-                    elif 'JOURNALCTL_PRIORITY_LOGS' in line:
-                        current_section = 'JOURNALCTL_PRIORITY_LOGS'
-                    elif 'DMESG_HARDWARE_LOGS' in line:
-                        current_section = 'DMESG_HARDWARE_LOGS'
-                    elif 'NETWORK_INTERFACE_LOGS' in line:
-                        current_section = 'NETWORK_INTERFACE_LOGS'
+                # Source-status markers are coverage metadata, not events.
+                if self._record_source_status(device_name, line):
+                    continue
+
+                # Match exact section labels only. A real message such as
+                # "fatal error:" must remain available to the classifier.
+                marker = self._section_marker(line)
+                if marker in self.section_names:
+                    current_section = marker
                     continue
                 
                 # Skip non-informative lines
-                if (line.startswith('No ') or line == '' or len(line) < 10 or 
-                    'No entries' in line or line.strip() == '-- No entries --' or
-                    'not found' in line.lower() or 'log not found' in line):
+                if len(line) < 5 or self._is_placeholder_line(line):
                     continue
                 
                 if current_section:
@@ -302,6 +363,11 @@ class LogAnalyzer:
                     # Skip if severity is None (monitoring noise)
                     if severity is None:
                         continue
+
+                    normalized_line = self._normalized_event_line(line)
+                    if normalized_line in self.seen_events[device_name]:
+                        continue
+                    self.seen_events[device_name].add(normalized_line)
                     
                     timestamp = self.parse_timestamp(line)
                     
@@ -315,18 +381,54 @@ class LogAnalyzer:
                         'section': section_name,
                         'message': line.strip(),
                         'severity': severity,
-                        'original_severity': original_severity if original_severity != severity else None
+                        'original_severity': original_severity,
                     }
                     
                     self.log_analysis[device_name][severity].append(log_entry)
                     self.log_counts[device_name][severity] += 1
+
+            return True
         
         except Exception as e:
             print(f"❌ Error processing logs for {device_name}: {e}")
+            return False
+
+    def coverage_summary(self):
+        """Return machine-readable log collection coverage metadata."""
+        expected_devices = self.expected_devices or self.current_devices
+        source_error_devices = {
+            device for device, statuses in self.source_status.items()
+            if any(status == 'ERROR' for status in statuses.values())
+        }
+        partial_devices = sorted(
+            (set(expected_devices) - self.current_devices) | source_error_devices
+        )
+        unsupported_sources = {
+            device: sorted(
+                source for source, status in statuses.items()
+                if status == 'UNAVAILABLE'
+            )
+            for device, statuses in sorted(self.source_status.items())
+            if any(status == 'UNAVAILABLE' for status in statuses.values())
+        }
+        return {
+            'expected_devices': sorted(expected_devices),
+            'current_devices': sorted(self.current_devices),
+            'partial': bool(partial_devices),
+            'partial_devices': partial_devices,
+            'unsupported_sources': unsupported_sources,
+        }
     
     def generate_html_report(self):
         """Generate HTML report for log analysis"""
         print("Generating log analysis HTML report...")
+
+        coverage = self.coverage_summary()
+        coverage_partial_attr = 'true' if coverage['partial'] else 'false'
+        partial_devices_attr = html.escape(
+            json.dumps(coverage['partial_devices'], separators=(',', ':')),
+            quote=True,
+        )
         
         # Calculate totals
         total_devices = len(self.log_counts)
@@ -424,7 +526,12 @@ class LogAnalyzer:
         @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
     </style>
 </head>
-<body>
+<body data-analysis-summary="log"
+      data-collection-status="{self.collection_status}"
+      data-coverage-partial="{coverage_partial_attr}"
+      data-coverage-expected="{len(coverage['expected_devices'])}"
+      data-coverage-current="{len(coverage['current_devices'])}"
+      data-coverage-partial-devices="{partial_devices_attr}">
     <div class="page-header">
         <div>
             <div class="page-title">Log Analysis Results</div>
@@ -509,18 +616,19 @@ class LogAnalyzer:
             device_label = html.escape(str(canonical(device_name)))
             device_attr = html.escape(str(device_name), quote=True)
             
-            # Color code total count like other analysis pages
-            if total_count == 0:
-                total_class = "total-excellent"
-            elif total_count <= 50:
-                total_class = "total-good" 
-            elif total_count <= 100:
-                total_class = "total-warning"
-            else:
+            # Operational severity, not raw info volume, determines the row
+            # color. A chatty but healthy device must not look critical.
+            if counts['critical'] > 0:
                 total_class = "total-critical"
+            elif counts['error'] > 0 or counts['warning'] > 0:
+                total_class = "total-warning"
+            elif counts['info'] > 0:
+                total_class = "total-good"
+            else:
+                total_class = "total-excellent"
             
             html_content += f"""
-                    <tr>
+                    <tr data-device-key="{device_attr}">
                         <td>{device_label}</td>
                         <td>
                             <span class="severity-count critical {'zero' if counts['critical'] == 0 else ''}" 
@@ -552,22 +660,22 @@ class LogAnalyzer:
                         </td>
                         <td><span class="{total_class}">{total_count}</span></td>
                     </tr>
-                    <tr id="details-{device_attr}-critical" class="log-details">
+                    <tr id="details-{device_attr}-critical" class="log-details" data-parent-device-key="{device_attr}">
                         <td colspan="6">
                             <div id="content-{device_attr}-critical"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_attr}-warning" class="log-details">
+                    <tr id="details-{device_attr}-warning" class="log-details" data-parent-device-key="{device_attr}">
                         <td colspan="6">
                             <div id="content-{device_attr}-warning"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_attr}-error" class="log-details">
+                    <tr id="details-{device_attr}-error" class="log-details" data-parent-device-key="{device_attr}">
                         <td colspan="6">
                             <div id="content-{device_attr}-error"></div>
                         </td>
                     </tr>
-                    <tr id="details-{device_attr}-info" class="log-details">
+                    <tr id="details-{device_attr}-info" class="log-details" data-parent-device-key="{device_attr}">
                         <td colspan="6">
                             <div id="content-{device_attr}-info"></div>
                         </td>
@@ -882,6 +990,15 @@ class LogAnalyzer:
                     section.textContent = String(log.section ?? '');
                     entry.appendChild(section);
 
+                    const severityTrace = document.createElement('span');
+                    severityTrace.className = 'log-section';
+                    const originalSeverity = String(log.original_severity ?? log.severity ?? severity).toUpperCase();
+                    const effectiveSeverity = String(log.severity ?? severity).toUpperCase();
+                    severityTrace.textContent = originalSeverity === effectiveSeverity
+                        ? effectiveSeverity
+                        : `${originalSeverity} → ${effectiveSeverity}`;
+                    entry.appendChild(severityTrace);
+
                     const message = document.createElement('span');
                     message.className = 'log-message';
                     message.textContent = String(log.message ?? '');
@@ -966,15 +1083,15 @@ class LogAnalyzer:
             });
             
             // DIFFERENT APPROACH: Move existing DOM nodes instead of destroying them
-            rows.forEach((row, index) => {
-                const deviceName = row.cells[0].textContent.trim();
+            rows.forEach(row => {
+                const deviceKey = row.dataset.deviceKey;
                 
                 // Move the device row to its new position
                 tbody.appendChild(row);
                 
                 // Move the associated log-details rows right after the device row
                 const logDetailsRows = Array.from(tbody.querySelectorAll('.log-details')).filter(
-                    detailRow => detailRow.id.includes(deviceName)
+                    detailRow => detailRow.dataset.parentDeviceKey === deviceKey
                 );
                 logDetailsRows.forEach(detailRow => tbody.appendChild(detailRow));
             });
@@ -983,9 +1100,15 @@ class LogAnalyzer:
         // reattachClickHandlers function removed - no longer needed since we don't destroy DOM nodes
         
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
+            let notification = null;
+
+            const restoreButton = () => {
+                button.disabled = false;
+                button.innerHTML = originalText;
+            };
             
             // Disable button and show loading
             button.disabled = true;
@@ -996,19 +1119,24 @@ class LogAnalyzer:
                 Running...
             `;
             
-            // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
+            try {
+                const baseline = typeof window.lldpqCapturePipelineState === 'function'
+                    ? await window.lldpqCapturePipelineState()
+                    : null;
+
+                const response = await fetch('/trigger-monitor', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+                const data = await response.json();
+                if (!response.ok || data.status !== 'success') {
+                    throw new Error(data.message || `HTTP ${response.status}`);
                 }
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    console.log('Monitor analysis triggered successfully');
-                    // Show notification
-                    const notification = document.createElement('div');
+
+                console.log('Monitor analysis triggered successfully');
+                notification = document.createElement('div');
                     notification.style.cssText = `
                         position: fixed;
                         top: 20px;
@@ -1023,31 +1151,39 @@ class LogAnalyzer:
                         max-width: 350px;
                         font-family: monospace;
                     `;
-                    notification.innerHTML = `
+                const completionHelperAvailable =
+                    typeof window.waitForLldpqAnalysisCompletion === 'function';
+                notification.innerHTML = `
                         <strong>Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small>Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small>${completionHelperAvailable
+                            ? 'Page will refresh when the latest results are ready.'
+                            : 'Page will automatically refresh in 35 seconds.'}</small>
                     `;
-                    document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
+                document.body.appendChild(notification);
+
+                if (!completionHelperAvailable) {
                     setTimeout(() => {
                         window.location.reload();
                     }, 35000);
-                } else {
-                    console.error('❌ Failed to trigger monitor analysis:', data.message);
-                    alert('Failed to trigger analysis. Please try again.');
-                    // Restore button
-                    button.disabled = false;
-                    button.innerHTML = originalText;
+                    return;
                 }
-            })
-            .catch(error => {
-                console.error('❌ Error triggering analysis:', error);
-                alert('Error triggering analysis. Please try again.');
-                // Restore button
-                button.disabled = false;
-                button.innerHTML = originalText;
-            });
+
+                await window.waitForLldpqAnalysisCompletion(baseline);
+                window.location.reload();
+            } catch (error) {
+                console.error('❌ Analysis did not complete:', error);
+                if (notification) notification.remove();
+                restoreButton();
+                alert(`Analysis did not complete: ${error.message || error}`);
+            }
+        }
+
+        function csvEscape(value) {
+            let text = String(value ?? '').replace(/\\r?\\n/g, ' ');
+            // Prevent spreadsheet formula execution for untrusted log text.
+            if (/^[=+\\-@\\t\\r]/.test(text)) text = "'" + text;
+            return '"' + text.replace(/"/g, '""') + '"';
         }
 
         // CSV Download Function
@@ -1069,7 +1205,7 @@ class LogAnalyzer:
                     'Total'
                 ];
                 
-                let csvContent = headers.join(',') + '\\n';
+                let csvContent = '';
                 
                 // Get table data (only visible rows)
                 const table = document.getElementById('log-table');
@@ -1085,12 +1221,19 @@ class LogAnalyzer:
                 csvContent += `# Error Messages: ${document.getElementById('error-logs').textContent}\\n`;
                 csvContent += `# Info Messages: ${document.getElementById('info-logs').textContent}\\n`;
                 csvContent += `#\\n`;
+                csvContent += headers.map(csvEscape).join(',') + '\\n';
+
+                const visibleDevices = [];
                 
                 // Process each visible row (skip log-details rows)
                 rows.forEach(row => {
                     if (row.style.display !== 'none' && !row.classList.contains('log-details')) {
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 6) {
+                            visibleDevices.push({
+                                key: row.dataset.deviceKey,
+                                label: cells[0].textContent.trim()
+                            });
                             const rowData = [
                                 cells[0].textContent.trim(), // Device
                                 cells[1].querySelector('.severity-count') ? cells[1].querySelector('.severity-count').textContent.trim() : '0', // Critical
@@ -1100,28 +1243,47 @@ class LogAnalyzer:
                                 cells[5].textContent.trim()  // Total
                             ];
                             
-                            // Escape commas and quotes in data
-                            const escapedData = rowData.map(field => {
-                                if (field.includes(',') || field.includes('"') || field.includes('\\n')) {
-                                    return '"' + field.replace(/"/g, '""') + '"';
-                                }
-                                return field;
-                            });
-                            
-                            csvContent += escapedData.join(',') + '\\n';
+                            csvContent += rowData.map(csvEscape).join(',') + '\\n';
                         }
                     }
+                });
+
+                // Preserve event-level provenance, including age demotion.
+                csvContent += '\\n' + [
+                    'Device',
+                    'Effective Severity',
+                    'Original Severity',
+                    'Timestamp',
+                    'Section',
+                    'Message'
+                ].map(csvEscape).join(',') + '\\n';
+                visibleDevices.forEach(device => {
+                    ['critical', 'error', 'warning', 'info'].forEach(severity => {
+                        const entries = logData[device.key]?.[severity] || [];
+                        entries.forEach(entry => {
+                            csvContent += [
+                                device.label,
+                                entry.severity || severity,
+                                entry.original_severity || entry.severity || severity,
+                                entry.timestamp || '',
+                                entry.section || '',
+                                entry.message || ''
+                            ].map(csvEscape).join(',') + '\\n';
+                        });
+                    });
                 });
                 
                 // Create and trigger download
                 const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
+                const objectUrl = URL.createObjectURL(blob);
+                link.href = objectUrl;
                 link.download = filename;
                 link.style.display = 'none';
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                URL.revokeObjectURL(objectUrl);
                 
                 console.log(`CSV downloaded: ${filename}`);
                 
@@ -1145,6 +1307,8 @@ class LogAnalyzer:
     
     def save_summary_data(self):
         """Save summary data for dashboard and AI integration"""
+        coverage = self.coverage_summary()
+        unsupported_sources = coverage.pop('unsupported_sources')
         recent_messages = {}
         for device, categories in self.log_analysis.items():
             msgs = []
@@ -1158,7 +1322,14 @@ class LogAnalyzer:
                 recent_messages[device] = msgs
         
         summary_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "collection_status": self.collection_status,
+            "coverage": coverage,
+            "source_status": {
+                device: dict(sorted(statuses.items()))
+                for device, statuses in sorted(self.source_status.items())
+            },
+            "unsupported_sources": unsupported_sources,
             "total_devices": len(self.log_counts),
             "totals": {
                 "critical": sum(device["critical"] for device in self.log_counts.values()),
@@ -1186,6 +1357,17 @@ class LogAnalyzer:
         
         # Process all log files
         asset_snapshot = read_asset_snapshot()
+        statuses, _asset_mtime, assets_available = asset_snapshot
+        snapshot_valid = asset_snapshot_is_valid(asset_snapshot)
+        if assets_available and not snapshot_valid:
+            print("❌ Asset snapshot is invalid or incomplete")
+            return False
+        inventory_hosts = set(statuses) if snapshot_valid else set()
+        expected_current_hosts = (
+            {host for host, status in statuses.items() if status == "OK"}
+            if snapshot_valid else set()
+        )
+        all_devices_unavailable = snapshot_valid and not expected_current_hosts
         log_files = [
             f for f in os.listdir(self.log_data_dir)
             if f.endswith('_logs.txt')
@@ -1196,10 +1378,25 @@ class LogAnalyzer:
             )
         ]
         
-        if not log_files:
+        collected_hosts = {
+            filename.removesuffix('_logs.txt') for filename in log_files
+        }
+        self.expected_devices = set(inventory_hosts or collected_hosts)
+        self.current_devices = set(collected_hosts)
+        missing_hosts = sorted(expected_current_hosts - collected_hosts)
+        if missing_hosts:
+            print(
+                "❌ Missing current log collections for: "
+                + ", ".join(missing_hosts)
+            )
+            return False
+        if not log_files and not all_devices_unavailable:
             print("⚠️  No log files found")
             return False
+        if all_devices_unavailable:
+            self.collection_status = "unavailable"
         
+        failed_devices = []
         for log_file in log_files:
             device_name = log_file.replace('_logs.txt', '')
             log_file_path = os.path.join(self.log_data_dir, log_file)
@@ -1209,13 +1406,25 @@ class LogAnalyzer:
                 self.log_counts[device_name] = {"critical": 0, "warning": 0, "error": 0, "info": 0}
                 self.log_analysis[device_name] = {"critical": [], "warning": [], "error": [], "info": []}
             
-            self.process_device_logs(device_name, log_file_path)
+            if not self.process_device_logs(device_name, log_file_path):
+                failed_devices.append(device_name)
+
+        if failed_devices:
+            print(
+                "❌ Failed to process current logs for: "
+                + ", ".join(sorted(failed_devices))
+            )
+            return False
         
         print(f"Processed {len(log_files)} devices")
         
         # Generate outputs
         self.generate_html_report()
         self.save_summary_data()
+        if all_devices_unavailable:
+            mark_html_collection_unavailable(
+                os.path.join(self.data_dir, "log-analysis.html")
+            )
         
         # Print summary
         total_logs = sum(sum(device.values()) for device in self.log_counts.values())

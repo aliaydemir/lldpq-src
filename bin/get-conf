@@ -2,27 +2,31 @@
 # LLDPq Network Monitoring - Main execution script
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
-# Load config with fallback
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
-fi
-LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
-
-# Verbose mode: get-conf - (shows output)
-if [[ "$1" == "-" ]]; then
-    QUIET=""
-else
-    QUIET=">/dev/null 2>&1"
-fi
-
-cd "$LLDPQ_DIR"
-wait_until_not_running() {
-    script_name="$1"
-    while pgrep -f "$script_name" >/dev/null; do
-        sleep 10
-    done
+# A scheduled collector must use the configured installation.  Falling back to
+# $HOME/lldpq after a partial upgrade silently runs the wrong tree on custom
+# installs, so treat the fixed helper and LLDPQ_DIR as required runtime state.
+get_conf_fatal() {
+    printf 'get-conf: ERROR: %s\n' "$*" >&2
+    exit 1
 }
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+[[ -x "$LLDPQ_CONFIG_HELPER" ]] || \
+    get_conf_fatal "required config helper is missing: $LLDPQ_CONFIG_HELPER"
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+    --require-key LLDPQ_DIR 2>/dev/null); then
+    get_conf_fatal "required runtime configuration is missing or unreadable"
+fi
+eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
+    get_conf_fatal "runtime configuration could not be applied"
+unset LLDPQ_CONFIG_ASSIGNMENTS
+[[ -n "${LLDPQ_DIR:-}" ]] || get_conf_fatal "LLDPQ_DIR is empty"
 
-wait_until_not_running "get-configs.sh"
-eval "./get-configs.sh $QUIET"
-exit 0
+# get-configs.sh owns the process-wide flock. Calling it directly removes the
+# check-then-run race between cron, the web trigger and manual invocations, and
+# propagates partial/failure status to the scheduler.
+cd "$LLDPQ_DIR" || exit 1
+if [[ "${1:-}" == "-" ]]; then
+    exec ./get-configs.sh
+else
+    exec ./get-configs.sh >/dev/null 2>&1
+fi

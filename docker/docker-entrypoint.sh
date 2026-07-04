@@ -5,6 +5,8 @@
 
 set -e
 
+BACKUP_IMPORT_HELPER=/usr/local/libexec/lldpq-backup-import.py
+
 echo "╔══════════════════════════════════════╗"
 echo "║      LLDPq Network Monitoring        ║"
 echo "║      Docker Container v$(cat /var/www/html/VERSION 2>/dev/null || echo '?')        ║"
@@ -22,14 +24,25 @@ fi
 
 # ─── SSH Key Setup ───
 # Support mounting host SSH keys as read-only volume
+mkdir -p /home/lldpq/.ssh
 if [ -d /home/lldpq/.ssh-mount ]; then
     # Copy mounted keys (read-only mount → writable .ssh)
     cp -n /home/lldpq/.ssh-mount/id_* /home/lldpq/.ssh/ 2>/dev/null || true
     cp -n /home/lldpq/.ssh-mount/known_hosts /home/lldpq/.ssh/ 2>/dev/null || true
-    chown -R lldpq:lldpq /home/lldpq/.ssh/
-    chmod 700 /home/lldpq/.ssh
-    chmod 600 /home/lldpq/.ssh/id_* 2>/dev/null || true
 fi
+# Named-volume imports performed through `docker cp` commonly arrive owned by
+# root. Normalize every startup, not only the legacy read-only mount path.
+chown -R lldpq:lldpq /home/lldpq/.ssh/
+chmod 700 /home/lldpq/.ssh
+chmod 600 /home/lldpq/.ssh/id_* 2>/dev/null || true
+chmod 644 /home/lldpq/.ssh/known_hosts 2>/dev/null || true
+
+# The default named volume and `docker cp` imports can both arrive root-owned.
+# The web workflows need group access to inventory/playbooks while Ansible runs
+# as the lldpq service user.
+mkdir -p /home/lldpq/ansible
+chown -R lldpq:www-data /home/lldpq/ansible
+chmod 775 /home/lldpq/ansible
 
 if [ -f /home/lldpq/.ssh/id_rsa ] || [ -f /home/lldpq/.ssh/id_ed25519 ]; then
     echo "✓ SSH keys found"
@@ -38,16 +51,159 @@ else
     echo "  docker run ... -v ~/.ssh:/home/lldpq/.ssh-mount:ro ..."
 fi
 
+# ─── Persistent system configuration ───
+# Keep mutable /etc configuration in one data directory. docker-compose mounts
+# this directory as a named volume; legacy direct file bind mounts are detected
+# and left untouched. A plain `docker run` remains backward compatible, with
+# persistence for the lifetime of that container's writable layer.
+if ! command -v mountpoint >/dev/null 2>&1; then
+    echo "ERROR: mountpoint (util-linux) is required for safe volume migration; rebuild the image" >&2
+    exit 1
+fi
+SYSTEM_CONFIG_DIR="${LLDPQ_SYSTEM_CONFIG_DIR:-/home/lldpq/lldpq/system-config}"
+mkdir -p "$SYSTEM_CONFIG_DIR" /etc/dhcp /etc/default
+chown lldpq:www-data "$SYSTEM_CONFIG_DIR" 2>/dev/null || true
+chmod 750 "$SYSTEM_CONFIG_DIR" 2>/dev/null || true
+
+_is_direct_mount() {
+    command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$1" 2>/dev/null
+}
+
+_persist_system_file() {
+    local name="$1" app_path="$2" owner="$3" mode="$4"
+    local persistent="$SYSTEM_CONFIG_DIR/$name" resolved=""
+
+    if _is_direct_mount "$app_path"; then
+        echo "  ✓ Legacy direct mount retained: $app_path"
+        return 0
+    fi
+    if [ ! -e "$persistent" ]; then
+        if [ -e "$app_path" ] || [ -L "$app_path" ]; then
+            resolved=$(readlink -f "$app_path" 2>/dev/null || true)
+            if [ -n "$resolved" ] && [ -e "$resolved" ]; then
+                cp -a "$resolved" "$persistent"
+            else
+                touch "$persistent"
+            fi
+        else
+            touch "$persistent"
+        fi
+    fi
+    rm -f "$app_path"
+    ln -s "$persistent" "$app_path"
+    chown "$owner" "$persistent" 2>/dev/null || true
+    chmod "$mode" "$persistent" 2>/dev/null || true
+}
+
+_persist_system_file lldpq.conf /etc/lldpq.conf root:www-data 664
+_persist_system_file dhcpd.conf /etc/dhcp/dhcpd.conf lldpq:www-data 664
+_persist_system_file dhcpd.hosts /etc/dhcp/dhcpd.hosts lldpq:www-data 664
+_persist_system_file isc-dhcp-server /etc/default/isc-dhcp-server root:root 644
+
+# A killed Setup restore may have left /etc/lldpq.conf only partly activated.
+# Recover from the persistent, hashed authority before asking lldpq-config to
+# parse that file. Arguments are fixed image paths; no config data is trusted.
+if [ -L "$BACKUP_IMPORT_HELPER" ] || [ ! -f "$BACKUP_IMPORT_HELPER" ] || \
+   [ "$(stat -c '%u:%g:%a' -- "$BACKUP_IMPORT_HELPER" 2>/dev/null || true)" != "0:0:755" ]; then
+    echo "ERROR: root-owned backup/import helper is missing or unsafe; rebuild the image" >&2
+    exit 1
+fi
+if ! python3 "$BACKUP_IMPORT_HELPER" recover \
+    --lldpq-dir /home/lldpq/lldpq \
+    --user lldpq \
+    --web-root /var/www/html; then
+    echo "ERROR: retained LLDPq backup import could not be recovered; startup stopped" >&2
+    exit 1
+fi
+
+if [ ! -x /usr/local/bin/lldpq-config ]; then
+    echo "ERROR: required /usr/local/bin/lldpq-config helper is missing; rebuild the image" >&2
+    exit 1
+fi
+if ! /usr/local/bin/lldpq-config --require-config \
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
+    >/dev/null 2>&1; then
+    echo "ERROR: persistent /etc/lldpq.conf is missing or lacks core runtime settings" >&2
+    exit 1
+fi
+LLDPQ_CONF_REAL=$(readlink -f /etc/lldpq.conf 2>/dev/null || echo /etc/lldpq.conf)
+
+_set_lldpq_conf_value() {
+    local key="$1" value="$2" direct_mount=false
+    if _is_direct_mount /etc/lldpq.conf; then
+        direct_mount=true
+    fi
+    # A bind-mounted file cannot be replaced with rename(2) (EBUSY). Update
+    # that inode in place; for the persistent-volume target use a same-folder
+    # fsync + atomic replace while retaining its owner and mode.
+    python3 - "$LLDPQ_CONF_REAL" "$key" "$value" "$direct_mount" <<'PYTHON'
+import os
+import pathlib
+import tempfile
+import sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+direct_mount = sys.argv[4] == "true"
+if any(character in value for character in ("\x00", "\n", "\r")):
+    raise SystemExit(f"invalid control character in {key}")
+
+original = path.read_text(encoding="utf-8")
+lines = original.splitlines(keepends=True)
+replacement = f"{key}={value}\n"
+output = []
+replaced = False
+for line in lines:
+    if line.startswith(f"{key}="):
+        if not replaced:
+            output.append(replacement)
+            replaced = True
+        continue
+    output.append(line)
+if not replaced:
+    if output and not output[-1].endswith("\n"):
+        output[-1] += "\n"
+    output.append(replacement)
+content = "".join(output)
+
+metadata = path.stat()
+if direct_mount:
+    with path.open("r+", encoding="utf-8") as handle:
+        handle.seek(0)
+        handle.write(content)
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+else:
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, metadata.st_mode & 0o7777)
+        os.chown(temporary, metadata.st_uid, metadata.st_gid)
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+PYTHON
+}
+
 # ─── Ansible Directory Setup ───
 if [ -n "$ANSIBLE_DIR" ] && [ "$ANSIBLE_DIR" != "NoNe" ] && [ -d "$ANSIBLE_DIR" ]; then
-    sed -i "s|^ANSIBLE_DIR=.*|ANSIBLE_DIR=$ANSIBLE_DIR|" /etc/lldpq.conf
+    _set_lldpq_conf_value ANSIBLE_DIR "$ANSIBLE_DIR"
     chown -R lldpq:www-data "$ANSIBLE_DIR" 2>/dev/null || true
     echo "  ✓ Ansible directory: $ANSIBLE_DIR"
 fi
 
 # ─── Editor Root Setup ───
 if [ -n "$EDITOR_ROOT" ] && [ -d "$EDITOR_ROOT" ]; then
-    sed -i "s|^EDITOR_ROOT=.*|EDITOR_ROOT=$EDITOR_ROOT|" /etc/lldpq.conf
+    _set_lldpq_conf_value EDITOR_ROOT "$EDITOR_ROOT"
 fi
 echo "  ✓ Fabric Editor: $(grep '^EDITOR_ROOT=' /etc/lldpq.conf | cut -d= -f2)"
 
@@ -68,6 +224,13 @@ CONFIG_DIR=/home/lldpq/lldpq/config
 mkdir -p "$CONFIG_DIR"
 chown lldpq:www-data "$CONFIG_DIR" 2>/dev/null || true
 chmod 775 "$CONFIG_DIR" 2>/dev/null || true
+if [ ! -f /var/www/html/serial-mapping.txt ]; then
+    printf '# Serial → Hostname mapping for ZTP config resolution\n# Format: SERIAL_NUMBER  HOSTNAME\n\n' \
+        > /var/www/html/serial-mapping.txt
+fi
+if [ ! -f /var/www/html/display-aliases.json ]; then
+    printf '{"interfaces":{},"devices":{}}\n' > /var/www/html/display-aliases.json
+fi
 
 if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$CONFIG_DIR" 2>/dev/null; then
     _setup_config_file() {
@@ -89,10 +252,14 @@ if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$CONFIG_DIR" 2>/dev/n
     _setup_config_file topology.dot         /var/www/html/topology.dot          lldpq:www-data    664
     _setup_config_file topology_config.yaml /var/www/html/topology_config.yaml  lldpq:www-data    664
     _setup_config_file lldpq-users.conf     /etc/lldpq-users.conf               www-data:www-data 600
+    _setup_config_file notifications.yaml   /home/lldpq/lldpq/notifications.yaml lldpq:www-data   664
+    _setup_config_file cumulus-ztp.sh       /var/www/html/cumulus-ztp.sh        lldpq:www-data    775
+    _setup_config_file serial-mapping.txt   /var/www/html/serial-mapping.txt    lldpq:www-data    664
+    _setup_config_file display-aliases.json /var/www/html/display-aliases.json  lldpq:www-data    664
     # Scripts read topology files from the lldpq dir → keep those symlinks valid
     ln -sf /var/www/html/topology.dot /home/lldpq/lldpq/topology.dot 2>/dev/null || true
     ln -sf /var/www/html/topology_config.yaml /home/lldpq/lldpq/topology_config.yaml 2>/dev/null || true
-    echo "✓ Config directory active: $CONFIG_DIR (devices.yaml, topology.dot, topology_config.yaml, lldpq-users.conf)"
+    echo "✓ Persistent application configuration directory active: $CONFIG_DIR"
 fi
 
 # ─── devices.yaml Setup ───
@@ -126,8 +293,86 @@ done
 echo "✓ Topology files ready"
 
 # ─── Persistent data directories ───
-for dir in /home/lldpq/lldpq/monitor-results \
+MONITOR_SOURCE_DIR=/home/lldpq/lldpq/monitor-results
+MONITOR_WEB_DIR=/var/www/html/monitor-results
+MONITOR_WEB_PARENT=$(dirname "$MONITOR_WEB_DIR")
+MONITOR_SEED_BACKUP="$MONITOR_WEB_PARENT/.monitor-results.seed-backup"
+
+_remove_monitor_seed_path() {
+    local path="$1"
+    if [ -L "$path" ] || [ -f "$path" ]; then
+        rm -f -- "$path"
+    elif [ -d "$path" ]; then
+        rm -rf -- "$path"
+    fi
+}
+
+_seed_monitor_web_tree() {
+    local source="$1" target="$2" stage
+    stage=$(mktemp -d "$MONITOR_WEB_PARENT/.monitor-results.seed.XXXXXXXX") || return 1
+    if ! cp -a "$source"/. "$stage"/; then
+        _remove_monitor_seed_path "$stage"
+        return 1
+    fi
+    rm -f "$stage/.gitkeep" 2>/dev/null || true
+
+    _remove_monitor_seed_path "$MONITOR_SEED_BACKUP"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if ! mv "$target" "$MONITOR_SEED_BACKUP"; then
+            _remove_monitor_seed_path "$stage"
+            return 1
+        fi
+    fi
+    if mv "$stage" "$target"; then
+        _remove_monitor_seed_path "$MONITOR_SEED_BACKUP"
+        return 0
+    fi
+
+    _remove_monitor_seed_path "$stage"
+    if [ -e "$MONITOR_SEED_BACKUP" ] || [ -L "$MONITOR_SEED_BACKUP" ]; then
+        mv "$MONITOR_SEED_BACKUP" "$target" 2>/dev/null || true
+    fi
+    return 1
+}
+
+# Recover a seed activation interrupted between the old-tree rename and the
+# new-tree activation. Both locations are on the same filesystem.
+if { [ -e "$MONITOR_SEED_BACKUP" ] || [ -L "$MONITOR_SEED_BACKUP" ]; } && \
+   [ ! -e "$MONITOR_WEB_DIR" ] && [ ! -L "$MONITOR_WEB_DIR" ]; then
+    mv "$MONITOR_SEED_BACKUP" "$MONITOR_WEB_DIR"
+elif [ -e "$MONITOR_SEED_BACKUP" ] || [ -L "$MONITOR_SEED_BACKUP" ]; then
+    _remove_monitor_seed_path "$MONITOR_SEED_BACKUP"
+fi
+
+# Older images exposed the source tree through a direct symlink. Remove only
+# that link through the staged activation below. monitor.sh now publishes
+# source -> web as separate trees.
+if [ -L "$MONITOR_WEB_DIR" ]; then
+    _old_monitor_source=$(readlink -f "$MONITOR_WEB_DIR" 2>/dev/null || true)
+    if [ -n "$_old_monitor_source" ] && [ -d "$_old_monitor_source" ]; then
+        if ! _seed_monitor_web_tree "$_old_monitor_source" "$MONITOR_WEB_DIR"; then
+            echo "ERROR: legacy monitor report tree could not be migrated; source data was retained" >&2
+            exit 1
+        fi
+    else
+        echo "ERROR: legacy monitor report link has no readable source; refusing partial migration" >&2
+        exit 1
+    fi
+fi
+mkdir -p "$MONITOR_SOURCE_DIR" "$MONITOR_WEB_DIR"
+if [ ! -f "$MONITOR_WEB_DIR/.lldpq-current.json" ] && \
+   find "$MONITOR_SOURCE_DIR" -mindepth 1 -maxdepth 1 ! -name .gitkeep \
+       -print -quit 2>/dev/null | grep -q .; then
+    if ! _seed_monitor_web_tree "$MONITOR_SOURCE_DIR" "$MONITOR_WEB_DIR"; then
+        echo "ERROR: last-known-good monitor reports could not be seeded into the web tree" >&2
+        exit 1
+    fi
+fi
+
+for dir in "$MONITOR_SOURCE_DIR" \
            /home/lldpq/lldpq/monitor-results/fabric-tables \
+           /home/lldpq/lldpq/lldp-results \
+           /home/lldpq/lldpq/alert-states \
            /var/www/html/hstr \
            /var/www/html/configs \
            /var/www/html/monitor-results \
@@ -137,8 +382,81 @@ for dir in /home/lldpq/lldpq/monitor-results \
     chmod 775 "$dir"
 done
 
-# Symlink monitor-results to web root
-ln -sf /home/lldpq/lldpq/monitor-results /var/www/html/monitor-results 2>/dev/null || true
+# ─── Persistent provisioning artifacts ───
+GENERATED_CONFIGS_DIR=/var/www/html/generated_config_folder
+PROVISION_UPLOAD_DIR=/var/www/html/provision-uploads
+mkdir -p "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR"
+chown -R lldpq:www-data "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR"
+find "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR" -type d -exec chmod 775 {} \;
+find "$GENERATED_CONFIGS_DIR" -type f -exec chmod 664 {} \;
+find "$PROVISION_UPLOAD_DIR" -type f -exec chmod 664 {} \;
+
+_publish_provision_link() {
+    local name="$1" root_path="/var/www/html/$1"
+    if [ -e "$root_path" ] || [ -L "$root_path" ]; then
+        rm -f -- "$root_path"
+    fi
+    ln -s "provision-uploads/$name" "$root_path"
+}
+
+_migrate_legacy_provision_file() {
+    local legacy="$1" name destination stage
+    name=$(basename "$legacy")
+    destination="$PROVISION_UPLOAD_DIR/$name"
+    [ -f "$legacy" ] && [ ! -L "$legacy" ] || return 0
+
+    if [ ! -e "$destination" ] && [ ! -L "$destination" ]; then
+        stage=$(mktemp "$PROVISION_UPLOAD_DIR/.${name}.migrate.XXXXXXXX") || return 1
+        if ! cp -p "$legacy" "$stage" || ! cmp -s "$legacy" "$stage"; then
+            rm -f "$stage"
+            echo "ERROR: legacy provisioning file could not be copied safely: $legacy" >&2
+            return 1
+        fi
+        mv "$stage" "$destination"
+    elif ! cmp -s "$legacy" "$destination"; then
+        echo "ERROR: conflicting persistent provisioning file: $name" >&2
+        return 1
+    fi
+    rm -f "$legacy"
+    _publish_provision_link "$name"
+}
+
+# Move OS images left in the legacy writable container layer into the named
+# volume without deleting the source until a byte-for-byte copy is present.
+for legacy_image in /var/www/html/*.bin /var/www/html/*.img /var/www/html/*.iso; do
+    [ -e "$legacy_image" ] || continue
+    _migrate_legacy_provision_file "$legacy_image"
+done
+
+# Preserve the active generic ONIE waterfall aliases in the same volume. Old
+# aliases pointed directly at the image name; root links now point at the
+# persistent alias, which in turn remains relative to its image in the volume.
+for onie_alias in onie-installer-x86_64 onie-installer-x86_64-mlnx onie-installer; do
+    root_alias="/var/www/html/$onie_alias"
+    persistent_alias="$PROVISION_UPLOAD_DIR/$onie_alias"
+    if [ -L "$root_alias" ]; then
+        alias_target=$(basename "$(readlink "$root_alias")")
+        if [ "$alias_target" != "$onie_alias" ] && \
+           [ -e "$PROVISION_UPLOAD_DIR/$alias_target" ]; then
+            ln -sfn "$alias_target" "$persistent_alias"
+        fi
+        rm -f "$root_alias"
+    elif [ -f "$root_alias" ]; then
+        _migrate_legacy_provision_file "$root_alias"
+    fi
+    if [ -e "$persistent_alias" ] || [ -L "$persistent_alias" ]; then
+        _publish_provision_link "$onie_alias"
+    fi
+done
+
+# Re-publish every persisted image at the historical web-root URL expected by
+# ONIE and cumulus-ztp.sh.
+for stored_image in "$PROVISION_UPLOAD_DIR"/*.bin \
+                    "$PROVISION_UPLOAD_DIR"/*.img \
+                    "$PROVISION_UPLOAD_DIR"/*.iso; do
+    [ -e "$stored_image" ] || continue
+    _publish_provision_link "$(basename "$stored_image")"
+done
 
 # ─── Cache files (assets.sh, fabric-scan.sh, provision, AI need these writable by lldpq) ───
 for f in /var/www/html/device-cache.json /var/www/html/fabric-scan-cache.json /var/www/html/discovery-cache.json /var/www/html/inventory.json /var/www/html/ai-analysis.json; do
@@ -179,12 +497,23 @@ echo "✓ Authentication ready"
 # ─── Cron Setup ───
 # lldpq = assets.sh + check-lldp.sh + monitor.sh + fabric-scan.sh + alerts
 # lldpq-trigger = web UI refresh buttons (Refresh Assets, Refresh LLDP, etc.)
-# Honor allowlisted schedules from lldpq.conf when the fixed helper is present.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Honor allowlisted schedules from persistent lldpq.conf.
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$(/usr/local/bin/lldpq-config --require-config \
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT); then
+    echo "ERROR: unable to load /etc/lldpq.conf through lldpq-config" >&2
+    exit 1
 fi
+eval "$LLDPQ_CONFIG_ASSIGNMENTS"
 LLDPQ_CRON="${LLDPQ_CRON:-*/10 * * * *}"
 GETCONF_CRON="${GETCONF_CRON:-0 */12 * * *}"
+if ! /usr/local/bin/lldpq-config --validate-cron "$LLDPQ_CRON"; then
+    echo "ERROR: invalid LLDPQ_CRON schedule: $LLDPQ_CRON" >&2
+    exit 1
+fi
+if ! /usr/local/bin/lldpq-config --validate-cron "$GETCONF_CRON"; then
+    echo "ERROR: invalid GETCONF_CRON schedule: $GETCONF_CRON" >&2
+    exit 1
+fi
 cat > /etc/cron.d/lldpq << CRON
 # LLDPq full run (assets + lldp + monitor + alerts)
 $LLDPQ_CRON lldpq /usr/local/bin/lldpq > /dev/null 2>&1
@@ -201,6 +530,9 @@ chmod 644 /etc/cron.d/lldpq
 # Ensure DHCP directories and files exist
 mkdir -p /var/lib/dhcp /etc/dhcp
 touch /var/lib/dhcp/dhcpd.leases
+chown root:www-data /var/lib/dhcp /var/lib/dhcp/dhcpd.leases
+chmod 775 /var/lib/dhcp
+chmod 664 /var/lib/dhcp/dhcpd.leases
 [ ! -f /etc/dhcp/dhcpd.hosts ] && touch /etc/dhcp/dhcpd.hosts
 chown lldpq:www-data /etc/dhcp/dhcpd.hosts
 chmod 664 /etc/dhcp/dhcpd.hosts
@@ -211,16 +543,23 @@ for key_val in "AUTO_BASE_CONFIG=true" "AUTO_ZTP_DISABLE=true" "AUTO_SET_HOSTNAM
     grep -q "^${key}=" /etc/lldpq.conf 2>/dev/null || echo "$key_val" >> /etc/lldpq.conf
 done
 
-# Default dhcpd.conf if not configured yet (Ubuntu sample is useless)
-if ! grep -q 'cumulus-provision-url\|LLDPq' /etc/dhcp/dhcpd.conf 2>/dev/null; then
-    # Detect our IP for default config
-    OUR_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    OUR_IP="${OUR_IP:-127.0.0.1}"
-    # Detect subnet from our IP (replace last octet with 0)
-    OUR_SUBNET=$(echo "$OUR_IP" | sed 's/\.[0-9]*$/.0/')
-    OUR_GW=$(echo "$OUR_IP" | sed 's/\.[0-9]*$/.1/')
-    
-    cat > /etc/dhcp/dhcpd.conf << DHCPEOF
+_docker_dhcp_is_managed() {
+    grep -Fqx '# /etc/dhcp/dhcpd.conf - Generated by LLDPq' /etc/dhcp/dhcpd.conf 2>/dev/null
+}
+
+_docker_dhcp_is_packaged_sample() {
+    [ ! -s /etc/dhcp/dhcpd.conf ] && return 0
+    grep -Eq '^[[:space:]]*option[[:space:]]+domain-name[[:space:]]+"example\.org";' \
+        /etc/dhcp/dhcpd.conf || return 1
+    ! grep -Eq '^[[:space:]]*(subnet|shared-network|host|include)[[:space:]]' \
+        /etc/dhcp/dhcpd.conf
+}
+
+_render_docker_dhcp_config() {
+    local output="$1" server_ip="$2" subnet gateway
+    subnet=$(echo "$server_ip" | sed 's/\.[0-9]*$/.0/')
+    gateway=$(echo "$server_ip" | sed 's/\.[0-9]*$/.1/')
+    cat > "$output" << DHCPEOF
 # /etc/dhcp/dhcpd.conf - Generated by LLDPq
 
 ddns-update-style none;
@@ -249,14 +588,14 @@ class "onie-vendor-classes" {
 
 # OOB Management subnet
 shared-network OOB {
-  subnet ${OUR_SUBNET} netmask 255.255.255.0 {
-    range ${OUR_SUBNET%.*}.210 ${OUR_SUBNET%.*}.249;
-    option routers ${OUR_GW};
+  subnet ${subnet} netmask 255.255.255.0 {
+    range ${subnet%.*}.210 ${subnet%.*}.249;
+    option routers ${gateway};
     option domain-name "example.com";
-    option domain-name-servers ${OUR_GW};
-    option www-server ${OUR_IP};
-    option default-url "http://${OUR_IP}/";
-    option cumulus-provision-url "http://${OUR_IP}/cumulus-ztp.sh";
+    option domain-name-servers ${gateway};
+    option www-server ${server_ip};
+    option default-url "http://${server_ip}/";
+    option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
     default-lease-time 172800;
     max-lease-time     345600;
   }
@@ -264,9 +603,66 @@ shared-network OOB {
 
 include "/etc/dhcp/dhcpd.hosts";
 DHCPEOF
-    chown lldpq:www-data /etc/dhcp/dhcpd.conf
+}
+
+_install_docker_dhcp_config() {
+    local server_ip="$1" backup_existing="${2:-false}"
+    local temp_file target_file staged_file backup_file
+    temp_file=$(mktemp /tmp/lldpq-dhcp.XXXXXXXX)
+    _render_docker_dhcp_config "$temp_file" "$server_ip"
+    if ! dhcpd -t -cf "$temp_file" >/dev/null 2>&1; then
+        echo "ERROR: generated Docker DHCP configuration failed dhcpd -t" >&2
+        rm -f "$temp_file"
+        return 1
+    fi
+
+    target_file=$(readlink -f /etc/dhcp/dhcpd.conf 2>/dev/null || echo /etc/dhcp/dhcpd.conf)
+    if [ "$backup_existing" = "true" ] && [ -s /etc/dhcp/dhcpd.conf ]; then
+        if _is_direct_mount /etc/dhcp/dhcpd.conf; then
+            backup_file="$SYSTEM_CONFIG_DIR/dhcpd.conf.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
+        else
+            backup_file="$(dirname "$target_file")/dhcpd.conf.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
+        fi
+        cp -p /etc/dhcp/dhcpd.conf "$backup_file" || {
+            echo "ERROR: existing Docker DHCP config could not be backed up" >&2
+            rm -f "$temp_file"
+            return 1
+        }
+        echo "  Existing DHCP config backed up to: $backup_file"
+    fi
+
+    if _is_direct_mount /etc/dhcp/dhcpd.conf; then
+        cp "$temp_file" /etc/dhcp/dhcpd.conf || { rm -f "$temp_file"; return 1; }
+    else
+        mkdir -p "$(dirname "$target_file")"
+        staged_file=$(mktemp "$(dirname "$target_file")/.dhcpd.conf.new.XXXXXXXX")
+        cp "$temp_file" "$staged_file"
+        chown lldpq:www-data "$staged_file"
+        chmod 664 "$staged_file"
+        mv -f "$staged_file" "$target_file"
+    fi
+    chown lldpq:www-data /etc/dhcp/dhcpd.conf 2>/dev/null || true
     chmod 664 /etc/dhcp/dhcpd.conf
-    echo "✓ Default DHCP config created (subnet: ${OUR_SUBNET}/24, server: ${OUR_IP})"
+    rm -f "$temp_file"
+}
+
+OUR_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print; exit}')
+OUR_IP="${OUR_IP:-127.0.0.1}"
+if _docker_dhcp_is_managed; then
+    if ! dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+        echo "⚠ Existing LLDPq-managed DHCP config is invalid; DHCP will stay disabled until it is repaired" >&2
+        DHCP_AUTOSTART=false
+    else
+        echo "✓ Existing LLDPq DHCP config validated"
+    fi
+elif _docker_dhcp_is_packaged_sample; then
+    _install_docker_dhcp_config "$OUR_IP" false
+    echo "✓ Default DHCP config validated and created (server: ${OUR_IP})"
+elif [ "${LLDPQ_REPLACE_DHCP_CONFIG:-false}" = "true" ]; then
+    _install_docker_dhcp_config "$OUR_IP" true
+    echo "✓ Foreign DHCP config explicitly replaced after validation + backup"
+else
+    echo "⚠ Existing non-LLDPq DHCP config preserved. Set LLDPQ_REPLACE_DHCP_CONFIG=true to replace it explicitly."
 fi
 
 # Write interface config if missing
@@ -297,6 +693,12 @@ fi
 
 # DHCP server: only start if explicitly enabled via DHCP_AUTOSTART=true
 # By default DHCP is OFF — admin enables from Provision → DHCP Server → Start
+if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
+    if ! dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+        echo "  DHCP: not started because dhcpd.conf failed validation" >&2
+        DHCP_AUTOSTART=false
+    fi
+fi
 if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
     DHCP_IFACE="eth0"
     if [ -f /etc/default/isc-dhcp-server ]; then

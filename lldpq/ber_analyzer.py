@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BER (Bit Error Rate) Analysis Module for LLDPq
+Link Error Analysis Module for LLDPq
 
 Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
@@ -14,6 +14,11 @@ import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from enum import Enum
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 try:
     from device_names import canonical
@@ -32,11 +37,25 @@ class BERGrade(Enum):
 class BERAnalyzer:
     """Professional BER Analysis System"""
     
-    # Industry-standard BER thresholds
+    # Interface error-event density, raw (pre-FEC) BER, and effective
+    # (post-FEC) BER are different metrics and intentionally have separate
+    # contracts. NVIDIA's cable-validation guidance accepts raw BER through
+    # 1e-6; applying the post-FEC service threshold to raw BER makes healthy
+    # high-speed FEC links appear critical. The configured network BER limit
+    # therefore applies only to effective BER.
     DEFAULT_CONFIG = {
-        "raw_ber_threshold": 1.0E-6,      # 1 error per million bits
-        "warning_ber_threshold": 1.0E-5,   # 1 error per 100k bits  
-        "critical_ber_threshold": 1.0E-4,  # 1 error per 10k bits
+        "frame_density_warning_threshold": 1.0E-6,
+        "frame_density_critical_threshold": 1.0E-5,
+        "raw_phy_ber_warning_threshold": 1.0E-6,
+        "raw_phy_ber_critical_threshold": 1.0E-5,
+        "effective_phy_ber_warning_threshold": 1.0E-12,
+        "effective_phy_ber_critical_threshold": 1.0E-11,
+        # Compatibility aliases used by the processing summary and older
+        # callers; these always mirror the effective/post-FEC limits.
+        "phy_ber_warning_threshold": 1.0E-12,
+        "phy_ber_critical_threshold": 1.0E-11,
+        "symbol_error_warning_delta": 1,
+        "symbol_error_critical_delta": 1000,
         "min_packets_for_analysis": 1000,  # Minimum packets for reliable BER
         "history_retention_hours": 24,     # Keep 24 hours of history
         "trend_analysis_points": 10        # Minimum points for trend analysis
@@ -49,7 +68,9 @@ class BERAnalyzer:
         self.config = self.DEFAULT_CONFIG.copy()
         self._raw_phy_ber_cache = {}  # hostname -> { interface: raw_ber_float }
         self._l1_extras_cache = {}  # hostname -> { interface: {effective_ber, symbol_errors} }
+        self._last_delta_details = {}  # port -> directional deltas/sample window
         self.baseline_data = {}  # hostname -> { interface: {counters, timestamp} }
+        self._load_network_thresholds()
         
         # Ensure ber-data directory exists
         os.makedirs(f"{self.data_dir}/ber-data", exist_ok=True)
@@ -57,6 +78,37 @@ class BERAnalyzer:
         # Load historical data and baseline
         self.load_ber_history()
         self.load_baseline_data()
+
+    def _load_network_thresholds(self) -> None:
+        """Load the configured PHY BER boundary without affecting frame density."""
+        if yaml is None:
+            return
+        candidates = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'notifications.yaml'),
+            os.path.join(os.path.dirname(os.path.abspath(self.data_dir)),
+                         'notifications.yaml'),
+        ]
+        for path in dict.fromkeys(candidates):
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, 'r') as stream:
+                    config = yaml.safe_load(stream) or {}
+                value = config.get('thresholds', {}).get('network', {}).get(
+                    'ber_error_rate'
+                )
+                if value is None:
+                    return
+                threshold = float(value)
+                if math.isfinite(threshold) and threshold > 0:
+                    self.config['effective_phy_ber_warning_threshold'] = threshold
+                    self.config['effective_phy_ber_critical_threshold'] = threshold * 10.0
+                    self.config['phy_ber_warning_threshold'] = threshold
+                    self.config['phy_ber_critical_threshold'] = threshold * 10.0
+                return
+            except (OSError, TypeError, ValueError, yaml.YAMLError):
+                return
     
     def load_ber_history(self):
         """Load historical BER data from file"""
@@ -121,7 +173,9 @@ class BERAnalyzer:
                             result[current_if] = raw_ber
                     except Exception:
                         pass
-                elif current_received_bits and current_corrected_bits and current_received_bits > 0 and current_corrected_bits >= 0:
+                elif (current_received_bits is not None and
+                      current_corrected_bits is not None and
+                      current_received_bits > 0 and current_corrected_bits >= 0):
                     try:
                         raw_ber = float(current_corrected_bits) / float(current_received_bits)
                         result[current_if] = raw_ber
@@ -253,6 +307,21 @@ class BERAnalyzer:
 
         self._l1_extras_cache[hostname] = result
         return result
+
+    @staticmethod
+    def _physical_port_name(interface: str) -> str:
+        """Return the cage-level name for a Cumulus breakout interface."""
+        match = re.fullmatch(r'(swp\d+)s\d+', interface or '')
+        return match.group(1) if match else interface
+
+    def _lookup_l1_metric(self, mapping: Dict[str, Any], interface: str):
+        """Resolve exact L1 data first, then its cage-level breakout record."""
+        if interface in mapping:
+            return mapping[interface]
+        physical = self._physical_port_name(interface)
+        if physical in mapping:
+            return mapping[physical]
+        return None
     
     def save_ber_history(self):
         """Save BER history to file"""
@@ -304,12 +373,37 @@ class BERAnalyzer:
         return False
     
     def calculate_delta_ber(self, hostname: str, interface: str, current_stats: Dict[str, int]) -> tuple:
-        """Calculate delta-based BER using only new errors since last measurement.
+        """Calculate delta-based interface error-event density.
+
+        `/proc/net/dev` exposes errored packet/frame events, not erroneous bit
+        counts.  The returned value is therefore the worse of RX and TX error
+        events divided by the corresponding observed bit volume; it must not
+        be interpreted as a physical BER.
         
-        Returns: (ber_value, is_baseline_run, delta_errors, delta_bytes)
+        Returns: (ber_value, is_baseline_run, delta_errors, delta_bytes,
+        delta_packets). Samples below min_packets_for_analysis remain
+        accumulated against the prior baseline instead of being discarded.
         """
         port_key = f"{hostname}:{interface}"
         current_time = time.time()
+
+        if not hasattr(self, '_last_delta_details'):
+            self._last_delta_details = {}
+
+        def remember(delta_rx_errors=0, delta_tx_errors=0,
+                     delta_rx_bytes=0, delta_tx_bytes=0,
+                     delta_rx_packets=0, delta_tx_packets=0,
+                     sample_seconds=0.0, reset=False):
+            self._last_delta_details[port_key] = {
+                'delta_rx_errors': delta_rx_errors,
+                'delta_tx_errors': delta_tx_errors,
+                'delta_rx_bytes': delta_rx_bytes,
+                'delta_tx_bytes': delta_tx_bytes,
+                'delta_rx_packets': delta_rx_packets,
+                'delta_tx_packets': delta_tx_packets,
+                'sample_duration_seconds': max(0.0, sample_seconds),
+                'counter_reset': reset,
+            }
         
         # Extract current values
         current_rx_errors = current_stats.get('rx_errors', 0)
@@ -334,23 +428,91 @@ class BERAnalyzer:
                 'tx_packets': current_tx_packets,
                 'timestamp': current_time
             }
+            remember()
             # Note: save_baseline_data() called once after all interfaces processed
-            return 0.0, True, 0, 0  # Baseline run, no BER calculation
+            return 0.0, True, 0, 0, 0  # Baseline run, no BER calculation
         
         # Calculate deltas
         baseline = self.baseline_data[hostname][interface]
-        delta_rx_errors = max(0, current_rx_errors - baseline['rx_errors'])
-        delta_tx_errors = max(0, current_tx_errors - baseline['tx_errors'])
-        delta_rx_bytes = max(0, current_rx_bytes - baseline['rx_bytes'])
-        delta_tx_bytes = max(0, current_tx_bytes - baseline['tx_bytes'])
-        delta_rx_packets = max(0, current_rx_packets - baseline['rx_packets'])
-        delta_tx_packets = max(0, current_tx_packets - baseline['tx_packets'])
+        try:
+            sample_seconds = current_time - float(baseline.get('timestamp', current_time))
+        except (TypeError, ValueError):
+            sample_seconds = 0.0
+        current_counters = (
+            current_rx_errors, current_tx_errors, current_rx_bytes,
+            current_tx_bytes, current_rx_packets, current_tx_packets,
+        )
+        baseline_counters = (
+            baseline['rx_errors'], baseline['tx_errors'], baseline['rx_bytes'],
+            baseline['tx_bytes'], baseline['rx_packets'], baseline['tx_packets'],
+        )
+        if any(current < previous for current, previous in
+               zip(current_counters, baseline_counters)):
+            # Interface/counter reset: establish a fresh baseline and avoid a
+            # misleading zero/excellent sample for this run.
+            self.baseline_data[hostname][interface] = {
+                'rx_errors': current_rx_errors,
+                'tx_errors': current_tx_errors,
+                'rx_bytes': current_rx_bytes,
+                'tx_bytes': current_tx_bytes,
+                'rx_packets': current_rx_packets,
+                'tx_packets': current_tx_packets,
+                'timestamp': current_time,
+            }
+            remember(sample_seconds=sample_seconds, reset=True)
+            return 0.0, True, 0, 0, 0
+
+        delta_rx_errors = current_rx_errors - baseline['rx_errors']
+        delta_tx_errors = current_tx_errors - baseline['tx_errors']
+        delta_rx_bytes = current_rx_bytes - baseline['rx_bytes']
+        delta_tx_bytes = current_tx_bytes - baseline['tx_bytes']
+        delta_rx_packets = current_rx_packets - baseline['rx_packets']
+        delta_tx_packets = current_tx_packets - baseline['tx_packets']
         
         total_delta_errors = delta_rx_errors + delta_tx_errors
         total_delta_bytes = delta_rx_bytes + delta_tx_bytes
         total_delta_packets = delta_rx_packets + delta_tx_packets
+
+        remember(
+            delta_rx_errors, delta_tx_errors,
+            delta_rx_bytes, delta_tx_bytes,
+            delta_rx_packets, delta_tx_packets,
+            sample_seconds,
+        )
         
-        # Update baseline for next run
+        # Calculate the observed directional event density before applying the
+        # confidence gate.  Low-traffic ports still have a real observation to
+        # display, and an early error must not be hidden by returning a forced
+        # zero merely because the packet target has not been reached yet.
+        def directional_density(errors, byte_count, packet_count):
+            if errors <= 0:
+                return 0.0
+            if byte_count > 0:
+                return errors / (byte_count * 8)
+            avg_bits_per_packet = 12000  # 1500 bytes conservative estimate
+            return (errors / (packet_count * avg_bits_per_packet)
+                    if packet_count > 0 else 0.0)
+
+        error_density = (
+            max(
+                directional_density(
+                    delta_rx_errors, delta_rx_bytes, delta_rx_packets
+                ),
+                directional_density(
+                    delta_tx_errors, delta_tx_bytes, delta_tx_packets
+                ),
+            )
+            if total_delta_errors > 0 else 0.0
+        )
+
+        if total_delta_packets < self.config["min_packets_for_analysis"]:
+            # Retain the prior baseline so several low-traffic intervals can
+            # accumulate into one statistically useful grading sample.  The
+            # observed value is returned for transparent UI display only.
+            return (error_density, False, total_delta_errors,
+                    total_delta_bytes, total_delta_packets)
+
+        # Update baseline only after a complete sample (or counter reset).
         self.baseline_data[hostname][interface] = {
             'rx_errors': current_rx_errors,
             'tx_errors': current_tx_errors,
@@ -361,62 +523,77 @@ class BERAnalyzer:
             'timestamp': current_time
         }
         # Note: save_baseline_data() called once after all interfaces processed
-        
-        # Calculate BER from deltas
-        if total_delta_errors == 0:
-            return 0.0, False, 0, total_delta_bytes
-        
-        if total_delta_packets < self.config["min_packets_for_analysis"]:
-            return 0.0, False, total_delta_errors, total_delta_bytes
-        
-        # Prefer byte-based calculation
-        if total_delta_bytes > 0:
-            total_delta_bits = total_delta_bytes * 8
-            ber = total_delta_errors / total_delta_bits
-        else:
-            # Fallback to packet estimation
-            avg_bits_per_packet = 12000  # 1500 bytes conservative estimate
-            total_delta_bits = total_delta_packets * avg_bits_per_packet
-            ber = total_delta_errors / total_delta_bits if total_delta_bits > 0 else 0.0
-        
-        return ber, False, total_delta_errors, total_delta_bytes
+
+        return error_density, False, total_delta_errors, total_delta_bytes, total_delta_packets
 
     def calculate_ber(self, rx_packets: int, tx_packets: int, rx_errors: int, tx_errors: int, rx_bytes: int, tx_bytes: int) -> float:
-        """Legacy BER calculation - kept for compatibility.
-        
-        Note: Use calculate_delta_ber() for accurate delta-based measurements.
+        """Legacy whole-counter interface error density calculation.
+
+        Note: Use calculate_delta_ber() for current interval measurements.
         """
         total_packets = rx_packets + tx_packets
-        total_errors = rx_errors + tx_errors
-        total_bytes = rx_bytes + tx_bytes
-
         if total_packets < self.config["min_packets_for_analysis"]:
             return 0.0  # Not enough data for reliable BER calculation
 
-        if total_errors == 0:
+        if rx_errors + tx_errors == 0:
             return 0.0  # Perfect transmission
 
-        # Prefer exact bit volume from byte counters (MTU-independent)
-        total_bits = total_bytes * 8
-
-        # Fallback to estimated bits if byte counters are missing/zero
-        if total_bits <= 0:
+        def directional_density(errors, byte_count, packet_count):
+            if errors <= 0:
+                return 0.0
+            if byte_count > 0:
+                return errors / (byte_count * 8)
             avg_bits_per_packet = 12000  # 1500 bytes as conservative estimate
-            total_bits = total_packets * avg_bits_per_packet
+            return (errors / (packet_count * avg_bits_per_packet)
+                    if packet_count > 0 else 0.0)
 
-        ber = total_errors / total_bits if total_bits > 0 else 0.0
-        return ber
+        return max(
+            directional_density(rx_errors, rx_bytes, rx_packets),
+            directional_density(tx_errors, tx_bytes, tx_packets),
+        )
     
     def get_ber_grade(self, ber_value: float) -> BERGrade:
-        """Determine BER quality grade"""
+        """Determine interface error-density grade (compatibility name)."""
         if ber_value == 0.0:
             return BERGrade.EXCELLENT
-        elif ber_value < self.config["raw_ber_threshold"]:
+        elif ber_value < self.config["frame_density_warning_threshold"]:
             return BERGrade.GOOD
-        elif ber_value < self.config["warning_ber_threshold"]:
+        elif ber_value < self.config["frame_density_critical_threshold"]:
             return BERGrade.WARNING
         else:
             return BERGrade.CRITICAL
+
+    @staticmethod
+    def _get_phy_ber_grade(ber_value: float, warning_threshold: float,
+                           critical_threshold: float) -> BERGrade:
+        """Grade one PHY BER metric against its own engineering limits."""
+        if ber_value == 0.0:
+            return BERGrade.EXCELLENT
+        if ber_value < warning_threshold:
+            return BERGrade.GOOD
+        if ber_value < critical_threshold:
+            return BERGrade.WARNING
+        return BERGrade.CRITICAL
+
+    def get_raw_phy_ber_grade(self, ber_value: float) -> BERGrade:
+        """Grade pre-FEC BER without treating normal FEC corrections as loss."""
+        return self._get_phy_ber_grade(
+            ber_value,
+            self.config['raw_phy_ber_warning_threshold'],
+            self.config['raw_phy_ber_critical_threshold'],
+        )
+
+    def get_effective_phy_ber_grade(self, ber_value: float) -> BERGrade:
+        """Grade post-FEC BER seen by the MAC/application layer."""
+        return self._get_phy_ber_grade(
+            ber_value,
+            self.config['effective_phy_ber_warning_threshold'],
+            self.config['effective_phy_ber_critical_threshold'],
+        )
+
+    def get_phy_ber_grade(self, ber_value: float) -> BERGrade:
+        """Compatibility alias for the service-impacting effective BER grade."""
+        return self.get_effective_phy_ber_grade(ber_value)
     
     def update_interface_ber(self, port_name: str, interface_stats: Dict[str, int]):
         """Update BER statistics for an interface"""
@@ -464,7 +641,14 @@ class BERAnalyzer:
             return {"trend": "insufficient_data", "confidence": "low"}
         
         history = self.ber_history[port_name]
-        recent_values = [entry['ber_value'] for entry in history[-self.config["trend_analysis_points"]:]]
+        analyzed_history = [
+            entry for entry in history
+            if entry.get('sample_status', 'analyzed') == 'analyzed'
+        ]
+        recent_values = [
+            entry['ber_value']
+            for entry in analyzed_history[-self.config["trend_analysis_points"]:]
+        ]
         
         # Simple trend analysis
         if len(recent_values) < 2:
@@ -496,8 +680,170 @@ class BERAnalyzer:
             "previous_avg": avg_first
         }
     
+    @staticmethod
+    def _grade_priority(grade: str) -> int:
+        return {
+            BERGrade.EXCELLENT.value: 0,
+            BERGrade.GOOD.value: 1,
+            BERGrade.WARNING.value: 2,
+            BERGrade.CRITICAL.value: 3,
+        }.get(grade, -1)
+
+    @staticmethod
+    def _format_duration(seconds: Any) -> str:
+        try:
+            seconds = max(0, int(float(seconds)))
+        except (TypeError, ValueError):
+            return 'N/A'
+        if seconds < 60:
+            return f'{seconds}s'
+        if seconds < 3600:
+            return f'{seconds // 60}m{seconds % 60:02d}s'
+        return f'{seconds // 3600}h{(seconds % 3600) // 60:02d}m'
+
+    def _previous_symbol_errors(self, port_name: str,
+                                current_stats: Dict[str, Any]) -> Optional[int]:
+        current_timestamp = current_stats.get('timestamp', 0)
+        for entry in reversed(self.ber_history.get(port_name, [])):
+            if entry is current_stats:
+                continue
+            try:
+                if entry.get('timestamp', 0) >= current_timestamp:
+                    continue
+            except TypeError:
+                continue
+            value = entry.get('symbol_errors')
+            if isinstance(value, int):
+                return value
+        return None
+
+    def _analyze_port(self, port_name: str,
+                      stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Combine frame-density, PHY BER and symbol-delta evidence once."""
+        device, _, interface = port_name.partition(':')
+        if not interface:
+            interface = device
+            device = 'unknown'
+
+        raw_ber = self._lookup_l1_metric(
+            self._parse_raw_phy_ber_for_device(device), interface
+        )
+        l1_extras = self._lookup_l1_metric(
+            self._parse_l1_extras_for_device(device), interface
+        ) or {}
+        effective_ber = l1_extras.get('effective_ber')
+        symbol_errors = l1_extras.get('symbol_errors')
+
+        frame_density = stats.get('ber_value', 0)
+        sample_status = stats.get('sample_status', 'analyzed')
+        grades = []
+        reasons = []
+
+        low_sample_with_errors = (
+            sample_status == 'insufficient_traffic'
+            and (
+                stats.get('delta_rx_errors', 0)
+                + stats.get('delta_tx_errors', 0)
+            ) > 0
+        )
+        if ((sample_status == 'analyzed' or low_sample_with_errors)
+                and isinstance(frame_density, (int, float))):
+            observed_frame_grade = self.get_ber_grade(frame_density).value
+            is_actionable = (
+                self._grade_priority(observed_frame_grade)
+                >= self._grade_priority(BERGrade.WARNING.value)
+            )
+            # A complete sample may establish any grade.  Before the sample
+            # target, only an observed warning/critical condition is allowed
+            # to affect health; a small provisional sample cannot prove GOOD.
+            if sample_status == 'analyzed' or is_actionable:
+                frame_grade = observed_frame_grade
+                grades.append(frame_grade)
+            else:
+                frame_grade = BERGrade.UNKNOWN.value
+            if is_actionable:
+                qualifier = (
+                    'provisional low-sample ' if low_sample_with_errors else ''
+                )
+                reasons.append(
+                    f"{qualifier}interface error density {frame_density:.2e}"
+                )
+        else:
+            frame_grade = BERGrade.UNKNOWN.value
+
+        raw_grade = BERGrade.UNKNOWN.value
+        if isinstance(raw_ber, (int, float)):
+            raw_grade = self.get_raw_phy_ber_grade(raw_ber).value
+            grades.append(raw_grade)
+            if self._grade_priority(raw_grade) >= self._grade_priority(BERGrade.WARNING.value):
+                reasons.append(f"raw PHY BER {raw_ber:.2e}")
+
+        effective_grade = BERGrade.UNKNOWN.value
+        if isinstance(effective_ber, (int, float)):
+            effective_grade = self.get_effective_phy_ber_grade(effective_ber).value
+            grades.append(effective_grade)
+            if self._grade_priority(effective_grade) >= self._grade_priority(BERGrade.WARNING.value):
+                reasons.append(f"effective PHY BER {effective_ber:.2e}")
+
+        previous_symbols = self._previous_symbol_errors(port_name, stats)
+        symbol_delta = None
+        symbol_grade = BERGrade.UNKNOWN.value
+        if isinstance(symbol_errors, int) and isinstance(previous_symbols, int):
+            # A reset/wrap establishes a new baseline instead of inventing a
+            # negative or enormous delta.
+            if symbol_errors >= previous_symbols:
+                symbol_delta = symbol_errors - previous_symbols
+                if symbol_delta >= self.config['symbol_error_critical_delta']:
+                    symbol_grade = BERGrade.CRITICAL.value
+                elif symbol_delta >= self.config['symbol_error_warning_delta']:
+                    symbol_grade = BERGrade.WARNING.value
+                else:
+                    symbol_grade = BERGrade.EXCELLENT.value
+                grades.append(symbol_grade)
+                if self._grade_priority(symbol_grade) >= self._grade_priority(BERGrade.WARNING.value):
+                    reasons.append(f"PHY symbol errors +{symbol_delta}")
+
+        status = (max(grades, key=self._grade_priority)
+                  if grades else BERGrade.UNKNOWN.value)
+
+        # Persist the L1 snapshot on the current history record so the next run
+        # can calculate a real symbol counter delta.
+        stats.update({
+            'raw_ber': raw_ber,
+            'effective_ber': effective_ber,
+            'symbol_errors': symbol_errors,
+            'symbol_error_delta': symbol_delta,
+            'effective_grade': status,
+            'severity_reasons': reasons,
+        })
+
+        return {
+            "port": port_name,
+            "ber_value": frame_density,
+            "frame_error_density": frame_density,
+            "frame_grade": frame_grade,
+            "raw_ber": raw_ber if isinstance(raw_ber, (int, float)) else None,
+            "raw_grade": raw_grade,
+            "effective_ber": effective_ber if isinstance(effective_ber, (int, float)) else None,
+            "effective_grade": effective_grade,
+            "symbol_errors": symbol_errors if isinstance(symbol_errors, int) else None,
+            "symbol_error_delta": symbol_delta,
+            "symbol_grade": symbol_grade,
+            "status": status,
+            "severity_reasons": reasons,
+            "sample_status": sample_status,
+            "sample_duration_seconds": stats.get('sample_duration_seconds', 0),
+            "delta_packets": stats.get('delta_packets', 0),
+            "delta_rx_errors": stats.get('delta_rx_errors', 0),
+            "delta_tx_errors": stats.get('delta_tx_errors', 0),
+            "total_packets": stats.get('total_packets', 0),
+            "rx_errors": stats.get('rx_errors', 0),
+            "tx_errors": stats.get('tx_errors', 0),
+            "timestamp": stats.get('timestamp', time.time()),
+        }
+
     def get_ber_summary(self) -> Dict[str, Any]:
-        """Get overall BER analysis summary"""
+        """Get overall link-error analysis summary."""
         summary = {
             "total_ports": 0,
             "excellent_ports": [],
@@ -509,35 +855,8 @@ class BERAnalyzer:
         
         for port_name, stats in self.current_ber_stats.items():
             summary["total_ports"] += 1
-            grade = stats.get('grade', 'unknown')
-            
-            # Raw / pre-FEC physical BER (from l1-show). FEC can correct a marginal fiber so
-            # the frame BER (packet errors) reads ~0 while the raw BER is high — exactly the
-            # case HPC engineering tracks. Escalate the grade on raw BER so those links surface
-            # instead of all showing EXCELLENT.
-            device = port_name.split(':', 1)[0]
-            interface = port_name.split(':', 1)[1] if ':' in port_name else port_name
-            raw_ber = self._parse_raw_phy_ber_for_device(device).get(interface)
-            eff_grade = grade
-            if isinstance(raw_ber, (int, float)):
-                if raw_ber >= self.config["warning_ber_threshold"]:
-                    eff_grade = BERGrade.CRITICAL.value
-                elif raw_ber >= self.config["raw_ber_threshold"] and eff_grade != BERGrade.CRITICAL.value:
-                    eff_grade = BERGrade.WARNING.value
-
-            l1_extras = self._parse_l1_extras_for_device(device).get(interface, {})
-            port_info = {
-                "port": port_name,
-                "ber_value": stats.get('ber_value', 0),
-                "raw_ber": raw_ber if isinstance(raw_ber, (int, float)) else None,
-                "effective_ber": l1_extras.get('effective_ber'),
-                "symbol_errors": l1_extras.get('symbol_errors'),
-                "status": eff_grade,
-                "total_packets": stats.get('total_packets', 0),
-                "rx_errors": stats.get('rx_errors', 0),
-                "tx_errors": stats.get('tx_errors', 0),
-                "timestamp": stats.get('timestamp', time.time())
-            }
+            port_info = self._analyze_port(port_name, stats)
+            eff_grade = port_info['status']
             
             if eff_grade == BERGrade.EXCELLENT.value:
                 summary["excellent_ports"].append(port_info)
@@ -553,43 +872,77 @@ class BERAnalyzer:
         return summary
     
     def detect_ber_anomalies(self) -> List[Dict[str, Any]]:
-        """Detect BER-related anomalies"""
+        """Detect anomalies from the same combined evidence as the report."""
         anomalies = []
-        
-        for port_name, stats in self.current_ber_stats.items():
-            grade = stats.get('grade', 'unknown')
-            ber_value = stats.get('ber_value', 0)
-            
-            # Critical BER anomaly
+
+        summary = self.get_ber_summary()
+        port_infos = (summary['critical_ports'] + summary['warning_ports'] +
+                      summary['good_ports'] + summary['excellent_ports'] +
+                      summary['unknown_ports'])
+
+        for port_info in port_infos:
+            port_name = port_info['port']
+            grade = port_info['status']
+            frame_density = port_info['frame_error_density']
+            reasons = port_info.get('severity_reasons') or []
+            reason_text = ', '.join(reasons) if reasons else 'combined link error evidence'
+
             if grade == BERGrade.CRITICAL.value:
                 anomalies.append({
                     "device": port_name.split(':')[0] if ':' in port_name else "unknown",
                     "interface": port_name.split(':')[1] if ':' in port_name else port_name,
-                    "type": "HIGH_BER_RATE",
+                    "type": "HIGH_LINK_ERROR_RATE",
                     "severity": "critical",
-                    "message": f"Critical BER detected: {ber_value:.2e}",
+                    "message": f"Critical link error condition: {reason_text}",
                     "details": {
-                        "ber_value": ber_value,
-                        "threshold": self.config["critical_ber_threshold"],
-                        "rx_errors": stats.get('rx_errors', 0),
-                        "tx_errors": stats.get('tx_errors', 0)
+                        "frame_error_density": frame_density,
+                        "raw_ber": port_info.get('raw_ber'),
+                        "effective_ber": port_info.get('effective_ber'),
+                        "symbol_error_delta": port_info.get('symbol_error_delta'),
+                        "frame_density_threshold": self.config[
+                            "frame_density_critical_threshold"
+                        ],
+                        "raw_phy_ber_threshold": self.config[
+                            "raw_phy_ber_critical_threshold"
+                        ],
+                        "effective_phy_ber_threshold": self.config[
+                            "effective_phy_ber_critical_threshold"
+                        ],
+                        "phy_ber_threshold": self.config[
+                            "effective_phy_ber_critical_threshold"
+                        ],
+                        "delta_rx_errors": port_info.get('delta_rx_errors', 0),
+                        "delta_tx_errors": port_info.get('delta_tx_errors', 0),
                     },
                     "action": f"Immediate attention required - check cable and transceivers for {port_name}"
                 })
-            
-            # Warning BER anomaly  
+
             elif grade == BERGrade.WARNING.value:
                 anomalies.append({
                     "device": port_name.split(':')[0] if ':' in port_name else "unknown",
                     "interface": port_name.split(':')[1] if ':' in port_name else port_name,
-                    "type": "ELEVATED_BER_RATE",
+                    "type": "ELEVATED_LINK_ERROR_RATE",
                     "severity": "warning",
-                    "message": f"Elevated BER detected: {ber_value:.2e}",
+                    "message": f"Elevated link error condition: {reason_text}",
                     "details": {
-                        "ber_value": ber_value,
-                        "threshold": self.config["warning_ber_threshold"],
-                        "rx_errors": stats.get('rx_errors', 0),
-                        "tx_errors": stats.get('tx_errors', 0)
+                        "frame_error_density": frame_density,
+                        "raw_ber": port_info.get('raw_ber'),
+                        "effective_ber": port_info.get('effective_ber'),
+                        "symbol_error_delta": port_info.get('symbol_error_delta'),
+                        "frame_density_threshold": self.config[
+                            "frame_density_warning_threshold"
+                        ],
+                        "raw_phy_ber_threshold": self.config[
+                            "raw_phy_ber_warning_threshold"
+                        ],
+                        "effective_phy_ber_threshold": self.config[
+                            "effective_phy_ber_warning_threshold"
+                        ],
+                        "phy_ber_threshold": self.config[
+                            "effective_phy_ber_warning_threshold"
+                        ],
+                        "delta_rx_errors": port_info.get('delta_rx_errors', 0),
+                        "delta_tx_errors": port_info.get('delta_tx_errors', 0),
                     },
                     "action": f"Monitor {port_name} closely and consider preventive maintenance"
                 })
@@ -600,13 +953,13 @@ class BERAnalyzer:
                 anomalies.append({
                     "device": port_name.split(':')[0] if ':' in port_name else "unknown",
                     "interface": port_name.split(':')[1] if ':' in port_name else port_name,
-                    "type": "BER_TREND_WORSENING",
+                    "type": "LINK_ERROR_TREND_WORSENING",
                     "severity": "warning",
-                    "message": f"BER trend worsening on {port_name}",
+                    "message": f"Interface error-density trend worsening on {port_name}",
                     "details": {
                         "trend": trend_info["trend"],
                         "change_ratio": trend_info.get("change_ratio", 0),
-                        "current_ber": ber_value
+                        "current_error_density": frame_density
                     },
                     "action": f"Investigate potential cable degradation on {port_name}"
                 })
@@ -617,6 +970,18 @@ class BERAnalyzer:
         """Export BER data for web display - same format as BGP/Link Flap/Optical"""
         summary = self.get_ber_summary()
         anomalies = self.detect_ber_anomalies()
+        expected_hosts = getattr(self, 'coverage_expected_hosts', None)
+        current_hosts = getattr(self, 'coverage_current_hosts', None)
+        coverage_attrs = ''
+        if isinstance(expected_hosts, int) and isinstance(current_hosts, int):
+            coverage_status = (
+                'complete' if current_hosts >= expected_hosts else 'partial'
+            )
+            coverage_attrs = (
+                f' data-coverage-status="{coverage_status}"'
+                f' data-coverage-expected="{expected_hosts}"'
+                f' data-coverage-current="{current_hosts}"'
+            )
         
         # Determine overall health status
         total_problematic = len(summary['warning_ports']) + len(summary['critical_ports'])
@@ -646,7 +1011,7 @@ class BERAnalyzer:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BER Analysis Results</title>
+    <title>Link Error / BER Analysis</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
     <style>
@@ -726,10 +1091,10 @@ class BERAnalyzer:
         @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
     </style>
 </head>
-<body>
+<body{coverage_attrs}>
     <div class="page-header">
         <div>
-            <div class="page-title">BER Analysis Results</div>
+            <div class="page-title">Link Error / BER Analysis</div>
             <div class="last-updated">Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
         </div>
         <div class="action-buttons">
@@ -779,6 +1144,10 @@ class BERAnalyzer:
                     <div class="metric" id="critical-ports">{len(summary['critical_ports'])}</div>
                     <div class="metric-label">Critical</div>
                 </div>
+                <div class="summary-card card-info" id="unknown-card">
+                    <div class="metric" id="unknown-ports">{len(summary['unknown_ports'])}</div>
+                    <div class="metric-label">Awaiting Sample</div>
+                </div>
             </div>
         </div>
     </div>
@@ -813,7 +1182,7 @@ class BERAnalyzer:
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4,1H20A1,1 0 0,1 21,2V6A1,1 0 0,1 20,7H4A1,1 0 0,1 3,6V2A1,1 0 0,1 4,1M4,9H20A1,1 0 0,1 21,10V14A1,1 0 0,1 20,15H4A1,1 0 0,1 3,14V10A1,1 0 0,1 4,9M4,17H20A1,1 0 0,1 21,18V22A1,1 0 0,1 20,23H4A1,1 0 0,1 3,22V18A1,1 0 0,1 4,17Z"/></svg>
-            Interface BER Status
+            Interface Error Status
         </div>
         <div class="section-content-table">
             <div id="filter-info" class="filter-info">
@@ -826,22 +1195,23 @@ class BERAnalyzer:
                         <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="1" data-type="port">Interface <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="2" data-type="ber-status">Status <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="3" data-type="ber-value">Frame BER <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="3" data-type="ber-value">Frame Error Density <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="4" data-type="ber-value">Physical BER <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="5" data-type="ber-value">Effective BER <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="6" data-type="number">PHY Symbol Errors <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="7" data-type="number">Total Pkt <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="8" data-type="number">RX Err <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="9" data-type="number">TX Err <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="10" data-type="time">Updated <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="6" data-type="number">PHY Symbol Δ / Total <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="7" data-type="number">Δ Pkt <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="8" data-type="number">Δ RX Err <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="9" data-type="number">Δ TX Err <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="10" data-type="time">Updated / Window <span class="sort-arrow">▲▼</span></th>
                     </tr>
                 </thead>
                 <tbody id="ber-data">
 """
         
         # Add all ports to table (sorted by health - problems first, then good ones)
-        all_ports = (summary['excellent_ports'] + summary['good_ports'] + 
-                    summary['warning_ports'] + summary['critical_ports'])
+        all_ports = (summary['excellent_ports'] + summary['good_ports'] +
+                    summary['warning_ports'] + summary['critical_ports'] +
+                    summary['unknown_ports'])
         
         # Sort ports by BER status priority (critical/warning first)
         def get_ber_priority(port_info):
@@ -863,7 +1233,7 @@ class BERAnalyzer:
             # Status = effective grade (frame BER escalated by raw/physical BER), computed once
             # in get_ber_summary so the summary cards and this table always agree.
             ber_value = port_info['ber_value']
-            status = str(port_info.get('status') or 'excellent').upper()
+            status = str(port_info.get('status') or 'unknown').upper()
             badge_class = {
                 "EXCELLENT": "badge badge-green",
                 "GOOD": "badge badge-green",
@@ -871,7 +1241,29 @@ class BERAnalyzer:
                 "CRITICAL": "badge badge-red",
             }.get(status, "badge badge-gray")
             
-            ber_display = f"{ber_value:.2e}" if ber_value > 0 else "0"
+            sample_status = port_info.get('sample_status')
+            delta_packets = port_info.get('delta_packets', 0)
+            sample_target = self.config['min_packets_for_analysis']
+            if (sample_status == 'insufficient_traffic'
+                    and isinstance(ber_value, (int, float))
+                    and delta_packets > 0):
+                observed = f"{ber_value:.2e}" if ber_value > 0 else "0"
+                ber_display = (
+                    f'<span title="Observed low-traffic value; grading waits '
+                    f'for {sample_target:,} packets while the baseline keeps '
+                    f'accumulating">{observed} '
+                    f'({delta_packets:,}/{sample_target:,})</span>'
+                )
+            elif sample_status == 'insufficient_traffic':
+                ber_display = "No traffic"
+            elif sample_status == 'counter_reset':
+                ber_display = "Counter reset"
+            elif sample_status == 'baseline':
+                ber_display = "Baseline"
+            elif port_info.get('frame_grade') == BERGrade.UNKNOWN.value:
+                ber_display = "N/A"
+            else:
+                ber_display = f"{ber_value:.2e}" if ber_value > 0 else "0"
             
             # RAW PHY BER (pre-FEC) — already parsed during classification.
             raw_phy_val = port_info.get('raw_ber')
@@ -882,9 +1274,18 @@ class BERAnalyzer:
             eff_val = port_info.get('effective_ber')
             eff_display = f"{eff_val:.2e}" if isinstance(eff_val, (int, float)) else "N/A"
             sym_val = port_info.get('symbol_errors')
-            sym_display = f"{sym_val:,}" if isinstance(sym_val, int) else "N/A"
+            sym_delta = port_info.get('symbol_error_delta')
+            if isinstance(sym_val, int) and isinstance(sym_delta, int):
+                sym_display = f"+{sym_delta:,} / {sym_val:,}"
+            elif isinstance(sym_val, int):
+                sym_display = f"baseline / {sym_val:,}"
+            else:
+                sym_display = "N/A"
 
             timestamp = datetime.fromtimestamp(port_info['timestamp']).strftime('%H:%M:%S')
+            sample_window = self._format_duration(
+                port_info.get('sample_duration_seconds', 0)
+            )
             
             html_content += f"""
                 <tr data-status="{status.lower()}">
@@ -895,14 +1296,14 @@ class BERAnalyzer:
                     <td>{raw_phy_display}</td>
                     <td>{eff_display}</td>
                     <td>{sym_display}</td>
-                    <td>{port_info['total_packets']:,}</td>
-                    <td>{port_info['rx_errors']:,}</td>
-                    <td>{port_info['tx_errors']:,}</td>
-                    <td>{timestamp}</td>
+                    <td>{port_info['delta_packets']:,}</td>
+                    <td>{port_info['delta_rx_errors']:,}</td>
+                    <td>{port_info['delta_tx_errors']:,}</td>
+                    <td>{timestamp} / {sample_window}</td>
                 </tr>
 """
         
-        html_content += """
+        html_content += f"""
                 </tbody>
             </table>
         </div>
@@ -911,7 +1312,7 @@ class BERAnalyzer:
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
-            BER Analysis Thresholds
+            Link Error / BER Thresholds
         </div>
         <div class="section-content-table">
             <table class="ber-table">
@@ -919,11 +1320,12 @@ class BERAnalyzer:
                     <tr><th>Parameter</th><th>Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>Excellent</td><td>Zero errors</td><td>Zero bit errors detected</td></tr>
-                    <tr><td>Good</td><td>&lt; 1×10⁻⁶</td><td>Industry standard acceptable BER level</td></tr>
-                    <tr><td>Warning</td><td>1×10⁻⁶ to 1×10⁻⁵</td><td>Elevated error rate requiring monitoring</td></tr>
-                    <tr><td>Critical</td><td>&gt; 1×10⁻⁵</td><td>Unacceptable error rate, immediate attention required</td></tr>
-                    <tr><td>Analysis Method</td><td>Interface statistics</td><td>Based on error counters and packet statistics</td></tr>
+                    <tr><td>Excellent</td><td>Zero new errors</td><td>No new error events in the sample</td></tr>
+                    <tr><td>Frame Density</td><td>Warning &ge; {self.config['frame_density_warning_threshold']:.0e}; Critical &ge; {self.config['frame_density_critical_threshold']:.0e}</td><td>Interface error events per observed bit volume</td></tr>
+                    <tr><td>Raw PHY BER (pre-FEC)</td><td>Warning &ge; {self.config['raw_phy_ber_warning_threshold']:.0e}; Critical &ge; {self.config['raw_phy_ber_critical_threshold']:.0e}</td><td>Physical-link quality before FEC correction</td></tr>
+                    <tr><td>Effective PHY BER (post-FEC)</td><td>Warning &ge; {self.config['effective_phy_ber_warning_threshold']:.0e}; Critical &ge; {self.config['effective_phy_ber_critical_threshold']:.0e}</td><td>Configured by notifications.yaml network.ber_error_rate (critical is 10×)</td></tr>
+                    <tr><td>PHY Symbol Δ</td><td>Warning &ge; {self.config['symbol_error_warning_delta']:,}; Critical &ge; {self.config['symbol_error_critical_delta']:,}</td><td>New symbol errors since the previous L1 sample</td></tr>
+                    <tr><td>Analysis Method</td><td>Worst RX/TX direction</td><td>Interface error events per observed bit volume; this is not a physical BER</td></tr>
                 </tbody>
             </table>
         </div>
@@ -936,11 +1338,11 @@ class BERAnalyzer:
         </div>
         <div class="section-content" style="font-size: 13px; color: #888;">
             <ul style="margin-left: 20px; line-height: 1.8;">
-                <li><strong style="color: #d4d4d4;">Frame BER</strong>: Computed from interface error counters to show overall link quality. Uses delta measurement (new errors since last check) for accurate current status.</li>
+                <li><strong style="color: #d4d4d4;">Frame Error Density</strong>: The worse RX/TX <code>/proc/net/dev</code> error-event count divided by that direction's observed bit volume. It is an operational density indicator, not a physical bit-error rate.</li>
                 <li><strong style="color: #d4d4d4;">Physical BER</strong>: Physical layer bit error rate from l1-show/PCS layer. Shows actual fiber and optics health including FEC-corrected errors.</li>
                 <li><strong style="color: #d4d4d4;">Effective BER</strong>: Post-FEC bit error rate from l1-show (<code>effective_ber_coef × 10^effective_ber_magnitude</code>). This is the error rate the traffic actually sees after FEC correction — the primary day-to-day health metric.</li>
-                <li><strong style="color: #d4d4d4;">PHY Symbol Errors</strong>: Physical-layer symbol error count (<code>phy_symbol_errors</code> from l1-show). A rising count indicates a degrading lane/fiber even while FEC still hides it from the frame BER.</li>
-                <li><strong style="color: #d4d4d4;">Delta-based measurement</strong>: Both metrics use only new errors since the last measurement to avoid showing accumulated historical errors. First measurement establishes baseline.</li>
+                <li><strong style="color: #d4d4d4;">PHY Symbol Errors</strong>: The table shows new symbol errors and the lifetime total from <code>l1-show</code>. Severity uses only the new delta; a reset establishes a fresh baseline.</li>
+                <li><strong style="color: #d4d4d4;">Sample window</strong>: The Δ packet/error columns and the window beside Updated describe the exact interval used for Frame Error Density. A value followed by progress such as <code>0 (509/1,000)</code> is the observed low-traffic value; the baseline keeps accumulating and a zero-error sample is not graded until the target is reached. Errors observed before the target are evaluated immediately. Raw and Effective BER are current L1 snapshots.</li>
             </ul>
         </div>
     </div>
@@ -1279,15 +1681,11 @@ class BERAnalyzer:
                 'UNKNOWN': 4
             };
             
-            return (priority[a] || 5) - (priority[b] || 5);
+            return (priority[a] ?? 5) - (priority[b] ?? 5);
         }
         
         function compareBERValue(a, b) {
             // Handle scientific notation (1.23e-5) and plain numbers
-            if (a === '0' && b === '0') return 0;
-            if (a === '0') return 1; // 0 is best (excellent)
-            if (b === '0') return -1;
-            
             const numA = parseFloat(a);
             const numB = parseFloat(b);
             
@@ -1299,9 +1697,10 @@ class BERAnalyzer:
         }
 
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
+            let notification = null;
             
             // Disable button and show loading
             button.disabled = true;
@@ -1312,19 +1711,23 @@ class BERAnalyzer:
                 Running...
             `;
             
-            // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
+            try {
+                let baseline = null;
+                if (typeof window.lldpqCapturePipelineState === 'function') {
+                    baseline = await window.lldpqCapturePipelineState();
                 }
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    console.log('✅ Monitor analysis triggered successfully');
-                    // Show notification
-                    const notification = document.createElement('div');
+
+                const response = await fetch('/trigger-monitor', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await response.json();
+                if (data.status !== 'success') {
+                    throw new Error(data.message || 'Failed to trigger monitor analysis');
+                }
+
+                console.log('✅ Monitor analysis triggered successfully');
+                notification = document.createElement('div');
                     notification.style.cssText = `
                         position: fixed;
                         top: 20px;
@@ -1342,28 +1745,24 @@ class BERAnalyzer:
                     notification.innerHTML = `
                         <strong>✅ Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small>Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small>Page will refresh after the new analysis is completely published.</small>
                     `;
-                    document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 35000);
+                document.body.appendChild(notification);
+
+                if (typeof window.waitForLldpqAnalysisCompletion === 'function') {
+                    await window.waitForLldpqAnalysisCompletion(baseline);
                 } else {
-                    console.error('❌ Failed to trigger monitor analysis:', data.message);
-                    alert('Failed to trigger analysis. Please try again.');
-                    // Restore button
-                    button.disabled = false;
-                    button.innerHTML = originalText;
+                    await new Promise(resolve => setTimeout(resolve, 35000));
                 }
-            })
-            .catch(error => {
+
+                window.location.reload();
+            } catch (error) {
                 console.error('❌ Error triggering analysis:', error);
-                alert('Error triggering analysis. Please try again.');
-                // Restore button
+                if (notification) notification.remove();
+                alert('Analysis did not complete: ' + (error.message || error));
                 button.disabled = false;
                 button.innerHTML = originalText;
-            });
+            }
         }
 
         // CSV Download Function
@@ -1386,7 +1785,7 @@ class BERAnalyzer:
                 const rows = tbody.querySelectorAll('tr');
                 
                 // Add summary stats as comments
-                csvContent += `# BER Analysis Summary Report\\n`;
+                csvContent += `# Link Error / BER Analysis Summary Report\\n`;
                 csvContent += `# Generated: ${now.toLocaleString()}\\n`;
                 csvContent += `# Total Ports: ${document.getElementById('total-ports').textContent}\\n`;
                 csvContent += `# Excellent: ${document.getElementById('excellent-ports').textContent}\\n`;

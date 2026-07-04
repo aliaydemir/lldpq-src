@@ -13,6 +13,7 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import stat
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -226,12 +227,21 @@ def check_connections(topology_file, device_neighbors, device_port_status):
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     lldp_results_folder = os.path.join(script_dir, "lldp-results")
+    input_folder = os.environ.get("LLDPQ_LLDP_INPUT_DIR", lldp_results_folder)
+    input_folder = os.path.realpath(input_folder)
+    if os.path.commonpath((input_folder, os.path.realpath(lldp_results_folder))) != \
+            os.path.realpath(lldp_results_folder):
+        print("Error validating LLDP data: input directory is outside lldp-results")
+        return 1
     topology_file = os.path.join(script_dir, "topology.dot")
     output_file_path = os.path.join(lldp_results_folder, "lldp_results.ini")
     temp_output_path = None
+    previous_output_path = None
+    new_output_active = False
+    stage_only = os.environ.get("LLDPQ_LLDP_STAGE_ONLY") == "1"
 
     try:
-        device_neighbors, device_port_status, files_in_order = get_device_neighbors(lldp_results_folder)
+        device_neighbors, device_port_status, files_in_order = get_device_neighbors(input_folder)
         results = check_connections(topology_file, device_neighbors, device_port_status)
         date_str = subprocess.getoutput("date '+%Y-%m-%d %H-%M-%S'")
         script_name = get_topology_script_name()
@@ -272,18 +282,69 @@ def main():
             output_file.flush()
             os.fsync(output_file.fileno())
 
-        # The topology generator writes atomically and exits nonzero on failure.
-        # Do not publish the validation report or delete its raw inputs until it
-        # has completed successfully.
-        subprocess.run(["sudo", "python3", generate_topology_script], check=True)
+        if stage_only:
+            # check-lldp.sh owns the final multi-file commit.  Keep both the
+            # aggregate and topology in its private collection tree so any
+            # post-processing/publication failure leaves every LKG destination
+            # untouched.
+            staged_report = os.path.join(input_folder, "lldp_results.ini")
+            staged_topology = os.path.join(input_folder, "topology.js")
+            os.replace(temp_output_path, staged_report)
+            temp_output_path = None
+            subprocess.run(
+                [sys.executable, generate_topology_script, input_folder,
+                 staged_topology],
+                check=True,
+            )
+            if not os.path.isfile(staged_topology) or os.path.getsize(staged_topology) == 0:
+                raise RuntimeError("topology generator did not create a staged output")
+            return 0
+
+        # Compatibility path for direct validator callers: activate the complete
+        # local report, retain the previous report, and roll it back if legacy
+        # direct topology publication fails.
+        if os.path.exists(output_file_path):
+            descriptor, previous_output_path = tempfile.mkstemp(
+                dir=lldp_results_folder, prefix=".lldp_results.previous."
+            )
+            os.close(descriptor)
+            os.unlink(previous_output_path)
+            os.replace(output_file_path, previous_output_path)
         os.replace(temp_output_path, output_file_path)
         temp_output_path = None
+        new_output_active = True
+        if input_folder != os.path.realpath(lldp_results_folder):
+            shutil.copy2(
+                output_file_path, os.path.join(input_folder, "lldp_results.ini")
+            )
+        subprocess.run(
+            ["sudo", "python3", generate_topology_script, input_folder],
+            check=True,
+        )
+        if previous_output_path:
+            os.unlink(previous_output_path)
+            previous_output_path = None
 
-        for filename in files_in_order:
-            if filename.endswith("_lldp_result.ini"):
-                os.remove(os.path.join(lldp_results_folder, filename))
+        # The caller owns the private collection directory and removes it as a
+        # unit.  Do not perform fallible per-file cleanup after both the report
+        # and topology have already been published: a cleanup error here would
+        # otherwise roll back only lldp_results.ini and leave topology.js from
+        # the new run active.
         return 0
     except Exception as exc:
+        if previous_output_path and os.path.exists(previous_output_path):
+            try:
+                if new_output_active and os.path.exists(output_file_path):
+                    os.unlink(output_file_path)
+                os.replace(previous_output_path, output_file_path)
+                previous_output_path = None
+            except OSError as restore_exc:
+                print(f"CRITICAL: could not restore previous LLDP report: {restore_exc}")
+        elif new_output_active and os.path.exists(output_file_path):
+            try:
+                os.unlink(output_file_path)
+            except OSError as cleanup_exc:
+                print(f"CRITICAL: could not remove failed LLDP report: {cleanup_exc}")
         print(f"Error validating LLDP data: {exc}")
         return 1
     finally:

@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client sshpass \
     sudo cron \
     iproute2 iputils-ping dnsutils tcpdump \
-    curl jq git bsdmainutils bsdextrautils \
+    curl jq git bsdmainutils bsdextrautils util-linux \
     dos2unix bash-completion colordiff net-tools bzip2 nano vim \
     tmux openssh-server \
     isc-dhcp-server \
@@ -63,11 +63,14 @@ RUN echo "www-data ALL=(lldpq) NOPASSWD: /usr/bin/timeout, /usr/bin/ssh, /usr/bi
 
 # Create directory structure
 RUN mkdir -p /home/lldpq/lldpq/monitor-results/fabric-tables \
+    && mkdir -p /home/lldpq/lldpq/lldp-results \
+    && mkdir -p /home/lldpq/lldpq/alert-states \
     && mkdir -p /var/www/html/hstr \
     && mkdir -p /var/www/html/configs \
     && mkdir -p /var/www/html/monitor-results \
     && mkdir -p /var/www/html/topology \
     && mkdir -p /var/www/html/generated_config_folder \
+    && mkdir -p /var/www/html/provision-uploads \
     && mkdir -p /home/lldpq/.ssh \
     && mkdir -p /home/lldpq/ansible \
     && chown lldpq:www-data /home/lldpq/ansible \
@@ -114,6 +117,15 @@ RUN chown -R lldpq:lldpq /home/lldpq/ \
     && find /home/lldpq/lldpq -name '*.sh' -exec chmod 755 {} \; \
     && find /home/lldpq/lldpq -name '*.py' -exec chmod 755 {} \;
 
+# Install the backup/import engine outside the service-user-writable app tree.
+# This COPY deliberately occurs after the recursive /home ownership change.
+RUN install -d -o root -g root -m 0755 /usr/local/libexec \
+    && rm -f /home/lldpq/lldpq/backup_import.py
+COPY --chown=root:root lldpq/backup_import.py /usr/local/libexec/lldpq-backup-import.py
+RUN chmod 0755 /usr/local/libexec/lldpq-backup-import.py \
+    && test ! -L /usr/local/libexec/lldpq-backup-import.py \
+    && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-backup-import.py)" = "0:0:755"
+
 # Setup topology files: real files in web root, symlinks in lldpq dir
 # Same pattern as native install - web UI edits files in /var/www/html/
 # Scripts access them via symlink in /home/lldpq/lldpq/
@@ -146,11 +158,12 @@ RUN printf '%s\n' \
     'BASE_CONFIG_DIR=/home/lldpq/lldpq/sw-base' \
     'ANSIBLE_DIR=NoNe' \
     'EDITOR_ROOT=/home/lldpq' \
-    'SKIP_L1=false' \
+    'SKIP_L1=true' \
     'MONITOR_MAX_PARALLEL=100' \
     'LLDP_MAX_PARALLEL=100' \
     'ASSETS_MAX_PARALLEL=100' \
     'GET_CONFIGS_MAX_PARALLEL=100' \
+    'GET_CONFIGS_SSH_TIMEOUT=60' \
     'SEND_CMD_MAX_PARALLEL=25' \
     'TELEMETRY_MAX_PARALLEL=25' \
     'TRANSCEIVER_FW_MAX_PARALLEL=10' \

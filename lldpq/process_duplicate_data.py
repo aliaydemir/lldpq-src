@@ -26,6 +26,12 @@ def main():
     print("  MAC duplicates       : %d" % summary["mac_total"])
     print("  APIPA addresses      : %d" % summary["apipa_total"])
     print("  VLANs affected       : %d" % summary["vlans"])
+    print("  Coverage              : %d/%d devices%s" % (
+        summary["coverage_current"], summary["coverage_expected"],
+        " (partial)" if summary["coverage_partial"] else "",
+    ))
+    if summary["coverage_failures"]:
+        print("  Collection failures   : %d" % summary["coverage_failures"])
     if summary["disabled"]:
         print("  Dup-detect DISABLED  : %s" % ", ".join(summary["disabled"]))
     print("  -> %s" % output_file)

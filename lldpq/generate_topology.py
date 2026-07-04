@@ -349,6 +349,14 @@ def parse_port_speed(filepath):
         pass
     return port_speed
 
+def lldp_collection_is_available(filepath):
+    """Placeholder files keep expected links but must not mark a node reachable."""
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as file:
+            return "__LLDPQ_LLDP_UNAVAILABLE__" not in file.read()
+    except OSError:
+        return False
+
 def format_speed(speed_mbps):
     """Format speed in Mbps to human readable (e.g., 400Gbps)"""
     if not speed_mbps or speed_mbps == 0:
@@ -436,7 +444,8 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
         device_name = filename.split("_lldp_result.ini")[0]
         all_port_status[device_name] = parse_port_status(filepath)
         all_port_speed[device_name] = parse_port_speed(filepath)
-        reachable_devices.add(device_name)
+        if lldp_collection_is_available(filepath):
+            reachable_devices.add(device_name)
 
     # Second pass: process LLDP data and create links
     for filename in os.listdir(directory):
@@ -736,14 +745,19 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
         raise
 
 def main():
-    lldp_results_directory = "lldp-results"
+    lldp_results_directory = (
+        sys.argv[1] if len(sys.argv) > 1 else "lldp-results"
+    )
     assets_file_path = "assets.ini"
     devices_yaml_path = "devices.yaml"
     dot_file_path = "topology.dot"
     
     # Get web root from config with fallback
     WEB_ROOT = get_web_root()
-    output_file = f"{WEB_ROOT}/topology/topology.js"
+    explicit_output = len(sys.argv) > 2
+    output_file = (
+        sys.argv[2] if explicit_output else f"{WEB_ROOT}/topology/topology.js"
+    )
 
     if not os.path.isdir(lldp_results_directory):
         print(f"Error: LLDP results directory not found: {lldp_results_directory}")
@@ -751,7 +765,8 @@ def main():
 
     try:
         generate_topology_file(output_file, lldp_results_directory, assets_file_path, devices_yaml_path, dot_file_path)
-        append_creation_time_to_html(f"{WEB_ROOT}/topology/main.html")
+        if not explicit_output:
+            append_creation_time_to_html(f"{WEB_ROOT}/topology/main.html")
         return 0
     except Exception as exc:
         print(f"Error generating topology: {exc}")

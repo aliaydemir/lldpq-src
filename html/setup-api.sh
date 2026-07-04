@@ -7,10 +7,24 @@
 source "$(dirname "$0")/auth-guard.sh"
 require_admin
 
-# Load allowlisted config data through the fixed, root-owned parser.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Load allowlisted config data through the fixed, root-owned parser. A missing
+# helper is a broken/partial installation; silently using Docker-style defaults
+# could make Setup operate on the wrong installation tree.
+if [[ ! -x /usr/local/bin/lldpq-config ]]; then
+    echo "Content-Type: application/json"
+    echo ""
+    echo '{"success": false, "error": "Required runtime config helper is missing; run install.sh to repair this installation."}'
+    exit 0
 fi
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$(/usr/local/bin/lldpq-config --require-config \
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
+    2>/dev/null); then
+    echo "Content-Type: application/json"
+    echo ""
+    echo '{"success": false, "error": "Runtime configuration is missing or unreadable; run install.sh to repair this installation."}'
+    exit 0
+fi
+eval "$LLDPQ_CONFIG_ASSIGNMENTS"
 
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
@@ -72,44 +86,83 @@ import os
 import subprocess
 import re
 import shlex
+import fcntl
+import stat
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-def load_devices(devices_yaml):
-    """Load devices from devices.yaml"""
+CRON_VALIDATOR = '/usr/local/bin/lldpq-config'
+BACKUP_IMPORT_HELPER = '/usr/local/libexec/lldpq-backup-import.py'
+_CONFIG_LOCK_HANDLE = None
+
+def load_backup_import_helper(module_name):
+    """Load only the installer-owned helper, never a service-tree module."""
     try:
-        import yaml
-        with open(devices_yaml, 'r') as f:
-            config = yaml.safe_load(f)
+        metadata = os.lstat(BACKUP_IMPORT_HELPER)
+    except OSError as exc:
+        raise RuntimeError(
+            'Backup helper is missing; run install.sh to repair this installation.'
+        ) from exc
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755):
+        raise RuntimeError(
+            'Backup helper ownership/mode is unsafe; run install.sh to repair this installation.'
+        )
+    spec = importlib.util.spec_from_file_location(module_name, BACKUP_IMPORT_HELPER)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('Backup helper could not be loaded.')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+def ensure_configuration_lock():
+    """Serialize all /etc/lldpq.conf + cron transactions in this CGI."""
+    global _CONFIG_LOCK_HANDLE
+    if _CONFIG_LOCK_HANDLE is not None:
+        return
+    handle = open('/etc/lldpq.conf.lock', 'a+')
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    _CONFIG_LOCK_HANDLE = handle
+
+def valid_cron_schedule(schedule):
+    if not isinstance(schedule, str):
+        return False
+    try:
+        return subprocess.run(
+            [CRON_VALIDATOR, '--validate-cron', schedule],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def load_devices(devices_yaml):
+    """Load devices through the same canonical parser used by collectors."""
+    parser_path = os.path.join(os.path.dirname(devices_yaml), 'parse_devices.py')
+    if not os.path.isfile(parser_path):
+        return None, 'Canonical device parser is missing: ' + parser_path
+    try:
+        parsed = subprocess.run(
+            [sys.executable, parser_path, '--format', 'json', '--file', devices_yaml],
+            capture_output=True, text=True, timeout=10,
+        )
     except Exception as e:
         return None, str(e)
-    
-    defaults = config.get('defaults', {})
-    default_username = defaults.get('username', 'cumulus')
-    
-    devs = config.get('devices', {})
-    if not devs:
-        return None, 'No devices found in devices.yaml'
-    
-    devices = []
-    for ip_addr, device_config in devs.items():
-        if isinstance(device_config, str):
-            match = re.match(r'^(.+?)\s+@(\w+)$', device_config.strip())
-            if match:
-                hostname = match.group(1).strip()
-            else:
-                hostname = device_config.strip()
-            username = default_username
-        elif isinstance(device_config, dict):
-            hostname = device_config.get('hostname', str(ip_addr))
-            username = device_config.get('username', default_username)
-        else:
-            continue
-        devices.append({
-            'ip': str(ip_addr),
-            'hostname': hostname,
-            'username': username
-        })
-    
+    if parsed.returncode != 0:
+        return None, (parsed.stderr or 'Device inventory is invalid').strip()[:300]
+    try:
+        records = json.loads(parsed.stdout)
+        if not isinstance(records, list) or not records:
+            raise ValueError('No devices found in devices.yaml')
+        devices = [
+            {
+                'ip': record['address'],
+                'hostname': record['hostname'],
+                'username': record['username'],
+            }
+            for record in records
+        ]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+        return None, 'Invalid canonical device data: ' + str(e)
     return devices, None
 
 def ensure_ssh_key(lldpq_user):
@@ -267,9 +320,10 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 # NEVER include host paths/identity (LLDPQ_DIR/USER/SRC, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE)
 # or secrets (AI_API_KEY).
 LLDPQ_PREF_KEYS = (
-    'LLDPQ_CRON', 'GETCONF_CRON', 'SKIP_OPTICAL', 'SKIP_L1',
+    'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL', 'SKIP_OPTICAL', 'SKIP_L1',
     'MONITOR_MAX_PARALLEL', 'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
-    'GET_CONFIGS_MAX_PARALLEL', 'SEND_CMD_MAX_PARALLEL', 'TELEMETRY_MAX_PARALLEL',
+    'GET_CONFIGS_MAX_PARALLEL', 'GET_CONFIGS_SSH_TIMEOUT',
+    'SEND_CMD_MAX_PARALLEL', 'TELEMETRY_MAX_PARALLEL',
     'AUTO_BASE_CONFIG', 'AUTO_ZTP_DISABLE', 'AUTO_SET_HOSTNAME',
     'TRANSCEIVER_FW_SKIP_MODELS', 'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY',
     'TRANSCEIVER_FW_MAX_PARALLEL', 'TRANSCEIVER_FW_MIN_INTERVAL', 'TRANSCEIVER_FW_SSH_TIMEOUT',
@@ -279,6 +333,7 @@ action = post_data.get('action', 'setup')
 
 def read_conf():
     """Read /etc/lldpq.conf into a dict (group-readable by www-data)."""
+    ensure_configuration_lock()
     conf = {}
     try:
         with open('/etc/lldpq.conf') as fh:
@@ -291,22 +346,77 @@ def read_conf():
         pass
     return conf
 
-def write_conf(pairs):
-    """Update key=value pairs in /etc/lldpq.conf as the lldpq user (root-owned file)."""
-    if not pairs:
-        return True
-    keys_re = '|'.join(re.escape(k) for k in pairs)
-    parts = ["sudo sed -i -E '/^(" + keys_re + ")=/d' /etc/lldpq.conf 2>/dev/null || true"]
-    for k, v in pairs.items():
-        parts.append('echo ' + shlex.quote(k + '=' + str(v)) + ' | sudo tee -a /etc/lldpq.conf >/dev/null')
-    parts.append('sudo chown root:www-data /etc/lldpq.conf 2>/dev/null || true')
-    parts.append('sudo chmod 664 /etc/lldpq.conf 2>/dev/null || true')
+def install_text_as_root(content, target, temp_name, mode='644', owner='root:root'):
+    """Use unique fsynced staging and the existing narrow root cp permission."""
+    ensure_configuration_lock()
+    temp_path = None
     try:
-        r = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c', ' && '.join(parts)],
-                           capture_output=True, text=True, timeout=15)
-        return r.returncode == 0
+        fd, temp_path = tempfile.mkstemp(prefix=temp_name + '.', dir='/tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as staged:
+            staged.write(content)
+            staged.flush()
+            os.fsync(staged.fileno())
+        copied = subprocess.run(
+            ['sudo', 'cp', temp_path, target], capture_output=True, text=True, timeout=10,
+        )
+        if copied.returncode != 0:
+            return False
+        try:
+            with open(target, encoding='utf-8') as installed:
+                if installed.read() != content:
+                    return False
+        except Exception:
+            return False
+        if subprocess.run(
+            ['sudo', 'chmod', mode, target], capture_output=True, text=True, timeout=5,
+        ).returncode != 0:
+            return False
+        if subprocess.run(
+            ['sudo', 'chown', owner, target],
+            capture_output=True, text=True, timeout=5,
+        ).returncode != 0:
+            return False
+        return True
     except Exception:
         return False
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+
+def write_conf(pairs):
+    """Update allowlisted key=value pairs without nested sudo shells."""
+    if not pairs:
+        return True
+    ensure_configuration_lock()
+    try:
+        original = open('/etc/lldpq.conf').read()
+    except Exception:
+        return False
+    current = original.splitlines()
+    keys = set(pairs)
+    output = []
+    for line in current:
+        stripped = line.strip()
+        key = stripped.split('=', 1)[0].strip() if '=' in stripped else ''
+        if stripped and not stripped.startswith('#') and key in keys:
+            continue
+        output.append(line)
+    output.extend('%s=%s' % (key, value) for key, value in pairs.items())
+    if install_text_as_root(
+        '\n'.join(output) + '\n', '/etc/lldpq.conf', '.lldpq.conf.setup.tmp',
+        '664', 'root:www-data'
+    ):
+        return True
+    # A copy can succeed before a later chmod/chown failure. Restore the exact
+    # original bytes before reporting failure so callers get a transaction.
+    install_text_as_root(
+        original, '/etc/lldpq.conf', '.lldpq.conf.setup.rollback.tmp',
+        '664', 'root:www-data'
+    )
+    return False
 
 # ─── Action: Save existing private key ───
 if action == 'save-key':
@@ -745,6 +855,7 @@ if action == 'update-log':
 
 # ─── Action: Read cron schedules for lldpq (auto-run) and get-conf (config collection) ───
 if action == 'get-schedules':
+    ensure_configuration_lock()
     cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
     lldpq_expr = ''
     getconf_expr = ''
@@ -778,6 +889,7 @@ if action == 'get-schedules':
 
 # ─── Action: Change cron schedules (presets only) + persist to lldpq.conf ───
 if action == 'set-schedules':
+    ensure_configuration_lock()
     LLDPQ_PRESETS = {5: '*/5 * * * *', 10: '*/10 * * * *', 15: '*/15 * * * *', 20: '*/20 * * * *', 30: '*/30 * * * *'}
     GETCONF_PRESETS = {6: '0 */6 * * *', 12: '0 */12 * * *', 24: '0 0 * * *'}
     try:
@@ -791,6 +903,9 @@ if action == 'set-schedules':
         sys.exit(0)
     lldpq_cron = LLDPQ_PRESETS[mins]
     getconf_cron = GETCONF_PRESETS[hours]
+    if not valid_cron_schedule(lldpq_cron) or not valid_cron_schedule(getconf_cron):
+        print(json.dumps({'success': False, 'error': 'Generated cron schedule failed validation'}))
+        sys.exit(0)
     cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
     try:
         with open(cron_file) as f:
@@ -800,33 +915,53 @@ if action == 'set-schedules':
         sys.exit(0)
     # Rebuild only the lldpq + get-conf lines (preserve every other line byte-for-byte).
     out = []
+    found_lldpq = False
+    found_getconf = False
     for line in orig:
         parts = line.split()
         if (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq':
             out.append(lldpq_cron + ' ' + ' '.join(parts[5:]) + '\n')
+            found_lldpq = True
         elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf':
             out.append(getconf_cron + ' ' + ' '.join(parts[5:]) + '\n')
+            found_getconf = True
         else:
             out.append(line)
+    if not found_lldpq or not found_getconf:
+        missing = []
+        if not found_lldpq:
+            missing.append('/usr/local/bin/lldpq')
+        if not found_getconf:
+            missing.append('/usr/local/bin/get-conf')
+        print(json.dumps({
+            'success': False,
+            'error': 'Required cron entry is missing: ' + ', '.join(missing) +
+                     '. Run install.sh to repair the schedule file.'
+        }))
+        sys.exit(0)
     new_content = ''.join(out)
-    tmp = os.path.join(lldpq_dir, '.cron.tmp')
     try:
-        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', tmp], input=new_content,
-                           capture_output=True, text=True, timeout=10)
-        if w.returncode != 0:
-            print(json.dumps({'success': False, 'error': 'Could not stage cron file'}))
+        if not install_text_as_root(new_content, cron_file, '.cron.setup.tmp', '644'):
+            rolled_back = install_text_as_root(
+                ''.join(orig), cron_file, '.cron.setup.rollback.tmp', '644'
+            )
+            error = ('Could not update cron file; original cron was restored'
+                     if rolled_back else
+                     'Could not update cron file and automatic cron rollback failed')
+            print(json.dumps({'success': False, 'error': error}))
             sys.exit(0)
-        apply_cmd = (
-            'sudo cp ' + shlex.quote(tmp) + ' ' + shlex.quote(cron_file) + ' && '
-            'sudo chmod 644 ' + shlex.quote(cron_file) + ' && rm -f ' + shlex.quote(tmp) + ' && '
-            "sudo sed -i '/^LLDPQ_CRON=/d;/^GETCONF_CRON=/d' /etc/lldpq.conf 2>/dev/null; "
-            'echo ' + shlex.quote('LLDPQ_CRON="' + lldpq_cron + '"') + ' | sudo tee -a /etc/lldpq.conf >/dev/null; '
-            'echo ' + shlex.quote('GETCONF_CRON="' + getconf_cron + '"') + ' | sudo tee -a /etc/lldpq.conf >/dev/null'
-        )
-        a = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c', apply_cmd],
-                           capture_output=True, text=True, timeout=20)
-        if a.returncode != 0:
-            print(json.dumps({'success': False, 'error': (a.stderr or 'apply failed').strip()[:200]}))
+        if not write_conf({
+            'LLDPQ_CRON': '"' + lldpq_cron + '"',
+            'GETCONF_CRON': '"' + getconf_cron + '"',
+        }):
+            # Keep the live cron and persisted configuration in sync.
+            rolled_back = install_text_as_root(
+                ''.join(orig), cron_file, '.cron.rollback.tmp', '644'
+            )
+            error = ('Cron updated but config persistence failed; cron was rolled back'
+                     if rolled_back else
+                     'Cron updated but config persistence failed, and automatic cron rollback failed')
+            print(json.dumps({'success': False, 'error': error}))
             sys.exit(0)
         print(json.dumps({'success': True, 'lldpq_cron': lldpq_cron, 'getconf_cron': getconf_cron}))
     except Exception as e:
@@ -1006,7 +1141,7 @@ if action == 'test-alert':
 
 # ─── Action: Export config bundle (devices/topology/topology_config/notifications) ───
 if action == 'backup-export':
-    import base64, io, tarfile, time as _t
+    import base64, importlib.util, io, tarfile, time as _t
     include_key = bool(post_data.get('include_key'))
     wanted = [('devices.yaml', lldpq_dir), ('topology.dot', lldpq_dir),
               ('topology_config.yaml', lldpq_dir), ('notifications.yaml', lldpq_dir),
@@ -1015,12 +1150,18 @@ if action == 'backup-export':
     added = []
     has_key = False
     try:
+        backup_tools = load_backup_import_helper('lldpq_backup_tools')
+        # Native and Docker installs intentionally expose several config files
+        # through symlinks. Read their resolved bytes under a managed root and
+        # create regular tar members; path-based archive insertion would preserve
+        # the link itself and produce a bundle the fail-closed importer rejects.
+        config_files = backup_tools.collect_managed_config_files(
+            wanted, (lldpq_dir, web_root)
+        )
         with tarfile.open(fileobj=buf, mode='w:gz') as tar:
-            for fn, base_dir in wanted:
-                p = os.path.join(base_dir, fn)
-                if os.path.isfile(p):
-                    tar.add(p, arcname=fn)
-                    added.append(fn)
+            for fn, content in config_files:
+                backup_tools.add_regular_tar_member(tar, fn, content, mode=0o600)
+                added.append(fn)
             # Collector SSH key (private + public). Opt-in — makes the bundle SECRET, but lets a
             # restore reach the switches immediately (true "move to another host" bundle).
             if include_key:
@@ -1028,17 +1169,28 @@ if action == 'backup-export':
                     kp = os.path.expanduser('~%s/.ssh/%s' % (lldpq_user, key_name))
                     r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', kp], capture_output=True, timeout=5)
                     if r.returncode == 0 and b'PRIVATE KEY' in r.stdout:
-                        ti = tarfile.TarInfo('ssh/%s' % key_name); ti.size = len(r.stdout); ti.mode = 0o600
-                        tar.addfile(ti, io.BytesIO(r.stdout)); added.append('ssh/%s' % key_name); has_key = True
-                        rp = subprocess.run(['sudo', '-u', lldpq_user, 'cat', kp + '.pub'], capture_output=True, timeout=5)
-                        if rp.returncode == 0 and rp.stdout.strip():
-                            tip = tarfile.TarInfo('ssh/%s.pub' % key_name); tip.size = len(rp.stdout); tip.mode = 0o644
-                            tar.addfile(tip, io.BytesIO(rp.stdout)); added.append('ssh/%s.pub' % key_name)
+                        derived = subprocess.run(
+                            ['sudo', '-u', lldpq_user, 'ssh-keygen', '-y', '-f', kp],
+                            capture_output=True, timeout=10
+                        )
+                        if derived.returncode != 0 or not derived.stdout.strip():
+                            raise RuntimeError('Could not validate/derive public key for ' + key_name)
+                        backup_tools.add_regular_tar_member(
+                            tar, 'ssh/%s' % key_name, r.stdout, mode=0o600
+                        )
+                        added.append('ssh/%s' % key_name); has_key = True
+                        # Derive instead of trusting a possibly missing/stale .pub.
+                        public_bytes = derived.stdout.strip() + b'\n'
+                        backup_tools.add_regular_tar_member(
+                            tar, 'ssh/%s.pub' % key_name, public_bytes, mode=0o644
+                        )
+                        added.append('ssh/%s.pub' % key_name)
                         break
             # Portable preferences from /etc/lldpq.conf: ONLY tunable knobs (schedules, parallelism,
             # toggles, AI provider/model). Deliberately excludes host paths/identity (LLDPQ_DIR,
             # LLDPQ_USER, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE) and secrets (AI_API_KEY).
             PREF_KEYS = LLDPQ_PREF_KEYS
+            ensure_configuration_lock()
             try:
                 conf_lines = open('/etc/lldpq.conf').read().splitlines()
             except Exception:
@@ -1050,8 +1202,10 @@ if action == 'backup-export':
                 pdata = ('# LLDPq portable preferences — schedules / parallelism / toggles.\n'
                          '# No host paths, no secrets. Re-applied by key on restore.\n'
                          + '\n'.join(pref_lines) + '\n').encode()
-                ti = tarfile.TarInfo('prefs/lldpq.conf'); ti.size = len(pdata); ti.mode = 0o644
-                tar.addfile(ti, io.BytesIO(pdata)); added.append('prefs/lldpq.conf')
+                backup_tools.add_regular_tar_member(
+                    tar, 'prefs/lldpq.conf', pdata, mode=0o600
+                )
+                added.append('prefs/lldpq.conf')
     except Exception as e:
         print(json.dumps({'success': False, 'error': 'Bundle failed: ' + str(e)}))
         sys.exit(0)
@@ -1065,128 +1219,22 @@ if action == 'backup-export':
 
 # ─── Action: Restore config bundle (upload) — only known config files, no path traversal ───
 if action == 'backup-import':
-    import base64, io, tarfile
+    import importlib.util
     b64 = post_data.get('data', '')
     if not b64:
         print(json.dumps({'success': False, 'error': 'No file data'}))
         sys.exit(0)
     try:
-        raw = base64.b64decode(b64)
-    except Exception:
-        print(json.dumps({'success': False, 'error': 'Invalid file (not base64)'}))
+        importer = load_backup_import_helper('lldpq_backup_import')
+        result = importer.restore_bundle(
+            b64, lldpq_user=lldpq_user, lldpq_dir=lldpq_dir, web_root=web_root,
+            pref_keys=LLDPQ_PREF_KEYS, validate_cron=valid_cron_schedule,
+            acquire_lock=ensure_configuration_lock,
+        )
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': 'Backup restore failed: ' + str(exc)[:300]}))
         sys.exit(0)
-    allowed = {'devices.yaml': lldpq_dir, 'topology.dot': lldpq_dir,
-               'topology_config.yaml': lldpq_dir, 'notifications.yaml': lldpq_dir,
-               'display-aliases.json': web_root}
-    key_names = {'id_ed25519', 'id_ed25519.pub', 'id_rsa', 'id_rsa.pub'}
-    ssh_dir = os.path.expanduser('~%s/.ssh' % lldpq_user)
-    restored = []
-    keys = []
-    prefs_applied = []
-
-    def _apply_cron_from_conf(vals):
-        # Schedules live in the cron file too (that's what actually runs), so mirror them there.
-        def _clean(x):
-            return x.strip().strip('"').strip("'") if x else None
-        lc, gc = _clean(vals.get('LLDPQ_CRON')), _clean(vals.get('GETCONF_CRON'))
-        if not lc and not gc:
-            return
-        cron_file = '/etc/cron.d/lldpq' if os.path.exists('/etc/cron.d/lldpq') else '/etc/crontab'
-        try:
-            orig = open(cron_file).read().splitlines(True)
-        except Exception:
-            return
-        outl = []
-        for line in orig:
-            parts = line.split()
-            if (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq' and lc:
-                outl.append(lc + ' ' + ' '.join(parts[5:]) + '\n')
-            elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf' and gc:
-                outl.append(gc + ' ' + ' '.join(parts[5:]) + '\n')
-            else:
-                outl.append(line)
-        # cron file is not tee-able via sudoers: stage as the service user, then `sudo cp` (allowed).
-        tmp = os.path.join(lldpq_dir, '.cron.restore.tmp')
-        st = subprocess.run(['sudo', '-u', lldpq_user, 'tee', tmp], input=''.join(outl),
-                            capture_output=True, text=True, timeout=10)
-        if st.returncode == 0:
-            subprocess.run(['sudo', 'cp', tmp, cron_file], capture_output=True, timeout=10)
-            subprocess.run(['sudo', 'chmod', '644', cron_file], capture_output=True, timeout=5)
-            subprocess.run(['sudo', '-u', lldpq_user, 'rm', '-f', tmp], capture_output=True, timeout=5)
-
-    try:
-        with tarfile.open(fileobj=io.BytesIO(raw), mode='r:gz') as tar:
-            for m in tar.getmembers():
-                if not m.isfile():
-                    continue
-                name = m.name.replace('\\', '/')
-                base = os.path.basename(name)
-                # Portable preferences -> merge ONLY whitelisted keys into /etc/lldpq.conf (never
-                # touch host paths/identity), and reflect schedules into the live cron file.
-                if name == 'prefs/lldpq.conf':
-                    try:
-                        txt = tar.extractfile(m).read().decode('utf-8', 'replace')
-                    except Exception:
-                        txt = ''
-                    newvals = {}
-                    for line in txt.splitlines():
-                        s = line.strip()
-                        if s and not s.startswith('#') and '=' in s:
-                            k, v = s.split('=', 1)
-                            k = k.strip()
-                            if k in LLDPQ_PREF_KEYS:
-                                newvals[k] = v.strip()
-                    if newvals:
-                        try:
-                            cur = open('/etc/lldpq.conf').read().splitlines()
-                        except Exception:
-                            cur = []
-                        seen = set()
-                        outc = []
-                        for line in cur:
-                            s = line.strip()
-                            if s and not s.startswith('#') and '=' in s and s.split('=', 1)[0].strip() in newvals:
-                                k = s.split('=', 1)[0].strip()
-                                outc.append('%s=%s' % (k, newvals[k])); seen.add(k)
-                            else:
-                                outc.append(line)
-                        for k, v in newvals.items():
-                            if k not in seen:
-                                outc.append('%s=%s' % (k, v))
-                        w = subprocess.run(['sudo', 'tee', '/etc/lldpq.conf'],
-                                           input='\n'.join(outc) + '\n', capture_output=True, text=True, timeout=10)
-                        if w.returncode == 0:
-                            prefs_applied = sorted(newvals.keys())
-                            _apply_cron_from_conf(newvals)
-                    continue
-                # SSH key files (ssh/id_ed25519[.pub]) -> service user's ~/.ssh with strict perms
-                if name.startswith('ssh/') and base in key_names:
-                    content = tar.extractfile(m).read()
-                    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', ssh_dir], capture_output=True, timeout=10)
-                    dest = os.path.join(ssh_dir, base)
-                    w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
-                                       input=content, capture_output=True, timeout=10)
-                    if w.returncode == 0:
-                        mode = '644' if base.endswith('.pub') else '600'
-                        subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c',
-                                        'chmod %s %s' % (mode, shlex.quote(dest))], capture_output=True, timeout=10)
-                        keys.append(base)
-                    continue
-                # Config files
-                if base in allowed:
-                    content = tar.extractfile(m).read()
-                    dest = os.path.join(allowed[base], base)
-                    w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', dest],
-                                       input=content, capture_output=True, timeout=15)
-                    if w.returncode == 0:
-                        restored.append(base)
-    except Exception as e:
-        print(json.dumps({'success': False, 'error': 'Not a valid LLDPq config bundle: ' + str(e)[:150]}))
-        sys.exit(0)
-    if not restored and not keys and not prefs_applied:
-        print(json.dumps({'success': False, 'error': 'No recognized config files inside the archive.'}))
-        sys.exit(0)
-    print(json.dumps({'success': True, 'restored': restored, 'keys': keys, 'prefs': prefs_applied}))
+    print(json.dumps(result))
     sys.exit(0)
 
 # ─── Action: Maintenance — disk usage + count of old update backups ───

@@ -6,12 +6,15 @@
 #   ./uninstall.sh -y         # auto-yes
 #   ./uninstall.sh --dry-run  # show what would be removed, do nothing
 #   ./uninstall.sh --keep-data  # keep monitor-results/lldp-results/devices.yaml
+#   ./uninstall.sh --force-partial # also remove an unrecognized partial install tree
 #   ./uninstall.sh --remove-docker # also remove Docker packages and data
 #   ./uninstall.sh --remove-dhcp   # also remove isc-dhcp-server package/config
 #
 # What it removes:
 #   - LLDPq cron entries (/etc/crontab + /etc/cron.d/lldpq)
 #   - lldpq-trigger daemon process
+#   - retained-import recovery systemd service + path watcher
+#   - root-owned backup/import helper and validated native recovery remnants
 #   - /usr/local/bin/{lldpq, lldpq-config, lldpq-trigger, lldpq-ai-analyze, zzh, pping, send-cmd, get-conf}
 #   - /var/www/html web content (nginx + fcgiwrap site removed)
 #   - $LLDPQ_INSTALL_DIR (default ~/lldpq)
@@ -25,6 +28,8 @@
 
 set -u
 set -o pipefail
+
+LLDPQ_BACKUP_IMPORT_HELPER="/usr/local/libexec/lldpq-backup-import.py"
 
 load_lldpq_uninstall_config() {
     local config_file="${1:-/etc/lldpq.conf}"
@@ -123,7 +128,7 @@ assert_lldpq_install_tree() {
     local path="$1"
     [[ -d "$path" ]] || return 0
     [[ -f "$path/devices.yaml" && -f "$path/monitor.sh" ]] || {
-        echo "Refusing uninstall of unrecognized directory: '$path'" >&2
+        echo "Unrecognized or partial LLDPq directory: '$path'" >&2
         return 1
     }
 }
@@ -145,6 +150,21 @@ filter_legacy_lldpq_crontab() {
     ' "$input_file" > "$output_file"
 }
 
+native_recovery_namespace_present() {
+    local user="$1" home state
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    [[ -n "$home" && "$home" == /* && "$home" != "/" ]] || return 0
+    state="$home/.lldpq-state"
+    [[ ! -L "$state" ]] || return 0
+    [[ -d "$state" ]] || return 1
+    sudo find -P "$state" -mindepth 1 -maxdepth 1 \
+        \( -name '.backup-import-recovery' -o \
+           -name '.backup-import-recovery.tmp-*' -o \
+           -name '.backup-import-recovery.committed-*' -o \
+           -name '.backup-import-recovery.rolled-back-*' \) \
+        -print -quit 2>/dev/null | grep -q .
+}
+
 if [[ "${LLDPQ_UNINSTALL_LIB_ONLY:-false}" == "true" ]]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -156,6 +176,7 @@ KEEP_DATA=false
 REMOVE_DHCP=false
 REMOVE_NGINX_PKG=false
 REMOVE_DOCKER_PKG=false
+FORCE_PARTIAL=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -165,6 +186,7 @@ while [[ $# -gt 0 ]]; do
         --remove-dhcp) REMOVE_DHCP=true ;;
         --remove-nginx) REMOVE_NGINX_PKG=true ;;
         --remove-docker) REMOVE_DOCKER_PKG=true ;;
+        --force-partial) FORCE_PARTIAL=true ;;
         -h|--help)
             sed -n '1,30p' "$0"
             exit 0
@@ -220,7 +242,16 @@ if paths_overlap "$LLDPQ_INSTALL_DIR" "$WEB_ROOT"; then
     echo "Refusing uninstall: LLDPQ_DIR and WEB_ROOT overlap" >&2
     exit 1
 fi
-assert_lldpq_install_tree "$LLDPQ_INSTALL_DIR" || exit 1
+PARTIAL_INSTALL_TREE=false
+if ! assert_lldpq_install_tree "$LLDPQ_INSTALL_DIR"; then
+    PARTIAL_INSTALL_TREE=true
+    if $FORCE_PARTIAL; then
+        echo "  [!] --force-partial: the guarded partial install tree will be removed" >&2
+    else
+        echo "  [!] Known LLDPq system components will be cleaned, but this directory will be left in place." >&2
+        echo "      Re-run with --force-partial only after verifying the path." >&2
+    fi
+fi
 if [[ ! "$LLDPQ_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
     echo "Refusing invalid LLDPQ_USER: '$LLDPQ_USER'" >&2
     exit 1
@@ -257,6 +288,80 @@ for proc in lldpq-trigger lldpq-ai-analyze fabric-scan.sh monitor.sh check-lldp.
         echo "  killed $proc"
     fi
 done
+
+# Stop the watcher before removing either the lock or the executable tree. An
+# authority published by an interrupted import must not start a now-orphaned
+# recovery process while uninstall is in progress.
+step "Removing retained-import recovery units..."
+run "sudo systemctl disable --now lldpq-recovery.path lldpq-recovery.service 2>/dev/null || true"
+if ! $DRY_RUN && \
+   { sudo systemctl is-active --quiet lldpq-recovery.path 2>/dev/null || \
+     sudo systemctl is-active --quiet lldpq-recovery.service 2>/dev/null; }; then
+    echo "[!] Retained-import recovery units are still active; cleanup stopped" >&2
+    exit 1
+fi
+for unit in lldpq-recovery.path lldpq-recovery.service; do
+    if ! run "sudo rm -f '/etc/systemd/system/$unit' '/etc/systemd/system/multi-user.target.wants/$unit'"; then
+        echo "[!] Could not remove retained-import recovery unit: $unit" >&2
+        exit 1
+    fi
+done
+run "sudo systemctl daemon-reload 2>/dev/null || true"
+echo "  retained-import recovery service + path watcher removed"
+
+# Quiesce every LLDPq CGI before purging its rollback authority. Stopping only
+# the recovery path leaves a race where a running or socket-queued Setup import
+# can publish a new authority after purge and before the helper is removed.
+FCGIWRAP_SERVICE_WAS_ACTIVE=false
+FCGIWRAP_SOCKET_WAS_ACTIVE=false
+systemctl is-active --quiet fcgiwrap.service 2>/dev/null && \
+    FCGIWRAP_SERVICE_WAS_ACTIVE=true
+systemctl is-active --quiet fcgiwrap.socket 2>/dev/null && \
+    FCGIWRAP_SOCKET_WAS_ACTIVE=true
+echo "  [i] fcgiwrap is shared: LLDPq CGI execution will be paused during cleanup."
+echo "      Previously active units will be restored after the LLDPq route and CGI files are removed."
+run "sudo systemctl stop fcgiwrap.socket fcgiwrap.service 2>/dev/null || true"
+if ! $DRY_RUN && \
+   { systemctl is-active --quiet fcgiwrap.socket 2>/dev/null || \
+     systemctl is-active --quiet fcgiwrap.service 2>/dev/null; }; then
+    echo "[!] fcgiwrap could not be quiesced; recovery authority was not purged" >&2
+    exit 1
+fi
+
+# Purge only the helper's reserved, validated recovery directories. The helper
+# resolves the passwd home, opens it and .lldpq-state with O_NOFOLLOW, validates
+# ownership/modes/names, and deletes through directory file descriptors.
+if $DRY_RUN; then
+    echo "DRY-RUN  sudo '$LLDPQ_BACKUP_IMPORT_HELPER' purge-native-state --user '$LLDPQ_USER'"
+else
+    _backup_helper_metadata=$(sudo stat -c '%u:%g:%a' -- \
+        "$LLDPQ_BACKUP_IMPORT_HELPER" 2>/dev/null || true)
+    if [[ -f "$LLDPQ_BACKUP_IMPORT_HELPER" ]] && \
+       [[ ! -L "$LLDPQ_BACKUP_IMPORT_HELPER" ]] && \
+       [[ "$_backup_helper_metadata" == "0:0:755" ]]; then
+        if ! sudo "$LLDPQ_BACKUP_IMPORT_HELPER" purge-native-state \
+            --user "$LLDPQ_USER"; then
+            echo "[!] Native backup-import recovery state was not safely removed; uninstall stopped" >&2
+            exit 1
+        fi
+    elif native_recovery_namespace_present "$LLDPQ_USER"; then
+        echo "[!] Recovery remnants exist but the root-owned cleanup helper is missing or unsafe" >&2
+        echo "    Repair the installation before uninstalling so old snapshots cannot survive." >&2
+        exit 1
+    fi
+fi
+if [[ -d "$LLDPQ_BACKUP_IMPORT_HELPER" ]] && \
+   [[ ! -L "$LLDPQ_BACKUP_IMPORT_HELPER" ]]; then
+    echo "[!] Refusing to recursively remove unexpected helper directory: $LLDPQ_BACKUP_IMPORT_HELPER" >&2
+    exit 1
+fi
+run "sudo rm -f '$LLDPQ_BACKUP_IMPORT_HELPER'"
+if ! $DRY_RUN && \
+   { [[ -e "$LLDPQ_BACKUP_IMPORT_HELPER" ]] || [[ -L "$LLDPQ_BACKUP_IMPORT_HELPER" ]]; }; then
+    echo "[!] Root-owned backup/import helper could not be removed" >&2
+    exit 1
+fi
+echo "  root-owned backup/import helper removed"
 
 # ─── 2. Telemetry stack ───────────────────────────────────────────────
 step "Removing telemetry stack..."
@@ -308,6 +413,11 @@ done
 # ─── 6. Auth + sessions + config ──────────────────────────────────────
 step "Removing config + auth files..."
 for f in /etc/lldpq.conf /etc/lldpq.conf.lock /etc/lldpq-users.conf; do
+    if [[ "$f" == "/etc/lldpq.conf" && "$PARTIAL_INSTALL_TREE" == "true" && \
+          "$FORCE_PARTIAL" != "true" ]]; then
+        echo "  kept $f so a verified --force-partial rerun retains the custom install path"
+        continue
+    fi
     if [[ -e "$f" ]]; then
         run "sudo rm -f '$f'"
         echo "  removed $f"
@@ -376,10 +486,45 @@ for d in "${WEB_DIRS[@]}"; do
     [[ -d "$d" ]] && run "sudo rm -rf '$d'" && echo "  removed $d"
 done
 
+# The LLDPq nginx route and CGI files are now gone, so reactivating a shared
+# fcgiwrap unit cannot enqueue another backup import. Restore only what was
+# active before uninstall; --remove-nginx intentionally leaves it stopped for
+# the package-removal phase below.
+if $REMOVE_NGINX_PKG; then
+    echo "  fcgiwrap remains stopped because --remove-nginx was requested"
+elif $FCGIWRAP_SOCKET_WAS_ACTIVE || $FCGIWRAP_SERVICE_WAS_ACTIVE; then
+    step "Restoring shared fcgiwrap service..."
+    if $FCGIWRAP_SOCKET_WAS_ACTIVE; then
+        run "sudo systemctl start fcgiwrap.socket"
+    fi
+    if $FCGIWRAP_SERVICE_WAS_ACTIVE; then
+        run "sudo systemctl start fcgiwrap.service"
+    fi
+    FCGIWRAP_RESTORE_FAILED=false
+    if ! $DRY_RUN; then
+        if $FCGIWRAP_SOCKET_WAS_ACTIVE && \
+           ! systemctl is-active --quiet fcgiwrap.socket 2>/dev/null; then
+            FCGIWRAP_RESTORE_FAILED=true
+        fi
+        if $FCGIWRAP_SERVICE_WAS_ACTIVE && \
+           ! systemctl is-active --quiet fcgiwrap.service 2>/dev/null; then
+            FCGIWRAP_RESTORE_FAILED=true
+        fi
+    fi
+    if $FCGIWRAP_RESTORE_FAILED; then
+        echo "[!] LLDPq was removed, but the previously active shared fcgiwrap unit could not be restored" >&2
+        echo "    Restore it manually with: sudo systemctl start fcgiwrap.socket fcgiwrap.service" >&2
+        exit 1
+    fi
+    echo "  shared fcgiwrap state restored"
+fi
+
 # ─── 9. Install directory ─────────────────────────────────────────────
 step "Removing install directory..."
 if [[ -d "$LLDPQ_INSTALL_DIR" ]]; then
-    if $KEEP_DATA; then
+    if $PARTIAL_INSTALL_TREE && ! $FORCE_PARTIAL; then
+        echo "  left unrecognized partial directory in place: $LLDPQ_INSTALL_DIR"
+    elif $KEEP_DATA; then
         # Keep monitor-results / lldp-results / alert-states / devices.yaml
         run "find '$LLDPQ_INSTALL_DIR' -mindepth 1 -maxdepth 1 ! -name 'monitor-results' ! -name 'lldp-results' ! -name 'alert-states' ! -name 'devices.yaml' ! -name 'notifications.yaml' -exec sudo rm -rf {} +"
         echo "  cleaned $LLDPQ_INSTALL_DIR (kept data)"
@@ -433,7 +578,12 @@ else
 fi
 echo ""
 echo "Verify with:"
-echo "  ls /etc/lldpq* 2>/dev/null   # should be empty"
-echo "  ls $LLDPQ_INSTALL_DIR 2>/dev/null  # should not exist"
+if $PARTIAL_INSTALL_TREE && ! $FORCE_PARTIAL; then
+    echo "  ls /etc/lldpq* 2>/dev/null   # lldpq.conf is intentionally retained"
+    echo "  inspect $LLDPQ_INSTALL_DIR manually (partial tree intentionally retained)"
+else
+    echo "  ls /etc/lldpq* 2>/dev/null   # should be empty"
+    echo "  ls $LLDPQ_INSTALL_DIR 2>/dev/null  # should not exist"
+fi
 echo "  systemctl status nginx       # nginx state (if you kept it)"
 echo "  crontab -l; cat /etc/crontab # no LLDPq lines"

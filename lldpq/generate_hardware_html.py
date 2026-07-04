@@ -14,7 +14,8 @@ Licensed under MIT License - see LICENSE file for details
 import json
 import os
 import re
-from datetime import datetime
+import html
+from datetime import datetime, timezone
 from collection_freshness import is_current_collection, read_asset_snapshot
 
 try:
@@ -22,6 +23,222 @@ try:
 except Exception:
     def canonical(_n):
         return _n
+
+
+# One grading contract drives both the calculation and the threshold reference
+# rendered in the report. Tuples are the boundaries between
+# EXCELLENT/GOOD/WARNING/CRITICAL in that order. Notification warning/critical
+# values are loaded below, while the extra GOOD/EXCELLENT boundaries retain
+# conservative defaults unless explicitly configured.
+DEFAULT_HARDWARE_THRESHOLDS = {
+    "cpu_temp_c": (60.0, 75.0, 85.0),
+    "asic_temp_c": (70.0, 80.0, 90.0),
+    "memory_percent": (60.0, 80.0, 90.0),
+    "load_per_core": (0.7, 1.0, 1.5),
+    # Low values are bad for fan speed and PSU efficiency.  These tuples are
+    # CRITICAL/WARNING/GOOD boundaries; values above the final boundary are
+    # EXCELLENT (strictly above for compatibility with the existing grading).
+    "fan_rpm": (3000.0, 4000.0, 5000.0),
+    "psu_efficiency_percent": (30.0, 80.0, 90.0),
+}
+
+
+def _finite_number(mapping, key, fallback):
+    value = mapping.get(key, fallback) if isinstance(mapping, dict) else fallback
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+    return value if value == value and abs(value) != float("inf") else float(fallback)
+
+
+def load_hardware_thresholds():
+    """Load the alert thresholds and safely extend them to four UI grades."""
+    defaults = DEFAULT_HARDWARE_THRESHOLDS
+    try:
+        import yaml
+
+        config_file = os.path.join(os.path.dirname(__file__), "notifications.yaml")
+        with open(config_file, "r", encoding="utf-8") as source:
+            config = yaml.safe_load(source) or {}
+        configured = config.get("thresholds", {}).get("hardware", {})
+        if not isinstance(configured, dict):
+            raise ValueError("hardware thresholds must be a mapping")
+    except Exception as exc:
+        print(f"Warning: using default hardware thresholds: {exc}")
+        return dict(defaults)
+
+    def high_is_bad(key, warning_key, critical_key, excellent_default):
+        warning = _finite_number(configured, warning_key, defaults[key][1])
+        critical = _finite_number(configured, critical_key, defaults[key][2])
+        excellent = _finite_number(
+            configured,
+            f"{warning_key.removesuffix('_warning')}_excellent",
+            excellent_default,
+        )
+        values = (excellent, warning, critical)
+        return values if 0 <= excellent < warning < critical else defaults[key]
+
+    def low_is_bad(key, critical_key, warning_key, excellent_default):
+        critical = _finite_number(configured, critical_key, defaults[key][0])
+        warning = _finite_number(configured, warning_key, defaults[key][1])
+        excellent = _finite_number(
+            configured,
+            f"{warning_key.removesuffix('_warning')}_excellent",
+            excellent_default,
+        )
+        values = (critical, warning, excellent)
+        return values if 0 <= critical < warning < excellent else defaults[key]
+
+    cpu_warning = _finite_number(configured, "cpu_temp_warning", 75.0)
+    asic_warning = _finite_number(configured, "asic_temp_warning", 80.0)
+    memory_warning = _finite_number(configured, "memory_usage_warning", 80.0)
+    fan_warning = _finite_number(configured, "fan_rpm_warning", 4000.0)
+    psu_warning = _finite_number(configured, "psu_efficiency_warning", 80.0)
+
+    return {
+        "cpu_temp_c": high_is_bad(
+            "cpu_temp_c", "cpu_temp_warning", "cpu_temp_critical",
+            min(defaults["cpu_temp_c"][0], cpu_warning - 1.0),
+        ),
+        "asic_temp_c": high_is_bad(
+            "asic_temp_c", "asic_temp_warning", "asic_temp_critical",
+            min(70.0, asic_warning - 1.0),
+        ),
+        "memory_percent": high_is_bad(
+            "memory_percent", "memory_usage_warning", "memory_usage_critical",
+            min(defaults["memory_percent"][0], memory_warning - 1.0),
+        ),
+        # notifications.yaml currently defines absolute load thresholds, while
+        # this report intentionally grades load per core. Keep that distinct
+        # metric on its validated default rather than mixing units.
+        "load_per_core": defaults["load_per_core"],
+        "fan_rpm": low_is_bad(
+            "fan_rpm", "fan_rpm_critical", "fan_rpm_warning",
+            max(5000.0, fan_warning + 1.0),
+        ),
+        "psu_efficiency_percent": low_is_bad(
+            "psu_efficiency_percent", "psu_efficiency_critical",
+            "psu_efficiency_warning", max(90.0, psu_warning + 1.0),
+        ),
+    }
+
+
+HARDWARE_THRESHOLDS = load_hardware_thresholds()
+
+GRADE_PRIORITY = {"CRITICAL": 4, "WARNING": 3, "GOOD": 2, "EXCELLENT": 1}
+HISTORY_MAX_SKEW_SECONDS = 300.0
+
+
+def grade_high_is_bad(value, threshold_key):
+    """Grade a metric where higher values are worse."""
+    if not isinstance(value, (int, float)):
+        return None
+    excellent_max, good_max, warning_max = HARDWARE_THRESHOLDS[threshold_key]
+    if value < excellent_max:
+        return "EXCELLENT"
+    if value < good_max:
+        return "GOOD"
+    if value < warning_max:
+        return "WARNING"
+    return "CRITICAL"
+
+
+def grade_low_is_bad(value, threshold_key):
+    """Grade a metric where lower values are worse."""
+    if not isinstance(value, (int, float)):
+        return None
+    critical_min, warning_min, excellent_min = HARDWARE_THRESHOLDS[threshold_key]
+    if value > excellent_min:
+        return "EXCELLENT"
+    if value >= warning_min:
+        return "GOOD"
+    if value >= critical_min:
+        return "WARNING"
+    return "CRITICAL"
+
+
+def _power_to_watts(value, unit):
+    watts = float(value)
+    if unit == "kW":
+        return watts * 1000.0
+    if unit == "mW":
+        return watts / 1000.0
+    return watts
+
+
+def _parse_history_timestamp(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # Legacy entries were written in local time.  Treat them as local for
+        # the sole purpose of comparing them with the raw file mtime.
+        return parsed.timestamp()
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def fresh_history_entry(history, raw_file, max_skew_seconds=HISTORY_MAX_SKEW_SECONDS):
+    """Return history data only when it belongs to the current raw sample."""
+    if not isinstance(history, list) or not history:
+        return None
+    entry = history[-1]
+    if not isinstance(entry, dict):
+        return None
+    entry_timestamp = _parse_history_timestamp(entry.get("timestamp"))
+    if entry_timestamp is None:
+        return None
+    try:
+        raw_timestamp = os.path.getmtime(raw_file)
+    except OSError:
+        return None
+    if abs(entry_timestamp - raw_timestamp) > max(max_skew_seconds, 0.0):
+        return None
+    return entry
+
+
+def _format_threshold(value):
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def threshold_reference_rows():
+    """Render the visible reference from the same constants used for grading."""
+    rows = []
+    for label, key, unit in (
+        ("CPU Temperature", "cpu_temp_c", "°C"),
+        ("ASIC Temperature", "asic_temp_c", "°C"),
+        ("Memory Usage", "memory_percent", "%"),
+        ("CPU Load (5min avg per core)", "load_per_core", ""),
+    ):
+        excellent_max, good_max, warning_max = HARDWARE_THRESHOLDS[key]
+        a, b, c = map(_format_threshold, (excellent_max, good_max, warning_max))
+        rows.append(
+            f"<tr><td>{label}</td>"
+            f"<td>&lt; {a}{unit}</td>"
+            f"<td>&ge; {a}{unit} and &lt; {b}{unit}</td>"
+            f"<td>&ge; {b}{unit} and &lt; {c}{unit}</td>"
+            f"<td>&ge; {c}{unit}</td></tr>"
+        )
+    for label, key, unit in (
+        ("Fan Speed", "fan_rpm", " RPM"),
+        ("PSU Efficiency", "psu_efficiency_percent", "%"),
+    ):
+        critical_min, warning_min, excellent_min = HARDWARE_THRESHOLDS[key]
+        a, b, c = map(_format_threshold, (critical_min, warning_min, excellent_min))
+        rows.append(
+            f"<tr><td>{label}</td>"
+            f"<td>&gt; {c}{unit}</td>"
+            f"<td>&ge; {b}{unit} and &le; {c}{unit}</td>"
+            f"<td>&ge; {a}{unit} and &lt; {b}{unit}</td>"
+            f"<td>&lt; {a}{unit}</td></tr>"
+        )
+    return "\n".join(rows)
 
 def parse_assets_file(assets_file_path="assets.ini"):
     """Parse assets.ini file to get device model information"""
@@ -67,7 +284,12 @@ def parse_assets_file(assets_file_path="assets.ini"):
     return device_info
 
 def parse_temperature_from_hardware_file(device_name):
-    """Parse CPU and ASIC temperatures from raw hardware file"""
+    """Parse the hottest CPU and ASIC sensor from the raw hardware file.
+
+    Alerts use the maximum observed temperature because one hot core/package
+    is operationally significant. The report uses the same max metric rather
+    than averaging cores and disagreeing with the alert state.
+    """
     
     cpu_temp = None
     asic_temp = None
@@ -81,72 +303,37 @@ def parse_temperature_from_hardware_file(device_name):
         with open(hardware_file, 'r') as f:
             content = f.read()
         
-        # Parse ASIC temperature: try fast Linux/hw-management sources first.
-        asic_mgmt = re.search(r'^HW_MGMT_ASIC:\s*([0-9]+\.?[0-9]*)', content, re.MULTILINE)
-        if asic_mgmt:
-            asic_temp = float(asic_mgmt.group(1))
-        else:
-            asic_match = re.search(r'Ambient ASIC Temp:\s*\+?(-?\d+\.?\d*)[°C]', content)
-            if asic_match:
-                asic_temp = float(asic_match.group(1))
-            else:
-                thermal_zone_asic = re.search(r'^THERMAL_ZONE_ASIC:\s*([0-9]+\.?[0-9]*)', content, re.MULTILINE)
-                if thermal_zone_asic:
-                    asic_temp = float(thermal_zone_asic.group(1))
-                else:
-                    hwmon_asic = re.search(r'^HWMON_ASIC:\s*([0-9]+\.?[0-9]*)', content, re.MULTILINE)
-                    if hwmon_asic:
-                        asic_temp = float(hwmon_asic.group(1))
-                    else:
-                        # Passive support for already-collected NVUE output; monitor.sh does not run nv.
-                        nvue_asic = re.search(
-                            r'^\s*Asic-Temp-Sensor\s+(-?\d+\.?\d*)\s+',
-                            content,
-                            re.MULTILINE | re.IGNORECASE,
-                        )
-                        if nvue_asic:
-                            asic_temp = float(nvue_asic.group(1))
-        
-        # Parse CPU temperature: prefer real CPU sensors and avoid unrelated ones (e.g., drivetemp)
-        # Pattern 1: Average of CPU cores "Core 0:        +40.0°C"
-        core_matches = re.findall(r'Core \d+:\s*\+?(-?\d+\.?\d*)[°C]', content)
-        if core_matches:
-            core_temps = [float(temp) for temp in core_matches]
-            cpu_temp = sum(core_temps) / len(core_temps)
-        else:
-            # Pattern 2: CPU package temperature
-            package_match = re.search(r'Package id \d+:\s*\+?(-?\d+\.?\d*)[°C]', content)
-            if package_match:
-                cpu_temp = float(package_match.group(1))
-            else:
-                # Pattern 3: "CPU ACPI temp:  +27.8°C"
-                cpu_acpi_matches = re.findall(r'CPU ACPI temp:\s*\+?(-?\d+\.?\d*)[°C]', content)
-                if cpu_acpi_matches:
-                    cpu_temp = float(cpu_acpi_matches[0])
-                else:
-                    # Pattern 4: HW_MGMT_CPU injected by monitor.sh
-                    cpu_mgmt = re.search(r'^HW_MGMT_CPU:\s*([0-9]+\.?[0-9]*)', content, re.MULTILINE)
-                    if cpu_mgmt:
-                        cpu_temp = float(cpu_mgmt.group(1))
-                    else:
-                        # Passive support for already-collected NVUE output; monitor.sh does not run nv.
-                        nvue_core_matches = re.findall(
-                            r'^\s*CPU-Core-Sensor-\d+\s+(-?\d+\.?\d*)\s+',
-                            content,
-                            re.MULTILINE | re.IGNORECASE,
-                        )
-                        if nvue_core_matches:
-                            core_temps = [float(temp) for temp in nvue_core_matches]
-                            cpu_temp = sum(core_temps) / len(core_temps)
-                        else:
-                            package_match = re.search(
-                                r'^\s*CPU-Package-Sensor\s+(-?\d+\.?\d*)\s+',
-                                content,
-                                re.MULTILINE | re.IGNORECASE,
-                            )
-                            if package_match:
-                                cpu_temp = float(package_match.group(1))
-                # Intentionally not falling back to generic "temp1" to avoid picking up disks/PSU sensors
+        asic_temperatures = []
+        for pattern in (
+            r'Ambient ASIC Temp:\s*\+?(-?\d+\.?\d*)[°C]',
+            r'^(?:HW_MGMT_ASIC|THERMAL_ZONE_ASIC|HWMON_ASIC):\s*(-?\d+\.?\d*)',
+            r'^\s*Asic-Temp-Sensor\s+(-?\d+\.?\d*)\s+',
+        ):
+            asic_temperatures.extend(
+                float(value) for value in re.findall(
+                    pattern, content, re.MULTILINE | re.IGNORECASE
+                )
+            )
+        if asic_temperatures:
+            asic_temp = max(asic_temperatures)
+
+        # Deliberately do not use generic "temp1": it may be a disk or PSU.
+        cpu_temperatures = []
+        for pattern in (
+            r'CPU ACPI temp:\s*\+?(-?\d+\.?\d*)[°C]',
+            r'Core \d+:\s*\+?(-?\d+\.?\d*)[°C]',
+            r'Package id \d+:\s*\+?(-?\d+\.?\d*)[°C]',
+            r'^HW_MGMT_CPU:\s*(-?\d+\.?\d*)',
+            r'^\s*CPU-Core-Sensor-\d+\s+(-?\d+\.?\d*)\s+',
+            r'^\s*CPU-Package-Sensor\s+(-?\d+\.?\d*)\s+',
+        ):
+            cpu_temperatures.extend(
+                float(value) for value in re.findall(
+                    pattern, content, re.MULTILINE | re.IGNORECASE
+                )
+            )
+        if cpu_temperatures:
+            cpu_temp = max(cpu_temperatures)
         
     except Exception as e:
         print(f"Warning: Could not parse temperatures for {device_name}: {e}")
@@ -169,24 +356,19 @@ def parse_psu_efficiency_from_hardware_file(device_name):
         # Support both 54V (most switches) and 12V (some platforms)
         psu_dc_out_w = re.findall(r'^PSU-[^\n]*(?:54V|12V)\s+Rail\s+Pwr\s*\(out\):\s*(\d+\.?\d*)\s*([km]?W)', content, re.MULTILINE)
 
-        # Convert kW to W, handle both W and kW units
+        # Normalize W/kW/mW before aggregating.
         total_psu_in = 0.0
         for value, unit in psu_ac_in_w:
-            watts = float(value)
-            if unit == 'kW':
-                watts *= 1000
-            total_psu_in += watts
+            total_psu_in += _power_to_watts(value, unit)
             
         total_psu_out = 0.0  
         for value, unit in psu_dc_out_w:
-            watts = float(value)
-            if unit == 'kW':
-                watts *= 1000
-            total_psu_out += watts
+            total_psu_out += _power_to_watts(value, unit)
 
         if total_psu_in > 0 and total_psu_out > 0:
             efficiency = (total_psu_out / total_psu_in) * 100.0
-            return min(efficiency, 100.0)
+            # A value above 100% is invalid telemetry, not an excellent PSU.
+            return efficiency if efficiency <= 100.0 else None
 
         # 2) Fallback (legacy): aggregate PMIC/VR in/out if PSU rails are unavailable
         total_input_power = 0.0
@@ -230,7 +412,7 @@ def parse_psu_efficiency_from_hardware_file(device_name):
 
         if total_input_power > 0 and total_output_power > 0:
             efficiency = (total_output_power / total_input_power) * 100.0
-            return min(efficiency, 100.0)
+            return efficiency if efficiency <= 100.0 else None
         
     except Exception as e:
         print(f"Warning: Could not parse PSU efficiency for {device_name}: {e}")
@@ -258,27 +440,21 @@ def parse_psu_power_in_out_from_hardware_file(device_name):
         psu_ac_in_w = re.findall(r'^PSU-[^\n]*220V\s+Rail\s+Pwr\s*\(in\):\s*(\d+\.?\d*)\s*([km]?W)', content, re.MULTILINE)
         psu_dc_out_w = re.findall(r'^PSU-[^\n]*(?:54V|12V)\s+Rail\s+Pwr\s*\(out\):\s*(\d+\.?\d*)\s*([km]?W)', content, re.MULTILINE)
 
-        # Convert kW to W, handle both W and kW units
+        # Normalize W/kW/mW before aggregating.
         total_psu_in = 0.0
         for value, unit in psu_ac_in_w:
-            watts = float(value)
-            if unit == 'kW':
-                watts *= 1000
-            total_psu_in += watts
+            total_psu_in += _power_to_watts(value, unit)
             
         total_psu_out = 0.0  
         for value, unit in psu_dc_out_w:
-            watts = float(value)
-            if unit == 'kW':
-                watts *= 1000
-            total_psu_out += watts
+            total_psu_out += _power_to_watts(value, unit)
 
 
         if total_psu_in > 0 and total_psu_out > 0:
             # Sanity check: Output should never be higher than input (physics!)
             if total_psu_out > total_psu_in:
                 print(f"⚠️  {device_name}: PSU output ({total_psu_out}W) > input ({total_psu_in}W) - IMPOSSIBLE!")
-                return total_psu_in, total_psu_out  # Still return for debugging
+                return None, None
             return total_psu_in, total_psu_out
 
         # Fallback: PMIC/VR and generic PSU Pwr(in/out)
@@ -319,6 +495,8 @@ def parse_psu_power_in_out_from_hardware_file(device_name):
             total_output_power += float(s)
 
         if total_input_power > 0 and total_output_power > 0:
+            if total_output_power > total_input_power:
+                return None, None
             return total_input_power, total_output_power
         return None, None
     except Exception:
@@ -327,7 +505,7 @@ def parse_psu_power_in_out_from_hardware_file(device_name):
 def _parse_size_to_gib(size_str: str) -> float:
     """Convert a size token like '15Gi', '286Mi' into GiB float."""
     try:
-        m = re.match(r'(\d+\.?\d*)([KMG]i)', size_str)
+        m = re.fullmatch(r'(\d+\.?\d*)([KMGT]i)', size_str)
         if not m:
             return 0.0
         value = float(m.group(1))
@@ -397,7 +575,16 @@ def parse_resources_from_hardware_file(device_name):
                 results['memory_usage'] = max(0.0, min(100.0, usage_percent))
 
         # CPU load 5‑min average from CPU_INFO first line: "1.28 0.68 0.43 ..."
-        cpu_line = re.search(r'^CPU_INFO:\n([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+', content, re.MULTILINE)
+        # Current collections include an explicit source-status marker between
+        # the heading and /proc/loadavg.  Keep accepting marker-free legacy
+        # samples, but never parse a value following an ERROR marker.
+        cpu_line = re.search(
+            r'^CPU_INFO:\n'
+            r'(?:__LLDPQ_HARDWARE_SOURCE_STATUS__:CPU_LOAD:OK\s*\n)?'
+            r'([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+',
+            content,
+            re.MULTILINE,
+        )
         if cpu_line:
             results['cpu_load'] = float(cpu_line.group(2))
 
@@ -414,6 +601,38 @@ def parse_resources_from_hardware_file(device_name):
         print(f"Warning: Could not parse resources for {device_name}: {e}")
     return results
 
+
+def hardware_missing_telemetry_markers(device_name):
+    """Return collector-declared telemetry gaps from the current raw sample.
+
+    The collector deliberately writes these messages when a command cannot
+    provide data.  Treating them as ordinary text can otherwise allow a fresh
+    history entry or a partial fallback to make an incomplete sample look
+    healthy.
+    """
+    hardware_file = f"monitor-results/hardware-data/{device_name}_hardware.txt"
+    try:
+        with open(hardware_file, "r", encoding="utf-8", errors="ignore") as source:
+            content = source.read().lower()
+    except OSError:
+        return {"hardware_file"}
+
+    markers = set()
+    for source, status in re.findall(
+        r'^__LLDPQ_HARDWARE_SOURCE_STATUS__:([A-Za-z0-9_.-]+):(OK|ERROR|UNAVAILABLE)\s*$',
+        content,
+        re.MULTILINE | re.IGNORECASE,
+    ):
+        if status.upper() != "OK":
+            markers.add(source.lower())
+    if "no sensors available" in content:
+        markers.add("sensors")
+    if "no memory info" in content:
+        markers.add("memory")
+    if "no cpu info" in content:
+        markers.add("cpu")
+    return markers
+
 def grade_load_per_core(cpu_load, cpu_cores):
     """Grade the CPU load average normalized by core count.
 
@@ -425,46 +644,35 @@ def grade_load_per_core(cpu_load, cpu_cores):
     """
     if not isinstance(cpu_load, (int, float)):
         return None
-    cores = cpu_cores if isinstance(cpu_cores, int) and cpu_cores > 0 else 4
+    cores = (
+        cpu_cores
+        if isinstance(cpu_cores, (int, float)) and cpu_cores > 0
+        else 4
+    )
     load_per_core = cpu_load / cores
-    if load_per_core < 0.7:
-        return "EXCELLENT"
-    elif load_per_core < 1.0:
-        return "GOOD"
-    elif load_per_core < 1.5:
-        return "WARNING"
-    else:
-        return "CRITICAL"
+    return grade_high_is_bad(load_per_core, "load_per_core")
 
 
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
-    required_telemetry_missing = False
-    priority = {"CRITICAL": 4, "WARNING": 3, "GOOD": 2, "EXCELLENT": 1}
+    missing_markers = hardware_missing_telemetry_markers(device_name)
+    required_telemetry_missing = bool(missing_markers)
     
     # CPU Temperature grade
     cpu_temp, asic_temp = parse_temperature_from_hardware_file(device_name)
-    if cpu_temp is not None:
-        if cpu_temp < 60:
-            health_grades.append("EXCELLENT")
-        elif cpu_temp < 70:
-            health_grades.append("GOOD")
-        elif cpu_temp < 80:
-            health_grades.append("WARNING")
-        else:
-            health_grades.append("CRITICAL")
+    cpu_grade = grade_high_is_bad(cpu_temp, "cpu_temp_c")
+    if cpu_grade:
+        health_grades.append(cpu_grade)
+    else:
+        required_telemetry_missing = True
     
-    # ASIC Temperature grade  
-    if asic_temp is not None:
-        if asic_temp < 85:
-            health_grades.append("EXCELLENT")
-        elif asic_temp < 105:
-            health_grades.append("GOOD")
-        elif asic_temp < 115:
-            health_grades.append("WARNING")
-        else:
-            health_grades.append("CRITICAL")
+    # ASIC Temperature grade
+    asic_grade = grade_high_is_bad(asic_temp, "asic_temp_c")
+    if asic_grade:
+        health_grades.append(asic_grade)
+    else:
+        required_telemetry_missing = True
     
     parsed_resources = {}
 
@@ -475,14 +683,8 @@ def calculate_device_health_grade(device_name, device_data):
         memory_usage = parsed_resources.get('memory_usage')
     if not isinstance(memory_usage, (int, float)):
         required_telemetry_missing = True
-    elif memory_usage < 60:
-        health_grades.append("EXCELLENT")
-    elif memory_usage < 75:
-        health_grades.append("GOOD")
-    elif memory_usage < 85:
-        health_grades.append("WARNING")
     else:
-        health_grades.append("CRITICAL")
+        health_grades.append(grade_high_is_bad(memory_usage, "memory_percent"))
         
     # CPU Load grade
     cpu_load = device_data.get("resources", {}).get("cpu", {}).get("load_5min", None)
@@ -496,6 +698,8 @@ def calculate_device_health_grade(device_name, device_data):
         if not parsed_resources:
             parsed_resources = parse_resources_from_hardware_file(device_name)
         cpu_cores = parsed_resources.get('cpu_cores')
+    if not isinstance(cpu_cores, (int, float)) or cpu_cores <= 0:
+        required_telemetry_missing = True
     load_grade = grade_load_per_core(cpu_load, cpu_cores)
     if load_grade:
         health_grades.append(load_grade)
@@ -503,38 +707,34 @@ def calculate_device_health_grade(device_name, device_data):
         required_telemetry_missing = True
     
     # PSU Efficiency grade
-    psu_efficiency = parse_psu_efficiency_from_hardware_file(device_name) or 0.0
-    if psu_efficiency > 90:
-        health_grades.append("EXCELLENT")
-    elif psu_efficiency >= 50:
-        health_grades.append("GOOD")
-    elif psu_efficiency >= 30:
-        health_grades.append("WARNING")
-    elif psu_efficiency > 0:
-        health_grades.append("CRITICAL")
+    psu_efficiency = parse_psu_efficiency_from_hardware_file(device_name)
+    psu_grade = grade_low_is_bad(psu_efficiency, "psu_efficiency_percent")
+    if psu_grade:
+        health_grades.append(psu_grade)
+    else:
+        required_telemetry_missing = True
     
     # Fan status grade
     fans = device_data.get("fans", {})
     if not fans:
         fans = parse_fans_from_hardware_file(device_name)
     if fans:
-        fan_grades = []
-        for fan_name, fan_speed in fans.items():
-            if fan_speed > 4000:
-                fan_grades.append("EXCELLENT")
-            elif fan_speed >= 3000:
-                fan_grades.append("GOOD")  
-            elif fan_speed >= 1000:
-                fan_grades.append("WARNING")
-            else:
-                fan_grades.append("CRITICAL")
+        fan_grades = [
+            grade_low_is_bad(fan_speed, "fan_rpm")
+            for fan_speed in fans.values()
+            if isinstance(fan_speed, (int, float))
+        ]
         if fan_grades:
-            fan_status = max(fan_grades, key=lambda x: priority.get(x, 0))
+            fan_status = max(fan_grades, key=lambda x: GRADE_PRIORITY.get(x, 0))
             health_grades.append(fan_status)
+        else:
+            required_telemetry_missing = True
+    else:
+        required_telemetry_missing = True
     
     # Calculate overall health grade (worst case)
     if health_grades:
-        worst_known = max(health_grades, key=lambda x: priority.get(x, 0))
+        worst_known = max(health_grades, key=lambda x: GRADE_PRIORITY.get(x, 0))
         # Do not advertise an incomplete sample as healthy. A known warning or
         # critical condition still takes precedence over missing telemetry.
         if required_telemetry_missing and worst_known not in ("WARNING", "CRITICAL"):
@@ -583,12 +783,16 @@ def generate_hardware_html():
     for filename in current_device_files:
         device_name = filename.removesuffix('_hardware.txt')
         history = hardware_history.get(device_name, [])
-        if history:
-            latest_devices[device_name] = history[-1]
+        raw_file = os.path.join(hardware_data_dir, filename)
+        history_entry = fresh_history_entry(history, raw_file)
+        if history_entry is not None:
+            latest_devices[device_name] = history_entry
         else:
             latest_devices[device_name] = {
                 'device': device_name,
-                'timestamp': datetime.now().isoformat(),
+                'timestamp': datetime.fromtimestamp(
+                    os.path.getmtime(raw_file), tz=timezone.utc
+                ).isoformat(),
                 'fans': {},
                 'memory_usage': 'N/A',
                 'cpu_load': 'N/A',
@@ -630,6 +834,15 @@ def generate_hardware_html():
     
     # Use current device files count instead of historical count
     total_devices = current_device_count
+    asset_statuses = asset_snapshot[0] if asset_snapshot else {}
+    # Coverage represents the whole inventory, including devices that were
+    # unreachable in this run; current data still contains only OK devices.
+    expected_devices = len(asset_statuses) or total_devices
+    unknown_device_count = len(summary['unknown_devices'])
+    coverage_partial = (
+        current_device_count < expected_devices or unknown_device_count > 0
+    )
+    coverage_status = "partial" if coverage_partial else "current"
     
     # Generate dark theme HTML
     html_content = f"""<!DOCTYPE html>
@@ -717,6 +930,13 @@ def generate_hardware_html():
     </style>
 </head>
 <body>
+    <div data-analysis-summary="hardware"
+         data-collection-status="{coverage_status}"
+         data-coverage-expected="{expected_devices}"
+         data-coverage-current="{current_device_count}"
+         data-coverage-partial="{'true' if coverage_partial else 'false'}"
+         data-unknown-devices="{unknown_device_count}"
+         style="display:none"></div>
     <div class="page-header">
         <div>
             <div class="page-title">Hardware Health Analysis</div>
@@ -794,7 +1014,7 @@ def generate_hardware_html():
                         <th class="sortable" data-column="5" data-type="number">Load <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="6" data-type="hardware-status">Fan <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="7" data-type="number">PSU% <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="8" data-type="string">PSU Power <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="8" data-type="power">PSU Power <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="9" data-type="string">Model <span class="sort-arrow">▲▼</span></th>
                     </tr>
                 </thead>
@@ -842,21 +1062,20 @@ def generate_hardware_html():
         if not fans:
             fans = parse_fans_from_hardware_file(device_name)
         if fans:
-            priority = {"CRITICAL": 4, "WARNING": 3, "GOOD": 2, "EXCELLENT": 1}
-            fan_grades_calculated = []
-            for fan_name, fan_speed in fans.items():
-                if fan_speed > 4000:
-                    grade = "EXCELLENT"
-                elif fan_speed >= 3000:
-                    grade = "GOOD"  
-                elif fan_speed >= 1000:
-                    grade = "WARNING"
-                else:
-                    grade = "CRITICAL"
-                fan_grades_calculated.append(grade)
+            fan_grades_calculated = [
+                grade_low_is_bad(fan_speed, "fan_rpm")
+                for fan_speed in fans.values()
+                if isinstance(fan_speed, (int, float))
+            ]
             
             # Get overall fan status (worst case from all fans)
-            fan_status = max(fan_grades_calculated, key=lambda x: priority.get(x, 0))
+            fan_status = (
+                max(
+                    fan_grades_calculated,
+                    key=lambda x: GRADE_PRIORITY.get(x, 0),
+                )
+                if fan_grades_calculated else "N/A"
+            )
         else:
             fan_status = "N/A"
         
@@ -886,53 +1105,19 @@ def generate_hardware_html():
         
         # Compute per-metric grades for dot indicators
         def grade_cpu(t):
-            if t is None:
-                return None
-            if t < 60:
-                return "EXCELLENT"
-            elif t < 70:
-                return "GOOD"
-            elif t < 80:
-                return "WARNING"
-            else:
-                return "CRITICAL"
+            return grade_high_is_bad(t, "cpu_temp_c")
 
         def grade_asic(t):
-            if t is None:
-                return None
-            if t < 85:
-                return "EXCELLENT"
-            elif t < 105:
-                return "GOOD"
-            elif t < 115:
-                return "WARNING"
-            else:
-                return "CRITICAL"
+            return grade_high_is_bad(t, "asic_temp_c")
 
         def grade_memory(p):
-            if not isinstance(p, (int, float)):
-                return None
-            if p < 60:
-                return "EXCELLENT"
-            elif p < 75:
-                return "GOOD"
-            elif p < 85:
-                return "WARNING"
-            else:
-                return "CRITICAL"
+            return grade_high_is_bad(p, "memory_percent")
 
         def grade_psu(eff, raw):
             # Only grade when we have parsed value
             if raw is None:
                 return None
-            if eff > 90:
-                return "EXCELLENT"
-            elif eff >= 50:
-                return "GOOD"
-            elif eff >= 30:
-                return "WARNING"
-            else:
-                return "CRITICAL"
+            return grade_low_is_bad(eff, "psu_efficiency_percent")
 
         cpu_g = grade_cpu(cpu_temp)
         asic_g = grade_asic(asic_temp)
@@ -964,28 +1149,36 @@ def generate_hardware_html():
             psu_in_out_str = f"{psu_in_w:.1f}W / {psu_out_w:.1f}W"
 
         # Get model information from assets
-        device_model = assets_data.get(device_name, {}).get("model", "N/A")
+        device_label = html.escape(str(canonical(device_name)))
+        device_model = html.escape(
+            str(assets_data.get(device_name, {}).get("model", "N/A"))
+        )
         memory_usage_str = (f"{memory_usage:.1f}%"
                             if isinstance(memory_usage, (int, float)) else "N/A")
         cpu_load_str = (f"{cpu_load:.2f}"
                         if isinstance(cpu_load, (int, float)) else "N/A")
+        psu_efficiency_str = (
+            f"{psu_efficiency:.1f}%"
+            if psu_efficiency_parsed is not None else "N/A"
+        )
         
         html_content += f"""
                 <tr data-status="{health_grade.lower()}">
-                    <td>{canonical(device_name)}</td>
+                    <td>{device_label}</td>
                     <td><span class="{health_badge_class}">{health_grade.upper()}</span></td>
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
                     <td>{asic_temp_str}{asic_cell_suffix}</td>
                     <td>{memory_usage_str}{mem_cell_suffix}</td>
                     <td>{cpu_load_str}{load_cell_suffix}</td>
                     <td><span class="{fan_badge_class}">{fan_status}</span>{fan_cell_suffix}</td>
-                    <td>{psu_efficiency:.1f}%{psu_cell_suffix}</td>
+                    <td>{psu_efficiency_str}{psu_cell_suffix}</td>
                     <td>{psu_in_out_str}</td>
                     <td>{device_model}</td>
                 </tr>
 """
     
-    html_content += """
+    threshold_rows = threshold_reference_rows()
+    html_content += f"""
                 </tbody>
             </table>
         </div>
@@ -1002,12 +1195,7 @@ def generate_hardware_html():
                     <tr><th>Parameter</th><th>Excellent</th><th>Good</th><th>Warning</th><th>Critical</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>CPU Temperature</td><td>&lt; 60°C</td><td>60-70°C</td><td>70-80°C</td><td>&gt; 80°C</td></tr>
-                    <tr><td>ASIC Temperature</td><td>&lt; 85°C</td><td>85-105°C</td><td>105-115°C</td><td>&gt; 115°C</td></tr>
-                    <tr><td>Memory Usage</td><td>&lt; 60%</td><td>60-75%</td><td>75-85%</td><td>&gt; 85%</td></tr>
-                    <tr><td>CPU Load (5min avg)</td><td>&lt; 1.0</td><td>1.0-2.0</td><td>2.0-3.0</td><td>&gt; 3.0</td></tr>
-                    <tr><td>Fan Speed</td><td>&gt; 4000 RPM</td><td>3000-4000 RPM</td><td>1000-3000 RPM</td><td>&lt; 1000 RPM</td></tr>
-                    <tr><td>PSU Efficiency</td><td>&gt; 90%</td><td>50-90%</td><td>30-50%</td><td>&lt; 30%</td></tr>
+                    {threshold_rows}
                 </tbody>
             </table>
         </div>
@@ -1293,6 +1481,14 @@ def generate_hardware_html():
                         else if (isNaN(numB)) result = -1;
                         else result = numA - numB;
                         break;
+                    case 'power':
+                        const powerA = parseFloat(aVal);
+                        const powerB = parseFloat(bVal);
+                        if (isNaN(powerA) && isNaN(powerB)) result = 0;
+                        else if (isNaN(powerA)) result = 1;
+                        else if (isNaN(powerB)) result = -1;
+                        else result = powerA - powerB;
+                        break;
                     case 'string':
                     default:
                         result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
@@ -1316,13 +1512,21 @@ def generate_hardware_html():
                 'UNKNOWN': 4
             };
             
-            return (priority[a] || 5) - (priority[b] || 5);
+            const aPriority = Object.prototype.hasOwnProperty.call(priority, a) ? priority[a] : 5;
+            const bPriority = Object.prototype.hasOwnProperty.call(priority, b) ? priority[b] : 5;
+            return aPriority - bPriority;
         }
 
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
+            let notification = null;
+
+            const restoreButton = () => {
+                button.disabled = false;
+                button.innerHTML = originalText;
+            };
             
             // Disable button and show loading
             button.disabled = true;
@@ -1333,19 +1537,27 @@ def generate_hardware_html():
                 Running...
             `;
             
-            // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
+            try {
+                // Capture the current pipeline generation before starting a
+                // new run, so completion means "new output is ready" rather
+                // than merely "some output exists".
+                const baseline = typeof window.lldpqCapturePipelineState === 'function'
+                    ? await window.lldpqCapturePipelineState()
+                    : null;
+
+                const response = await fetch('/trigger-monitor', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    }
+                });
+                const data = await response.json();
+                if (!response.ok || data.status !== 'success') {
+                    throw new Error(data.message || `HTTP ${response.status}`);
                 }
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.status === 'success') {
-                    console.log('Monitor analysis triggered successfully');
-                    // Show notification
-                    const notification = document.createElement('div');
+
+                console.log('Monitor analysis triggered successfully');
+                notification = document.createElement('div');
                     notification.style.cssText = `
                         position: fixed;
                         top: 20px;
@@ -1360,31 +1572,32 @@ def generate_hardware_html():
                         max-width: 350px;
                         font-family: monospace;
                     `;
-                    notification.innerHTML = `
+                const completionHelperAvailable =
+                    typeof window.waitForLldpqAnalysisCompletion === 'function';
+                notification.innerHTML = `
                         <strong>Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small>Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small>${completionHelperAvailable
+                            ? 'Page will refresh when the latest results are ready.'
+                            : 'Page will automatically refresh in 35 seconds.'}</small>
                     `;
-                    document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
+                document.body.appendChild(notification);
+
+                if (!completionHelperAvailable) {
                     setTimeout(() => {
                         window.location.reload();
                     }, 35000);
-                } else {
-                    console.error('❌ Failed to trigger monitor analysis:', data.message);
-                    alert('Failed to trigger analysis. Please try again.');
-                    // Restore button
-                    button.disabled = false;
-                    button.innerHTML = originalText;
+                    return;
                 }
-            })
-            .catch(error => {
-                console.error('❌ Error triggering analysis:', error);
-                alert('Error triggering analysis. Please try again.');
-                // Restore button
-                button.disabled = false;
-                button.innerHTML = originalText;
-            });
+
+                await window.waitForLldpqAnalysisCompletion(baseline);
+                window.location.reload();
+            } catch (error) {
+                console.error('❌ Analysis did not complete:', error);
+                if (notification) notification.remove();
+                restoreButton();
+                alert(`Analysis did not complete: ${error.message || error}`);
+            }
         }
 
         // CSV Download Function

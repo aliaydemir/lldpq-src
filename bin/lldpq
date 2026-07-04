@@ -2,11 +2,26 @@
 # LLDPq Network Monitoring - Main execution script
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
-# Load allowlisted config data through the fixed, root-owned parser.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Load the installed path fail-closed. Explicit LLDPQ_DIR remains supported for
+# isolated tests/source-tree runs, but a partial production upgrade must never
+# fall back to a different $HOME/lldpq tree.
+lldpq_fatal() {
+    printf 'lldpq: ERROR: %s\n' "$*" >&2
+    exit 1
+}
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
+    if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+        --require-key LLDPQ_DIR 2>/dev/null); then
+        lldpq_fatal "required runtime configuration is missing or unreadable"
+    fi
+    eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
+        lldpq_fatal "runtime configuration could not be applied"
+    unset LLDPQ_CONFIG_ASSIGNMENTS
+elif [[ -z "${LLDPQ_DIR:-}" ]]; then
+    lldpq_fatal "required config helper is missing: $LLDPQ_CONFIG_HELPER"
 fi
-LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
+[[ -n "${LLDPQ_DIR:-}" ]] || lldpq_fatal "LLDPQ_DIR is empty"
 
 # Parse flags: lldpq - (verbose), lldpq -s (skip optical)
 QUIET=true
@@ -34,6 +49,11 @@ if ! flock -n 9; then
 fi
 export LLDPQ_MONITOR_LOCK_HELD=1
 
+# Bind assets, LLDP and monitor outputs to one pipeline identity. monitor.sh
+# records exact source fingerprints; alert summaries reject mixed-run inputs.
+export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
+
 run_command() {
     if [[ "$QUIET" == "true" ]]; then
         "$@" >/dev/null 2>&1
@@ -55,6 +75,11 @@ if ! run_command ./assets.sh; then
     echo "Asset discovery failed; monitoring was not published." >&2
     exit 1
 fi
+# Total-fabric loss must be alertable even when LLDP/monitor analyzers cannot
+# produce a new aggregate bundle. This path is stateful and silent for the
+# normal/partial case; it emits only total-outage and recovery transitions.
+run_command python3 ./check_alerts.py --assets-only || \
+    echo "⚠️  Fabric availability pre-check failed (non-critical)" >&2
 wait_until_not_running "check-lldp.sh"
 if ! run_command ./check-lldp.sh; then
     echo "LLDP collection failed; monitoring was not published." >&2
@@ -74,11 +99,13 @@ if [[ $status -ne 0 ]]; then
     exit "$status"
 fi
 
-# Fabric table scan for search
+# Fabric table scan for search. A partial scan must not suppress availability
+# alerts from the already-published monitor/assets snapshot.
 wait_until_not_running "fabric-scan.sh"
-if ! run_command ./fabric-scan.sh; then
+run_command ./fabric-scan.sh
+fabric_status=$?
+if [[ $fabric_status -ne 0 ]]; then
     echo "Fabric scan failed." >&2
-    exit 1
 fi
 
 # Check for network alerts (only if monitoring data exists)
@@ -86,4 +113,4 @@ if [[ -d "monitor-results" ]] && [[ -f "notifications.yaml" ]]; then
     run_command python3 ./check_alerts.py || echo "⚠️  Alert check failed (non-critical)"
 fi
 
-exit 0
+exit "$fabric_status"

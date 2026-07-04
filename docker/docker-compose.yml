@@ -13,29 +13,49 @@ services:
       dockerfile: docker/Dockerfile
     image: lldpq:latest
     container_name: lldpq
+    privileged: true
     ports:
       - "${LLDPQ_PORT:-80}:80"
     volumes:
       # Recommended: manage ALL config from ONE directory (single mount).
       # On first run the files self-seed from the baked-in defaults; afterwards
       # they persist on the host and are editable (UI or directly). Includes:
-      # devices.yaml, topology.dot, topology_config.yaml, lldpq-users.conf
-      # - ./configs:/home/lldpq/lldpq/config
+      # devices.yaml, topology.dot, topology_config.yaml, notifications.yaml,
+      # lldpq-users.conf, cumulus-ztp.sh, serial mapping and display aliases.
+      - lldpq-app-config:/home/lldpq/lldpq/config
+
+      # Runtime settings + DHCP configuration persist here without mounting
+      # over /etc itself. The entrypoint seeds this volume and keeps the normal
+      # application paths as symlinks, so existing direct file mounts continue
+      # to work as a backward-compatible alternative.
+      - lldpq-system-config:/home/lldpq/lldpq/system-config
+      - lldpq-ssh:/home/lldpq/.ssh
+      - lldpq-ansible:/home/lldpq/ansible
 
       # Legacy alternative: override baked-in files individually
       # - ./devices.yaml:/home/lldpq/lldpq/devices.yaml
       # - ./topology.dot:/var/www/html/topology.dot
       # - ./topology_config.yaml:/var/www/html/topology_config.yaml
+      # - ./lldpq.conf:/etc/lldpq.conf
+      # - ./dhcpd.conf:/etc/dhcp/dhcpd.conf
+      # - ./dhcpd.hosts:/etc/dhcp/dhcpd.hosts
 
       # Optional: Ansible directory (enables VLAN/BGP reports, Fabric Config/Editor/Deploy).
       # Ansible is OFF by default in Docker; uncomment the mount + the ANSIBLE_DIR env below
       # to enable it (or toggle any time in the UI: Setup -> Integrate Ansible).
+      # Replace the lldpq-ansible named-volume line above with this bind mount
+      # when the Ansible project is managed directly on the host:
       # - ~/ansible:/home/lldpq/ansible:rw
 
       # Persistent monitoring data (survives container restart/recreation)
       - lldpq-data:/home/lldpq/lldpq/monitor-results
+      - lldpq-lldp-data:/home/lldpq/lldpq/lldp-results
+      - lldpq-alert-state:/home/lldpq/lldpq/alert-states
+      - lldpq-dhcp-state:/var/lib/dhcp
       - lldpq-configs:/var/www/html/configs
       - lldpq-hstr:/var/www/html/hstr
+      - lldpq-generated-configs:/var/www/html/generated_config_folder
+      - lldpq-provision-files:/var/www/html/provision-uploads
     restart: unless-stopped
     environment:
       - TZ=${TZ:-UTC}
@@ -44,5 +64,14 @@ services:
 
 volumes:
   lldpq-data:      # Monitoring results
+  lldpq-lldp-data: # LLDP validation results
+  lldpq-alert-state: # Alert deduplication/history state
+  lldpq-dhcp-state: # DHCP lease database
   lldpq-configs:   # Device configurations
   lldpq-hstr:      # Historical data
+  lldpq-generated-configs: # Generated NVUE configs served to ZTP clients
+  lldpq-provision-files: # Uploaded OS images + persistent ONIE aliases
+  lldpq-system-config: # /etc/lldpq.conf + DHCP configuration
+  lldpq-app-config: # inventory, topology, notifications, users, ZTP settings
+  lldpq-ssh:       # SSH keys used to connect to switches
+  lldpq-ansible:   # Ansible inventory, playbooks and host/group vars

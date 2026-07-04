@@ -13,7 +13,13 @@ import sys
 import time
 from datetime import datetime
 from ber_analyzer import BERAnalyzer
-from collection_freshness import is_current_collection, read_asset_snapshot
+from collection_freshness import (
+    asset_snapshot_is_authoritative,
+    asset_snapshot_is_valid,
+    is_current_collection,
+    mark_html_collection_unavailable,
+    read_asset_snapshot,
+)
 
 def parse_proc_net_dev(content):
     """Parse /proc/net/dev content to extract interface statistics"""
@@ -88,15 +94,29 @@ def process_detailed_counters(content, hostname):
 
 def process_ber_data_files(data_dir="monitor-results/ber-data"):
     """Process BER data files and update BER analyzer"""
-    ber_analyzer = BERAnalyzer("monitor-results")
+    data_dir = os.path.abspath(data_dir)
+    result_dir = os.path.dirname(data_dir.rstrip(os.sep))
+    ber_analyzer = BERAnalyzer(result_dir)
     # Keep historical/baseline data, but rebuild the current snapshot solely
     # from this run's successful raw files.
     ber_analyzer.current_ber_stats = {}
     
-    print(f"Processing BER analysis data")
-    print(f"Using thresholds: Good < {ber_analyzer.config['raw_ber_threshold']:.2e}, "
-          f"Warning < {ber_analyzer.config['warning_ber_threshold']:.2e}, "
-          f"Critical > {ber_analyzer.config['critical_ber_threshold']:.2e}")
+    print("Processing link error analysis data")
+    print(
+        "Using frame-density thresholds: "
+        f"Warning >= {ber_analyzer.config['frame_density_warning_threshold']:.2e}, "
+        f"Critical >= {ber_analyzer.config['frame_density_critical_threshold']:.2e}"
+    )
+    print(
+        "Using raw/pre-FEC BER thresholds: "
+        f"Warning >= {ber_analyzer.config['raw_phy_ber_warning_threshold']:.2e}, "
+        f"Critical >= {ber_analyzer.config['raw_phy_ber_critical_threshold']:.2e}"
+    )
+    print(
+        "Using effective/post-FEC BER thresholds: "
+        f"Warning >= {ber_analyzer.config['effective_phy_ber_warning_threshold']:.2e}, "
+        f"Critical >= {ber_analyzer.config['effective_phy_ber_critical_threshold']:.2e}"
+    )
     
     if not os.path.exists(data_dir):
         print(f"❌ BER data directory {data_dir} not found")
@@ -105,8 +125,40 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     processed_devices = 0
     total_interfaces_processed = 0
     processing_errors = 0
+    hosts_with_interfaces = set()
     
-    asset_snapshot = read_asset_snapshot()
+    assets_file = os.path.join(os.path.dirname(result_dir), "assets.ini")
+    asset_snapshot = read_asset_snapshot(assets_file)
+    statuses, _asset_mtime, assets_available = asset_snapshot
+    snapshot_valid = asset_snapshot_is_valid(asset_snapshot)
+    assets_authoritative = asset_snapshot_is_authoritative(asset_snapshot)
+    if assets_available and not snapshot_valid:
+        print("❌ Asset snapshot is invalid or incomplete")
+        return False
+
+    if assets_authoritative:
+        active_hosts = set(statuses)
+        for filename in os.listdir(data_dir):
+            for suffix in (
+                "_interface_errors.txt", "_detailed_counters.txt", "_l1_show.txt"
+            ):
+                if filename.endswith(suffix):
+                    hostname = filename.removesuffix(suffix)
+                    if hostname not in active_hosts:
+                        try:
+                            os.unlink(os.path.join(data_dir, filename))
+                        except OSError as exc:
+                            print(f"❌ Could not prune retired BER data {filename}: {exc}")
+                            return False
+                    break
+        for hostname in list(ber_analyzer.baseline_data):
+            if hostname not in active_hosts:
+                del ber_analyzer.baseline_data[hostname]
+        for mapping in (ber_analyzer.ber_history, ber_analyzer.current_ber_stats):
+            for port_name in list(mapping):
+                if port_name.split(":", 1)[0] not in active_hosts:
+                    del mapping[port_name]
+
     current_files = [
         filename for filename in os.listdir(data_dir)
         if filename.endswith("_interface_errors.txt")
@@ -116,6 +168,24 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             asset_snapshot,
         )
     ]
+    if snapshot_valid:
+        expected_hosts = {
+            host for host, status in statuses.items() if status == "OK"
+        }
+        collected_hosts = {
+            filename.removesuffix("_interface_errors.txt")
+            for filename in current_files
+        }
+        missing_hosts = sorted(expected_hosts - collected_hosts)
+        if missing_hosts:
+            print(
+                "❌ Missing current BER collections for: "
+                + ", ".join(missing_hosts)
+            )
+            return False
+    else:
+        expected_hosts = set()
+    all_devices_unavailable = snapshot_valid and not expected_hosts
 
     # Process all current interface error files
     for filename in current_files:
@@ -156,7 +226,6 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 # Process each interface with delta-based calculation
                 processed_interfaces = 0
-                baseline_interfaces = 0
                 for interface_name, stats in interfaces.items():
                     # Only process physical interfaces
                     if not ber_analyzer.is_physical_port(interface_name):
@@ -165,33 +234,78 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                     port_name = f"{hostname}:{interface_name}"
                     
                     # Calculate delta-based BER
-                    ber_value, is_baseline, delta_errors, delta_bytes = ber_analyzer.calculate_delta_ber(
+                    (ber_value, is_baseline, delta_errors, delta_bytes,
+                     delta_packets) = ber_analyzer.calculate_delta_ber(
                         hostname, interface_name, stats
                     )
+                    delta_details = ber_analyzer._last_delta_details.get(port_name, {})
                     
                     if is_baseline:
                         # Create baseline record for web display
                         baseline_record = {
                             'timestamp': time.time(),
                             'ber_value': 0.0,
-                            'grade': 'excellent',
+                            'grade': 'unknown',
+                            'sample_status': (
+                                'counter_reset'
+                                if delta_details.get('counter_reset')
+                                else 'baseline'
+                            ),
                             'rx_packets': stats.get('rx_packets', 0),
                             'tx_packets': stats.get('tx_packets', 0),
                             'rx_errors': stats.get('rx_errors', 0),
                             'tx_errors': stats.get('tx_errors', 0),
                             'total_packets': stats.get('rx_packets', 0) + stats.get('tx_packets', 0),
                             'delta_errors': 0,
-                            'delta_bytes': 0
+                            'delta_bytes': 0,
+                            'delta_packets': 0,
+                            'delta_rx_errors': 0,
+                            'delta_tx_errors': 0,
+                            'sample_duration_seconds': delta_details.get(
+                                'sample_duration_seconds', 0
+                            ),
                         }
+                        ber_analyzer.ber_history.setdefault(port_name, []).append(
+                            baseline_record
+                        )
                         ber_analyzer.current_ber_stats[port_name] = baseline_record
-                        baseline_interfaces += 1
                         processed_interfaces += 1
                         total_interfaces_processed += 1
                         continue
                     
-                    # Skip interfaces with no activity since baseline
+                    # Every physical port belongs to the current snapshot. A
+                    # low-traffic interval is explicitly unknown and remains
+                    # accumulated against the prior baseline for a later run.
                     total_packets = stats.get('rx_packets', 0) + stats.get('tx_packets', 0)
-                    if total_packets < ber_analyzer.config['min_packets_for_analysis']:
+                    if delta_packets < ber_analyzer.config['min_packets_for_analysis']:
+                        ber_analyzer.current_ber_stats[port_name] = {
+                            'timestamp': time.time(),
+                            # Preserve the observed value for display and for
+                            # immediate evaluation when an error is already
+                            # present.  The low sample remains ungraded when it
+                            # contains no errors, and its baseline accumulates.
+                            'ber_value': ber_value,
+                            'grade': 'unknown',
+                            'sample_status': 'insufficient_traffic',
+                            'rx_packets': stats.get('rx_packets', 0),
+                            'tx_packets': stats.get('tx_packets', 0),
+                            'rx_errors': stats.get('rx_errors', 0),
+                            'tx_errors': stats.get('tx_errors', 0),
+                            'total_packets': total_packets,
+                            'delta_errors': delta_errors,
+                            'delta_bytes': delta_bytes,
+                            'delta_packets': delta_packets,
+                            'delta_rx_errors': delta_details.get('delta_rx_errors', 0),
+                            'delta_tx_errors': delta_details.get('delta_tx_errors', 0),
+                            'sample_duration_seconds': delta_details.get(
+                                'sample_duration_seconds', 0
+                            ),
+                        }
+                        ber_analyzer.ber_history.setdefault(port_name, []).append(
+                            ber_analyzer.current_ber_stats[port_name]
+                        )
+                        processed_interfaces += 1
+                        total_interfaces_processed += 1
                         continue
                     
                     # Create BER record manually since we're using delta calculation
@@ -208,7 +322,14 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                         'tx_errors': stats.get('tx_errors', 0),
                         'total_packets': total_packets,
                         'delta_errors': delta_errors,
-                        'delta_bytes': delta_bytes
+                        'delta_bytes': delta_bytes,
+                        'delta_packets': delta_packets,
+                        'delta_rx_errors': delta_details.get('delta_rx_errors', 0),
+                        'delta_tx_errors': delta_details.get('delta_tx_errors', 0),
+                        'sample_duration_seconds': delta_details.get(
+                            'sample_duration_seconds', 0
+                        ),
+                        'sample_status': 'analyzed',
                     }
                     
                     # Update current stats and history
@@ -222,43 +343,65 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                     
                     processed_interfaces += 1
                     total_interfaces_processed += 1
-                
-                
+                if processed_interfaces > 0:
+                    hosts_with_interfaces.add(hostname)
                 
             except Exception as e:
                 print(f"❌ Error processing {filename}: {e}")
                 processing_errors += 1
     
-    if processed_devices == 0:
+    if processed_devices == 0 and not all_devices_unavailable:
         print("❌ No BER data files found to process")
         ber_analyzer.save_ber_history()
+        return False
+    missing_interface_hosts = sorted(expected_hosts - hosts_with_interfaces)
+    if missing_interface_hosts:
+        print(
+            "❌ No physical interface counters for current hosts: "
+            + ", ".join(missing_interface_hosts)
+        )
         return False
     
     # Save baseline data once after all interfaces processed
     ber_analyzer.save_baseline_data()
+    ber_analyzer.save_ber_history()
+    if total_interfaces_processed == 0 and not all_devices_unavailable:
+        print("❌ No physical interface counters were processed")
+        return False
+    for required_state in (
+        os.path.join(result_dir, "ber_baseline.json"),
+        os.path.join(result_dir, "ber_history.json"),
+    ):
+        if not os.path.isfile(required_state) or os.path.getsize(required_state) == 0:
+            print(f"❌ BER state was not saved: {required_state}")
+            return False
     
     # Generate summary
     summary = ber_analyzer.get_ber_summary()
     anomalies = ber_analyzer.detect_ber_anomalies()
     
-    print(f"\nBER Analysis Summary:")
+    print("\nLink Error / BER Analysis Summary:")
     print(f"  Total devices processed: {processed_devices}")
     print(f"  Total interfaces analyzed: {total_interfaces_processed}")
     print(f"  Excellent quality: {len(summary['excellent_ports'])}")
     print(f"  Good quality: {len(summary['good_ports'])}")
     print(f"  Warning level: {len(summary['warning_ports'])}")
     print(f"  Critical issues: {len(summary['critical_ports'])}")
+    print(f"  Awaiting a complete sample: {len(summary['unknown_ports'])}")
     print(f"  Anomalies detected: {len(anomalies)}")
     
     # Show critical issues
     if summary['critical_ports']:
-        print(f"\nCritical BER Issues (Immediate Attention):")
+        print("\nCritical Link Error Issues (Immediate Attention):")
         for port_info in summary['critical_ports'][:5]:  # Show first 5
             port = port_info['port']
             ber_value = port_info['ber_value']
             rx_errors = port_info['rx_errors']
             tx_errors = port_info['tx_errors']
-            print(f"    {port}: BER={ber_value:.2e}, RX_Errors={rx_errors}, TX_Errors={tx_errors}")
+            print(
+                f"    {port}: ErrorDensity={ber_value:.2e}, "
+                f"RX_Errors={rx_errors}, TX_Errors={tx_errors}"
+            )
     
     # Show anomalies
     if anomalies:
@@ -271,8 +414,16 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             print(f"      Action: {anomaly['action']}")
     
     # Export web report
-    output_file = "monitor-results/ber-analysis.html"
+    output_file = os.path.join(result_dir, "ber-analysis.html")
+    if snapshot_valid:
+        ber_analyzer.coverage_expected_hosts = len(statuses)
+        ber_analyzer.coverage_current_hosts = len(hosts_with_interfaces)
     ber_analyzer.export_ber_data_for_web(output_file)
+    if all_devices_unavailable:
+        mark_html_collection_unavailable(output_file)
+    if not os.path.isfile(output_file) or os.path.getsize(output_file) == 0:
+        print("❌ BER analysis report was not generated")
+        return False
     print(f"BER analysis report generated: {output_file}")
     
     # Final summary

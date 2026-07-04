@@ -25,11 +25,7 @@
     }
 
     /* ---- header ---- */
-    .hdr { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #1e1e1e; border-bottom: 1px solid #333; flex: none; }
-    .hdr .title { font-size: 16px; font-weight: 700; color: #76b900; display: flex; align-items: center; gap: 8px; }
-    .hdr .title svg { width: 20px; height: 20px; fill: #76b900; }
-    .hdr .sub { font-size: 12px; color: #888; }
-    .hdr .badge { font-size: 10px; font-weight: 700; letter-spacing: .5px; padding: 2px 8px; border-radius: 4px; background: #3a2a10; color: #e0b84a; border: 1px solid #5a4520; }
+    .hdr { display: flex; align-items: center; gap: 12px; padding: 10px 16px; min-height: 52px; background: #1e1e1e; border-bottom: 1px solid #333; flex: none; }
     .hdr .spacer { flex: 1; }
     .hdr .hbtn { display: inline-flex; align-items: center; gap: 6px; background: #2d2d2d; border: 1px solid #3c3c3c; color: #ccc; border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
     .hdr .hbtn:hover { border-color: #76b900; color: #76b900; }
@@ -49,10 +45,11 @@
     .wrap { flex: 1; display: flex; min-height: 0; }
 
     /* ---- left target list (matches Commands/Details) ---- */
-    .cr-left { width: 290px; min-width: 290px; background: #252526; border-right: 1px solid #333; display: flex; flex-direction: column; min-height: 0; }
-    .cr-left-header { padding: 12px 14px; font-size: 16px; font-weight: 700; color: #e0e0e0; border-bottom: 1px solid #333; background: #2d2d2d; }
-    .cr-search { padding: 8px 10px; border-bottom: 1px solid #333; }
-    .cr-search input { width: 100%; background: #1a1a1a; border: 1px solid #3c3c3c; color: #e0e0e0; border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none; }
+    .cr-left { width: 300px; min-width: 300px; background: #252526; border-right: 1px solid #404040; display: flex; flex-direction: column; min-height: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+    .cr-left-header { background: linear-gradient(0deg,#76b900 0%,#5a8c00 100%); color: #fff; font-weight: bold; font-size: 16px; padding: 16px; display: flex; align-items: center; gap: 10px; }
+    .cr-left-header svg { width: 20px; height: 20px; fill: #fff; }
+    .cr-search { padding: 10px; border-bottom: 1px solid #404040; }
+    .cr-search input { width: 100%; background: #3c3c3c; border: 1px solid #555; color: #d4d4d4; border-radius: 4px; padding: 8px 12px; font-size: 13px; outline: none; }
     .cr-search input:focus { border-color: #76b900; }
     input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus {
         -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important; -webkit-text-fill-color: #fff !important; caret-color: #fff !important;
@@ -67,8 +64,8 @@
     .host-item { color: #e0b84a; font-weight: 600; border-bottom: 1px solid #333; }
     .host-item .dot, .device-item .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; flex: none; }
     .host-item.active .dot, .device-item.active .dot { background: #76b900; }
-    .group-header { display: flex; align-items: center; gap: 6px; padding: 7px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; color: #888; cursor: pointer; user-select: none; }
-    .group-header:hover { color: #aaa; }
+    .group-header { display: flex; align-items: center; gap: 8px; padding: 8px 15px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; color: #999; background: #2d2d2d; cursor: pointer; user-select: none; }
+    .group-header:hover { background: #333; }
     .group-header .arrow { transition: transform .15s; font-size: 9px; }
     .group-header.collapsed .arrow { transform: rotate(-90deg); }
     .group-devices.collapsed { display: none; }
@@ -109,31 +106,27 @@
 </style>
 </head>
 <body>
-    <div class="hdr">
-        <div class="title">
-            <svg viewBox="0 0 24 24"><path d="M20,19V7H4V19H20M20,3A2,2 0 0,1 22,5V19A2,2 0 0,1 20,21H4A2,2 0 0,1 2,19V5C2,3.89 2.89,3 4,3H20M9.58,13L5.57,9H8.4L11.7,12.3C12.09,12.69 12.09,13.32 11.7,13.71L8.42,17H5.59L9.58,13Z"/></svg>
-            Console
-        </div>
-        <span class="sub" id="hdrSub">interactive SSH terminal</span>
-        <span class="badge" title="Full interactive shell — every session is audited">FULL ACCESS · AUDITED</span>
-        <div class="spacer"></div>
-        <button class="hbtn" id="askAiBtn" onclick="askAIaboutSelection()" title="Send the selected terminal output to Ask AI">Ask AI</button>
-        <button class="hbtn" id="bcastBtn" onclick="toggleBroadcast()" title="Broadcast — type once, send to ALL open tabs"><b>B</b></button>
-        <button class="hbtn" onclick="fontStep(-1)" title="Smaller font">A−</button>
-        <button class="hbtn" onclick="fontStep(1)" title="Larger font">A+</button>
-        <button class="hbtn" onclick="openSearch()" title="Search (Ctrl+F)"><svg viewBox="0 0 24 24"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg></button>
-        <button class="hbtn" onclick="copyAll()" title="Copy buffer"><svg viewBox="0 0 24 24"><path d="M16,1H4C2.9,1 2,1.9 2,3V17H4V3H16V1M19,5H8C6.9,5 6,5.9 6,7V21C6,22.1 6.9,23 8,23H19C20.1,23 21,22.1 21,21V7C21,5.9 20.1,5 19,5M19,21H8V7H19V21Z"/></svg></button>
-        <button class="hbtn" onclick="downloadLog()" title="Download session log"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg></button>
-    </div>
-
     <div class="wrap">
         <aside class="cr-left">
-            <div class="cr-left-header">Targets</div>
-            <div class="cr-search"><input type="text" id="search" placeholder="Search targets..." autocomplete="off" oninput="renderList()"></div>
+            <div class="cr-left-header">
+                <svg viewBox="0 0 24 24"><path d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
+                Device Console
+            </div>
+            <div class="cr-search"><input type="text" id="search" placeholder="Search devices..." autocomplete="off" oninput="renderList()"></div>
             <div class="cr-list" id="list"></div>
             <div class="cr-count" id="count">Loading…</div>
         </aside>
         <main class="term-main">
+            <div class="hdr">
+                <div class="spacer"></div>
+                <button class="hbtn" id="askAiBtn" onclick="askAIaboutSelection()" title="Send the selected terminal output to Ask AI">Ask AI</button>
+                <button class="hbtn" id="bcastBtn" onclick="toggleBroadcast()" title="Broadcast — type once, send to ALL open tabs"><b>B</b></button>
+                <button class="hbtn" onclick="fontStep(-1)" title="Smaller font">A−</button>
+                <button class="hbtn" onclick="fontStep(1)" title="Larger font">A+</button>
+                <button class="hbtn" onclick="openSearch()" title="Search (Ctrl+F)"><svg viewBox="0 0 24 24"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg></button>
+                <button class="hbtn" onclick="copyAll()" title="Copy buffer"><svg viewBox="0 0 24 24"><path d="M16,1H4C2.9,1 2,1.9 2,3V17H4V3H16V1M19,5H8C6.9,5 6,5.9 6,7V21C6,22.1 6.9,23 8,23H19C20.1,23 21,22.1 21,21V7C21,5.9 20.1,5 19,5M19,21H8V7H19V21Z"/></svg></button>
+                <button class="hbtn" onclick="downloadLog()" title="Download session log"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg></button>
+            </div>
             <div class="tabs" id="tabs"></div>
             <div class="term-stack" id="stack">
                 <div class="empty-hint" id="emptyHint">Select a target on the left to open a session.</div>
@@ -342,7 +335,6 @@
         }
         const s = sessions[id];
         if (s) {
-            document.getElementById('hdrSub').textContent = s.label;
             setTimeout(() => { snug(s); s.term.focus(); }, 0);
         }
         renderList();
@@ -402,7 +394,7 @@
             const rest = Object.keys(sessions);
             activeId = null;
             if (rest.length) switchTo(rest[rest.length - 1]);
-            else { document.getElementById('emptyHint').style.display = 'flex'; document.getElementById('hdrSub').textContent = 'interactive SSH terminal'; }
+            else { document.getElementById('emptyHint').style.display = 'flex'; }
         }
         renderList();
     }

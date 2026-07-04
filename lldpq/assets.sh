@@ -8,11 +8,22 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/load_devices.sh"
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
-# Load allowlisted config data through the fixed, root-owned parser.
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+# Installed runs require the root-owned parser. Explicit WEB_ROOT is accepted
+# only for isolated tests/source-tree execution.
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
+    LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
+        --require-key WEB_ROOT --require-key LLDPQ_USER 2>/dev/null) || {
+        echo "assets: required runtime configuration is missing or unreadable" >&2
+        exit 1
+    }
+    eval "$LLDPQ_CONFIG_ASSIGNMENTS"
+    unset LLDPQ_CONFIG_ASSIGNMENTS
+elif [[ -z "${WEB_ROOT:-}" ]]; then
+    echo "assets: required config helper is missing: $LLDPQ_CONFIG_HELPER" >&2
+    exit 1
 fi
-WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 ASSETS_MAX_PARALLEL="${ASSETS_MAX_PARALLEL:-50}"
 case "$ASSETS_MAX_PARALLEL" in
   ''|*[!0-9]*|0) ASSETS_MAX_PARALLEL=50 ;;

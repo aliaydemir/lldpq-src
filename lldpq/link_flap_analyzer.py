@@ -18,6 +18,11 @@ from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass, asdict
 
 try:
+    import yaml
+except Exception:
+    yaml = None
+
+try:
     from device_names import canonical
 except Exception:
     def canonical(_n):
@@ -26,8 +31,8 @@ except Exception:
 class FlapStatus(Enum):
     """flap status"""
     OK = "ok"
-    FLAPPING = "flapping"
-    FLAPPED = "flapped"
+    WARNING = "warning"
+    CRITICAL = "critical"
 
 class FlapPeriod(Enum):
     """flap detection periods"""
@@ -55,21 +60,85 @@ class LinkFlapAnalyzer:
     MIN_CARRIER_TRANSITION_DELTA = 2  # minimum transitions to consider flap
     INTERVAL_TO_PERSIST_FLAP = 60  # seconds - how long flap status persists
     INTERVAL_24_HOURS = 24 * 60 * 60  # 24 hour cleanup
+    DEFAULT_THRESHOLDS = {
+        "warning_flaps_per_hour": 10,
+        "critical_flaps_per_hour": 20,
+    }
     
     def __init__(self, data_dir="monitor-results"):
         self.data_dir = data_dir
         self.carrier_transitions_lookback = {}  # port -> deque of (time, transitions)
-        self.flapping_hist = {}  # port -> deque of (time, transitions, flap_count)
+        # port -> deque of legacy 3-tuples or interval-aware 5-tuples
+        self.flapping_hist = {}
         self.carrier_transitions_stats = {}  # port -> current transition count
         self.prev_cumulative = {}  # port -> last cycle's cumulative carrier_changes (persisted baseline)
+        self.prev_sample_time = {}  # port -> timestamp of persisted baseline
         self.flapping_counters = {}  # port -> {period: count}
         self._port_cache = {}  # Cache for calculated port status/counters
+        self.thresholds = self.DEFAULT_THRESHOLDS.copy()
+        self.collection_coverage = {
+            "expected_devices": 0,
+            "current_devices": 0,
+            "unavailable_devices": [],
+        }
+        self._load_configured_thresholds()
         
         # Ensure flap-data directory exists
         os.makedirs(f"{self.data_dir}/flap-data", exist_ok=True)
         
         # Load historical data if exists
         self.load_flap_history()
+
+    def _load_configured_thresholds(self):
+        """Load the same flap thresholds used by the notification pipeline."""
+        candidates = [
+            os.environ.get("LLDPQ_NOTIFICATIONS_FILE"),
+            os.path.join(os.path.dirname(os.path.abspath(self.data_dir)), "notifications.yaml"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "notifications.yaml"),
+        ]
+        if yaml is not None:
+            for path in candidates:
+                if not path or not os.path.isfile(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as handle:
+                        config = yaml.safe_load(handle) or {}
+                    network = config.get("thresholds", {}).get("network", {})
+                    warning = int(network.get(
+                        "link_flaps_per_hour",
+                        self.thresholds["warning_flaps_per_hour"],
+                    ))
+                    critical = int(network.get(
+                        "link_flaps_critical",
+                        self.thresholds["critical_flaps_per_hour"],
+                    ))
+                    if warning >= 0:
+                        self.thresholds["warning_flaps_per_hour"] = warning
+                    if critical >= 0:
+                        self.thresholds["critical_flaps_per_hour"] = critical
+                    break
+                except (OSError, TypeError, ValueError, AttributeError):
+                    continue
+
+        for env_name, key in (
+            ("LINK_FLAPS_PER_HOUR", "warning_flaps_per_hour"),
+            ("LINK_FLAPS_CRITICAL", "critical_flaps_per_hour"),
+        ):
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+                if value >= 0:
+                    self.thresholds[key] = value
+            except ValueError:
+                continue
+
+        # A critical boundary below warning would make the grading ambiguous.
+        self.thresholds["critical_flaps_per_hour"] = max(
+            self.thresholds["critical_flaps_per_hour"],
+            self.thresholds["warning_flaps_per_hour"],
+        )
     
     def load_flap_history(self):
         """Load historical flap data from file"""
@@ -82,6 +151,10 @@ class LinkFlapAnalyzer:
                 for port, lookback in data.get("carrier_transitions_lookback", {}).items():
                     self.carrier_transitions_lookback[port] = collections.deque(lookback, maxlen=100)
                 self.prev_cumulative = dict(data.get("prev_cumulative", {}))
+                self.prev_sample_time = dict(data.get("prev_sample_time", {}))
+                saved_coverage = data.get("collection_coverage")
+                if isinstance(saved_coverage, dict):
+                    self.collection_coverage.update(saved_coverage)
         except (FileNotFoundError, json.JSONDecodeError):
             pass
     
@@ -92,6 +165,8 @@ class LinkFlapAnalyzer:
                 "flapping_hist": {port: list(deq) for port, deq in self.flapping_hist.items()},
                 "carrier_transitions_lookback": {port: list(deq) for port, deq in self.carrier_transitions_lookback.items()},
                 "prev_cumulative": self.prev_cumulative,
+                "prev_sample_time": self.prev_sample_time,
+                "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
             }
             with open(f"{self.data_dir}/flap_history.json", "w") as f:
@@ -110,6 +185,7 @@ class LinkFlapAnalyzer:
         (The old code compared two samples that never coexisted at a 10-min cadence -> windows were
         always 0 while the raw Total counter still showed a value.)"""
         curr_time = time.time()
+        self._port_cache = {}
 
         # Initialize if new port
         if port_name not in self.carrier_transitions_lookback:
@@ -119,14 +195,30 @@ class LinkFlapAnalyzer:
 
         # Cycle-over-cycle delta vs the persisted previous cumulative reading.
         prev = self.prev_cumulative.get(port_name)
+        prev_time = self.prev_sample_time.get(port_name)
         if prev is not None and current_transitions >= prev:
             delta = current_transitions - prev
             if delta >= self.MIN_CARRIER_TRANSITION_DELTA:
-                # delta transitions = delta//2 up-down flap cycles, attributed to "now" (we only know
-                # they happened somewhere within the last poll interval).
-                self.flapping_hist[port_name].append((curr_time, current_transitions, delta // 2))
+                # The exact event time is unknown.  Persist the complete poll
+                # interval so short-window counters can refuse to overclaim it.
+                if prev_time is None:
+                    # Baselines persisted by older versions have no sampling
+                    # timestamp, so the delta may span minutes or days. Rebase
+                    # once instead of assigning an unknowable interval.
+                    pass
+                else:
+                    interval_start = float(prev_time)
+                    interval_seconds = max(0.0, curr_time - interval_start)
+                    self.flapping_hist[port_name].append((
+                        curr_time,
+                        current_transitions,
+                        delta // 2,
+                        interval_start,
+                        interval_seconds,
+                    ))
         # current < prev => counter reset (e.g. reboot); skip this cycle and just re-baseline below.
         self.prev_cumulative[port_name] = current_transitions
+        self.prev_sample_time[port_name] = curr_time
 
         # Keep lookback/stats for the rest of the report (Total column = current cumulative counter).
         self.carrier_transitions_lookback[port_name].append((curr_time, current_transitions))
@@ -148,20 +240,14 @@ class LinkFlapAnalyzer:
                 flap_hist_queue.popleft()
     
     def check_flapping(self) -> bool:
-        """Return True if any port recorded a flap within the most recent detection window.
-
-        Detection itself now happens per-cycle in update_carrier_transitions (delta vs the previous
-        cumulative reading). This is read-only: it must NOT mutate the lookback or append history
-        (doing so previously double-counted / cleared the baseline)."""
-        curr_time = time.time()
-        detected = False
-        for port_name, flaps in self.flapping_hist.items():
-            for flap_time, _, flap_count in flaps:
-                if curr_time - flap_time <= self.FLAPPING_INTERVAL:
-                    print(f"Flap detected on {port_name}: {flap_count} flaps")
-                    detected = True
-                    break
-        return detected
+        """Return True when any port crosses the configured hourly warning rate."""
+        warning = self.thresholds["warning_flaps_per_hour"]
+        for port_name in self.carrier_transitions_stats:
+            count = self.calculate_flapping_rate(port_name)["flap_1_hr"]
+            if warning > 0 and count >= warning:
+                print(f"Flap threshold exceeded on {port_name}: {count} flaps in last hour")
+                return True
+        return False
     
     def calculate_flapping_rate(self, port_name: str) -> Dict[str, int]:
         """Calculate flapping rates for different time periods"""
@@ -171,13 +257,26 @@ class LinkFlapAnalyzer:
         flaps = self.flapping_hist.get(port_name, [])
         
         if flaps:
-            for flap_time, _, flap_count in flaps:
-                time_delta = curr_time - flap_time
-                
-                # Add to appropriate time buckets
+            for event in flaps:
+                if len(event) < 3:
+                    continue
+                flap_time, _, flap_count = event[:3]
+                sample_age = max(0.0, curr_time - float(flap_time))
+                is_interval_aware = len(event) >= 5
+                interval_seconds = max(0.0, float(event[4])) if is_interval_aware else None
+
                 for period in FlapPeriod:
-                    if time_delta <= period.value:
-                        flap_counters[period.name.lower()] += flap_count
+                    if is_interval_aware:
+                        # Count only when the entire observation interval fits
+                        # inside the requested lookback. A ten-minute poll can
+                        # therefore populate 1h/12h/24h, never 30s/1m/5m.
+                        fits = sample_age + interval_seconds <= period.value
+                    else:
+                        # Legacy entries lack observation-window metadata. Keep
+                        # them out of short buckets where they could be false.
+                        fits = period.value >= FlapPeriod.FLAP_1_HR.value and sample_age <= period.value
+                    if fits:
+                        flap_counters[period.name.lower()] += int(flap_count)
         
         return flap_counters
     
@@ -186,36 +285,34 @@ class LinkFlapAnalyzer:
         self._port_cache = {}
         for port_name in self.carrier_transitions_stats.keys():
             counters = self.calculate_flapping_rate(port_name)
-            # Determine status from counters
-            if counters['flap_30_sec'] > 0 or counters['flap_1_min'] > 0:
-                status = FlapStatus.FLAPPING
-            elif any(count > 0 for count in counters.values()):
-                status = FlapStatus.FLAPPED
-            else:
-                status = FlapStatus.OK
+            status = self._status_for_counters(counters)
             self._port_cache[port_name] = {'status': status, 'counters': counters}
+
+    def _status_for_counters(self, counters: Dict[str, int]) -> FlapStatus:
+        """Grade a port from configured one-hour flap thresholds."""
+        hourly = counters.get("flap_1_hr", 0)
+        critical = self.thresholds["critical_flaps_per_hour"]
+        warning = self.thresholds["warning_flaps_per_hour"]
+        if critical > 0 and hourly >= critical:
+            return FlapStatus.CRITICAL
+        if warning > 0 and hourly >= warning:
+            return FlapStatus.WARNING
+        return FlapStatus.OK
     
     def get_port_flap_status(self, port_name: str) -> FlapStatus:
         """Get current flap status for a port"""
         counters = self.calculate_flapping_rate(port_name)
         
-        # Currently flapping if recent activity
-        if counters['flap_30_sec'] > 0 or counters['flap_1_min'] > 0:
-            return FlapStatus.FLAPPING
-        
-        # Previously flapped if any activity in longer periods
-        if any(count > 0 for count in counters.values()):
-            return FlapStatus.FLAPPED
-        
-        return FlapStatus.OK
+        return self._status_for_counters(counters)
     
     def get_flap_summary(self) -> Dict[str, Any]:
         """Get summary of all flapping ports - uses cache for performance"""
         summary = {
             "total_ports": len(self.carrier_transitions_stats),
-            "flapping_ports": [],
-            "flapped_ports": [],
+            "critical_ports": [],
+            "warning_ports": [],
             "ok_ports": [],
+            "collection_coverage": dict(self.collection_coverage),
             "timestamp": datetime.now().isoformat()
         }
         
@@ -234,12 +331,16 @@ class LinkFlapAnalyzer:
                 "last_transitions": self.carrier_transitions_stats.get(port_name, 0)
             }
             
-            if status == FlapStatus.FLAPPING:
-                summary["flapping_ports"].append(port_info)
-            elif status == FlapStatus.FLAPPED:
-                summary["flapped_ports"].append(port_info)
+            if status == FlapStatus.CRITICAL:
+                summary["critical_ports"].append(port_info)
+            elif status == FlapStatus.WARNING:
+                summary["warning_ports"].append(port_info)
             else:
                 summary["ok_ports"].append(port_info)
+
+        # Compatibility aliases for consumers upgraded independently.
+        summary["flapping_ports"] = summary["critical_ports"]
+        summary["flapped_ports"] = summary["warning_ports"]
         
         return summary
     
@@ -255,37 +356,46 @@ class LinkFlapAnalyzer:
             status = cached['status']
             counters = cached['counters']
             
-            if status == FlapStatus.FLAPPING:
+            if status == FlapStatus.CRITICAL:
                 anomalies.append({
-                    "device": port_name.split(':')[0] if ':' in port_name else "unknown",
-                    "interface": port_name.split(':')[1] if ':' in port_name else port_name,
+                    "device": port_name.split(':', 1)[0] if ':' in port_name else "unknown",
+                    "interface": port_name.split(':', 1)[1] if ':' in port_name else port_name,
                     "type": "CRITICAL_FLAPPING",
                     "severity": "critical",
-                    "message": f"Port {port_name} is currently flapping ({counters['flap_30_sec']} flaps in last 30 seconds)",
+                    "message": f"Port {port_name} crossed the critical threshold ({counters['flap_1_hr']} flaps in last hour)",
                     "details": {
-                        "flap_count_30s": counters['flap_30_sec'],
-                        "flap_count_1min": counters['flap_1_min'],
+                        "flap_count_1hr": counters['flap_1_hr'],
+                        "critical_threshold": self.thresholds["critical_flaps_per_hour"],
                         "current_transitions": self.carrier_transitions_stats.get(port_name, 0)
                     },
                     "action": f"Check physical cabling and hardware health for {port_name}"
                 })
             
-            elif status == FlapStatus.FLAPPED and counters['flap_5_min'] > 0:
+            elif status == FlapStatus.WARNING:
                 anomalies.append({
-                    "device": port_name.split(':')[0] if ':' in port_name else "unknown",
-                    "interface": port_name.split(':')[1] if ':' in port_name else port_name,
+                    "device": port_name.split(':', 1)[0] if ':' in port_name else "unknown",
+                    "interface": port_name.split(':', 1)[1] if ':' in port_name else port_name,
                     "type": "WARNING_FLAPPING",
                     "severity": "warning",
-                    "message": f"Port {port_name} recently flapped ({counters['flap_5_min']} flaps in last 5 minutes)",
+                    "message": f"Port {port_name} crossed the warning threshold ({counters['flap_1_hr']} flaps in last hour)",
                     "details": {
-                        "flap_count_5min": counters['flap_5_min'],
                         "flap_count_1hr": counters['flap_1_hr'],
+                        "warning_threshold": self.thresholds["warning_flaps_per_hour"],
                         "current_transitions": self.carrier_transitions_stats.get(port_name, 0)
                     },
                     "action": f"Monitor {port_name} closely and investigate if pattern continues"
                 })
         
         return anomalies
+
+    def set_collection_coverage(self, expected_devices, current_devices):
+        expected = set(expected_devices)
+        current = set(current_devices)
+        self.collection_coverage = {
+            "expected_devices": len(expected),
+            "current_devices": len(current),
+            "unavailable_devices": sorted(expected - current),
+        }
     
     def export_flap_data_for_web(self, output_file: str):
         """Export flap data for web display - optimized with caching"""
@@ -296,8 +406,17 @@ class LinkFlapAnalyzer:
         anomalies = self.detect_flap_anomalies()
         
         # Determine overall health status
-        total_problematic = len(summary['flapping_ports']) + len(summary['flapped_ports'])
+        total_problematic = len(summary['critical_ports']) + len(summary['warning_ports'])
         stability_ratio = ((summary['total_ports'] - total_problematic) / summary['total_ports'] * 100) if summary['total_ports'] > 0 else 0
+        coverage = summary.get("collection_coverage", {})
+        expected_devices = int(coverage.get("expected_devices", 0) or 0)
+        current_devices = int(coverage.get("current_devices", 0) or 0)
+        if expected_devices and current_devices == 0:
+            coverage_status = "unavailable"
+        elif expected_devices and current_devices < expected_devices:
+            coverage_status = "partial"
+        else:
+            coverage_status = "current"
         
         html_content = f"""
 <!DOCTYPE html>
@@ -411,6 +530,11 @@ class LinkFlapAnalyzer:
     </style>
 </head>
 <body>
+    <div data-analysis-summary="flap" data-collection-status="{coverage_status}"
+         data-expected-devices="{expected_devices}"
+         data-current-devices="{current_devices}"
+         data-critical-ports="{len(summary['critical_ports'])}"
+         data-warning-ports="{len(summary['warning_ports'])}" style="display:none"></div>
     <div class="page-header">
         <div>
             <div class="page-title">Link Flap Detection Results</div>
@@ -443,23 +567,23 @@ class LinkFlapAnalyzer:
         </div>
         <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card card-info" id="total-devices-card">
-                    <div class="metric" id="total-devices">{len(set(port.split(':')[0] for port in self.carrier_transitions_stats.keys()))}</div>
+                <div class="summary-card card-info" id="total-devices-card" data-metric-key="flap_current_devices" data-metric-value="{len(set(port.split(':', 1)[0] for port in self.carrier_transitions_stats.keys()))}">
+                    <div class="metric" id="total-devices">{len(set(port.split(':', 1)[0] for port in self.carrier_transitions_stats.keys()))}</div>
                     <div class="metric-label">Total Devices</div>
                 </div>
-                <div class="summary-card card-info" id="total-ports-card">
+                <div class="summary-card card-info" id="total-ports-card" data-metric-key="flap_total_ports" data-metric-value="{summary['total_ports']}">
                     <div class="metric" id="total-ports">{summary['total_ports']}</div>
                     <div class="metric-label">Total Ports</div>
                 </div>
-                <div class="summary-card card-excellent" id="stable-card">
+                <div class="summary-card card-excellent" id="stable-card" data-metric-key="flap_stable_ports" data-metric-value="{len(summary['ok_ports'])}">
                     <div class="metric flap-excellent" id="stable-ports">{len(summary['ok_ports'])}</div>
                     <div class="metric-label">Stable</div>
                 </div>
-                <div class="summary-card card-critical" id="problematic-card">
-                    <div class="metric flap-critical" id="problematic-ports">{len(summary['flapping_ports']) + len(summary['flapped_ports'])}</div>
+                <div class="summary-card card-critical" id="problematic-card" data-metric-key="flap_problematic_ports" data-metric-value="{total_problematic}">
+                    <div class="metric flap-critical" id="problematic-ports">{total_problematic}</div>
                     <div class="metric-label">Problematic</div>
                 </div>
-                <div class="summary-card" id="stability-card">
+                <div class="summary-card" id="stability-card" data-metric-key="flap_stability_ratio" data-metric-value="{stability_ratio:.1f}">
                     <div class="metric" id="stability-ratio">{stability_ratio:.1f}%</div>
                     <div class="metric-label">Stability Ratio</div>
                 </div>
@@ -495,8 +619,8 @@ class LinkFlapAnalyzer:
         # Collect all ports for display - using cache
         all_ports = []
         for port_name, cached in self._port_cache.items():
-            device = port_name.split(':')[0] if ':' in port_name else "unknown"
-            interface = port_name.split(':')[1] if ':' in port_name else port_name
+            device = port_name.split(':', 1)[0] if ':' in port_name else "unknown"
+            interface = port_name.split(':', 1)[1] if ':' in port_name else port_name
             
             port_info = {
                 'device': device,
@@ -539,8 +663,8 @@ class LinkFlapAnalyzer:
         
         # Sort by severity (problems first, like BGP)
         sorted_ports = sorted(all_ports, key=lambda x: (
-            0 if x['status'] == FlapStatus.FLAPPING else
-            1 if x['status'] == FlapStatus.FLAPPED else 2
+            0 if x['status'] == FlapStatus.CRITICAL else
+            1 if x['status'] == FlapStatus.WARNING else 2
         ))
         
         # Build table rows using list for O(n) performance instead of O(n²) string concat
@@ -551,20 +675,23 @@ class LinkFlapAnalyzer:
             status_val = port['status'].value
             if status_val == 'ok':
                 badge_class = 'badge badge-green'
-            elif status_val == 'flapping':
+            elif status_val == 'critical':
                 badge_class = 'badge badge-red'
-            else:  # flapped
+            else:  # warning
                 badge_class = 'badge badge-orange'
             
-            # Color coding for transition counts
-            transition_class = "transition-good"
-            if port['total_transitions'] > 50:
+            # The cumulative counter can be large on a healthy old device; its
+            # colour follows the current threshold grade, not lifetime total.
+            if status_val == "critical":
                 transition_class = "transition-critical"
-            elif port['total_transitions'] > 10:
+            elif status_val == "warning":
                 transition_class = "transition-warning"
-                
+            else:
+                transition_class = "transition-good"
+
+            dashboard_status = "ok" if status_val == "ok" else "problematic"
             table_rows.append(f"""
-        <tr data-status="{status_val}">
+        <tr data-status="{dashboard_status}" data-flap-status="{status_val}">
             <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
             <td><span class="{badge_class}">{status_val.upper()}</span></td>
@@ -596,10 +723,10 @@ class LinkFlapAnalyzer:
                     <tr><th>Parameter</th><th>Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>Detection Window</td><td>125 seconds</td><td>Time window for carrier transition analysis</td></tr>
+                    <tr><td>Warning Rate</td><td>__FLAP_WARNING_THRESHOLD__</td><td>Flaps observed during complete sampling intervals within the last hour</td></tr>
+                    <tr><td>Critical Rate</td><td>__FLAP_CRITICAL_THRESHOLD__</td><td>Critical one-hour flap boundary</td></tr>
                     <tr><td>Min Transition Delta</td><td>2+ transitions</td><td>Minimum transitions to trigger flap detection</td></tr>
-                    <tr><td>Flap Persistence</td><td>60 seconds</td><td>Duration flap status remains active</td></tr>
-                    <tr><td>High Transition Alert</td><td>50+ transitions</td><td>Indicates potential hardware issues</td></tr>
+                    <tr><td>Short Windows</td><td>Complete interval only</td><td>A poll interval is never attributed to a shorter 30s, 1m, or 5m bucket</td></tr>
                     <tr><td>Data Retention</td><td>24 hours</td><td>Historical carrier transition data retention</td></tr>
                 </tbody>
             </table>
@@ -693,10 +820,7 @@ class LinkFlapAnalyzer:
                 filterText = 'Showing ' + filteredRows.length + ' Stable Ports';
                 document.getElementById('stable-card').classList.add('active');
             } else if (filterType === 'PROBLEMATIC') {
-                filteredRows = allRows.filter(row => 
-                    row.dataset.status === 'flapping' || 
-                    row.dataset.status === 'flapped'
-                );
+                filteredRows = allRows.filter(row => row.dataset.status === 'problematic');
                 filterText = 'Showing ' + filteredRows.length + ' Problematic Ports';
                 document.getElementById('problematic-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
@@ -919,16 +1043,18 @@ class LinkFlapAnalyzer:
         
         function compareFlapStatus(a, b) {
             const priority = {
-                'FLAPPING': 0,
-                'FLAPPED': 1,
+                'CRITICAL': 0,
+                'WARNING': 1,
                 'OK': 2
             };
             
-            return (priority[a] || 3) - (priority[b] || 3);
+            const aPriority = Object.prototype.hasOwnProperty.call(priority, a) ? priority[a] : 99;
+            const bPriority = Object.prototype.hasOwnProperty.call(priority, b) ? priority[b] : 99;
+            return aPriority - bPriority;
         }
 
         // Run Analysis Function
-        function runAnalysis() {
+        async function runAnalysis() {
             const button = document.getElementById('run-analysis');
             const originalText = button.innerHTML;
             
@@ -940,6 +1066,10 @@ class LinkFlapAnalyzer:
                 </svg>
                 Running...
             `;
+            let baseline = null;
+            if (typeof window.lldpqCapturePipelineState === 'function') {
+                try { baseline = await window.lldpqCapturePipelineState(); } catch (error) { baseline = null; }
+            }
             
             // Send POST request to trigger monitor
             fetch('/trigger-monitor', {
@@ -971,13 +1101,21 @@ class LinkFlapAnalyzer:
                     notification.innerHTML = `
                         <strong>✅ Monitor Analysis Started</strong><br>
                         The full system analysis is running in the background.<br>
-                        <small>Page will automatically refresh in 35 seconds to show the latest results.</small>
+                        <small>Waiting for the current pipeline to complete before refreshing.</small>
                     `;
                     document.body.appendChild(notification);
-                    // Auto-refresh page after 35 seconds
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 35000);
+                    const completion = typeof window.waitForLldpqAnalysisCompletion === 'function'
+                        ? window.waitForLldpqAnalysisCompletion(baseline)
+                        : new Promise(resolve => setTimeout(resolve, 35000));
+                    Promise.resolve(completion)
+                        .then(() => window.location.reload())
+                        .catch(error => {
+                            console.error('Analysis did not complete successfully:', error);
+                            notification.remove();
+                            alert('Analysis did not complete successfully. The previous report was kept.');
+                            button.disabled = false;
+                            button.innerHTML = originalText;
+                        });
                 } else {
                     console.error('❌ Failed to trigger monitor analysis:', data.message);
                     alert('Failed to trigger analysis. Please try again.');
@@ -1008,11 +1146,14 @@ class LinkFlapAnalyzer:
                 const headers = [
                     'Device',
                     'Port',
-                    'Current Status',
-                    'Last 30 Seconds',
-                    'Last 5 Minutes', 
-                    'Last 24 Hours',
-                    'Total Transitions'
+                    'Status',
+                    '30s',
+                    '1m',
+                    '5m',
+                    '1h',
+                    '12h',
+                    '24h',
+                    'Total'
                 ];
                 
                 let csvContent = headers.join(',') + '\\n';
@@ -1036,15 +1177,18 @@ class LinkFlapAnalyzer:
                 rows.forEach(row => {
                     if (row.style.display !== 'none') {
                         const cells = row.querySelectorAll('td');
-                        if (cells.length >= 7) {
+                        if (cells.length >= 10) {
                             const rowData = [
                                 cells[0].textContent.trim(), // Device
                                 cells[1].textContent.trim(), // Port
                                 cells[2].querySelector('span') ? cells[2].querySelector('span').textContent.trim() : cells[2].textContent.trim(), // Status
                                 cells[3].textContent.trim(), // 30 sec
-                                cells[4].textContent.trim(), // 5 min
-                                cells[5].textContent.trim(), // 24 hrs
-                                cells[6].textContent.trim()  // Total
+                                cells[4].textContent.trim(), // 1 min
+                                cells[5].textContent.trim(), // 5 min
+                                cells[6].textContent.trim(), // 1 hour
+                                cells[7].textContent.trim(), // 12 hours
+                                cells[8].textContent.trim(), // 24 hours
+                                cells[9].textContent.trim()  // Total
                             ];
                             
                             // Escape commas and quotes in data
@@ -1126,6 +1270,14 @@ class LinkFlapAnalyzer:
     <script src="/css/analysis-guard.js"></script>
 </body>
 </html>"""
+
+        html_content = html_content.replace(
+            "__FLAP_WARNING_THRESHOLD__",
+            f'{self.thresholds["warning_flaps_per_hour"]}+ flaps/hour',
+        ).replace(
+            "__FLAP_CRITICAL_THRESHOLD__",
+            f'{self.thresholds["critical_flaps_per_hour"]}+ flaps/hour',
+        )
         
         with open(output_file, "w") as f:
             f.write(html_content)

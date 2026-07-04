@@ -11,7 +11,12 @@ import os
 import sys
 import subprocess
 from datetime import datetime
-from collection_freshness import is_current_collection, read_asset_snapshot
+from collection_freshness import (
+    asset_snapshot_is_valid,
+    is_current_collection,
+    mark_html_collection_unavailable,
+    read_asset_snapshot,
+)
 
 
 def main():
@@ -29,9 +34,19 @@ def main():
     # Check for hardware data files  
     hardware_data_dir = f"{data_dir}/hardware-data"
     processed_count = 0
+    asset_snapshot = read_asset_snapshot()
+    statuses, _asset_mtime, assets_available = asset_snapshot
+    snapshot_valid = asset_snapshot_is_valid(asset_snapshot)
+    if assets_available and not snapshot_valid:
+        print("❌ Asset snapshot is invalid or incomplete")
+        return 1
+    expected_hosts = (
+        {host for host, status in statuses.items() if status == "OK"}
+        if snapshot_valid else set()
+    )
+    all_devices_unavailable = snapshot_valid and not expected_hosts
     
     if os.path.exists(hardware_data_dir):
-        asset_snapshot = read_asset_snapshot()
         hardware_files = [
             f for f in os.listdir(hardware_data_dir)
             if f.endswith('_hardware.txt')
@@ -42,6 +57,16 @@ def main():
             )
         ]
         processed_count = len(hardware_files)
+        collected_hosts = {
+            filename.removesuffix('_hardware.txt') for filename in hardware_files
+        }
+        missing_hosts = sorted(expected_hosts - collected_hosts)
+        if missing_hosts:
+            print(
+                "❌ Missing current hardware collections for: "
+                + ", ".join(missing_hosts)
+            )
+            return 1
         if processed_count > 0:
             print(f"Found {processed_count} hardware data files")
         else:
@@ -49,7 +74,7 @@ def main():
     else:
         print("Hardware data directory doesn't exist yet.")
     
-    if processed_count == 0:
+    if processed_count == 0 and not all_devices_unavailable:
         print("❌ No current hardware collection files found")
         return 1
 
@@ -61,6 +86,10 @@ def main():
         if result.returncode == 0:
             print("BER-style hardware analysis HTML generated successfully!")
             print(result.stdout.strip())
+            if all_devices_unavailable:
+                mark_html_collection_unavailable(
+                    os.path.join(data_dir, "hardware-analysis.html")
+                )
         else:
             print(f"❌ Error generating HTML: {result.stderr}")
             return result.returncode or 1
@@ -70,7 +99,7 @@ def main():
     
     print(f"[{datetime.now()}] Hardware data processing completed")
     
-    if processed_count == 0:
+    if processed_count == 0 and not all_devices_unavailable:
         print("\n💡 To enable hardware monitoring:")
         print("   1. Hardware data collection is not yet added to monitor.sh")
         print("   2. This will be added in the next step")
