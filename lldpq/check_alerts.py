@@ -21,6 +21,118 @@ import fcntl
 import re
 from pathlib import Path
 
+
+DEFAULT_LOAD_PER_CORE_WARNING = 1.0
+DEFAULT_LOAD_PER_CORE_CRITICAL = 1.5
+PIPELINE_FILE_MTIME_TOLERANCE_SECONDS = 2.0
+
+
+def resolve_load_per_core_thresholds(hardware_thresholds):
+    """Resolve validated warning/critical thresholds in load-per-core units.
+
+    Legacy ``system.load_average_*`` values are intentionally not accepted as
+    aliases: those values are absolute loads and interpreting them as per-core
+    thresholds would silently mix units.  Missing or invalid explicit keys use
+    the same defaults as the hardware report.
+    """
+    configured = (
+        hardware_thresholds if isinstance(hardware_thresholds, dict) else {}
+    )
+    def finite_or_default(key, default):
+        try:
+            value = float(configured.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    warning = finite_or_default(
+        "load_per_core_warning", DEFAULT_LOAD_PER_CORE_WARNING
+    )
+    critical = finite_or_default(
+        "load_per_core_critical", DEFAULT_LOAD_PER_CORE_CRITICAL
+    )
+    if (not math.isfinite(warning) or not math.isfinite(critical) or
+            not 0 < warning < critical):
+        return DEFAULT_LOAD_PER_CORE_WARNING, DEFAULT_LOAD_PER_CORE_CRITICAL
+    return warning, critical
+
+
+def parse_load_per_core(hardware_data):
+    """Return (normalized load, raw 5-minute load, cores) from a collection."""
+    if not isinstance(hardware_data, str):
+        return None
+    load_match = re.search(
+        r'^CPU_INFO:\n'
+        r'(?:__LLDPQ_HARDWARE_SOURCE_STATUS__:CPU_LOAD:OK\s*\n)?'
+        r'[0-9.]+\s+([0-9.]+)\s+[0-9.]+\s+',
+        hardware_data,
+        re.MULTILINE,
+    )
+    cores_match = re.search(r'^CPU_CORES:\s*(\d+)', hardware_data, re.MULTILINE)
+    if not load_match or not cores_match:
+        return None
+    raw_load = float(load_match.group(1))
+    cores = int(cores_match.group(1))
+    if not math.isfinite(raw_load) or raw_load < 0 or cores <= 0:
+        return None
+    return raw_load / cores, raw_load, cores
+
+
+def read_stable_pipeline_file(path, run_manifest=None):
+    """Read a stable file and, when available, bind it to the pipeline window.
+
+    ``run_manifest=None`` intentionally keeps this helper usable by focused
+    unit/debug callers that do not run the complete monitoring pipeline.
+    Production alert paths provide the validated current-run manifest.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    before = path.stat()
+    content = path.read_bytes()
+    after = path.stat()
+    before_identity = (
+        before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+    )
+    after_identity = (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns
+    )
+    if before_identity != after_identity:
+        raise RuntimeError("file changed while it was read")
+
+    if isinstance(run_manifest, dict):
+        if not run_manifest.get("pipeline_complete"):
+            raise ValueError("current manifest is not from a complete pipeline")
+        started_at = run_manifest.get("pipeline_started_at")
+        if (isinstance(started_at, bool) or
+                not isinstance(started_at, (int, float)) or
+                not math.isfinite(started_at) or started_at <= 0):
+            raise ValueError("pipeline start time is invalid")
+
+        completed_value = run_manifest.get("completed_at")
+        if not isinstance(completed_value, str) or not completed_value.strip():
+            raise ValueError("pipeline completion time is invalid")
+        normalized = completed_value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            completed = datetime.datetime.fromisoformat(normalized)
+        except ValueError as exc:
+            raise ValueError("pipeline completion time is invalid") from exc
+        if completed.tzinfo is None:
+            completed = completed.astimezone()
+
+        file_mtime = before.st_mtime_ns / 1_000_000_000
+        completed_limit = (
+            completed.timestamp() + PIPELINE_FILE_MTIME_TOLERANCE_SECONDS
+        )
+        if file_mtime < started_at:
+            raise ValueError("file predates the current pipeline")
+        if file_mtime > completed_limit:
+            raise ValueError("file was modified after pipeline completion")
+
+    return content.decode("utf-8", errors="replace")
+
+
 class LLDPqAlerts:
     def __init__(self, script_dir):
         self.script_dir = Path(script_dir)
@@ -501,7 +613,7 @@ class LLDPqAlerts:
                         f"ASIC temperature: {asic_temp}°C (back to normal)",
                         "RECOVERED", device, "asic_temp", current_state
                     )
-        
+
         # Check fan speeds
         fan_matches = re.findall(r'fan\d+:\s*(\d+)\s*RPM', hardware_data, re.IGNORECASE)
         if fan_matches:
@@ -547,6 +659,91 @@ class LLDPqAlerts:
                         f"All fans operating normally",
                         "RECOVERED", device, "fan_speed", current_state
                     )
+
+    def check_system_alerts(self, device):
+        """Check system metrics that are collected with hardware telemetry."""
+        if not self.config.get('alert_types', {}).get('system_alerts', True):
+            return
+
+        hardware_file = (
+            self.monitor_results / "hardware-data" / f"{device}_hardware.txt"
+        )
+        run_manifest = getattr(self, "run_manifest", None)
+        # UNREACHABLE devices deliberately have their old raw artifacts
+        # removed by monitor.sh. Availability/assets alerts own that state; a
+        # file that is absent from the outset is therefore not a system-load
+        # collection error. If a file disappears after this check, the stable
+        # reader below still treats that read race as a fail-closed error.
+        if not hardware_file.exists():
+            return
+        try:
+            hardware_data = read_stable_pipeline_file(
+                hardware_file, run_manifest
+            )
+        except (OSError, OverflowError, RuntimeError, TypeError, ValueError) as exc:
+            print(
+                f"    ❌ System data for {device} is not from the current "
+                f"stable pipeline: {exc}"
+            )
+            self.had_error = True
+            return
+
+        # Grade and notify on the same normalized 5-minute load used by the
+        # hardware report. Absolute load is retained only as message context.
+        parsed_load = parse_load_per_core(hardware_data)
+        if parsed_load is None:
+            return
+        load_per_core, raw_load, cpu_cores = parsed_load
+        thresholds = self.config.get('thresholds', {}).get('hardware', {})
+        load_warning, load_critical = resolve_load_per_core_thresholds(
+            thresholds
+        )
+        if load_per_core >= load_critical:
+            current_state = "CRITICAL"
+        elif load_per_core >= load_warning:
+            current_state = "WARNING"
+        else:
+            current_state = "OK"
+
+        alert_type = "cpu_load_per_core"
+        last_state = self.get_alert_state(device, alert_type)
+        if current_state == "OK" and last_state == "UNKNOWN":
+            # This alert type is new. Establish a healthy baseline silently so
+            # an upgrade cannot emit one false recovery per inventory device.
+            self.record_state_without_delivery(device, alert_type, current_state)
+            return
+
+        send_recovery = self.config.get('frequency', {}).get(
+            'send_recovery', True
+        )
+        if current_state == "OK" and not send_recovery:
+            self.record_state_without_delivery(device, alert_type, current_state)
+            return
+        if not self.should_send_alert(device, alert_type, current_state):
+            return
+
+        load_context = (
+            f"5-minute load per core: {load_per_core:.2f} "
+            f"(raw load {raw_load:.2f} / {cpu_cores} cores)"
+        )
+        if current_state == "CRITICAL":
+            self.send_stateful_notification(
+                "🔥 Critical CPU Load",
+                f"{load_context}; critical threshold: {load_critical:g}/core",
+                "CRITICAL", device, alert_type, current_state
+            )
+        elif current_state == "WARNING":
+            self.send_stateful_notification(
+                "⚠️ High CPU Load",
+                f"{load_context}; warning threshold: {load_warning:g}/core",
+                "WARNING", device, alert_type, current_state
+            )
+        else:
+            self.send_stateful_notification(
+                "CPU Load Recovered",
+                f"{load_context}; back below {load_warning:g}/core",
+                "RECOVERED", device, alert_type, current_state
+            )
 
     def check_network_alerts(self, device):
         """Check network-related alerts (BGP, link flaps, optical)"""
@@ -1019,6 +1216,7 @@ class LLDPqAlerts:
                 print(f"  📍 Checking {device}...")
                 try:
                     self.check_hardware_alerts(device)
+                    self.check_system_alerts(device)
                     self.check_network_alerts(device)
                     self.check_log_alerts(device)
                 except Exception as e:
@@ -2219,6 +2417,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             print(f"  📍 Checking {device}...")
             try:
                 self.check_hardware_alerts(device)
+                self.check_system_alerts(device)
                 self.check_network_alerts(device)
                 self.check_log_alerts(device)
             except Exception as e:
@@ -2258,6 +2457,7 @@ def main():
         print(f"Checking alerts for device: {device}")
         try:
             alerts.check_hardware_alerts(device)
+            alerts.check_system_alerts(device)
             alerts.check_network_alerts(device)
             alerts.check_log_alerts(device)
         except Exception as exc:

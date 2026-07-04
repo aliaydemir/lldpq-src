@@ -52,6 +52,35 @@ def _finite_number(mapping, key, fallback):
     return value if value == value and abs(value) != float("inf") else float(fallback)
 
 
+def _validated_load_per_core_thresholds(configured):
+    """Return one validated per-core load contract for grading and alerts.
+
+    The older ``thresholds.system.load_average_*`` settings are absolute load
+    values.  They cannot be compared with a normalized per-core value, so they
+    are deliberately not treated as aliases here.  Installations without the
+    explicit per-core keys keep the established safe defaults.
+    """
+    defaults = DEFAULT_HARDWARE_THRESHOLDS["load_per_core"]
+    warning = _finite_number(
+        configured, "load_per_core_warning", defaults[1]
+    )
+    critical = _finite_number(
+        configured, "load_per_core_critical", defaults[2]
+    )
+    if not 0 < warning < critical:
+        return defaults
+
+    # EXCELLENT is a report-only band.  Derive a valid boundary when a custom
+    # warning threshold is lower than the normal 0.7/core default.
+    excellent_default = min(defaults[0], warning * 0.7)
+    excellent = _finite_number(
+        configured, "load_per_core_excellent", excellent_default
+    )
+    if not 0 <= excellent < warning:
+        excellent = excellent_default
+    return (excellent, warning, critical)
+
+
 def load_hardware_thresholds():
     """Load the alert thresholds and safely extend them to four UI grades."""
     defaults = DEFAULT_HARDWARE_THRESHOLDS
@@ -109,10 +138,7 @@ def load_hardware_thresholds():
             "memory_percent", "memory_usage_warning", "memory_usage_critical",
             min(defaults["memory_percent"][0], memory_warning - 1.0),
         ),
-        # notifications.yaml currently defines absolute load thresholds, while
-        # this report intentionally grades load per core. Keep that distinct
-        # metric on its validated default rather than mixing units.
-        "load_per_core": defaults["load_per_core"],
+        "load_per_core": _validated_load_per_core_thresholds(configured),
         "fan_rpm": low_is_bad(
             "fan_rpm", "fan_rpm_critical", "fan_rpm_warning",
             max(5000.0, fan_warning + 1.0),
@@ -633,23 +659,31 @@ def hardware_missing_telemetry_markers(device_name):
         markers.add("cpu")
     return markers
 
+
+def normalize_load_per_core(cpu_load, cpu_cores):
+    """Return the 5-minute load average divided by logical CPU cores."""
+    if (isinstance(cpu_load, bool) or
+            not isinstance(cpu_load, (int, float)) or
+            cpu_load < 0 or cpu_load != cpu_load or
+            abs(cpu_load) == float("inf") or
+            isinstance(cpu_cores, bool) or
+            not isinstance(cpu_cores, (int, float)) or cpu_cores <= 0 or
+            cpu_cores != cpu_cores or abs(cpu_cores) == float("inf")):
+        return None
+    return cpu_load / cpu_cores
+
+
 def grade_load_per_core(cpu_load, cpu_cores):
     """Grade the CPU load average normalized by core count.
 
     Load average is a per-core measure, so an absolute threshold falsely flags
     healthy multi-core switches (e.g. load 3.3 on an 8-core CPU is ~0.4/core).
-    When the core count is unknown (data collected before CPU_CORES existed),
-    fall back to 4 cores — a conservative minimum for a switch CPU — so we do
-    not regress to the old absolute behavior.
+    A missing core count cannot be normalized safely.  In that case the metric
+    remains unavailable instead of silently assuming a CPU size.
     """
-    if not isinstance(cpu_load, (int, float)):
+    load_per_core = normalize_load_per_core(cpu_load, cpu_cores)
+    if load_per_core is None:
         return None
-    cores = (
-        cpu_cores
-        if isinstance(cpu_cores, (int, float)) and cpu_cores > 0
-        else 4
-    )
-    load_per_core = cpu_load / cores
     return grade_high_is_bad(load_per_core, "load_per_core")
 
 
@@ -1022,7 +1056,7 @@ def generate_hardware_html():
                         <th class="sortable" data-column="2" data-type="number">CPU <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="3" data-type="number">ASIC <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="4" data-type="number">Mem% <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="5" data-type="number">Load <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="5" data-type="number" title="Shows raw 5-minute load; health is evaluated as raw load divided by logical CPU cores">Load <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="6" data-type="hardware-status">Fan <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="7" data-type="number">PSU% <span class="sort-arrow">▲▼</span></th>
                         <th class="sortable" data-column="8" data-type="power">PSU Power <span class="sort-arrow">▲▼</span></th>
@@ -1137,11 +1171,12 @@ def generate_hardware_html():
         fan_g = fan_status if fan_status in ("EXCELLENT", "GOOD", "WARNING", "CRITICAL") else None
         psu_g = grade_psu(psu_efficiency, psu_efficiency_parsed)
 
-        def dot_for(g):
+        def dot_for(g, title=None):
+            title_attr = html.escape(title or str(g).title(), quote=True)
             if g == "CRITICAL":
-                return '<span class="status-dot critical" title="Critical"></span>'
+                return f'<span class="status-dot critical" title="{title_attr}"></span>'
             if g == "WARNING":
-                return '<span class="status-dot warning" title="Warning"></span>'
+                return f'<span class="status-dot warning" title="{title_attr}"></span>'
             return ''
 
         show_dots = health_grade in ("WARNING", "CRITICAL")
@@ -1149,7 +1184,23 @@ def generate_hardware_html():
         cpu_cell_suffix = dot_for(cpu_g) if show_dots else ''
         asic_cell_suffix = dot_for(asic_g) if show_dots else ''
         mem_cell_suffix = dot_for(mem_g) if show_dots else ''
-        load_cell_suffix = dot_for(load_g) if show_dots else ''
+        normalized_load = normalize_load_per_core(cpu_load, cpu_cores)
+        if normalized_load is not None:
+            load_explanation = (
+                f"Raw 5-minute load {cpu_load:.2f}; health: {cpu_load:.2f} / "
+                f"{cpu_cores:g} cores = {normalized_load:.2f}/core"
+            )
+        elif isinstance(cpu_load, (int, float)):
+            load_explanation = (
+                f"Raw 5-minute load {cpu_load:.2f}; health cannot be evaluated "
+                "without a valid logical CPU core count"
+            )
+        else:
+            load_explanation = "Raw 5-minute load is unavailable"
+        load_title = html.escape(load_explanation, quote=True)
+        load_cell_suffix = (
+            dot_for(load_g, load_explanation) if show_dots else ''
+        )
         fan_cell_suffix = dot_for(fan_g) if show_dots else ''
         psu_cell_suffix = dot_for(psu_g) if show_dots else ''
 
@@ -1180,7 +1231,7 @@ def generate_hardware_html():
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
                     <td>{asic_temp_str}{asic_cell_suffix}</td>
                     <td>{memory_usage_str}{mem_cell_suffix}</td>
-                    <td>{cpu_load_str}{load_cell_suffix}</td>
+                    <td title="{load_title}">{cpu_load_str}{load_cell_suffix}</td>
                     <td><span class="{fan_badge_class}">{fan_status}</span>{fan_cell_suffix}</td>
                     <td>{psu_efficiency_str}{psu_cell_suffix}</td>
                     <td>{psu_in_out_str}</td>

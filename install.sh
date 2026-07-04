@@ -2432,6 +2432,11 @@ sudo chown "$LLDPQ_USER:www-data" /var/lib/lldpq/upgrade-jobs
 sudo chmod 755 /var/lib/lldpq
 sudo chmod 700 /var/lib/lldpq/sessions
 sudo chmod 775 /var/lib/lldpq/upgrade-jobs
+# Opaque LLDP/Assets refresh lifecycle state must survive daemon restarts and
+# source-tree replacement.  setgid keeps atomic CGI/daemon replacements in the
+# shared group regardless of which side creates the temporary file.
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/lldp-jobs
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/assets-jobs
 echo "  Sessions directory configured"
 
 if [[ "$INSTALL_MODE" == "fresh" ]] || [[ ! -f /etc/lldpq-users.conf ]]; then

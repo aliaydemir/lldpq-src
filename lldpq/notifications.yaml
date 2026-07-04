@@ -61,6 +61,8 @@ thresholds:
     fan_rpm_warning: 4000      # RPM - Minimum fan speed (warning)
     memory_usage_critical: 90  # % - Critical memory usage
     memory_usage_warning: 80   # % - Warning memory usage
+    load_per_core_warning: 1.0 # 5-min load / logical CPU cores (warning)
+    load_per_core_critical: 1.5 # 5-min load / logical CPU cores (critical)
     psu_efficiency_warning: 80 # % - Minimum PSU efficiency
     
   # Network monitoring
@@ -75,8 +77,8 @@ thresholds:
   system:
     disk_usage_warning: 80    # % - Disk usage warning
     disk_usage_critical: 90   # % - Disk usage critical
-    load_average_warning: 8   # Load average warning (adjust for your CPUs)
-    load_average_critical: 12 # Load average critical
+    # CPU load uses hardware.load_per_core_* above. Legacy absolute
+    # load_average_* values are not mixed with the normalized metric.
     uptime_minimum_hours: 1   # Hours - Alert if device rebooted recently
 
 # =============================================================================

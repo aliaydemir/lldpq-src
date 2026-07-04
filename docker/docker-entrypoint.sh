@@ -488,10 +488,16 @@ chmod 600 /etc/lldpq-users.conf
 chown www-data:www-data /etc/lldpq-users.conf
 mkdir -p /var/lib/lldpq/sessions
 mkdir -p /var/lib/lldpq/upgrade-jobs
+mkdir -p /var/lib/lldpq/lldp-jobs
+mkdir -p /var/lib/lldpq/assets-jobs
 chown -R www-data:www-data /var/lib/lldpq
 chown lldpq:www-data /var/lib/lldpq/upgrade-jobs
+chown lldpq:www-data /var/lib/lldpq/lldp-jobs
+chown lldpq:www-data /var/lib/lldpq/assets-jobs
 chmod 700 /var/lib/lldpq/sessions
 chmod 775 /var/lib/lldpq/upgrade-jobs
+chmod 2770 /var/lib/lldpq/lldp-jobs
+chmod 2770 /var/lib/lldpq/assets-jobs
 echo "✓ Authentication ready"
 
 # ─── Cron Setup ───

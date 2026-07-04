@@ -22,16 +22,15 @@ eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
     trigger_fatal "runtime configuration could not be applied"
 unset LLDPQ_CONFIG_ASSIGNMENTS
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
-LLDP_TRIGGER_FILE="/tmp/.lldp_web_trigger"
 MONITOR_TRIGGER_FILE="/tmp/.monitor_web_trigger"
-ASSETS_TRIGGER_FILE="/tmp/.assets_web_trigger"
 CONFIGS_TRIGGER_FILE="/tmp/.configs_web_trigger"
 TRANSCEIVER_TRIGGER_FILE="/tmp/.transceiver_web_trigger"
-DAEMON_PID_FILE="/tmp/lldp_trigger_daemon.pid"
-LLDP_LOCK_FILE="/tmp/lldp_running.lock"
-ASSETS_LOCK_FILE="/tmp/assets_running.lock"
+DAEMON_PID_FILE="${LLDPQ_TRIGGER_DAEMON_PID_FILE:-/tmp/lldp_trigger_daemon.pid}"
+DAEMON_LOCK_FILE="${LLDPQ_TRIGGER_DAEMON_LOCK_FILE:-/tmp/lldpq-trigger-daemon.lock}"
 CONFIGS_LOCK_FILE="/tmp/configs_running.lock"
 MONITOR_LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+LLDP_JOB_DIR="${LLDPQ_LLDP_JOB_DIR:-/var/lib/lldpq/lldp-jobs}"
+ASSETS_JOB_DIR="${LLDPQ_ASSETS_JOB_DIR:-/var/lib/lldpq/assets-jobs}"
 
 # Failed config collections remain pending, but use a bounded exponential
 # backoff instead of launching a full-fabric ping/SSH sweep every three seconds.
@@ -39,6 +38,8 @@ CONFIGS_RETRY_BASE_SECONDS="${LLDPQ_CONFIG_RETRY_BASE_SECONDS:-30}"
 CONFIGS_RETRY_MAX_SECONDS="${LLDPQ_CONFIG_RETRY_MAX_SECONDS:-300}"
 TRIGGER_RETRY_BASE_SECONDS="${LLDPQ_TRIGGER_RETRY_BASE_SECONDS:-30}"
 TRIGGER_RETRY_MAX_SECONDS="${LLDPQ_TRIGGER_RETRY_MAX_SECONDS:-300}"
+LLDP_JOB_STATUS_TTL_SECONDS="${LLDPQ_LLDP_JOB_STATUS_TTL_SECONDS:-86400}"
+ASSETS_JOB_STATUS_TTL_SECONDS="${LLDPQ_ASSETS_JOB_STATUS_TTL_SECONDS:-$LLDP_JOB_STATUS_TTL_SECONDS}"
 case "$CONFIGS_RETRY_BASE_SECONDS" in
     ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_CONFIG_RETRY_BASE_SECONDS" ;;
 esac
@@ -57,6 +58,12 @@ esac
 if (( TRIGGER_RETRY_MAX_SECONDS < TRIGGER_RETRY_BASE_SECONDS )); then
     TRIGGER_RETRY_MAX_SECONDS="$TRIGGER_RETRY_BASE_SECONDS"
 fi
+case "$LLDP_JOB_STATUS_TTL_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_LLDP_JOB_STATUS_TTL_SECONDS" ;;
+esac
+case "$ASSETS_JOB_STATUS_TTL_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_ASSETS_JOB_STATUS_TTL_SECONDS" ;;
+esac
 
 next_retry_delay() {
     local current="$1" maximum="$2" doubled
@@ -89,6 +96,166 @@ read_trigger_timestamp() {
     fi
     [[ "$value" =~ ^[0-9]+([.:-][0-9]+)*$ ]] || value=0
     printf '%s\n' "$value"
+}
+
+lldp_job_valid_token() {
+    [[ "${1-}" =~ ^[a-f0-9]{32}$ ]]
+}
+
+lldp_job_field() {
+    local file=$1 key=$2
+    awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; exit }' \
+        "$file" 2>/dev/null
+}
+
+lldp_job_number() {
+    [[ "${1-}" =~ ^[0-9]+$ ]] && printf '%s\n' "$1" || printf '0\n'
+}
+
+ensure_lldp_job_dir() {
+    mkdir -p -m 2770 "$LLDP_JOB_DIR" 2>/dev/null || return 1
+    chmod 2770 "$LLDP_JOB_DIR" 2>/dev/null || true
+    [[ -d "$LLDP_JOB_DIR" && -r "$LLDP_JOB_DIR" && -w "$LLDP_JOB_DIR" ]]
+}
+
+ensure_assets_job_dir() {
+    mkdir -p -m 2770 "$ASSETS_JOB_DIR" 2>/dev/null || return 1
+    chmod 2770 "$ASSETS_JOB_DIR" 2>/dev/null || true
+    [[ -d "$ASSETS_JOB_DIR" && -r "$ASSETS_JOB_DIR" && -w "$ASSETS_JOB_DIR" ]]
+}
+
+# Atomically publish one complete token-specific lifecycle snapshot.  Readers
+# therefore see either the previous state or the next state, never a partially
+# rewritten file while the daemon is transitioning queued/running/failure.
+write_lldp_job_status() {
+    local token=$1 state=$2 created_at=$3 started_at=$4 completed_at=$5
+    local attempt=$6 exit_code=$7 next_retry_at=$8 retry_scheduled=$9
+    local reason=${10-} worker_pid=0 temporary
+
+    lldp_job_valid_token "$token" || return 1
+    case "$state" in queued|running|success|failure) ;; *) return 1 ;; esac
+    created_at=$(lldp_job_number "$created_at")
+    started_at=$(lldp_job_number "$started_at")
+    completed_at=$(lldp_job_number "$completed_at")
+    attempt=$(lldp_job_number "$attempt")
+    next_retry_at=$(lldp_job_number "$next_retry_at")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=""
+    [[ "$retry_scheduled" == "true" ]] || retry_scheduled=false
+    [[ "$state" == "running" ]] && worker_pid=$$
+    reason=${reason//$'\n'/ }
+    reason=${reason//$'\r'/ }
+
+    ensure_lldp_job_dir || return 1
+    temporary=$(mktemp "$LLDP_JOB_DIR/.${token}.status.XXXXXXXX") || return 1
+    if ! {
+        printf 'token=%s\n' "$token"
+        printf 'state=%s\n' "$state"
+        printf 'created_at=%s\n' "$created_at"
+        printf 'updated_at=%s\n' "$(date +%s)"
+        printf 'started_at=%s\n' "$started_at"
+        printf 'completed_at=%s\n' "$completed_at"
+        printf 'attempt=%s\n' "$attempt"
+        printf 'exit_code=%s\n' "$exit_code"
+        printf 'next_retry_at=%s\n' "$next_retry_at"
+        printf 'retry_scheduled=%s\n' "$retry_scheduled"
+        printf 'worker_pid=%s\n' "$worker_pid"
+        printf 'reason=%s\n' "$reason"
+    } > "$temporary" || ! chmod 0660 "$temporary" || \
+       ! mv -f "$temporary" "$LLDP_JOB_DIR/$token.status"; then
+        rm -f "$temporary" 2>/dev/null || true
+        return 1
+    fi
+}
+
+lldp_retry_delay() {
+    local attempt=$1 delay=$TRIGGER_RETRY_BASE_SECONDS
+    local maximum=$TRIGGER_RETRY_MAX_SECONDS steps
+    attempt=$(lldp_job_number "$attempt")
+    steps=$((attempt > 0 ? attempt - 1 : 0))
+    while (( steps > 0 && delay < maximum )); do
+        delay=$(next_retry_delay "$delay" "$maximum")
+        steps=$((steps - 1))
+    done
+    printf '%s\n' "$delay"
+}
+
+cleanup_lldp_job_statuses() {
+    local status_file token updated_at now
+    ensure_lldp_job_dir || return 1
+    now=$(date +%s)
+    for status_file in "$LLDP_JOB_DIR"/*.status; do
+        [[ -f "$status_file" ]] || continue
+        token=${status_file##*/}
+        token=${token%.status}
+        lldp_job_valid_token "$token" || continue
+        # Presence of the request is authoritative for queued/running/retrying
+        # work.  Never age out an active request, even if its status is old.
+        [[ ! -f "$LLDP_JOB_DIR/$token.request" ]] || continue
+        updated_at=$(lldp_job_number "$(lldp_job_field "$status_file" updated_at)")
+        if (( updated_at > 0 && now - updated_at >= LLDP_JOB_STATUS_TTL_SECONDS )); then
+            rm -f "$status_file"
+        fi
+    done
+}
+
+# Assets refreshes use the same lifecycle contract as standalone LLDP jobs,
+# but a separate directory prevents either worker from consuming the other
+# request type.  The field format deliberately stays identical for the UI.
+write_assets_job_status() {
+    local token=$1 state=$2 created_at=$3 started_at=$4 completed_at=$5
+    local attempt=$6 exit_code=$7 next_retry_at=$8 retry_scheduled=$9
+    local reason=${10-} worker_pid=0 temporary
+
+    lldp_job_valid_token "$token" || return 1
+    case "$state" in queued|running|success|failure) ;; *) return 1 ;; esac
+    created_at=$(lldp_job_number "$created_at")
+    started_at=$(lldp_job_number "$started_at")
+    completed_at=$(lldp_job_number "$completed_at")
+    attempt=$(lldp_job_number "$attempt")
+    next_retry_at=$(lldp_job_number "$next_retry_at")
+    [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=""
+    [[ "$retry_scheduled" == "true" ]] || retry_scheduled=false
+    [[ "$state" == "running" ]] && worker_pid=$$
+    reason=${reason//$'\n'/ }
+    reason=${reason//$'\r'/ }
+
+    ensure_assets_job_dir || return 1
+    temporary=$(mktemp "$ASSETS_JOB_DIR/.${token}.status.XXXXXXXX") || return 1
+    if ! {
+        printf 'token=%s\n' "$token"
+        printf 'state=%s\n' "$state"
+        printf 'created_at=%s\n' "$created_at"
+        printf 'updated_at=%s\n' "$(date +%s)"
+        printf 'started_at=%s\n' "$started_at"
+        printf 'completed_at=%s\n' "$completed_at"
+        printf 'attempt=%s\n' "$attempt"
+        printf 'exit_code=%s\n' "$exit_code"
+        printf 'next_retry_at=%s\n' "$next_retry_at"
+        printf 'retry_scheduled=%s\n' "$retry_scheduled"
+        printf 'worker_pid=%s\n' "$worker_pid"
+        printf 'reason=%s\n' "$reason"
+    } > "$temporary" || ! chmod 0660 "$temporary" || \
+       ! mv -f "$temporary" "$ASSETS_JOB_DIR/$token.status"; then
+        rm -f "$temporary" 2>/dev/null || true
+        return 1
+    fi
+}
+
+cleanup_assets_job_statuses() {
+    local status_file token updated_at now
+    ensure_assets_job_dir || return 1
+    now=$(date +%s)
+    for status_file in "$ASSETS_JOB_DIR"/*.status; do
+        [[ -f "$status_file" ]] || continue
+        token=${status_file##*/}
+        token=${token%.status}
+        lldp_job_valid_token "$token" || continue
+        [[ ! -f "$ASSETS_JOB_DIR/$token.request" ]] || continue
+        updated_at=$(lldp_job_number "$(lldp_job_field "$status_file" updated_at)")
+        if (( updated_at > 0 && now - updated_at >= ASSETS_JOB_STATUS_TTL_SECONDS )); then
+            rm -f "$status_file"
+        fi
+    done
 }
 
 # The full web analysis gathers assets and LLDP before monitor.sh starts.  Mark
@@ -132,19 +299,27 @@ if [[ "${LLDPQ_TRIGGER_LIB_ONLY:-false}" == "true" ]]; then
     return 0 2>/dev/null || exit 0
 fi
 
-# Exit if daemon already running
-if [ -f "$DAEMON_PID_FILE" ]; then
-    # Check if process is actually running
-    if kill -0 "$(cat "$DAEMON_PID_FILE")" 2>/dev/null; then
-        exit 0
-    else
-        # Stale PID file, remove it
-        rm -f "$DAEMON_PID_FILE"
-    fi
-fi
+ensure_lldp_job_dir || \
+    trigger_fatal "LLDP job directory is missing or not writable: $LLDP_JOB_DIR"
+ensure_assets_job_dir || \
+    trigger_fatal "Assets job directory is missing or not writable: $ASSETS_JOB_DIR"
 
-# Create PID file for daemon
-echo $$ > "$DAEMON_PID_FILE"
+# Hold one kernel lock for the daemon's entire lifetime.  A PID
+# check-then-write is not atomic and PID reuse can reject the real successor;
+# the PID file below is therefore diagnostic only and is written after flock.
+command -v flock >/dev/null 2>&1 || trigger_fatal "flock is required"
+exec {DAEMON_LOCK_FD}>"$DAEMON_LOCK_FILE" || \
+    trigger_fatal "could not open daemon lock: $DAEMON_LOCK_FILE"
+if ! flock -n "$DAEMON_LOCK_FD"; then
+    exit 0
+fi
+DAEMON_PID_TEMP="${DAEMON_PID_FILE}.tmp.$$"
+if ! printf '%s\n' "$$" > "$DAEMON_PID_TEMP" || \
+   ! mv -f "$DAEMON_PID_TEMP" "$DAEMON_PID_FILE"; then
+    rm -f "$DAEMON_PID_TEMP" 2>/dev/null || true
+    printf 'lldpq-trigger: WARNING: could not publish diagnostic PID file: %s\n' \
+        "$DAEMON_PID_FILE" >&2
+fi
 
 # Cleanup function - only remove PID file if it belongs to us
 cleanup() {
@@ -190,10 +365,271 @@ refresh_lldp() {
     ./check-lldp.sh >/dev/null 2>&1
 }
 
+# Process the newest outstanding web request.  The pre-existing trigger was a
+# single latest-value slot, so a newer click superseded an older pending click.
+# Keep that workload behaviour, but explicitly close superseded tokens instead
+# of silently losing them: every browser receives a matching terminal state.
+process_lldp_jobs() {
+    local request_file token request_token created_at latest_file="" latest_token=""
+    local latest_created=0 status_file state started_at attempt
+    local next_retry_at retry_scheduled now result delay old_attempt
+    local -a request_snapshot=()
+
+    ensure_lldp_job_dir || {
+        printf 'lldpq-trigger: LLDP job directory is unavailable: %s\n' \
+            "$LLDP_JOB_DIR" >&2
+        return 1
+    }
+
+    # Freeze membership before selecting/superseding.  A CGI request published
+    # after this point belongs to the next daemon iteration; without this array
+    # snapshot a newer request could appear only in the second glob and be
+    # incorrectly closed as older than the already-selected request.
+    for request_file in "$LLDP_JOB_DIR"/*.request; do
+        [[ -f "$request_file" ]] && request_snapshot+=("$request_file")
+    done
+
+    # Select by creation time, then mtime for clicks which landed in one second.
+    for request_file in "${request_snapshot[@]}"; do
+        token=${request_file##*/}
+        token=${token%.request}
+        lldp_job_valid_token "$token" || continue
+        request_token=$(lldp_job_field "$request_file" token)
+        [[ "$request_token" == "$token" ]] || continue
+        created_at=$(lldp_job_number "$(lldp_job_field "$request_file" created_at)")
+        if (( created_at > latest_created )) || \
+           { (( created_at == latest_created )) && \
+             { [[ -z "$latest_file" ]] || [[ "$request_file" -nt "$latest_file" ]]; }; }; then
+            latest_file=$request_file
+            latest_token=$token
+            latest_created=$created_at
+        fi
+    done
+    [[ -n "$latest_file" ]] || return 0
+
+    # A rapid second click used to overwrite the first trigger.  Record that
+    # supersession for the old opaque token so its poller cannot wait forever.
+    for request_file in "${request_snapshot[@]}"; do
+        [[ -f "$request_file" && "$request_file" != "$latest_file" ]] || continue
+        token=${request_file##*/}
+        token=${token%.request}
+        lldp_job_valid_token "$token" || continue
+        status_file="$LLDP_JOB_DIR/$token.status"
+        created_at=$(lldp_job_number "$(lldp_job_field "$request_file" created_at)")
+        started_at=$(lldp_job_number "$(lldp_job_field "$status_file" started_at)")
+        attempt=$(lldp_job_number "$(lldp_job_field "$status_file" attempt)")
+        now=$(date +%s)
+        if write_lldp_job_status "$token" failure "$created_at" "$started_at" \
+            "$now" "$attempt" 125 0 false \
+            "Superseded by a newer LLDP request"; then
+            rm -f "$request_file"
+        fi
+    done
+
+    token=$latest_token
+    request_file=$latest_file
+    status_file="$LLDP_JOB_DIR/$token.status"
+    created_at=$latest_created
+    state=$(lldp_job_field "$status_file" state)
+    started_at=$(lldp_job_number "$(lldp_job_field "$status_file" started_at)")
+    attempt=$(lldp_job_number "$(lldp_job_field "$status_file" attempt)")
+    next_retry_at=$(lldp_job_number "$(lldp_job_field "$status_file" next_retry_at)")
+    retry_scheduled=$(lldp_job_field "$status_file" retry_scheduled)
+    now=$(date +%s)
+
+    # A running snapshot belongs to a previous daemon instance: the PID-file
+    # guard means two healthy daemon loops cannot reach this branch together.
+    # Re-queue it and let the monitor flock serialize against any surviving
+    # child process from an abrupt daemon restart.
+    if [[ "$state" == "running" ]]; then
+        write_lldp_job_status "$token" queued "$created_at" "$started_at" 0 \
+            "$attempt" "" 0 false "Recovered after LLDP worker restart" || return 1
+        state=queued
+        next_retry_at=0
+    elif [[ "$state" == "success" ]]; then
+        rm -f "$request_file"
+        return 0
+    elif [[ "$state" == "failure" && "$retry_scheduled" != "true" ]]; then
+        rm -f "$request_file"
+        return 0
+    elif [[ "$state" != "queued" && "$state" != "failure" ]]; then
+        write_lldp_job_status "$token" queued "$created_at" 0 0 0 "" 0 false \
+            "Recovered request with missing job status" || return 1
+        started_at=0
+        attempt=0
+        next_retry_at=0
+    fi
+
+    (( now >= next_retry_at )) || return 0
+
+    old_attempt=$attempt
+    attempt=$((attempt + 1))
+    (( started_at > 0 )) || started_at=$now
+    write_lldp_job_status "$token" running "$created_at" "$started_at" 0 \
+        "$attempt" "" 0 false "LLDP collection is running" || return 1
+
+    run_under_monitor_lock refresh_lldp
+    result=$?
+    now=$(date +%s)
+    if (( result == 0 )); then
+        if write_lldp_job_status "$token" success "$created_at" "$started_at" \
+            "$now" "$attempt" 0 0 false "LLDP collection completed"; then
+            rm -f "$request_file"
+            return 0
+        fi
+        return 1
+    fi
+
+    if (( result == 75 )); then
+        # Lock contention is not a collection failure and does not consume an
+        # attempt.  Keep it visibly queued and retry on the normal daemon loop.
+        next_retry_at=$((now + 3))
+        write_lldp_job_status "$token" queued "$created_at" "$started_at" 0 \
+            "$old_attempt" "" "$next_retry_at" false \
+            "Waiting for another analysis to release the monitor lock" || return 1
+        return 0
+    fi
+
+    # Actual assets/check-lldp failure remains retriable without a finite cap,
+    # matching the daemon's established bounded exponential retry semantics.
+    # The failure is nevertheless published immediately so the UI can surface
+    # it and re-enable the button while continuing a low-frequency token poll.
+    delay=$(lldp_retry_delay "$attempt")
+    next_retry_at=$((now + delay))
+    write_lldp_job_status "$token" failure "$created_at" "$started_at" 0 \
+        "$attempt" "$result" "$next_retry_at" true \
+        "LLDP refresh failed with status $result; automatic retry in ${delay}s" || return 1
+    printf 'lldpq-trigger: LLDP refresh token %s failed; retrying in %ss\n' \
+        "$token" "$delay" >&2
+    return 0
+}
+
 refresh_assets() {
     cd "$LLDPQ_DIR" || return 1
     wait_until_not_running "./assets.sh"
     ./assets.sh >/dev/null 2>&1
+}
+
+process_assets_jobs() {
+    local request_file token request_token created_at latest_file="" latest_token=""
+    local latest_created=0 status_file state started_at attempt
+    local next_retry_at retry_scheduled now result delay old_attempt
+    local -a request_snapshot=()
+
+    ensure_assets_job_dir || {
+        printf 'lldpq-trigger: Assets job directory is unavailable: %s\n' \
+            "$ASSETS_JOB_DIR" >&2
+        return 1
+    }
+
+    # Freeze the request set before choosing the newest job.  A request which
+    # arrives during this pass remains queued for the next daemon iteration.
+    for request_file in "$ASSETS_JOB_DIR"/*.request; do
+        [[ -f "$request_file" ]] && request_snapshot+=("$request_file")
+    done
+
+    for request_file in "${request_snapshot[@]}"; do
+        token=${request_file##*/}
+        token=${token%.request}
+        lldp_job_valid_token "$token" || continue
+        request_token=$(lldp_job_field "$request_file" token)
+        [[ "$request_token" == "$token" ]] || continue
+        created_at=$(lldp_job_number "$(lldp_job_field "$request_file" created_at)")
+        if (( created_at > latest_created )) || \
+           { (( created_at == latest_created )) && \
+             { [[ -z "$latest_file" ]] || [[ "$request_file" -nt "$latest_file" ]]; }; }; then
+            latest_file=$request_file
+            latest_token=$token
+            latest_created=$created_at
+        fi
+    done
+    [[ -n "$latest_file" ]] || return 0
+
+    # Preserve the former one-slot trigger semantics while terminating every
+    # older token explicitly, so no browser poller can wait indefinitely.
+    for request_file in "${request_snapshot[@]}"; do
+        [[ -f "$request_file" && "$request_file" != "$latest_file" ]] || continue
+        token=${request_file##*/}
+        token=${token%.request}
+        lldp_job_valid_token "$token" || continue
+        status_file="$ASSETS_JOB_DIR/$token.status"
+        created_at=$(lldp_job_number "$(lldp_job_field "$request_file" created_at)")
+        started_at=$(lldp_job_number "$(lldp_job_field "$status_file" started_at)")
+        attempt=$(lldp_job_number "$(lldp_job_field "$status_file" attempt)")
+        now=$(date +%s)
+        if write_assets_job_status "$token" failure "$created_at" "$started_at" \
+            "$now" "$attempt" 125 0 false \
+            "Superseded by a newer Assets request"; then
+            rm -f "$request_file"
+        fi
+    done
+
+    token=$latest_token
+    request_file=$latest_file
+    status_file="$ASSETS_JOB_DIR/$token.status"
+    created_at=$latest_created
+    state=$(lldp_job_field "$status_file" state)
+    started_at=$(lldp_job_number "$(lldp_job_field "$status_file" started_at)")
+    attempt=$(lldp_job_number "$(lldp_job_field "$status_file" attempt)")
+    next_retry_at=$(lldp_job_number "$(lldp_job_field "$status_file" next_retry_at)")
+    retry_scheduled=$(lldp_job_field "$status_file" retry_scheduled)
+    now=$(date +%s)
+
+    if [[ "$state" == "running" ]]; then
+        write_assets_job_status "$token" queued "$created_at" "$started_at" 0 \
+            "$attempt" "" 0 false "Recovered after Assets worker restart" || return 1
+        state=queued
+        next_retry_at=0
+    elif [[ "$state" == "success" ]]; then
+        rm -f "$request_file"
+        return 0
+    elif [[ "$state" == "failure" && "$retry_scheduled" != "true" ]]; then
+        rm -f "$request_file"
+        return 0
+    elif [[ "$state" != "queued" && "$state" != "failure" ]]; then
+        write_assets_job_status "$token" queued "$created_at" 0 0 0 "" 0 false \
+            "Recovered request with missing Assets job status" || return 1
+        started_at=0
+        attempt=0
+        next_retry_at=0
+    fi
+
+    (( now >= next_retry_at )) || return 0
+
+    old_attempt=$attempt
+    attempt=$((attempt + 1))
+    (( started_at > 0 )) || started_at=$now
+    write_assets_job_status "$token" running "$created_at" "$started_at" 0 \
+        "$attempt" "" 0 false "Assets collection is running" || return 1
+
+    run_under_monitor_lock refresh_assets
+    result=$?
+    now=$(date +%s)
+    if (( result == 0 )); then
+        if write_assets_job_status "$token" success "$created_at" "$started_at" \
+            "$now" "$attempt" 0 0 false "Assets report published"; then
+            rm -f "$request_file"
+            return 0
+        fi
+        return 1
+    fi
+
+    if (( result == 75 )); then
+        next_retry_at=$((now + 3))
+        write_assets_job_status "$token" queued "$created_at" "$started_at" 0 \
+            "$old_attempt" "" "$next_retry_at" false \
+            "Waiting for another analysis to release the monitor lock" || return 1
+        return 0
+    fi
+
+    delay=$(lldp_retry_delay "$attempt")
+    next_retry_at=$((now + delay))
+    write_assets_job_status "$token" failure "$created_at" "$started_at" 0 \
+        "$attempt" "$result" "$next_retry_at" true \
+        "Assets refresh failed with status $result; automatic retry in ${delay}s" || return 1
+    printf 'lldpq-trigger: Assets refresh token %s failed; retrying in %ss\n' \
+        "$token" "$delay" >&2
+    return 0
 }
 
 refresh_monitor() (
@@ -277,58 +713,28 @@ refresh_transceiver() {
 }
 
 # Main daemon loop - check every 5 seconds
-LLDP_LAST_CHECK_FILE="$LLDPQ_DIR/.last_lldp_trigger_check"
 MONITOR_LAST_CHECK_FILE="$LLDPQ_DIR/.last_monitor_trigger_check"
-ASSETS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_assets_trigger_check"
 CONFIGS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_configs_trigger_check"
 TRANSCEIVER_LAST_CHECK_FILE="$LLDPQ_DIR/.last_transceiver_trigger_check"
-LLDP_PENDING_TRIGGER_TIME=0
-LLDP_NEXT_RETRY_AT=0
-LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
 MONITOR_PENDING_TRIGGER_TIME=0
 MONITOR_NEXT_RETRY_AT=0
 MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
 CONFIGS_PENDING_TRIGGER_TIME=0
 CONFIGS_NEXT_RETRY_AT=0
 CONFIGS_RETRY_DELAY="$CONFIGS_RETRY_BASE_SECONDS"
+LLDP_NEXT_STATUS_CLEANUP_AT=0
 
 while true; do
-    # Check LLDP trigger
-    LLDP_LAST_CHECK=$(read_trigger_timestamp "$LLDP_LAST_CHECK_FILE")
-
-    if [ -f "$LLDP_TRIGGER_FILE" ]; then
-        LLDP_TRIGGER_TIME=$(read_trigger_timestamp "$LLDP_TRIGGER_FILE")
-        
-        if [[ "$LLDP_TRIGGER_TIME" != "0" && "$LLDP_TRIGGER_TIME" != "$LLDP_LAST_CHECK" ]]; then
-            if [ "$LLDP_PENDING_TRIGGER_TIME" != "$LLDP_TRIGGER_TIME" ]; then
-                LLDP_PENDING_TRIGGER_TIME="$LLDP_TRIGGER_TIME"
-                LLDP_NEXT_RETRY_AT=0
-                LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
-            fi
-            LLDP_NOW=$(date +%s)
-            if (( LLDP_NOW < LLDP_NEXT_RETRY_AT )); then
-                : # Pending; bounded retry window has not elapsed yet
-            elif [ -f "$LLDP_LOCK_FILE" ] && kill -0 "$(cat "$LLDP_LOCK_FILE")" 2>/dev/null; then
-                : # LLDP check already running, skipping trigger
-            else
-                echo $$ > "$LLDP_LOCK_FILE"
-                if run_under_monitor_lock refresh_lldp && \
-                   write_trigger_timestamp "$LLDP_LAST_CHECK_FILE" "$LLDP_TRIGGER_TIME"; then
-                    LLDP_PENDING_TRIGGER_TIME=0
-                    LLDP_NEXT_RETRY_AT=0
-                    LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
-                else
-                    LLDP_NOW=$(date +%s)
-                    LLDP_NEXT_RETRY_AT=$((LLDP_NOW + LLDP_RETRY_DELAY))
-                    printf 'lldpq-trigger: LLDP refresh failed; retrying in %ss\n' \
-                        "$LLDP_RETRY_DELAY" >&2
-                    LLDP_RETRY_DELAY=$(next_retry_delay \
-                        "$LLDP_RETRY_DELAY" "$TRIGGER_RETRY_MAX_SECONDS")
-                fi
-                rm -f "$LLDP_LOCK_FILE"
-            fi
-        fi
+    LLDP_NOW=$(date +%s)
+    if (( LLDP_NOW >= LLDP_NEXT_STATUS_CLEANUP_AT )); then
+        cleanup_lldp_job_statuses || true
+        cleanup_assets_job_statuses || true
+        LLDP_NEXT_STATUS_CLEANUP_AT=$((LLDP_NOW + 3600))
     fi
+    # Token-specific LLDP jobs keep their own persisted retry/lifecycle state.
+    process_lldp_jobs || true
+    # Assets uses the same lifecycle contract in a separate request namespace.
+    process_assets_jobs || true
 
     # Check Monitor trigger
     MONITOR_LAST_CHECK=$(read_trigger_timestamp "$MONITOR_LAST_CHECK_FILE")
@@ -357,25 +763,6 @@ while true; do
                     "$MONITOR_RETRY_DELAY" >&2
                 MONITOR_RETRY_DELAY=$(next_retry_delay \
                     "$MONITOR_RETRY_DELAY" "$TRIGGER_RETRY_MAX_SECONDS")
-            fi
-        fi
-    fi
-
-    # Check Assets trigger
-    ASSETS_LAST_CHECK=$(read_trigger_timestamp "$ASSETS_LAST_CHECK_FILE")
-
-    if [ -f "$ASSETS_TRIGGER_FILE" ]; then
-        ASSETS_TRIGGER_TIME=$(read_trigger_timestamp "$ASSETS_TRIGGER_FILE")
-        
-        if [[ "$ASSETS_TRIGGER_TIME" != "0" && "$ASSETS_TRIGGER_TIME" != "$ASSETS_LAST_CHECK" ]]; then
-            if [ -f "$ASSETS_LOCK_FILE" ] && kill -0 "$(cat "$ASSETS_LOCK_FILE")" 2>/dev/null; then
-                : # Assets refresh already running, skipping trigger
-            else
-                echo $$ > "$ASSETS_LOCK_FILE"
-                if run_under_monitor_lock refresh_assets; then
-                    write_trigger_timestamp "$ASSETS_LAST_CHECK_FILE" "$ASSETS_TRIGGER_TIME"
-                fi
-                rm -f "$ASSETS_LOCK_FILE"
             fi
         fi
     fi
@@ -430,9 +817,18 @@ while true; do
             # and minimum interval and runs in the background so it never blocks
             # the other triggers during a potentially minutes-long sweep.
             write_trigger_timestamp "$TRANSCEIVER_LAST_CHECK_FILE" "$TRANSCEIVER_TRIGGER_TIME"
-            refresh_transceiver &
+            (
+                # This child can outlive the trigger daemon by many minutes.
+                # It must not inherit the singleton lock and block a restart.
+                exec {DAEMON_LOCK_FD}>&-
+                refresh_transceiver
+            ) &
         fi
     fi
+
+    # Deterministic one-iteration mode for lifecycle regression tests.  It is
+    # intentionally opt-in and does not change the installed daemon loop.
+    [[ "${LLDPQ_TRIGGER_RUN_ONCE:-false}" == "true" ]] && break
 
     # Sleep for 3 seconds before next check
     sleep 3
