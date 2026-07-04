@@ -12,7 +12,7 @@ lldpq_fatal() {
 LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
-        --require-key LLDPQ_DIR 2>/dev/null); then
+        --require-key LLDPQ_DIR --require-key WEB_ROOT 2>/dev/null); then
         lldpq_fatal "required runtime configuration is missing or unreadable"
     fi
     eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
@@ -22,6 +22,7 @@ elif [[ -z "${LLDPQ_DIR:-}" ]]; then
     lldpq_fatal "required config helper is missing: $LLDPQ_CONFIG_HELPER"
 fi
 [[ -n "${LLDPQ_DIR:-}" ]] || lldpq_fatal "LLDPQ_DIR is empty"
+[[ -n "${WEB_ROOT:-}" ]] || lldpq_fatal "WEB_ROOT is empty"
 
 # Parse flags: lldpq - (verbose), lldpq -s (skip optical)
 QUIET=true
@@ -54,6 +55,58 @@ export LLDPQ_MONITOR_LOCK_HELD=1
 export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
 export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
 
+# The monitor owns the final current manifest and clears this marker only after
+# a complete web publication.  The wrapper starts the same state contract
+# before assets/LLDP collection so an upstream failure cannot leave the prior
+# generation looking current.
+REPORT_DIR="$LLDPQ_DIR/monitor-results"
+STALE_MARKER="$REPORT_DIR/.lldpq-stale"
+PIPELINE_REPORT_STATE=idle
+
+write_pipeline_report_marker() {
+    local marker_status=$1 reason=$2 timestamp temporary web_marker
+    mkdir -p "$REPORT_DIR" || return 1
+    timestamp=$(date -Is) || return 1
+    temporary=$(mktemp "$REPORT_DIR/.lldpq-stale.tmp.XXXXXXXX") || return 1
+    if ! {
+        printf 'status=%s\n' "$marker_status"
+        printf 'timestamp=%s\n' "$timestamp"
+        printf 'reason=%s\n' "$reason"
+    } > "$temporary" || ! chmod 0644 "$temporary" || \
+       ! mv -f "$temporary" "$STALE_MARKER"; then
+        rm -f "$temporary"
+        return 1
+    fi
+
+    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
+        web_marker="$WEB_ROOT/monitor-results/.lldpq-stale"
+        if [[ ! -e "$web_marker" || ! "$STALE_MARKER" -ef "$web_marker" ]]; then
+            sudo cp "$STALE_MARKER" "$web_marker" 2>/dev/null || return 1
+        fi
+    fi
+    return 0
+}
+
+mark_pipeline_reports_stale() {
+    local reason=$1 timestamp
+    PIPELINE_REPORT_STATE=stale
+    write_pipeline_report_marker stale "$reason" || return 1
+    timestamp=$(date -Is) || timestamp=unknown
+    printf '%s %s\n' "$timestamp" "$reason" >> "$LLDPQ_DIR/monitor-failures.log" || true
+    return 0
+}
+
+pipeline_exit_guard() {
+    local status=$?
+    trap - EXIT
+    if [[ "$PIPELINE_REPORT_STATE" == "collecting" ]]; then
+        mark_pipeline_reports_stale \
+            "pipeline exited unexpectedly with status $status" || true
+    fi
+    exit "$status"
+}
+trap pipeline_exit_guard EXIT
+
 run_command() {
     if [[ "$QUIET" == "true" ]]; then
         "$@" >/dev/null 2>&1
@@ -69,9 +122,20 @@ wait_until_not_running() {
     done
 }
 
+# Mark the complete generation as collecting before its first mutable input is
+# gathered.  monitor.sh replaces this marker with its own in-progress state and
+# clears it only after a successful, atomic report publication.
+PIPELINE_REPORT_STATE=collecting
+if ! write_pipeline_report_marker collecting pipeline_collection_in_progress; then
+    mark_pipeline_reports_stale "could not mark pipeline reports as in-progress" || true
+    echo "Could not mark monitoring reports as in-progress." >&2
+    exit 1
+fi
+
 # Run asset discovery and LLDP checks
 wait_until_not_running "assets.sh"
 if ! run_command ./assets.sh; then
+    mark_pipeline_reports_stale "asset discovery failed before monitoring" || true
     echo "Asset discovery failed; monitoring was not published." >&2
     exit 1
 fi
@@ -82,6 +146,7 @@ run_command python3 ./check_alerts.py --assets-only || \
     echo "⚠️  Fabric availability pre-check failed (non-critical)" >&2
 wait_until_not_running "check-lldp.sh"
 if ! run_command ./check-lldp.sh; then
+    mark_pipeline_reports_stale "LLDP collection failed before monitoring" || true
     echo "LLDP collection failed; monitoring was not published." >&2
     exit 1
 fi
@@ -89,15 +154,30 @@ fi
 # generation failure. check-lldp.sh predates strict exit propagation, so use
 # that invariant to prevent the rest of the run from looking successful.
 if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
+    mark_pipeline_reports_stale \
+        "LLDP validation/topology generation did not complete" || true
     echo "LLDP validation/topology generation did not complete; raw inputs were preserved." >&2
     exit 1
 fi
 run_command ./monitor.sh "${MONITOR_FLAGS[@]}"
 status=$?
 if [[ $status -ne 0 ]]; then
+    if grep -q '^status=stale$' "$STALE_MARKER" 2>/dev/null; then
+        PIPELINE_REPORT_STATE=stale
+    else
+        mark_pipeline_reports_stale \
+            "monitoring analysis failed with status $status" || true
+    fi
     echo "Monitoring analysis failed; last-known-good reports were preserved." >&2
     exit "$status"
 fi
+if [[ -e "$STALE_MARKER" ]]; then
+    mark_pipeline_reports_stale \
+        "monitor returned success without clearing the report state marker" || true
+    echo "Monitoring returned success but report state is not current." >&2
+    exit 1
+fi
+PIPELINE_REPORT_STATE=current
 
 # Fabric table scan for search. A partial scan must not suppress availability
 # alerts from the already-published monitor/assets snapshot.

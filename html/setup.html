@@ -851,8 +851,23 @@ async function pollRunLog() {
             if (d.done) {
                 runActive = false;
                 document.getElementById('run-btn').disabled = false;
-                setStatus('run-status', 'Done \u2713 \u2014 Fabric / LLDP / Analysis pages are now up to date.', 'ok');
-                markDone('run', true);
+                if (d.ok) {
+                    setStatus('run-status', 'Done \u2713 \u2014 Fabric / LLDP / Analysis pages are now up to date.', 'ok');
+                    markDone('run', true);
+                } else if (!Number.isInteger(d.exit_code)) {
+                    setStatus('run-status', 'LLDPq run finished, but its exit status is unavailable \u2014 review the log above.', 'info');
+                    markDone('run', false);
+                } else {
+                    setStatus('run-status', `LLDPq run failed (exit ${d.exit_code}) \u2014 review the log above.`, 'err');
+                    markDone('run', false);
+                }
+                return;
+            }
+            if (!d.running && (d.log || d.pid_recorded)) {
+                runActive = false;
+                document.getElementById('run-btn').disabled = false;
+                setStatus('run-status', 'LLDPq run was interrupted before an exit status was recorded \u2014 review the log above.', 'err');
+                markDone('run', false);
                 return;
             }
         }
@@ -864,17 +879,30 @@ async function showRunLog() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run-log' }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success && d.log) {
+        if (d.success && (d.log || d.done || d.pid_recorded)) {
             const out = document.getElementById('run-output');
             out.textContent = d.log; out.scrollTop = out.scrollHeight;
-            if (!d.done) {
+            if (!d.done && d.running) {
                 runActive = true;
                 document.getElementById('run-btn').disabled = true;
                 setStatus('run-status', 'A run is in progress\u2026', 'info');
                 pollRunLog();
+            } else if (!d.done) {
+                runActive = false;
+                document.getElementById('run-btn').disabled = false;
+                setStatus('run-status', 'The previous run was interrupted before an exit status was recorded.', 'err');
+                markDone('run', false);
             } else {
-                setStatus('run-status', 'Last run finished.', 'info');
-                markDone('run', true);
+                if (d.ok) {
+                    setStatus('run-status', 'Last run finished successfully.', 'info');
+                    markDone('run', true);
+                } else if (!Number.isInteger(d.exit_code)) {
+                    setStatus('run-status', 'Last run finished, but its exit status is unavailable.', 'info');
+                    markDone('run', false);
+                } else {
+                    setStatus('run-status', `Last run failed (exit ${d.exit_code}).`, 'err');
+                    markDone('run', false);
+                }
             }
         }
     } catch (e) { /* ignore */ }
@@ -950,8 +978,16 @@ async function pollUpdateLog() {
             if (d.done) {
                 updateActive = false;
                 setUpdateButtons(false);
-                setStatus('update-status', 'Update finished \u2713 \u2014 reload the app if the UI looks stale.', 'ok');
-                markDone('update', true);
+                if (d.ok) {
+                    setStatus('update-status', 'Update finished \u2713 \u2014 reload the app if the UI looks stale.', 'ok');
+                    markDone('update', true);
+                } else if (!Number.isInteger(d.exit_code)) {
+                    setStatus('update-status', 'Update finished, but its exit status is unavailable \u2014 review the log above.', 'info');
+                    markDone('update', false);
+                } else {
+                    setStatus('update-status', `Update failed (exit ${d.exit_code}) \u2014 review the log above.`, 'err');
+                    markDone('update', false);
+                }
                 return;
             }
         }
@@ -967,15 +1003,24 @@ async function showUpdateLog() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-log' }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success && d.log) {
+        if (d.success && (d.log || d.done)) {
             const out = document.getElementById('update-output');
             out.textContent = d.log; out.scrollTop = out.scrollHeight;
             // Show the previous run's log for reference, but NEVER lock the button on a
             // stale/incomplete log (an interrupted run leaves no DONE marker). The user can
             // always start a fresh update; updateLLDPq() truncates the log first.
-            setStatus('update-status', d.done
-                ? 'Last update finished \u2713'
-                : 'Showing the last run log (may be incomplete) \u2014 click Update LLDPq to run again.', 'info');
+            if (d.done && d.ok) {
+                setStatus('update-status', 'Last update finished successfully \u2713', 'info');
+                markDone('update', true);
+            } else if (d.done && !Number.isInteger(d.exit_code)) {
+                setStatus('update-status', 'Last update finished, but its exit status is unavailable.', 'info');
+                markDone('update', false);
+            } else if (d.done) {
+                setStatus('update-status', `Last update failed (exit ${d.exit_code}) \u2014 review the log below.`, 'err');
+                markDone('update', false);
+            } else {
+                setStatus('update-status', 'Showing the last run log (may be incomplete) \u2014 click Update LLDPq to run again.', 'info');
+            }
         }
     } catch (e) { /* ignore */ }
 }

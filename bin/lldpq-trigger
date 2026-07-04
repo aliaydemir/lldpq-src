@@ -37,6 +37,8 @@ MONITOR_LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
 # backoff instead of launching a full-fabric ping/SSH sweep every three seconds.
 CONFIGS_RETRY_BASE_SECONDS="${LLDPQ_CONFIG_RETRY_BASE_SECONDS:-30}"
 CONFIGS_RETRY_MAX_SECONDS="${LLDPQ_CONFIG_RETRY_MAX_SECONDS:-300}"
+TRIGGER_RETRY_BASE_SECONDS="${LLDPQ_TRIGGER_RETRY_BASE_SECONDS:-30}"
+TRIGGER_RETRY_MAX_SECONDS="${LLDPQ_TRIGGER_RETRY_MAX_SECONDS:-300}"
 case "$CONFIGS_RETRY_BASE_SECONDS" in
     ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_CONFIG_RETRY_BASE_SECONDS" ;;
 esac
@@ -46,8 +48,17 @@ esac
 if (( CONFIGS_RETRY_MAX_SECONDS < CONFIGS_RETRY_BASE_SECONDS )); then
     CONFIGS_RETRY_MAX_SECONDS="$CONFIGS_RETRY_BASE_SECONDS"
 fi
+case "$TRIGGER_RETRY_BASE_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_TRIGGER_RETRY_BASE_SECONDS" ;;
+esac
+case "$TRIGGER_RETRY_MAX_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_TRIGGER_RETRY_MAX_SECONDS" ;;
+esac
+if (( TRIGGER_RETRY_MAX_SECONDS < TRIGGER_RETRY_BASE_SECONDS )); then
+    TRIGGER_RETRY_MAX_SECONDS="$TRIGGER_RETRY_BASE_SECONDS"
+fi
 
-next_config_retry_delay() {
+next_retry_delay() {
     local current="$1" maximum="$2" doubled
     doubled=$((current * 2))
     if (( doubled > maximum || doubled < current )); then
@@ -78,6 +89,43 @@ read_trigger_timestamp() {
     fi
     [[ "$value" =~ ^[0-9]+([.:-][0-9]+)*$ ]] || value=0
     printf '%s\n' "$value"
+}
+
+# The full web analysis gathers assets and LLDP before monitor.sh starts.  Mark
+# that upstream phase too, otherwise an early failure leaves the previous
+# .lldpq-current.json looking like the result of the new request.
+TRIGGER_REPORT_DIR="$LLDPQ_DIR/monitor-results"
+TRIGGER_STALE_MARKER="$TRIGGER_REPORT_DIR/.lldpq-stale"
+
+write_trigger_report_marker() {
+    local marker_status=$1 reason=$2 timestamp temporary web_marker
+    mkdir -p "$TRIGGER_REPORT_DIR" || return 1
+    timestamp=$(date -Is) || return 1
+    temporary=$(mktemp "$TRIGGER_REPORT_DIR/.lldpq-stale.tmp.XXXXXXXX") || return 1
+    if ! {
+        printf 'status=%s\n' "$marker_status"
+        printf 'timestamp=%s\n' "$timestamp"
+        printf 'reason=%s\n' "$reason"
+    } > "$temporary" || ! chmod 0644 "$temporary" || \
+       ! mv -f "$temporary" "$TRIGGER_STALE_MARKER"; then
+        rm -f "$temporary"
+        return 1
+    fi
+
+    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
+        web_marker="$WEB_ROOT/monitor-results/.lldpq-stale"
+        if [[ ! -e "$web_marker" || ! "$TRIGGER_STALE_MARKER" -ef "$web_marker" ]]; then
+            sudo cp "$TRIGGER_STALE_MARKER" "$web_marker" 2>/dev/null || return 1
+        fi
+    fi
+    return 0
+}
+
+mark_trigger_reports_stale() {
+    local reason=$1 timestamp
+    write_trigger_report_marker stale "$reason" || return 1
+    timestamp=$(date -Is) || timestamp=unknown
+    printf '%s %s\n' "$timestamp" "$reason" >> "$LLDPQ_DIR/monitor-failures.log" || true
 }
 
 if [[ "${LLDPQ_TRIGGER_LIB_ONLY:-false}" == "true" ]]; then
@@ -126,6 +174,10 @@ run_under_monitor_lock() {
         command -v flock >/dev/null 2>&1 || return 1
         exec 9>"$MONITOR_LOCK_FILE" || return 1
         flock -n 9 || return 75
+        # check-lldp.sh and monitor.sh verify both this marker and inherited fd
+        # 9 before trusting the caller.  Exporting only after flock succeeds
+        # prevents either child from trying to acquire our own lock again.
+        export LLDPQ_MONITOR_LOCK_HELD=1
         "$@"
     )
 }
@@ -144,19 +196,70 @@ refresh_assets() {
     ./assets.sh >/dev/null 2>&1
 }
 
-refresh_monitor() {
+refresh_monitor() (
+    local report_state=collecting status
+
+    trigger_monitor_exit_guard() {
+        local exit_status=$?
+        trap - EXIT
+        if [[ "$report_state" == "collecting" ]]; then
+            mark_trigger_reports_stale \
+                "web analysis exited unexpectedly with status $exit_status" || true
+        fi
+        exit "$exit_status"
+    }
+    trap trigger_monitor_exit_guard EXIT
+
     cd "$LLDPQ_DIR" || return 1
     export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
     export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
+    if ! write_trigger_report_marker collecting web_analysis_collection_in_progress; then
+        mark_trigger_reports_stale \
+            "could not mark web analysis reports as in-progress" || true
+        report_state=stale
+        return 1
+    fi
     wait_until_not_running "./assets.sh"
-    ./assets.sh >/dev/null 2>&1 || return 1
+    if ! ./assets.sh >/dev/null 2>&1; then
+        mark_trigger_reports_stale \
+            "asset discovery failed before web analysis" || true
+        report_state=stale
+        return 1
+    fi
     wait_until_not_running "./check-lldp.sh"
-    ./check-lldp.sh >/dev/null 2>&1 || return 1
+    if ! ./check-lldp.sh >/dev/null 2>&1; then
+        mark_trigger_reports_stale \
+            "LLDP collection failed before web analysis" || true
+        report_state=stale
+        return 1
+    fi
     if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
+        mark_trigger_reports_stale \
+            "LLDP validation/topology generation did not complete" || true
+        report_state=stale
         return 1
     fi
     LLDPQ_MONITOR_LOCK_HELD=1 ./monitor.sh >/dev/null 2>&1
-}
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        if grep -q '^status=stale$' "$TRIGGER_STALE_MARKER" 2>/dev/null; then
+            report_state=stale
+        else
+            mark_trigger_reports_stale \
+                "web monitoring analysis failed with status $status" || true
+            report_state=stale
+        fi
+        return "$status"
+    fi
+    if [[ -e "$TRIGGER_STALE_MARKER" ]]; then
+        mark_trigger_reports_stale \
+            "web monitor returned success without clearing the report state marker" || true
+        report_state=stale
+        return 1
+    fi
+    report_state=current
+    return 0
+)
 
 refresh_configs() {
     cd "$LLDPQ_DIR" || return 1
@@ -179,6 +282,12 @@ MONITOR_LAST_CHECK_FILE="$LLDPQ_DIR/.last_monitor_trigger_check"
 ASSETS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_assets_trigger_check"
 CONFIGS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_configs_trigger_check"
 TRANSCEIVER_LAST_CHECK_FILE="$LLDPQ_DIR/.last_transceiver_trigger_check"
+LLDP_PENDING_TRIGGER_TIME=0
+LLDP_NEXT_RETRY_AT=0
+LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
+MONITOR_PENDING_TRIGGER_TIME=0
+MONITOR_NEXT_RETRY_AT=0
+MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
 CONFIGS_PENDING_TRIGGER_TIME=0
 CONFIGS_NEXT_RETRY_AT=0
 CONFIGS_RETRY_DELAY="$CONFIGS_RETRY_BASE_SECONDS"
@@ -191,12 +300,30 @@ while true; do
         LLDP_TRIGGER_TIME=$(read_trigger_timestamp "$LLDP_TRIGGER_FILE")
         
         if [[ "$LLDP_TRIGGER_TIME" != "0" && "$LLDP_TRIGGER_TIME" != "$LLDP_LAST_CHECK" ]]; then
-            if [ -f "$LLDP_LOCK_FILE" ] && kill -0 "$(cat "$LLDP_LOCK_FILE")" 2>/dev/null; then
+            if [ "$LLDP_PENDING_TRIGGER_TIME" != "$LLDP_TRIGGER_TIME" ]; then
+                LLDP_PENDING_TRIGGER_TIME="$LLDP_TRIGGER_TIME"
+                LLDP_NEXT_RETRY_AT=0
+                LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
+            fi
+            LLDP_NOW=$(date +%s)
+            if (( LLDP_NOW < LLDP_NEXT_RETRY_AT )); then
+                : # Pending; bounded retry window has not elapsed yet
+            elif [ -f "$LLDP_LOCK_FILE" ] && kill -0 "$(cat "$LLDP_LOCK_FILE")" 2>/dev/null; then
                 : # LLDP check already running, skipping trigger
             else
                 echo $$ > "$LLDP_LOCK_FILE"
-                if run_under_monitor_lock refresh_lldp; then
-                    write_trigger_timestamp "$LLDP_LAST_CHECK_FILE" "$LLDP_TRIGGER_TIME"
+                if run_under_monitor_lock refresh_lldp && \
+                   write_trigger_timestamp "$LLDP_LAST_CHECK_FILE" "$LLDP_TRIGGER_TIME"; then
+                    LLDP_PENDING_TRIGGER_TIME=0
+                    LLDP_NEXT_RETRY_AT=0
+                    LLDP_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
+                else
+                    LLDP_NOW=$(date +%s)
+                    LLDP_NEXT_RETRY_AT=$((LLDP_NOW + LLDP_RETRY_DELAY))
+                    printf 'lldpq-trigger: LLDP refresh failed; retrying in %ss\n' \
+                        "$LLDP_RETRY_DELAY" >&2
+                    LLDP_RETRY_DELAY=$(next_retry_delay \
+                        "$LLDP_RETRY_DELAY" "$TRIGGER_RETRY_MAX_SECONDS")
                 fi
                 rm -f "$LLDP_LOCK_FILE"
             fi
@@ -210,8 +337,26 @@ while true; do
         MONITOR_TRIGGER_TIME=$(read_trigger_timestamp "$MONITOR_TRIGGER_FILE")
         
         if [[ "$MONITOR_TRIGGER_TIME" != "0" && "$MONITOR_TRIGGER_TIME" != "$MONITOR_LAST_CHECK" ]]; then
-            if run_under_monitor_lock refresh_monitor; then
-                write_trigger_timestamp "$MONITOR_LAST_CHECK_FILE" "$MONITOR_TRIGGER_TIME"
+            if [ "$MONITOR_PENDING_TRIGGER_TIME" != "$MONITOR_TRIGGER_TIME" ]; then
+                MONITOR_PENDING_TRIGGER_TIME="$MONITOR_TRIGGER_TIME"
+                MONITOR_NEXT_RETRY_AT=0
+                MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
+            fi
+            MONITOR_NOW=$(date +%s)
+            if (( MONITOR_NOW < MONITOR_NEXT_RETRY_AT )); then
+                : # Pending; bounded retry window has not elapsed yet
+            elif run_under_monitor_lock refresh_monitor && \
+                 write_trigger_timestamp "$MONITOR_LAST_CHECK_FILE" "$MONITOR_TRIGGER_TIME"; then
+                MONITOR_PENDING_TRIGGER_TIME=0
+                MONITOR_NEXT_RETRY_AT=0
+                MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
+            else
+                MONITOR_NOW=$(date +%s)
+                MONITOR_NEXT_RETRY_AT=$((MONITOR_NOW + MONITOR_RETRY_DELAY))
+                printf 'lldpq-trigger: monitor refresh failed; retrying in %ss\n' \
+                    "$MONITOR_RETRY_DELAY" >&2
+                MONITOR_RETRY_DELAY=$(next_retry_delay \
+                    "$MONITOR_RETRY_DELAY" "$TRIGGER_RETRY_MAX_SECONDS")
             fi
         fi
     fi
@@ -266,7 +411,7 @@ while true; do
                     CONFIGS_NEXT_RETRY_AT=$((CONFIGS_NOW + CONFIGS_RETRY_DELAY))
                     printf 'lldpq-trigger: config refresh failed; retrying in %ss\n' \
                         "$CONFIGS_RETRY_DELAY" >&2
-                    CONFIGS_RETRY_DELAY=$(next_config_retry_delay \
+                    CONFIGS_RETRY_DELAY=$(next_retry_delay \
                         "$CONFIGS_RETRY_DELAY" "$CONFIGS_RETRY_MAX_SECONDS")
                 fi
                 rm -f "$CONFIGS_LOCK_FILE"

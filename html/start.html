@@ -1017,35 +1017,37 @@
                     summaryData.warning = 0;
                     summaryData.noInfo = 0;
                     
-                    // Parse each line using same logic as assets.html
+                    // Parse the dedicated STATUS column emitted by assets.sh.
+                    // Cached UNREACHABLE rows deliberately retain their previous
+                    // IP/MAC/uptime, so inferring health from those fields makes a
+                    // currently unreachable device look successful.
                     assetsLines.forEach(line => {
                         if (!line.trim()) return;
                         
                         const parts = line.trim().split(/\s+/);
                         if (parts.length < 6) return;
                         
-                        const deviceName = parts[0];
                         const ipAddress = parts[1];
                         const macAddress = parts[2];
-                        const serialNumber = parts[3];
-                        const model = parts[4];
-                        const release = parts[5];
-                        const uptime = parts.slice(6).join(' ');
-                        
-                        // Use exact same status determination logic as assets.html
-                        const lineText = line.toLowerCase();
-                        
-                        if (lineText.includes('ssh-failed') || (ipAddress && ipAddress !== 'No-Info' && macAddress === 'SSH-FAILED')) {
-                            summaryData.failed++;
-                        } else if (lineText.includes('fail') || lineText.includes('error') || lineText.includes('timeout')) {
-                            summaryData.failed++;
-                        } else if (lineText.includes('no-info') || lineText.includes('no info') || 
-                                   (!ipAddress || ipAddress === 'N/A' || !macAddress || macAddress === 'N/A')) {
-                            summaryData.noInfo++;
-                        } else if (lineText.includes('reated') || lineText.includes('partial') || lineText.includes('warning')) {
+                        const uptime = parts[6] || '';
+                        const rawStatus = String(parts[7] || '').toUpperCase();
+
+                        if (rawStatus === 'OK') {
+                            summaryData.successful++;
+                        } else if (rawStatus === 'UNREACHABLE') {
                             summaryData.warning++;
-                        } else if (uptime && uptime.includes('up-') && ipAddress && macAddress && 
-                                   ipAddress !== 'N/A' && macAddress !== 'N/A') {
+                        } else if (rawStatus === 'SSH-FAILED') {
+                            summaryData.failed++;
+                        } else if (rawStatus === 'NO-INFO') {
+                            summaryData.noInfo++;
+                        } else if (rawStatus.includes('FAIL') || rawStatus.includes('ERROR')) {
+                            summaryData.failed++;
+                        } else if (!rawStatus && (
+                                   !ipAddress || ipAddress === 'N/A' || ipAddress === 'No-Info' ||
+                                   !macAddress || macAddress === 'N/A' || macAddress === 'No-Info')) {
+                            summaryData.noInfo++;
+                        } else if (!rawStatus && uptime.includes('up-') && ipAddress && macAddress) {
+                            // Backward compatibility for legacy seven-column files.
                             summaryData.successful++;
                         } else {
                             summaryData.warning++;
@@ -1282,11 +1284,25 @@
                             summaryData.totalDevices = metric('#total-devices');
                             summaryData.totalNeighbors = metric('#total-neighbors');
                             summaryData.established = metric('#established-neighbors');
-                            summaryData.failed = metric('#down-neighbors');
+                            summaryData.down = metric('#down-neighbors') || 0;
                             summaryData.stale = metric('#stale-devices') || 0;
                             summaryData.unknown = metric('#unknown-devices') || 0;
-                            summaryData.warning = metadataNumber('warningNeighbors') || 0;
-                            summaryData.critical = metadataNumber('criticalNeighbors') || 0;
+                            const warningNeighbors = metadataNumber('warningNeighbors');
+                            const criticalNeighbors = metadataNumber('criticalNeighbors');
+                            if (warningNeighbors === null && criticalNeighbors === null) {
+                                // A last-known-good report from an older version has
+                                // only the aggregate Down/Problem card. Preserve its
+                                // former hard-failure semantics until it is refreshed.
+                                summaryData.warning = 0;
+                                summaryData.critical = summaryData.down;
+                            } else {
+                                summaryData.warning = warningNeighbors || 0;
+                                summaryData.critical = criticalNeighbors || 0;
+                            }
+                            summaryData.problematic = summaryData.warning + summaryData.critical;
+                            // Retain the legacy field for callers that treat
+                            // "failed" as a hard failure, not as every problem.
+                            summaryData.failed = summaryData.critical;
                             summaryData.healthPercent = metric('#health-ratio');
                             summaryData.coveragePartial = summaryData.coveragePartial ||
                                 summaryData.stale > 0 || summaryData.unknown > 0;
@@ -1303,9 +1319,14 @@
                             summaryData.totalPorts = metric('#total-ports');
                             summaryData.stable = metric('#stable-ports') || 0;
                             summaryData.problematic = metric('#problematic-ports') || 0;
-                            summaryData.critical = metadataNumber('criticalPorts') || 0;
-                            summaryData.warning = metadataNumber('warningPorts') || 0;
-                            if (summaryData.critical || summaryData.warning) {
+                            const criticalPorts = metadataNumber('criticalPorts');
+                            const warningPorts = metadataNumber('warningPorts');
+                            if (criticalPorts === null && warningPorts === null) {
+                                summaryData.critical = summaryData.problematic;
+                                summaryData.warning = 0;
+                            } else {
+                                summaryData.critical = criticalPorts || 0;
+                                summaryData.warning = warningPorts || 0;
                                 summaryData.problematic = summaryData.critical + summaryData.warning;
                             }
                             summaryData.stabilityPercent = summaryData.totalPorts > 0
@@ -1366,7 +1387,10 @@
                 updateDashboardCard('bgp-devices', dashboardMetric(bgpData, bgpData.totalDevices));
                 updateDashboardCard('bgp-neighbors', dashboardMetric(bgpData, bgpData.totalNeighbors));
                 updateDashboardCard('bgp-established', dashboardMetric(bgpData, bgpData.established));
-                updateDashboardCard('bgp-down', dashboardMetric(bgpData, bgpData.failed));
+                updateDashboardCard('bgp-down', dashboardMetric(bgpData, bgpData.problematic));
+                setDashboardProblemSeverity(
+                    'bgp-down', bgpData, bgpData.critical, bgpData.warning
+                );
                 updateDashboardCard('bgp-health', dashboardMetric(
                     bgpData,
                     bgpData.healthPercent !== null && bgpData.healthPercent !== undefined
@@ -1397,6 +1421,9 @@
                 updateDashboardCard('flap-ports', dashboardMetric(flapData, flapData.totalPorts));
                 updateDashboardCard('flap-stable', dashboardMetric(flapData, flapData.stable));
                 updateDashboardCard('flap-problematic', dashboardMetric(flapData, flapData.problematic));
+                setDashboardProblemSeverity(
+                    'flap-problematic', flapData, flapData.critical, flapData.warning
+                );
                 updateDashboardCard('flap-stability', dashboardMetric(flapData, flapData.stabilityPercent ? flapData.stabilityPercent + '%' : '0.0%'));
 
                 updateDashboardCard('hardware-total', dashboardMetric(hardwareData, hardwareData.totalDevices));
@@ -1462,13 +1489,15 @@
                 'Assets Failed': assetsData.failed || 0,
                 'LLDP Failed Ports': lldpData.failed || 0,
                 'LLDP No Info': lldpData.noInfo || 0,
-                'BGP Failed': bgpData.failed || 0,
+                'BGP Critical': bgpData.critical || 0,
+                'BGP Warning': bgpData.warning || 0,
                 'Optical Critical': opticalData.critical || 0,
                 'Optical Warning': opticalData.warning || 0,
                 'Optical Down': opticalData.down || 0,
                 'BER Critical': berData.critical || 0,
                 'BER Warning': berData.warning || 0,
-                'Link Flaps': flapData.problematic || 0,
+                'Link Flap Critical': flapData.critical || 0,
+                'Link Flap Warning': flapData.warning || 0,
                 'Hardware Critical': hardwareData.critical || 0,
                 'Hardware Warning': hardwareData.warning || 0,
                 'Log Critical': logData.critical || 0,
@@ -1485,8 +1514,8 @@
             // Build tooltip HTML
             // Hard failures render red; advisory / warning-severity signals render yellow.
             const CRITICAL_SOURCES = new Set([
-                'Assets Failed', 'LLDP Failed Ports', 'BGP Failed',
-                'Optical Critical', 'BER Critical', 'Link Flaps',
+                'Assets Failed', 'LLDP Failed Ports', 'BGP Critical',
+                'Optical Critical', 'BER Critical', 'Link Flap Critical',
                 'Hardware Critical', 'Log Critical', 'Active IP Duplicates'
             ]);
             let tooltipHtml = '<div class="tooltip-title">Open Issues Breakdown</div>';
@@ -1514,10 +1543,10 @@
             // as healthy so they never drag the percentage down.
             addHealthDomain(assetsData.totalDevices - (assetsData.failed || 0), assetsData.totalDevices, assetsData);
             addHealthDomain(lldpData.totalConnections - (lldpData.failed || 0), lldpData.totalConnections, lldpData);
-            addHealthDomain(bgpData.totalNeighbors - (bgpData.failed || 0), bgpData.totalNeighbors, bgpData);
+            addHealthDomain(bgpData.totalNeighbors - (bgpData.critical || 0), bgpData.totalNeighbors, bgpData);
             addHealthDomain(opticalData.totalPorts - (opticalData.critical || 0), opticalData.totalPorts, opticalData);
             addHealthDomain(berData.totalPorts - (berData.critical || 0), berData.totalPorts, berData);
-            addHealthDomain(flapData.totalPorts - (flapData.problematic || 0), flapData.totalPorts, flapData);
+            addHealthDomain(flapData.totalPorts - (flapData.critical || 0), flapData.totalPorts, flapData);
             addHealthDomain(hardwareData.totalDevices - (hardwareData.critical || 0), hardwareData.totalDevices, hardwareData);
 
             // Sum the hard-failure (red) breakdown rows; a perfect 100% must never
@@ -1555,15 +1584,16 @@
                 healthElement.style.color = '#f44336';
             }
             
-            // Color code critical issues
+            // Color the aggregate by its highest severity, not by volume. A
+            // large warning-only set stays advisory; one hard failure is red.
             const criticalElement = document.getElementById('critical-issues');
             if (criticalIssues === 0) {
                 criticalElement.style.color = '#4caf50';
-            } else if (criticalIssues <= 5) {
-                criticalElement.style.color = '#ff9800';
-            } else {
+            } else if (criticalOnlyCount > 0) {
                 criticalElement.style.color = '#f44336';
-                }
+            } else {
+                criticalElement.style.color = '#ff9800';
+            }
                 
             } catch (error) {
                 console.error('Failed to update network stats:', error);
@@ -1577,6 +1607,34 @@
                 const missing = value === undefined || value === null ||
                     (typeof value === 'number' && !Number.isFinite(value));
                 element.textContent = missing ? 'N/A' : value;
+            }
+        }
+
+        // Keep the existing card layout while making a mixed problem counter
+        // reflect its highest current severity. Warning-only states must remain
+        // advisory (orange), not hard failures (red).
+        function setDashboardProblemSeverity(elementId, data, criticalCount, warningCount) {
+            const element = document.getElementById(elementId);
+            const card = element && element.closest('.summary-card');
+            if (!element || !card) return;
+
+            card.classList.remove('card-critical', 'card-warning', 'card-excellent', 'card-info');
+            element.classList.remove(
+                'status-critical', 'status-warning', 'status-excellent', 'status-info'
+            );
+
+            if (!data || data.unavailable) {
+                card.classList.add('card-info');
+                element.classList.add('status-info');
+            } else if ((Number(criticalCount) || 0) > 0) {
+                card.classList.add('card-critical');
+                element.classList.add('status-critical');
+            } else if ((Number(warningCount) || 0) > 0) {
+                card.classList.add('card-warning');
+                element.classList.add('status-warning');
+            } else {
+                card.classList.add('card-excellent');
+                element.classList.add('status-excellent');
             }
         }
 

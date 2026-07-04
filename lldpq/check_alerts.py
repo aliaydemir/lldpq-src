@@ -1012,7 +1012,7 @@ class LLDPqAlerts:
             if not self.send_summary_alert(devices):
                 self.had_error = True
         elif mode == "change_only":
-            self.check_changes_only(devices)  
+            self.check_changes_only(devices)
         else:
             # Immediate mode (original behavior)
             for device in devices:
@@ -1025,6 +1025,7 @@ class LLDPqAlerts:
                     print(f"    ❌ Error checking {device}: {e}")
                     self.had_error = True
                     continue
+            self.check_duplicate_alerts()
         
         print("Alert check completed")
         return not self.had_error
@@ -1049,6 +1050,7 @@ class LLDPqAlerts:
         ber_stats = self.get_stats_from_html("ber-analysis.html")
         flap_stats = self.get_stats_from_html("link-flap-analysis.html")
         lldp_stats = self.get_lldp_stats_from_ini()
+        duplicate_stats = self.get_duplicate_stats()
 
         skipped = set()
         if isinstance(self.run_manifest, dict):
@@ -1067,6 +1069,7 @@ class LLDPqAlerts:
             "ber-analysis.html": ber_stats,
             "link-flap-analysis.html": flap_stats,
             "lldp_results.ini": lldp_stats,
+            "duplicate-analysis.html": duplicate_stats,
         }
         if not optical_skipped:
             required_sources["optical-analysis.html"] = optical_stats
@@ -1173,12 +1176,22 @@ class LLDPqAlerts:
                 f"LLDP Topology: {lldp_stats['no_info']} connections without current information"
             )
 
+        if duplicate_stats['active'] > 0:
+            critical_issues.append(
+                f"Duplicate IP: {duplicate_stats['active']} active conflicts"
+            )
+        if duplicate_stats['quiesced'] > 0:
+            warning_issues.append(
+                f"Duplicate IP: {duplicate_stats['quiesced']} quiesced conflicts"
+            )
+
         report_stats = {
             "Hardware": hardware_stats,
             "Logs": log_stats,
             "BGP": bgp_stats,
             "BER": ber_stats,
             "Link Flap": flap_stats,
+            "Duplicate IP": duplicate_stats,
         }
         if optical_stats:
             report_stats["Optical"] = optical_stats
@@ -1223,6 +1236,11 @@ class LLDPqAlerts:
             int(bool(flap_stats.get('coverage_partial'))), optical_signature,
             lldp_stats['successful'], lldp_stats['failed'],
             lldp_stats['warnings'], lldp_stats['no_info'],
+            duplicate_stats['active'], duplicate_stats['quiesced'],
+            duplicate_stats.get('coverage_expected'),
+            duplicate_stats.get('coverage_current'),
+            duplicate_stats.get('coverage_failures', 0),
+            int(bool(duplicate_stats.get('coverage_partial'))),
         )))
         
         # Check if summary changed or it's scheduled time (critical issues don't force immediate send in summary mode)
@@ -1305,6 +1323,14 @@ BER Analysis Results:
 
 Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: {ber_stats['warnings']}     Critical: {ber_stats['critical']}     Awaiting Sample: {ber_stats.get('unknown', 0)}
 
+
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
+
+Duplicate IP Analysis Results:
+
+
+Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']}     Coverage: {duplicate_stats.get('coverage_current')}/{duplicate_stats.get('coverage_expected')}
+
 """
             open_issues = (
                 [f"[CRITICAL] {issue}" for issue in critical_issues]
@@ -1347,6 +1373,68 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             return False
 
         return True
+
+    def check_duplicate_alerts(self):
+        """Send one fabric-wide stateful alert for authoritative IP conflicts."""
+        stats = self.get_duplicate_stats()
+        if not stats:
+            self.had_error = True
+            return False
+
+        active = stats["active"]
+        quiesced = stats["quiesced"]
+        partial = bool(stats.get("coverage_partial"))
+        if active:
+            severity = "CRITICAL"
+            title = "Active Duplicate IP Conflicts"
+        elif quiesced or partial:
+            severity = "WARNING"
+            title = (
+                "Quiesced Duplicate IP Conflicts"
+                if quiesced else "Duplicate IP Coverage Partial"
+            )
+        else:
+            severity = "OK"
+            title = "Duplicate IP Conflicts Cleared"
+
+        state = ":".join(map(str, (
+            severity, active, quiesced,
+            stats.get("coverage_current"), stats.get("coverage_expected"),
+            int(partial),
+        )))
+        previous_state = self.get_alert_state("_fabric", "duplicate_ip")
+
+        # Establish a clean first-run baseline without sending a fake recovery.
+        if severity == "OK" and previous_state == "UNKNOWN":
+            return self.record_state_without_delivery(
+                "_fabric", "duplicate_ip", state
+            )
+        if not self.should_send_alert("_fabric", "duplicate_ip", state):
+            return True
+
+        coverage = (
+            f"{stats.get('coverage_current')}/{stats.get('coverage_expected')}"
+        )
+        message = (
+            f"Active duplicate IP conflicts: {active}; "
+            f"quiesced conflicts: {quiesced}; collection coverage: {coverage}."
+        )
+        if severity == "OK":
+            send_recovery = self.config.get('frequency', {}).get(
+                'send_recovery', True
+            )
+            if not send_recovery:
+                return self.record_state_without_delivery(
+                    "_fabric", "duplicate_ip", state
+                )
+            notification_severity = "RECOVERED"
+        else:
+            notification_severity = severity
+
+        return self.send_stateful_notification(
+            title, message, notification_severity, "_fabric",
+            "duplicate_ip", state,
+        )
 
     def should_send_summary_alert(self, current_signature):
         """Check if summary should be sent based on changes or schedule"""
@@ -1882,6 +1970,63 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             self.had_error = True
             return {}
 
+    def get_duplicate_stats(self):
+        """Read the duplicate report's authoritative machine summary."""
+        report = self.monitor_results / "duplicate-analysis.html"
+        if not report.is_file():
+            print(f"    ❌ Duplicate report is missing: {report}")
+            self.had_error = True
+            return {}
+        try:
+            content = report.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            print(f"    ❌ Could not read duplicate report: {exc}")
+            self.had_error = True
+            return {}
+
+        collection_status = (
+            self.extract_attribute_value(content, "data-collection-status")
+            or ""
+        ).lower()
+        active = self.extract_attribute_int(
+            content, "data-confirmed-ip-active"
+        )
+        quiesced = self.extract_attribute_int(content, "data-ip-quiesced")
+        expected = self.extract_attribute_int(content, "data-coverage-expected")
+        current = self.extract_attribute_int(content, "data-coverage-current")
+        failures = self.extract_attribute_int(content, "data-coverage-failures")
+        partial_text = (
+            self.extract_attribute_value(content, "data-coverage-partial")
+            or ""
+        ).lower()
+
+        required = (active, quiesced, expected, current, failures)
+        if collection_status not in {"current", "partial"} or any(
+                value is None for value in required):
+            print("    ❌ Duplicate report has no valid current machine summary")
+            self.had_error = True
+            return {}
+        if partial_text not in {"true", "false"}:
+            print("    ❌ Duplicate report has invalid coverage metadata")
+            self.had_error = True
+            return {}
+
+        coverage_partial = (
+            collection_status == "partial"
+            or partial_text == "true"
+            or failures > 0
+            or current < expected
+        )
+        return {
+            "active": active,
+            "quiesced": quiesced,
+            "coverage_expected": expected,
+            "coverage_current": current,
+            "coverage_failures": failures,
+            "coverage_partial": coverage_partial,
+            "collection_status": collection_status,
+        }
+
     def extract_attribute_value(self, html_content, attribute):
         """Return one quoted machine-readable HTML attribute value."""
         try:
@@ -2036,7 +2181,14 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 if status == 'Pass':
                     stats["successful"] += 1
                 elif status == 'Fail':
-                    stats["failed"] += 1
+                    # Match lldp.html and the main dashboard: only a physical
+                    # DOWN is a hard failure. An UP port with a wrong or
+                    # unexpected neighbor remains an operational warning.
+                    port_status = parts[-1].upper() if len(parts) >= 7 else ""
+                    if port_status == "DOWN":
+                        stats["failed"] += 1
+                    else:
+                        stats["warnings"] += 1
                 else:
                     stats["no_info"] += 1
 
@@ -2073,6 +2225,7 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 print(f"    ❌ Error checking {device}: {e}")
                 self.had_error = True
                 continue
+        self.check_duplicate_alerts()
 
 def main():
     """Main function"""

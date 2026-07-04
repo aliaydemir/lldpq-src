@@ -495,6 +495,46 @@ class OpticalAnalyzer:
         # behind a GOOD badge.
         if warning_count:
             return OpticalHealth.WARNING
+
+        # GOOD is the healthy-but-near-threshold band.  It does not relax any
+        # existing warning boundary above; it only distinguishes comfortable
+        # readings from readings that are still valid but deserve trend
+        # awareness.  The bands are derived from the configured hard limits so
+        # custom optical margin settings continue to behave consistently.
+        good_band = False
+        if rx_lanes:
+            good_margin = self.thresholds['link_margin_min_db'] + 3.0
+            good_band = good_band or any(
+                self.calculate_link_margin(value) < good_margin
+                for value in rx_lanes
+            )
+            high_warning = self.thresholds.get('rx_power_warning_high_dbm', 5.0)
+            good_band = good_band or any(
+                value > high_warning - 1.0 for value in rx_lanes
+            )
+        if tx_lanes:
+            good_band = good_band or any(
+                value < self.thresholds['tx_power_min_dbm'] + 2.0 or
+                value > self.thresholds['tx_power_max_dbm'] - 2.0
+                for value in tx_lanes
+            )
+        if temperature is not None:
+            good_band = good_band or (
+                temperature > self.thresholds['temperature_max_c'] - 20.0 or
+                temperature < self.thresholds['temperature_min_c'] + 10.0
+            )
+        if voltage is not None:
+            good_band = good_band or (
+                voltage < self.thresholds['voltage_min_v'] + 0.1 or
+                voltage > self.thresholds['voltage_max_v'] - 0.1
+            )
+        if bias_lanes:
+            good_band = good_band or any(
+                value > self.thresholds['bias_current_max_ma'] * 0.8
+                for value in bias_lanes
+            )
+        if good_band:
+            return OpticalHealth.GOOD
         return OpticalHealth.EXCELLENT
 
     def update_optical_stats(self, port_name: str, optical_data: str):

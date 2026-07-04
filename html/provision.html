@@ -3658,6 +3658,26 @@ async function loadUpgradeCandidates() {
     upgradeDevices = data.devices || [];
     renderUpgradeImages();
     renderUpgradeTable();
+    await recoverActiveUpgradeJob();
+}
+
+async function recoverActiveUpgradeJob() {
+    const data = await apiCall('upgrade-active');
+    if (!data.success || !data.job) return;
+    const job = data.job;
+    upgradeJobId = job.id;
+    const target = document.getElementById('upgradeTargetVersion');
+    const server = document.getElementById('upgradeServerIP');
+    const image = document.getElementById('upgradeImage');
+    if (target) target.value = job.target_version || target.value;
+    if (server) server.value = job.server_ip || server.value;
+    if (image && Array.from(image.options).some(option => option.value === job.image_name)) {
+        image.value = job.image_name;
+    }
+    document.getElementById('btnStartUpgrade').disabled = true;
+    document.getElementById('btnCancelUpgrade').style.display = '';
+    renderUpgradeJob(job);
+    pollUpgradeStatus();
 }
 
 function selectedUpgradeDevices() {
@@ -3841,7 +3861,8 @@ function renderUpgradeJob(job) {
     const done = job.devices.filter(d => d.status === 'done').length;
     const failed = job.devices.filter(d => d.status === 'failed').length;
     const active = job.devices.filter(d => ['upgrading', 'waiting_reboot'].includes(d.status)).length;
-    document.getElementById('upgradeStatusText').textContent = `Job ${job.id.slice(0, 8)}: ${done} done, ${failed} failed, ${active} active`;
+    document.getElementById('upgradeStatusText').textContent = `Job ${job.id.slice(0, 8)}: ${done} done, ${failed} failed, ${active} active` +
+        (job.worker_error ? ` — worker retrying: ${job.worker_error}` : '');
     if (job.complete) {
         clearInterval(upgradePollTimer);
         upgradePollTimer = null;

@@ -1039,6 +1039,18 @@ class BGPAnalyzer:
             f"{summary['health_ratio']:.1f}%"
             if summary["health_ratio"] is not None else "N/A"
         )
+        problem_neighbors = (
+            summary['warning_neighbors'] + summary['critical_neighbors']
+        )
+        if summary['critical_neighbors'] > 0:
+            problem_card_class = "card-critical"
+            problem_metric_class = "bgp-critical"
+        elif summary['warning_neighbors'] > 0:
+            problem_card_class = "card-warning"
+            problem_metric_class = "bgp-warning"
+        else:
+            problem_card_class = "card-excellent"
+            problem_metric_class = "bgp-excellent"
         
         html_content = f"""
 <!DOCTYPE html>
@@ -1373,8 +1385,8 @@ class BGPAnalyzer:
                     <div class="metric bgp-excellent" id="established-neighbors">{summary['established_neighbors']}</div>
                     <div class="metric-label">Established</div>
                 </div>
-                <div class="summary-card card-critical" id="down-card" data-metric-key="bgp_non_established_neighbors" data-metric-value="{summary['down_neighbors']}">
-                    <div class="metric bgp-critical" id="down-neighbors">{summary['down_neighbors']}</div>
+                <div class="summary-card {problem_card_class}" id="down-card" data-metric-key="bgp_problem_neighbors" data-metric-value="{problem_neighbors}">
+                    <div class="metric {problem_metric_class}" id="down-neighbors">{problem_neighbors}</div>
                     <div class="metric-label">Down/Problem</div>
                 </div>
                 <div class="summary-card card-warning" id="stale-devices-card" data-metric-key="bgp_stale_devices" data-metric-value="{summary['stale_devices']}">

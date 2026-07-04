@@ -95,6 +95,16 @@ CRON_VALIDATOR = '/usr/local/bin/lldpq-config'
 BACKUP_IMPORT_HELPER = '/usr/local/libexec/lldpq-backup-import.py'
 _CONFIG_LOCK_HANDLE = None
 
+def parse_completion_log(content):
+    """Return cleaned log and the real exit status recorded by a detached runner."""
+    matches = list(re.finditer(r'(?m)^__LLDPQ_DONE__(?::(-?[0-9]+))?\s*$', content))
+    if not matches:
+        return content.rstrip(), False, None, False
+    raw_code = matches[-1].group(1)
+    exit_code = int(raw_code) if raw_code is not None else None
+    display = re.sub(r'(?m)^__LLDPQ_DONE__(?::(?:-?[0-9]+)?)?\s*\n?', '', content).rstrip()
+    return display, True, exit_code, exit_code == 0
+
 def load_backup_import_helper(module_name):
     """Load only the installer-owned helper, never a service-tree module."""
     try:
@@ -581,13 +591,29 @@ if action == 'verify':
 
 # ─── Action: Run the full LLDPq pipeline verbosely (lldpq -) into a log we can tail ───
 if action == 'run':
-    cmd = (
-        f'cd {shlex.quote(lldpq_dir)} && : > .run.log && '
-        f'nohup setsid bash -c "/usr/local/bin/lldpq - >> .run.log 2>&1; '
-        f'echo __LLDPQ_DONE__ >> .run.log" >/dev/null 2>&1 &'
+    log_path = os.path.join(lldpq_dir, '.run.log')
+    pid_path = os.path.join(lldpq_dir, '.run.pid')
+    runner = (
+        f'cd {shlex.quote(lldpq_dir)} || {{ echo "ERROR: LLDPq directory is unavailable" >> {shlex.quote(log_path)}; '
+        f'printf "__LLDPQ_DONE__:10\\n" >> {shlex.quote(log_path)}; exit 10; }}; '
+        f'/usr/local/bin/lldpq - >> {shlex.quote(log_path)} 2>&1; '
+        f'rc=$?; printf "__LLDPQ_DONE__:%s\\n" "$rc" >> {shlex.quote(log_path)}; '
+        f'rm -f {shlex.quote(pid_path)}; exit "$rc"'
     )
     try:
-        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', cmd],
+        prep = subprocess.run(
+            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if prep.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not create the LLDPq run log: ' + (prep.stderr or '').strip()[:200]}))
+            sys.exit(0)
+        launch = (
+            f'rm -f {shlex.quote(pid_path)}; '
+            f'nohup setsid bash -c {shlex.quote(runner)} >/dev/null 2>&1 & '
+            f'printf "%s\\n" "$!" > {shlex.quote(pid_path)}'
+        )
+        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
                          start_new_session=True, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print(json.dumps({'success': True, 'message': 'LLDPq run started'}))
@@ -598,6 +624,7 @@ if action == 'run':
 # ─── Action: Tail the run log started by action=run ───
 if action == 'run-log':
     log_path = os.path.join(lldpq_dir, '.run.log')
+    pid_path = os.path.join(lldpq_dir, '.run.pid')
     content = ''
     try:
         r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', log_path],
@@ -606,9 +633,30 @@ if action == 'run-log':
             content = r.stdout
     except Exception:
         content = ''
-    done = '__LLDPQ_DONE__' in content
-    display = content.replace('__LLDPQ_DONE__', '').rstrip()
-    print(json.dumps({'success': True, 'done': done, 'log': display}))
+    display, done, exit_code, ok = parse_completion_log(content)
+    running = False
+    pid_recorded = False
+    if not done:
+        try:
+            with open(pid_path, 'r', encoding='utf-8') as source:
+                pid_text = source.read().strip()
+            if re.fullmatch(r'[1-9][0-9]*', pid_text):
+                pid_recorded = True
+                try:
+                    os.kill(int(pid_text), 0)
+                    running = True
+                except PermissionError:
+                    # The CGI user normally differs from LLDPQ_USER; EPERM still
+                    # proves that the recorded process exists.
+                    running = True
+                except ProcessLookupError:
+                    running = False
+        except (OSError, subprocess.SubprocessError):
+            running = False
+    print(json.dumps({'success': True, 'done': done, 'ok': ok,
+                      'running': running, 'pid_recorded': pid_recorded,
+                      'exit_code': exit_code,
+                      'log': display}))
     sys.exit(0)
 
 # ─── Action: Ansible integration status (current dir, enabled?, auto-detected candidates) ───
@@ -710,6 +758,7 @@ if action == 'update':
     subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
                    capture_output=True, text=True, timeout=10)
     script_path = os.path.join(state_dir, 'update-run.sh')
+    log_path = os.path.join(state_dir, 'update.log')
     SCRIPT = '''#!/usr/bin/env bash
 if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
@@ -719,26 +768,35 @@ HOMESRC="$HOME/lldpq-src"
 URL="__URL__"
 LOG="__LOG__"
 : > "$LOG"
-{
+(
   echo "=== LLDPq Update $(date) ==="
   if [ -n "$SRC" ] && [ -d "$SRC/.git" ]; then
-    cd "$SRC" || exit 1
+    cd "$SRC" || { echo "ERROR: cannot enter source repo: $SRC"; exit 10; }
   elif [ -d "$HOMESRC/.git" ]; then
-    cd "$HOMESRC" || exit 1
+    cd "$HOMESRC" || { echo "ERROR: cannot enter source repo: $HOMESRC"; exit 10; }
   else
     echo "Source repo not found (LLDPQ_SRC=$SRC); cloning $URL -> $HOMESRC"
     rm -rf "$HOMESRC"
-    git clone "$URL" "$HOMESRC" && cd "$HOMESRC" || { echo "clone failed"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; }
+    git clone "$URL" "$HOMESRC" || { echo "ERROR: git clone failed"; exit 11; }
+    cd "$HOMESRC" || { echo "ERROR: cannot enter cloned source repo"; exit 10; }
   fi
   echo "--- git pull (in $(pwd)) ---"
-  GIT_TERMINAL_PROMPT=0 timeout 120 git pull 2>&1 || echo "(git pull skipped/failed -- continuing with the current checkout)"
+  GIT_TERMINAL_PROMPT=0 timeout 120 git pull 2>&1
+  git_rc=$?
+  if [ "$git_rc" -ne 0 ]; then
+    echo "ERROR: git pull failed (exit $git_rc); update stopped before install"
+    exit "$git_rc"
+  fi
   echo "--- ./install.sh -y __BACKUP__ ---"
   ./install.sh -y __BACKUP__ 2>&1
-  echo "--- install finished (exit $?) ---"
-} >> "$LOG" 2>&1
-echo __LLDPQ_DONE__ >> "$LOG"
+  install_rc=$?
+  echo "--- install finished (exit $install_rc) ---"
+  exit "$install_rc"
+) >> "$LOG" 2>&1
+rc=$?
+printf '__LLDPQ_DONE__:%s\n' "$rc" >> "$LOG"
+exit "$rc"
 '''
-    log_path = os.path.join(state_dir, 'update.log')
     script = (SCRIPT.replace('__URL__', url)
               .replace('__BACKUP__', '--backup' if backup else '')
               .replace('__LOG__', log_path))
@@ -747,6 +805,13 @@ echo __LLDPQ_DONE__ >> "$LOG"
                            input=script, capture_output=True, text=True, timeout=10)
         if w.returncode != 0:
             print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
+            sys.exit(0)
+        clear = subprocess.run(
+            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if clear.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not initialize update log'}))
             sys.exit(0)
         # Run the update in its OWN systemd transient unit (separate cgroup). install.sh
         # restarts fcgiwrap, and systemd kills the fcgiwrap.service cgroup on restart — a
@@ -795,25 +860,35 @@ TARBALL="__TARBALL__"
 DEST="$HOME/lldpq-src"
 LOG="__LOG__"
 : > "$LOG"
-{
+(
+  TMP=""
+  trap '[ -z "$TMP" ] || rm -rf "$TMP"' EXIT
   echo "=== LLDPq Offline Update $(date) ==="
   echo "--- tarball: $TARBALL ---"
-  if [ ! -f "$TARBALL" ]; then echo "ERROR: tarball not found (or not readable by $(whoami)): $TARBALL"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  if [ ! -f "$TARBALL" ]; then echo "ERROR: tarball not found (or not readable by $(whoami)): $TARBALL"; exit 1; fi
   TMP="$(mktemp -d)"
   echo "--- extracting ---"
-  if ! tar -xzf "$TARBALL" -C "$TMP" 2>&1; then echo "ERROR: extract failed (is this a valid .tar.gz?)"; rm -rf "$TMP"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  if ! tar -xzf "$TARBALL" -C "$TMP" 2>&1; then echo "ERROR: extract failed (is this a valid .tar.gz?)"; exit 1; fi
   INSTALLER="$(find "$TMP" -maxdepth 2 -name install.sh -type f 2>/dev/null | head -1)"
-  if [ -z "$INSTALLER" ]; then echo "ERROR: install.sh not found inside the tarball"; rm -rf "$TMP"; echo __LLDPQ_DONE__ >> "$LOG"; exit 1; fi
+  if [ -z "$INSTALLER" ]; then echo "ERROR: install.sh not found inside the tarball"; exit 1; fi
   SRCDIR="$(dirname "$INSTALLER")"
   echo "--- source: $SRCDIR ---"
-  if rm -rf "$DEST" && mkdir -p "$DEST" && cp -a "$SRCDIR/." "$DEST/"; then cd "$DEST" || cd "$SRCDIR"; else echo "(staging to $DEST failed; running from the extract dir)"; cd "$SRCDIR" || { echo __LLDPQ_DONE__ >> "$LOG"; exit 1; }; fi
+  if rm -rf "$DEST" && mkdir -p "$DEST" && cp -a "$SRCDIR/." "$DEST/"; then
+    cd "$DEST" || { echo "ERROR: cannot enter staged source: $DEST"; exit 12; }
+  else
+    echo "(staging to $DEST failed; running from the extract dir)"
+    cd "$SRCDIR" || { echo "ERROR: cannot enter extracted source: $SRCDIR"; exit 12; }
+  fi
   chmod +x ./install.sh 2>/dev/null
   echo "--- ./install.sh -y __BACKUP__ (offline) ---"
   ./install.sh -y __BACKUP__ 2>&1
-  echo "--- install finished (exit $?) ---"
-  rm -rf "$TMP"
-} >> "$LOG" 2>&1
-echo __LLDPQ_DONE__ >> "$LOG"
+  install_rc=$?
+  echo "--- install finished (exit $install_rc) ---"
+  exit "$install_rc"
+) >> "$LOG" 2>&1
+rc=$?
+printf '__LLDPQ_DONE__:%s\n' "$rc" >> "$LOG"
+exit "$rc"
 '''
     script = (SCRIPT.replace('__TARBALL__', tarball)
               .replace('__BACKUP__', '--backup' if backup else '')
@@ -823,6 +898,13 @@ echo __LLDPQ_DONE__ >> "$LOG"
                            input=script, capture_output=True, text=True, timeout=10)
         if w.returncode != 0:
             print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
+            sys.exit(0)
+        clear = subprocess.run(
+            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if clear.returncode != 0:
+            print(json.dumps({'success': False, 'error': 'Could not initialize update log'}))
             sys.exit(0)
         launch = ('if sudo systemd-run --no-block --collect '
                   '--uid=' + shlex.quote(lldpq_user) + ' '
@@ -848,9 +930,9 @@ if action == 'update-log':
             content = r.stdout
     except Exception:
         content = ''
-    done = '__LLDPQ_DONE__' in content
-    display = content.replace('__LLDPQ_DONE__', '').rstrip()
-    print(json.dumps({'success': True, 'done': done, 'log': display}))
+    display, done, exit_code, ok = parse_completion_log(content)
+    print(json.dumps({'success': True, 'done': done, 'ok': ok,
+                      'exit_code': exit_code, 'log': display}))
     sys.exit(0)
 
 # ─── Action: Read cron schedules for lldpq (auto-run) and get-conf (config collection) ───

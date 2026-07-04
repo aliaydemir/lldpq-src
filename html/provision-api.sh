@@ -3,9 +3,21 @@
 # Backend for provision.html
 # Called by nginx fcgiwrap
 
-# Admin-only guard (validates session, exits 401/403 if not admin)
-source "$(dirname "$0")/auth-guard.sh"
-require_admin
+# Upgrade workers are internal detached processes started by this CGI.  They do
+# not emit HTTP and must not depend on a browser request remaining open.
+UPGRADE_WORKER_MODE=false
+UPGRADE_JOB_ID=""
+if [[ "${1:-}" == "--upgrade-worker" ]]; then
+    if [[ ! "${2:-}" =~ ^[a-f0-9-]{36}$ ]]; then
+        exit 2
+    fi
+    UPGRADE_WORKER_MODE=true
+    UPGRADE_JOB_ID="$2"
+else
+    # Admin-only guard (validates session, exits 401/403 if not admin)
+    source "$(dirname "$0")/auth-guard.sh"
+    require_admin
+fi
 
 # Load allowlisted config data through the fixed, root-owned parser.
 if [[ -x /usr/local/bin/lldpq-config ]]; then
@@ -25,22 +37,27 @@ ZTP_SCRIPT_FILE="${ZTP_SCRIPT_FILE:-${WEB_ROOT}/cumulus-ztp.sh}"
 BASE_CONFIG_DIR="${BASE_CONFIG_DIR:-${LLDPQ_DIR}/sw-base}"
 PROVISION_UPLOAD_DIR="${PROVISION_UPLOAD_DIR:-${WEB_ROOT}/provision-uploads}"
 
-# Output JSON header
-echo "Content-Type: application/json"
-echo ""
-
-# Parse query string
-ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
-LINES_PARAM=$(echo "$QUERY_STRING" | grep -oP '(^|&)lines=\K[0-9]+' | head -1)
-
-# Read POST data if present (skip for file uploads — Python reads stdin directly)
 POST_DATA=""
-if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-    # File uploads (multipart) go directly to Python via stdin — don't consume here
-    case "$CONTENT_TYPE" in
-        multipart/form-data*) ;;
-        *) POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH") ;;
-    esac
+LINES_PARAM=""
+if [[ "$UPGRADE_WORKER_MODE" == true ]]; then
+    ACTION="upgrade-worker"
+else
+    # Output JSON header
+    echo "Content-Type: application/json"
+    echo ""
+
+    # Parse query string
+    ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
+    LINES_PARAM=$(echo "$QUERY_STRING" | grep -oP '(^|&)lines=\K[0-9]+' | head -1)
+
+    # Read POST data if present (skip for file uploads — Python reads stdin directly)
+    if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+        # File uploads (multipart) go directly to Python via stdin — don't consume here
+        case "$CONTENT_TYPE" in
+            multipart/form-data*) ;;
+            *) POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH") ;;
+        esac
+    fi
 fi
 
 # Discovery config
@@ -54,7 +71,8 @@ export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE DHCP_LOG_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
 export PROVISION_UPLOAD_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
-export POST_DATA ACTION LINES_PARAM
+export POST_DATA ACTION LINES_PARAM UPGRADE_JOB_ID UPGRADE_WORKER_MODE
+export PROVISION_API_SCRIPT="${BASH_SOURCE[0]}"
 
 python3 << 'PYTHON_SCRIPT'
 import json
@@ -63,7 +81,10 @@ import os
 import re
 import shlex
 import subprocess
+import fcntl
+import tempfile
 import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import time
@@ -88,6 +109,8 @@ INVENTORY_FILE = f'{WEB_ROOT}/inventory.json'
 SERIAL_MAPPING_FILE = f'{WEB_ROOT}/serial-mapping.txt'
 GENERATED_CONFIGS_DIR = f'{WEB_ROOT}/generated_config_folder'
 UPGRADE_JOBS_DIR = '/var/lib/lldpq/upgrade-jobs'
+UPGRADE_JOB_ID = os.environ.get('UPGRADE_JOB_ID', '')
+PROVISION_API_SCRIPT = os.path.abspath(os.environ.get('PROVISION_API_SCRIPT', 'provision-api.sh'))
 
 def update_lldpq_conf(key, value):
     """Update or add a key=value in /etc/lldpq.conf (with file locking)."""
@@ -2270,17 +2293,47 @@ def job_path(job_id):
         error_json('Invalid job id')
     return os.path.join(UPGRADE_JOBS_DIR, f'{job_id}.json')
 
+@contextmanager
+def upgrade_job_lock(job_id):
+    """Serialize API, cancellation and worker access to one job."""
+    ensure_upgrade_jobs_dir()
+    lock_path = job_path(job_id) + '.lock'
+    handle = open(lock_path, 'a+')
+    try:
+        try:
+            os.chmod(lock_path, 0o664)
+        except OSError:
+            pass
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
 def save_upgrade_job(job):
     ensure_upgrade_jobs_dir()
     path = job_path(job['id'])
-    tmp = path + '.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(job, f, indent=2)
-    os.replace(tmp, path)
+    fd, tmp = tempfile.mkstemp(prefix=f'.{job["id"]}.', suffix='.tmp', dir=UPGRADE_JOBS_DIR)
     try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(job, f, indent=2)
+            f.write('\n')
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o664)
+        os.replace(tmp, path)
         os.chmod(path, 0o664)
-    except Exception:
-        pass
+        try:
+            dir_fd = os.open(UPGRADE_JOBS_DIR, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 def load_upgrade_job(job_id):
     path = job_path(job_id)
@@ -2288,6 +2341,22 @@ def load_upgrade_job(job_id):
         error_json('Upgrade job not found')
     with open(path, 'r') as f:
         return json.load(f)
+
+def launch_upgrade_worker(job_id):
+    """Start a browser-independent worker; its lifetime lock prevents duplicates."""
+    env = os.environ.copy()
+    for key in ('CONTENT_LENGTH', 'CONTENT_TYPE', 'QUERY_STRING', 'REQUEST_METHOD'):
+        env.pop(key, None)
+    proc = subprocess.Popen(
+        ['/bin/bash', PROVISION_API_SCRIPT, '--upgrade-worker', job_id],
+        env=env,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return proc.pid
 
 def start_upgrade_for_device(dev, image_url, ztp_url):
     ip = dev.get('ip')
@@ -2348,11 +2417,13 @@ def update_upgrade_job(job):
         for d in job['devices']:
             if d['status'] == 'queued':
                 d['status'] = 'cancelled'
+        finalize_upgrade_job(job, now)
         return job
     if job.get('stop_on_failure', True) and failed:
         for d in job['devices']:
             if d['status'] == 'queued':
                 d['status'] = 'blocked'
+        finalize_upgrade_job(job, now)
         return job
     slots = max(0, int(job.get('batch_size', 1)) - len(active))
     for dev in [d for d in job['devices'] if d['status'] == 'queued'][:slots]:
@@ -2364,10 +2435,59 @@ def update_upgrade_job(job):
         else:
             dev['status'] = 'failed'
             dev['error'] = detail or 'Failed to start upgrade'
+    finalize_upgrade_job(job, now)
+    return job
+
+def finalize_upgrade_job(job, now=None):
     if all(d['status'] in ('done', 'failed', 'cancelled', 'blocked') for d in job['devices']):
         job['complete'] = True
-        job['completed_at'] = int(now)
-    return job
+        job.setdefault('completed_at', int(now or time.time()))
+
+def run_upgrade_worker(job_id):
+    """Advance a persisted upgrade job until terminal, independently of UI polling."""
+    ensure_upgrade_jobs_dir()
+    worker_lock_path = job_path(job_id) + '.worker.lock'
+    worker_lock = open(worker_lock_path, 'a+')
+    try:
+        try:
+            os.chmod(worker_lock_path, 0o664)
+        except OSError:
+            pass
+        try:
+            fcntl.flock(worker_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+
+        while True:
+            try:
+                with upgrade_job_lock(job_id):
+                    job = load_upgrade_job(job_id)
+                    if job.get('complete'):
+                        return
+                    job['worker_heartbeat'] = int(time.time())
+                    job.pop('worker_error', None)
+                    save_upgrade_job(job)
+                    job = update_upgrade_job(job)
+                    job['worker_heartbeat'] = int(time.time())
+                    save_upgrade_job(job)
+                    if job.get('complete'):
+                        return
+            except Exception as exc:
+                try:
+                    with upgrade_job_lock(job_id):
+                        job = load_upgrade_job(job_id)
+                        job['worker_heartbeat'] = int(time.time())
+                        job['worker_error'] = str(exc)[:300]
+                        save_upgrade_job(job)
+                except Exception:
+                    pass
+            time.sleep(15)
+    finally:
+        try:
+            fcntl.flock(worker_lock.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        worker_lock.close()
 
 def ensure_onie_symlinks(image_name):
     """Point the generic ONIE HTTP-discovery fallback names at the selected upgrade image.
@@ -2480,6 +2600,7 @@ def action_upgrade_start():
         'timeout_seconds': 3600,
         'complete': False,
         'cancelled': False,
+        'worker_started_at': int(time.time()),
         'devices': [],
     }
     for d in devices:
@@ -2487,8 +2608,20 @@ def action_upgrade_start():
         item['status'] = 'queued'
         item['target_version'] = target_version
         job['devices'].append(item)
-    job = update_upgrade_job(job)
-    save_upgrade_job(job)
+    with upgrade_job_lock(job['id']):
+        save_upgrade_job(job)
+    try:
+        launch_upgrade_worker(job['id'])
+    except Exception as exc:
+        with upgrade_job_lock(job['id']):
+            job = load_upgrade_job(job['id'])
+            for item in job['devices']:
+                if item['status'] == 'queued':
+                    item['status'] = 'blocked'
+            job['worker_error'] = 'Could not start upgrade worker: ' + str(exc)[:200]
+            finalize_upgrade_job(job)
+            save_upgrade_job(job)
+        error_json(job['worker_error'] + '; no device upgrade was started')
     result_json({'success': True, 'job': job})
 
 def action_upgrade_status():
@@ -2496,9 +2629,53 @@ def action_upgrade_status():
         data = json.loads(POST_DATA)
     except Exception:
         error_json("Invalid JSON data")
-    job = load_upgrade_job(data.get('job_id', ''))
-    job = update_upgrade_job(job)
-    save_upgrade_job(job)
+    job_id = data.get('job_id', '')
+    with upgrade_job_lock(job_id):
+        job = load_upgrade_job(job_id)
+    if not job.get('complete'):
+        # Status remains observational, but it may replace a worker that died
+        # after a service/process restart. The lifetime flock rejects duplicate
+        # workers when the original is merely busy in a long device check.
+        heartbeat = max(
+            int(job.get('worker_heartbeat', 0) or 0),
+            int(job.get('worker_started_at', 0) or 0),
+        )
+        if time.time() - heartbeat > 45:
+            try:
+                launch_upgrade_worker(job_id)
+            except Exception:
+                pass
+    result_json({'success': True, 'job': job})
+
+def action_upgrade_active():
+    """Recover the newest unfinished job after a browser reload."""
+    ensure_upgrade_jobs_dir()
+    candidates = []
+    try:
+        names = os.listdir(UPGRADE_JOBS_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        match = re.fullmatch(r'([a-f0-9-]{36})\.json', name)
+        if not match:
+            continue
+        job_id = match.group(1)
+        try:
+            with upgrade_job_lock(job_id):
+                job = load_upgrade_job(job_id)
+            if not job.get('complete'):
+                candidates.append(job)
+        except Exception:
+            continue
+    if not candidates:
+        result_json({'success': True, 'job': None})
+    job = max(candidates, key=lambda item: int(item.get('created_at', 0)))
+    # If the previous worker was interrupted (for example by a service restart),
+    # starting another process is safe: the lifetime worker lock admits only one.
+    try:
+        launch_upgrade_worker(job['id'])
+    except Exception:
+        pass
     result_json({'success': True, 'job': job})
 
 def action_upgrade_cancel():
@@ -2506,10 +2683,15 @@ def action_upgrade_cancel():
         data = json.loads(POST_DATA)
     except Exception:
         error_json("Invalid JSON data")
-    job = load_upgrade_job(data.get('job_id', ''))
-    job['cancelled'] = True
-    job = update_upgrade_job(job)
-    save_upgrade_job(job)
+    job_id = data.get('job_id', '')
+    with upgrade_job_lock(job_id):
+        job = load_upgrade_job(job_id)
+        job['cancelled'] = True
+        for item in job['devices']:
+            if item['status'] == 'queued':
+                item['status'] = 'cancelled'
+        finalize_upgrade_job(job)
+        save_upgrade_job(job)
     result_json({'success': True, 'job': job})
 
 # ======================== SSH KEY ========================
@@ -3483,7 +3665,10 @@ def action_load_ztp_tab():
 
 # ======================== ROUTER ========================
 
-if ACTION == 'list-bindings':
+if ACTION == 'upgrade-worker':
+    run_upgrade_worker(UPGRADE_JOB_ID)
+    sys.exit(0)
+elif ACTION == 'list-bindings':
     action_list_bindings()
 elif ACTION == 'save-bindings':
     action_save_bindings()
@@ -3522,6 +3707,8 @@ elif ACTION == 'upgrade-start':
     action_upgrade_start()
 elif ACTION == 'upgrade-status':
     action_upgrade_status()
+elif ACTION == 'upgrade-active':
+    action_upgrade_active()
 elif ACTION == 'upgrade-cancel':
     action_upgrade_cancel()
 elif ACTION == 'ping-scan':

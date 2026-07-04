@@ -408,6 +408,15 @@ class LinkFlapAnalyzer:
         # Determine overall health status
         total_problematic = len(summary['critical_ports']) + len(summary['warning_ports'])
         stability_ratio = ((summary['total_ports'] - total_problematic) / summary['total_ports'] * 100) if summary['total_ports'] > 0 else 0
+        if summary['critical_ports']:
+            problem_card_class = "card-critical"
+            problem_metric_class = "flap-critical"
+        elif summary['warning_ports']:
+            problem_card_class = "card-warning"
+            problem_metric_class = "flap-warning"
+        else:
+            problem_card_class = "card-excellent"
+            problem_metric_class = "flap-excellent"
         coverage = summary.get("collection_coverage", {})
         expected_devices = int(coverage.get("expected_devices", 0) or 0)
         current_devices = int(coverage.get("current_devices", 0) or 0)
@@ -442,6 +451,7 @@ class LinkFlapAnalyzer:
         .summary-card:hover {{ background: #2d2d2d; transform: translateY(-1px); }}
         .summary-card.active {{ background: #333; border-left-width: 5px; }}
         .card-excellent {{ border-left-color: #76b900; }}
+        .card-warning {{ border-left-color: #ff9800; }}
         .card-critical {{ border-left-color: #f44336; }}
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
@@ -579,8 +589,8 @@ class LinkFlapAnalyzer:
                     <div class="metric flap-excellent" id="stable-ports">{len(summary['ok_ports'])}</div>
                     <div class="metric-label">Stable</div>
                 </div>
-                <div class="summary-card card-critical" id="problematic-card" data-metric-key="flap_problematic_ports" data-metric-value="{total_problematic}">
-                    <div class="metric flap-critical" id="problematic-ports">{total_problematic}</div>
+                <div class="summary-card {problem_card_class}" id="problematic-card" data-metric-key="flap_problematic_ports" data-metric-value="{total_problematic}">
+                    <div class="metric {problem_metric_class}" id="problematic-ports">{total_problematic}</div>
                     <div class="metric-label">Problematic</div>
                 </div>
                 <div class="summary-card" id="stability-card" data-metric-key="flap_stability_ratio" data-metric-value="{stability_ratio:.1f}">

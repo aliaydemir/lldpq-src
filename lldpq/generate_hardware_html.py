@@ -656,8 +656,13 @@ def grade_load_per_core(cpu_load, cpu_cores):
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
+    # Source markers describe the primary collector command, not necessarily the
+    # metric itself. Platforms commonly report SENSORS=UNAVAILABLE while the
+    # hw-management/thermal-zone fallback still supplies valid CPU/ASIC values.
+    # Keep every other explicit collector failure fail-closed; fresh history can
+    # otherwise mask a current MEMORY/CPU_LOAD error with an older value.
     missing_markers = hardware_missing_telemetry_markers(device_name)
-    required_telemetry_missing = bool(missing_markers)
+    required_telemetry_missing = bool(missing_markers - {"sensors"})
     
     # CPU Temperature grade
     cpu_temp, asic_temp = parse_temperature_from_hardware_file(device_name)
@@ -871,6 +876,7 @@ def generate_hardware_html():
         .card-good {{ border-left-color: #8bc34a; }}
         .card-warning {{ border-left-color: #ff9800; }}
         .card-critical {{ border-left-color: #f44336; }}
+        .card-unknown {{ border-left-color: #9e9e9e; }}
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
         .metric-label {{ font-size: 12px; color: #888; margin-top: 4px; }}
@@ -878,6 +884,7 @@ def generate_hardware_html():
         .card-good .metric {{ color: #8bc34a; }}
         .card-warning .metric {{ color: #ff9800; }}
         .card-critical .metric {{ color: #f44336; }}
+        .card-unknown .metric {{ color: #9e9e9e; }}
         .badge {{ display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; }}
         .badge-green {{ background: rgba(118, 185, 0, 0.2); color: #76b900; }}
         .badge-red {{ background: rgba(244, 67, 54, 0.2); color: #ff6b6b; }}
@@ -988,6 +995,10 @@ def generate_hardware_html():
                 <div class="summary-card card-critical" id="critical-card">
                     <div class="metric" id="critical-devices">{len(summary['critical_devices'])}</div>
                     <div class="metric-label">Critical</div>
+                </div>
+                <div class="summary-card card-unknown" id="unknown-card">
+                    <div class="metric" id="unknown-devices">{unknown_device_count}</div>
+                    <div class="metric-label">Unknown</div>
                 </div>
             </div>
         </div>
@@ -1265,6 +1276,12 @@ def generate_hardware_html():
                     filterDevices('CRITICAL');
                 }
             });
+
+            document.getElementById('unknown-card').addEventListener('click', function() {
+                if (parseInt(document.getElementById('unknown-devices').textContent) > 0) {
+                    filterDevices('UNKNOWN');
+                }
+            });
         }
         
         function filterDevices(filterType) {
@@ -1302,6 +1319,10 @@ def generate_hardware_html():
                 filteredRows = allRows.filter(row => row.dataset.status === 'critical');
                 filterText = 'Showing ' + filteredRows.length + ' Critical Devices';
                 document.getElementById('critical-card').classList.add('active');
+            } else if (filterType === 'UNKNOWN') {
+                filteredRows = allRows.filter(row => row.dataset.status === 'unknown');
+                filterText = 'Showing ' + filteredRows.length + ' Unknown Devices';
+                document.getElementById('unknown-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
                 filteredRows = allRows;
                 document.getElementById('total-devices-card').classList.add('active');
@@ -1638,6 +1659,7 @@ def generate_hardware_html():
                 csvContent += `# Good: ${document.getElementById('good-devices').textContent}\\n`;
                 csvContent += `# Warning: ${document.getElementById('warning-devices').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-devices').textContent}\\n`;
+                csvContent += `# Unknown: ${document.getElementById('unknown-devices').textContent}\\n`;
                 csvContent += `#\\n`;
                 
                 // Process each visible row
@@ -1747,6 +1769,7 @@ def generate_hardware_html():
     print(f"   - Good: {len(summary['good_devices'])}")
     print(f"   - Warning: {len(summary['warning_devices'])}")
     print(f"   - Critical: {len(summary['critical_devices'])}")
+    print(f"   - Unknown: {len(summary['unknown_devices'])}")
 
 if __name__ == "__main__":
     generate_hardware_html()

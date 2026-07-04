@@ -707,13 +707,7 @@ PING="ping"
 
 ping_test() {
     local device=$1
-    local hostname=$2
     $PING -c 1 -W 0.5 "$device" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "$device $hostname" >> "$unreachable_hosts_file"
-        return 1
-    fi
-    return 0
 }
 
 clear_current_device_artifacts() {
@@ -1450,6 +1444,11 @@ execute_commands_optimized() {
     local user=$2
     local hostname=$3
     local bundle_stage html_temp raw_file carrier_body optical_body
+    # process_device runs in its own subshell, so this result classification is
+    # private to one device.  process_device owns the dynamically-scoped local;
+    # assigning it here lets the caller distinguish an actual SSH failure from
+    # a reachable device returning malformed data after this function returns.
+    COLLECTION_FAILURE_KIND=""
 
     bundle_stage=$(mktemp -d \
         "$bundle_root/device-${hostname}.XXXXXXXX") || return 1
@@ -2217,12 +2216,16 @@ EOF
     ' > "$raw_file" 2>/dev/null
     local ssh_status=$?
 
-    if [[ $ssh_status -ne 0 ]] || ! validate_collection_bundle "$raw_file"; then
+    if [[ $ssh_status -ne 0 ]]; then
+        COLLECTION_FAILURE_KIND=ssh
         echo "Data collection failed for ${hostname} (ssh status ${ssh_status})" >&2
         rm -rf "$bundle_stage"
-        if [[ $ssh_status -ne 0 ]]; then
-            return "$ssh_status"
-        fi
+        return "$ssh_status"
+    fi
+    if ! validate_collection_bundle "$raw_file"; then
+        COLLECTION_FAILURE_KIND=invalid
+        echo "Data collection failed for ${hostname} (invalid collection bundle)" >&2
+        rm -rf "$bundle_stage"
         return 1
     fi
     
@@ -2345,16 +2348,33 @@ process_device() {
     local device=$1
     local user=$2
     local hostname=$3
-    ping_test "$device" "$hostname"
-    if [ $? -eq 0 ]; then
-        execute_commands_optimized "$device" "$user" "$hostname"
+    local ping_reachable=true collection_status COLLECTION_FAILURE_KIND=""
+
+    # ICMP is only a fast hint.  A dropped/filtered echo must not suppress a
+    # valid SSH collection; the existing 300-second collection timeout remains
+    # the authoritative reachability bound.
+    ping_test "$device" || ping_reachable=false
+    if execute_commands_optimized "$device" "$user" "$hostname"; then
+        return 0
+    else
+        collection_status=$?
+    fi
+
+    if [[ "$ping_reachable" == "false" && \
+          "${COLLECTION_FAILURE_KIND:-}" == "ssh" ]]; then
+        echo "$device $hostname" >> "$unreachable_hosts_file"
+        # Do not let a previous raw snapshot or per-device page look current.
+        # Both ICMP and the authoritative SSH attempt failed, so preserve the
+        # established explicit-unavailable behavior for this device.
+        clear_current_device_artifacts "$hostname" || return 1
+        write_unreachable_device_report "$device" "$hostname"
         return $?
     fi
-    # Do not let a previous raw snapshot or per-device page look current. The
-    # aggregate run may still succeed for the rest of the fabric, while this
-    # device gets an explicit unavailable page and asset status.
-    clear_current_device_artifacts "$hostname" || return 1
-    write_unreachable_device_report "$device" "$hostname"
+
+    # Ping succeeded, or SSH reached the device but returned an invalid bundle.
+    # Keep the prior fail-closed generation semantics for those collection
+    # errors instead of disguising them as an unreachable host.
+    return "$collection_status"
 }
 
 # ============================================================================
