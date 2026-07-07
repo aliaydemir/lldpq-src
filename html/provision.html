@@ -1153,17 +1153,16 @@
             <thead>
                 <tr>
                     <th style="width:42px; text-align:center;"><input type="checkbox" id="handoverSelectAll" onchange="selectAllTrackingFiltered(this.checked)" aria-label="Select all filtered switches"></th>
-                    <th>Hostname</th>
-                    <th>IP Address</th>
-                    <th>Role</th>
-                    <th>State</th>
-                    <th>Changed At</th>
-                    <th>Changed By</th>
-                    <th>Note</th>
+                    <th data-tracking-sort="hostname" aria-sort="ascending" style="cursor:pointer;" onclick="sortTracking('hostname')">Hostname <span id="tsort-hostname" style="opacity:1;">&#9650;</span></th>
+                    <th data-tracking-sort="ip" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('ip')">IP Address <span id="tsort-ip" style="opacity:0.4;">&#9650;</span></th>
+                    <th data-tracking-sort="role" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('role')">Role <span id="tsort-role" style="opacity:0.4;">&#9650;</span></th>
+                    <th data-tracking-sort="state" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('state')">State <span id="tsort-state" style="opacity:0.4;">&#9650;</span></th>
+                    <th data-tracking-sort="changed_at" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('changed_at')">Changed At <span id="tsort-changed_at" style="opacity:0.4;">&#9650;</span></th>
+                    <th data-tracking-sort="changed_by" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('changed_by')">Changed By <span id="tsort-changed_by" style="opacity:0.4;">&#9650;</span></th>
                 </tr>
             </thead>
             <tbody id="handoverBody">
-                <tr><td colspan="8" class="loading">Open this tab to load switch tracking...</td></tr>
+                <tr><td colspan="7" class="loading">Open this tab to load switch tracking...</td></tr>
             </tbody>
         </table>
     </div>
@@ -1558,6 +1557,12 @@ let trackingBusy = false;
 let trackingSelected = new Set();
 let trackingPendingState = '';
 let trackingPendingHostnames = [];
+let trackingSortCol = 'hostname';
+let trackingSortAsc = true;
+
+const TRACKING_SORT_COLUMNS = new Set([
+    'hostname', 'ip', 'role', 'state', 'changed_at', 'changed_by'
+]);
 
 const BASE_CONFIG_FILES = [
     { name: 'bash.bashrc', dest: '/etc/bash.bashrc', destAlt: '/home/cumulus/.bashrc', type: 'config', desc: 'Shell aliases & VRF helpers' },
@@ -1723,10 +1728,10 @@ async function loadTracking(force = false) {
 
     trackingBusy = true;
     updateTrackingControls();
-    document.getElementById('handoverBody').innerHTML = '<tr><td colspan="8" class="loading">Loading switch tracking...</td></tr>';
+    document.getElementById('handoverBody').innerHTML = '<tr><td colspan="7" class="loading">Loading switch tracking...</td></tr>';
     const data = await apiCall('get-tracking');
     if (!data.success) {
-        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="8" style="color:#f44336;padding:20px;">Error: ${escHtml(String(data.error || 'Unable to load tracking'))}</td></tr>`;
+        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="7" style="color:#f44336;padding:20px;">Error: ${escHtml(String(data.error || 'Unable to load tracking'))}</td></tr>`;
         showToast('Tracking load failed: ' + (data.error || 'Unknown error'), 'error');
         trackingBusy = false;
         updateTrackingControls();
@@ -1765,7 +1770,68 @@ function filteredTrackingDevices() {
         if (role !== 'all' && device.role !== role) return false;
         return !search || device.hostname.toLowerCase().includes(search) ||
             device.ip.toLowerCase().includes(search) || device.role.toLowerCase().includes(search);
+    }).sort(compareTrackingDevices);
+}
+
+function trackingSortValue(device, column) {
+    if (column === 'changed_at') {
+        const timestamp = Date.parse(device.changed_at || '');
+        return Number.isFinite(timestamp) ? timestamp : null;
+    }
+    if (column === 'state') {
+        return device.state === 'handed_over' ? 'Handed Over' : 'Commissioning';
+    }
+    return String(device[column] || '').trim();
+}
+
+function compareTrackingDevices(a, b) {
+    const left = trackingSortValue(a, trackingSortCol);
+    const right = trackingSortValue(b, trackingSortCol);
+    const leftMissing = left === null || left === '';
+    const rightMissing = right === null || right === '';
+    if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+
+    let comparison = 0;
+    if (!leftMissing && typeof left === 'number' && typeof right === 'number') {
+        comparison = left - right;
+    } else if (!leftMissing) {
+        comparison = String(left).localeCompare(String(right), undefined, {
+            numeric: true,
+            sensitivity: 'base',
+        });
+    }
+    if (comparison === 0 && trackingSortCol !== 'hostname') {
+        comparison = a.hostname.localeCompare(b.hostname, undefined, {
+            numeric: true,
+            sensitivity: 'base',
+        });
+    }
+    return trackingSortAsc ? comparison : -comparison;
+}
+
+function sortTracking(column) {
+    if (!TRACKING_SORT_COLUMNS.has(column)) return;
+    if (trackingSortCol === column) trackingSortAsc = !trackingSortAsc;
+    else {
+        trackingSortCol = column;
+        trackingSortAsc = true;
+    }
+
+    document.querySelectorAll('#handoverTable th[data-tracking-sort]').forEach(header => {
+        header.setAttribute('aria-sort', 'none');
     });
+    document.querySelectorAll('[id^="tsort-"]').forEach(indicator => {
+        indicator.style.opacity = '0.4';
+        indicator.innerHTML = '&#9650;';
+    });
+    const header = document.querySelector(`#handoverTable th[data-tracking-sort="${column}"]`);
+    const indicator = document.getElementById('tsort-' + column);
+    if (header) header.setAttribute('aria-sort', trackingSortAsc ? 'ascending' : 'descending');
+    if (indicator) {
+        indicator.style.opacity = '1';
+        indicator.innerHTML = trackingSortAsc ? '&#9650;' : '&#9660;';
+    }
+    renderTracking();
 }
 
 function formatTrackingDate(value) {
@@ -1793,7 +1859,7 @@ function renderTracking() {
     selectAll.disabled = trackingBusy || filtered.length === 0;
 
     if (filtered.length === 0) {
-        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="8" style="text-align:center; padding:40px; color:#666;">${trackingDevices.length === 0 ? 'No switches found in devices.yaml.' : 'No switches match the current filters.'}</td></tr>`;
+        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="7" style="text-align:center; padding:40px; color:#666;">${trackingDevices.length === 0 ? 'No switches found in devices.yaml.' : 'No switches match the current filters.'}</td></tr>`;
         updateTrackingControls();
         return;
     }
@@ -1811,7 +1877,6 @@ function renderTracking() {
             <td>${stateBadge}</td>
             <td style="color:#888; white-space:nowrap;">${formatTrackingDate(device.changed_at)}</td>
             <td>${escHtml(device.changed_by) || '-'}</td>
-            <td style="color:#888; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escAttr(device.note)}">${escHtml(device.note) || '-'}</td>
         </tr>`;
     }).join('');
     updateTrackingControls();
