@@ -86,6 +86,7 @@ def get_all_devices(config):
         sys.exit(1)
     
     result = []
+    hostnames_seen = {}
     for ip, device_config in devices.items():
         if isinstance(device_config, str):
             # Simple format: IP: hostname or IP: hostname @role
@@ -153,6 +154,29 @@ def get_all_devices(config):
                 file=sys.stderr,
             )
             sys.exit(1)
+
+        # Hostnames are the stable identity used by assets.ini, cache JSON and
+        # all analysis reports.  Two addresses sharing one hostname would make
+        # collection coverage ambiguous and allow the later row/cache entry to
+        # silently replace the first.  Treat DNS-style case variants as the
+        # same hostname as well.
+        hostname_key = fields['hostname'].casefold()
+        if hostname_key in {'created', 'device-name'}:
+            print(
+                f"ERROR: Reserved hostname {fields['hostname']!r} cannot be used "
+                "in the Assets report",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if hostname_key in hostnames_seen:
+            print(
+                f"ERROR: Duplicate hostname {fields['hostname']!r} for device "
+                f"{fields['address']!r}; already used by "
+                f"{hostnames_seen[hostname_key]!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        hostnames_seen[hostname_key] = fields['address']
 
         result.append((
             fields['address'],

@@ -12,6 +12,7 @@ import time
 import re
 import os
 import math
+import html
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
@@ -817,6 +818,14 @@ class OpticalAnalyzer:
                 f' data-coverage-expected="{expected_hosts}"'
                 f' data-coverage-current="{current_hosts}"'
             )
+        # Machine-readable categories keep dashboard/alert consumers from
+        # treating an intentionally empty cage as missing diagnostics. They are
+        # attributes only and do not alter the report's visual layout.
+        coverage_attrs += (
+            f' data-optical-total="{summary["total_ports"]}"'
+            f' data-optical-unplugged="{len(summary["unplugged_ports"])}"'
+            f' data-optical-unknown="{len(summary["unknown_ports"])}"'
+        )
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1023,6 +1032,7 @@ class OpticalAnalyzer:
             if bias_lane is not None:
                 bias_current += f" (L{bias_lane})"
             recommended_action = self.get_recommended_action(port)
+            device_key = html.escape(str(device_name), quote=True)
             # Badge class based on health
             health = port['health']
             if health == 'excellent':
@@ -1041,7 +1051,7 @@ class OpticalAnalyzer:
                 badge_class = 'badge badge-gray'
 
             html_content += f"""
-                <tr data-health="{port['health']}">
+                <tr data-device-key="{device_key}" data-health="{port['health']}">
                     <td>{canonical(device_name)}</td>
                     <td>{interface_name}</td>
                     <td><span class="{badge_class}">{port['health'].upper()}</span></td>
@@ -1456,16 +1466,16 @@ class OpticalAnalyzer:
                 // new one.  The shared analysis guard resolves only after a
                 // newer complete generation has been published.
                 let baseline = null;
-                if (typeof window.lldpqCapturePipelineState === 'function') {
-                    baseline = await window.lldpqCapturePipelineState();
+                if (typeof window.lldpqCaptureAnalysisState === 'function') {
+                    baseline = await window.lldpqCaptureAnalysisState('optical');
                 }
 
-                const response = await fetch('/trigger-monitor', {
+                const response = await fetch('/trigger-monitor?scope=optical', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
                 const data = await response.json();
-                if (data.status !== 'success') {
+                if (!response.ok || data.status !== 'success' || !data.trigger_id || data.scope !== 'optical') {
                     throw new Error(data.message || 'Failed to trigger monitor analysis');
                 }
 
@@ -1487,13 +1497,15 @@ class OpticalAnalyzer:
                     `;
                     notification.innerHTML = `
                         <strong>✅ Monitor Analysis Started</strong><br>
-                        The full system analysis is running in the background.<br>
-                        <small>Page will refresh after the new analysis is completely published.</small>
+                        The optical analysis is running in the background.<br>
+                        <small>Page will refresh after the new optical results are completely published.</small>
                     `;
                 document.body.appendChild(notification);
 
                 if (typeof window.waitForLldpqAnalysisCompletion === 'function') {
-                    await window.waitForLldpqAnalysisCompletion(baseline);
+                    await window.waitForLldpqAnalysisCompletion(
+                        baseline, { scope: 'optical', pipelineId: data.trigger_id }
+                    );
                 } else {
                     // Compatibility fallback for older installations that do
                     // not yet provide analysis-guard.js completion polling.
@@ -1627,7 +1639,7 @@ class OpticalAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/analysis-guard.js"></script>
+    <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""
 

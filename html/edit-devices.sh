@@ -11,6 +11,7 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
 fi
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 LLDPQ_HOME="${LLDPQ_DIR:-$HOME/lldpq}"
+SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 
 # devices.yaml location
 DEVICES_FILE="$LLDPQ_HOME/devices.yaml"
@@ -20,17 +21,24 @@ METHOD="${REQUEST_METHOD:-GET}"
 
 # Output headers
 echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo "X-Content-Type-Options: nosniff"
 echo ""
 
 if [ "$METHOD" = "GET" ]; then
-    # Read and return devices.yaml content
-    if [ -f "$DEVICES_FILE" ]; then
-        # Escape content for JSON
-        CONTENT=$(cat "$DEVICES_FILE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-        echo "{\"success\": true, \"content\": $CONTENT}"
-    else
-        echo "{\"success\": false, \"error\": \"File not found: $DEVICES_FILE\"}"
-    fi
+    DEVICES_FILE="$DEVICES_FILE" python3 - <<'PY'
+import hashlib, json, os
+path = os.environ['DEVICES_FILE']
+try:
+    raw = open(path, 'rb').read()
+    print(json.dumps({'success': True, 'content': raw.decode('utf-8'),
+                      'revision': hashlib.sha256(raw).hexdigest(), 'exists': True}))
+except FileNotFoundError:
+    print(json.dumps({'success': True, 'content': '', 'exists': False,
+                      'revision': hashlib.sha256(b'').hexdigest()}))
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': 'Cannot read devices.yaml: ' + str(exc)}))
+PY
     
 elif [ "$METHOD" = "POST" ]; then
     # Read POST data from stdin
@@ -40,50 +48,19 @@ elif [ "$METHOD" = "POST" ]; then
         POST_DATA=$(cat)
     fi
     
-    # Extract content from JSON using Python
-    CONTENT=$(echo "$POST_DATA" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get("content", ""))
-except:
-    print("")
-' 2>/dev/null)
-    
-    if [ -n "$CONTENT" ]; then
-        # Validate YAML syntax before saving
-        VALIDATION=$(echo "$CONTENT" | python3 -c '
-import sys, yaml
-try:
-    yaml.safe_load(sys.stdin)
-    print("valid")
-except yaml.YAMLError as e:
-    print(f"YAML Error: {str(e)[:100]}")
-except Exception as e:
-    print(f"Error: {str(e)[:100]}")
-' 2>/dev/null)
-        
-        if [ "$VALIDATION" = "valid" ]; then
-            # Create backup before writing
-            if [ -f "$DEVICES_FILE" ]; then
-                cp "$DEVICES_FILE" "${DEVICES_FILE}.bak" 2>/dev/null
-            fi
-            
-            # Write new content
-            echo "$CONTENT" > "$DEVICES_FILE"
-            
-            if [ $? -eq 0 ]; then
-                sudo -n chown "${LLDPQ_USER:-$(whoami)}:www-data" "$DEVICES_FILE" 2>/dev/null || true
-                sudo -n chmod 664 "$DEVICES_FILE" 2>/dev/null || true
-                echo "{\"success\": true, \"message\": \"devices.yaml saved successfully\"}"
-            else
-                echo "{\"success\": false, \"error\": \"Failed to write file\"}"
-            fi
-        else
-            echo "{\"success\": false, \"error\": \"$VALIDATION\"}"
-        fi
+    if [ ! -f "$SETUP_SAFETY" ]; then
+        echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
+        exit 0
+    fi
+    ARGS=("$SETUP_SAFETY" save-devices --request-json --target "$DEVICES_FILE" --parser "$LLDPQ_HOME/parse_devices.py" --managed-root "$LLDPQ_HOME")
+    RESULT=$(printf '%s' "$POST_DATA" | sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c 'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
+    if [ -z "$RESULT" ]; then
+        echo '{"success": false, "error": "Failed to validate or atomically save devices.yaml"}'
     else
-        echo "{\"success\": false, \"error\": \"No content provided\"}"
+        RESULT="$RESULT" python3 -c 'import json,os
+r=json.loads(os.environ["RESULT"])
+if r.get("success"): r["message"]="devices.yaml saved successfully"
+print(json.dumps(r))' 2>/dev/null || echo "$RESULT"
     fi
 else
     echo "{\"success\": false, \"error\": \"Invalid method\"}"

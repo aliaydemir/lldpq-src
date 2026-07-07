@@ -189,17 +189,20 @@
             content: '▲';
             color: #76b900;
             opacity: 1;
+            font-size: 10px;
         }
         
         .sortable.desc .sort-arrow::before {
             content: '▼';
             color: #76b900;
             opacity: 1;
+            font-size: 10px;
         }
         
         .sortable.asc .sort-arrow,
         .sortable.desc .sort-arrow {
             opacity: 1;
+            font-size: 0;
         }
         
         /* Badges */
@@ -580,108 +583,139 @@
     <script src="/css/select2.min.js"></script>
 
 <script>
-    // Global role map: hostname -> role (loaded from devices.yaml via provision-api)
-    let deviceRoleMap = {};
+    function assetText(value, fallback = '') {
+        return typeof value === 'string' || typeof value === 'number'
+            ? String(value)
+            : fallback;
+    }
 
-    function fetchAndDisplayAssetResults() {
-        // Load assets data and role data in parallel
-        Promise.all([
-            fetch('assets.ini').then(r => r.text()),
-            fetch('/provision-api.sh?action=list-devices').then(r => r.json()).catch(() => ({ success: false }))
-        ]).then(([data, roleData]) => {
-            // Build role map from devices.yaml
-            if (roleData.success && roleData.devices) {
-                roleData.devices.forEach(d => {
-                    if (d.hostname && d.role && d.role !== 'ungrouped') {
-                        deviceRoleMap[d.hostname] = d.role;
-                    }
-                });
+    function normalizeAssetReport(payload) {
+        if (!payload || typeof payload !== 'object' || payload.success !== true ||
+            !Array.isArray(payload.rows)) {
+            throw new Error(assetText(payload?.error || payload?.message, 'Invalid Assets response'));
+        }
+        const rows = payload.rows.map((row, index) => {
+            if (!row || typeof row !== 'object' || Array.isArray(row)) {
+                throw new Error(`Invalid Assets row at index ${index}`);
             }
-
-            // Extract timestamp from data (first line: "Created on YYYY-MM-DD HH-MM")
-            const firstLine = data.split('\n')[0];
-            if (firstLine.startsWith('Created on ')) {
-                const timestampStr = firstLine.replace('Created on ', '');
-                setLastUpdated(timestampStr);
-            } else {
-                setLastUpdated();
-            }
-            
-            displayAssetResults(data);
-            generateAssetTable(data);
-        }).catch(error => {
-            console.error('Error fetching Asset results:', error);
-            document.getElementById('metinAlani-1').innerHTML = '<p style="color: red;">Error loading asset data: ' + error.message + '</p>';
-            setLastUpdated();
+            return {
+                device_name: assetText(row.device_name),
+                ip_address: assetText(row.ip_address),
+                mac_address: assetText(row.mac_address),
+                serial_number: assetText(row.serial_number),
+                role: assetText(row.role),
+                model: assetText(row.model),
+                release: assetText(row.release),
+                uptime: assetText(row.uptime),
+                status: assetText(row.status),
+                last_seen: assetText(row.last_seen),
+            };
         });
+        return { createdAt: assetText(payload.created_at), rows };
+    }
+
+    async function fetchAndDisplayAssetResults() {
+        try {
+            const response = await fetch('/assets-api', {
+                method: 'GET',
+                cache: 'no-store',
+                headers: {
+                    'Accept': 'application/json',
+                    'Cache-Control': 'no-cache'
+                }
+            });
+            let payload;
+            try {
+                payload = await response.json();
+            } catch (_) {
+                throw new Error(`Assets request returned invalid JSON (${response.status})`);
+            }
+            if (!response.ok || payload?.success !== true) {
+                throw new Error(assetText(payload?.error || payload?.message,
+                    `Assets request failed (${response.status})`));
+            }
+            const report = normalizeAssetReport(payload);
+            if (!setLastUpdated(report.createdAt)) {
+                throw new Error('Assets response contained an invalid collection timestamp');
+            }
+            generateAssetTable(report.rows);
+            return true;
+        } catch (error) {
+            console.error('Error fetching Asset results:', error);
+            setLastUpdated(null);
+            generateAssetTable([]);
+            updateAssetsNotification('failure', 'Assets Data Unavailable', error.message,
+                'No report data was treated as current.');
+            return false;
+        }
     }
     
-    function setLastUpdated(timestampFromFile) {
-        let dateToUse;
-        
-        if (timestampFromFile) {
-            // Parse "2025-08-05 04-22-30" format from assets.ini
-            const parts = timestampFromFile.trim().split(' ');
-            if (parts.length === 2) {
-                const datePart = parts[0]; // "2025-08-05"
-                const timePart = parts[1].replace(/-/g, ':'); // "04-22-30" -> "04:22:30"
-                dateToUse = new Date(datePart + 'T' + timePart);
-            } else {
-                // Fallback if format doesn't match
-                dateToUse = new Date();
-            }
-        } else {
-            // Fallback to current time if no timestamp available
-            dateToUse = new Date();
+    function setLastUpdated(createdAt) {
+        const target = document.getElementById('last-updated');
+        const match = typeof createdAt === 'string'
+            ? createdAt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/)
+            : null;
+        if (!match) {
+            target.textContent = 'Unavailable';
+            return false;
         }
-        
-        const options = { 
-            year: 'numeric', 
-            month: '2-digit', 
-            day: '2-digit', 
-            hour: '2-digit', 
+        const [, year, month, day, hour, minute, second] = match.map(Number);
+        const dateToUse = new Date(year, month - 1, day, hour, minute, second);
+        if (dateToUse.getFullYear() !== year || dateToUse.getMonth() !== month - 1 ||
+            dateToUse.getDate() !== day || dateToUse.getHours() !== hour ||
+            dateToUse.getMinutes() !== minute || dateToUse.getSeconds() !== second) {
+            target.textContent = 'Unavailable';
+            return false;
+        }
+        target.textContent = dateToUse.toLocaleString('en-US', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
             minute: '2-digit',
             second: '2-digit',
             hour12: false
-        };
-        const formattedDate = dateToUse.toLocaleString('en-US', options);
-        document.getElementById('last-updated').textContent = formattedDate;
-    }
-
-    function displayAssetResults(results) {
-        const element = document.getElementById('metinAlani-1');
-        element.innerHTML = '';
-        const lines = results.split('\n');
-        lines.forEach(line => {
-            let colorClass = 'green';
-            if (line.startsWith('DEVICE')) {
-                colorClass = 'steelBlue';
-            } else if (line.toLowerCase().includes('ssh-failed')) {
-                colorClass = 'yellow';
-            } else if (line.toLowerCase().includes('fail')) {
-                colorClass = 'tomato';
-            } else if (line.toLowerCase().includes('reated')) {
-                colorClass = 'tomato';
-            } else if (line.toLowerCase().includes('no-info')) {
-                colorClass = 'red';
-            }
-
-            const span = document.createElement('span');
-            span.className = colorClass;
-            span.textContent = line;
-
-            element.appendChild(span);
-            element.appendChild(document.createElement('br'));
         });
+        return true;
     }
 
-    function generateAssetTable(results) {
-        const lines = results.split('\n').filter(line => line.trim() !== '');
+    function classifyAssetStatus(rawStatus, _uptime = '') {
+        const status = assetText(rawStatus).trim();
+        switch (status.toUpperCase()) {
+            case 'OK':
+                return { displayStatus: 'SUCCESS', category: 'success',
+                    healthClass: 'assets-excellent', statusClass: 'status-success', rank: 4 };
+            case 'UNREACHABLE':
+                return { displayStatus: 'UNREACHABLE', category: 'failed',
+                    healthClass: 'assets-unreachable', statusClass: 'status-unreachable', rank: 0 };
+            case 'SSH-FAILED':
+                return { displayStatus: 'SSH FAILED', category: 'failed',
+                    healthClass: 'assets-critical', statusClass: 'status-ssh-failed', rank: 1 };
+            case 'NO-INFO':
+                return { displayStatus: 'NO INFO', category: 'no-info',
+                    healthClass: 'assets-unknown', statusClass: 'status-no-info', rank: 3 };
+            default:
+                return { displayStatus: 'WARNING', category: 'warning',
+                    healthClass: 'assets-warning', statusClass: 'status-warning', rank: 2 };
+        }
+    }
+
+    function appendAssetCell(row, value) {
+        const cell = document.createElement('td');
+        const text = value || 'N/A';
+        cell.textContent = text;
+        cell.dataset.csvValue = text;
+        row.appendChild(cell);
+        return cell;
+    }
+
+    let assetCardHandlersAdded = false;
+    let deviceSearchInitialized = false;
+
+    function generateAssetTable(rows) {
         const table = document.getElementById('assets-table');
         const tbody = table.querySelector('tbody');
-        
-        // Clear existing rows in tbody
-        tbody.innerHTML = '';
+        tbody.replaceChildren();
         
         let totalDevices = 0;
         let successCount = 0;
@@ -689,92 +723,54 @@
         let warningCount = 0;
         let noInfoCount = 0;
         
-        // Parse each line and create table rows
-        // New format: DEVICE-NAME IP ETH0-MAC SERIAL MODEL RELEASE UPTIME STATUS LAST-SEEN
-        lines.forEach(line => {
-            if (line.startsWith('DEVICE-NAME') || line.trim() === '') return;
-            if (line.startsWith('Created on')) return;
-            
-            // Parse the structured data - split by whitespace
-            const parts = line.trim().split(/\s+/);
-            if (parts.length < 7) return;
-            
-            const deviceName = parts[0];
-            const ipAddress = parts[1];
-            const macAddress = parts[2];
-            const serialNumber = parts[3];
-            const model = parts[4];
-            const release = parts[5];
-            const uptime = parts[6];
-            // STATUS is now a dedicated column (index 7)
-            const rawStatus = parts[7] || '';
-            // LAST-SEEN is the last column (index 8)
-            const lastSeen = parts[8] || '-';
-            
-            let displayStatus, healthClass, statusClass;
-            
-            // Map status from assets.ini to display status
-            const statusUpper = rawStatus.toUpperCase();
-            
-            if (statusUpper === 'OK') {
-                displayStatus = 'SUCCESS';
-                healthClass = 'assets-excellent';
-                statusClass = 'status-success';
-                successCount++;
-            } else if (statusUpper === 'UNREACHABLE') {
-                displayStatus = 'UNREACHABLE';
-                healthClass = 'assets-unreachable';
-                statusClass = 'status-unreachable';
-                warningCount++;
-            } else if (statusUpper === 'SSH-FAILED') {
-                displayStatus = 'SSH FAILED';
-                healthClass = 'assets-critical';
-                statusClass = 'status-ssh-failed';
-                failCount++;
-            } else if (statusUpper === 'NO-INFO') {
-                displayStatus = 'NO INFO';
-                healthClass = 'assets-unknown';
-                statusClass = 'status-no-info';
-                noInfoCount++;
-            } else if (statusUpper.includes('FAIL') || statusUpper.includes('ERROR')) {
-                displayStatus = 'FAILED';
-                healthClass = 'assets-critical';
-                statusClass = 'status-fail';
-                failCount++;
-            } else if (rawStatus && uptime && uptime.includes('up-')) {
-                displayStatus = 'SUCCESS';
-                healthClass = 'assets-excellent';
-                statusClass = 'status-success';
-                successCount++;
-            } else {
-                displayStatus = rawStatus || 'UNKNOWN';
-                healthClass = 'assets-warning';
-                statusClass = 'status-warning';
-                warningCount++;
-            }
-            
+        rows.forEach(asset => {
+            const deviceName = assetText(asset.device_name);
+            const ipAddress = assetText(asset.ip_address);
+            const macAddress = assetText(asset.mac_address);
+            const serialNumber = assetText(asset.serial_number);
+            const role = assetText(asset.role);
+            const model = assetText(asset.model);
+            const release = assetText(asset.release);
+            const uptime = assetText(asset.uptime);
+            const lastSeenDisplay = assetText(asset.last_seen, '-').replace(/_/g, ' ') || '-';
+            const classification = classifyAssetStatus(asset.status, uptime);
+            if (classification.category === 'success') successCount++;
+            else if (classification.category === 'failed') failCount++;
+            else if (classification.category === 'no-info') noInfoCount++;
+            else warningCount++;
             totalDevices++;
-            
-            // Format last seen for display
-            const lastSeenDisplay = lastSeen.replace(/_/g, ' ');
-            
-            // Look up role from devices.yaml
-            const role = deviceRoleMap[deviceName] || 'N/A';
 
             const row = document.createElement('tr');
-            row.setAttribute('data-health', healthClass);
-            row.innerHTML = `
-                <td><a href="device.html?device=${deviceName}" target="_blank" rel="noopener noreferrer" class="device-link">${deviceName}</a></td>
-                <td>${macAddress || 'N/A'}</td>
-                <td>${ipAddress || 'N/A'}</td>
-                <td>${serialNumber || 'N/A'}</td>
-                <td>${role}</td>
-                <td>${model || 'N/A'}</td>
-                <td>${release || 'N/A'}</td>
-                <td>${uptime || 'N/A'}</td>
-                <td><span class="${statusClass}">${displayStatus}</span></td>
-                <td>${lastSeenDisplay}</td>
-            `;
+            row.dataset.health = classification.healthClass;
+            row.dataset.canonicalDevice = deviceName;
+            row.dataset.statusCategory = classification.category;
+            row.dataset.statusRank = String(classification.rank);
+
+            const deviceCell = document.createElement('td');
+            deviceCell.dataset.csvValue = deviceName || 'N/A';
+            const deviceLink = document.createElement('a');
+            deviceLink.href = `device.html?device=${encodeURIComponent(deviceName)}`;
+            deviceLink.target = '_blank';
+            deviceLink.rel = 'noopener noreferrer';
+            deviceLink.className = 'device-link';
+            deviceLink.textContent = deviceName || 'N/A';
+            deviceCell.appendChild(deviceLink);
+            row.appendChild(deviceCell);
+            appendAssetCell(row, macAddress);
+            appendAssetCell(row, ipAddress);
+            appendAssetCell(row, serialNumber);
+            appendAssetCell(row, role);
+            appendAssetCell(row, model);
+            appendAssetCell(row, release);
+            appendAssetCell(row, uptime);
+            const statusCell = document.createElement('td');
+            statusCell.dataset.csvValue = classification.displayStatus;
+            const statusBadge = document.createElement('span');
+            statusBadge.className = classification.statusClass;
+            statusBadge.textContent = classification.displayStatus;
+            statusCell.appendChild(statusBadge);
+            row.appendChild(statusCell);
+            appendAssetCell(row, lastSeenDisplay);
             tbody.appendChild(row);
         });
         
@@ -786,14 +782,20 @@
         document.getElementById('no-info-count').textContent = noInfoCount;
         
         // Add click handlers to cards for filtering
-        addCardClickHandlers();
+        if (!assetCardHandlersAdded) {
+            addCardClickHandlers();
+            assetCardHandlersAdded = true;
+        }
         
         // Sort table by health (problems first)
         sortTableByHealth();
         
         // Initialize device search after table is populated
         populateDeviceList();
-        initDeviceSearch();
+        if (!deviceSearchInitialized) {
+            initDeviceSearch();
+            deviceSearchInitialized = true;
+        }
     }
     
     function sortTableByHealth() {
@@ -805,19 +807,14 @@
             const aStatus = a.cells[8].textContent.trim(); // Status is column 8 (9th column)
             const bStatus = b.cells[8].textContent.trim();
             
-            const priority = {
-                'FAILED': 0,
-                'SSH FAILED': 1,
-                'WARNING': 2,
-                'NO INFO': 3,
-                'SUCCESS': 4
-            };
-            
-            return (priority[aStatus] || 4) - (priority[bStatus] || 4);
+            const aRank = Number.parseInt(a.dataset.statusRank, 10);
+            const bRank = Number.parseInt(b.dataset.statusRank, 10);
+            return (Number.isFinite(aRank) ? aRank : statusPriority(aStatus)) -
+                (Number.isFinite(bRank) ? bRank : statusPriority(bStatus));
         });
         
         // Clear tbody and add sorted rows back
-        tbody.innerHTML = '';
+        tbody.replaceChildren();
         rows.forEach(row => tbody.appendChild(row));
     }
 
@@ -886,16 +883,22 @@
         });
         
         // Clear tbody and add sorted rows back
-        tbody.innerHTML = '';
+        tbody.replaceChildren();
         rows.forEach(row => tbody.appendChild(row));
     }
     
     function compareIP(a, b) {
-        if (a === 'N/A') return 1;
-        if (b === 'N/A') return -1;
-        
-        const aNum = a.split('.').map(num => parseInt(num, 10));
-        const bNum = b.split('.').map(num => parseInt(num, 10));
+        const parseIP = value => {
+            const parts = String(value).split('.');
+            if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part))) return null;
+            const octets = parts.map(part => Number(part));
+            return octets.every(octet => octet >= 0 && octet <= 255) ? octets : null;
+        };
+        const aNum = parseIP(a);
+        const bNum = parseIP(b);
+        if (!aNum && !bNum) return String(a).localeCompare(String(b));
+        if (!aNum) return 1;
+        if (!bNum) return -1;
         
         for (let i = 0; i < 4; i++) {
             if (aNum[i] !== bNum[i]) {
@@ -906,37 +909,43 @@
     }
     
     function compareUptime(a, b) {
-        if (a === 'N/A') return 1;
-        if (b === 'N/A') return -1;
-        
-        // Convert uptime to minutes for comparison
-        const getUptimeMinutes = (uptime) => {
+        const getUptimeMinutes = uptime => {
             let minutes = 0;
-            const weekMatch = uptime.match(/(\d+).*week/);
-            const dayMatch = uptime.match(/(\d+).*day/);
-            const hourMatch = uptime.match(/(\d+).*hour/);
-            const minuteMatch = uptime.match(/(\d+).*minute/);
-            
-            if (weekMatch) minutes += parseInt(weekMatch[1]) * 7 * 24 * 60;
-            if (dayMatch) minutes += parseInt(dayMatch[1]) * 24 * 60;
-            if (hourMatch) minutes += parseInt(hourMatch[1]) * 60;
-            if (minuteMatch) minutes += parseInt(minuteMatch[1]);
-            
-            return minutes;
+            let matched = false;
+            const matcher = /(\d+)[\s_-]*(weeks?|days?|hours?|minutes?)/gi;
+            for (const match of String(uptime).matchAll(matcher)) {
+                matched = true;
+                const amount = Number(match[1]);
+                const unit = match[2].toLowerCase();
+                if (unit.startsWith('week')) minutes += amount * 7 * 24 * 60;
+                else if (unit.startsWith('day')) minutes += amount * 24 * 60;
+                else if (unit.startsWith('hour')) minutes += amount * 60;
+                else minutes += amount;
+            }
+            return matched ? minutes : null;
         };
-        
-        return getUptimeMinutes(a) - getUptimeMinutes(b);
+        const aMinutes = getUptimeMinutes(a);
+        const bMinutes = getUptimeMinutes(b);
+        if (aMinutes === null && bMinutes === null) return String(a).localeCompare(String(b));
+        if (aMinutes === null) return 1;
+        if (bMinutes === null) return -1;
+        return aMinutes - bMinutes;
     }
-    
-    function compareStatus(a, b) {
+
+    function statusPriority(status) {
         const priority = {
             'FAILED': 0,
-            'WARNING': 1,
-            'NO INFO': 2,
-            'SUCCESS': 3
+            'UNREACHABLE': 0,
+            'SSH FAILED': 1,
+            'WARNING': 2,
+            'NO INFO': 3,
+            'SUCCESS': 4
         };
-        
-        return (priority[a] || 4) - (priority[b] || 4);
+        return priority[String(status).trim().toUpperCase()] ?? 2;
+    }
+
+    function compareStatus(a, b) {
+        return statusPriority(a) - statusPriority(b);
     }
     // Refresh Assets Function.  Elapsed time is never considered completion;
     // only the status belonging to the opaque token returned by this request
@@ -1190,75 +1199,50 @@
         if (/^[a-f0-9]{32}$/.test(pendingToken)) trackAssetsJob(pendingToken);
     });
 
+    function canonicalAssetCellText(cell) {
+        if (!cell) return '';
+        if (cell.dataset?.csvValue !== undefined) return cell.dataset.csvValue;
+        if (window.LLDPqP2P && typeof window.LLDPqP2P.canonicalText === 'function') {
+            return window.LLDPqP2P.canonicalText(cell).trim();
+        }
+        return cell.textContent.trim();
+    }
+
+    function escapeCSVField(value) {
+        const rawField = String(value ?? '');
+        // Spreadsheet programs can execute cells beginning with these
+        // characters as formulas. Preserve the text while forcing literal
+        // interpretation in exported CSV files.
+        const field = /^[\u0000-\u0020]*[=+\-@]/.test(rawField)
+            ? `'${rawField}`
+            : rawField;
+        return /[",\r\n]/.test(field) ? `"${field.replace(/"/g, '""')}"` : field;
+    }
+
+    function buildAssetCSV() {
+        const headers = [
+            'Device Name', 'MAC Address', 'IP Address', 'Serial Number', 'Role',
+            'Model', 'Release', 'Uptime', 'Status', 'Last Seen'
+        ];
+        const records = [headers];
+        const tbody = document.getElementById('assets-table').querySelector('tbody');
+        tbody.querySelectorAll('tr').forEach(row => {
+            if (row.style.display === 'none' || row.cells.length < headers.length) return;
+            records.push(Array.from(row.cells, (cell, index) => index === 0
+                ? (row.dataset.canonicalDevice || canonicalAssetCellText(cell))
+                : canonicalAssetCellText(cell)));
+        });
+        return records.map(record => record.map(escapeCSVField).join(',')).join('\r\n') + '\r\n';
+    }
+
     // CSV Download Function
     function downloadCSV() {
         try {
-            // Get current date for filename
             const now = new Date();
-            const dateStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
-            const timeStr = now.toTimeString().slice(0, 5).replace(':', '-'); // HH-MM
+            const dateStr = now.toISOString().slice(0, 10);
+            const timeStr = now.toTimeString().slice(0, 5).replace(':', '-');
             const filename = `Asset_Analysis_Report_${dateStr}_${timeStr}.csv`;
-            
-            // Create CSV header
-            const headers = [
-                'Device Name',
-                'MAC Address',
-                'IP Address', 
-                'Serial Number',
-                'Role',
-                'Model',
-                'Release',
-                'Uptime',
-                'Status'
-            ];
-            
-            let csvContent = headers.join(',') + '\n';
-            
-            // Get table data (only visible rows)
-            const table = document.getElementById('assets-table');
-            const tbody = table.querySelector('tbody');
-            const rows = tbody.querySelectorAll('tr');
-            
-            // Add summary stats as comments
-            csvContent += `# Asset Analysis Summary Report\n`;
-            csvContent += `# Generated: ${now.toLocaleString()}\n`;
-            csvContent += `# Total Devices: ${document.getElementById('total-devices').textContent}\n`;
-            csvContent += `# Successful: ${document.getElementById('success-count').textContent}\n`;
-            csvContent += `# Failed: ${document.getElementById('fail-count').textContent}\n`;
-            csvContent += `# Warnings: ${document.getElementById('warning-count').textContent}\n`;
-            csvContent += `# No Information: ${document.getElementById('no-info-count').textContent}\n`;
-            csvContent += `#\n`;
-            
-            // Process each visible row
-            rows.forEach(row => {
-                if (row.style.display !== 'none') {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length >= 9) {
-                        const rowData = [
-                            cells[0].textContent.trim(), // Device Name
-                            cells[1].textContent.trim(), // MAC Address
-                            cells[2].textContent.trim(), // IP Address
-                            cells[3].textContent.trim(), // Serial Number
-                            cells[4].textContent.trim(), // Role
-                            cells[5].textContent.trim(), // Model
-                            cells[6].textContent.trim(), // Release
-                            cells[7].textContent.trim(), // Uptime
-                            cells[8].textContent.trim()  // Status
-                        ];
-                        
-                        // Escape commas and quotes in data
-                        const escapedData = rowData.map(field => {
-                            if (field.includes(',') || field.includes('"') || field.includes('\n')) {
-                                return '"' + field.replace(/"/g, '""') + '"';
-                            }
-                            return field;
-                        });
-                        
-                        csvContent += escapedData.join(',') + '\n';
-                    }
-                }
-            });
-            
+            const csvContent = buildAssetCSV();
             // Create and trigger download
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement('a');
@@ -1308,8 +1292,7 @@
         document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active-filter'));
         
         rows.forEach(row => {
-            const statusCell = row.cells[8]; // Status is column 8
-            const statusText = statusCell.querySelector('span')?.textContent || statusCell.textContent;
+            const statusCategory = row.dataset.statusCategory || 'warning';
             let shouldShow = true;
             
             switch(filterType) {
@@ -1318,19 +1301,19 @@
                     document.querySelector('.card-total').classList.add('active-filter');
                     break;
                 case 'success':
-                    shouldShow = statusText === 'SUCCESS';
+                    shouldShow = statusCategory === 'success';
                     document.querySelector('.card-excellent').classList.add('active-filter');
                     break;
                 case 'failed':
-                    shouldShow = statusText === 'FAILED' || statusText === 'SSH FAILED';
+                    shouldShow = statusCategory === 'failed';
                     document.querySelector('.card-critical').classList.add('active-filter');
                     break;
                 case 'warning':
-                    shouldShow = statusText === 'WARNING' || statusText === 'UNREACHABLE';
+                    shouldShow = statusCategory === 'warning';
                     document.querySelector('.card-warning').classList.add('active-filter');
                     break;
                 case 'no-info':
-                    shouldShow = statusText === 'NO INFO';
+                    shouldShow = statusCategory === 'no-info';
                     document.querySelector('.card-info').classList.add('active-filter');
                     break;
             }
@@ -1388,7 +1371,7 @@
         const rows = tbody.querySelectorAll('tr');
         
         rows.forEach(row => {
-            const deviceName = row.cells[0]?.textContent?.trim();
+            const deviceName = row.dataset.canonicalDevice || row.cells[0]?.textContent?.trim();
             if (deviceName) deviceSet.add(deviceName);
         });
         
@@ -1401,7 +1384,10 @@
         
         // Clear existing options and populate
         const select = document.getElementById('deviceSearch');
-        select.innerHTML = '<option value="">Search Device...</option>';
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Search Device...';
+        select.replaceChildren(placeholder);
         
         sortedDevices.forEach(device => {
             const option = document.createElement('option');
@@ -1433,7 +1419,7 @@
         let matchCount = 0;
         
         rows.forEach(row => {
-            const rowDeviceName = row.cells[0]?.textContent?.trim();
+            const rowDeviceName = row.dataset.canonicalDevice || row.cells[0]?.textContent?.trim();
             if (rowDeviceName === deviceName) {
                 row.style.display = '';
                 matchCount++;
@@ -1472,43 +1458,64 @@
 
     // ===== Devices Editor Functions =====
     let devicesEditor = null;
-    
-    function openDevicesEditor() {
-        document.getElementById('devicesEditorModal').style.display = 'flex';
-        document.getElementById('devicesEditorStatus').textContent = 'Loading...';
-        
-        fetch('/edit-devices')
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    // Initialize CodeMirror if not already done
-                    if (!devicesEditor) {
-                        devicesEditor = CodeMirror(document.getElementById('devicesEditorContainer'), {
-                            value: data.content,
-                            mode: 'yaml',
-                            theme: 'material-darker',
-                            lineNumbers: true,
-                            lineWrapping: true,
-                            tabSize: 2,
-                            indentWithTabs: false,
-                            autofocus: true
-                        });
-                        devicesEditor.setSize('100%', '100%');
-                    } else {
-                        devicesEditor.setValue(data.content);
-                    }
-                    document.getElementById('devicesEditorStatus').textContent = 'Loaded successfully. Edit and save.';
-                } else {
-                    document.getElementById('devicesEditorStatus').textContent = 'Error: ' + data.error;
-                }
-            })
-            .catch(err => {
-                document.getElementById('devicesEditorStatus').textContent = 'Error loading: ' + err.message;
-            });
+    let devicesEditorRevision = '';
+    let devicesEditorSaving = false;
+    let devicesEditorLoadGeneration = 0;
+
+    function setDevicesEditorActionsEnabled(enabled) {
+        const active = Boolean(enabled) && !devicesEditorSaving && Boolean(devicesEditorRevision);
+        document.getElementById('devicesSaveBtn').disabled = !active;
+        document.getElementById('devicesSaveRunBtn').disabled = !active;
     }
 
-    function closeDevicesEditorModal() {
+    async function openDevicesEditor() {
+        if (devicesEditorSaving) return false;
+        devicesEditorLoadGeneration += 1;
+        const generation = devicesEditorLoadGeneration;
+        devicesEditorRevision = '';
+        setDevicesEditorActionsEnabled(false);
+        document.getElementById('devicesEditorModal').style.display = 'flex';
+        document.getElementById('devicesEditorStatus').textContent = 'Loading...';
+        try {
+            const response = await fetch('/edit-devices', { cache: 'no-store' });
+            const data = await response.json();
+            if (generation !== devicesEditorLoadGeneration) return false;
+            if (!response.ok || !data.success || !/^[a-f0-9]{64}$/.test(data.revision || '')) {
+                throw new Error(assetText(data.error, 'Invalid devices.yaml response'));
+            }
+            if (!devicesEditor) {
+                devicesEditor = CodeMirror(document.getElementById('devicesEditorContainer'), {
+                    value: assetText(data.content),
+                    mode: 'yaml',
+                    theme: 'material-darker',
+                    lineNumbers: true,
+                    lineWrapping: true,
+                    tabSize: 2,
+                    indentWithTabs: false,
+                    autofocus: true
+                });
+                devicesEditor.setSize('100%', '100%');
+            } else {
+                devicesEditor.setValue(assetText(data.content));
+            }
+            devicesEditorRevision = data.revision;
+            document.getElementById('devicesEditorStatus').textContent = 'Loaded successfully. Edit and save.';
+            setDevicesEditorActionsEnabled(true);
+            return true;
+        } catch (err) {
+            if (generation !== devicesEditorLoadGeneration) return false;
+            devicesEditorRevision = '';
+            setDevicesEditorActionsEnabled(false);
+            document.getElementById('devicesEditorStatus').textContent = 'Error loading: ' + err.message;
+            return false;
+        }
+    }
+
+    function closeDevicesEditorModal(force = false) {
+        if (devicesEditorSaving && !force) return false;
+        devicesEditorLoadGeneration += 1;
         document.getElementById('devicesEditorModal').style.display = 'none';
+        return true;
     }
 
     function closeDevicesEditor(event) {
@@ -1517,57 +1524,54 @@
         }
     }
 
-    function saveDevices() {
+    async function persistDevices(runAfterSave) {
+        if (!devicesEditor || !devicesEditorRevision || devicesEditorSaving) return false;
         const content = devicesEditor ? devicesEditor.getValue() : '';
+        const expectedRevision = devicesEditorRevision;
+        devicesEditorSaving = true;
+        setDevicesEditorActionsEnabled(false);
         document.getElementById('devicesEditorStatus').textContent = 'Saving...';
-        
-        fetch('/edit-devices', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content })
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                document.getElementById('devicesEditorStatus').textContent = '✓ Saved successfully!';
-                document.getElementById('devicesEditorStatus').style.color = '#76b900';
-                setTimeout(() => {
-                    document.getElementById('devicesEditorStatus').style.color = '#888';
-                }, 3000);
-            } else {
-                document.getElementById('devicesEditorStatus').textContent = 'Error: ' + data.error;
-                document.getElementById('devicesEditorStatus').style.color = '#ff6b6b';
+        const status = document.getElementById('devicesEditorStatus');
+        try {
+            const response = await fetch('/edit-devices', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content, expected_revision: expectedRevision })
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success || !/^[a-f0-9]{64}$/.test(data.revision || '')) {
+                if (data.conflict) devicesEditorRevision = '';
+                throw new Error(assetText(data.error, 'Save failed'));
             }
-        })
-        .catch(err => {
-            document.getElementById('devicesEditorStatus').textContent = 'Error: ' + err.message;
-            document.getElementById('devicesEditorStatus').style.color = '#ff6b6b';
-        });
+            devicesEditorRevision = data.revision;
+            status.style.color = '#76b900';
+            if (runAfterSave) {
+                status.textContent = '✓ Saved! Refreshing Assets...';
+                closeDevicesEditorModal(true);
+                refreshAssets();
+            } else {
+                status.textContent = '✓ Saved successfully!';
+                setTimeout(() => {
+                    status.style.color = '#888';
+                }, 3000);
+            }
+            return true;
+        } catch (err) {
+            status.textContent = 'Error: ' + err.message;
+            status.style.color = '#ff6b6b';
+            return false;
+        } finally {
+            devicesEditorSaving = false;
+            setDevicesEditorActionsEnabled(true);
+        }
+    }
+
+    function saveDevices() {
+        return persistDevices(false);
     }
 
     function saveDevicesAndRun() {
-        const content = devicesEditor ? devicesEditor.getValue() : '';
-        document.getElementById('devicesEditorStatus').textContent = 'Saving...';
-        
-        fetch('/edit-devices', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: content })
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                document.getElementById('devicesEditorStatus').textContent = '✓ Saved! Refreshing Assets...';
-                closeDevicesEditorModal();
-                refreshAssets();
-            } else {
-                document.getElementById('devicesEditorStatus').textContent = 'Error: ' + data.error;
-                document.getElementById('devicesEditorStatus').style.color = '#ff6b6b';
-            }
-        })
-        .catch(err => {
-            document.getElementById('devicesEditorStatus').textContent = 'Error: ' + err.message;
-        });
+        return persistDevices(true);
     }
 </script>
 
@@ -1616,7 +1620,7 @@
                 <div style="position: relative;">
                     <input type="password" id="sshPassword" placeholder="Enter device password" oninput="checkPasswordInput()" autocomplete="off"
                         style="width: 100%; padding: 10px 40px 10px 12px; background: #1a1a1a; border: 1px solid #555; border-radius: 4px; color: #fff; font-size: 14px; box-sizing: border-box;">
-                    <button onclick="togglePasswordVisibility('sshPassword', this)" style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #888; cursor: pointer; padding: 4px;" title="Show/Hide"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
+                    <button id="sshPasswordToggle" onclick="togglePasswordVisibility('sshPassword', this)" style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #888; cursor: pointer; padding: 4px;" title="Show/Hide"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
                 </div>
             </div>
             <div style="display: flex; gap: 10px; align-items: center;">
@@ -1652,12 +1656,23 @@
 <script>
 // ─── SSH Setup Modal ───
 let sshSetupFailedDevices = [];
+let sshSetupGeneration = 0;
+let sshSetupInFlight = false;
+let sshSetupAbortController = null;
+
+function resetSSHPasswordState() {
+    const input = document.getElementById('sshPassword');
+    const toggle = document.getElementById('sshPasswordToggle');
+    input.value = '';
+    input.type = 'password';
+    if (toggle) toggle.style.color = '#888';
+}
 
 function checkPasswordInput() {
     const pw = document.getElementById('sshPassword').value;
     const btn = document.getElementById('sshRunBtn');
     const hasKey = document.getElementById('sshKeyStatus').dataset.hasKey === 'true';
-    if (pw && hasKey) {
+    if (pw && hasKey && !sshSetupInFlight) {
         btn.disabled = false;
         btn.style.opacity = '1';
     } else {
@@ -1667,18 +1682,25 @@ function checkPasswordInput() {
 }
 
 async function openSSHSetupModal() {
+    if (sshSetupInFlight) return false;
+    sshSetupGeneration += 1;
+    const generation = sshSetupGeneration;
+    sshSetupInFlight = false;
+    if (sshSetupAbortController) sshSetupAbortController.abort();
+    sshSetupAbortController = new AbortController();
     const modal = document.getElementById('sshSetupModal');
     modal.style.display = 'flex';
     // Reset state
-    document.getElementById('sshPassword').value = '';
+    resetSSHPasswordState();
     document.getElementById('sshRunBtn').disabled = true;
     document.getElementById('sshRunBtn').style.opacity = '0.5';
     document.getElementById('sshRunBtn').textContent = 'Run Setup';
     document.getElementById('sshRetryBtn').style.display = 'none';
     document.getElementById('sshProgress').textContent = '';
     document.getElementById('sshResultsArea').style.display = 'none';
-    document.getElementById('sshResultsBody').innerHTML = '';
+    document.getElementById('sshResultsBody').replaceChildren();
     document.getElementById('sshSummary').style.display = 'none';
+    document.getElementById('sshSummary').replaceChildren();
     sshSetupFailedDevices = [];
     
     // Check for existing SSH key
@@ -1687,24 +1709,59 @@ async function openSSHSetupModal() {
     status.dataset.hasKey = 'false';
     
     try {
-        const resp = await fetch('/provision-api.sh?action=get-ssh-key');
+        const resp = await fetch('/provision-api.sh?action=get-ssh-key', {
+            signal: sshSetupAbortController.signal
+        });
         const data = await resp.json();
+        if (generation !== sshSetupGeneration) return;
+        status.replaceChildren();
         if (data.success && data.public_key) {
-            status.innerHTML = `<span style="color: #4caf50;">&#10004; Key found:</span> ${data.key_type} <span style="color: #666; font-family: monospace; font-size: 11px;">(${data.key_file})</span>`;
+            const label = document.createElement('span');
+            label.style.color = '#4caf50';
+            label.textContent = '✔ Key found:';
+            const keyFile = document.createElement('span');
+            keyFile.style.cssText = 'color: #666; font-family: monospace; font-size: 11px;';
+            keyFile.textContent = `(${assetText(data.key_file)})`;
+            status.append(label, document.createTextNode(` ${assetText(data.key_type)} `), keyFile);
             status.dataset.hasKey = 'true';
         } else {
-            status.innerHTML = '<span style="color: #f44336;">&#10008; No SSH key found.</span> Go to <strong>Provision → ZTP Script</strong> tab to generate a key first.';
+            const label = document.createElement('span');
+            label.style.color = '#f44336';
+            label.textContent = '✘ No SSH key found.';
+            const destination = document.createElement('strong');
+            destination.textContent = 'Provision → ZTP Script';
+            status.append(label, document.createTextNode(' Go to '), destination,
+                document.createTextNode(' tab to generate a key first.'));
             status.dataset.hasKey = 'false';
         }
     } catch (e) {
-        status.innerHTML = '<span style="color: #ff9800;">Could not check key status</span>';
+        if (generation !== sshSetupGeneration || e.name === 'AbortError') return;
+        const warning = document.createElement('span');
+        warning.style.color = '#ff9800';
+        warning.textContent = 'Could not check key status';
+        status.replaceChildren(warning);
         status.dataset.hasKey = 'true'; // Allow anyway
     }
-    checkPasswordInput();
+    if (generation === sshSetupGeneration) checkPasswordInput();
 }
 
 function closeSSHSetupModal() {
+    // Aborting fetch only closes the browser connection; the server-side
+    // mass SSH operation may continue. Keep the modal locked until its result
+    // arrives so a second overlapping run cannot be started accidentally.
+    if (sshSetupInFlight) return false;
+    sshSetupGeneration += 1;
+    sshSetupInFlight = false;
+    if (sshSetupAbortController) sshSetupAbortController.abort();
+    sshSetupAbortController = null;
     document.getElementById('sshSetupModal').style.display = 'none';
+    resetSSHPasswordState();
+    document.getElementById('sshRunBtn').disabled = true;
+    document.getElementById('sshRunBtn').style.opacity = '0.5';
+    document.getElementById('sshRunBtn').textContent = 'Run Setup';
+    document.getElementById('sshRetryBtn').style.display = 'none';
+    document.getElementById('sshProgress').textContent = '';
+    return true;
 }
 
 function togglePasswordVisibility(inputId, btn) {
@@ -1719,11 +1776,17 @@ function togglePasswordVisibility(inputId, btn) {
 }
 
 function statusIcon(status) {
-    if (status === 'ok') return '<span style="color: #4caf50;" title="Success">&#10004;</span>';
-    if (status === 'already') return '<span style="color: #4fc3f7;" title="Already configured">&#10004;</span>';
-    if (status === 'fail') return '<span style="color: #f44336;" title="Failed">&#10008;</span>';
-    if (status === 'skipped') return '<span style="color: #888;" title="Skipped">&#8212;</span>';
-    return '<span style="color: #888;">?</span>';
+    const icon = document.createElement('span');
+    const settings = {
+        ok: ['#4caf50', 'Success', '✔'],
+        already: ['#4fc3f7', 'Already configured', '✔'],
+        fail: ['#f44336', 'Failed', '✘'],
+        skipped: ['#888', 'Skipped', '—']
+    }[status] || ['#888', '', '?'];
+    icon.style.color = settings[0];
+    if (settings[1]) icon.title = settings[1];
+    icon.textContent = settings[2];
+    return icon;
 }
 
 function statusColor(status) {
@@ -1732,9 +1795,99 @@ function statusColor(status) {
     return '#888';
 }
 
+function appendSSHResultCell(row, text, style) {
+    const cell = document.createElement('td');
+    cell.style.cssText = style;
+    cell.textContent = assetText(text);
+    row.appendChild(cell);
+    return cell;
+}
+
+function appendSSHStatusCell(row, status, message) {
+    const cell = document.createElement('td');
+    cell.style.cssText = 'padding: 8px 12px; border-bottom: 1px solid #333;';
+    const safeMessage = assetText(message, assetText(status));
+    cell.title = safeMessage;
+    const text = document.createElement('span');
+    text.style.color = statusColor(status);
+    text.style.fontSize = '12px';
+    text.textContent = safeMessage;
+    cell.append(statusIcon(status), document.createTextNode(' '), text);
+    row.appendChild(cell);
+}
+
+function renderSSHSetupResults(data, retryDevices = null) {
+    const tbody = document.getElementById('sshResultsBody');
+    if (!retryDevices) {
+        tbody.replaceChildren();
+    } else {
+        const retrySet = new Set(retryDevices.map(String));
+        Array.from(tbody.rows).forEach(row => {
+            if (retrySet.has(row.dataset.ip || '')) row.remove();
+        });
+    }
+    sshSetupFailedDevices = [];
+    const results = Array.isArray(data.results) ? data.results : [];
+    results.forEach(result => {
+        const hostname = assetText(result?.hostname);
+        const ip = assetText(result?.ip);
+        const sendKey = assetText(result?.send_key);
+        const sudoFix = assetText(result?.sudo_fix);
+        const row = document.createElement('tr');
+        row.dataset.ip = ip;
+        const isFailed = sendKey === 'fail' || sudoFix === 'fail';
+        if (isFailed) {
+            sshSetupFailedDevices.push(ip);
+            row.style.background = 'rgba(244, 67, 54, 0.08)';
+        }
+        appendSSHResultCell(row, hostname,
+            'padding: 8px 12px; border-bottom: 1px solid #333; color: #ddd;');
+        appendSSHResultCell(row, ip,
+            'padding: 8px 12px; border-bottom: 1px solid #333; color: #999; font-family: monospace; font-size: 12px;');
+        appendSSHStatusCell(row, sendKey, result?.send_key_msg);
+        appendSSHStatusCell(row, sudoFix, result?.sudo_fix_msg);
+        tbody.appendChild(row);
+    });
+    document.getElementById('sshResultsArea').style.display = 'block';
+
+    const summary = document.getElementById('sshSummary');
+    const label = document.createElement('strong');
+    label.textContent = 'Results:';
+    const sendCount = document.createElement('span');
+    sendCount.style.color = '#4caf50';
+    sendCount.textContent = `${assetText(data.send_key_ok, '0')}/${assetText(data.total, '0')}`;
+    const sudoCount = document.createElement('span');
+    sudoCount.style.color = '#4caf50';
+    sudoCount.textContent = `${assetText(data.sudo_fix_ok, '0')}/${assetText(data.total, '0')}`;
+    summary.replaceChildren(label, document.createTextNode(' Send Key: '), sendCount,
+        document.createTextNode(' | Sudo Fix: '), sudoCount);
+    if (sshSetupFailedDevices.length > 0) {
+        const failed = document.createElement('span');
+        failed.style.color = '#f44336';
+        failed.textContent = `${sshSetupFailedDevices.length} failed`;
+        summary.append(document.createTextNode(' | '), failed);
+        document.getElementById('sshRetryBtn').style.display = 'inline-block';
+    }
+    summary.style.display = 'block';
+}
+
+function finishSSHSetupControls() {
+    document.getElementById('sshProgress').textContent = '';
+    const btn = document.getElementById('sshRunBtn');
+    btn.textContent = 'Run Setup';
+    btn.disabled = false;
+    btn.style.opacity = '1';
+}
+
 async function runSSHSetup(retryDevices = null) {
+    if (sshSetupInFlight) return false;
     const password = document.getElementById('sshPassword').value;
-    if (!password) return;
+    if (!password) return false;
+    sshSetupInFlight = true;
+    sshSetupGeneration += 1;
+    const generation = sshSetupGeneration;
+    if (sshSetupAbortController) sshSetupAbortController.abort();
+    sshSetupAbortController = new AbortController();
     
     const btn = document.getElementById('sshRunBtn');
     const retryBtn = document.getElementById('sshRetryBtn');
@@ -1748,8 +1901,9 @@ async function runSSHSetup(retryDevices = null) {
     
     if (!retryDevices) {
         document.getElementById('sshResultsArea').style.display = 'none';
-        document.getElementById('sshResultsBody').innerHTML = '';
+        document.getElementById('sshResultsBody').replaceChildren();
         document.getElementById('sshSummary').style.display = 'none';
+        document.getElementById('sshSummary').replaceChildren();
     }
     
     try {
@@ -1761,76 +1915,40 @@ async function runSSHSetup(retryDevices = null) {
         const response = await fetch('/setup-api.sh', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+            body: JSON.stringify(body),
+            signal: sshSetupAbortController.signal
         });
         
         const data = await response.json();
-        
-        if (!data.success) {
-            progress.textContent = '';
-            btn.textContent = 'Run Setup';
-            btn.disabled = false;
-            btn.style.opacity = '1';
-            alert('Error: ' + (data.error || 'Unknown error'));
-            return;
+        if (generation !== sshSetupGeneration) return false;
+        if (!response.ok || !data.success) {
+            throw new Error(assetText(data.error, `Setup request failed (${response.status})`));
         }
-        
-        const tbody = document.getElementById('sshResultsBody');
-        if (!retryDevices) tbody.innerHTML = '';
-        
-        sshSetupFailedDevices = [];
-        
-        if (retryDevices) {
-            retryDevices.forEach(ip => {
-                const oldRow = document.querySelector(`tr[data-ip="${ip}"]`);
-                if (oldRow) oldRow.remove();
-            });
-        }
-        
-        data.results.forEach(r => {
-            const row = document.createElement('tr');
-            row.setAttribute('data-ip', r.ip);
-            const isFailed = r.send_key === 'fail' || r.sudo_fix === 'fail';
-            if (isFailed) {
-                sshSetupFailedDevices.push(r.ip);
-                row.style.background = 'rgba(244, 67, 54, 0.08)';
-            }
-            row.innerHTML = `
-                <td style="padding: 8px 12px; border-bottom: 1px solid #333; color: #ddd;">${r.hostname}</td>
-                <td style="padding: 8px 12px; border-bottom: 1px solid #333; color: #999; font-family: monospace; font-size: 12px;">${r.ip}</td>
-                <td style="padding: 8px 12px; border-bottom: 1px solid #333;" title="${r.send_key_msg || ''}">${statusIcon(r.send_key)} <span style="color: ${statusColor(r.send_key)}; font-size: 12px;">${r.send_key_msg || r.send_key}</span></td>
-                <td style="padding: 8px 12px; border-bottom: 1px solid #333;" title="${r.sudo_fix_msg || ''}">${statusIcon(r.sudo_fix)} <span style="color: ${statusColor(r.sudo_fix)}; font-size: 12px;">${r.sudo_fix_msg || r.sudo_fix}</span></td>
-            `;
-            tbody.appendChild(row);
-        });
-        
-        document.getElementById('sshResultsArea').style.display = 'block';
-        
-        const summary = document.getElementById('sshSummary');
-        summary.innerHTML = `<strong>Results:</strong> Send Key: <span style="color: #4caf50;">${data.send_key_ok}/${data.total}</span> | Sudo Fix: <span style="color: #4caf50;">${data.sudo_fix_ok}/${data.total}</span>`;
-        if (sshSetupFailedDevices.length > 0) {
-            summary.innerHTML += ` | <span style="color: #f44336;">${sshSetupFailedDevices.length} failed</span>`;
-            retryBtn.style.display = 'inline-block';
-        }
-        summary.style.display = 'block';
-        
-        progress.textContent = '';
-        btn.textContent = 'Run Setup';
-        btn.disabled = false;
-        btn.style.opacity = '1';
-        
+        renderSSHSetupResults(data, retryDevices);
+        finishSSHSetupControls();
+        return true;
     } catch (err) {
-        progress.textContent = '';
-        btn.textContent = 'Run Setup';
-        btn.disabled = false;
-        btn.style.opacity = '1';
+        if (generation !== sshSetupGeneration || err.name === 'AbortError') return false;
+        finishSSHSetupControls();
         alert('Request failed: ' + err.message);
+        return false;
+    } finally {
+        if (generation === sshSetupGeneration) {
+            sshSetupInFlight = false;
+            sshSetupAbortController = null;
+            resetSSHPasswordState();
+            checkPasswordInput();
+        }
     }
 }
 
 function retrySSHSetup() {
     if (sshSetupFailedDevices.length === 0) return;
-    runSSHSetup(sshSetupFailedDevices);
+    if (!document.getElementById('sshPassword').value) {
+        alert('Enter the password again before retrying failed devices.');
+        return;
+    }
+    runSSHSetup([...sshSetupFailedDevices]);
 }
 </script>
 
@@ -1851,8 +1969,8 @@ function retrySSHSetup() {
                 <span id="devicesEditorStatus" style="color: #888; font-size: 12px;"></span>
                 <div>
                     <button onclick="closeDevicesEditorModal()" style="background: #555; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">Cancel</button>
-                    <button onclick="saveDevices()" style="background: #607d8b; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">Save</button>
-                    <button onclick="saveDevicesAndRun()" style="background: #76b900; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;">Save & Run LLDPq</button>
+                    <button id="devicesSaveBtn" onclick="saveDevices()" disabled style="background: #607d8b; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">Save</button>
+                    <button id="devicesSaveRunBtn" onclick="saveDevicesAndRun()" disabled style="background: #76b900; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;">Save & Run LLDPq</button>
                 </div>
             </div>
         </div>

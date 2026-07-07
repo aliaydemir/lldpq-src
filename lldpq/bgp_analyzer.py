@@ -13,7 +13,7 @@ import re
 import json
 import time
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass
@@ -593,7 +593,7 @@ class BGPAnalyzer:
             "down_neighbors": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
             "warning_neighbors": warning_neighbors,
             "critical_neighbors": critical_neighbors,
-            "last_update": datetime.now().isoformat()
+            "last_update": datetime.now(timezone.utc).isoformat()
         }
         
         # Add to history (keep last 50 entries per device)
@@ -601,7 +601,7 @@ class BGPAnalyzer:
             self.bgp_history[hostname] = []
         
         history_entry = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_neighbors": len(neighbors),
             "established_count": len([n for n in neighbors if n.state == BGPState.ESTABLISHED]),
             "down_count": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
@@ -747,7 +747,7 @@ class BGPAnalyzer:
             "route_cap": stats.route_cap,
             "routes_truncated": stats.routes_truncated,
             "route_metadata_status": stats.route_metadata_status,
-            "last_update": datetime.now().isoformat()
+            "last_update": datetime.now(timezone.utc).isoformat()
         }
     
     def get_evpn_summary(self) -> Dict[str, Any]:
@@ -796,7 +796,7 @@ class BGPAnalyzer:
             "truncated_devices": truncated_devices,
             "unique_vni_details": list(unique_vnis.values()),
             "per_device": self.current_evpn_stats,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
     def set_collection_coverage(
@@ -876,7 +876,7 @@ class BGPAnalyzer:
                 if total_neighbors > 0 else None
             ),
             "collection_coverage": dict(self.collection_coverage),
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
     
     def detect_bgp_anomalies(self) -> List[Dict[str, Any]]:
@@ -1232,7 +1232,9 @@ class BGPAnalyzer:
         /* Sortable */
         .sortable {{ cursor: pointer; user-select: none; padding-right: 20px; }}
         .sortable:hover {{ background: #3c3c3c; }}
+        .sortable:focus-visible {{ outline: 2px solid #76b900; outline-offset: -2px; }}
         .sort-arrow {{ font-size: 10px; color: #666; margin-left: 5px; opacity: 0.5; }}
+        .sort-arrow::before {{ content: '▲▼'; }}
         .sortable.asc .sort-arrow::before {{ content: '▲'; color: #76b900; opacity: 1; }}
         .sortable.desc .sort-arrow::before {{ content: '▼'; color: #76b900; opacity: 1; }}
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
@@ -1481,12 +1483,13 @@ class BGPAnalyzer:
 """
             for anomaly in anomalies:
                 severity_class = "warning" if anomaly['severity'] == 'warning' else ""
+                anomaly_device_key = html.escape(str(anomaly['device']), quote=True)
                 anomaly_device = html.escape(str(anomaly['device']))
                 anomaly_neighbor = html.escape(str(anomaly['neighbor']))
                 anomaly_message = html.escape(str(anomaly['message']))
                 anomaly_action = html.escape(str(anomaly['action']))
                 html_content += f"""
-            <div class="anomaly-card {severity_class}">
+            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}">
                 <h4>{anomaly_device} - {anomaly_neighbor}</h4>
                 <p><strong>Issue:</strong> {anomaly_message}</p>
                 <p><strong>Recommended Action:</strong> {anomaly_action}</p>
@@ -1515,16 +1518,16 @@ class BGPAnalyzer:
             <table class="bgp-table" id="bgp-table">
                 <thead>
                 <tr>
-                    <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="1" data-type="string">Neighbor <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="2" data-type="port">Interface <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="3" data-type="bgp-state">State <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="4" data-type="number">ASN <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="5" data-type="uptime">Uptime <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="6" data-type="ratio">Prefixes RX/TX <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="7" data-type="ratio">Messages RX/TX <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="8" data-type="ratio">Queue In/Out <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="9" data-type="bgp-health">Health <span class="sort-arrow">▲▼</span></th>
+                    <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="1" data-type="string">Neighbor <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="2" data-type="port">Interface <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="3" data-type="bgp-state">State <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="4" data-type="number">ASN <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="5" data-type="uptime">Uptime <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="6" data-type="ratio">Prefixes RX/TX <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="7" data-type="ratio">Messages RX/TX <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="8" data-type="ratio">Queue In/Out <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="9" data-type="bgp-health">Health <span class="sort-arrow"></span></th>
                 </tr>
                 </thead>
                 <tbody id="bgp-data">
@@ -1578,6 +1581,7 @@ class BGPAnalyzer:
             if neighbor_occurrences.get((hostname, vrf, neighbor.neighbor_name), 0) > 1:
                 neighbor_display = f"{neighbor_display} [{address_family}]"
             display_hostname = html.escape(str(canonical(hostname)))
+            device_key = html.escape(str(hostname), quote=True)
             display_neighbor = html.escape(str(neighbor_display))
             display_interface = html.escape(str(neighbor.interface or 'N/A'))
             display_vrf = html.escape(str(vrf), quote=True)
@@ -1585,7 +1589,7 @@ class BGPAnalyzer:
             display_uptime = html.escape(str(neighbor.uptime))
             
             html_content += f"""
-        <tr data-health="{health_val}" data-state="{dashboard_state}" data-bgp-state="{state_val}" data-vrf="{display_vrf}" data-address-family="{display_address_family}">
+        <tr data-device-key="{device_key}" data-health="{health_val}" data-state="{dashboard_state}" data-bgp-state="{state_val}" data-vrf="{display_vrf}" data-address-family="{display_address_family}">
             <td>{display_hostname}</td>
             <td>{display_neighbor}</td>
             <td>{display_interface}</td>
@@ -1649,6 +1653,104 @@ class BGPAnalyzer:
         // EVPN per-device data
         const evpnPerDevice = __EVPN_DATA_PLACEHOLDER__;
         const evpnUniqueVnis = __EVPN_UNIQUE_VNI_PLACEHOLDER__;
+
+        function evpnSortableHeader(label, column, type) {
+            return '<th class="sortable evpn-sortable" data-column="' + column +
+                '" data-type="' + type + '" scope="col" tabindex="0" aria-sort="none"' +
+                ' title="Sort by ' + label + '">' + label +
+                ' <span class="sort-arrow" aria-hidden="true"></span></th>';
+        }
+
+        function sortEvpnTable(table, columnIndex, direction, type) {
+            const tbody = table.tBodies[0];
+            if (!tbody) return;
+
+            const rows = Array.from(tbody.rows).map((row, originalIndex) => ({
+                row,
+                originalIndex
+            }));
+
+            const cellValue = (row) => {
+                const cell = row.cells[columnIndex];
+                if (!cell) return '';
+                return cell.dataset.sortValue !== undefined
+                    ? cell.dataset.sortValue
+                    : cell.textContent.trim();
+            };
+
+            rows.sort((a, b) => {
+                const aValue = cellValue(a.row);
+                const bValue = cellValue(b.row);
+                let result = 0;
+
+                if (type === 'number') {
+                    const parseNumber = (value) => {
+                        const normalized = String(value).replace(/[^0-9.+-]/g, '');
+                        return normalized === '' ? Number.NaN : Number(normalized);
+                    };
+                    const aNumber = parseNumber(aValue);
+                    const bNumber = parseNumber(bValue);
+
+                    if (Number.isNaN(aNumber) && Number.isNaN(bNumber)) result = 0;
+                    else if (Number.isNaN(aNumber)) result = 1;
+                    else if (Number.isNaN(bNumber)) result = -1;
+                    else result = aNumber - bNumber;
+                } else {
+                    result = String(aValue).localeCompare(String(bValue), undefined, {
+                        numeric: true,
+                        sensitivity: 'base'
+                    });
+                }
+
+                const directedResult = direction === 'desc' ? -result : result;
+                return directedResult || a.originalIndex - b.originalIndex;
+            });
+
+            const fragment = document.createDocumentFragment();
+            rows.forEach(item => fragment.appendChild(item.row));
+            tbody.appendChild(fragment);
+        }
+
+        function initEvpnTableSorting() {
+            const table = document.querySelector('#evpnModalBody .evpn-table');
+            if (!table) return;
+
+            const headers = Array.from(table.querySelectorAll('th.evpn-sortable'));
+            const sortState = { column: -1, direction: 'asc' };
+
+            const activateSort = (header) => {
+                const column = Number(header.dataset.column);
+                const type = header.dataset.type || 'string';
+
+                if (sortState.column === column) {
+                    sortState.direction = sortState.direction === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortState.column = column;
+                    sortState.direction = 'asc';
+                }
+
+                headers.forEach(item => {
+                    item.classList.remove('asc', 'desc');
+                    item.setAttribute('aria-sort', 'none');
+                });
+                header.classList.add(sortState.direction);
+                header.setAttribute(
+                    'aria-sort',
+                    sortState.direction === 'asc' ? 'ascending' : 'descending'
+                );
+                sortEvpnTable(table, column, sortState.direction, type);
+            };
+
+            headers.forEach(header => {
+                header.addEventListener('click', () => activateSort(header));
+                header.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        activateSort(header);
+                    }
+                });
+            });
+        }
         
         // EVPN Modal functions
         function showEvpnModal(filterType) {
@@ -1664,7 +1766,10 @@ class BGPAnalyzer:
                 const routeKey = filterType === 'type2' ? 'type2_routes' : 'type5_routes';
                 title.textContent = routeType + ' - Per Device';
                 
-                html = '<table class="evpn-table"><thead><tr><th>Device</th><th>Route Count</th></tr></thead><tbody>';
+                html = '<table class="evpn-table"><thead><tr>' +
+                    evpnSortableHeader('Device', 0, 'string') +
+                    evpnSortableHeader('Route Count', 1, 'number') +
+                    '</tr></thead><tbody>';
                 
                 // Sort by route count descending
                 const sorted = Object.entries(evpnPerDevice)
@@ -1673,7 +1778,8 @@ class BGPAnalyzer:
                     .sort((a, b) => b.count - a.count);
                 
                 sorted.forEach(item => {
-                    html += '<tr><td>' + item.device + '</td><td>' + item.count.toLocaleString() + '</td></tr>';
+                    html += '<tr><td>' + item.device + '</td><td data-sort-value="' +
+                        item.count + '">' + item.count.toLocaleString() + '</td></tr>';
                 });
                 
                 html += '</tbody></table>';
@@ -1694,11 +1800,24 @@ class BGPAnalyzer:
                     return a.vni - b.vni;
                 });
                 
-                html = '<table class="evpn-table"><thead><tr><th>VNI</th><th>Type</th><th>VRF</th><th>MACs</th><th>ARPs</th><th>Remote VTEPs</th></tr></thead><tbody>';
+                html = '<table class="evpn-table"><thead><tr>' +
+                    evpnSortableHeader('VNI', 0, 'number') +
+                    evpnSortableHeader('Type', 1, 'string') +
+                    evpnSortableHeader('VRF', 2, 'string') +
+                    evpnSortableHeader('MACs', 3, 'number') +
+                    evpnSortableHeader('ARPs', 4, 'number') +
+                    evpnSortableHeader('Remote VTEPs', 5, 'number') +
+                    '</tr></thead><tbody>';
                 
                 uniqueVnis.forEach(vni => {
                     const badge = vni.type === 'L2' ? 'evpn-badge-l2' : 'evpn-badge-l3';
-                    html += '<tr><td>' + vni.vni + '</td><td><span class="evpn-badge ' + badge + '">' + vni.type + '</span></td><td>' + (vni.vrf || 'default') + '</td><td>' + (vni.macs || 0) + '</td><td>' + (vni.arps || 0) + '</td><td>' + (vni.remote_vteps || 0) + '</td></tr>';
+                    html += '<tr><td data-sort-value="' + vni.vni + '">' + vni.vni +
+                        '</td><td><span class="evpn-badge ' + badge + '">' + vni.type +
+                        '</span></td><td>' + (vni.vrf || 'default') +
+                        '</td><td data-sort-value="' + (vni.macs || 0) + '">' + (vni.macs || 0) +
+                        '</td><td data-sort-value="' + (vni.arps || 0) + '">' + (vni.arps || 0) +
+                        '</td><td data-sort-value="' + (vni.remote_vteps || 0) + '">' +
+                        (vni.remote_vteps || 0) + '</td></tr>';
                 });
                 
                 html += '</tbody></table>';
@@ -1706,6 +1825,7 @@ class BGPAnalyzer:
             }
             
             body.innerHTML = html;
+            initEvpnTableSorting();
             modal.classList.add('show');
         }
         
@@ -2104,12 +2224,12 @@ class BGPAnalyzer:
                 Running...
             `;
             let baseline = null;
-            if (typeof window.lldpqCapturePipelineState === 'function') {
-                try { baseline = await window.lldpqCapturePipelineState(); } catch (error) { baseline = null; }
+            if (typeof window.lldpqCaptureAnalysisState === 'function') {
+                try { baseline = await window.lldpqCaptureAnalysisState('bgp'); } catch (error) { baseline = null; }
             }
             
             // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
+            fetch('/trigger-monitor?scope=bgp', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -2117,7 +2237,7 @@ class BGPAnalyzer:
             })
             .then(response => response.json())
             .then(data => {
-                if (data.status === 'success') {
+                if (data.status === 'success' && data.trigger_id && data.scope === 'bgp') {
                     console.log('✅ Monitor analysis triggered successfully');
                     // Show notification
                     const notification = document.createElement('div');
@@ -2137,12 +2257,13 @@ class BGPAnalyzer:
                     `;
                     notification.innerHTML = `
                         <strong style="color: #76b900;">✅ Monitor Analysis Started</strong><br>
-                        The full system analysis is running in the background.<br>
-                        <small style="color: #888;">Waiting for the current pipeline to complete before refreshing.</small>
+                        The BGP analysis is running in the background.<br>
+                        <small style="color: #888;">Waiting for the BGP results to be published before refreshing.</small>
                     `;
                     document.body.appendChild(notification);
                     const completion = typeof window.waitForLldpqAnalysisCompletion === 'function'
-                        ? window.waitForLldpqAnalysisCompletion(baseline)
+                        ? window.waitForLldpqAnalysisCompletion(
+                            baseline, { scope: 'bgp', pipelineId: data.trigger_id })
                         : new Promise(resolve => setTimeout(resolve, 35000));
                     Promise.resolve(completion)
                         .then(() => window.location.reload())
@@ -2311,7 +2432,7 @@ class BGPAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/analysis-guard.js"></script>
+    <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>
 """

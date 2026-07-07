@@ -23,9 +23,12 @@ def main():
     print("Duplicate analysis complete:")
     print("  Active IP duplicates : %d" % summary["ip_active"])
     print("  Quiesced IP dups     : %d" % summary["ip_quiesced"])
-    print("  MAC duplicates       : %d" % summary["mac_total"])
+    print("  Confirmed MAC conflicts: %d" % summary["confirmed_mac_total"])
+    print("  MAC DAD findings       : %d" % summary["mac_dad_total"])
+    print("  Active MAC mobility    : %d" % summary["mac_mobility_active"])
+    print("  MAC mobility signals   : %d" % summary["mac_mobility_total"])
     print("  APIPA addresses      : %d" % summary["apipa_total"])
-    print("  VLANs affected       : %d" % summary["vlans"])
+    print("  VLANs with findings  : %d" % summary["vlans"])
     print("  Coverage              : %d/%d devices%s" % (
         summary["coverage_current"], summary["coverage_expected"],
         " (partial)" if summary["coverage_partial"] else "",

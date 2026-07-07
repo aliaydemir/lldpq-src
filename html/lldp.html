@@ -399,11 +399,11 @@
         </div>
         <div class="action-buttons">
             <div class="device-search-container">
-                <select id="deviceSearch" multiple style="min-width: 220px;">
+                <select id="deviceSearch" multiple aria-label="Filter by local device" style="min-width: 220px;">
                 </select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
-            <input type="text" id="tableFilter" placeholder="Filter Device..." oninput="filterTable()" style="height:34px;padding:0 10px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;font-size:13px;width:220px;outline:none;" autocomplete="off">
+            <input type="text" id="tableFilter" aria-label="Filter LLDP connections" placeholder="Filter Device..." oninput="filterTable()" style="height:34px;padding:0 10px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;font-size:13px;width:220px;outline:none;" autocomplete="off">
             <button id="run-lldp" onclick="runLLDPCheck()" class="btn btn-secondary">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M8,5.14V19.14L19,12.14L8,5.14Z"/>
@@ -416,7 +416,7 @@
                 </svg>
                 Edit Topology
             </button>
-            <button id="p2p-toggle" onclick="togglePortAliases()" class="btn btn-gray" title="Toggle interface names between OS (enP22...) and P2P/field labels (M1, S1)">
+            <button id="p2p-toggle" onclick="togglePortAliases()" class="btn btn-gray" title="Toggle interface names between OS (enP22...) and P2P/field labels (M1, S1)" aria-pressed="true">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M21,9L17,5V8H10V10H17V13M7,11L3,15L7,19V16H14V14H7V11Z"/>
                 </svg>
@@ -447,23 +447,23 @@
         </div>
         <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card card-total">
+                <div class="summary-card card-total" role="button" tabindex="0" aria-pressed="false">
                     <div class="card-value" id="total-connections">0</div>
                     <div class="card-label">Total Ports</div>
                 </div>
-                <div class="summary-card card-excellent">
+                <div class="summary-card card-excellent" role="button" tabindex="0" aria-pressed="false">
                     <div class="card-value" id="success-connections">0</div>
                     <div class="card-label">Successful Ports</div>
                 </div>
-                <div class="summary-card card-critical">
+                <div class="summary-card card-critical" role="button" tabindex="0" aria-pressed="false">
                     <div class="card-value" id="failed-connections">0</div>
                     <div class="card-label">Failed Ports</div>
                 </div>
-                <div class="summary-card card-warning">
+                <div class="summary-card card-warning" role="button" tabindex="0" aria-pressed="false">
                     <div class="card-value" id="warning-connections">0</div>
                     <div class="card-label">Warning Ports</div>
                 </div>
-                <div class="summary-card card-info">
+                <div class="summary-card card-info" role="button" tabindex="0" aria-pressed="false">
                     <div class="card-value" id="no-info-connections">0</div>
                     <div class="card-label">No Information</div>
                 </div>
@@ -480,7 +480,7 @@
             LLDP Connection Status
         </div>
         <div class="section-content" style="padding: 0;">
-            <div id="filter-info" class="filter-info" style="margin: 16px;">
+            <div id="filter-info" class="filter-info" role="status" aria-live="polite" aria-atomic="true" style="margin: 16px;">
                 <span id="filter-text"></span>
                 <button onclick="clearFilter()">Show All</button>
             </div>
@@ -542,6 +542,32 @@
         // Filter state
         let currentFilter = 'ALL';
         let allConnections = [];
+        let currentSort = { column: -1, direction: 'asc', type: 'string' };
+        const rowConnectionMap = new WeakMap();
+        const LLDP_STATUS_PRIORITY = Object.freeze({
+            'FAILED': 0,
+            'NO INFO': 1,
+            'WARNING': 2,
+            'SUCCESS': 3
+        });
+
+        function normalizedValue(value) {
+            return value === undefined || value === null ? '' : String(value).trim();
+        }
+
+        function isMissingValue(value) {
+            const normalized = normalizedValue(value).toLowerCase();
+            return normalized === '' || normalized === 'none' || normalized === 'n/a';
+        }
+
+        function displayValue(value) {
+            return isMissingValue(value) ? 'N/A' : normalizedValue(value);
+        }
+
+        function sameHostname(left, right) {
+            return !isMissingValue(left) && !isMissingValue(right) &&
+                normalizedValue(left).toLowerCase() === normalizedValue(right).toLowerCase();
+        }
 
         // ===== Display aliases (P2P / field names) — display-only =====
         // Map real names -> field labels, loaded from display-aliases.json:
@@ -552,6 +578,13 @@
         let deviceAliasMap = {};
         let portAliasLc = {};       // lower(realName) -> alias (case-insensitive lookup)
         let deviceAliasLc = {};
+        let aliasDisplayLoadSeq = 0;
+        let aliasEditorLoadSeq = 0;
+        let aliasEditorOpSeq = 0;
+        let aliasEditorEditVersion = 0;
+        let aliasEditorFilling = false;
+        let aliasEditorRevision = null;
+        let aliasEditorReady = false;
         let p2pNamesOn = localStorage.getItem('lldpq_port_alias_on') !== 'false'; // default ON
 
         // Build case-INSENSITIVE lookup maps. This decouples aliasing from the
@@ -563,32 +596,45 @@
             Object.keys(portAliasMap).forEach(k => { if (k) portAliasLc[k.toLowerCase()] = portAliasMap[k]; });
             Object.keys(deviceAliasMap).forEach(k => { if (k) deviceAliasLc[k.toLowerCase()] = deviceAliasMap[k]; });
         }
+        function aliasForValue(value, mapLc) {
+            const canonical = displayValue(value);
+            return mapLc ? mapLc[canonical.toLowerCase()] : undefined;
+        }
         function aliasedLabel(v, mapLc) {
-            const a = (v && mapLc) ? mapLc[String(v).toLowerCase()] : undefined;
-            return (p2pNamesOn && a) ? a : v;
+            const canonical = displayValue(v);
+            const alias = aliasForValue(canonical, mapLc);
+            return (p2pNamesOn && alias) ? alias : canonical;
         }
         function setAliasedCell(cell, raw, mapLc) {
-            const v = (raw === undefined || raw === null || raw === '') ? 'N/A' : raw;
+            const v = displayValue(raw);
             cell.textContent = aliasedLabel(v, mapLc);
-            const a = mapLc ? mapLc[String(v).toLowerCase()] : undefined;
+            const a = aliasForValue(v, mapLc);
             if (p2pNamesOn && a) cell.title = v; else cell.removeAttribute('title');
         }
         function loadDisplayAliases() {
+            const seq = ++aliasDisplayLoadSeq;
             return fetch('display-aliases.json', { cache: 'no-store' })
                 .then(r => r.ok ? r.json() : {})
                 .then(d => {
+                    if (seq !== aliasDisplayLoadSeq) return;
                     d = (d && typeof d === 'object') ? d : {};
                     portAliasMap = (d.interfaces && typeof d.interfaces === 'object') ? d.interfaces : {};
                     deviceAliasMap = (d.devices && typeof d.devices === 'object') ? d.devices : {};
                     rebuildAliasLc();
                 })
-                .catch(() => { portAliasMap = {}; deviceAliasMap = {}; rebuildAliasLc(); });
+                .catch(() => {
+                    if (seq !== aliasDisplayLoadSeq) return;
+                    portAliasMap = {}; deviceAliasMap = {}; rebuildAliasLc();
+                });
         }
         function updateP2pToggleUI() {
             const t = document.getElementById('p2p-toggle-text');
             const b = document.getElementById('p2p-toggle');
             if (t) t.textContent = p2pNamesOn ? 'P2P: On' : 'P2P: Off';
-            if (b) b.style.borderColor = p2pNamesOn ? '#76b900' : '';
+            if (b) {
+                b.style.borderColor = p2pNamesOn ? '#76b900' : '';
+                b.setAttribute('aria-pressed', p2pNamesOn ? 'true' : 'false');
+            }
         }
         function togglePortAliases() {
             p2pNamesOn = !p2pNamesOn;
@@ -602,44 +648,117 @@
                 p2pNamesOn = (e.newValue !== 'false');
                 updateP2pToggleUI();
                 filterTable();
-            }
+            } else if (e.key === 'lldpq_aliases_revision') refreshDisplayAliases();
         });
+        try {
+            const aliasChannel = new BroadcastChannel('lldpq-aliases');
+            aliasChannel.onmessage = e => { if (e && e.data && e.data.type === 'updated') refreshDisplayAliases(); };
+        } catch (e) { /* storage events are the compatibility fallback */ }
+
+        function refreshDisplayAliases() {
+            return loadDisplayAliases().then(() => {
+                updateP2pToggleUI();
+                updateDeviceOptionAliases();
+                filterTable();
+            });
+        }
 
         // ----- Display alias editor modal (admin) — devices + ports -----
-        function openPortAliasModal() {
+        function markAliasEditorDirty() {
+            if (!aliasEditorFilling) aliasEditorEditVersion++;
+        }
+        async function openPortAliasModal() {
+            const seq = ++aliasEditorLoadSeq;
+            const op = ++aliasEditorOpSeq;
+            aliasEditorReady = false;
+            aliasEditorRevision = null;
             fillAliasRows('deviceAliasRows', deviceAliasMap, 'tan-spine-01', 'SPINE-01');
             fillAliasRows('portAliasRows', portAliasMap, 'enP22p3s0f0np0', 'M1');
-            document.getElementById('aliasStatus').textContent = '';
+            const startedVersion = aliasEditorEditVersion;
+            const status = document.getElementById('aliasStatus');
+            status.style.color = '#888';
+            status.textContent = 'Loading current aliases...';
             document.getElementById('portAliasModal').style.display = 'flex';
+            try {
+                const response = await fetch('/setup-api.sh', {
+                    method:'POST', headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify({action:'get-aliases'})
+                });
+                const data = await response.json().catch(() => ({}));
+                if (seq !== aliasEditorLoadSeq || op !== aliasEditorOpSeq) return;
+                if (!data.success || typeof data.revision !== 'string') throw new Error(data.error || 'Could not load current aliases');
+                const aliases = data.aliases || {};
+                deviceAliasMap = aliases.devices || {};
+                portAliasMap = aliases.interfaces || {};
+                rebuildAliasLc();
+                if (aliasEditorEditVersion !== startedVersion) {
+                    aliasEditorRevision = data.revision;
+                    status.style.color = '#ffb74d';
+                    status.textContent = 'Current aliases loaded, but edits made during loading were kept. Close and reopen before saving.';
+                    return;
+                }
+                fillAliasRows('deviceAliasRows', deviceAliasMap, 'tan-spine-01', 'SPINE-01');
+                fillAliasRows('portAliasRows', portAliasMap, 'enP22p3s0f0np0', 'M1');
+                aliasEditorRevision = data.revision;
+                aliasEditorReady = true;
+                status.textContent = '';
+            } catch (error) {
+                if (seq !== aliasEditorLoadSeq || op !== aliasEditorOpSeq) return;
+                status.style.color = '#ef5350';
+                status.textContent = error.message || 'Could not load current aliases';
+            }
         }
         function closePortAliasModal() {
+            aliasEditorLoadSeq++;
+            aliasEditorOpSeq++;
+            aliasEditorReady = false;
             document.getElementById('portAliasModal').style.display = 'none';
         }
         function fillAliasRows(containerId, map, kph, vph) {
             const box = document.getElementById(containerId);
-            box.innerHTML = '';
+            box.replaceChildren();
             const entries = Object.entries(map || {});
-            if (entries.length === 0) { addAliasRow(containerId, '', '', kph, vph); }
-            else entries.forEach(([k, v]) => addAliasRow(containerId, k, v, kph, vph));
+            aliasEditorFilling = true;
+            try {
+                if (entries.length === 0) { addAliasRow(containerId, '', '', kph, vph); }
+                else entries.forEach(([k, v]) => addAliasRow(containerId, k, v, kph, vph));
+            } finally { aliasEditorFilling = false; }
         }
         function addAliasRow(containerId, key, label, kph, vph) {
-            const esc = s => (s || '').replace(/"/g, '&quot;');
             const row = document.createElement('div');
             row.className = 'alias-row';
             row.style.cssText = 'display:flex; gap:8px; align-items:center; margin-bottom:8px;';
-            row.innerHTML =
-                '<input type="text" class="alias-os" placeholder="' + esc(kph) + '" value="' + esc(key) + '" autocomplete="off" style="flex:1; height:32px; padding:0 8px; background:#2d2d2d; color:#d4d4d4; border:1px solid #555; border-radius:4px; outline:none;">' +
-                '<span style="color:#76b900;">&rarr;</span>' +
-                '<input type="text" class="alias-label" placeholder="' + esc(vph) + '" value="' + esc(label) + '" autocomplete="off" style="width:140px; height:32px; padding:0 8px; background:#2d2d2d; color:#d4d4d4; border:1px solid #555; border-radius:4px; outline:none;">' +
-                '<button type="button" title="Remove" onclick="this.closest(\'.alias-row\').remove()" style="background:#555; color:#fff; border:none; width:30px; height:30px; border-radius:4px; cursor:pointer; font-size:16px; line-height:1;">&times;</button>';
+            const real = document.createElement('input');
+            real.type = 'text'; real.className = 'alias-os'; real.placeholder = kph || ''; real.value = key || '';
+            real.autocomplete = 'off'; real.setAttribute('aria-label', 'Canonical name');
+            real.style.cssText = 'flex:1; height:32px; padding:0 8px; background:#2d2d2d; color:#d4d4d4; border:1px solid #555; border-radius:4px; outline:none;';
+            const arrow = document.createElement('span'); arrow.style.color = '#76b900'; arrow.textContent = '→'; arrow.setAttribute('aria-hidden', 'true');
+            const display = document.createElement('input');
+            display.type = 'text'; display.className = 'alias-label'; display.placeholder = vph || ''; display.value = label || '';
+            display.autocomplete = 'off'; display.setAttribute('aria-label', 'Display alias');
+            display.style.cssText = 'width:140px; height:32px; padding:0 8px; background:#2d2d2d; color:#d4d4d4; border:1px solid #555; border-radius:4px; outline:none;';
+            const remove = document.createElement('button');
+            remove.type = 'button'; remove.title = 'Remove'; remove.setAttribute('aria-label', 'Remove alias row'); remove.textContent = '×';
+            remove.style.cssText = 'background:#555; color:#fff; border:none; width:30px; height:30px; border-radius:4px; cursor:pointer; font-size:16px; line-height:1;';
+            remove.addEventListener('click', () => { row.remove(); markAliasEditorDirty(); });
+            real.addEventListener('input', markAliasEditorDirty);
+            display.addEventListener('input', markAliasEditorDirty);
+            row.append(real, arrow, display, remove);
             document.getElementById(containerId).appendChild(row);
+            markAliasEditorDirty();
         }
         function collectAliasRows(containerId) {
             const map = {};
+            const seen = new Map();
             document.querySelectorAll('#' + containerId + ' .alias-row').forEach(r => {
                 const k = r.querySelector('.alias-os').value.trim();
                 const v = r.querySelector('.alias-label').value.trim();
-                if (k && v) map[k] = v;
+                if (!k && !v) return;
+                if (!k || !v) throw new Error('Complete or remove every alias row.');
+                const folded = k.toLowerCase();
+                if (seen.has(folded)) throw new Error('Duplicate canonical name: ' + k);
+                seen.set(folded, k);
+                map[k] = v;
             });
             return map;
         }
@@ -649,7 +768,7 @@
             const txt = document.getElementById(textareaId).value || '';
             const lines = txt.split('\n').map(l => l.trim()).filter(Boolean);
             const box = document.getElementById(containerId);
-            box.innerHTML = '';
+            box.replaceChildren();
             let added = 0;
             lines.forEach(line => {
                 const parts = line.split(/[\s,]+/).filter(Boolean);
@@ -660,35 +779,80 @@
             });
             if (added === 0) addAliasRow(containerId, '', '', '', '');
             document.getElementById(textareaId).value = '';
+            markAliasEditorDirty();
+        }
+        function publishLldpAliasUpdate() {
+            try { localStorage.setItem('lldpq_aliases_revision', 'legacy:' + Date.now()); } catch (e) {}
+            try {
+                const channel = new BroadcastChannel('lldpq-aliases');
+                channel.postMessage({ type:'updated' }); channel.close();
+            } catch (e) {}
         }
         function savePortAliases() {
-            const devices = collectAliasRows('deviceAliasRows');
-            const interfaces = collectAliasRows('portAliasRows');
             const status = document.getElementById('aliasStatus');
+            if (!aliasEditorReady || typeof aliasEditorRevision !== 'string') {
+                status.style.color = '#ef5350';
+                status.textContent = 'Wait for the current aliases to load before saving.';
+                return;
+            }
+            let devices, interfaces;
+            try {
+                devices = collectAliasRows('deviceAliasRows');
+                interfaces = collectAliasRows('portAliasRows');
+            } catch (error) {
+                status.style.color = '#ef5350';
+                status.textContent = error.message;
+                return;
+            }
             status.style.color = '#888';
             status.textContent = 'Saving...';
-            fetch('/fabric-api.sh?action=save-display-aliases', {
+            const op = ++aliasEditorOpSeq;
+            const startedVersion = aliasEditorEditVersion;
+            aliasEditorReady = false;
+            fetch('/setup-api.sh', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ interfaces: interfaces, devices: devices })
+                body: JSON.stringify({
+                    action:'set-aliases', aliases:{ interfaces:interfaces, devices:devices },
+                    expected_revision:aliasEditorRevision
+                })
             })
             .then(r => r.json())
             .then(d => {
+                if (d.success) publishLldpAliasUpdate();
+                if (op !== aliasEditorOpSeq) {
+                    if (d.success) refreshDisplayAliases();
+                    return;
+                }
                 if (d.success) {
-                    portAliasMap = interfaces;
-                    deviceAliasMap = devices;
+                    const normalized = d.aliases || { interfaces: interfaces, devices: devices };
+                    portAliasMap = normalized.interfaces || {};
+                    deviceAliasMap = normalized.devices || {};
+                    aliasEditorRevision = d.revision || aliasEditorRevision;
                     rebuildAliasLc();
+                    updateDeviceOptionAliases();
                     status.style.color = '#76b900';
-                    status.textContent = 'Saved';
                     updateP2pToggleUI();
                     filterTable();
-                    setTimeout(closePortAliasModal, 600);
+                    if (aliasEditorEditVersion === startedVersion) {
+                        status.textContent = 'Saved';
+                        setTimeout(() => { if (op === aliasEditorOpSeq) closePortAliasModal(); }, 600);
+                    } else {
+                        aliasEditorReady = true;
+                        status.style.color = '#ffb74d';
+                        status.textContent = 'Saved the submitted aliases; newer edits remain unsaved.';
+                    }
                 } else {
+                    aliasEditorReady = !d.conflict;
                     status.style.color = '#ef5350';
-                    status.textContent = d.error || 'Save failed';
+                    status.textContent = (d.error || 'Save failed') + (d.conflict ? ' Close and reopen to load the current aliases.' : '');
                 }
             })
-            .catch(() => { status.style.color = '#ef5350'; status.textContent = 'Save failed'; });
+            .catch(() => {
+                if (op !== aliasEditorOpSeq) return;
+                aliasEditorReady = true;
+                status.style.color = '#ef5350'; status.textContent = 'Save failed';
+            });
         }
 
         function updateSummaryCards() {
@@ -699,148 +863,119 @@
             document.getElementById('no-info-connections').textContent = noInfoConnections;
         }
         
-        function filterConnections(filterType) {
-            if (allConnections.length === 0) return;
-            
-            currentFilter = filterType;
-            
-            // Clear device search when using card filters
-            if (deviceSearchActive) {
-                selectedDevices = [];
-                deviceSearchActive = false;
-                _suppressDeviceChange = true;
-                $('#deviceSearch').val(null).trigger('change');
-                _suppressDeviceChange = false;
-                document.getElementById('clearSearchBtn').style.display = 'none';
-            }
-            
-            // Clear active state from all cards
+        const STATUS_FILTERS = Object.freeze({
+            SUCCESS: { status: 'SUCCESS', label: 'Successful' },
+            FAILED: { status: 'FAILED', label: 'Failed' },
+            WARNING: { status: 'WARNING', label: 'Warning' },
+            NO_INFO: { status: 'NO INFO', label: 'No Information' }
+        });
+
+        function connectionSearchTerms(connection) {
+            const status = determineLLDPStatus(connection);
+            const terms = [connection.portStatus, connection.lldpStatus, status.status, status.health];
+            const addCanonicalAndAlias = (value, aliases) => {
+                terms.push(displayValue(value));
+                const alias = aliasForValue(value, aliases);
+                if (alias) terms.push(alias);
+            };
+            addCanonicalAndAlias(connection.localDevice, deviceAliasLc);
+            addCanonicalAndAlias(connection.localPort, portAliasLc);
+            addCanonicalAndAlias(connection.expectedDevice, deviceAliasLc);
+            addCanonicalAndAlias(connection.expectedPort, portAliasLc);
+            addCanonicalAndAlias(connection.actualDevice, deviceAliasLc);
+            addCanonicalAndAlias(connection.actualPort, portAliasLc);
+            return terms.map(value => normalizedValue(value).toLowerCase());
+        }
+
+        function filterConnectionsByState(connections, statusFilter, devices, query) {
+            const statusDefinition = STATUS_FILTERS[statusFilter];
+            const selected = new Set((devices || []).filter(Boolean));
+            const normalizedQuery = normalizedValue(query).toLowerCase();
+            return connections.filter(connection => {
+                if (statusDefinition && determineLLDPStatus(connection).status !== statusDefinition.status) return false;
+                if (selected.size > 0 && !selected.has(connection.localDevice)) return false;
+                return !normalizedQuery || connectionSearchTerms(connection).some(term => term.includes(normalizedQuery));
+            });
+        }
+
+        function updateSummaryCardSelection() {
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
+                card.setAttribute('aria-pressed', 'false');
             });
-            
-            let filteredConnections = allConnections;
-            let filterText = '';
-            
-            if (filterType === 'SUCCESS') {
-                filteredConnections = allConnections.filter(conn => determineLLDPStatus(conn).status === 'SUCCESS');
-                filterText = `Showing ${filteredConnections.length} Successful Ports`;
-                document.getElementById('success-connections').parentElement.classList.add('active');
-            } else if (filterType === 'FAILED') {
-                filteredConnections = allConnections.filter(conn => determineLLDPStatus(conn).status === 'FAILED');
-                filterText = `Showing ${filteredConnections.length} Failed Ports`;
-                document.getElementById('failed-connections').parentElement.classList.add('active');
-            } else if (filterType === 'WARNING') {
-                filteredConnections = allConnections.filter(conn => determineLLDPStatus(conn).status === 'WARNING');
-                filterText = `Showing ${filteredConnections.length} Warning Ports`;
-                document.getElementById('warning-connections').parentElement.classList.add('active');
-            } else if (filterType === 'NO_INFO') {
-                filteredConnections = allConnections.filter(conn => determineLLDPStatus(conn).status === 'NO INFO');
-                filterText = `Showing ${filteredConnections.length} No Information Ports`;
-                document.getElementById('no-info-connections').parentElement.classList.add('active');
-            } else if (filterType === 'TOTAL') {
-                filteredConnections = allConnections;
-                filterText = `Showing All ${filteredConnections.length} Connections`;
-                document.getElementById('total-connections').parentElement.classList.add('active');
+            const cardIds = {
+                TOTAL: 'total-connections', SUCCESS: 'success-connections', FAILED: 'failed-connections',
+                WARNING: 'warning-connections', NO_INFO: 'no-info-connections'
+            };
+            const value = document.getElementById(cardIds[currentFilter]);
+            if (value && value.parentElement) {
+                value.parentElement.classList.add('active');
+                value.parentElement.setAttribute('aria-pressed', 'true');
             }
-            
-            // If text filter is active, apply it on top
-            if (document.getElementById('tableFilter').value.trim()) {
-                filterTable();
+        }
+
+        function applyCurrentFilters() {
+            const filterInput = document.getElementById('tableFilter');
+            const query = filterInput ? filterInput.value.trim() : '';
+            const base = filterConnectionsByState(allConnections, currentFilter, selectedDevices, '');
+            const filtered = filterConnectionsByState(allConnections, currentFilter, selectedDevices, query);
+            const statusDefinition = STATUS_FILTERS[currentFilter];
+            const filterInfo = document.getElementById('filter-info');
+            const filterText = document.getElementById('filter-text');
+            const hasStatusFilter = Boolean(statusDefinition);
+            const hasDeviceFilter = deviceSearchActive && selectedDevices.length > 0;
+
+            if (query) {
+                const scope = [statusDefinition?.label, hasDeviceFilter ? selectedDevices.join(', ') : '']
+                    .filter(Boolean).join(' / ') || 'All';
+                filterInfo.style.display = 'block';
+                filterText.textContent = `${scope}: "${filterInput.value}" — ${filtered.length} of ${base.length} ports`;
+            } else if (hasDeviceFilter) {
+                const statusLabel = statusDefinition ? `${statusDefinition.label.toLowerCase()} ` : '';
+                filterInfo.style.display = 'block';
+                filterText.textContent = `Showing ${filtered.length} ${statusLabel}connections for ${selectedDevices.length} device${selectedDevices.length > 1 ? 's' : ''}: ${selectedDevices.join(', ')}`;
+            } else if (hasStatusFilter) {
+                filterInfo.style.display = 'block';
+                filterText.textContent = `Showing ${filtered.length} ${statusDefinition.label} Ports`;
             } else {
-                if (filterType !== 'ALL' && filterType !== 'TOTAL') {
-                    document.getElementById('filter-info').style.display = 'block';
-                    document.getElementById('filter-text').textContent = filterText;
-                } else {
-                    document.getElementById('filter-info').style.display = 'none';
-                }
-                renderConnectionsTable(filteredConnections);
+                filterInfo.style.display = 'none';
             }
+
+            renderConnectionsTable(filtered);
+            return filtered;
+        }
+
+        function filterConnections(filterType) {
+            if (allConnections.length === 0) return;
+            currentFilter = filterType;
+            updateSummaryCardSelection();
+            applyCurrentFilters();
         }
         
         function clearFilter() {
             currentFilter = 'ALL';
-            document.querySelectorAll('.summary-card').forEach(card => {
-                card.classList.remove('active');
-            });
-            document.getElementById('filter-info').style.display = 'none';
+            selectedDevices = [];
+            deviceSearchActive = false;
+            updateSummaryCardSelection();
             document.getElementById('tableFilter').value = '';
-            
-            // Also clear device search
-            if (deviceSearchActive) {
-                selectedDevices = [];
-                deviceSearchActive = false;
-                _suppressDeviceChange = true;
-                $('#deviceSearch').val(null).trigger('change');
-                _suppressDeviceChange = false;
-                document.getElementById('clearSearchBtn').style.display = 'none';
-            }
-            
-            renderConnectionsTable(allConnections);
+            _suppressDeviceChange = true;
+            $('#deviceSearch').val(null).trigger('change');
+            _suppressDeviceChange = false;
+            document.getElementById('clearSearchBtn').style.display = 'none';
+            applyCurrentFilters();
         }
 
         function filterTable() {
-            const query = document.getElementById('tableFilter').value.toLowerCase().trim();
-            
-            // Start from current card/device filter, then apply text filter on top
-            let base = allConnections;
-            let baseLabel = 'All';
-            
-            if (currentFilter === 'SUCCESS') {
-                base = allConnections.filter(conn => determineLLDPStatus(conn).status === 'SUCCESS');
-                baseLabel = 'Successful';
-            } else if (currentFilter === 'FAILED') {
-                base = allConnections.filter(conn => determineLLDPStatus(conn).status === 'FAILED');
-                baseLabel = 'Failed';
-            } else if (currentFilter === 'WARNING') {
-                base = allConnections.filter(conn => determineLLDPStatus(conn).status === 'WARNING');
-                baseLabel = 'Warning';
-            } else if (currentFilter === 'NO_INFO') {
-                base = allConnections.filter(conn => determineLLDPStatus(conn).status === 'NO INFO');
-                baseLabel = 'No Info';
-            } else if (currentFilter === 'TOTAL') {
-                base = allConnections;
-                baseLabel = 'All';
-            }
-            
-            if (deviceSearchActive && selectedDevices.length) {
-                const _set = new Set(selectedDevices);
-                base = base.filter(conn => _set.has(conn.localDevice));
-                baseLabel = selectedDevices.join(', ');
-            }
-            
-            if (!query) {
-                if (currentFilter !== 'ALL' || deviceSearchActive) {
-                    document.getElementById('filter-info').style.display = 'block';
-                    document.getElementById('filter-text').textContent = `Showing ${base.length} ${baseLabel} Ports`;
-                } else {
-                    document.getElementById('filter-info').style.display = 'none';
-                }
-                renderConnectionsTable(base);
-                return;
-            }
-            
-            // Apply text filter on top of card/device filter
-            const filtered = base.filter(conn => {
-                const texts = [
-                    conn.localDevice, conn.localPort, conn.portStatus,
-                    conn.expectedDevice, conn.expectedPort,
-                    conn.actualDevice, conn.actualPort,
-                    determineLLDPStatus(conn).status,
-                    determineLLDPStatus(conn).detail
-                ].map(s => (s || '').toLowerCase());
-                return texts.some(t => t.includes(query));
-            });
-            document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent = `${baseLabel}: "${document.getElementById('tableFilter').value}" — ${filtered.length} of ${base.length} ports`;
-            renderConnectionsTable(filtered);
+            return applyCurrentFilters();
         }
 
         function determineLLDPStatus(connection) {
             const { lldpStatus, expectedDevice, expectedPort, actualDevice, actualPort, portStatus, localPort } = connection;
+            const normalizedLLDPStatus = normalizedValue(lldpStatus).toLowerCase();
+            const normalizedPortStatus = normalizedValue(portStatus).toUpperCase();
             
-            // Check if local port is N/A - this is a critical error
-            if (!localPort || localPort === 'N/A' || localPort === '') {
+            // A missing/sentinel local port means the topology row itself is incomplete.
+            if (isMissingValue(localPort)) {
                 return {
                     status: 'FAILED',
                     healthClass: 'lldp-critical',
@@ -850,16 +985,16 @@
             }
             
             // Based on actual LLDP status from the data
-            if (lldpStatus === 'Pass') {
+            if (normalizedLLDPStatus === 'pass') {
                 return {
                     status: 'SUCCESS',
                     healthClass: 'lldp-excellent',
                     statusClass: 'status-success',
                     health: 'LLDP Connection Verified'
                 };
-            } else if (lldpStatus === 'No-Info') {
+            } else if (normalizedLLDPStatus === 'no-info') {
                 // Check if port is physically down
-                if (portStatus === 'DOWN') {
+                if (normalizedPortStatus === 'DOWN') {
                     return {
                         status: 'NO INFO',
                         healthClass: 'lldp-unknown',
@@ -874,9 +1009,9 @@
                         health: 'No LLDP Response Received'
                     };
                 }
-            } else if (lldpStatus === 'Fail') {
+            } else if (normalizedLLDPStatus === 'fail') {
                 // Check if port is physically down first
-                if (portStatus === 'DOWN') {
+                if (normalizedPortStatus === 'DOWN') {
                     return {
                         status: 'FAILED',
                         healthClass: 'lldp-critical',
@@ -884,9 +1019,19 @@
                         health: 'Local Port is DOWN'
                     };
                 }
-                // Check if it's a port mismatch (same device, different port)
-                else if (actualDevice && expectedDevice && actualDevice === expectedDevice && 
-                    actualPort && expectedPort && actualPort !== expectedPort) {
+                // "None"/"N/A" are absence sentinels, not literal hostnames.
+                if (isMissingValue(actualDevice) || isMissingValue(expectedDevice)) {
+                    return {
+                        status: 'WARNING',
+                        healthClass: 'lldp-warning',
+                        statusClass: 'status-warning',
+                        health: 'Unexpected Connection'
+                    };
+                }
+                // Device identity is case-insensitive; port identifiers remain canonical/exact.
+                if (sameHostname(actualDevice, expectedDevice) &&
+                    !isMissingValue(actualPort) && !isMissingValue(expectedPort) &&
+                    normalizedValue(actualPort) !== normalizedValue(expectedPort)) {
                     return {
                         status: 'WARNING',
                         healthClass: 'lldp-warning',
@@ -895,7 +1040,7 @@
                     };
                 }
                 // Device mismatch (wrong device connected) - also WARNING now
-                else if (actualDevice && expectedDevice && actualDevice !== expectedDevice) {
+                if (!sameHostname(actualDevice, expectedDevice)) {
                     return {
                         status: 'WARNING',
                         healthClass: 'lldp-warning',
@@ -903,15 +1048,13 @@
                         health: `Wrong Device: Expected ${expectedDevice}, Got ${actualDevice}`
                     };
                 }
-                // Other fail cases (unexpected connection, etc.)
-                else {
-                    return {
-                        status: 'WARNING',
-                        healthClass: 'lldp-warning',
-                        statusClass: 'status-warning',
-                        health: 'Unexpected Connection'
-                    };
-                }
+                // A raw Fail with matching device/port is still unexpected input.
+                return {
+                    status: 'WARNING',
+                    healthClass: 'lldp-warning',
+                    statusClass: 'status-warning',
+                    health: 'Unexpected Connection'
+                };
             } else {
                 // Unknown status - treat as warning
                 return {
@@ -930,6 +1073,10 @@
             connections.forEach(connection => {
                 const status = determineLLDPStatus(connection);
                 const row = tbody.insertRow();
+                rowConnectionMap.set(row, connection);
+                // Raw lifecycle identity. Display aliases must never influence
+                // Commissioning/Handed Over scope membership.
+                row.dataset.deviceKey = connection.localDevice;
                 row.className = status.healthClass;
                 
                 setAliasedCell(row.insertCell(0), connection.localDevice, deviceAliasLc);
@@ -967,76 +1114,82 @@
                 
                 row.insertCell(8).textContent = status.health;
             });
+            applyCurrentSortToRenderedTable();
+        }
+
+        function parseLLDPReportData(data) {
+            if (typeof data !== 'string') throw new TypeError('LLDP report must be text');
+            const lines = data.split(/\r?\n/)
+                .map((raw, index) => ({ lineNumber: index + 1, text: raw.trim() }))
+                .filter(entry => entry.text !== '');
+            if (lines.length === 0) throw new Error('LLDP report is empty');
+
+            const createdPrefix = 'Created on ';
+            if (!lines[0].text.startsWith(createdPrefix) ||
+                !parseReportTimestamp(lines[0].text.slice(createdPrefix.length))) {
+                throw new Error('LLDP report has an invalid Created timestamp');
+            }
+
+            const connections = [];
+            let currentDevice = '';
+
+            lines.slice(1).forEach(({ lineNumber, text: line }) => {
+                const deviceMatch = line.match(/^=+\s+(\S+)\s+=+$/);
+                if (deviceMatch) {
+                    currentDevice = deviceMatch[1];
+                    return;
+                }
+                if (/^-{3,}$/.test(line)) return;
+
+                const parts = line.split(/\s+/);
+                const isColumnHeader = parts.length === 7 &&
+                    parts.join('|') === 'Port|Status|Exp-Nbr|Exp-Nbr-Port|Act-Nbr|Act-Nbr-Port|Port-Status';
+                if (isColumnHeader) {
+                    if (!currentDevice) throw new Error(`Line ${lineNumber}: column header before device`);
+                    return;
+                }
+                if (!currentDevice) throw new Error(`Line ${lineNumber}: data before device header`);
+                if (parts.length !== 7) {
+                    throw new Error(`Line ${lineNumber}: expected 7 LLDP columns, got ${parts.length}`);
+                }
+
+                const [localPort, status, expectedDevice, expectedPort,
+                    rawActualDevice, rawActualPort, rawPortStatus] = parts;
+                if (!['Pass', 'Fail', 'No-Info'].includes(status)) {
+                    throw new Error(`Line ${lineNumber}: unsupported LLDP status ${status}`);
+                }
+                const portStatus = rawPortStatus.toUpperCase();
+                if (!['UP', 'DOWN', 'UNKNOWN', 'N/A'].includes(portStatus)) {
+                    throw new Error(`Line ${lineNumber}: unsupported port status ${rawPortStatus}`);
+                }
+                connections.push({
+                    localDevice: currentDevice,
+                    localPort,
+                    expectedDevice,
+                    expectedPort,
+                    actualDevice: isMissingValue(rawActualDevice) ? null : rawActualDevice,
+                    actualPort: isMissingValue(rawActualPort) ? null : rawActualPort,
+                    lldpStatus: status,
+                    portStatus,
+                    originalLine: line
+                });
+            });
+
+            if (connections.length === 0) throw new Error('LLDP report contains no port rows');
+            return connections;
         }
 
         function parseAndDisplayLLDPData(data) {
             const tbody = document.getElementById('lldp-data');
             tbody.innerHTML = '';
-            
-            const lines = data.split('\n');
-            const connections = [];
-            let currentDevice = '';
-            
-            console.log('Total lines to process:', lines.length);
-            
-            // Parse LLDP data based on actual format
-            lines.forEach((line, index) => {
-                line = line.trim();
-                
-                // Extract device name from header lines
-                if (line.includes('===') && line.length > 20) {
-                    const deviceMatch = line.match(/=+\s*(.+?)\s*=+/);
-                    if (deviceMatch) {
-                        currentDevice = deviceMatch[1].trim();
-                        console.log('Found device:', currentDevice);
-                    }
-                    return;
-                }
-                
-                // Skip header and separator lines
-                if (!line || line.startsWith('Port') || line.startsWith('-') || 
-                    line.startsWith('Created') || line.includes('===')) {
-                    return;
-                }
-                
-                // Parse port data lines
-                const parts = line.split(/\s+/);
-                if (parts.length >= 7 && currentDevice) {
-                    const localPort = parts[0];
-                    const status = parts[1];
-                    const expectedDevice = parts[2];
-                    const expectedPort = parts[3];
-                    const actualDevice = parts[4] === 'None' ? null : parts[4];
-                    const actualPort = parts[5] === 'None' ? null : parts[5];
-                    const portStatus = parts[6] || 'N/A';
-                    
-                    connections.push({
-                        localDevice: currentDevice,
-                        localPort: localPort,
-                        expectedDevice: expectedDevice,
-                        expectedPort: expectedPort,
-                        actualDevice: actualDevice,
-                        actualPort: actualPort,
-                        lldpStatus: status,
-                        portStatus: portStatus,
-                        originalLine: line
-                    });
-                } else if (parts.length >= 6) {
-                    console.log('Skipping line (no current device):', line);
-                } else if (currentDevice && parts.length > 0) {
-                    console.log('Skipping line (not enough parts):', line, 'Parts:', parts.length);
-                }
-            });
-            
-            console.log('Total connections parsed:', connections.length);
+            const connections = parseLLDPReportData(data);
 
             // Sort connections - problems first
             connections.sort((a, b) => {
                 const statusA = determineLLDPStatus(a);
                 const statusB = determineLLDPStatus(b);
-                
-                const priority = { 'FAILED': 0, 'NO INFO': 1, 'WARNING': 2, 'SUCCESS': 3 };
-                return priority[statusA.status] - priority[statusB.status];
+                return (LLDP_STATUS_PRIORITY[statusA.status] ?? 4) -
+                    (LLDP_STATUS_PRIORITY[statusB.status] ?? 4);
             });
 
             // Store all connections for filtering
@@ -1075,7 +1228,7 @@
                 
                 // Load all connections after 20ms
                 setTimeout(() => {
-                    renderConnectionsTable(connections);
+                    applyCurrentFilters();
                 }, 20);
             }
             
@@ -1096,90 +1249,112 @@
             warningConnections = 0;
             noInfoConnections = 0;
             updateSummaryCards();
-            setLastUpdated();
+            setLastUpdated(null, null);
         }
-        
-        function setLastUpdated(timestampFromFile) {
-            let dateToUse;
-            
-            if (timestampFromFile) {
-                // Parse "2025-08-05 04-22-30" format from lldp_results.ini
-                const parts = timestampFromFile.trim().split(' ');
-                if (parts.length === 2) {
-                    const datePart = parts[0]; // "2025-08-05"
-                    const timePart = parts[1].replace(/-/g, ':'); // "04-22-30" -> "04:22:30"
-                    dateToUse = new Date(datePart + 'T' + timePart);
-                } else {
-                    // Fallback if format doesn't match
-                    dateToUse = new Date();
-                }
-            } else {
-                // Fallback to current time if no timestamp available
-                dateToUse = new Date();
+
+        function validTimestampParts(year, month, day, hour, minute, second) {
+            if (year < 1000 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) return false;
+            const probe = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+            return probe.getUTCFullYear() === year && probe.getUTCMonth() === month - 1 &&
+                probe.getUTCDate() === day && probe.getUTCHours() === hour &&
+                probe.getUTCMinutes() === minute && probe.getUTCSeconds() === second;
+        }
+
+        function parseReportTimestamp(value) {
+            const input = normalizedValue(value);
+            if (!input) return null;
+
+            // Timezone-aware ISO or report-safe form: YYYY-MM-DD HH-MM-SS +0000.
+            const aware = input.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2})(?::|-)(\d{2})(?::|-)(\d{2})(?:\.(\d{1,9}))?\s*(Z|[+-]\d{2}:?\d{2})$/i);
+            if (aware) {
+                const [, yearText, monthText, dayText, hourText, minuteText, secondText, fraction = '', rawOffset] = aware;
+                const parts = [yearText, monthText, dayText, hourText, minuteText, secondText].map(Number);
+                if (!validTimestampParts(...parts)) return null;
+                const offset = rawOffset.toUpperCase() === 'Z' ? 'Z' :
+                    rawOffset.replace(/^([+-]\d{2})(\d{2})$/, '$1:$2');
+                const milliseconds = fraction ? `.${fraction.slice(0, 3).padEnd(3, '0')}` : '';
+                const parsed = new Date(`${yearText}-${monthText}-${dayText}T${hourText}:${minuteText}:${secondText}${milliseconds}${offset}`);
+                return Number.isNaN(parsed.getTime()) ? null : parsed;
             }
-            
-                    const options = { 
-            year: 'numeric', 
-            month: '2-digit', 
-            day: '2-digit', 
-            hour: '2-digit', 
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: false
-        };
-            const formattedDate = dateToUse.toLocaleString('en-US', options);
-            document.getElementById('last-updated').textContent = formattedDate;
+
+            // Legacy report timestamps have no offset and retain browser-local interpretation.
+            const legacy = input.match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})(?:-(\d{2}))?$/);
+            if (!legacy) return null;
+            const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0'] = legacy;
+            const [year, month, day, hour, minute, second] =
+                [yearText, monthText, dayText, hourText, minuteText, secondText].map(Number);
+            if (!validTimestampParts(year, month, day, hour, minute, second)) return null;
+            const parsed = new Date(year, month - 1, day, hour, minute, second);
+            if (parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 ||
+                parsed.getDate() !== day || parsed.getHours() !== hour ||
+                parsed.getMinutes() !== minute || parsed.getSeconds() !== second) return null;
+            return parsed;
+        }
+
+        function parseLastModifiedHeader(value) {
+            if (!normalizedValue(value)) return null;
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function setLastUpdated(timestampFromFile, lastModifiedHeader) {
+            const dateToUse = parseLastModifiedHeader(lastModifiedHeader) ||
+                parseReportTimestamp(timestampFromFile);
+            const output = document.getElementById('last-updated');
+            if (!dateToUse) {
+                output.textContent = 'Unavailable';
+                return false;
+            }
+            const options = {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+            };
+            output.textContent = dateToUse.toLocaleString('en-US', options);
+            return true;
         }
         
         function setupSummaryCardEvents() {
-            // Total connections card
-            document.getElementById('total-connections').parentElement.addEventListener('click', function() {
-                if (totalConnections > 0) filterConnections('TOTAL');
-            });
-            
-            // Success connections card
-            document.getElementById('success-connections').parentElement.addEventListener('click', function() {
-                if (successConnections > 0) filterConnections('SUCCESS');
-            });
-            
-            // Failed connections card
-            document.getElementById('failed-connections').parentElement.addEventListener('click', function() {
-                if (failedConnections > 0) filterConnections('FAILED');
-            });
-            
-            // Warning connections card
-            document.getElementById('warning-connections').parentElement.addEventListener('click', function() {
-                if (warningConnections > 0) filterConnections('WARNING');
-            });
-            
-            // No info connections card
-            document.getElementById('no-info-connections').parentElement.addEventListener('click', function() {
-                if (noInfoConnections > 0) filterConnections('NO_INFO');
+            const cards = [
+                ['total-connections', 'TOTAL', () => totalConnections],
+                ['success-connections', 'SUCCESS', () => successConnections],
+                ['failed-connections', 'FAILED', () => failedConnections],
+                ['warning-connections', 'WARNING', () => warningConnections],
+                ['no-info-connections', 'NO_INFO', () => noInfoConnections]
+            ];
+            cards.forEach(([valueId, filterType, count]) => {
+                const card = document.getElementById(valueId).parentElement;
+                if (card.dataset.filterEventsBound === 'true') return;
+                card.dataset.filterEventsBound = 'true';
+                const activate = () => { if (count() > 0) filterConnections(filterType); };
+                card.addEventListener('click', activate);
+                card.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    activate();
+                });
             });
         }
 
         function loadLLDPData() {
             fetch('lldp_results.ini')
-                .then(response => {
+                .then(async response => {
                     if (!response.ok) {
                         throw new Error(`Data file not found. Status: ${response.status}`);
                     }
-                    return response.text();
+                    const lastModified = response.headers?.get?.('Last-Modified') || '';
+                    return { data: await response.text(), lastModified };
                 })
-                .then(data => {
+                .then(({ data, lastModified }) => {
+                    const firstLine = data.split(/\r?\n/).find(line => line.trim())?.trim() || '';
+                    const timestampStr = firstLine.startsWith('Created on ')
+                        ? firstLine.slice('Created on '.length)
+                        : '';
+
+                    // Parse first: malformed/truncated reports fail closed into the existing error state.
+                    parseAndDisplayLLDPData(data);
+                    setLastUpdated(timestampStr, lastModified);
                     document.getElementById('loading').style.display = 'none';
                     document.getElementById('lldp-table').style.display = 'table';
-                    
-                    // Extract timestamp from data (first line: "Created on YYYY-MM-DD HH-MM")
-                    const firstLine = data.split('\n')[0];
-                    if (firstLine.startsWith('Created on ')) {
-                        const timestampStr = firstLine.replace('Created on ', '');
-                        setLastUpdated(timestampStr);
-                    } else {
-                        setLastUpdated();
-                    }
-                    
-                    parseAndDisplayLLDPData(data);
                 })
                 .catch(error => {
                     showFallbackContent();
@@ -1187,14 +1362,14 @@
         }
 
         // Generic table sorting functionality
-        let currentSort = { column: -1, direction: 'asc' };
-        
         function initTableSorting() {
             const headers = document.querySelectorAll('.sortable');
             headers.forEach(header => {
-                header.addEventListener('click', function() {
-                    const column = parseInt(this.dataset.column);
-                    const type = this.dataset.type;
+                header.tabIndex = 0;
+                header.setAttribute('aria-sort', 'none');
+                const activate = () => {
+                    const column = parseInt(header.dataset.column);
+                    const type = header.dataset.type;
                     
                     // Toggle sort direction
                     if (currentSort.column === column) {
@@ -1203,23 +1378,41 @@
                         currentSort.direction = 'asc';
                     }
                     currentSort.column = column;
+                    currentSort.type = type;
                     
                     // Update header styling
-                    headers.forEach(h => h.classList.remove('asc', 'desc'));
-                    this.classList.add(currentSort.direction);
+                    headers.forEach(h => {
+                        h.classList.remove('asc', 'desc');
+                        h.setAttribute('aria-sort', 'none');
+                    });
+                    header.classList.add(currentSort.direction);
+                    header.setAttribute('aria-sort', currentSort.direction === 'asc' ? 'ascending' : 'descending');
                     
                     // Sort table
                     sortLLDPTable(column, currentSort.direction, type);
+                };
+                header.addEventListener('click', activate);
+                header.addEventListener('keydown', event => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    activate();
                 });
             });
+        }
+
+        function applyCurrentSortToRenderedTable() {
+            if (currentSort.column < 0) return;
+            sortLLDPTable(currentSort.column, currentSort.direction, currentSort.type);
         }
         
         function sortLLDPTable(columnIndex, direction, type) {
             const table = document.getElementById('lldp-table');
             const tbody = table.querySelector('tbody');
             const rows = Array.from(tbody.rows);
+            const sortableRows = rows.filter(row => row.cells && row.cells.length > columnIndex);
+            const passthroughRows = rows.filter(row => !row.cells || row.cells.length <= columnIndex);
             
-            rows.sort((a, b) => {
+            sortableRows.sort((a, b) => {
                 let aVal = a.cells[columnIndex].textContent.trim();
                 let bVal = b.cells[columnIndex].textContent.trim();
                 
@@ -1252,36 +1445,31 @@
             
             // Clear tbody and add sorted rows back
             tbody.innerHTML = '';
-            rows.forEach(row => tbody.appendChild(row));
+            sortableRows.concat(passthroughRows).forEach(row => tbody.appendChild(row));
         }
         
         function comparePort(a, b) {
+            if (a === 'N/A' && b === 'N/A') return 0;
             if (a === 'N/A') return 1;
             if (b === 'N/A') return -1;
-            
-            // Handle port sorting (swp1, swp10, swp1s0, etc.)
-            const extractPortNumber = (port) => {
-                const match = port.match(/swp(\d+)(?:s(\d+))?/);
-                if (match) {
-                    const mainPort = parseInt(match[1]);
-                    const subPort = match[2] ? parseInt(match[2]) : 0;
-                    return mainPort * 1000 + subPort; // swp1 = 1000, swp1s0 = 1000, swp1s1 = 1001
-                }
-                return port.localeCompare(b, undefined, { numeric: true });
+
+            const swpParts = port => {
+                const match = normalizedValue(port).match(/^swp(\d+)(?:s(\d+))?$/i);
+                return match ? [Number(match[1]), match[2] ? Number(match[2]) : 0] : null;
             };
-            
-            return extractPortNumber(a) - extractPortNumber(b);
+            const aParts = swpParts(a);
+            const bParts = swpParts(b);
+            if (aParts && bParts) {
+                return (aParts[0] - bParts[0]) || (aParts[1] - bParts[1]);
+            }
+            return normalizedValue(a).localeCompare(normalizedValue(b), undefined, {
+                numeric: true,
+                sensitivity: 'base'
+            });
         }
         
         function compareLLDPStatus(a, b) {
-            const priority = {
-                'FAILED': 0,
-                'WARNING': 1,
-                'NO INFO': 2,
-                'SUCCESS': 3
-            };
-            
-            return (priority[a] || 4) - (priority[b] || 4);
+            return (LLDP_STATUS_PRIORITY[a] ?? 4) - (LLDP_STATUS_PRIORITY[b] ?? 4);
         }
         
         function comparePortStatus(a, b) {
@@ -1351,6 +1539,9 @@
             const color = colors[kind] || colors.queued;
             if (!lldpStatusNotification) {
                 lldpStatusNotification = document.createElement('div');
+                lldpStatusNotification.setAttribute('role', 'status');
+                lldpStatusNotification.setAttribute('aria-live', 'polite');
+                lldpStatusNotification.setAttribute('aria-atomic', 'true');
                 lldpStatusNotification.style.cssText = `
                     position: fixed;
                     top: 20px;
@@ -1551,6 +1742,52 @@
         });
 
         // CSV Download Function
+        const CSV_HEADERS = Object.freeze([
+            'Local Device', 'Local Port', 'Port Status', 'Expected Neighbor', 'Expected Port',
+            'Active Neighbor', 'Active Port', 'Status', 'Connection Health'
+        ]);
+
+        function spreadsheetSafeValue(value) {
+            const text = displayValue(value);
+            return /^\s*[=+\-@]/.test(text) ? `'${text}` : text;
+        }
+
+        function csvField(value) {
+            const text = spreadsheetSafeValue(value);
+            return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+        }
+
+        function canonicalConnectionRow(connection) {
+            const status = determineLLDPStatus(connection);
+            return [
+                connection.localDevice,
+                connection.localPort,
+                connection.portStatus,
+                connection.expectedDevice,
+                connection.expectedPort,
+                connection.actualDevice,
+                connection.actualPort,
+                status.status,
+                status.health
+            ].map(displayValue);
+        }
+
+        function buildLLDPCSV(connections) {
+            const lines = [CSV_HEADERS.map(csvField).join(',')];
+            connections.forEach(connection => {
+                lines.push(canonicalConnectionRow(connection).map(csvField).join(','));
+            });
+            return lines.join('\r\n') + '\r\n';
+        }
+
+        function renderedConnectionsInTableOrder() {
+            const rows = document.querySelectorAll('#lldp-data tr');
+            return Array.from(rows)
+                .filter(row => row.style.display !== 'none')
+                .map(row => rowConnectionMap.get(row))
+                .filter(Boolean);
+        }
+
         function downloadCSV() {
             try {
                 // Get current date + active filter for filename
@@ -1561,76 +1798,19 @@
                 const textFilter = document.getElementById('tableFilter').value.trim();
                 const textSuffix = textFilter ? `_${textFilter.replace(/[^a-zA-Z0-9-]/g, '')}` : '';
                 const filename = `LLDP_Report${filterSuffix}${textSuffix}_${dateStr}_${timeStr}.csv`;
-                
-                // Create CSV header
-                const headers = [
-                    'Local Device',
-                    'Local Port',
-                    'Port Status',
-                    'Expected Neighbor',
-                    'Expected Port',
-                    'Active Neighbor',
-                    'Active Port',
-                    'Status',
-                    'Connection Health'
-                ];
-                
-                let csvContent = headers.join(',') + '\n';
-                
-                // Get table data (only visible rows)
-                const table = document.getElementById('lldp-table');
-                const tbody = table.querySelector('tbody');
-                const rows = tbody.querySelectorAll('tr');
-                
-                // Add summary stats as comments
-                csvContent += `# LLDP Connection Summary Report\n`;
-                csvContent += `# Generated: ${now.toLocaleString()}\n`;
-                csvContent += `# Total Ports: ${document.getElementById('total-connections').textContent}\n`;
-                csvContent += `# Successful Ports: ${document.getElementById('success-connections').textContent}\n`;
-                csvContent += `# Failed Ports: ${document.getElementById('failed-connections').textContent}\n`;
-                csvContent += `# Warning Ports: ${document.getElementById('warning-connections').textContent}\n`;
-                csvContent += `# No Information: ${document.getElementById('no-info-connections').textContent}\n`;
-                csvContent += `#\n`;
-                
-                // Process each visible row
-                rows.forEach(row => {
-                    if (row.style.display !== 'none') {
-                        const cells = row.querySelectorAll('td');
-                        if (cells.length >= 8) {
-                            const rowData = [
-                                cells[0].textContent.trim(), // Device
-                                cells[1].textContent.trim(), // Local Port
-                                cells[2].textContent.trim(), // Port Status
-                                cells[3].textContent.trim(), // Expected Neighbor
-                                cells[4].textContent.trim(), // Expected Port
-                                cells[5].textContent.trim(), // Active Neighbor
-                                cells[6].textContent.trim(), // Active Port
-                                cells[7].textContent.trim(), // Status
-                                cells[8].textContent.trim()  // Health
-                            ];
-                            
-                            // Escape commas and quotes in data
-                            const escapedData = rowData.map(field => {
-                                if (field.includes(',') || field.includes('"') || field.includes('\n')) {
-                                    return '"' + field.replace(/"/g, '""') + '"';
-                                }
-                                return field;
-                            });
-                            
-                            csvContent += escapedData.join(',') + '\n';
-                        }
-                    }
-                });
+                const csvContent = buildLLDPCSV(renderedConnectionsInTableOrder());
                 
                 // Create and trigger download
                 const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
+                const objectUrl = URL.createObjectURL(blob);
+                link.href = objectUrl;
                 link.download = filename;
                 link.style.display = 'none';
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
                 
                 console.log(`✅ CSV downloaded: ${filename}`);
                 
@@ -1661,7 +1841,9 @@
                     if (typeof data.text === 'undefined') {
                         return null;
                     }
-                    if (data.text.toLowerCase().indexOf(params.term.toLowerCase()) > -1) {
+                    const searchable = [data.text, data.element?.dataset?.alias || '']
+                        .join(' ').toLowerCase();
+                    if (searchable.indexOf(params.term.toLowerCase()) > -1) {
                         return data;
                     }
                     return null;
@@ -1675,20 +1857,27 @@
             });
         }
         
-        function populateDeviceList() {
-            // Collect all unique device names from connections
+        function localDeviceOptions(connections) {
             const deviceSet = new Set();
-            
-            allConnections.forEach(conn => {
+            connections.forEach(conn => {
                 if (conn.localDevice) deviceSet.add(conn.localDevice);
-                if (conn.expectedDevice && conn.expectedDevice !== 'N/A') deviceSet.add(conn.expectedDevice);
-                if (conn.actualDevice && conn.actualDevice !== 'N/A') deviceSet.add(conn.actualDevice);
             });
-            
-            // Sort devices alphabetically
-            const sortedDevices = Array.from(deviceSet).sort((a, b) => 
+            return Array.from(deviceSet).sort((a, b) =>
                 a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
             );
+        }
+
+        function updateDeviceOptionAliases() {
+            document.querySelectorAll('#deviceSearch option').forEach(option => {
+                const alias = aliasForValue(option.value, deviceAliasLc);
+                if (alias) option.dataset.alias = alias;
+                else delete option.dataset.alias;
+            });
+        }
+
+        function populateDeviceList() {
+            // This selector filters the Local Device column, so expose only local devices.
+            const sortedDevices = localDeviceOptions(allConnections);
             
             // Clear existing options and populate
             const select = document.getElementById('deviceSearch');
@@ -1698,6 +1887,8 @@
                 const option = document.createElement('option');
                 option.value = device;
                 option.textContent = device;
+                const alias = aliasForValue(device, deviceAliasLc);
+                if (alias) option.dataset.alias = alias;
                 select.appendChild(option);
             });
             
@@ -1710,32 +1901,10 @@
         function applyDeviceFilter(devices) {
             devices = (devices || []).filter(Boolean);
             selectedDevices = devices;
-            
-            // No devices selected -> behave like "show all"
-            if (devices.length === 0) {
-                deviceSearchActive = false;
-                document.getElementById('clearSearchBtn').style.display = 'none';
-                document.getElementById('filter-info').style.display = 'none';
-                renderConnectionsTable(allConnections);
-                return;
-            }
-            
-            deviceSearchActive = true;
-            
-            // Clear card-based filter
-            currentFilter = 'ALL';
-            document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
-            
-            // Connections whose LOCAL DEVICE is one of the selected devices (local column only)
-            const set = new Set(devices);
-            const filteredConnections = allConnections.filter(conn => set.has(conn.localDevice));
-            
-            document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent =
-                `Showing ${filteredConnections.length} connections for ${devices.length} device${devices.length > 1 ? 's' : ''}: ${devices.join(', ')}`;
-            document.getElementById('clearSearchBtn').style.display = 'inline-block';
-            
-            renderConnectionsTable(filteredConnections);
+            deviceSearchActive = devices.length > 0;
+            document.getElementById('clearSearchBtn').style.display =
+                deviceSearchActive ? 'inline-block' : 'none';
+            applyCurrentFilters();
         }
         
         function clearDeviceSearch() {
@@ -1748,8 +1917,7 @@
             _suppressDeviceChange = false;
             
             document.getElementById('clearSearchBtn').style.display = 'none';
-            document.getElementById('filter-info').style.display = 'none';
-            renderConnectionsTable(allConnections);
+            applyCurrentFilters();
         }
 
         // Load data when page loads
@@ -1761,8 +1929,33 @@
 
         // ===== Topology Editor Functions =====
         let topologyEditorCM = null;
+        let topologyRevision = null;
+
+        function rememberTopologyRevision(data) {
+            if (data && typeof data.revision === 'string' && data.revision.trim()) {
+                topologyRevision = data.revision.trim();
+                return true;
+            }
+            return false;
+        }
+
+        function topologySavePayload(content) {
+            return { content: content, expected_revision: topologyRevision };
+        }
+
+        function topologySaveIsReady() {
+            return typeof topologyRevision === 'string' && topologyRevision.length > 0;
+        }
+
+        function topologySaveError(data) {
+            if (data && data.conflict) {
+                return 'Conflict: topology.dot changed since it was loaded. Close and reopen the editor before saving.';
+            }
+            return 'Error: ' + ((data && data.error) || 'Topology save failed');
+        }
         
         function openTopologyEditor() {
+            topologyRevision = null;
             document.getElementById('topologyEditorModal').style.display = 'flex';
             document.getElementById('topologyEditorStatus').textContent = 'Loading...';
             
@@ -1770,6 +1963,7 @@
                 .then(response => response.json())
                 .then(data => {
                     if (data.success) {
+                        rememberTopologyRevision(data);
                         // Initialize CodeMirror if not already done
                         if (!topologyEditorCM) {
                             topologyEditorCM = CodeMirror(document.getElementById('topologyEditorContainer'), {
@@ -1878,22 +2072,28 @@
 
         function saveTopologyOnly() {
             const content = topologyEditorCM ? topologyEditorCM.getValue() : '';
+            if (!topologySaveIsReady()) {
+                document.getElementById('topologyEditorStatus').textContent =
+                    'Error: Reload the topology before saving.';
+                return;
+            }
             document.getElementById('topologyEditorStatus').textContent = 'Saving...';
             
             fetch('/edit-topology', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: content })
+                body: JSON.stringify(topologySavePayload(content))
             })
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
+                    rememberTopologyRevision(data);
                     document.getElementById('topologyEditorStatus').textContent = 'Saved successfully!';
                     setTimeout(() => {
                         document.getElementById('topologyEditorStatus').textContent = '';
                     }, 3000);
                 } else {
-                    document.getElementById('topologyEditorStatus').textContent = 'Error: ' + data.error;
+                    document.getElementById('topologyEditorStatus').textContent = topologySaveError(data);
                 }
             })
             .catch(err => {
@@ -1903,21 +2103,27 @@
 
         function saveTopologyAndRun() {
             const content = topologyEditorCM ? topologyEditorCM.getValue() : '';
+            if (!topologySaveIsReady()) {
+                document.getElementById('topologyEditorStatus').textContent =
+                    'Error: Reload the topology before saving.';
+                return;
+            }
             document.getElementById('topologyEditorStatus').textContent = 'Saving...';
             
             fetch('/edit-topology', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content: content })
+                body: JSON.stringify(topologySavePayload(content))
             })
             .then(response => response.json())
             .then(data => {
                 if (data.success) {
+                    rememberTopologyRevision(data);
                     document.getElementById('topologyEditorStatus').textContent = 'Saved! Running LLDP check...';
                     closeTopologyEditorModal();
                     runLLDPCheck();
                 } else {
-                    document.getElementById('topologyEditorStatus').textContent = 'Error: ' + data.error;
+                    document.getElementById('topologyEditorStatus').textContent = topologySaveError(data);
                 }
             })
             .catch(err => {

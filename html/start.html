@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <style>
         * {
             margin: 0;
@@ -20,6 +21,10 @@
             overflow-x: hidden;
             overflow-y: auto;
         }
+
+        /* Admin shortcuts stay fail-closed until the authenticated role is known. */
+        .admin-only-tool { display: none; }
+        body.lldpq-admin .admin-only-tool { display: block; }
         
         .dashboard-container {
             max-width: 1400px;
@@ -344,13 +349,13 @@
             </div>
             <div class="section-content">
             <div class="summary-grid">
-                <div class="summary-card" style="border-left-color: #78909c;" onclick="window.location.href='setup.html'">
+                <div class="summary-card admin-only-tool" style="border-left-color: #78909c;" onclick="window.location.href='setup.html'">
                     <div class="card-value" style="color: #b0bec5;">
                         <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
                     </div>
                     <div class="card-label">Setup</div>
                 </div>
-                <div class="summary-card" style="border-left-color: #ff9800;" onclick="window.location.href='provision.html'">
+                <div class="summary-card admin-only-tool" style="border-left-color: #ff9800;" onclick="window.location.href='provision.html'">
                     <div class="card-value" style="color: #ffb74d;">
                         <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
                     </div>
@@ -610,7 +615,7 @@
                 </a>
                 <a class="summary-card card-info" id="dup-mac-card" href="/monitor-results/duplicate-analysis.html">
                     <div class="card-value status-info" id="dup-mac">--</div>
-                    <div class="card-label">MAC Duplicates</div>
+                    <div class="card-label">Confirmed MAC Conflicts</div>
                 </a>
             </div>
             </div>
@@ -726,7 +731,23 @@
     </div>
 
     <script>
-        let dashboardPipelineState = { marker: null, manifest: null };
+        const DASHBOARD_DEFAULT_MAX_AGE_SECONDS = 30 * 60;
+        const DASHBOARD_STATUS_POLL_MILLISECONDS = 5000;
+        let dashboardPipelineState = {
+            marker: null,
+            manifest: null,
+            manifestValid: false,
+            generation: null,
+            metadataReliable: false
+        };
+        let dashboardStatusPollTimer = null;
+        let dashboardStatusPollInFlight = false;
+        let dashboardStatusInitialized = false;
+        let dashboardObservedGeneration = null;
+        let dashboardRenderedGeneration = null;
+        let dashboardRefreshRequestedGeneration = null;
+        let dashboardRefreshInFlight = false;
+        let dashboardQueuedRefreshGeneration = null;
 
         function noCacheUrl(path) {
             return path + (path.includes('?') ? '&' : '?') + '_=' + Date.now();
@@ -741,25 +762,143 @@
             return marker;
         }
 
-        async function readDashboardPipelineState() {
+        function validateDashboardManifest(manifest) {
+            if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) ||
+                manifest.status !== 'current' || manifest.pipeline_complete !== true ||
+                typeof manifest.pipeline_id !== 'string' || !manifest.pipeline_id.trim() ||
+                !Number.isInteger(manifest.device_count) || manifest.device_count < 0 ||
+                !Array.isArray(manifest.analyses) || !Array.isArray(manifest.skipped)) {
+                return null;
+            }
+            if (manifest.analyses.some(item => typeof item !== 'string' || !item) ||
+                manifest.skipped.some(item => typeof item !== 'string' || !item)) {
+                return null;
+            }
+            const requiredAnalyses = ['bgp', 'flap', 'ber', 'hardware', 'log', 'duplicate'];
+            if (requiredAnalyses.some(name => !manifest.analyses.includes(name)) ||
+                (!manifest.skipped.includes('optical') && !manifest.analyses.includes('optical'))) {
+                return null;
+            }
+
+            const completedAt = new Date(manifest.completed_at);
+            const completedEpoch = completedAt.getTime();
+            const configuredMaxAge = Number(manifest.max_age_seconds);
+            const maxAgeSeconds = Number.isFinite(configuredMaxAge) && configuredMaxAge >= 0
+                ? configuredMaxAge
+                : DASHBOARD_DEFAULT_MAX_AGE_SECONDS;
+            const ageMilliseconds = Date.now() - completedEpoch;
+            if (!Number.isFinite(completedEpoch) || ageMilliseconds < -300000 ||
+                ageMilliseconds > maxAgeSeconds * 1000) {
+                return null;
+            }
+
+            const expectedPaths = {
+                assets: '.pipeline-inputs/assets.ini',
+                lldp: '.pipeline-inputs/lldp_results.ini'
+            };
+            if (!manifest.sources || typeof manifest.sources !== 'object') return null;
+            for (const [name, expectedPath] of Object.entries(expectedPaths)) {
+                const identity = manifest.sources[name];
+                if (!identity || typeof identity !== 'object' ||
+                    identity.path !== expectedPath ||
+                    typeof identity.sha256 !== 'string' ||
+                    !/^[a-f0-9]{64}$/i.test(identity.sha256) ||
+                    !Number.isInteger(identity.size) || identity.size < 0 ||
+                    typeof identity.created_header !== 'string' ||
+                    !identity.created_header.startsWith('Created on ')) {
+                    return null;
+                }
+            }
+
+            return {
+                completedAt,
+                maxAgeSeconds,
+                generation: JSON.stringify([
+                    manifest.pipeline_id,
+                    manifest.completed_at,
+                    manifest.sources.assets.sha256,
+                    manifest.sources.lldp.sha256
+                ])
+            };
+        }
+
+        async function sha256Hex(bytes) {
+            if (!globalThis.crypto || !globalThis.crypto.subtle) return null;
+            const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+            return Array.from(new Uint8Array(digest), byte =>
+                byte.toString(16).padStart(2, '0')
+            ).join('');
+        }
+
+        async function fetchImmutablePipelineInput(sourceName, pipelineState) {
+            if (!pipelineState?.manifestValid || !pipelineState.manifest) return null;
+            const identity = pipelineState.manifest.sources?.[sourceName];
+            const expectedPath = sourceName === 'assets'
+                ? '.pipeline-inputs/assets.ini'
+                : sourceName === 'lldp'
+                    ? '.pipeline-inputs/lldp_results.ini'
+                    : null;
+            if (!identity || identity.path !== expectedPath) return null;
+
+            const response = await fetch(
+                noCacheUrl(`monitor-results/${identity.path}`),
+                { cache: 'no-store' }
+            );
+            if (!response.ok) return null;
+            const bytes = await response.arrayBuffer();
+            if (bytes.byteLength !== identity.size) return null;
+            const digest = await sha256Hex(bytes);
+            if (digest !== null && digest.toLowerCase() !== identity.sha256.toLowerCase()) {
+                return null;
+            }
+            const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+            if (text.split(/\r?\n/, 1)[0] !== identity.created_header) return null;
+            return text;
+        }
+
+        async function readDashboardMarkerState() {
             let marker = null;
-            let manifest = null;
+            let markerReadSuccessful = false;
             try {
                 const response = await fetch(noCacheUrl('monitor-results/.lldpq-stale'), { cache: 'no-store' });
-                if (response.ok) marker = parsePipelineMarker(await response.text());
+                if (response.status === 404) {
+                    markerReadSuccessful = true;
+                } else if (response.ok) {
+                    marker = parsePipelineMarker(await response.text());
+                    if (!['collecting', 'stale'].includes(marker.status)) {
+                        marker = { status: 'stale', reason: 'invalid pipeline marker' };
+                    }
+                    markerReadSuccessful = true;
+                }
             } catch (error) {}
+            return { marker, reliable: markerReadSuccessful };
+        }
+
+        async function readDashboardPipelineState() {
+            const markerState = await readDashboardMarkerState();
+            let manifest = null;
+            let manifestReadSuccessful = false;
             try {
                 const response = await fetch(noCacheUrl('monitor-results/.lldpq-current.json'), { cache: 'no-store' });
-                if (response.ok) manifest = await response.json();
+                if (response.ok) {
+                    manifest = await response.json();
+                    manifestReadSuccessful = true;
+                }
             } catch (error) {}
-            dashboardPipelineState = { marker, manifest };
+            const validation = validateDashboardManifest(manifest);
+            dashboardPipelineState = {
+                marker: markerState.marker,
+                manifest,
+                manifestValid: Boolean(validation),
+                generation: validation?.generation || null,
+                metadataReliable: markerState.reliable && manifestReadSuccessful
+            };
             return dashboardPipelineState;
         }
 
         // Show the report generation time, not the viewer's current clock.
-        async function setLastUpdated() {
-            const state = await readDashboardPipelineState();
-            const completedAt = state.manifest && state.manifest.completed_at;
+        function renderLastUpdated(state) {
+            const completedAt = state.manifestValid && state.manifest?.completed_at;
             const reportDate = completedAt ? new Date(completedAt) : null;
             const options = { 
                 year: 'numeric', 
@@ -827,7 +966,7 @@
         }
 
         function dashboardMetric(data, value) {
-            return data && data.unavailable ? 'N/A' : value;
+            return data && (data.unavailable || data.skipped) ? 'N/A' : value;
         }
 
         function duplicateDashboardMetric(data, value) {
@@ -909,17 +1048,16 @@
                 }
             }
 
-            // The Duplicate report intentionally has a small dashboard contract: active
-            // IP duplicates, quiesced IP duplicates and optional collection coverage.
-            // Ignore MAC, APIPA, mobility and loop cards; those are report details, not
-            // top-level health signals.
+            // Keep the top-level contract narrow: active/quiesced IP duplicates and
+            // confirmed simultaneous MAC conflicts. DAD and mobility remain separate
+            // report details and must not be folded into the conflict count.
             doc.querySelectorAll('.summary-card').forEach(card => {
                 const label = (card.querySelector('.metric-label')?.textContent || '').trim().toLowerCase();
                 const value = (card.querySelector('.metric')?.textContent || '').trim();
                 if (!label) return;
                 if (label.includes('active ip duplicate')) putMetric('ip_active', value);
                 else if (label.includes('quiesced ip')) putMetric('ip_quiesced', value);
-                else if (label.includes('mac duplicate')) putMetric('mac_duplicates', value);
+                else if (label.includes('confirmed mac conflict')) putMetric('confirmed_mac_total', value);
                 else if (label.includes('coverage') && label.includes('current') && label.includes('expected')) {
                     const ratio = value.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
                     if (ratio) {
@@ -950,8 +1088,9 @@
             ) ?? duplicateMetricNumber(metadata?.dataset?.confirmedIpActive);
             const quiescedIp = numberFor('ip_quiesced', 'quiesced_ip_duplicates') ??
                 duplicateMetricNumber(metadata?.dataset?.ipQuiesced);
-            const macDuplicates = numberFor('mac_duplicates', 'mac_duplicate_count') ??
-                duplicateMetricNumber(metadata?.dataset?.macDuplicates);
+            const confirmedMacConflicts = numberFor(
+                'confirmed_mac_total'
+            ) ?? duplicateMetricNumber(metadata?.dataset?.confirmedMacTotal);
             const coverageExpected = numberFor('coverage_expected_hosts', 'coverage_expected') ??
                 duplicateMetricNumber(metadata?.dataset?.coverageExpected);
             const coverageCurrent = numberFor('coverage_current_hosts', 'coverage_current') ??
@@ -984,7 +1123,7 @@
             return {
                 confirmedIpActive,
                 quiescedIp,
-                macDuplicates,
+                confirmedMacConflicts,
                 coverageExpected,
                 coverageCurrent,
                 coverageFailures,
@@ -995,116 +1134,196 @@
             };
         }
 
+        function unavailableAssetsSummary() {
+            return { unavailable: true, coveragePartial: true };
+        }
+
+        function summarizeAssetsReport(text, expectedDevices) {
+            if (typeof text !== 'string') return null;
+            const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+            if (lines.length < 3 ||
+                !/^Created on \d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}$/.test(lines[0])) {
+                return null;
+            }
+            const expectedHeader = [
+                'DEVICE-NAME', 'IP', 'ETH0-MAC', 'SERIAL', 'MODEL',
+                'RELEASE', 'UPTIME', 'STATUS', 'LAST-SEEN'
+            ];
+            const header = lines[1].split(/\s+/);
+            if (header.length !== expectedHeader.length ||
+                header.some((value, index) => value !== expectedHeader[index])) {
+                return null;
+            }
+
+            const summary = {
+                createdAt: lines[0].slice('Created on '.length),
+                totalDevices: 0,
+                successful: 0,
+                failed: 0,
+                warning: 0,
+                noInfo: 0,
+                unavailable: false,
+                coveragePartial: false
+            };
+            const seen = new Set();
+            for (const line of lines.slice(2)) {
+                const parts = line.split(/\s+/);
+                if ((parts.length !== 9 && parts.length !== 10) || seen.has(parts[0])) {
+                    return null;
+                }
+                seen.add(parts[0]);
+                const status = parts[7].toUpperCase();
+                if (status === 'OK') summary.successful++;
+                else if (status === 'UNREACHABLE' || status === 'SSH-FAILED') summary.failed++;
+                else if (status === 'NO-INFO') summary.noInfo++;
+                else return null;
+                summary.totalDevices++;
+            }
+            if (Number.isInteger(expectedDevices) && summary.totalDevices !== expectedDevices) {
+                return null;
+            }
+            return summary;
+        }
+
+        async function fetchAssetsSummary(pipelineState) {
+            try {
+                const text = await fetchImmutablePipelineInput('assets', pipelineState);
+                if (text === null) return unavailableAssetsSummary();
+                const summary = summarizeAssetsReport(
+                    text, pipelineState.manifest.device_count
+                );
+                return summary || unavailableAssetsSummary();
+            } catch (error) {
+                console.warn('Failed to fetch assets data:', error);
+                return unavailableAssetsSummary();
+            }
+        }
+
+        function unavailableLldpSummary() {
+            return { unavailable: true, coveragePartial: true };
+        }
+
+        function validLldpCalendarParts(year, month, day, hour, minute, second) {
+            const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+            const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30,
+                31, 31, 30, 31, 30, 31];
+            return year > 0 && month >= 1 && month <= 12 && day >= 1 &&
+                day <= daysInMonth[month - 1] && hour >= 0 && hour <= 23 &&
+                minute >= 0 && minute <= 59 && second >= 0 && second <= 59;
+        }
+
+        function parseLldpCreatedHeader(line) {
+            if (typeof line !== 'string') return null;
+            const header = line.trim();
+            let match = header.match(
+                /^Created on (\d{4})-(\d{2})-(\d{2}) (\d{2})-(\d{2})(?:-(\d{2}))?$/
+            );
+            if (match) {
+                const values = match.slice(1, 7).map((value, index) =>
+                    index === 5 && value === undefined ? 0 : Number(value)
+                );
+                return validLldpCalendarParts(...values)
+                    ? { header, timezoneAware: false }
+                    : null;
+            }
+
+            match = header.match(
+                /^Created on (\d{4})-(\d{2})-(\d{2})[T ](\d{2})(?::|-)(\d{2})(?::|-)(\d{2})(?:\.(\d+))?\s*(Z|[+-](\d{2}):?(\d{2}))$/i
+            );
+            if (!match) return null;
+            const dateValues = match.slice(1, 7).map(Number);
+            const offsetHour = match[9] === undefined ? 0 : Number(match[9]);
+            const offsetMinute = match[10] === undefined ? 0 : Number(match[10]);
+            if (!validLldpCalendarParts(...dateValues) || offsetHour > 23 ||
+                offsetMinute > 59) return null;
+            return { header, timezoneAware: true };
+        }
+
+        function summarizeLldpReport(text) {
+            if (typeof text !== 'string') return null;
+            const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+            if (!lines.length) return null;
+            const created = parseLldpCreatedHeader(lines[0]);
+            if (!created) return null;
+
+            const summary = {
+                createdAt: created.header,
+                timestampTimezoneAware: created.timezoneAware,
+                totalConnections: 0,
+                successful: 0,
+                failed: 0,
+                warning: 0,
+                noInfo: 0,
+                unavailable: false,
+                coveragePartial: false
+            };
+            const expectedHeader = [
+                'Port', 'Status', 'Exp-Nbr', 'Exp-Nbr-Port',
+                'Act-Nbr', 'Act-Nbr-Port', 'Port-Status'
+            ];
+            const validStatus = new Set(['Pass', 'Fail', 'No-Info']);
+            const validPortStatus = new Set(['UP', 'DOWN', 'UNKNOWN', 'N/A']);
+            let currentDevice = '';
+
+            for (const line of lines.slice(1)) {
+                const deviceMatch = line.match(/^=+\s+(\S+)\s+=+$/);
+                if (deviceMatch) {
+                    currentDevice = deviceMatch[1];
+                    continue;
+                }
+                if (/^-{3,}$/.test(line)) continue;
+
+                const parts = line.split(/\s+/);
+                if (parts.length === expectedHeader.length &&
+                    parts.every((value, index) => value === expectedHeader[index])) {
+                    if (!currentDevice) return null;
+                    continue;
+                }
+                if (!currentDevice || parts.length !== 7 || !validStatus.has(parts[1])) {
+                    return null;
+                }
+                const portStatus = parts[6].toUpperCase();
+                if (!validPortStatus.has(portStatus)) return null;
+
+                summary.totalConnections++;
+                const localPort = parts[0].trim().toLowerCase();
+                if (localPort === 'none' || localPort === 'n/a') summary.failed++;
+                else if (parts[1] === 'Pass') summary.successful++;
+                else if (parts[1] === 'No-Info') summary.noInfo++;
+                else if (portStatus === 'DOWN') summary.failed++;
+                else summary.warning++;
+            }
+
+            const classified = summary.successful + summary.failed +
+                summary.warning + summary.noInfo;
+            return summary.totalConnections > 0 && summary.totalConnections === classified
+                ? summary
+                : null;
+        }
+
         // Fetch summary data directly from data files
-        async function fetchRawDataSummary(dataType) {
+        async function fetchRawDataSummary(dataType, pipelineState = dashboardPipelineState) {
             try {
                 let summaryData = {};
+                if (!pipelineState?.manifestValid) {
+                    return { unavailable: true, coveragePartial: true };
+                }
                 
                 if (dataType === 'assets') {
-                    // Parse assets.ini file with same logic as assets.html
-                    const assetsResponse = await fetch('assets.ini');
-                    if (!assetsResponse.ok) return { unavailable: true, coveragePartial: true };
-                    const assetsText = await assetsResponse.text();
-                    const assetsLines = assetsText.split('\n').filter(line => 
-                        line.trim() && 
-                        !line.startsWith('DEVICE-NAME') && 
-                        !line.startsWith('Created on')
-                    );
-                    
-                    summaryData.totalDevices = assetsLines.length;
-                    summaryData.successful = 0;
-                    summaryData.failed = 0;
-                    summaryData.warning = 0;
-                    summaryData.noInfo = 0;
-                    
-                    // Parse the dedicated STATUS column emitted by assets.sh.
-                    // Cached UNREACHABLE rows deliberately retain their previous
-                    // IP/MAC/uptime, so inferring health from those fields makes a
-                    // currently unreachable device look successful.
-                    assetsLines.forEach(line => {
-                        if (!line.trim()) return;
-                        
-                        const parts = line.trim().split(/\s+/);
-                        if (parts.length < 6) return;
-                        
-                        const ipAddress = parts[1];
-                        const macAddress = parts[2];
-                        const uptime = parts[6] || '';
-                        const rawStatus = String(parts[7] || '').toUpperCase();
-
-                        if (rawStatus === 'OK') {
-                            summaryData.successful++;
-                        } else if (rawStatus === 'UNREACHABLE') {
-                            summaryData.warning++;
-                        } else if (rawStatus === 'SSH-FAILED') {
-                            summaryData.failed++;
-                        } else if (rawStatus === 'NO-INFO') {
-                            summaryData.noInfo++;
-                        } else if (rawStatus.includes('FAIL') || rawStatus.includes('ERROR')) {
-                            summaryData.failed++;
-                        } else if (!rawStatus && (
-                                   !ipAddress || ipAddress === 'N/A' || ipAddress === 'No-Info' ||
-                                   !macAddress || macAddress === 'N/A' || macAddress === 'No-Info')) {
-                            summaryData.noInfo++;
-                        } else if (!rawStatus && uptime.includes('up-') && ipAddress && macAddress) {
-                            // Backward compatibility for legacy seven-column files.
-                            summaryData.successful++;
-                        } else {
-                            summaryData.warning++;
-                        }
-                    });
+                    return await fetchAssetsSummary(pipelineState);
                     
                 } else if (dataType === 'lldp') {
-                    // Parse lldp_results.ini with same logic as lldp.html for calculating warnings
-                    const response = await fetch('lldp_results.ini');
-                    if (!response.ok) return { unavailable: true, coveragePartial: true };
-                    const text = await response.text();
-                    const lines = text.split('\n');
-                    
-                    summaryData.totalConnections = 0;
-                    summaryData.successful = 0;
-                    summaryData.failed = 0;
-                    summaryData.warning = 0;
-                    summaryData.noInfo = 0;
-                    
-                    lines.forEach(line => {
-                        // Look for port status lines (swp + status pattern)
-                        if (line.includes('swp') && (line.includes('Pass') || line.includes('Fail') || line.includes('No-Info'))) {
-                            const parts = line.trim().split(/\s+/);
-                            if (parts.length >= 2) {
-                                const lldpStatus = parts[1]; // Status column (Pass/Fail/No-Info)
-                                const portStatus = parts[parts.length - 1]; // Last column is port status (UP/DOWN)
-                                const expectedDevice = parts[2] || 'None';
-                                const actualDevice = parts[4] || 'None';
-                                
-                                summaryData.totalConnections++;
-                                
-                                if (lldpStatus === 'Pass') {
-                                    summaryData.successful++;
-                                } else if (lldpStatus === 'No-Info') {
-                                    summaryData.noInfo++;
-                                } else if (lldpStatus === 'Fail') {
-                                    // Same logic as lldp.html determineLLDPStatus()
-                                    if (portStatus === 'DOWN') {
-                                        // Port is physically down - real failure
-                                        summaryData.failed++;
-                                    } else if (actualDevice !== 'None' && actualDevice !== 'N/A') {
-                                        // Port UP but device/port mismatch - warning
-                                        summaryData.warning++;
-                                    } else {
-                                        // Port UP but no actual device - treat as warning
-                                        summaryData.warning++;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    
-                    // LLDP data parsed with warning calculation
+                    const text = await fetchImmutablePipelineInput('lldp', pipelineState);
+                    if (text === null) return unavailableLldpSummary();
+                    return summarizeLldpReport(text) ||
+                        unavailableLldpSummary();
                     
                 } else if (dataType === 'evpn') {
                     // Parse EVPN data from bgp-analysis.html summary cards
-                    const response = await fetch('monitor-results/bgp-analysis.html');
+                    const response = await fetch(
+                        noCacheUrl('monitor-results/bgp-analysis.html'),
+                        { cache: 'no-store' }
+                    );
                     if (!response.ok) return { unavailable: true, coveragePartial: true };
                     const html = await response.text();
                     const parser = new DOMParser();
@@ -1128,8 +1347,14 @@
                     }
                     
                 } else if (dataType === 'optical') {
+                    if (pipelineState.manifest.skipped.includes('optical')) {
+                        return { skipped: true, unavailable: false, coveragePartial: false };
+                    }
                     // Special case for optical: use summary cards because they have correct total ports count
-                    const response = await fetch('monitor-results/optical-analysis.html');
+                    const response = await fetch(
+                        noCacheUrl('monitor-results/optical-analysis.html'),
+                        { cache: 'no-store' }
+                    );
                     
                     if (!response.ok) {
                         return { unavailable: true, coveragePartial: true };
@@ -1142,31 +1367,51 @@
                     if (summaryData.unavailable) return summaryData;
                     
                     // Parse summary cards for optical (they have the correct total ports count)
-                    const totalPortsElement = doc.querySelector('#total-ports');
-                    const excellentElement = doc.querySelector('#excellent-ports');
-                    const goodElement = doc.querySelector('#good-ports');
-                    const warningElement = doc.querySelector('#warning-ports');
-                    const criticalElement = doc.querySelector('#critical-ports');
-                    const downElement = doc.querySelector('#down-ports');
-                    
-                    summaryData.totalPorts = totalPortsElement ? parseInt(totalPortsElement.textContent) : 0;
-                    summaryData.excellent = excellentElement ? parseInt(excellentElement.textContent) : 0;
-                    summaryData.good = goodElement ? parseInt(goodElement.textContent) : 0;
-                    summaryData.warning = warningElement ? parseInt(warningElement.textContent) : 0;
-                    summaryData.critical = criticalElement ? parseInt(criticalElement.textContent) : 0;
-                    summaryData.down = downElement ? parseInt(downElement.textContent) : 0;
-                    summaryData.unknown = Math.max(0, summaryData.totalPorts -
-                        summaryData.excellent - summaryData.good -
-                        summaryData.warning - summaryData.critical - summaryData.down);
+                    const metric = selector => {
+                        const text = String(doc.querySelector(selector)?.textContent || '').trim();
+                        return /^\d+$/.test(text) ? Number(text) : null;
+                    };
+                    const rows = Array.from(doc.querySelectorAll('tbody tr[data-health]'));
+                    const rowCount = health => rows.filter(row =>
+                        String(row.dataset.health || '').toLowerCase() === health
+                    ).length;
+                    const metadataCount = name => {
+                        const text = doc.body?.dataset?.[name];
+                        return typeof text === 'string' && /^\d+$/.test(text)
+                            ? Number(text)
+                            : null;
+                    };
+                    summaryData.totalPorts = metric('#total-ports');
+                    summaryData.excellent = metric('#excellent-ports');
+                    summaryData.good = metric('#good-ports');
+                    summaryData.warning = metric('#warning-ports');
+                    summaryData.critical = metric('#critical-ports');
+                    summaryData.down = metric('#down-ports');
+                    summaryData.unplugged = metadataCount('opticalUnplugged') ??
+                        rowCount('unplugged');
+                    summaryData.unknown = metadataCount('opticalUnknown') ??
+                        rowCount('unknown');
+                    const categories = [
+                        summaryData.excellent, summaryData.good, summaryData.warning,
+                        summaryData.critical, summaryData.down, summaryData.unplugged,
+                        summaryData.unknown
+                    ];
+                    if (summaryData.totalPorts === null ||
+                        categories.some(value => value === null) ||
+                        categories.reduce((total, value) => total + value, 0) !== summaryData.totalPorts) {
+                        return { unavailable: true, coveragePartial: true };
+                    }
                     if (summaryData.unknown > 0) summaryData.coveragePartial = true;
                     
                     // Count unique devices from table for optical (if needed)
-                    const rows = doc.querySelectorAll('tbody tr[data-health]');
-                    summaryData.totalDevices = new Set(Array.from(rows).map(row => row.cells[0]?.textContent.trim())).size;
+                    summaryData.totalDevices = new Set(rows.map(row => row.cells[0]?.textContent.trim())).size;
                     
                 } else if (dataType === 'hardware') {
                     // Parse hardware-analysis.html summary cards
-                    const response = await fetch('monitor-results/hardware-analysis.html');
+                    const response = await fetch(
+                        noCacheUrl('monitor-results/hardware-analysis.html'),
+                        { cache: 'no-store' }
+                    );
                     
                     if (!response.ok) {
                         return { unavailable: true, coveragePartial: true };
@@ -1202,7 +1447,10 @@
                 } else if (dataType === 'log') {
                     // Parse log summary data from log_summary.json
                     try {
-                        const response = await fetch('monitor-results/log_summary.json');
+                        const response = await fetch(
+                            noCacheUrl('monitor-results/log_summary.json'),
+                            { cache: 'no-store' }
+                        );
                         
                         if (!response.ok) {
                             return { unavailable: true, coveragePartial: true };
@@ -1235,7 +1483,10 @@
                 } else if (dataType === 'duplicate') {
                     // Duplicate exposes only the two IP states needed by the dashboard.
                     // MAC/APIPA diagnostics remain available on the analysis page.
-                    const response = await fetch('monitor-results/duplicate-analysis.html');
+                    const response = await fetch(
+                        noCacheUrl('monitor-results/duplicate-analysis.html'),
+                        { cache: 'no-store' }
+                    );
                     if (!response.ok) return {
                         unavailable: true,
                         coveragePartial: true,
@@ -1258,7 +1509,7 @@
                     
                     const pageUrl = pageMap[dataType];
                     if (pageUrl) {
-                        const response = await fetch(pageUrl);
+                        const response = await fetch(noCacheUrl(pageUrl), { cache: 'no-store' });
                         if (!response.ok) return { unavailable: true, coveragePartial: true };
                         const html = await response.text();
                         const parser = new DOMParser();
@@ -1354,35 +1605,49 @@
         // Calculate overall network stats with real-time data
         async function updateNetworkStats() {
             try {
-                const pipelineState = await readDashboardPipelineState();
+                let pipelineState = await readDashboardPipelineState();
                 // Fetch data directly from raw data files
                 const [assetsData, lldpData, bgpData, evpnData, opticalData, berData, flapData, hardwareData, logData, dupData] = await Promise.all([
-                    fetchRawDataSummary('assets'),
-                    fetchRawDataSummary('lldp'), 
-                    fetchRawDataSummary('bgp'),
-                    fetchRawDataSummary('evpn'),
-                    fetchRawDataSummary('optical'),
-                    fetchRawDataSummary('ber'),
-                    fetchRawDataSummary('flap'),
-                    fetchRawDataSummary('hardware'),
-                    fetchRawDataSummary('log'),
-                    fetchRawDataSummary('duplicate')
+                    fetchRawDataSummary('assets', pipelineState),
+                    fetchRawDataSummary('lldp', pipelineState),
+                    fetchRawDataSummary('bgp', pipelineState),
+                    fetchRawDataSummary('evpn', pipelineState),
+                    fetchRawDataSummary('optical', pipelineState),
+                    fetchRawDataSummary('ber', pipelineState),
+                    fetchRawDataSummary('flap', pipelineState),
+                    fetchRawDataSummary('hardware', pipelineState),
+                    fetchRawDataSummary('log', pipelineState),
+                    fetchRawDataSummary('duplicate', pipelineState)
                 ]);
+                // A directory publication can happen while the browser has
+                // several report requests in flight. Accept the batch only if
+                // the manifest still identifies the exact same generation.
+                const verifiedPipelineState = await readDashboardPipelineState();
+                if (verifiedPipelineState.generation !== pipelineState.generation) {
+                    // Publication is atomic, but this browser batch straddled
+                    // the swap. Retry through the shared refresh coordinator
+                    // and never render the mixed set or start parallel loads.
+                    setTimeout(() => requestDashboardRefresh(
+                        verifiedPipelineState.generation
+                    ), 250);
+                    return null;
+                }
+                pipelineState = verifiedPipelineState;
                 
                 // Data fetched successfully
 
                 // Update dashboard summary cards
-                updateDashboardCard('assets-total', assetsData.totalDevices);
-                updateDashboardCard('assets-success', assetsData.successful);
-                updateDashboardCard('assets-warning', assetsData.warning);
-                updateDashboardCard('assets-failed', assetsData.failed);
-                updateDashboardCard('assets-no-info', assetsData.noInfo);
+                updateDashboardCard('assets-total', dashboardMetric(assetsData, assetsData.totalDevices));
+                updateDashboardCard('assets-success', dashboardMetric(assetsData, assetsData.successful));
+                updateDashboardCard('assets-warnings', dashboardMetric(assetsData, assetsData.warning));
+                updateDashboardCard('assets-failed', dashboardMetric(assetsData, assetsData.failed));
+                updateDashboardCard('assets-no-info', dashboardMetric(assetsData, assetsData.noInfo));
 
-                updateDashboardCard('lldp-total', lldpData.totalConnections);
-                updateDashboardCard('lldp-success', lldpData.successful);
-                updateDashboardCard('lldp-failed', lldpData.failed);
-                updateDashboardCard('lldp-warning', lldpData.warning);
-                updateDashboardCard('lldp-no-info', lldpData.noInfo);
+                updateDashboardCard('lldp-total', dashboardMetric(lldpData, lldpData.totalConnections));
+                updateDashboardCard('lldp-success', dashboardMetric(lldpData, lldpData.successful));
+                updateDashboardCard('lldp-failed', dashboardMetric(lldpData, lldpData.failed));
+                updateDashboardCard('lldp-warning', dashboardMetric(lldpData, lldpData.warning));
+                updateDashboardCard('lldp-no-info', dashboardMetric(lldpData, lldpData.noInfo));
 
                 updateDashboardCard('bgp-devices', dashboardMetric(bgpData, bgpData.totalDevices));
                 updateDashboardCard('bgp-neighbors', dashboardMetric(bgpData, bgpData.totalNeighbors));
@@ -1440,13 +1705,16 @@
 
                 updateDashboardCard('dup-active-ip', duplicateDashboardMetric(dupData, dupData.confirmedIpActive));
                 updateDashboardCard('dup-quiesced-ip', duplicateDashboardMetric(dupData, dupData.quiescedIp));
-                updateDashboardCard('dup-mac', duplicateDashboardMetric(dupData, dupData.macDuplicates));
+                updateDashboardCard('dup-mac', duplicateDashboardMetric(dupData, dupData.confirmedMacConflicts));
+                setDashboardProblemSeverity(
+                    'dup-mac', dupData, dupData.confirmedMacConflicts, 0
+                );
 
                 const duplicateMacCard = document.getElementById('dup-mac-card');
                 if (duplicateMacCard) {
                     duplicateMacCard.title = dupData.unavailable
                         ? 'Duplicate analysis is unavailable'
-                        : 'MAC address duplicates seen across the fabric (mobility + conflicts)';
+                        : 'Confirmed simultaneous MAC conflicts; mobility and DAD evidence are shown separately in the report';
                 }
 
                 // Calculate overall network statistics
@@ -1457,8 +1725,8 @@
                     unavailable: Boolean(bgpData.unavailable || evpnData.unavailable),
                     coveragePartial: Boolean(bgpData.coveragePartial || evpnData.coveragePartial)
                 };
-                const nonDuplicateReports = [bgpEvpnState, opticalData, berData,
-                    flapData, hardwareData, logData];
+                const nonDuplicateReports = [assetsData, lldpData, bgpEvpnState, opticalData,
+                    berData, flapData, hardwareData, logData];
                 const analysisReports = [...nonDuplicateReports, dupData];
                 const unavailableAnalyses = analysisReports.filter(data =>
                     !data || data.unavailable
@@ -1470,10 +1738,7 @@
                     data && !data.unavailable && data.coveragePartial
                 ).length;
                 const markerStatus = pipelineState.marker && pipelineState.marker.status;
-                const manifestCurrent = pipelineState.manifest &&
-                    pipelineState.manifest.status === 'current' &&
-                    pipelineState.manifest.pipeline_complete === true;
-                const pipelineNotCurrent = Boolean(markerStatus) || !manifestCurrent;
+                const pipelineNotCurrent = Boolean(markerStatus) || !pipelineState.manifestValid;
                 const analysisCoverageProblems = unavailableAnalyses + partialAnalyses +
                     (pipelineNotCurrent ? 1 : 0);
                 const interfaceSources = [opticalData, berData].filter(data =>
@@ -1487,13 +1752,18 @@
             // warning-class operational signals as well as critical failures.
             const criticalBreakdown = {
                 'Assets Failed': assetsData.failed || 0,
+                'Assets Warnings': assetsData.warning || 0,
+                'Assets No Info': assetsData.noInfo || 0,
                 'LLDP Failed Ports': lldpData.failed || 0,
+                'LLDP Warning Ports': lldpData.warning || 0,
                 'LLDP No Info': lldpData.noInfo || 0,
                 'BGP Critical': bgpData.critical || 0,
                 'BGP Warning': bgpData.warning || 0,
                 'Optical Critical': opticalData.critical || 0,
                 'Optical Warning': opticalData.warning || 0,
                 'Optical Down': opticalData.down || 0,
+                'Optical Unplugged': opticalData.unplugged || 0,
+                'Optical Unknown': opticalData.unknown || 0,
                 'BER Critical': berData.critical || 0,
                 'BER Warning': berData.warning || 0,
                 'Link Flap Critical': flapData.critical || 0,
@@ -1503,6 +1773,8 @@
                 'Log Critical': logData.critical || 0,
                 'Log Warning': logData.warning || 0,
                 'Active IP Duplicates': dupData.confirmedIpActive || 0,
+                'Quiesced IP Duplicates': dupData.quiescedIp || 0,
+                'Confirmed MAC Conflicts': dupData.confirmedMacConflicts || 0,
                 'Duplicate Coverage Partial': (!dupData.unavailable && dupData.coveragePartial) ? 1 : 0,
                 'Partial Analyses': otherPartialAnalyses,
                 'Unavailable Analyses': unavailableAnalyses,
@@ -1516,7 +1788,8 @@
             const CRITICAL_SOURCES = new Set([
                 'Assets Failed', 'LLDP Failed Ports', 'BGP Critical',
                 'Optical Critical', 'BER Critical', 'Link Flap Critical',
-                'Hardware Critical', 'Log Critical', 'Active IP Duplicates'
+                'Hardware Critical', 'Log Critical', 'Active IP Duplicates',
+                'Confirmed MAC Conflicts'
             ]);
             let tooltipHtml = '<div class="tooltip-title">Open Issues Breakdown</div>';
             for (const [source, count] of Object.entries(criticalBreakdown)) {
@@ -1538,13 +1811,15 @@
                     totalNumber <= 0) return;
                 healthDomains.push(Math.max(0, Math.min(1, healthyNumber / totalNumber)));
             }
-            // Only hard failures (the red breakdown rows) lower health; warning-class
-            // signals (optical/BER/hardware warnings, LLDP no-info, optical down) count
-            // as healthy so they never drag the percentage down.
-            addHealthDomain(assetsData.totalDevices - (assetsData.failed || 0), assetsData.totalDevices, assetsData);
+            // Assets has an explicit successful population, so every non-success
+            // status lowers its domain health even when the issue is advisory.
+            addHealthDomain(assetsData.successful, assetsData.totalDevices, assetsData);
             addHealthDomain(lldpData.totalConnections - (lldpData.failed || 0), lldpData.totalConnections, lldpData);
             addHealthDomain(bgpData.totalNeighbors - (bgpData.critical || 0), bgpData.totalNeighbors, bgpData);
-            addHealthDomain(opticalData.totalPorts - (opticalData.critical || 0), opticalData.totalPorts, opticalData);
+            const opticalComparablePorts = Number(opticalData.totalPorts) -
+                Number(opticalData.unplugged || 0);
+            addHealthDomain(opticalComparablePorts - (opticalData.critical || 0),
+                opticalComparablePorts, opticalData);
             addHealthDomain(berData.totalPorts - (berData.critical || 0), berData.totalPorts, berData);
             addHealthDomain(flapData.totalPorts - (flapData.critical || 0), flapData.totalPorts, flapData);
             addHealthDomain(hardwareData.totalDevices - (hardwareData.critical || 0), hardwareData.totalDevices, hardwareData);
@@ -1594,9 +1869,15 @@
             } else {
                 criticalElement.style.color = '#ff9800';
             }
-                
+
+                // The heavy 120-second path also refreshes its trusted
+                // timestamp/generation metadata. Unreliable marker reads are
+                // ignored by applyDashboardPipelineMetadata.
+                applyDashboardPipelineMetadata(pipelineState, false);
+                return pipelineState.generation;
             } catch (error) {
                 console.error('Failed to update network stats:', error);
+                return null;
             }
         }
 
@@ -1623,7 +1904,8 @@
                 'status-critical', 'status-warning', 'status-excellent', 'status-info'
             );
 
-            if (!data || data.unavailable) {
+            if (!data || data.unavailable || criticalCount === null || criticalCount === undefined ||
+                    warningCount === null || warningCount === undefined) {
                 card.classList.add('card-info');
                 element.classList.add('status-info');
             } else if ((Number(criticalCount) || 0) > 0) {
@@ -1638,16 +1920,131 @@
             }
         }
 
+        function requestDashboardRefresh(targetGeneration = null) {
+            if (targetGeneration && targetGeneration === dashboardRenderedGeneration) {
+                dashboardRefreshRequestedGeneration = targetGeneration;
+                return Promise.resolve(targetGeneration);
+            }
+
+            if (dashboardRefreshInFlight) {
+                // Periodic refreshes are redundant while one is active. A
+                // completed generation is not: remember only that generation
+                // and load it once after the current batch settles.
+                if (targetGeneration && targetGeneration !== dashboardRenderedGeneration) {
+                    dashboardQueuedRefreshGeneration = targetGeneration;
+                }
+                return Promise.resolve(null);
+            }
+
+            if (targetGeneration) {
+                dashboardRefreshRequestedGeneration = targetGeneration;
+            }
+            dashboardRefreshInFlight = true;
+            return updateNetworkStats().then(renderedGeneration => {
+                if (renderedGeneration) {
+                    dashboardRenderedGeneration = renderedGeneration;
+                    dashboardRefreshRequestedGeneration = renderedGeneration;
+                }
+                return renderedGeneration;
+            }).finally(() => {
+                dashboardRefreshInFlight = false;
+                const queuedGeneration = dashboardQueuedRefreshGeneration;
+                dashboardQueuedRefreshGeneration = null;
+                if (queuedGeneration && queuedGeneration !== dashboardRenderedGeneration) {
+                    requestDashboardRefresh(queuedGeneration);
+                }
+            });
+        }
+
+        function applyDashboardPipelineMetadata(state, allowRefresh) {
+            if (!state.metadataReliable) return state;
+
+            const wasInitialized = dashboardStatusInitialized;
+            const previousGeneration = dashboardObservedGeneration;
+            dashboardStatusInitialized = true;
+            renderLastUpdated(state);
+
+            // The web tree is activated before its collecting marker is
+            // cleared. Do not consume that generation early: otherwise the
+            // subsequent collecting -> current transition would look
+            // unchanged and its immediate card refresh would be lost.
+            const completedState = !state.marker && state.manifestValid &&
+                Boolean(state.generation);
+            const generationChanged = wasInitialized && completedState &&
+                state.generation !== previousGeneration;
+            if (completedState) {
+                dashboardObservedGeneration = state.generation;
+            }
+            if (allowRefresh && generationChanged && !state.marker &&
+                state.manifestValid &&
+                state.generation !== dashboardRefreshRequestedGeneration &&
+                state.generation !== dashboardRenderedGeneration) {
+                requestDashboardRefresh(state.generation);
+            }
+            return state;
+        }
+
+        async function pollDashboardPipelineState({ allowRefresh = true } = {}) {
+            if (dashboardStatusPollInFlight) return null;
+            dashboardStatusPollInFlight = true;
+            try {
+                // These are the two tiny pipeline metadata files. Polling them
+                // catches even a complete run that begins and ends between
+                // timer ticks; the large analysis reports are not fetched here.
+                const state = await readDashboardPipelineState();
+                return applyDashboardPipelineMetadata(state, allowRefresh);
+            } finally {
+                dashboardStatusPollInFlight = false;
+            }
+        }
+
+        function scheduleDashboardStatusPoll() {
+            if (dashboardStatusPollTimer !== null) {
+                clearTimeout(dashboardStatusPollTimer);
+            }
+            dashboardStatusPollTimer = setTimeout(async () => {
+                try {
+                    await pollDashboardPipelineState();
+                } catch (error) {
+                    console.warn('Failed to poll pipeline status:', error);
+                } finally {
+                    scheduleDashboardStatusPoll();
+                }
+            }, DASHBOARD_STATUS_POLL_MILLISECONDS);
+        }
+
         // Initialize dashboard
-        document.addEventListener('DOMContentLoaded', function() {
-            setLastUpdated().catch(error => console.warn('Failed to load report timestamp:', error));
-            updateNetworkStats();
-            
+        document.addEventListener('DOMContentLoaded', async function() {
+            try {
+                const authenticated = await LLDPqAuth.check();
+                if (!authenticated) return;
+                if (LLDPqAuth.isAdmin()) document.body.classList.add('lldpq-admin');
+            } catch (error) {
+                console.warn('Could not resolve dashboard role:', error);
+            }
+            let initialState = null;
+            try {
+                initialState = await pollDashboardPipelineState({
+                    allowRefresh: false
+                });
+            } catch (error) {
+                console.warn('Failed to load report timestamp:', error);
+            }
+            requestDashboardRefresh(initialState?.generation || null);
+            scheduleDashboardStatusPoll();
+
             // Update every 2 minutes (large data files)
             setInterval(function() {
-                setLastUpdated().catch(error => console.warn('Failed to load report timestamp:', error));
-                updateNetworkStats();
+                requestDashboardRefresh();
             }, 120000);
+        });
+
+        document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'visible') {
+                pollDashboardPipelineState().catch(error =>
+                    console.warn('Failed to poll pipeline status:', error)
+                );
+            }
         });
 
         // Add hover effects for clickable cards

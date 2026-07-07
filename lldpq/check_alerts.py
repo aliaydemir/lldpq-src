@@ -21,6 +21,11 @@ import fcntl
 import re
 from pathlib import Path
 
+try:
+    from .lldp_report import LLDPReportError, parse_lldp_report
+except ImportError:  # Direct script execution has no package context.
+    from lldp_report import LLDPReportError, parse_lldp_report
+
 
 DEFAULT_LOAD_PER_CORE_WARNING = 1.0
 DEFAULT_LOAD_PER_CORE_CRITICAL = 1.5
@@ -200,6 +205,11 @@ class LLDPqAlerts:
             manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict) or manifest.get("status") != "current":
                 raise ValueError("manifest status is not current")
+            pipeline_id = manifest.get("pipeline_id")
+            if (manifest.get("pipeline_complete") is not True or
+                    not isinstance(pipeline_id, str) or
+                    not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", pipeline_id)):
+                raise ValueError("manifest is not from one complete pipeline")
 
             analyses = manifest.get("analyses")
             skipped = manifest.get("skipped", [])
@@ -225,6 +235,27 @@ class LLDPqAlerts:
                     + ", ".join(missing_analyses)
                 )
 
+            sources = manifest.get("sources")
+            expected_source_paths = {
+                "assets": ".pipeline-inputs/assets.ini",
+                "lldp": ".pipeline-inputs/lldp_results.ini",
+            }
+            if not isinstance(sources, dict):
+                raise ValueError("manifest source identities are missing")
+            for name, expected_path in expected_source_paths.items():
+                identity = sources.get(name)
+                if (not isinstance(identity, dict) or
+                        identity.get("path") != expected_path or
+                        not isinstance(identity.get("sha256"), str) or
+                        re.fullmatch(r"[a-f0-9]{64}", identity["sha256"], re.I) is None or
+                        isinstance(identity.get("size"), bool) or
+                        not isinstance(identity.get("size"), int) or
+                        identity["size"] < 0 or
+                        isinstance(identity.get("mtime_ns"), bool) or
+                        not isinstance(identity.get("mtime_ns"), int) or
+                        identity["mtime_ns"] < 0):
+                    raise ValueError(f"manifest {name} source identity is invalid")
+
             completed_at = manifest.get("completed_at")
             if not isinstance(completed_at, str) or not completed_at.strip():
                 raise ValueError("manifest completed_at is missing")
@@ -238,7 +269,18 @@ class LLDPqAlerts:
             age_seconds = time.time() - completed.timestamp()
             if age_seconds < -300:
                 raise ValueError("manifest completion time is in the future")
-            max_age_seconds = self.get_frequency_seconds("data_stale_minutes", 30)
+            max_age_seconds = manifest.get("max_age_seconds")
+            if max_age_seconds is None:
+                # Compatibility for one pre-upgrade generation. New manifests
+                # carry the same policy consumed by the web/API surfaces.
+                max_age_seconds = self.get_frequency_seconds(
+                    "data_stale_minutes", 30
+                )
+            if (isinstance(max_age_seconds, bool) or
+                    not isinstance(max_age_seconds, (int, float)) or
+                    not math.isfinite(float(max_age_seconds)) or
+                    max_age_seconds < 0):
+                raise ValueError("manifest maximum age is invalid")
             if age_seconds > max_age_seconds:
                 raise ValueError(
                     f"manifest is stale ({age_seconds / 60:.1f} minutes old)"
@@ -390,6 +432,16 @@ class LLDPqAlerts:
         except (AttributeError, TypeError, ValueError):
             minutes = default_minutes
         return max(minutes, 0) * 60
+
+    def get_data_max_age_seconds(self):
+        """Return the current manifest's cross-surface freshness policy."""
+        run_manifest = getattr(self, "run_manifest", None)
+        if isinstance(run_manifest, dict):
+            value = run_manifest.get("max_age_seconds")
+            if (not isinstance(value, bool) and isinstance(value, (int, float))
+                    and math.isfinite(float(value)) and value >= 0):
+                return float(value)
+        return self.get_frequency_seconds("data_stale_minutes", 30)
     
     def should_send_alert(self, device, alert_type, current_state):
         """Check if we should send an alert based on state changes and frequency limits"""
@@ -746,7 +798,7 @@ class LLDPqAlerts:
             )
 
     def check_network_alerts(self, device):
-        """Check network-related alerts (BGP, link flaps, optical)"""
+        """Check network-related alerts (BGP, flaps, BER and optical)."""
         if not self.config.get('alert_types', {}).get('network_alerts', True):
             return
             
@@ -835,6 +887,72 @@ class LLDPqAlerts:
                         "RECOVERED", device, "link_flaps", current_state
                     )
 
+        self.check_processed_network_alerts(device)
+
+    def _notify_processed_health(self, device, alert_type, label, status):
+        """Deliver one stateful alert from an analyzer's per-device grade."""
+        normalized = str(status or "unknown").lower()
+        if normalized == "not_applicable":
+            return True
+        if normalized == "critical":
+            state, severity = "CRITICAL", "CRITICAL"
+            title = f"{label} Critical"
+            message = f"Processed {label} analysis reports a critical condition"
+        elif normalized in {"warning", "warnings", "down", "unplugged", "unknown"}:
+            state = "WARNING_UNKNOWN" if normalized == "unknown" else normalized.upper()
+            severity = "WARNING"
+            title = f"{label} Warning"
+            descriptions = {
+                "down": "a monitored optical link is down",
+                "unplugged": "an expected optical module is unplugged",
+                "unknown": "current diagnostics are incomplete or unknown",
+            }
+            message = (
+                f"Processed {label} analysis reports "
+                f"{descriptions.get(normalized, 'a warning condition')}"
+            )
+        elif normalized in {"excellent", "good", "ok"}:
+            state, severity = "OK", "RECOVERED"
+            title = f"{label} Recovered"
+            message = f"Processed {label} analysis is healthy"
+        else:
+            state, severity = "WARNING_UNSUPPORTED", "WARNING"
+            title = f"{label} Status Unknown"
+            message = f"Processed {label} analysis returned an unsupported state"
+
+        previous_state = self.get_alert_state(device, alert_type)
+        if state == "OK" and previous_state == "UNKNOWN":
+            return self.record_state_without_delivery(device, alert_type, state)
+        if state == "OK" and not self.config.get('frequency', {}).get(
+                'send_recovery', True):
+            return self.record_state_without_delivery(device, alert_type, state)
+        if not self.should_send_alert(device, alert_type, state):
+            return True
+        return self.send_stateful_notification(
+            title, message, severity, device, alert_type, state
+        )
+
+    def check_processed_network_alerts(self, device):
+        """Evaluate BER and Optical domains in individual-alert mode."""
+        if not self.config.get('alert_types', {}).get('network_alerts', True):
+            return True
+        results = [
+            self._notify_processed_health(
+                device, "ber_health", "BER", self.get_device_ber_status(device)
+            )
+        ]
+        run_manifest = getattr(self, "run_manifest", None)
+        skipped = (
+            set(run_manifest.get("skipped", []))
+            if isinstance(run_manifest, dict) else set()
+        )
+        if "optical" not in skipped:
+            results.append(self._notify_processed_health(
+                device, "optical_health", "Optical",
+                self.get_device_optical_status(device),
+            ))
+        return all(result is not False for result in results)
+
     def get_device_flap_counts(self, device, window_seconds=3600):
         """Return per-interface flap deltas recorded inside the time window."""
         asset_stats = self.get_asset_stats([device])
@@ -875,9 +993,7 @@ class LLDPqAlerts:
             history_age = time.time() - float(last_update)
             if history_age < -300:
                 raise ValueError("link-flap history timestamp is in the future")
-            max_age_seconds = self.get_frequency_seconds(
-                "data_stale_minutes", 30
-            )
+            max_age_seconds = self.get_data_max_age_seconds()
             if history_age > max_age_seconds:
                 raise ValueError(
                     f"link-flap history is stale ({history_age / 60:.1f} minutes old)"
@@ -1032,12 +1148,7 @@ class LLDPqAlerts:
         if not self.source_matches_run_manifest("assets", assets_file):
             return {}
 
-        try:
-            stale_minutes = float(
-                self.config.get('frequency', {}).get('data_stale_minutes', 30)
-            )
-        except (TypeError, ValueError):
-            stale_minutes = 30
+        max_age_seconds = self.get_data_max_age_seconds()
 
         try:
             file_mtime = assets_file.stat().st_mtime
@@ -1059,7 +1170,7 @@ class LLDPqAlerts:
             if abs(file_mtime - snapshot_time) > 120:
                 raise ValueError("assets Created time does not match file mtime")
             age = time.time() - snapshot_time
-            if age < -300 or age > max(stale_minutes, 0) * 60:
+            if age < -300 or age > max_age_seconds:
                 raise ValueError("assets snapshot is stale or from the future")
 
             rows = {}
@@ -1210,25 +1321,34 @@ class LLDPqAlerts:
                 self.had_error = True
         elif mode == "change_only":
             self.check_changes_only(devices)
+        elif mode == "immediate":
+            self.check_immediate_alerts(devices)
         else:
-            # Immediate mode (original behavior)
-            for device in devices:
-                print(f"  📍 Checking {device}...")
-                try:
-                    self.check_hardware_alerts(device)
-                    self.check_system_alerts(device)
-                    self.check_network_alerts(device)
-                    self.check_log_alerts(device)
-                except Exception as e:
-                    print(f"    ❌ Error checking {device}: {e}")
-                    self.had_error = True
-                    continue
-            self.check_duplicate_alerts()
+            print(f"❌ Unsupported alert strategy mode: {mode!r}")
+            self.had_error = True
         
         print("Alert check completed")
         return not self.had_error
 
-    def send_summary_alert(self, devices):
+    def check_immediate_alerts(self, devices):
+        """Run every enabled alert domain using individual stateful alerts."""
+        for device in devices:
+            print(f"  📍 Checking {device}...")
+            try:
+                self.check_hardware_alerts(device)
+                self.check_system_alerts(device)
+                self.check_network_alerts(device)
+                self.check_log_alerts(device)
+            except Exception as exc:
+                print(f"    ❌ Error checking {device}: {exc}")
+                self.had_error = True
+                continue
+        if not self.check_lldp_alerts():
+            self.had_error = True
+        if not self.check_duplicate_alerts():
+            self.had_error = True
+
+    def send_summary_alert(self, devices, *, include_schedule=True):
         """Send dashboard-style summary alert"""
         print("Generating network health summary...")
         if (not isinstance(self.run_manifest, dict) or
@@ -1327,6 +1447,10 @@ class LLDPqAlerts:
             warning_issues.append(
                 f"Optical: {optical_stats['down']} ports with no receive light/down state"
             )
+        if optical_stats and optical_stats.get('unplugged', 0) > 0:
+            warning_issues.append(
+                f"Optical: {optical_stats['unplugged']} expected modules unplugged"
+            )
         if optical_stats and optical_stats.get('unknown', 0) > 0:
             warning_issues.append(
                 f"Optical: {optical_stats['unknown']} ports with unknown diagnostics"
@@ -1409,6 +1533,7 @@ class LLDPqAlerts:
             f"{optical_stats['excellent']}:{optical_stats['good']}:"
             f"{optical_stats['warnings']}:{optical_stats['critical']}:"
             f"{optical_stats.get('down', 0)}:"
+            f"{optical_stats.get('unplugged', 0)}:"
             f"{optical_stats.get('unknown', 0)}:"
             f"{int(bool(optical_stats.get('coverage_partial')))}"
         )
@@ -1442,7 +1567,8 @@ class LLDPqAlerts:
         )))
         
         # Check if summary changed or it's scheduled time (critical issues don't force immediate send in summary mode)
-        if self.should_send_summary_alert(summary_signature):
+        if self.should_send_summary_alert(
+                summary_signature, include_schedule=include_schedule):
             server_url = self.config.get('notifications', {}).get('server_url', 'http://localhost')
             if optical_skipped:
                 optical_section = "Optical Diagnostics Analysis:\n\nSkipped by configuration"
@@ -1453,6 +1579,8 @@ class LLDPqAlerts:
                     f"Good: {optical_stats['good']}     "
                     f"Warning: {optical_stats['warnings']}     "
                     f"Down: {optical_stats.get('down', 0)}     "
+                    f"Unplugged: {optical_stats.get('unplugged', 0)}     "
+                    f"Unknown: {optical_stats.get('unknown', 0)}     "
                     f"Critical: {optical_stats['critical']}"
                 )
             
@@ -1562,7 +1690,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                 persisted = self.record_alert_delivery(
                     "network_summary", "last_summary", summary_signature
                 )
-                if self.is_summary_time():
+                if include_schedule and self.is_summary_time():
                     current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
                     persisted = self.set_alert_state(
                         "network_summary", "last_summary_time", current_time
@@ -1571,6 +1699,48 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             return False
 
         return True
+
+    def check_lldp_alerts(self):
+        """Send one fabric-wide stateful alert for the current LLDP report."""
+        if not self.config.get('alert_types', {}).get('topology_alerts', True):
+            return True
+        stats = self.get_lldp_stats_from_ini()
+        if not stats:
+            return False
+
+        failed = stats["failed"]
+        warnings = stats["warnings"]
+        no_info = stats["no_info"]
+        if failed:
+            severity, notification_severity = "CRITICAL", "CRITICAL"
+            title = "LLDP Topology Failures"
+        elif warnings or no_info:
+            severity, notification_severity = "WARNING", "WARNING"
+            title = "LLDP Topology Warning"
+        else:
+            severity, notification_severity = "OK", "RECOVERED"
+            title = "LLDP Topology Recovered"
+        state = f"{severity}:{failed}:{warnings}:{no_info}"
+        previous_state = self.get_alert_state("_fabric", "lldp_topology")
+        if severity == "OK" and previous_state == "UNKNOWN":
+            return self.record_state_without_delivery(
+                "_fabric", "lldp_topology", state
+            )
+        if severity == "OK" and not self.config.get('frequency', {}).get(
+                'send_recovery', True):
+            return self.record_state_without_delivery(
+                "_fabric", "lldp_topology", state
+            )
+        if not self.should_send_alert("_fabric", "lldp_topology", state):
+            return True
+        message = (
+            f"Failed connections: {failed}; warning connections: {warnings}; "
+            f"connections without current information: {no_info}."
+        )
+        return self.send_stateful_notification(
+            title, message, notification_severity, "_fabric",
+            "lldp_topology", state,
+        )
 
     def check_duplicate_alerts(self):
         """Send one fabric-wide stateful alert for authoritative IP conflicts."""
@@ -1634,7 +1804,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             "duplicate_ip", state,
         )
 
-    def should_send_summary_alert(self, current_signature):
+    def should_send_summary_alert(self, current_signature, *, include_schedule=True):
         """Check if summary should be sent based on changes or schedule"""
         retry_interval = self.get_frequency_seconds('retry_interval_minutes', 5)
         last_attempt = self._read_marker_time(
@@ -1650,7 +1820,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             return True
             
         # Send if it's scheduled time and hasn't been sent recently
-        if self.is_summary_time():
+        if include_schedule and self.is_summary_time():
             last_summary_time = self.get_alert_state("network_summary", "last_summary_time")
             current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
             
@@ -1795,7 +1965,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                 ).lower()
                 grades.append(grade)
             if not grades:
-                return "unknown"
+                return "not_applicable"
             priority = {
                 "critical": 4, "warning": 3, "warnings": 3,
                 "unknown": 2, "good": 1, "excellent": 0,
@@ -1848,18 +2018,16 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                     str(stats.get("health_status", "unknown")).lower()
                 )
             if not health_values:
-                return "unknown"
+                return "not_applicable"
             priority = {
-                "critical": 6, "down": 5, "warning": 4,
-                "unplugged": 4, "unknown": 3, "good": 2,
+                "critical": 7, "down": 6, "warning": 5,
+                "unknown": 4, "unplugged": 3, "good": 2,
                 "excellent": 1,
             }
             result = max(
                 health_values, key=lambda value: priority.get(value, 3)
             )
             if result == "warning":
-                return "warnings"
-            if result in {"down", "unplugged"}:
                 return "warnings"
             return result
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -2046,12 +2214,32 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                     # DOWN received its own summary card.
                     down = 0
                 total = self.extract_element_value(content, 'total-ports')
-                known = [excellent, good, warnings, critical, down]
-                unknown = (
-                    max(total - sum(known), 0)
-                    if total is not None and all(value is not None for value in known)
-                    else None
+                unplugged = self.extract_attribute_int(
+                    content, 'data-optical-unplugged'
                 )
+                unknown = self.extract_attribute_int(
+                    content, 'data-optical-unknown'
+                )
+                # One pre-upgrade report may lack the machine metadata. Its
+                # table rows still carry the exact category and avoid folding
+                # unplugged cages into UNKNOWN diagnostics.
+                if unplugged is None:
+                    unplugged = len(re.findall(
+                        r'<tr\b[^>]*\bdata-health=["\']unplugged["\']',
+                        content, re.IGNORECASE,
+                    ))
+                if unknown is None:
+                    unknown = len(re.findall(
+                        r'<tr\b[^>]*\bdata-health=["\']unknown["\']',
+                        content, re.IGNORECASE,
+                    ))
+                known = [excellent, good, warnings, critical, down,
+                         unplugged, unknown]
+                if (total is not None and all(value is not None for value in known)
+                        and sum(known) != total):
+                    unknown = None
+                if unknown and unknown > 0:
+                    coverage_partial = True
                 
                 stats = {
                     "excellent": excellent,
@@ -2059,10 +2247,12 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                     "warnings": warnings,
                     "critical": critical,
                     "down": down,
+                    "unplugged": unplugged,
                     "unknown": unknown,
                 }
                 required_metrics = [
-                    "excellent", "good", "warnings", "critical", "unknown"
+                    "excellent", "good", "warnings", "critical",
+                    "unplugged", "unknown"
                 ]
                 
             elif "ber" in html_filename:
@@ -2310,7 +2500,7 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             return {}
 
     def get_lldp_stats_from_ini(self):
-        """Get LLDP topology statistics from lldp_results.ini (JavaScript logic)"""
+        """Get strict Wiring-compatible statistics from lldp_results.ini."""
         try:
             # Check for lldp_results.ini in different locations
             canonical_lldp = self.script_dir / "lldp-results" / "lldp_results.ini"
@@ -2339,63 +2529,27 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             if not self.source_matches_run_manifest("lldp", lldp_file):
                 return {}
                 
-            with open(lldp_file, 'r') as f:
-                content = f.read()
-
-            nonempty_lines = [line.strip() for line in content.splitlines()
-                              if line.strip()]
-            if (not nonempty_lines or
-                    not nonempty_lines[0].startswith("Created on ")):
-                print("    ❌ lldp_results.ini is empty or missing its header")
-                return {}
-
-            created = datetime.datetime.strptime(
-                nonempty_lines[0].removeprefix("Created on ").strip(),
-                "%Y-%m-%d %H-%M-%S",
+            report = parse_lldp_report(
+                lldp_file.read_text(encoding="utf-8")
             )
-            created_time = created.timestamp()
+            # Naive legacy timestamps deliberately retain the historical local
+            # timezone interpretation.  ISO headers carry their explicit offset.
+            created_time = report.created_at.timestamp()
             file_mtime = lldp_file.stat().st_mtime
             if abs(file_mtime - created_time) > 120:
                 print("    ❌ lldp_results.ini Created time does not match file mtime")
                 return {}
             lldp_age = time.time() - created_time
-            max_age = self.get_frequency_seconds("data_stale_minutes", 30)
+            max_age = self.get_data_max_age_seconds()
             if lldp_age < -300 or lldp_age > max_age:
                 print("    ❌ lldp_results.ini is stale or from the future")
                 return {}
             
-            stats = {"successful": 0, "failed": 0, "warnings": 0, "no_info": 0}
-            recognized_rows = 0
+            return report.counts.as_dict()
             
-            # Parse each line like JavaScript does
-            for line in nonempty_lines[1:]:
-                # Look for port status lines (swp + Pass/Fail/No-Info pattern)
-                parts = line.split()
-                if (len(parts) < 2 or not parts[0].startswith("swp") or
-                        parts[1] not in {"Pass", "Fail", "No-Info"}):
-                    continue
-                recognized_rows += 1
-                status = parts[1]
-                if status == 'Pass':
-                    stats["successful"] += 1
-                elif status == 'Fail':
-                    # Match lldp.html and the main dashboard: only a physical
-                    # DOWN is a hard failure. An UP port with a wrong or
-                    # unexpected neighbor remains an operational warning.
-                    port_status = parts[-1].upper() if len(parts) >= 7 else ""
-                    if port_status == "DOWN":
-                        stats["failed"] += 1
-                    else:
-                        stats["warnings"] += 1
-                else:
-                    stats["no_info"] += 1
-
-            if recognized_rows == 0:
-                print("    ❌ lldp_results.ini contains no valid port results")
-                return {}
-
-            return stats
-            
+        except LLDPReportError as e:
+            print(f"    ❌ Invalid lldp_results.ini schema: {e}")
+            return {}
         except Exception as e:
             print(f"    ❌ Error reading LLDP stats from INI: {e}")
             return {}
@@ -2409,22 +2563,10 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
         return current_time in summary_times
 
     def check_changes_only(self, devices):
-        """Check and alert only on significant changes"""
-        # This would compare with previous state and only alert on changes
-        # For now, fall back to immediate mode
-        print("🔄 Change-only mode not fully implemented, using immediate mode")
-        for device in devices:
-            print(f"  📍 Checking {device}...")
-            try:
-                self.check_hardware_alerts(device)
-                self.check_system_alerts(device)
-                self.check_network_alerts(device)
-                self.check_log_alerts(device)
-            except Exception as e:
-                print(f"    ❌ Error checking {device}: {e}")
-                self.had_error = True
-                continue
-        self.check_duplicate_alerts()
+        """Send the complete health summary only when its state changes."""
+        print("🔄 Evaluating complete network state for changes")
+        if not self.send_summary_alert(devices, include_schedule=False):
+            self.had_error = True
 
 def main():
     """Main function"""

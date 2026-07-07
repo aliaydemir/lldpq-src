@@ -65,13 +65,50 @@ const LLDPqAuth = {
     
     // Logout
     async logout() {
+        let logoutSucceeded = false;
         try {
-            await fetch('/auth-api?action=logout', { method: 'POST' });
+            const response = await fetch('/auth-api?action=logout', { method: 'POST' });
+            if (!response || !response.ok) {
+                throw new Error(`Logout request failed${response && response.status ? ` (${response.status})` : ''}`);
+            }
+            // The current endpoint returns JSON. Also accept a successful no-content or
+            // legacy response that does not expose json(), but never ignore success:false.
+            if (response.status !== 204 && typeof response.json === 'function') {
+                const data = await response.json();
+                if (!data || data.success !== true) throw new Error('Logout was not confirmed by the server');
+            }
+            logoutSucceeded = true;
         } catch (e) {
             console.error('Logout error:', e);
         }
+        // Preserve reconnectable Console SIDs when logout did not actually happen. The
+        // normal redirect remains unchanged, and a later successful logout will clear them.
+        if (logoutSucceeded) this.clearConsoleSessionState();
         try { localStorage.removeItem('lldpq_role'); } catch (e) {}
         this.getTopWindow().location.href = '/login.html';
+    },
+
+    // Console PTY ids must never survive an authentication boundary. Keep visual
+    // preferences (for example font size), but remove all per-tab Console state.
+    clearConsoleSessionState() {
+        const stores = [];
+        try { stores.push(window.sessionStorage); } catch (e) {}
+        try {
+            const topWin = this.getTopWindow();
+            if (topWin !== window && topWin.sessionStorage) stores.push(topWin.sessionStorage);
+        } catch (e) {}
+        stores.forEach(store => {
+            try {
+                // Explicit removal also supports small storage mocks without key()/length.
+                store.removeItem('lldpq_console_tabs');
+                const keys = [];
+                for (let i = 0; i < store.length; i += 1) {
+                    const key = store.key(i);
+                    if (key && key.indexOf('lldpq_console_') === 0) keys.push(key);
+                }
+                keys.forEach(key => store.removeItem(key));
+            } catch (e) {}
+        });
     },
     
     // Check if user is admin

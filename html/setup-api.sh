@@ -29,27 +29,59 @@ eval "$LLDPQ_CONFIG_ASSIGNMENTS"
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 
 # ─── Fast path: raw tarball upload (Setup → Update → Offline). The request body IS the file
 # (application/octet-stream), so stream stdin straight to disk in big chunks. The generic
 # byte-wise JSON reader below would be far too slow and would corrupt binary data. The
-# destination is fixed server-side (no path injection); the action comes via the query string.
+# destination is a unique server-created /tmp file; the action comes via the query string.
+# Retire abandoned uploads from interrupted browser sessions without touching
+# arbitrary /tmp files or a package currently moving through a normal update.
+find /tmp -maxdepth 1 -type f -uid "$(id -u)" \
+    -name 'lldpq-upload-src.*.tar.gz' -mmin +1440 -delete 2>/dev/null || true
 case "$QUERY_STRING" in
   *action=upload-src*)
     echo "Content-Type: application/json"
+    echo "Cache-Control: no-store"
+    echo "X-Content-Type-Options: nosniff"
     echo ""
     if [ "$REQUEST_METHOD" != "POST" ]; then echo '{"success": false, "error": "POST required"}'; exit 0; fi
-    UP_DEST="/tmp/lldpq-upload-src.tar.gz"
-    rm -f "$UP_DEST" 2>/dev/null
-    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-        head -c "$CONTENT_LENGTH" > "$UP_DEST" 2>/dev/null
+    umask 027
+    UP_DEST=$(mktemp /tmp/lldpq-upload-src.XXXXXX.tar.gz) || {
+        echo '{"success": false, "error": "Could not create a private upload buffer"}'
+        exit 0
+    }
+    MAX_UPLOAD_BYTES=536870912
+    if [ -n "$CONTENT_LENGTH" ]; then
+        if ! [[ "$CONTENT_LENGTH" =~ ^[0-9]+$ ]] || [ "${#CONTENT_LENGTH}" -gt 12 ]; then
+            rm -f "$UP_DEST" 2>/dev/null
+            echo '{"success": false, "error": "Invalid Content-Length"}'
+            exit 0
+        fi
+        UP_LENGTH=$((10#$CONTENT_LENGTH))
+        if [ "$UP_LENGTH" -le 0 ] || [ "$UP_LENGTH" -gt "$MAX_UPLOAD_BYTES" ]; then
+            rm -f "$UP_DEST" 2>/dev/null
+            echo '{"success": false, "error": "Offline source upload must be between 1 byte and 512 MiB"}'
+            exit 0
+        fi
+        head -c "$UP_LENGTH" > "$UP_DEST" 2>/dev/null
+        UP_READ=$(wc -c < "$UP_DEST" 2>/dev/null | tr -d ' ')
+        if [ "${UP_READ:-0}" -ne "$UP_LENGTH" ]; then
+            rm -f "$UP_DEST" 2>/dev/null
+            echo '{"success": false, "error": "Offline source upload was truncated"}'
+            exit 0
+        fi
     else
-        cat > "$UP_DEST" 2>/dev/null
+        head -c $((MAX_UPLOAD_BYTES + 1)) > "$UP_DEST" 2>/dev/null
     fi
-    chmod 644 "$UP_DEST" 2>/dev/null
+    chgrp www-data "$UP_DEST" 2>/dev/null || true
+    chmod 640 "$UP_DEST" 2>/dev/null
     UP_SZ=$(wc -c < "$UP_DEST" 2>/dev/null | tr -d ' ')
     UP_MAGIC=$(od -An -tx1 -N2 "$UP_DEST" 2>/dev/null | tr -d ' \n')
-    if [ "${UP_SZ:-0}" -gt 0 ] 2>/dev/null && [ "$UP_MAGIC" = "1f8b" ]; then
+    if [ "${UP_SZ:-0}" -gt "$MAX_UPLOAD_BYTES" ] 2>/dev/null; then
+        rm -f "$UP_DEST" 2>/dev/null
+        echo '{"success": false, "error": "Offline source upload exceeds 512 MiB"}'
+    elif [ "${UP_SZ:-0}" -gt 0 ] 2>/dev/null && [ "$UP_MAGIC" = "1f8b" ]; then
         echo "{\"success\": true, \"path\": \"$UP_DEST\", \"size\": ${UP_SZ}}"
     else
         rm -f "$UP_DEST" 2>/dev/null
@@ -61,14 +93,9 @@ esac
 
 # Output JSON header
 echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo "X-Content-Type-Options: nosniff"
 echo ""
-
-# Read POST data
-if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-    POST_DATA=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
-else
-    POST_DATA=$(cat)
-fi
 
 # Only accept POST
 if [ "$REQUEST_METHOD" != "POST" ]; then
@@ -76,8 +103,42 @@ if [ "$REQUEST_METHOD" != "POST" ]; then
     exit 0
 fi
 
+# Spool JSON privately instead of exporting it.  Environment export hits ARG_MAX
+# for backup bundles and exposes passwords/keys through the process environment.
+umask 077
+POST_DATA_FILE=$(mktemp /tmp/lldpq-setup-request.XXXXXX) || {
+    echo '{"success": false, "error": "Could not create a private request buffer"}'
+    exit 0
+}
+trap 'rm -f "$POST_DATA_FILE"' EXIT
+MAX_JSON_BYTES=33554432
+if [ -n "$CONTENT_LENGTH" ]; then
+    if ! [[ "$CONTENT_LENGTH" =~ ^[0-9]+$ ]] || [ "${#CONTENT_LENGTH}" -gt 10 ]; then
+        echo '{"success": false, "error": "Invalid Content-Length"}'
+        exit 0
+    fi
+    CONTENT_LENGTH_NUM=$((10#$CONTENT_LENGTH))
+    if [ "$CONTENT_LENGTH_NUM" -gt "$MAX_JSON_BYTES" ]; then
+        echo '{"success": false, "error": "JSON request exceeds the 32 MiB limit"}'
+        exit 0
+    fi
+    head -c "$CONTENT_LENGTH_NUM" > "$POST_DATA_FILE" 2>/dev/null
+    READ_SIZE=$(wc -c < "$POST_DATA_FILE" 2>/dev/null | tr -d ' ')
+    if [ "${READ_SIZE:-0}" -ne "$CONTENT_LENGTH_NUM" ]; then
+        echo '{"success": false, "error": "JSON request body was truncated"}'
+        exit 0
+    fi
+else
+    head -c $((MAX_JSON_BYTES + 1)) > "$POST_DATA_FILE" 2>/dev/null
+    READ_SIZE=$(wc -c < "$POST_DATA_FILE" 2>/dev/null | tr -d ' ')
+    if [ "${READ_SIZE:-0}" -gt "$MAX_JSON_BYTES" ]; then
+        echo '{"success": false, "error": "JSON request exceeds the 32 MiB limit"}'
+        exit 0
+    fi
+fi
+
 # Export for Python
-export LLDPQ_DIR LLDPQ_USER WEB_ROOT POST_DATA
+export LLDPQ_DIR LLDPQ_USER WEB_ROOT POST_DATA_FILE SETUP_SAFETY
 
 python3 << 'PYTHON'
 import json
@@ -89,32 +150,88 @@ import shlex
 import fcntl
 import stat
 import tempfile
+import hashlib
+import importlib.util
+import time
+import uuid
+import grp
+import pwd
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 CRON_VALIDATOR = '/usr/local/bin/lldpq-config'
 BACKUP_IMPORT_HELPER = '/usr/local/libexec/lldpq-backup-import.py'
+UNINSTALL_WEB_HELPER = '/usr/local/libexec/lldpq-uninstall-web.py'
+LIFECYCLE_LOCK_FILE = '/etc/lldpq.lifecycle.lock'
+UNINSTALL_ACTIVE_MARKER = '/run/lldpq-uninstall.active'
+SETUP_SAFETY = os.environ.get('SETUP_SAFETY', '')
 _CONFIG_LOCK_HANDLE = None
+_INVENTORY_LOCK_HANDLE = None
+_SSH_KEY_LOCK_HANDLE = None
+
+def load_setup_safety():
+    """Load the helper shipped beside this CGI (pure validation/read helpers)."""
+    if not SETUP_SAFETY or not os.path.isfile(SETUP_SAFETY):
+        raise RuntimeError('Setup safety helper is missing; run install.sh to repair this installation.')
+    spec = importlib.util.spec_from_file_location('lldpq_setup_safety', SETUP_SAFETY)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('Setup safety helper could not be loaded.')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+def service_atomic_write(command, target, content, *, expected_revision=None, parser=None):
+    """Run the common validator/durable writer as the target-file owner."""
+    argv = [SETUP_SAFETY, command, '--target', target]
+    for root in (os.environ.get('LLDPQ_DIR'), os.environ.get('WEB_ROOT')):
+        if root:
+            argv.extend(['--managed-root', root])
+    if parser:
+        argv.extend(['--parser', parser])
+    if expected_revision is not None:
+        argv.extend(['--expected-revision', expected_revision])
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', '-H', '-u', os.environ.get('LLDPQ_USER', 'lldpq'),
+             '/usr/bin/bash', '-c', 'exec python3 "$@"', '--'] + argv,
+            input=content, capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        return {'success': False, 'error': 'Atomic write failed: ' + str(exc)[:300]}
+    try:
+        response = json.loads(result.stdout)
+    except Exception:
+        detail = (result.stderr or result.stdout or 'helper returned no result').strip()
+        return {'success': False, 'error': 'Atomic write failed: ' + detail[:300]}
+    return response
 
 def parse_completion_log(content):
     """Return cleaned log and the real exit status recorded by a detached runner."""
+    job_matches = list(re.finditer(r'(?m)^__LLDPQ_JOB__:([a-f0-9]{32})\s*$', content))
+    log_job_id = job_matches[-1].group(1) if job_matches else None
     matches = list(re.finditer(r'(?m)^__LLDPQ_DONE__(?::(-?[0-9]+))?\s*$', content))
     if not matches:
-        return content.rstrip(), False, None, False
+        display = re.sub(r'(?m)^__LLDPQ_JOB__:[a-f0-9]{32}\s*\n?', '', content).rstrip()
+        return display, False, None, False, log_job_id
     raw_code = matches[-1].group(1)
     exit_code = int(raw_code) if raw_code is not None else None
-    display = re.sub(r'(?m)^__LLDPQ_DONE__(?::(?:-?[0-9]+)?)?\s*\n?', '', content).rstrip()
-    return display, True, exit_code, exit_code == 0
+    display = re.sub(r'(?m)^__LLDPQ_DONE__(?::(?:-?[0-9]+)?)?\s*\n?', '', content)
+    display = re.sub(r'(?m)^__LLDPQ_JOB__:[a-f0-9]{32}\s*\n?', '', display).rstrip()
+    return display, True, exit_code, exit_code == 0, log_job_id
 
 def load_backup_import_helper(module_name):
     """Load only the installer-owned helper, never a service-tree module."""
     try:
         metadata = os.lstat(BACKUP_IMPORT_HELPER)
+        parent = os.lstat(os.path.dirname(BACKUP_IMPORT_HELPER))
     except OSError as exc:
         raise RuntimeError(
             'Backup helper is missing; run install.sh to repair this installation.'
         ) from exc
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
-            or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755):
+            or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755
+            or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+            or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
         raise RuntimeError(
             'Backup helper ownership/mode is unsafe; run install.sh to repair this installation.'
         )
@@ -125,14 +242,183 @@ def load_backup_import_helper(module_name):
     spec.loader.exec_module(module)
     return module
 
+def call_uninstall_web_helper(command, payload, *, timeout):
+    """Call the fixed root-owned uninstall gateway with bounded JSON on stdin."""
+    if command not in ('preview', 'start', 'status'):
+        return {'success': False, 'error': 'Unsupported uninstall gateway action'}
+    try:
+        metadata = os.lstat(UNINSTALL_WEB_HELPER)
+        parent = os.lstat(os.path.dirname(UNINSTALL_WEB_HELPER))
+    except OSError:
+        return {
+            'success': False,
+            'error': 'Uninstall helper is missing; run install.sh to repair this installation.',
+        }
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_gid != 0 or stat.S_IMODE(metadata.st_mode) != 0o755
+            or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+            or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        return {
+            'success': False,
+            'error': 'Uninstall helper ownership or permissions are unsafe; run install.sh to repair this installation.',
+        }
+    try:
+        raw_payload = json.dumps(payload, separators=(',', ':'), ensure_ascii=True)
+    except (TypeError, ValueError):
+        return {'success': False, 'error': 'Uninstall request could not be encoded'}
+    if len(raw_payload.encode('utf-8')) > 16384:
+        return {'success': False, 'error': 'Uninstall request is too large'}
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', UNINSTALL_WEB_HELPER, command],
+            input=raw_payload, capture_output=True, text=True, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'error': 'Uninstall gateway timed out'}
+    except Exception as exc:
+        return {'success': False, 'error': 'Uninstall gateway failed: ' + str(exc)[:200]}
+    if len(result.stdout.encode('utf-8', errors='replace')) > 262144:
+        return {'success': False, 'error': 'Uninstall gateway returned too much data'}
+    try:
+        response = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        detail = (result.stderr or result.stdout or 'no response').strip()
+        return {'success': False, 'error': 'Uninstall gateway failed: ' + detail[:300]}
+    if not isinstance(response, dict):
+        return {'success': False, 'error': 'Uninstall gateway returned an invalid response'}
+    if result.returncode != 0 and response.get('success') is not False:
+        return {'success': False, 'error': 'Uninstall gateway exited unexpectedly'}
+    return response
+
+@contextmanager
+def setup_job_start_guard():
+    """Serialize run/update reservations against an accepted uninstall."""
+    if os.path.exists('/.dockerenv'):
+        yield
+        return
+    try:
+        metadata = os.lstat(LIFECYCLE_LOCK_FILE)
+    except OSError as exc:
+        raise RuntimeError(
+            'Lifecycle lock is missing; run install.sh to repair this installation.'
+        ) from exc
+    try:
+        web_gid = grp.getgrnam('www-data').gr_gid
+    except KeyError as exc:
+        raise RuntimeError('Required www-data group is unavailable') from exc
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_gid != web_gid or stat.S_IMODE(metadata.st_mode) != 0o660
+            or metadata.st_nlink != 1):
+        raise RuntimeError('Lifecycle lock has unsafe ownership or permissions')
+    flags = os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(LIFECYCLE_LOCK_FILE, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if ((opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                or not stat.S_ISREG(opened.st_mode)):
+            raise RuntimeError('Lifecycle lock changed while opening')
+        deadline = time.monotonic() + 3.0
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        'Another LLDPq install, update or uninstall lifecycle operation is active'
+                    ) from exc
+                time.sleep(0.05)
+        if os.path.lexists(UNINSTALL_ACTIVE_MARKER):
+            marker = os.lstat(UNINSTALL_ACTIVE_MARKER)
+            if (not stat.S_ISREG(marker.st_mode) or marker.st_uid != 0
+                    or marker.st_gid != 0 or stat.S_IMODE(marker.st_mode) != 0o644
+                    or marker.st_nlink != 1 or marker.st_size > 128):
+                raise RuntimeError('Uninstall lifecycle marker is unsafe; inspect the host')
+            raise RuntimeError('An LLDPq uninstall is already scheduled or running')
+        # The uninstaller removes its fixed gateway while holding this same
+        # lock. A request that was already waiting on the now-unlinked lock
+        # must still fail after the marker is retired; it may not launch work
+        # against a dismantled installation.
+        try:
+            helper = os.lstat(UNINSTALL_WEB_HELPER)
+        except OSError as exc:
+            raise RuntimeError('LLDPq uninstall/install lifecycle is no longer available') from exc
+        if (not stat.S_ISREG(helper.st_mode) or helper.st_uid != 0
+                or helper.st_gid != 0 or stat.S_IMODE(helper.st_mode) != 0o755
+                or helper.st_nlink != 1):
+            raise RuntimeError('LLDPq lifecycle helper has unsafe ownership or permissions')
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
 def ensure_configuration_lock():
     """Serialize all /etc/lldpq.conf + cron transactions in this CGI."""
     global _CONFIG_LOCK_HANDLE
     if _CONFIG_LOCK_HANDLE is not None:
         return
-    handle = open('/etc/lldpq.conf.lock', 'a+')
-    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-    _CONFIG_LOCK_HANDLE = handle
+    path = '/etc/lldpq.conf.lock'
+    metadata = os.lstat(path)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_mode & stat.S_IWOTH):
+        raise RuntimeError('Global configuration lock has unsafe ownership, type, or permissions.')
+    flags = os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        os.close(descriptor)
+        raise RuntimeError('Global configuration lock changed while opening.')
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    _CONFIG_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
+
+def ensure_inventory_lock():
+    """Serialize backup snapshots/restores with Provision inventory writers."""
+    global _INVENTORY_LOCK_HANDLE
+    if _INVENTORY_LOCK_HANDLE is not None:
+        return
+    path = os.path.join(os.environ.get('WEB_ROOT', '/var/www/html'), '.inventory.lock')
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_CLOEXEC', 0)
+    flags |= getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags, 0o664)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IWOTH:
+            raise RuntimeError('Inventory lock has unsafe type or permissions.')
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except Exception:
+        os.close(descriptor)
+        raise
+    _INVENTORY_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
+
+def ensure_backup_locks():
+    """Use the shared global -> inventory order for portable config bundles."""
+    ensure_configuration_lock()
+    ensure_inventory_lock()
+
+def ensure_ssh_key_lock():
+    """Lock order is global configuration first, then the SSH-key transaction."""
+    global _SSH_KEY_LOCK_HANDLE
+    if _SSH_KEY_LOCK_HANDLE is not None:
+        return
+    ensure_configuration_lock()
+    path = '/var/lib/lldpq/ssh-key.lock'
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError('SSH key lock is missing; run install.sh to repair this installation.') from exc
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+            or metadata.st_mode & stat.S_IWOTH):
+        raise RuntimeError('SSH key lock has unsafe ownership, type, or permissions.')
+    flags = os.O_RDWR | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        os.close(descriptor)
+        raise RuntimeError('SSH key lock changed while opening.')
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    _SSH_KEY_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
 
 def valid_cron_schedule(schedule):
     if not isinstance(schedule, str):
@@ -175,51 +461,98 @@ def load_devices(devices_yaml):
         return None, 'Invalid canonical device data: ' + str(e)
     return devices, None
 
-def ensure_ssh_key(lldpq_user):
-    """Check if SSH key exists for LLDPQ_USER, generate if missing. Returns (key_path, generated, error)"""
-    # Check for existing keys
-    for key_type, key_name in [('ed25519', 'id_ed25519'), ('rsa', 'id_rsa')]:
-        pub_path = os.path.expanduser(f'~{lldpq_user}/.ssh/{key_name}.pub')
-        if os.path.isfile(pub_path):
-            return pub_path, False, None
-    
-    # No key found - generate ed25519
-    ssh_dir = os.path.expanduser(f'~{lldpq_user}/.ssh')
-    key_path = os.path.join(ssh_dir, 'id_ed25519')
-    pub_path = key_path + '.pub'
-    
-    try:
-        # Ensure .ssh directory exists
-        os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-        
-        # Generate key as LLDPQ_USER
-        result = subprocess.run(
-            ['sudo', '-u', lldpq_user, 'ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.returncode != 0:
-            return None, False, f'ssh-keygen failed: {result.stderr}'
-        
-        return pub_path, True, None
-    except Exception as e:
-        return None, False, str(e)
+def _as_service(argv, *, input_text=None, timeout=10):
+    return subprocess.run(
+        ['sudo', '-n', '-u', os.environ.get('LLDPQ_USER', 'lldpq')] + argv,
+        input=input_text, capture_output=True, text=True, timeout=timeout,
+    )
 
-def detect_ping_cmd(lldpq_user):
-    """Returns ping command. On Cumulus switches with --privileged, the entrypoint
-    adds 'ip rule add pref 100 table <mgmt>' which routes ALL traffic through mgmt VRF.
-    So plain 'ping' works without ip vrf exec (which needs BPF/root)."""
-    return ['ping']
-
-def ping_check(ip, ping_cmd, timeout=2):
-    """Quick ping check - VRF-aware on Cumulus switches."""
+def _read_service_file(path):
     try:
-        result = subprocess.run(
-            ping_cmd + ['-c', '1', '-W', str(timeout), ip],
-            capture_output=True, text=True, timeout=timeout + 2
-        )
-        return result.returncode == 0
+        result = _as_service(['/usr/bin/cat', path], timeout=5)
     except Exception:
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+def cleanup_uploaded_tarball(path):
+    """Delete only a regular upload buffer created by this CGI principal."""
+    if not isinstance(path, str) or not re.fullmatch(
+            r'/tmp/lldpq-upload-src\.[A-Za-z0-9]{6}\.tar\.gz', path):
         return False
+    try:
+        metadata = os.lstat(path)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            return False
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+def _public_key_identity(value):
+    parts = (value or '').strip().split()
+    return tuple(parts[:2]) if len(parts) >= 2 else None
+
+def validate_ssh_key_pair(private_path):
+    """Return the canonical public key only when the private key is usable."""
+    try:
+        private = _read_service_file(private_path)
+        if not private or 'PRIVATE KEY' not in private:
+            return None, 'Private key is missing or unreadable'
+        derived = _as_service(
+            ['/usr/bin/ssh-keygen', '-y', '-f', private_path], timeout=10,
+        )
+        if derived.returncode != 0 or not _public_key_identity(derived.stdout):
+            return None, 'ssh-keygen could not validate the private key'
+        existing = _read_service_file(private_path + '.pub')
+        if existing is None:
+            return None, 'Public key is missing'
+        if _public_key_identity(existing) != _public_key_identity(derived.stdout):
+            return None, 'Public key does not match the collector private key'
+        return derived.stdout.strip() + '\n', None
+    except Exception as exc:
+        return None, str(exc)
+
+def ensure_ssh_key(lldpq_user):
+    """Return a validated collector public key path, generating only if none exists."""
+    ssh_dir = os.path.expanduser(f'~{lldpq_user}/.ssh')
+    invalid = []
+    any_key_material = False
+    for key_name in ('id_ed25519', 'id_rsa'):
+        private_path = os.path.join(ssh_dir, key_name)
+        private = _read_service_file(private_path)
+        public = _read_service_file(private_path + '.pub')
+        if private is None and public is None:
+            continue
+        any_key_material = True
+        canonical, error = validate_ssh_key_pair(private_path)
+        if canonical:
+            return private_path + '.pub', False, None
+        invalid.append(f'{key_name}: {error}')
+    if any_key_material:
+        return None, False, ('Collector key material is incomplete or inconsistent; refusing to overwrite it. '
+                             + '; '.join(invalid))
+
+    key_path = os.path.join(ssh_dir, 'id_ed25519')
+    try:
+        made = _as_service(['/usr/bin/mkdir', '-p', ssh_dir], timeout=10)
+        if made.returncode != 0:
+            return None, False, 'Could not create the collector .ssh directory'
+        # ssh-keygen uses exclusive creation.  With no prior key material this is
+        # safe, and a concurrent request will simply lose without replacing a key.
+        generated = _as_service(
+            ['/usr/bin/ssh-keygen', '-t', 'ed25519', '-N', '', '-f', key_path],
+            timeout=15,
+        )
+        if generated.returncode != 0:
+            return None, False, 'ssh-keygen failed: ' + (generated.stderr or '').strip()[:200]
+        canonical, error = validate_ssh_key_pair(key_path)
+        if not canonical:
+            return None, False, 'Generated collector key failed validation: ' + str(error)
+        return key_path + '.pub', True, None
+    except Exception as exc:
+        return None, False, str(exc)
 
 def setup_device(device, password, ssh_key_path, lldpq_user):
     """Run send-key + sudo-fix for a single device. Returns result dict."""
@@ -237,20 +570,17 @@ def setup_device(device, password, ssh_key_path, lldpq_user):
         'sudo_fix_msg': ''
     }
     
-    # Step 0: Quick ping check - skip unreachable devices
-    if not ping_check(ip, PING_CMD):
-        result['send_key'] = 'fail'
-        result['send_key_msg'] = 'Unreachable (ping failed)'
-        result['sudo_fix'] = 'skipped'
-        result['sudo_fix_msg'] = 'Skipped (device unreachable)'
-        return result
-    
     # Step 1: Check if key already works
+    priv_key = ssh_key_path[:-4] if ssh_key_path.endswith('.pub') else ssh_key_path
+    ssh_base = [
+        'sudo', '-n', '-u', lldpq_user, 'ssh',
+        '-i', priv_key, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+        '-q', f'{username}@{ip}',
+    ]
     try:
         check = subprocess.run(
-            ['sudo', '-u', lldpq_user, 'ssh',
-             '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
-             '-q', f'{username}@{ip}', 'exit'],
+            ssh_base + ['true'],
             capture_output=True, text=True, timeout=10
         )
         if check.returncode == 0:
@@ -261,13 +591,13 @@ def setup_device(device, password, ssh_key_path, lldpq_user):
     except Exception:
         # Key not configured - send it
         try:
-            # Get the private key path (remove .pub)
-            priv_key = ssh_key_path.replace('.pub', '')
             send = subprocess.run(
-                ['sudo', '-u', lldpq_user, 'sshpass', '-p', password,
-                 'ssh-copy-id', '-o', 'StrictHostKeyChecking=no', '-i', priv_key,
+                ['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
+                 'IFS= read -r SSHPASS || exit 2; export SSHPASS; exec sshpass -e ssh-copy-id "$@"',
+                 '--', '-o', 'StrictHostKeyChecking=no',
+                 '-o', 'IdentitiesOnly=yes', '-i', ssh_key_path,
                  f'{username}@{ip}'],
-                capture_output=True, text=True, timeout=30
+                input=password + '\n', capture_output=True, text=True, timeout=30,
             )
             if send.returncode == 0:
                 result['send_key'] = 'ok'
@@ -285,23 +615,37 @@ def setup_device(device, password, ssh_key_path, lldpq_user):
     # Step 2: Setup sudo (only if send-key succeeded or already configured)
     if result['send_key'] in ('ok', 'already'):
         try:
-            sudo_cmd = (
-                f"echo '{password}' | sudo -S bash -c "
-                f"'echo \"{username} ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/10_{username} "
-                f"&& chmod 440 /etc/sudoers.d/10_{username}'"
+            sudo_check = subprocess.run(
+                ssh_base + ['sudo -n true'], capture_output=True, text=True, timeout=15,
             )
-            sudo = subprocess.run(
-                ['sudo', '-u', lldpq_user, 'sshpass', '-p', password,
-                 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
-                 f'{username}@{ip}', sudo_cmd],
-                capture_output=True, text=True, timeout=30
-            )
-            if sudo.returncode == 0:
+            if sudo_check.returncode == 0:
                 result['sudo_fix'] = 'ok'
-                result['sudo_fix_msg'] = 'Sudo configured'
+                result['sudo_fix_msg'] = 'Passwordless sudo already configured'
             else:
-                result['sudo_fix'] = 'fail'
-                result['sudo_fix_msg'] = sudo.stderr.strip()[:200] if sudo.stderr else 'sudo setup failed'
+                # The password and sudoers line are data on stdin.  Neither is
+                # interpolated into a local or remote shell command.
+                remote = (
+                    "sudo -S -p '' /bin/sh -c '"
+                    "umask 077; t=$(mktemp /etc/sudoers.d/.10_lldpq_collector.XXXXXX) || exit 1; "
+                    "cat >\"$t\" || { rm -f \"$t\"; exit 1; }; chmod 440 \"$t\" || exit 1; "
+                    "if command -v visudo >/dev/null 2>&1; then visudo -cf \"$t\" >/dev/null || { rm -f \"$t\"; exit 1; }; fi; "
+                    "mv -f \"$t\" /etc/sudoers.d/10_lldpq_collector'"
+                )
+                payload = password + '\n' + username + ' ALL=(ALL) NOPASSWD:ALL\n'
+                sudo = subprocess.run(
+                    ssh_base[:-2] + [f'{username}@{ip}', remote],
+                    input=payload, capture_output=True, text=True, timeout=30,
+                )
+                verified = subprocess.run(
+                    ssh_base + ['sudo -n true'], capture_output=True, text=True, timeout=15,
+                ) if sudo.returncode == 0 else sudo
+                if sudo.returncode == 0 and verified.returncode == 0:
+                    result['sudo_fix'] = 'ok'
+                    result['sudo_fix_msg'] = 'Sudo configured and verified'
+                else:
+                    result['sudo_fix'] = 'fail'
+                    detail = (sudo.stderr or verified.stderr or 'sudo setup failed').strip()
+                    result['sudo_fix_msg'] = detail[:200]
         except subprocess.TimeoutExpired:
             result['sudo_fix'] = 'fail'
             result['sudo_fix_msg'] = 'Timeout (30s)'
@@ -314,16 +658,64 @@ def setup_device(device, password, ssh_key_path, lldpq_user):
     
     return result
 
+def read_private_request_json():
+    path = os.environ.get('POST_DATA_FILE', '')
+    if not path:
+        raise ValueError('Private request buffer is missing')
+    metadata = os.lstat(path)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077):
+        raise ValueError('Private request buffer has unsafe metadata')
+    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags)
+    opened = os.fstat(descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        os.close(descriptor)
+        raise ValueError('Private request buffer changed while opening')
+    try:
+        os.unlink(path)
+        with os.fdopen(descriptor, 'rb') as source:
+            raw = source.read(33554433)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    if len(raw) > 33554432:
+        raise ValueError('JSON request exceeds the 32 MiB limit')
+    def reject_duplicate_keys(pairs):
+        result = {}
+        seen = {}
+        for key, value in pairs:
+            folded = key.casefold()
+            if folded in seen:
+                raise ValueError(
+                    'JSON request contains a duplicate key: '
+                    + repr(seen[folded]) + ' and ' + repr(key)
+                )
+            seen[folded] = key
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw.decode('utf-8'), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError('Invalid JSON: ' + str(exc)) from exc
+
 # Main
 try:
-    post_data = json.loads(os.environ.get('POST_DATA', '{}'))
-except:
-    print(json.dumps({'success': False, 'error': 'Invalid JSON'}))
+    post_data = read_private_request_json()
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': str(exc)[:300]}))
+    sys.exit(0)
+if not isinstance(post_data, dict):
+    print(json.dumps({'success': False, 'error': 'JSON request must be an object'}))
     sys.exit(0)
 
 lldpq_user = os.environ.get('LLDPQ_USER', 'lldpq')
 lldpq_dir = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 web_root = os.environ.get('WEB_ROOT', '/var/www/html')
+config_owner = f'{lldpq_user}:www-data'
 devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 
 # /etc/lldpq.conf keys that are portable (safe to carry in a backup): tunable knobs only.
@@ -331,13 +723,19 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 # or secrets (AI_API_KEY).
 LLDPQ_PREF_KEYS = (
     'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL', 'SKIP_OPTICAL', 'SKIP_L1',
-    'MONITOR_MAX_PARALLEL', 'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
+    'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'PFC_ECN_MAX_PARALLEL',
+    'PFC_ECN_COLLECTION_BUDGET_SECONDS', 'PFC_ECN_PORT_TIMEOUT_SECONDS',
+    'OPTICAL_COLLECTION_BUDGET_SECONDS', 'OPTICAL_PORT_TIMEOUT_SECONDS',
+    'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
     'GET_CONFIGS_MAX_PARALLEL', 'GET_CONFIGS_SSH_TIMEOUT',
     'SEND_CMD_MAX_PARALLEL', 'TELEMETRY_MAX_PARALLEL',
     'AUTO_BASE_CONFIG', 'AUTO_ZTP_DISABLE', 'AUTO_SET_HOSTNAME',
     'TRANSCEIVER_FW_SKIP_MODELS', 'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY',
     'TRANSCEIVER_FW_MAX_PARALLEL', 'TRANSCEIVER_FW_MIN_INTERVAL', 'TRANSCEIVER_FW_SSH_TIMEOUT',
     'TELEMETRY_ENABLED', 'PROMETHEUS_URL', 'AI_PROVIDER', 'AI_MODEL', 'AI_API_URL', 'OLLAMA_URL',
+    'AI_FALLBACK_MODEL', 'AI_CONTEXT_WINDOW_TOKENS',
+    'AI_FALLBACK_CONTEXT_WINDOW_TOKENS', 'AI_PROXY_URL', 'AI_SEARCH_MODEL',
+    'AI_SEARCH_URL',
 )
 action = post_data.get('action', 'setup')
 
@@ -357,44 +755,19 @@ def read_conf():
     return conf
 
 def install_text_as_root(content, target, temp_name, mode='644', owner='root:root'):
-    """Use unique fsynced staging and the existing narrow root cp permission."""
+    """Install privileged text through the root-owned atomic bundle helper."""
     ensure_configuration_lock()
-    temp_path = None
     try:
-        fd, temp_path = tempfile.mkstemp(prefix=temp_name + '.', dir='/tmp')
-        with os.fdopen(fd, 'w', encoding='utf-8') as staged:
-            staged.write(content)
-            staged.flush()
-            os.fsync(staged.fileno())
-        copied = subprocess.run(
-            ['sudo', 'cp', temp_path, target], capture_output=True, text=True, timeout=10,
+        user_name, group_name = owner.split(':', 1)
+        uid = int(user_name) if user_name.isdigit() else pwd.getpwnam(user_name).pw_uid
+        gid = int(group_name) if group_name.isdigit() else grp.getgrnam(group_name).gr_gid
+        helper = load_backup_import_helper('lldpq_root_atomic_write')
+        helper._install_bytes_as_root(
+            content.encode('utf-8'), target, int(mode, 8), uid, gid,
         )
-        if copied.returncode != 0:
-            return False
-        try:
-            with open(target, encoding='utf-8') as installed:
-                if installed.read() != content:
-                    return False
-        except Exception:
-            return False
-        if subprocess.run(
-            ['sudo', 'chmod', mode, target], capture_output=True, text=True, timeout=5,
-        ).returncode != 0:
-            return False
-        if subprocess.run(
-            ['sudo', 'chown', owner, target],
-            capture_output=True, text=True, timeout=5,
-        ).returncode != 0:
-            return False
         return True
     except Exception:
         return False
-    finally:
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except FileNotFoundError:
-                pass
 
 def write_conf(pairs):
     """Update allowlisted key=value pairs without nested sudo shells."""
@@ -417,105 +790,357 @@ def write_conf(pairs):
     output.extend('%s=%s' % (key, value) for key, value in pairs.items())
     if install_text_as_root(
         '\n'.join(output) + '\n', '/etc/lldpq.conf', '.lldpq.conf.setup.tmp',
-        '664', 'root:www-data'
+        '660', config_owner
     ):
         return True
     # A copy can succeed before a later chmod/chown failure. Restore the exact
     # original bytes before reporting failure so callers get a transaction.
     install_text_as_root(
         original, '/etc/lldpq.conf', '.lldpq.conf.setup.rollback.tmp',
-        '664', 'root:www-data'
+        '660', config_owner
     )
     return False
 
+def reserve_background_job(state_dir, kind, log_path):
+    """Atomically reserve one service-user job slot and return a unique id."""
+    job_id = uuid.uuid4().hex
+    active = os.path.join(state_dir, kind + '.active')
+    pid_path = os.path.join(state_dir, kind + '.pid')
+    script = r'''
+set -u
+active=$1; pidfile=$2; job=$3; logfile=$4
+exec 9>"${active%.active}.start.lock" || exit 76
+flock -x 9 || exit 76
+if ! mkdir "$active" 2>/dev/null; then
+  pid_record=""; pid=""; pid_job=""; pid_start=""; extra=""
+  [ -f "$pidfile" ] && IFS= read -r pid_record < "$pidfile"
+  read -r first second third extra <<< "$pid_record"
+  if [[ "$first" =~ ^[a-f0-9]{32}$ ]] && [[ "$second" =~ ^[1-9][0-9]*$ ]] && [ -z "$extra" ]; then
+    pid_job=$first; pid=$second
+    [[ "$third" =~ ^[1-9][0-9]*$ ]] && pid_start=$third
+  elif [[ "$first" =~ ^[1-9][0-9]*$ ]] && [ -z "$second" ]; then
+    pid=$first
+  fi
+  current_job=$(cat "$active/job_id" 2>/dev/null || true)
+  now=$(date +%s); mt=$(stat -c %Y "$active" 2>/dev/null || stat -f %m "$active" 2>/dev/null || echo "$now")
+  age=$((now-mt)); [ "$age" -lt 0 ] && age=0
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]] && { [ -z "$pid_job" ] || [ "$pid_job" = "$current_job" ]; } \
+     && kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$pid_start" ]; then
+      current_start=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)
+      [ "$current_start" = "$pid_start" ] && exit 75
+    elif [ "$age" -lt 120 ]; then
+      # Legacy one/two-field records have no process generation. Trust them
+      # only during the startup grace period so PID reuse cannot block forever.
+      exit 75
+    fi
+  fi
+  if [ "$age" -lt 120 ]; then exit 75; fi
+  rm -f "$active/job_id" "$active/created" 2>/dev/null || exit 76
+  rmdir "$active" 2>/dev/null || exit 76
+  mkdir "$active" 2>/dev/null || exit 75
+fi
+printf '%s\n' "$job" > "$active/job_id" || exit 76
+date +%s > "$active/created" || exit 76
+printf '%s\n' "$job" > "${active%.active}.last-job" || exit 76
+printf '__LLDPQ_JOB__:%s\n' "$job" > "$logfile" || exit 76
+'''
+    result = subprocess.run(
+        ['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c', script,
+         '--', active, pid_path, job_id, log_path],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode == 0:
+        return job_id, None
+    if result.returncode == 75:
+        return None, f'Another {kind} job is already active'
+    release_background_job(state_dir, kind, job_id)
+    return None, f'Could not reserve the {kind} job slot: ' + (result.stderr or '').strip()[:160]
+
+def release_background_job(state_dir, kind, expected_job_id=None):
+    if not expected_job_id:
+        return
+    active = os.path.join(state_dir, kind + '.active')
+    pid_path = os.path.join(state_dir, kind + '.pid')
+    subprocess.run(
+         ['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
+         'exec 9>"${1%.active}.start.lock" || exit 1; flock -x 9 || exit 1; '
+         'current=$(cat "$1/job_id" 2>/dev/null || true); '
+         'if [ -z "$current" ] || [ "$current" = "$3" ]; then '
+         'rm -f "$1/job_id" "$1/created" "$2" 2>/dev/null; rmdir "$1" 2>/dev/null || true; fi',
+         '--', active, pid_path, expected_job_id or ''],
+        capture_output=True, text=True, timeout=10,
+    )
+
+def background_job_status(state_dir, kind, raw_done, log_job_id):
+    """Return job status and retire detached-launch reservations that went stale."""
+    active = os.path.join(state_dir, kind + '.active')
+    pid_path = os.path.join(state_dir, kind + '.pid')
+    active_exists = os.path.isdir(active)
+    active_job_id = (_read_service_file(os.path.join(active, 'job_id')) or '').strip()
+    last_job_id = (_read_service_file(os.path.join(state_dir, kind + '.last-job')) or '').strip()
+    job_id = active_job_id if active_exists else last_job_id
+    pid_text = (_read_service_file(pid_path) or '').strip()
+    pid_job_id = None
+    pid_value = ''
+    pid_start = None
+    pid_match = re.fullmatch(
+        r'([a-f0-9]{32})\s+([1-9][0-9]*)(?:\s+([1-9][0-9]*))?',
+        pid_text,
+    )
+    if pid_match:
+        pid_job_id, pid_value, pid_start = pid_match.groups()
+    elif re.fullmatch(r'[1-9][0-9]*', pid_text):
+        # Compatibility with reservations created before job IDs were stored.
+        pid_value = pid_text
+    pid_recorded = bool(pid_value)
+    if pid_job_id and job_id and pid_job_id != job_id:
+        pid_recorded = False
+    done = load_setup_safety().completion_belongs_to_job(
+        raw_done=raw_done, log_job_id=log_job_id,
+        known_job_id=job_id or None, active_exists=active_exists,
+    )
+    age = 0
+    if active_exists:
+        created_text = (_read_service_file(os.path.join(active, 'created')) or '').strip()
+        try:
+            age = max(0, time.time() - int(created_text))
+        except (TypeError, ValueError):
+            try:
+                age = max(0, time.time() - os.stat(active).st_mtime)
+            except OSError:
+                age = 121
+    process_alive = False
+    if pid_recorded:
+        try:
+            os.kill(int(pid_value), 0)
+            kill_alive = True
+        except PermissionError:
+            kill_alive = True
+        except ProcessLookupError:
+            kill_alive = False
+        if kill_alive and pid_start is not None:
+            try:
+                raw_stat = open(f'/proc/{pid_value}/stat', encoding='ascii').read(4096)
+                stat_fields = raw_stat.rsplit(') ', 1)[1].split()
+                current_start = stat_fields[19]
+            except (OSError, IndexError, UnicodeError):
+                current_start = None
+            process_alive = current_start == pid_start
+        elif kill_alive:
+            # A legacy PID-only record cannot distinguish a reused PID. Keep
+            # only the same bounded grace used by reservation recovery.
+            process_alive = active_exists and age < 120
+    decision = load_setup_safety().classify_background_job(
+        done=done, process_alive=process_alive,
+        active_exists=active_exists, age_seconds=age,
+    )
+    if job_id and done and (active_exists or pid_recorded):
+        release_background_job(state_dir, kind, job_id)
+    elif job_id and decision['stale_reservation']:
+        release_background_job(state_dir, kind, job_id)
+    return {'running': decision['running'], 'pid_recorded': pid_recorded,
+            'job_id': job_id or None,
+            'stale_reservation': decision['stale_reservation'], 'done': done}
+
+def active_setup_job_names():
+    """Return active collector/update jobs that must not race an uninstall."""
+    state_dir = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state')
+    jobs = (
+        ('run', os.path.join(lldpq_dir, '.run.log')),
+        ('update', os.path.join(state_dir, 'update.log')),
+    )
+    active = []
+    for kind, log_path in jobs:
+        content = _read_service_file(log_path) or ''
+        _display, raw_done, _exit_code, _ok, log_job_id = parse_completion_log(content)
+        status = background_job_status(state_dir, kind, raw_done, log_job_id)
+        if status['running']:
+            active.append(kind)
+    return active
+
+def validated_uninstall_request(*, start=False):
+    """Copy only the fixed uninstall schema; reject extras and type coercion."""
+    allowed_top = {'action', 'options', 'acknowledgements'}
+    if start:
+        allowed_top.update({
+            'preview_token', 'preview_fingerprint', 'confirmation', 'request_id',
+        })
+    unknown_top = set(post_data) - allowed_top
+    if unknown_top:
+        raise ValueError('Unsupported uninstall request field: ' + sorted(unknown_top)[0])
+
+    options = post_data.get('options')
+    option_names = {
+        'keep_data', 'remove_source', 'remove_nginx', 'remove_dhcp', 'remove_docker',
+    }
+    if not isinstance(options, dict) or set(options) != option_names:
+        raise ValueError('Uninstall options must contain exactly the supported fields')
+    if any(not isinstance(options[name], bool) for name in option_names):
+        raise ValueError('Every uninstall option must be true or false')
+
+    acknowledgements = post_data.get('acknowledgements', {})
+    acknowledgement_names = {'ack_disconnect', 'ack_data_loss', 'ack_shared_services'}
+    if (not isinstance(acknowledgements, dict)
+            or set(acknowledgements) != acknowledgement_names
+            or any(not isinstance(value, bool) for value in acknowledgements.values())):
+        raise ValueError('Uninstall acknowledgements are invalid')
+    acknowledgements = {name: acknowledgements[name] for name in acknowledgement_names}
+
+    payload = {'options': dict(options), 'acknowledgements': acknowledgements}
+    if not start:
+        return payload
+
+    confirmation = post_data.get('confirmation')
+    if confirmation != 'UNINSTALL':
+        raise ValueError('Type UNINSTALL exactly to confirm')
+    if not acknowledgements['ack_disconnect']:
+        raise ValueError('The management-disconnect acknowledgement is required')
+    if ((not options['keep_data'] or options['remove_source'])
+            and not acknowledgements['ack_data_loss']):
+        raise ValueError('The permanent data-loss acknowledgement is required')
+    if (any(options[name] for name in ('remove_nginx', 'remove_dhcp', 'remove_docker'))
+            and not acknowledgements['ack_shared_services']):
+        raise ValueError('The shared-service removal acknowledgement is required')
+
+    token = post_data.get('preview_token')
+    fingerprint = post_data.get('preview_fingerprint', '')
+    request_id = post_data.get('request_id')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{64}', token):
+        raise ValueError('A valid dry-run preview token is required')
+    if (not isinstance(fingerprint, str)
+            or not re.fullmatch(r'[a-f0-9]{64}', fingerprint)):
+        raise ValueError('The preview fingerprint is invalid')
+    if (not isinstance(request_id, str)
+            or not re.fullmatch(r'[a-f0-9]{32}', request_id)):
+        raise ValueError('The uninstall request ID is invalid')
+    payload.update({
+        'preview_token': token,
+        'preview_fingerprint': fingerprint,
+        'confirmation': confirmation,
+        'request_id': request_id,
+    })
+    return payload
+
+# ─── Actions: Native uninstall Danger Zone (root-owned fixed gateway) ───
+if action in ('uninstall-preview', 'uninstall-start'):
+    if os.path.exists('/.dockerenv'):
+        response = {
+            'success': False,
+            'docker': True,
+            'error': ('Docker deployment: uninstall LLDPq from the Docker host with '
+                      'docker compose down and remove the host deployment files there.'),
+        }
+        if action == 'uninstall-start':
+            response['accepted'] = False
+        print(json.dumps(response))
+        sys.exit(0)
+    try:
+        payload = validated_uninstall_request(start=action == 'uninstall-start')
+        conflicts = active_setup_job_names()
+    except Exception as exc:
+        response = {'success': False, 'error': str(exc)[:300]}
+        if action == 'uninstall-start':
+            response['accepted'] = False
+        print(json.dumps(response))
+        sys.exit(0)
+    if conflicts:
+        response = {
+            'success': False,
+            'conflict': True,
+            'error': 'Cannot uninstall while Setup jobs are active: ' + ', '.join(conflicts),
+        }
+        if action == 'uninstall-start':
+            response['accepted'] = False
+        print(json.dumps(response))
+        sys.exit(0)
+    command = 'start' if action == 'uninstall-start' else 'preview'
+    response = call_uninstall_web_helper(
+        command, payload, timeout=30 if command == 'start' else 180,
+    )
+    print(json.dumps(response))
+    sys.exit(0)
+
+if action == 'uninstall-status':
+    if set(post_data) != {'action', 'job_id'}:
+        print(json.dumps({'success': False, 'error': 'Uninstall status request is invalid'}))
+        sys.exit(0)
+    job_id = post_data.get('job_id')
+    if (not isinstance(job_id, str)
+            or not re.fullmatch(r'[a-f0-9]{32}', job_id)):
+        print(json.dumps({'success': False, 'error': 'Uninstall job ID is invalid'}))
+        sys.exit(0)
+    response = call_uninstall_web_helper('status', {'job_id': job_id}, timeout=20)
+    print(json.dumps(response))
+    sys.exit(0)
+
+# ─── Actions: Read/write display-only P2P and field aliases ───
+if action == 'get-aliases':
+    alias_file = os.path.join(web_root, 'display-aliases.json')
+    try:
+        safety = load_setup_safety()
+        aliases, revision = safety.load_aliases(alias_file)
+        print(json.dumps({'success': True, 'aliases': aliases, 'revision': revision}))
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': 'Cannot load display aliases: ' + str(exc)[:300]}))
+    sys.exit(0)
+
+if action == 'set-aliases':
+    alias_file = os.path.join(web_root, 'display-aliases.json')
+    raw_aliases = post_data.get('aliases')
+    if raw_aliases is None:
+        raw_aliases = {
+            'interfaces': post_data.get('interfaces', {}),
+            'devices': post_data.get('devices', {}),
+        }
+    expected = post_data.get('expected_revision', post_data.get('revision'))
+    if expected is not None and not isinstance(expected, str):
+        print(json.dumps({'success': False, 'error': 'revision must be a string'}))
+        sys.exit(0)
+    try:
+        safety = load_setup_safety()
+        aliases, rendered = safety.aliases_text(raw_aliases)
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': str(exc)[:300]}))
+        sys.exit(0)
+    response = service_atomic_write(
+        'save-aliases', alias_file, rendered, expected_revision=expected,
+    )
+    if response.get('success'):
+        response['aliases'] = aliases
+        response['message'] = 'Display aliases saved successfully'
+    print(json.dumps(response))
+    sys.exit(0)
+
 # ─── Action: Save existing private key ───
 if action == 'save-key':
-    private_key = post_data.get('private_key', '').strip()
-    if not private_key or 'PRIVATE KEY' not in private_key:
-        print(json.dumps({'success': False, 'error': 'Invalid private key'}))
-        sys.exit(0)
-    
-    # Determine key type
-    ssh_dir = os.path.expanduser(f'~{lldpq_user}/.ssh')
-    os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
-    
-    if 'RSA' in private_key:
-        key_file = os.path.join(ssh_dir, 'id_rsa')
-    else:
-        key_file = os.path.join(ssh_dir, 'id_ed25519')
-    
-    try:
-        # Write private key
-        with open(key_file, 'w') as f:
-            f.write(private_key + '\n')
-        os.chmod(key_file, 0o600)
-        
-        # Generate public key from private key
-        gen = subprocess.run(
-            ['ssh-keygen', '-y', '-f', key_file],
-            capture_output=True, text=True, timeout=5
-        )
-        if gen.returncode == 0:
-            with open(key_file + '.pub', 'w') as f:
-                f.write(gen.stdout.strip() + '\n')
-        
-        # Fix ownership
-        subprocess.run(['chown', '-R', f'{lldpq_user}:{lldpq_user}', ssh_dir],
-                      capture_output=True, timeout=5)
-        
-        # Quick connectivity test: try SSH to first 5 reachable devices
-        all_devices, _ = load_devices(devices_yaml)
-        reachable = 0
-        total = len(all_devices) if all_devices else 0
-        
-        if all_devices:
-            test_devices = all_devices[:10]  # Test first 10
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                def test_ssh(dev):
-                    try:
-                        r = subprocess.run(
-                            ['sudo', '-u', lldpq_user, 'ssh',
-                             '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3',
-                             '-o', 'StrictHostKeyChecking=no', '-q',
-                             f"{dev['username']}@{dev['ip']}", 'exit'],
-                            capture_output=True, text=True, timeout=8
-                        )
-                        return r.returncode == 0
-                    except:
-                        return False
-                
-                futures = {executor.submit(test_ssh, d): d for d in test_devices}
-                for future in as_completed(futures):
-                    if future.result():
-                        reachable += 1
-            
-            # Extrapolate: if X/10 work, assume same ratio for all
-            if len(test_devices) < total:
-                reachable = int((reachable / len(test_devices)) * total)
-        
-        print(json.dumps({
-            'success': True,
-            'message': 'Key saved successfully',
-            'key_file': key_file,
-            'reachable': reachable,
-            'total': total
-        }))
-    except Exception as e:
-        print(json.dumps({'success': False, 'error': str(e)}))
-    
+    # This legacy endpoint used to overwrite the live private key before it had
+    # been validated.  Setup no longer calls it; key import is handled by the
+    # staged/rollback-capable Provision key API.  Fail closed so old clients
+    # cannot reintroduce the destructive path.
+    print(json.dumps({
+        'success': False,
+        'deprecated': True,
+        'error': 'Legacy direct key import is disabled. Use Setup → SSH Keys → Import, which validates and stages the key before replacement.'
+    }))
     sys.exit(0)
 
 # ─── Action: Export the collector PRIVATE key (back up / migrate LLDPq to another host) ───
 if action == 'get-private-key':
+    try:
+        ensure_ssh_key_lock()
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': str(exc)}))
+        sys.exit(0)
     private_key = ''
     key_file = ''
     for key_name in ('id_ed25519', 'id_rsa'):
         p = os.path.expanduser(f'~{lldpq_user}/.ssh/{key_name}')
         try:
-            r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', p],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and 'PRIVATE KEY' in r.stdout:
-                private_key = r.stdout
+            canonical, pair_error = validate_ssh_key_pair(p)
+            candidate = _read_service_file(p)
+            if canonical and candidate:
+                private_key = candidate
                 key_file = p
                 break
         except Exception:
@@ -528,36 +1153,60 @@ if action == 'get-private-key':
 
 # ─── Action: Verify which devices already trust the collector key (no password) ───
 if action == 'verify':
+    try:
+        ensure_ssh_key_lock()
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': str(exc)}))
+        sys.exit(0)
     all_devices, load_error = load_devices(devices_yaml)
     if load_error:
         print(json.dumps({'success': False, 'error': load_error}))
         sys.exit(0)
 
-    PING_CMD = detect_ping_cmd(lldpq_user)
+    ssh_key_path, key_generated, key_error = ensure_ssh_key(lldpq_user)
+    if key_error:
+        print(json.dumps({'success': False, 'error': 'SSH key error: ' + key_error}))
+        sys.exit(0)
+    private_key_path = ssh_key_path[:-4] if ssh_key_path.endswith('.pub') else ssh_key_path
+    public_key, pair_error = validate_ssh_key_pair(private_key_path)
+    if pair_error:
+        print(json.dumps({'success': False, 'error': 'SSH key error: ' + pair_error}))
+        sys.exit(0)
 
     def verify_device(device):
         ip = device['ip']
         username = device['username']
-        res = {'hostname': device['hostname'], 'ip': ip, 'username': username, 'trusted': False, 'msg': ''}
-        if not ping_check(ip, PING_CMD):
-            res['msg'] = 'Unreachable (ping failed)'
-            return res
+        res = {'hostname': device['hostname'], 'ip': ip, 'username': username,
+               'trusted': False, 'msg': '', 'sudo_ok': False, 'sudo_msg': ''}
+        base = ['sudo', '-n', '-u', lldpq_user, 'ssh', '-i', private_key_path,
+                '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+                '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
+                '-q', f'{username}@{ip}']
         try:
             chk = subprocess.run(
-                ['sudo', '-u', lldpq_user, 'ssh',
-                 '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
-                 '-q', f'{username}@{ip}', 'exit'],
+                base + ['true'],
                 capture_output=True, text=True, timeout=10
             )
             if chk.returncode == 0:
                 res['trusted'] = True
                 res['msg'] = 'Key trusted'
+                sudo_check = subprocess.run(
+                    base + ['sudo -n true'], capture_output=True, text=True, timeout=10,
+                )
+                if sudo_check.returncode == 0:
+                    res['sudo_ok'] = True
+                    res['sudo_msg'] = 'Passwordless sudo ready'
+                else:
+                    res['sudo_msg'] = 'Key works, but passwordless sudo is not ready'
             else:
                 res['msg'] = 'Key not accepted (needs distribution)'
+                res['sudo_msg'] = 'Sudo not checked because key authentication failed'
         except subprocess.TimeoutExpired:
             res['msg'] = 'Timeout (10s)'
+            res['sudo_msg'] = 'Sudo not checked'
         except Exception as e:
             res['msg'] = str(e)[:120]
+            res['sudo_msg'] = 'Sudo not checked'
         return res
 
     results = []
@@ -569,62 +1218,80 @@ if action == 'verify':
             except Exception as e:
                 d = futures[future]
                 results.append({'hostname': d['hostname'], 'ip': d['ip'], 'username': d['username'],
-                                'trusted': False, 'msg': str(e)[:120]})
+                                'trusted': False, 'msg': str(e)[:120],
+                                'sudo_ok': False, 'sudo_msg': 'Sudo not checked'})
     results.sort(key=lambda r: r['hostname'])
 
-    # Include the current public key so the page can show it without a separate call.
-    public_key = ''
-    for key_name in ('id_ed25519', 'id_rsa'):
-        pub_path = os.path.expanduser(f'~{lldpq_user}/.ssh/{key_name}.pub')
-        if os.path.isfile(pub_path):
-            try:
-                with open(pub_path) as fh:
-                    public_key = fh.read().strip()
-            except Exception:
-                pass
-            break
-
     trusted = sum(1 for r in results if r['trusted'])
+    sudo_ok = sum(1 for r in results if r['sudo_ok'])
     print(json.dumps({'success': True, 'total': len(results), 'trusted': trusted,
-                      'public_key': public_key, 'results': results}))
+                      'sudo_ok': sudo_ok, 'ready': sudo_ok,
+                      'key_generated': key_generated,
+                      'public_key': public_key.strip(), 'results': results}))
     sys.exit(0)
 
 # ─── Action: Run the full LLDPq pipeline verbosely (lldpq -) into a log we can tail ───
 if action == 'run':
     log_path = os.path.join(lldpq_dir, '.run.log')
-    pid_path = os.path.join(lldpq_dir, '.run.pid')
+    state_dir = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state')
+    subprocess.run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/mkdir', '-p', state_dir],
+                   capture_output=True, text=True, timeout=10)
+    try:
+        with setup_job_start_guard():
+            job_id, job_error = reserve_background_job(state_dir, 'run', log_path)
+    except Exception as exc:
+        print(json.dumps({'success': False, 'conflict': True,
+                          'error': 'Could not reserve the LLDPq run: ' + str(exc)[:200]}))
+        sys.exit(0)
+    if job_error:
+        print(json.dumps({'success': False, 'conflict': True, 'error': job_error}))
+        sys.exit(0)
+    pid_path = os.path.join(state_dir, 'run.pid')
+    active_path = os.path.join(state_dir, 'run.active')
+    start_lock_path = os.path.join(state_dir, 'run.start.lock')
+    cleanup = (
+        f'rc=$?; exec 8>{shlex.quote(start_lock_path)}; '
+        f'if flock -x 8; then current=$(cat {shlex.quote(os.path.join(active_path, "job_id"))} 2>/dev/null || true); '
+        f'if [ "$current" = {shlex.quote(job_id)} ]; then rm -f {shlex.quote(pid_path)} '
+        f'{shlex.quote(os.path.join(active_path, "job_id"))} {shlex.quote(os.path.join(active_path, "created"))}; '
+        f'rmdir {shlex.quote(active_path)} 2>/dev/null || true; fi; fi; trap - EXIT; exit "$rc"'
+    )
     runner = (
+        f'JOB_ID={shlex.quote(job_id)}; START_TIME=$(awk \'{{print $22}}\' "/proc/$$/stat" 2>/dev/null || true); '
+        f'if [[ "$START_TIME" =~ ^[1-9][0-9]*$ ]]; then printf "%s %s %s\\n" "$JOB_ID" "$$" "$START_TIME"; '
+        f'else printf "%s %s\\n" "$JOB_ID" "$$"; fi > {shlex.quote(pid_path)}; '
+        f'trap {shlex.quote(cleanup)} EXIT; '
         f'cd {shlex.quote(lldpq_dir)} || {{ echo "ERROR: LLDPq directory is unavailable" >> {shlex.quote(log_path)}; '
         f'printf "__LLDPQ_DONE__:10\\n" >> {shlex.quote(log_path)}; exit 10; }}; '
         f'/usr/local/bin/lldpq - >> {shlex.quote(log_path)} 2>&1; '
         f'rc=$?; printf "__LLDPQ_DONE__:%s\\n" "$rc" >> {shlex.quote(log_path)}; '
-        f'rm -f {shlex.quote(pid_path)}; exit "$rc"'
+        f'exit "$rc"'
     )
     try:
-        prep = subprocess.run(
-            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if prep.returncode != 0:
-            print(json.dumps({'success': False, 'error': 'Could not create the LLDPq run log: ' + (prep.stderr or '').strip()[:200]}))
+        launch = f'nohup setsid bash -c {shlex.quote(runner)} >/dev/null 2>&1 &'
+        launcher = subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
+                                    start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            launcher_rc = launcher.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            launcher_rc = None
+        if launcher_rc not in (None, 0):
+            release_background_job(state_dir, 'run', job_id)
+            print(json.dumps({'success': False, 'error': 'Detached LLDPq launch failed immediately'}))
             sys.exit(0)
-        launch = (
-            f'rm -f {shlex.quote(pid_path)}; '
-            f'nohup setsid bash -c {shlex.quote(runner)} >/dev/null 2>&1 & '
-            f'printf "%s\\n" "$!" > {shlex.quote(pid_path)}'
-        )
-        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
-                         start_new_session=True, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(json.dumps({'success': True, 'message': 'LLDPq run started'}))
+        print(json.dumps({'success': True, 'message': 'LLDPq run started', 'job_id': job_id}))
     except Exception as e:
+        release_background_job(state_dir, 'run', job_id)
         print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
 
 # ─── Action: Tail the run log started by action=run ───
 if action == 'run-log':
     log_path = os.path.join(lldpq_dir, '.run.log')
-    pid_path = os.path.join(lldpq_dir, '.run.pid')
+    state_dir = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state')
+    pid_path = os.path.join(state_dir, 'run.pid')
+    active_path = os.path.join(state_dir, 'run.active')
     content = ''
     try:
         r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', log_path],
@@ -633,29 +1300,15 @@ if action == 'run-log':
             content = r.stdout
     except Exception:
         content = ''
-    display, done, exit_code, ok = parse_completion_log(content)
-    running = False
-    pid_recorded = False
-    if not done:
-        try:
-            with open(pid_path, 'r', encoding='utf-8') as source:
-                pid_text = source.read().strip()
-            if re.fullmatch(r'[1-9][0-9]*', pid_text):
-                pid_recorded = True
-                try:
-                    os.kill(int(pid_text), 0)
-                    running = True
-                except PermissionError:
-                    # The CGI user normally differs from LLDPQ_USER; EPERM still
-                    # proves that the recorded process exists.
-                    running = True
-                except ProcessLookupError:
-                    running = False
-        except (OSError, subprocess.SubprocessError):
-            running = False
-    print(json.dumps({'success': True, 'done': done, 'ok': ok,
-                      'running': running, 'pid_recorded': pid_recorded,
-                      'exit_code': exit_code,
+    display, raw_done, exit_code, ok, log_job_id = parse_completion_log(content)
+    status = background_job_status(state_dir, 'run', raw_done, log_job_id)
+    print(json.dumps({'success': True, 'done': status['done'],
+                      'ok': ok and status['done'],
+                      'running': status['running'],
+                      'pid_recorded': status['pid_recorded'],
+                      'job_id': status['job_id'],
+                      'stale_reservation': status['stale_reservation'],
+                      'exit_code': exit_code if status['done'] else None,
                       'log': display}))
     sys.exit(0)
 
@@ -663,9 +1316,26 @@ if action == 'run-log':
 if action == 'get-ansible':
     conf = read_conf()
     raw = conf.get('ANSIBLE_DIR', '')
+    editor_raw = conf.get('EDITOR_ROOT', raw)
     disabled = (raw == '' or raw == 'NoNe')
     path = '' if disabled else raw
+    warnings = []
     exists = bool(path) and os.path.isdir(path) and os.path.isdir(os.path.join(path, 'inventory'))
+    inventory_file = ''
+    if exists:
+        for candidate in ('inventory.ini', 'hosts'):
+            candidate_path = os.path.join(path, 'inventory', candidate)
+            if os.path.isfile(candidate_path):
+                inventory_file = candidate_path
+                break
+        if not inventory_file:
+            warnings.append('inventory/ exists but inventory.ini or hosts was not found')
+        if not os.access(path, os.R_OK | os.X_OK):
+            warnings.append('The web service cannot read/traverse this directory; adjust group ACLs manually')
+        if editor_raw not in (raw, '', 'NoNe'):
+            warnings.append('EDITOR_ROOT differs from ANSIBLE_DIR; save this step to synchronize them')
+        if not os.path.isdir(os.path.join(path, 'playbooks')):
+            warnings.append('playbooks/ was not found; editor browsing may work but playbook actions will not')
     home = os.path.expanduser('~' + lldpq_user)
     candidates = []
     try:
@@ -675,24 +1345,53 @@ if action == 'get-ansible':
                 candidates.append(d)
     except Exception:
         pass
+    ready = disabled or (exists and bool(inventory_file) and not any('cannot read' in w for w in warnings))
     print(json.dumps({'success': True, 'disabled': disabled, 'path': path,
-                      'exists': exists, 'candidates': candidates}))
+                      'editor_root': '' if editor_raw == 'NoNe' else editor_raw,
+                      'exists': exists, 'ready': ready, 'warnings': warnings,
+                      'inventory_file': inventory_file, 'candidates': candidates}))
     sys.exit(0)
 
 # ─── Action: enable/point/disable Ansible integration (writes ANSIBLE_DIR, NoNe = off) ───
 if action == 'set-ansible':
-    disable = bool(post_data.get('disable'))
-    val = (post_data.get('ansible_dir') or '').strip()
+    disable = post_data.get('disable', False)
+    if not isinstance(disable, bool):
+        print(json.dumps({'success': False, 'error': 'disable must be true or false'}))
+        sys.exit(0)
+    raw_val = post_data.get('ansible_dir', '')
+    if not isinstance(raw_val, str):
+        print(json.dumps({'success': False, 'error': 'ansible_dir must be a string'}))
+        sys.exit(0)
+    val = raw_val.strip()
     if disable or not val:
         new_val = 'NoNe'
     else:
+        if (len(val) > 4096 or not os.path.isabs(val)
+                or any(char in val for char in ('\x00', '\r', '\n'))):
+            print(json.dumps({'success': False, 'error': 'Ansible directory must be a safe absolute path'}))
+            sys.exit(0)
+        val = os.path.realpath(val)
         if not (os.path.isdir(val) and os.path.isdir(os.path.join(val, 'inventory'))):
             print(json.dumps({'success': False, 'error': 'Directory not found or missing an inventory/ folder: ' + val}))
             sys.exit(0)
         new_val = val
-    if write_conf({'ANSIBLE_DIR': new_val}):
+    if write_conf({'ANSIBLE_DIR': new_val, 'EDITOR_ROOT': new_val}):
+        warnings = []
+        ready = True
+        if new_val != 'NoNe':
+            inv = os.path.join(new_val, 'inventory')
+            if not any(os.path.isfile(os.path.join(inv, name)) for name in ('inventory.ini', 'hosts')):
+                warnings.append('Saved, but inventory/inventory.ini or inventory/hosts is missing')
+                ready = False
+            if not os.access(new_val, os.R_OK | os.X_OK):
+                warnings.append('Saved, but the web service cannot read/traverse this directory; grant an appropriate group ACL')
+                ready = False
+            if not os.path.isdir(os.path.join(new_val, 'playbooks')):
+                warnings.append('playbooks/ is missing; playbook actions will remain unavailable')
         print(json.dumps({'success': True, 'disabled': new_val == 'NoNe',
-                          'path': '' if new_val == 'NoNe' else new_val}))
+                          'path': '' if new_val == 'NoNe' else new_val,
+                          'editor_root': '' if new_val == 'NoNe' else new_val,
+                          'ready': ready, 'warnings': warnings}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -747,7 +1446,10 @@ if action == 'update':
         print(json.dumps({'success': False, 'docker': True,
                           'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
         sys.exit(0)
-    backup = bool(post_data.get('backup'))
+    backup = post_data.get('backup', False)
+    if not isinstance(backup, bool):
+        print(json.dumps({'success': False, 'error': 'backup must be true or false'}))
+        sys.exit(0)
     url = 'https://github.com/aliaydemir/lldpq-src.git'
     # Stage the runner + log in ~/.lldpq-state, NOT inside lldpq_dir: install.sh wipes/
     # replaces the lldpq dir during an update (that's why it preserves data), which would
@@ -755,11 +1457,41 @@ if action == 'update':
     # the home directory tidy.
     home_dir = os.path.expanduser('~' + lldpq_user)
     state_dir = os.path.join(home_dir, '.lldpq-state')
-    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
-                   capture_output=True, text=True, timeout=10)
+    try:
+        prepared = subprocess.run(
+            ['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
+            capture_output=True, text=True, timeout=10,
+        )
+        if prepared.returncode != 0:
+            raise RuntimeError('Could not prepare the update state directory')
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': str(exc)[:200]}))
+        sys.exit(0)
     script_path = os.path.join(state_dir, 'update-run.sh')
     log_path = os.path.join(state_dir, 'update.log')
+    try:
+        with setup_job_start_guard():
+            job_id, job_error = reserve_background_job(state_dir, 'update', log_path)
+    except Exception as exc:
+        print(json.dumps({'success': False, 'error': 'Could not reserve the update: ' + str(exc)[:160]}))
+        sys.exit(0)
+    if job_error:
+        print(json.dumps({'success': False, 'conflict': True, 'error': job_error}))
+        sys.exit(0)
+    pid_path = os.path.join(state_dir, 'update.pid')
+    active_path = os.path.join(state_dir, 'update.active')
     SCRIPT = '''#!/usr/bin/env bash
+ACTIVE="__ACTIVE__"
+PIDFILE="__PID__"
+JOB_ID="__JOB__"
+START_TIME=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null || true)
+if [[ "$START_TIME" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s %s %s\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
+else
+    printf '%s %s\n' "$JOB_ID" "$$" > "$PIDFILE"
+fi
+cleanup_update_job() { rc=$?; exec 8>"${ACTIVE%.active}.start.lock"; if flock -x 8; then current=$(cat "$ACTIVE/job_id" 2>/dev/null || true); if [ "$current" = "$JOB_ID" ]; then rm -f "$PIDFILE" "$ACTIVE/job_id" "$ACTIVE/created"; rmdir "$ACTIVE" 2>/dev/null || true; fi; fi; trap - EXIT; exit "$rc"; }
+trap cleanup_update_job EXIT
 if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
@@ -767,7 +1499,7 @@ SRC="${LLDPQ_SRC:-}"
 HOMESRC="$HOME/lldpq-src"
 URL="__URL__"
 LOG="__LOG__"
-: > "$LOG"
+: # log already initialized with the job marker by the reservation transaction
 (
   echo "=== LLDPq Update $(date) ==="
   if [ -n "$SRC" ] && [ -d "$SRC/.git" ]; then
@@ -799,19 +1531,16 @@ exit "$rc"
 '''
     script = (SCRIPT.replace('__URL__', url)
               .replace('__BACKUP__', '--backup' if backup else '')
-              .replace('__LOG__', log_path))
+              .replace('__LOG__', log_path)
+              .replace('__ACTIVE__', active_path)
+              .replace('__PID__', pid_path)
+              .replace('__JOB__', job_id))
     try:
         w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', script_path],
                            input=script, capture_output=True, text=True, timeout=10)
         if w.returncode != 0:
+            release_background_job(state_dir, 'update', job_id)
             print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
-            sys.exit(0)
-        clear = subprocess.run(
-            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if clear.returncode != 0:
-            print(json.dumps({'success': False, 'error': 'Could not initialize update log'}))
             sys.exit(0)
         # Run the update in its OWN systemd transient unit (separate cgroup). install.sh
         # restarts fcgiwrap, and systemd kills the fcgiwrap.service cgroup on restart — a
@@ -823,43 +1552,95 @@ exit "$rc"
                   '--setenv=HOME=' + shlex.quote(home_dir) + ' '
                   '/bin/bash ' + shlex.quote(script_path) + ' 2>/dev/null; then :; '
                   'else nohup setsid /bin/bash ' + shlex.quote(script_path) + ' >/dev/null 2>&1 & fi')
-        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
-                         start_new_session=True, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(json.dumps({'success': True, 'message': 'Update started'}))
+        launcher = subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
+                                    start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            launcher_rc = launcher.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            launcher_rc = None
+        if launcher_rc not in (None, 0):
+            release_background_job(state_dir, 'update', job_id)
+            print(json.dumps({'success': False, 'error': 'Detached update launch failed immediately'}))
+            sys.exit(0)
+        print(json.dumps({'success': True, 'message': 'Update started', 'job_id': job_id}))
     except Exception as e:
+        release_background_job(state_dir, 'update', job_id)
         print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
 
 # ─── Action: Offline Update (apply a source tarball already on the host; no network/GitHub) ───
 if action == 'update-offline':
+    raw_tarball = post_data.get('path') or '/tmp/lldpq-src.tar.gz'
+    if not isinstance(raw_tarball, str):
+        print(json.dumps({'success': False, 'error': 'Offline update path must be a string'}))
+        sys.exit(0)
+    tarball = raw_tarball.strip()
     # Docker: a container can't replace its own image — update is a host operation.
     if os.path.exists('/.dockerenv'):
+        cleanup_uploaded_tarball(tarball)
         print(json.dumps({'success': False, 'docker': True,
                           'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
         sys.exit(0)
-    backup = bool(post_data.get('backup'))
-    tarball = (post_data.get('path') or '/tmp/lldpq-src.tar.gz').strip()
+    backup = post_data.get('backup', False)
+    if not isinstance(backup, bool):
+        cleanup_uploaded_tarball(tarball)
+        print(json.dumps({'success': False, 'error': 'backup must be true or false'}))
+        sys.exit(0)
     # Strict path: absolute, no traversal, no shell metacharacters (it is substituted into the
     # runner script below, so this also prevents shell injection).
     if not re.match(r'^/[A-Za-z0-9._/-]+$', tarball) or '..' in tarball:
+        cleanup_uploaded_tarball(tarball)
         print(json.dumps({'success': False, 'error': 'Enter a simple absolute path like /tmp/lldpq-src.tar.gz (letters, digits, . _ - / only).'}))
         sys.exit(0)
     home_dir = os.path.expanduser('~' + lldpq_user)
     state_dir = os.path.join(home_dir, '.lldpq-state')
-    subprocess.run(['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
-                   capture_output=True, text=True, timeout=10)
+    try:
+        prepared = subprocess.run(
+            ['sudo', '-u', lldpq_user, 'mkdir', '-p', state_dir],
+            capture_output=True, text=True, timeout=10,
+        )
+        if prepared.returncode != 0:
+            raise RuntimeError('Could not prepare the offline update state directory')
+    except Exception as exc:
+        cleanup_uploaded_tarball(tarball)
+        print(json.dumps({'success': False, 'error': str(exc)[:200]}))
+        sys.exit(0)
     script_path = os.path.join(state_dir, 'update-run.sh')
     log_path = os.path.join(state_dir, 'update.log')
+    try:
+        with setup_job_start_guard():
+            job_id, job_error = reserve_background_job(state_dir, 'update', log_path)
+    except Exception as exc:
+        cleanup_uploaded_tarball(tarball)
+        print(json.dumps({'success': False, 'error': 'Could not reserve the offline update: ' + str(exc)[:160]}))
+        sys.exit(0)
+    if job_error:
+        cleanup_uploaded_tarball(tarball)
+        print(json.dumps({'success': False, 'conflict': True, 'error': job_error}))
+        sys.exit(0)
+    pid_path = os.path.join(state_dir, 'update.pid')
+    active_path = os.path.join(state_dir, 'update.active')
     # Same log + systemd-run isolation as action=update, so the existing update-log polling
     # and the UI live view work unchanged. The only difference is the source: extract a local
     # tarball instead of git pull/clone, then run install.sh -y (update mode = offline-safe:
     # it skips apt/pip/Monaco which only run on a fresh install).
     SCRIPT = '''#!/usr/bin/env bash
+ACTIVE="__ACTIVE__"
+PIDFILE="__PID__"
+JOB_ID="__JOB__"
+START_TIME=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null || true)
+if [[ "$START_TIME" =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s %s %s\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
+else
+    printf '%s %s\n' "$JOB_ID" "$$" > "$PIDFILE"
+fi
+cleanup_update_job() { rc=$?; case "${TARBALL:-}" in /tmp/lldpq-upload-src.*.tar.gz) rm -f -- "$TARBALL";; esac; exec 8>"${ACTIVE%.active}.start.lock"; if flock -x 8; then current=$(cat "$ACTIVE/job_id" 2>/dev/null || true); if [ "$current" = "$JOB_ID" ]; then rm -f "$PIDFILE" "$ACTIVE/job_id" "$ACTIVE/created"; rmdir "$ACTIVE" 2>/dev/null || true; fi; fi; trap - EXIT; exit "$rc"; }
+trap cleanup_update_job EXIT
 TARBALL="__TARBALL__"
 DEST="$HOME/lldpq-src"
 LOG="__LOG__"
-: > "$LOG"
+: # log already initialized with the job marker by the reservation transaction
 (
   TMP=""
   trap '[ -z "$TMP" ] || rm -rf "$TMP"' EXIT
@@ -867,8 +1648,86 @@ LOG="__LOG__"
   echo "--- tarball: $TARBALL ---"
   if [ ! -f "$TARBALL" ]; then echo "ERROR: tarball not found (or not readable by $(whoami)): $TARBALL"; exit 1; fi
   TMP="$(mktemp -d)"
-  echo "--- extracting ---"
-  if ! tar -xzf "$TARBALL" -C "$TMP" 2>&1; then echo "ERROR: extract failed (is this a valid .tar.gz?)"; exit 1; fi
+  echo "--- validating and extracting safely ---"
+  if ! python3 - "$TARBALL" "$TMP" <<'PYSAFE'
+import os
+import pathlib
+import shutil
+import sys
+import tarfile
+
+archive_path, destination = sys.argv[1:]
+max_members = 100000
+max_member_bytes = 256 * 1024 * 1024
+max_total_bytes = 1024 * 1024 * 1024
+seen = set()
+
+def safe_parts(name):
+    if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
+        raise ValueError("archive contains an unsafe member name")
+    path = pathlib.PurePosixPath(name)
+    parts = tuple(part for part in path.parts if part not in ("", "."))
+    if path.is_absolute() or ".." in parts or not parts:
+        raise ValueError("archive contains an unsafe member path: " + name[:160])
+    if len(name) > 4096 or any(len(part.encode("utf-8")) > 255 for part in parts):
+        raise ValueError("archive member path is too long")
+    return parts
+
+try:
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        members = archive.getmembers()
+        if len(members) > max_members:
+            raise ValueError("archive contains too many members")
+        total = 0
+        planned = []
+        for member in members:
+            if member.isdir() and member.name.rstrip("/") in ("", "."):
+                continue
+            parts = safe_parts(member.name)
+            normalized = "/".join(parts)
+            if normalized in seen:
+                raise ValueError("archive contains duplicate member: " + normalized[:160])
+            seen.add(normalized)
+            if not (member.isdir() or member.isfile()):
+                raise ValueError("archive links/devices are not allowed: " + normalized[:160])
+            if member.size < 0 or member.size > max_member_bytes:
+                raise ValueError("archive member is too large: " + normalized[:160])
+            total += member.size
+            if total > max_total_bytes:
+                raise ValueError("expanded archive exceeds 1 GiB")
+            planned.append((member, parts))
+
+        root = os.path.realpath(destination)
+        for member, parts in planned:
+            target = os.path.join(root, *parts)
+            parent = target if member.isdir() else os.path.dirname(target)
+            os.makedirs(parent, mode=0o755, exist_ok=True)
+            if os.path.commonpath((root, os.path.realpath(parent))) != root:
+                raise ValueError("archive member escaped the extraction directory")
+            if member.isdir():
+                if not os.path.isdir(target):
+                    raise ValueError("archive directory conflicts with a file")
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError("archive member could not be read")
+            try:
+                with open(target, "xb") as output:
+                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+            finally:
+                source.close()
+            mode = member.mode & 0o777
+            os.chmod(target, mode or 0o644)
+except (OSError, tarfile.TarError, ValueError) as error:
+    print("ERROR: safe archive extraction failed: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+PYSAFE
+  then
+    echo "ERROR: extract failed (invalid, unsafe, or over-sized .tar.gz)"
+    exit 1
+  fi
   INSTALLER="$(find "$TMP" -maxdepth 2 -name install.sh -type f 2>/dev/null | head -1)"
   if [ -z "$INSTALLER" ]; then echo "ERROR: install.sh not found inside the tarball"; exit 1; fi
   SRCDIR="$(dirname "$INSTALLER")"
@@ -881,7 +1740,7 @@ LOG="__LOG__"
   fi
   chmod +x ./install.sh 2>/dev/null
   echo "--- ./install.sh -y __BACKUP__ (offline) ---"
-  ./install.sh -y __BACKUP__ 2>&1
+  LLDPQ_OFFLINE_UPDATE=1 ./install.sh -y __BACKUP__ 2>&1
   install_rc=$?
   echo "--- install finished (exit $install_rc) ---"
   exit "$install_rc"
@@ -892,36 +1751,48 @@ exit "$rc"
 '''
     script = (SCRIPT.replace('__TARBALL__', tarball)
               .replace('__BACKUP__', '--backup' if backup else '')
-              .replace('__LOG__', log_path))
+              .replace('__LOG__', log_path)
+              .replace('__ACTIVE__', active_path)
+              .replace('__PID__', pid_path)
+              .replace('__JOB__', job_id))
     try:
         w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', script_path],
                            input=script, capture_output=True, text=True, timeout=10)
         if w.returncode != 0:
+            release_background_job(state_dir, 'update', job_id)
+            cleanup_uploaded_tarball(tarball)
             print(json.dumps({'success': False, 'error': 'Could not stage update script'}))
-            sys.exit(0)
-        clear = subprocess.run(
-            ['sudo', '-u', lldpq_user, 'bash', '-c', ': > ' + shlex.quote(log_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if clear.returncode != 0:
-            print(json.dumps({'success': False, 'error': 'Could not initialize update log'}))
             sys.exit(0)
         launch = ('if sudo systemd-run --no-block --collect '
                   '--uid=' + shlex.quote(lldpq_user) + ' '
                   '--setenv=HOME=' + shlex.quote(home_dir) + ' '
                   '/bin/bash ' + shlex.quote(script_path) + ' 2>/dev/null; then :; '
                   'else nohup setsid /bin/bash ' + shlex.quote(script_path) + ' >/dev/null 2>&1 & fi')
-        subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
-                         start_new_session=True, stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(json.dumps({'success': True, 'message': 'Offline update started'}))
+        launcher = subprocess.Popen(['sudo', '-u', lldpq_user, 'bash', '-c', launch],
+                                    start_new_session=True, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            launcher_rc = launcher.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            launcher_rc = None
+        if launcher_rc not in (None, 0):
+            release_background_job(state_dir, 'update', job_id)
+            cleanup_uploaded_tarball(tarball)
+            print(json.dumps({'success': False, 'error': 'Detached offline update launch failed immediately'}))
+            sys.exit(0)
+        print(json.dumps({'success': True, 'message': 'Offline update started', 'job_id': job_id}))
     except Exception as e:
+        release_background_job(state_dir, 'update', job_id)
+        cleanup_uploaded_tarball(tarball)
         print(json.dumps({'success': False, 'error': str(e)}))
     sys.exit(0)
 
 # ─── Action: Tail the update log started by action=update ───
 if action == 'update-log':
-    log_path = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state', 'update.log')
+    state_dir = os.path.join(os.path.expanduser('~' + lldpq_user), '.lldpq-state')
+    log_path = os.path.join(state_dir, 'update.log')
+    active_path = os.path.join(state_dir, 'update.active')
+    pid_path = os.path.join(state_dir, 'update.pid')
     content = ''
     try:
         r = subprocess.run(['sudo', '-u', lldpq_user, 'cat', log_path],
@@ -930,9 +1801,15 @@ if action == 'update-log':
             content = r.stdout
     except Exception:
         content = ''
-    display, done, exit_code, ok = parse_completion_log(content)
-    print(json.dumps({'success': True, 'done': done, 'ok': ok,
-                      'exit_code': exit_code, 'log': display}))
+    display, raw_done, exit_code, ok, log_job_id = parse_completion_log(content)
+    status = background_job_status(state_dir, 'update', raw_done, log_job_id)
+    print(json.dumps({'success': True, 'done': status['done'],
+                      'ok': ok and status['done'],
+                      'running': status['running'], 'job_id': status['job_id'],
+                      'pid_recorded': status['pid_recorded'],
+                      'stale_reservation': status['stale_reservation'],
+                      'exit_code': exit_code if status['done'] else None,
+                      'log': display}))
     sys.exit(0)
 
 # ─── Action: Read cron schedules for lldpq (auto-run) and get-conf (config collection) ───
@@ -1056,18 +1933,32 @@ if action == 'get-notifications':
     notif_yaml = os.path.join(lldpq_dir, 'notifications.yaml')
     exists = os.path.exists(notif_yaml)
     cfg = {}
+    revision = hashlib.sha256(b'').hexdigest()
     if exists:
         try:
-            with open(notif_yaml) as f:
-                cfg = yaml.safe_load(f) or {}
+            raw_notifications = open(notif_yaml, 'rb').read()
+            revision = hashlib.sha256(raw_notifications).hexdigest()
+            cfg = yaml.safe_load(raw_notifications.decode('utf-8')) or {}
         except Exception as e:
             print(json.dumps({'success': False, 'error': 'Cannot parse notifications.yaml: ' + str(e)}))
             sys.exit(0)
     if not isinstance(cfg, dict):
-        cfg = {}
+        print(json.dumps({'success': False, 'error': 'notifications.yaml must contain a mapping'}))
+        sys.exit(0)
+    for section in ('notifications', 'thresholds', 'alert_types', 'alert_strategy', 'frequency'):
+        if section in cfg and cfg[section] is not None and not isinstance(cfg[section], dict):
+            print(json.dumps({'success': False, 'error': section + ' must be a mapping in notifications.yaml'}))
+            sys.exit(0)
     n = cfg.get('notifications') or {}
+    if 'slack' in n and n['slack'] is not None and not isinstance(n['slack'], dict):
+        print(json.dumps({'success': False, 'error': 'notifications.slack must be a mapping'}))
+        sys.exit(0)
     slack = n.get('slack') or {}
     thr = cfg.get('thresholds') or {}
+    for subsection in ('network', 'hardware', 'system'):
+        if subsection in thr and thr[subsection] is not None and not isinstance(thr[subsection], dict):
+            print(json.dumps({'success': False, 'error': 'thresholds.' + subsection + ' must be a mapping'}))
+            sys.exit(0)
     net = thr.get('network') or {}
     hw = thr.get('hardware') or {}
     sysd = thr.get('system') or {}
@@ -1088,105 +1979,35 @@ if action == 'get-notifications':
         't_topology': bool(at.get('topology_alerts', True)),
         't_log': bool(at.get('log_alerts', True)),
         'thresholds': {
-            'bgp': net.get('bgp_down_minutes'),
-            'flap_warn': net.get('link_flaps_per_hour'),
-            'flap_crit': net.get('link_flaps_critical'),
-            'optical': net.get('optical_power_margin'),
-            'cpu': hw.get('cpu_temp_critical'),
-            'asic': hw.get('asic_temp_critical'),
-            'disk': sysd.get('disk_usage_critical'),
+            'bgp': net.get('bgp_down_minutes', 5),
+            'flap_warn': net.get('link_flaps_per_hour', 10),
+            'flap_crit': net.get('link_flaps_critical', 20),
+            'optical': net.get('optical_power_margin', 3),
+            'cpu': hw.get('cpu_temp_critical', 85),
+            'asic': hw.get('asic_temp_critical', 90),
+            'disk': sysd.get('disk_usage_critical', 90),
         },
     }
-    print(json.dumps({'success': True, 'exists': exists, 'notifications': out}))
+    print(json.dumps({'success': True, 'exists': exists, 'notifications': out,
+                      'revision': revision}))
     sys.exit(0)
 
 # ─── Action: Write notifications.yaml (preserve unrelated keys; UI-managed) ───
 if action == 'set-notifications':
-    import yaml
     notif_yaml = os.path.join(lldpq_dir, 'notifications.yaml')
-    cfg = {}
-    if os.path.exists(notif_yaml):
-        try:
-            with open(notif_yaml) as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception:
-            cfg = {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-
-    def _sub(parent, key):
-        v = parent.get(key)
-        if not isinstance(v, dict):
-            v = {}
-            parent[key] = v
-        return v
-
-    def _num(v, default=None):
-        try:
-            f = float(v)
-            return int(f) if f == int(f) else f
-        except Exception:
-            return default
-
-    n = _sub(cfg, 'notifications')
-    slack = _sub(n, 'slack')
-    n['enabled'] = bool(post_data.get('enabled'))
-    n['server_url'] = str(post_data.get('server_url', '') or '')
-    slack['enabled'] = bool(post_data.get('slack_enabled'))
-    slack['webhook'] = str(post_data.get('webhook', '') or '')
-    slack['channel'] = str(post_data.get('channel', '') or '#lldpq')
-    slack.setdefault('username', 'LLDPq Bot')
-    slack.setdefault('icon_emoji', ':warning:')
-
-    at = _sub(cfg, 'alert_types')
-    at['hardware_alerts'] = bool(post_data.get('t_hardware'))
-    at['network_alerts'] = bool(post_data.get('t_network'))
-    at['system_alerts'] = bool(post_data.get('t_system'))
-    at['topology_alerts'] = bool(post_data.get('t_topology'))
-    at['log_alerts'] = bool(post_data.get('t_log'))
-
-    mode = str(post_data.get('mode', 'summary'))
-    if mode in ('summary', 'immediate', 'change_only'):
-        _sub(cfg, 'alert_strategy')['mode'] = mode
-    mi = _num(post_data.get('min_interval'))
-    if mi is not None:
-        _sub(cfg, 'frequency')['min_interval_minutes'] = mi
-
-    thr = _sub(cfg, 'thresholds')
-    net = _sub(thr, 'network')
-    hw = _sub(thr, 'hardware')
-    sysd = _sub(thr, 'system')
-    tin = post_data.get('thresholds') or {}
-
-    def _setnum(d, k, v):
-        val = _num(v)
-        if val is not None:
-            d[k] = val
-
-    _setnum(net, 'bgp_down_minutes', tin.get('bgp'))
-    _setnum(net, 'link_flaps_per_hour', tin.get('flap_warn'))
-    _setnum(net, 'link_flaps_critical', tin.get('flap_crit'))
-    _setnum(net, 'optical_power_margin', tin.get('optical'))
-    _setnum(hw, 'cpu_temp_critical', tin.get('cpu'))
-    _setnum(hw, 'asic_temp_critical', tin.get('asic'))
-    _setnum(sysd, 'disk_usage_critical', tin.get('disk'))
-
-    header = ("# LLDPq Notification Configuration — managed via the Setup page (Notifications).\n"
-              "# Slack incoming-webhook guide: https://api.slack.com/messaging/webhooks\n")
-    try:
-        body = yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False, allow_unicode=True)
-    except Exception as e:
-        print(json.dumps({'success': False, 'error': 'YAML serialize failed: ' + str(e)}))
+    expected_revision = post_data.get('expected_revision', post_data.get('revision'))
+    if expected_revision is not None and not isinstance(expected_revision, str):
+        print(json.dumps({'success': False, 'error': 'revision must be a string'}))
         sys.exit(0)
-    try:
-        w = subprocess.run(['sudo', '-u', lldpq_user, 'tee', notif_yaml],
-                           input=header + body, capture_output=True, text=True, timeout=10)
-        if w.returncode != 0:
-            print(json.dumps({'success': False, 'error': 'Write failed: ' + (w.stderr or '').strip()[:200]}))
-            sys.exit(0)
-        print(json.dumps({'success': True}))
-    except Exception as e:
-        print(json.dumps({'success': False, 'error': str(e)}))
+    payload = dict(post_data)
+    payload.pop('action', None)
+    payload.pop('revision', None)
+    payload.pop('expected_revision', None)
+    response = service_atomic_write(
+        'save-notifications', notif_yaml, json.dumps(payload),
+        expected_revision=expected_revision,
+    )
+    print(json.dumps(response))
     sys.exit(0)
 
 # ─── Action: Send a test Slack message to confirm the webhook works ───
@@ -1221,17 +2042,25 @@ if action == 'test-alert':
         print(json.dumps({'success': False, 'error': 'Send failed: ' + str(e)[:200]}))
     sys.exit(0)
 
-# ─── Action: Export config bundle (devices/topology/topology_config/notifications) ───
+# ─── Action: Export config bundle (inventory/tracking/topology/notifications) ───
 if action == 'backup-export':
     import base64, importlib.util, io, tarfile, time as _t
-    include_key = bool(post_data.get('include_key'))
-    wanted = [('devices.yaml', lldpq_dir), ('topology.dot', lldpq_dir),
+    include_key = post_data.get('include_key', False)
+    if not isinstance(include_key, bool):
+        print(json.dumps({'success': False, 'error': 'include_key must be true or false'}))
+        sys.exit(0)
+    wanted = [('devices.yaml', lldpq_dir), ('tracking.yaml', lldpq_dir),
+              ('topology.dot', lldpq_dir),
               ('topology_config.yaml', lldpq_dir), ('notifications.yaml', lldpq_dir),
               ('display-aliases.json', web_root)]
     buf = io.BytesIO()
     added = []
     has_key = False
+    sensitive_files = []
     try:
+        ensure_backup_locks()
+        if include_key:
+            ensure_ssh_key_lock()
         backup_tools = load_backup_import_helper('lldpq_backup_tools')
         # Native and Docker installs intentionally expose several config files
         # through symlinks. Read their resolved bytes under a managed root and
@@ -1242,8 +2071,34 @@ if action == 'backup-export':
         )
         with tarfile.open(fileobj=buf, mode='w:gz') as tar:
             for fn, content in config_files:
+                # Never return a successful bundle that this same release will
+                # reject during restore. This catches hand-edited/legacy drift
+                # across every managed config, not only display aliases.
+                backup_tools.validate_config_for_bundle(
+                    fn, content, lldpq_dir=lldpq_dir
+                )
+                if fn == 'display-aliases.json':
+                    try:
+                        aliases_value = json.loads(content.decode('utf-8'))
+                        aliases_value = backup_tools.validate_display_aliases(aliases_value)
+                        content = (json.dumps(
+                            aliases_value, indent=2, ensure_ascii=False
+                        ) + '\n').encode('utf-8')
+                    except Exception as exc:
+                        raise RuntimeError('display-aliases.json is invalid: ' + str(exc)) from exc
                 backup_tools.add_regular_tar_member(tar, fn, content, mode=0o600)
                 added.append(fn)
+                if fn == 'notifications.yaml':
+                    try:
+                        import yaml
+                        notification_cfg = yaml.safe_load(content.decode('utf-8')) or {}
+                        webhook = (((notification_cfg.get('notifications') or {}).get('slack') or {}).get('webhook') or '')
+                        if webhook:
+                            sensitive_files.append('notifications.yaml (Slack webhook)')
+                    except Exception:
+                        # The importer validates this file on restore.  If it is
+                        # malformed, conservatively mark it sensitive here.
+                        sensitive_files.append('notifications.yaml (unparsed)')
             # Collector SSH key (private + public). Opt-in — makes the bundle SECRET, but lets a
             # restore reach the switches immediately (true "move to another host" bundle).
             if include_key:
@@ -1261,6 +2116,7 @@ if action == 'backup-export':
                             tar, 'ssh/%s' % key_name, r.stdout, mode=0o600
                         )
                         added.append('ssh/%s' % key_name); has_key = True
+                        sensitive_files.append('ssh/%s (private key)' % key_name)
                         # Derive instead of trusting a possibly missing/stale .pub.
                         public_bytes = derived.stdout.strip() + b'\n'
                         backup_tools.add_regular_tar_member(
@@ -1296,6 +2152,7 @@ if action == 'backup-export':
         sys.exit(0)
     name = ('lldpq-backup-%s.tar.gz' if has_key else 'lldpq-config-%s.tar.gz') % _t.strftime('%Y%m%d-%H%M%S')
     print(json.dumps({'success': True, 'filename': name, 'files': added, 'has_key': has_key,
+                      'sensitive': bool(sensitive_files), 'sensitive_files': sensitive_files,
                       'data': base64.b64encode(buf.getvalue()).decode()}))
     sys.exit(0)
 
@@ -1311,7 +2168,7 @@ if action == 'backup-import':
         result = importer.restore_bundle(
             b64, lldpq_user=lldpq_user, lldpq_dir=lldpq_dir, web_root=web_root,
             pref_keys=LLDPQ_PREF_KEYS, validate_cron=valid_cron_schedule,
-            acquire_lock=ensure_configuration_lock,
+            acquire_lock=ensure_backup_locks,
         )
     except Exception as exc:
         print(json.dumps({'success': False, 'error': 'Backup restore failed: ' + str(exc)[:300]}))
@@ -1333,9 +2190,11 @@ if action == 'get-maintenance':
     # whitelist, which only allows bash/ssh/tee/etc.)
     mon = _run(['du', '-sm', mr]) if os.path.isdir(mr) else ''
     mon_mb = int(mon.split()[0]) if mon and mon.split() and mon.split()[0].isdigit() else 0
-    info = _run(['sudo', '-u', lldpq_user, 'bash', '-c',
-                 'shopt -s nullglob; f=(~/lldpq-backup-*); echo -n "${#f[@]} "; '
-                 'if [ ${#f[@]} -gt 0 ]; then du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1; else echo 0; fi'])
+    info = _run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
+                 'shopt -s nullglob; f=(); for d in ~/lldpq-backup-*; do '
+                 '[ -d "$d" ] && [ -s "$d/COMPLETE" ] && f+=("$d"); done; '
+                 'echo -n "${#f[@]} "; if [ ${#f[@]} -gt 0 ]; then '
+                 'du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1; else echo 0; fi'])
     parts = info.split()
     bk_count = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
     bk_mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
@@ -1350,27 +2209,44 @@ if action == 'purge-data':
     if post_data.get('target') != 'update_backups':
         print(json.dumps({'success': False, 'error': 'Unknown purge target'}))
         sys.exit(0)
-    r = subprocess.run(['sudo', '-u', lldpq_user, 'bash', '-c',
-                        'shopt -s nullglob; f=(~/lldpq-backup-*); n=${#f[@]}; '
-                        'm=0; if [ $n -gt 0 ]; then m=$(du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1); '
-                        'rm -rf "${f[@]}"; fi; echo "$n ${m:-0}"'],
+    r = subprocess.run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
+                        'set -o pipefail; state="$HOME/.lldpq-state"; if [ -d "$state/update.active" ]; then '
+                        'echo "ACTIVE"; exit 75; fi; shopt -s nullglob; f=(); '
+                        'for d in ~/lldpq-backup-*; do [ -d "$d" ] && [ -s "$d/COMPLETE" ] && f+=("$d"); done; '
+                        'n=${#f[@]}; m=0; if [ $n -gt 0 ]; then '
+                        'm=$(du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1) || exit 2; '
+                        'rm -rf -- "${f[@]}" || exit 3; fi; echo "$n ${m:-0}"'],
                        capture_output=True, text=True, timeout=120)
+    if r.returncode == 75:
+        print(json.dumps({'success': False, 'error': 'An update is active; completed backups were not removed.'}))
+        sys.exit(0)
+    if r.returncode != 0:
+        print(json.dumps({'success': False, 'error': 'Backup purge failed: ' + (r.stderr or r.stdout or '').strip()[:200]}))
+        sys.exit(0)
     parts = (r.stdout or '').split()
     n = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
     mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
-    print(json.dumps({'success': True, 'removed': n, 'freed_mb': mb}))
+    print(json.dumps({'success': True, 'removed': n, 'freed_mb': mb,
+                      'scope': 'completed_update_backups'}))
     sys.exit(0)
 
 # ─── Action: Generate new key + distribute with password ───
 password = post_data.get('password', '')
 retry_devices = post_data.get('retry_devices', [])  # List of IPs for retry
 
-if not password:
+if (not isinstance(password, str) or not password or len(password) > 1024
+        or any(char in password for char in ('\x00', '\r', '\n'))):
     print(json.dumps({'success': False, 'error': 'Password is required'}))
     sys.exit(0)
+if not isinstance(retry_devices, list) or any(not isinstance(value, str) for value in retry_devices):
+    print(json.dumps({'success': False, 'error': 'retry_devices must be a list of device addresses'}))
+    sys.exit(0)
 
-# Detect VRF-aware ping command (once, at startup)
-PING_CMD = detect_ping_cmd(lldpq_user)
+try:
+    ensure_ssh_key_lock()
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': str(exc)}))
+    sys.exit(0)
 
 # Ensure SSH key exists
 ssh_key_path, key_generated, key_error = ensure_ssh_key(lldpq_user)
@@ -1420,6 +2296,8 @@ results.sort(key=lambda r: r['hostname'])
 total = len(results)
 send_key_ok = sum(1 for r in results if r['send_key'] in ('ok', 'already'))
 sudo_fix_ok = sum(1 for r in results if r['sudo_fix'] == 'ok')
+ready_ok = sum(1 for r in results
+               if r['send_key'] in ('ok', 'already') and r['sudo_fix'] == 'ok')
 
 print(json.dumps({
     'success': True,
@@ -1428,6 +2306,8 @@ print(json.dumps({
     'total': total,
     'send_key_ok': send_key_ok,
     'sudo_fix_ok': sudo_fix_ok,
+    'ready_ok': ready_ok,
+    'all_ready': ready_ok == total,
     'results': results
 }))
 PYTHON

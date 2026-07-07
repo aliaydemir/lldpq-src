@@ -11,20 +11,172 @@ import grp
 import hashlib
 import io
 import json
+import math
 import os
 import pathlib
 import pwd
+import re
 import secrets
+import shlex
+import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.parse
 from typing import Callable, Iterable
 
 
 class BackupImportError(RuntimeError):
     """A bundle could not be validated, committed, or rolled back safely."""
+
+
+DISPLAY_ALIAS_LIMITS = {
+    "interfaces": (2000, 64, 32),
+    "devices": (2000, 128, 64),
+}
+
+TRACKING_STATES = frozenset(("commissioning", "handed_over"))
+TRACKING_METADATA_LIMITS = {
+    "changed_at": 253,
+    "changed_by": 253,
+    "note": 1000,
+}
+
+
+def validate_tracking_config(value):
+    """Validate the portable switch lifecycle configuration."""
+    if not isinstance(value, dict):
+        raise BackupImportError("tracking.yaml must contain a YAML mapping")
+    supported_fields = {"version", "default_state", "switches"}
+    unexpected = [key for key in value if key not in supported_fields]
+    if unexpected:
+        raise BackupImportError(
+            "tracking.yaml contains unsupported keys: "
+            + ", ".join(sorted(repr(key) for key in unexpected))
+        )
+    if value.get("version", 1) != 1:
+        raise BackupImportError("tracking.yaml version must be 1")
+    if value.get("default_state", "commissioning") != "commissioning":
+        raise BackupImportError(
+            "tracking.yaml default_state must be 'commissioning'"
+        )
+    switches = value.get("switches", {})
+    if switches is None:
+        switches = {}
+    if not isinstance(switches, dict):
+        raise BackupImportError("tracking.yaml 'switches' must be a mapping")
+    if len(switches) > 10000:
+        raise BackupImportError("tracking.yaml contains too many switches")
+
+    folded = set()
+    for hostname, entry in switches.items():
+        if (
+            not isinstance(hostname, str)
+            or hostname != hostname.strip()
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}", hostname)
+            or ".." in hostname
+        ):
+            raise BackupImportError("tracking.yaml contains an invalid hostname")
+        identity = hostname.casefold()
+        if identity in folded:
+            raise BackupImportError(
+                f"tracking.yaml contains a duplicate hostname: {hostname}"
+            )
+        folded.add(identity)
+        if not isinstance(entry, dict):
+            raise BackupImportError(
+                f"tracking.yaml entry for {hostname!r} must be a mapping"
+            )
+        supported_entry_fields = {"state"} | set(TRACKING_METADATA_LIMITS)
+        unknown_fields = [
+            key for key in entry if key not in supported_entry_fields
+        ]
+        if unknown_fields:
+            raise BackupImportError(
+                f"tracking.yaml entry for {hostname!r} contains unsupported fields"
+            )
+        if entry.get("state") not in TRACKING_STATES:
+            raise BackupImportError(
+                f"tracking.yaml state for {hostname!r} is invalid"
+            )
+        for field, maximum in TRACKING_METADATA_LIMITS.items():
+            candidate = entry.get(field)
+            if candidate is None:
+                continue
+            if (
+                not isinstance(candidate, str)
+                or not candidate.strip()
+                or len(candidate.strip()) > maximum
+                or any(char in candidate for char in ("\x00", "\r", "\n"))
+            ):
+                raise BackupImportError(
+                    f"tracking.yaml {field} for {hostname!r} is invalid"
+                )
+    return value
+
+
+def validate_display_aliases(value):
+    """Validate and normalize the public display-alias configuration.
+
+    Aliases are presentation-only, but the file is read by several pages and is
+    portable through Setup backups.  Keep its schema deliberately small so a
+    malformed restore cannot turn every alias lookup into a runtime error.
+    """
+    if not isinstance(value, dict):
+        raise BackupImportError("display-aliases.json must contain a JSON object")
+    unexpected = sorted(set(value) - set(DISPLAY_ALIAS_LIMITS))
+    if unexpected:
+        raise BackupImportError(
+            "display-aliases.json contains unsupported keys: "
+            + ", ".join(unexpected)
+        )
+
+    normalized = {}
+    for namespace, (max_entries, max_key, max_label) in DISPLAY_ALIAS_LIMITS.items():
+        source = value.get(namespace, {})
+        if not isinstance(source, dict):
+            raise BackupImportError(
+                f"display-aliases.json {namespace} must be a JSON object"
+            )
+        if len(source) > max_entries:
+            raise BackupImportError(
+                f"display-aliases.json {namespace} exceeds {max_entries} entries"
+            )
+
+        clean = {}
+        folded = {}
+        for canonical, label in source.items():
+            if not isinstance(canonical, str) or not isinstance(label, str):
+                raise BackupImportError(
+                    f"display-aliases.json {namespace} entries must map strings to strings"
+                )
+            canonical = canonical.strip()
+            label = label.strip()
+            if not canonical or not label:
+                raise BackupImportError(
+                    f"display-aliases.json {namespace} contains an empty name or label"
+                )
+            if len(canonical) > max_key or len(label) > max_label:
+                raise BackupImportError(
+                    f"display-aliases.json {namespace} contains an overlong name or label"
+                )
+            if any(ord(char) < 32 or ord(char) == 127 for char in canonical + label):
+                raise BackupImportError(
+                    f"display-aliases.json {namespace} contains control characters"
+                )
+            folded_key = canonical.casefold()
+            previous = folded.get(folded_key)
+            if previous is not None and previous != canonical:
+                raise BackupImportError(
+                    f"display-aliases.json {namespace} contains a case-insensitive "
+                    f"duplicate: {previous!r} and {canonical!r}"
+                )
+            folded[folded_key] = canonical
+            clean[canonical] = label
+        normalized[namespace] = clean
+    return normalized
 
 
 def collect_managed_config_files(wanted, managed_roots, *, max_size=2 * 1024 * 1024):
@@ -319,6 +471,38 @@ def _verify_file(path, expected, mode, uid, gid, *, reader=None):
         raise BackupImportError(f"Installed file metadata verification failed: {path}")
 
 
+def _canonical_service_metadata(kind, name, user):
+    try:
+        account = pwd.getpwnam(user)
+        config_gid = grp.getgrnam("www-data").gr_gid
+    except KeyError as exc:
+        raise BackupImportError(f"Required service account/group is missing: {exc}") from exc
+    if kind == "config":
+        return 0o664, account.pw_uid, config_gid
+    if kind == "key-private" or kind == "key-remove" and not name.endswith(".pub"):
+        return 0o600, account.pw_uid, account.pw_gid
+    if kind == "key-public" or kind == "key-remove" and name.endswith(".pub"):
+        return 0o644, account.pw_uid, account.pw_gid
+    raise BackupImportError("Unknown service-owned recovery metadata kind")
+
+
+def _collector_set_metadata(user, path, mode, uid, gid):
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError as exc:
+        raise BackupImportError(f"Collector account is unavailable: {exc}") from exc
+    if uid != account.pw_uid or mode & 0o7000:
+        raise BackupImportError("Unsafe collector-owned file metadata")
+    # No privileged pathname operation is used below. If the collector races
+    # its own path into a symlink, it gains no authority it did not already
+    # possess; the post-operation no-follow stat still rejects the ambiguity.
+    _collector_shell(
+        user,
+        'chgrp -- "$1" "$2" && chmod -- "$3" "$2"',
+        str(gid), path, format(mode, "o"), timeout=10,
+    )
+
+
 def _stage_collector_file(entry, user, uid, config_gid, key_gid, token):
     stage = entry.get("stage") or f"{entry['target']}.lldpq-import-stage-{token}"
     entry["stage"] = stage
@@ -329,19 +513,83 @@ def _stage_collector_file(entry, user, uid, config_gid, key_gid, token):
         mode, gid = 0o644, key_gid
     else:
         mode, gid = 0o664, config_gid
-    _run(["sudo", "chown", f"{uid}:{gid}", stage])
-    _run(["sudo", "chmod", format(mode, "o"), stage])
+    _collector_set_metadata(user, stage, mode, uid, gid)
     _verify_file(stage, entry["content"], mode, uid, gid, reader=user)
     entry.update({"mode": mode, "uid": uid, "gid": gid})
+
+
+def _install_direct_mount_no_follow(content, target, mode, uid, gid):
+    """Rewrite a pinned bind-mount inode without following a replaceable link."""
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(target, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise BackupImportError("Direct-mount restore target is not a regular file")
+        if os.geteuid() != 0 and (
+            before.st_uid != uid
+            or before.st_gid != gid
+            or stat.S_IMODE(before.st_mode) != mode
+        ):
+            raise BackupImportError("Direct-mount metadata cannot be safely normalized")
+        os.ftruncate(descriptor, 0)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise BackupImportError("Direct-mount write made no progress")
+            view = view[written:]
+        if os.geteuid() == 0:
+            os.fchown(descriptor, uid, gid)
+            os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        if (
+            after.st_uid != uid
+            or after.st_gid != gid
+            or stat.S_IMODE(after.st_mode) != mode
+        ):
+            raise BackupImportError("Direct-mount metadata verification failed")
+    except OSError as exc:
+        raise BackupImportError(f"Safe direct-mount write failed: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _install_bytes_as_collector(content, target, mode, uid, gid, *, user):
+    """Install service-owned bytes without any privileged pathname mutation."""
+    if _is_direct_mount(target):
+        _install_direct_mount_no_follow(content, target, mode, uid, gid)
+        _verify_file(target, content, mode, uid, gid, reader=user)
+        _durable_path(target, reader=user)
+        return
+    stage = f"{target}.lldpq-collector-stage-{os.getpid()}-{secrets.token_hex(8)}"
+    try:
+        _as_collector(user, ["tee", stage], input_data=content, timeout=15)
+        _collector_set_metadata(user, stage, mode, uid, gid)
+        _verify_file(stage, content, mode, uid, gid, reader=user)
+        _durable_path(stage, reader=user)
+        _collector_shell(user, 'mv -fT -- "$1" "$2"', stage, target, timeout=15)
+        stage = None
+        _verify_file(target, content, mode, uid, gid, reader=user)
+        _durable_path(target, reader=user)
+    finally:
+        if stage is not None:
+            try:
+                _as_collector(user, ["rm", "-f", "--", stage])
+            except Exception:
+                pass
 
 
 def _activate_collector_file(entry, user):
     if entry.get("direct_mount"):
         # Docker's documented legacy single-file bind mounts reject rename(2)
         # with EBUSY.  Keep the mount inode and copy verified bytes in-place.
-        _install_bytes_as_root(
+        _install_bytes_as_collector(
             entry["content"], entry["target"], entry["mode"],
-            entry["uid"], entry["gid"], reader=user,
+            entry["uid"], entry["gid"], user=user,
         )
         _as_collector(user, ["rm", "-f", "--", entry["stage"]])
         _durable_path(os.path.dirname(entry["stage"]), reader=user, include_parent=False)
@@ -356,7 +604,46 @@ def _activate_collector_file(entry, user):
     entry["stage"] = None
 
 
+def _activate_collector_removal(entry, user):
+    """Remove a retired SSH identity member and durably verify its absence."""
+    if entry.get("stage") is not None or entry.get("kind") != "key-remove":
+        raise BackupImportError("Invalid collector key-retirement entry")
+    _as_collector(user, ["rm", "-f", "--", entry["target"]])
+    if os.path.lexists(entry["target"]):
+        raise BackupImportError(
+            f"Could not retire opposite collector key: {entry['name']}"
+        )
+    _durable_existing_parent(entry["target"], reader=user)
+
+
 def _install_bytes_as_root(content, target, mode, uid, gid, *, reader=None):
+    if reader is not None:
+        return _install_bytes_as_collector(
+            content, target, mode, uid, gid, user=reader
+        )
+    resolved = os.path.realpath(target)
+    resolved_parent = os.path.dirname(resolved) or "/"
+    service_system_config = (
+        os.path.basename(resolved_parent) == "system-config"
+        and os.path.basename(resolved) == "lldpq.conf"
+        and not os.path.islink(resolved_parent)
+    )
+    if service_system_config:
+        try:
+            metadata = os.stat(resolved_parent, follow_symlinks=False)
+            service_user = pwd.getpwuid(metadata.st_uid).pw_name
+        except (KeyError, OSError) as exc:
+            raise BackupImportError("Could not resolve system-config owner") from exc
+        return _install_bytes_as_collector(
+            content, resolved, mode, metadata.st_uid, gid, user=service_user
+        )
+    privileged_atomic_targets = {
+        "/etc/lldpq.conf",
+        "/etc/crontab",
+        "/etc/cron.d/lldpq",
+    }
+    if target not in privileged_atomic_targets or os.path.islink(target):
+        raise BackupImportError("Refusing privileged write outside exact root targets")
     temp_path = None
     sibling_stage = None
     try:
@@ -366,34 +653,32 @@ def _install_bytes_as_root(content, target, mode, uid, gid, *, reader=None):
             staged.flush()
             os.fsync(staged.fileno())
         parent = os.path.dirname(target) or "/"
-        atomic_system_config = (
-            os.path.basename(parent) == "system-config"
-            and os.path.basename(target) == "lldpq.conf"
-            and not os.path.islink(target)
-            and not _is_direct_mount(target)
+        atomic_privileged = (
+            target in privileged_atomic_targets and not _is_direct_mount(target)
         )
+        if not atomic_privileged:
+            raise BackupImportError("Privileged direct mounts are not safely replaceable")
         install_target = target
-        if atomic_system_config:
-            try:
-                move_user = pwd.getpwuid(os.stat(parent).st_uid).pw_name
-            except (KeyError, OSError) as exc:
-                raise BackupImportError("Could not resolve system-config owner") from exc
-            sibling_stage = f"{target}.lldpq-root-stage-{os.getpid()}-{secrets.token_hex(8)}"
+        if atomic_privileged:
+            sibling_stage = f"{target}.lldpq-root-stage"
             if os.path.lexists(sibling_stage):
-                raise BackupImportError("Root config sibling stage already exists")
+                # A killed prior transaction cannot have changed the live
+                # target before rename. Retire only the fixed root-owned
+                # staging name, then construct and verify it again.
+                _run(["sudo", "rm", "-f", "--", sibling_stage])
+            if os.path.lexists(sibling_stage):
+                raise BackupImportError("Root config sibling stage could not be retired")
             install_target = sibling_stage
         _run(["sudo", "cp", temp_path, install_target])
         _run(["sudo", "chmod", format(mode, "o"), install_target])
         _run(["sudo", "chown", f"{uid}:{gid}", install_target])
-        _verify_file(install_target, content, mode, uid, gid, reader=reader)
-        _durable_path(install_target, reader=reader)
+        _verify_file(install_target, content, mode, uid, gid)
+        _durable_path(install_target)
         if sibling_stage:
-            _collector_shell(
-                move_user, 'mv -fT -- "$1" "$2"', sibling_stage, target, timeout=15
-            )
+            _run(["sudo", "mv", "-fT", "--", sibling_stage, target])
             sibling_stage = None
-        _verify_file(target, content, mode, uid, gid, reader=reader)
-        _durable_path(target, reader=reader)
+        _verify_file(target, content, mode, uid, gid)
+        _durable_path(target)
     finally:
         if sibling_stage:
             try:
@@ -418,7 +703,16 @@ def _restore_snapshot(snapshot):
             reader=snapshot["reader"],
         )
         return
-    _run(["sudo", "rm", "-f", "--", snapshot["path"]])
+    if snapshot["reader"]:
+        _as_collector(
+            snapshot["reader"], ["rm", "-f", "--", snapshot["path"]]
+        )
+    else:
+        if snapshot["path"] not in {
+            "/etc/lldpq.conf", "/etc/crontab", "/etc/cron.d/lldpq"
+        }:
+            raise BackupImportError("Refusing privileged removal outside root targets")
+        _run(["sudo", "rm", "-f", "--", snapshot["path"]])
     if os.path.lexists(snapshot["path"]):
         raise BackupImportError(
             f"Could not remove newly-created target: {snapshot['path']}"
@@ -470,8 +764,9 @@ def _ensure_recovery_base(user, base):
             raise BackupImportError("Recovery base is not a safe directory")
     else:
         _as_collector(user, ["mkdir", "-p", base])
-    _run(["sudo", "chown", f"{account.pw_uid}:{expected_gid}", base])
-    _run(["sudo", "chmod", format(expected_mode, "o"), base])
+    _collector_set_metadata(
+        user, base, expected_mode, account.pw_uid, expected_gid
+    )
     metadata = os.stat(base, follow_symlinks=False)
     if (
         metadata.st_uid != account.pw_uid
@@ -605,6 +900,13 @@ def _snapshot_record(entry, index, user):
     present = bool(snapshot["present"])
     content = snapshot.get("content", b"") if present else b""
     snapshot_name = f"snapshot-{index:04d}.bin" if present else None
+    mode = snapshot.get("mode") if present else None
+    uid = snapshot.get("uid") if present else None
+    gid = snapshot.get("gid") if present else None
+    if present and snapshot.get("reader") == user:
+        mode, uid, gid = _canonical_service_metadata(
+            entry["kind"], entry["name"], user
+        )
     return {
         "kind": entry["kind"],
         "name": entry["name"],
@@ -616,16 +918,24 @@ def _snapshot_record(entry, index, user):
         "snapshot": snapshot_name,
         "size": len(content),
         "sha256": hashlib.sha256(content).hexdigest() if present else None,
-        "mode": snapshot.get("mode") if present else None,
-        "uid": snapshot.get("uid") if present else None,
-        "gid": snapshot.get("gid") if present else None,
+        "mode": mode,
+        "uid": uid,
+        "gid": gid,
         "reader": "collector" if snapshot.get("reader") == user else None,
     }, content
 
 
 def _create_recovery_authority(
-    entries, root_entries, ssh_snapshot, *, lldpq_dir, web_root, user, token
+    entries, ssh_snapshot, *, lldpq_dir, web_root, user, token
 ):
+    """Publish rollback state for service-owned targets only.
+
+    The authority lives below the collector account's home (or its Docker
+    config volume) and is therefore deliberately writable by that account.
+    It must never contain enough authority for the root recovery service to
+    replace privileged system files such as /etc/lldpq.conf or cron files.
+    Those targets are rolled back synchronously from in-process snapshots.
+    """
     recovery_base = _recovery_base(lldpq_dir, user)
     _ensure_recovery_base(user, recovery_base)
     _cleanup_recovery_debris(user, recovery_base)
@@ -639,8 +949,7 @@ def _create_recovery_authority(
         raise BackupImportError("Backup-import temporary authority already exists")
     records = []
     snapshot_contents = []
-    all_entries = list(entries) + list(root_entries)
-    for index, entry in enumerate(all_entries):
+    for index, entry in enumerate(entries):
         record, content = _snapshot_record(entry, index, user)
         records.append(record)
         if record["present"]:
@@ -771,7 +1080,7 @@ def _load_recovery_authority(
                 name, expected_logical, record["target"], lldpq_dir, web_root
             )
             expected_reader = "collector"
-        elif kind in ("key-private", "key-public"):
+        elif kind in ("key-private", "key-public", "key-remove"):
             if name not in key_names:
                 raise BackupImportError("Unknown recovery SSH target")
             expected_logical = os.path.join(ssh_dir, name)
@@ -779,19 +1088,10 @@ def _load_recovery_authority(
                 expected_logical, lldpq_dir, web_root, allow_config_symlink=False
             )
             expected_reader = "collector"
-        elif kind == "root-conf":
-            if name != "lldpq.conf":
-                raise BackupImportError("Unknown root config recovery target")
-            expected_logical = "/etc/lldpq.conf"
-            expected_target = _safe_root_config_target(expected_logical, lldpq_dir)
-            expected_reader = None
-        elif kind == "root-cron":
-            if name != "lldpq-cron" or record["target"] not in (
-                "/etc/cron.d/lldpq", "/etc/crontab"
-            ):
-                raise BackupImportError("Unknown cron recovery target")
-            expected_logical = expected_target = record["target"]
-            expected_reader = None
+        elif kind in ("root-conf", "root-cron"):
+            raise BackupImportError(
+                "Collector-owned recovery authority may not contain privileged targets"
+            )
         else:
             raise BackupImportError("Unknown recovery target kind")
         if (
@@ -807,7 +1107,8 @@ def _load_recovery_authority(
             raise BackupImportError("Recovery target mount identity changed")
         expected_stage = (
             f"{record['target']}.lldpq-import-stage-{token}"
-            if expected_reader == "collector" else None
+            if expected_reader == "collector" and kind != "key-remove"
+            else None
         )
         if record["stage"] != expected_stage:
             raise BackupImportError("Recovery stage path mismatch")
@@ -819,9 +1120,23 @@ def _load_recovery_authority(
                 raise BackupImportError("Recovery snapshot name mismatch")
             if not all(isinstance(record[field], int) for field in ("size", "mode", "uid", "gid")):
                 raise BackupImportError("Recovery snapshot metadata is invalid")
+            expected_mode, expected_uid, expected_gid = _canonical_service_metadata(
+                kind, name, user
+            )
+            if (
+                record["mode"] != expected_mode
+                or record["uid"] != expected_uid
+                or record["gid"] != expected_gid
+            ):
+                raise BackupImportError(
+                    "Recovery snapshot metadata exceeds service-user authority"
+                )
             if record["size"] < 0 or record["size"] > 16 * 1024 * 1024:
                 raise BackupImportError("Recovery snapshot size is invalid")
-            if not isinstance(record["sha256"], str) or len(record["sha256"]) != 64:
+            if (
+                not isinstance(record["sha256"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+            ):
                 raise BackupImportError("Recovery snapshot hash is invalid")
             snapshot_path = os.path.join(recovery_dir, snapshot_name)
             _secure_require_private_file(user, snapshot_path)
@@ -858,6 +1173,18 @@ def _load_recovery_authority(
         if ssh_record["present"]:
             if not all(isinstance(ssh_record[field], int) for field in ("mode", "uid", "gid")):
                 raise BackupImportError("Invalid SSH directory recovery metadata")
+            try:
+                account = pwd.getpwnam(user)
+            except KeyError as exc:
+                raise BackupImportError("Collector account is unavailable") from exc
+            if (
+                ssh_record["mode"] != 0o700
+                or ssh_record["uid"] != account.pw_uid
+                or ssh_record["gid"] != account.pw_gid
+            ):
+                raise BackupImportError(
+                    "SSH directory recovery metadata exceeds collector authority"
+                )
         elif any(ssh_record[field] is not None for field in ("mode", "uid", "gid")):
             raise BackupImportError("Missing SSH directory has metadata")
     return recovery_dir, manifest
@@ -896,11 +1223,21 @@ def _recover_retained_authority(
     if ssh_record is not None:
         try:
             if ssh_record["present"]:
-                _run(["sudo", "chmod", format(ssh_record["mode"], "o"), ssh_dir])
-                _run(["sudo", "chown", f"{ssh_record['uid']}:{ssh_record['gid']}", ssh_dir])
+                _collector_set_metadata(
+                    user, ssh_dir, ssh_record["mode"],
+                    ssh_record["uid"], ssh_record["gid"],
+                )
+                metadata = os.stat(ssh_dir, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or metadata.st_uid != ssh_record["uid"]
+                    or metadata.st_gid != ssh_record["gid"]
+                    or stat.S_IMODE(metadata.st_mode) != ssh_record["mode"]
+                ):
+                    raise BackupImportError("SSH directory recovery verification failed")
                 _durable_path(ssh_dir, reader=user)
             elif os.path.isdir(ssh_dir):
-                _run(["sudo", "rm", "-d", "--", ssh_dir])
+                _as_collector(user, ["rm", "-d", "--", ssh_dir])
                 _durable_path(os.path.dirname(ssh_dir), reader=user, include_parent=False)
         except Exception as exc:
             errors.append(str(exc))
@@ -977,6 +1314,676 @@ def _render_cron(values, original, validate_cron):
     return "".join(output)
 
 
+def _topology_tokenize(content):
+    """Tokenize the LLDPq DOT subset without trusting the service tree."""
+    tokens = []
+    index = 0
+    line = 1
+    column = 1
+
+    def advance(character):
+        nonlocal line, column
+        if character == "\n":
+            line += 1
+            column = 1
+        else:
+            column += 1
+
+    while index < len(content):
+        character = content[index]
+        if character.isspace():
+            advance(character)
+            index += 1
+            continue
+        if character == "#" or content.startswith("//", index):
+            while index < len(content) and content[index] != "\n":
+                advance(content[index])
+                index += 1
+            continue
+        if content.startswith("/*", index):
+            start_line, start_column = line, column
+            advance(content[index])
+            advance(content[index + 1])
+            index += 2
+            while index + 1 < len(content) and content[index:index + 2] != "*/":
+                advance(content[index])
+                index += 1
+            if index + 1 >= len(content):
+                raise BackupImportError(
+                    f"topology.dot:{start_line}:{start_column}: unterminated block comment"
+                )
+            advance(content[index])
+            advance(content[index + 1])
+            index += 2
+            continue
+
+        start_line, start_column = line, column
+        if character == '"':
+            advance(character)
+            index += 1
+            value = []
+            while index < len(content):
+                current = content[index]
+                if current == '"':
+                    advance(current)
+                    index += 1
+                    break
+                if current == "\\":
+                    if index + 1 >= len(content):
+                        raise BackupImportError(
+                            f"topology.dot:{start_line}:{start_column}: unterminated quoted identifier"
+                        )
+                    escaped = content[index + 1]
+                    advance(current)
+                    advance(escaped)
+                    index += 2
+                    if escaped != "\n":
+                        value.append(escaped)
+                    continue
+                if current in "\r\n":
+                    raise BackupImportError(
+                        f"topology.dot:{start_line}:{start_column}: newline in quoted identifier"
+                    )
+                value.append(current)
+                advance(current)
+                index += 1
+            else:
+                raise BackupImportError(
+                    f"topology.dot:{start_line}:{start_column}: unterminated quoted identifier"
+                )
+            tokens.append(("ID", "".join(value), start_line, start_column, True))
+            continue
+
+        if character == "[":
+            depth = 1
+            quoted = False
+            escaped = False
+            advance(character)
+            index += 1
+            while index < len(content) and depth:
+                current = content[index]
+                if quoted:
+                    if escaped:
+                        escaped = False
+                    elif current == "\\":
+                        escaped = True
+                    elif current == '"':
+                        quoted = False
+                elif current == '"':
+                    quoted = True
+                elif current == "[":
+                    depth += 1
+                elif current == "]":
+                    depth -= 1
+                advance(current)
+                index += 1
+            if depth:
+                raise BackupImportError(
+                    f"topology.dot:{start_line}:{start_column}: unterminated attribute list"
+                )
+            continue
+
+        if content.startswith("--", index):
+            tokens.append(("EDGE", "--", start_line, start_column, False))
+            advance("-")
+            advance("-")
+            index += 2
+            continue
+        if content.startswith("->", index):
+            raise BackupImportError(
+                f"topology.dot:{start_line}:{start_column}: directed edges are unsupported; use '--'"
+            )
+        punctuation = {
+            ":": "COLON", ";": "SEMI", "{": "LBRACE", "}": "RBRACE",
+            ",": "COMMA", "=": "EQUAL",
+        }
+        if character in punctuation:
+            tokens.append((
+                punctuation[character], character, start_line, start_column, False
+            ))
+            advance(character)
+            index += 1
+            continue
+
+        value = []
+        while index < len(content):
+            current = content[index]
+            if current.isspace() or current in '\"#:;{}[],=':
+                break
+            if (
+                content.startswith("--", index)
+                or content.startswith("//", index)
+                or content.startswith("/*", index)
+            ):
+                break
+            value.append(current)
+            advance(current)
+            index += 1
+        if not value:
+            raise BackupImportError(
+                f"topology.dot:{start_line}:{start_column}: unsupported character {character!r}"
+            )
+        tokens.append(("ID", "".join(value), start_line, start_column, False))
+    return tokens
+
+
+def _topology_endpoint(tokens, index):
+    if index >= len(tokens) or tokens[index][0] != "ID":
+        return None
+    if (
+        index + 2 >= len(tokens)
+        or tokens[index + 1][0] != "COLON"
+        or tokens[index + 2][0] != "ID"
+    ):
+        return None
+    device = tokens[index][1]
+    port_parts = [tokens[index + 2][1]]
+    cursor = index + 3
+    while (
+        cursor + 1 < len(tokens)
+        and tokens[cursor][0] == "COLON"
+        and tokens[cursor + 1][0] == "ID"
+    ):
+        port_parts.append(tokens[cursor + 1][1])
+        cursor += 2
+    port = ":".join(port_parts)
+    if not device or not port:
+        return None
+    return device, port, cursor, tokens[index][2]
+
+
+def _topology_normalize_hostname(name):
+    value = name.strip().rstrip(".")
+    while value:
+        folded = value.casefold()
+        suffix = next((item for item in (
+            ".cm.cluster", ".localdomain", ".local"
+        ) if folded.endswith(item)), None)
+        if suffix is None:
+            break
+        value = value[:-len(suffix)].rstrip(".")
+    return value
+
+
+def _topology_device_key_resolver(known_names):
+    names = []
+    seen = set()
+    for raw_name in known_names:
+        name = raw_name.strip().rstrip(".")
+        if name and name.casefold() not in seen:
+            names.append(name)
+            seen.add(name.casefold())
+    short_identities = {name.casefold() for name in names if "." not in name}
+    exact_to_key = {}
+    aliases = {}
+    for name in names:
+        exact = name.casefold()
+        short = name.split(".", 1)[0].casefold()
+        normalized = _topology_normalize_hostname(name).casefold() or exact
+        canonical = short if "." in name and short in short_identities else normalized
+        exact_to_key[exact] = canonical
+        for candidate in (exact, canonical, short):
+            if candidate:
+                aliases.setdefault(candidate, set()).add(canonical)
+    unique_aliases = {
+        alias: next(iter(keys)) for alias, keys in aliases.items() if len(keys) == 1
+    }
+
+    def resolve(raw_name):
+        name = raw_name.strip().rstrip(".")
+        folded = name.casefold()
+        if folded in exact_to_key:
+            return exact_to_key[folded]
+        for candidate in (
+            _topology_normalize_hostname(name).casefold(),
+            name.split(".", 1)[0].casefold(),
+        ):
+            if candidate in unique_aliases:
+                return unique_aliases[candidate]
+        return _topology_normalize_hostname(name).casefold()
+
+    return resolve
+
+
+def _validate_project_topology_dot(text, staged_path):
+    """Validate the same syntax and P2P semantics as the Setup editor."""
+    if not text.strip():
+        raise BackupImportError("topology.dot cannot be empty")
+    tokens = _topology_tokenize(text)
+    cursor = 0
+    if (
+        cursor < len(tokens)
+        and tokens[cursor][0] == "ID"
+        and not tokens[cursor][4]
+        and tokens[cursor][1].casefold() == "strict"
+    ):
+        cursor += 1
+    if (
+        cursor >= len(tokens)
+        or tokens[cursor][0] != "ID"
+        or tokens[cursor][4]
+        or tokens[cursor][1].casefold() != "graph"
+    ):
+        raise BackupImportError(
+            "topology.dot must start with an undirected 'graph' declaration"
+        )
+    cursor += 1
+    if cursor < len(tokens) and tokens[cursor][0] == "ID":
+        cursor += 1
+    if cursor >= len(tokens) or tokens[cursor][0] != "LBRACE":
+        raise BackupImportError("topology.dot graph declaration must be followed by '{'")
+
+    header_brace = cursor
+    depth = 0
+    closing = None
+    for token_index in range(header_brace, len(tokens)):
+        kind = tokens[token_index][0]
+        token_line = tokens[token_index][2]
+        token_column = tokens[token_index][3]
+        if kind == "LBRACE":
+            depth += 1
+        elif kind == "RBRACE":
+            depth -= 1
+            if depth < 0:
+                raise BackupImportError(
+                    f"topology.dot:{token_line}:{token_column}: unmatched closing brace"
+                )
+            if depth == 0:
+                closing = token_index
+                break
+    if depth:
+        raise BackupImportError("topology.dot graph has unbalanced braces")
+    if closing is None:
+        raise BackupImportError("topology.dot graph is missing a closing brace")
+    for token in tokens[closing + 1:]:
+        if token[0] != "SEMI":
+            raise BackupImportError(
+                f"topology.dot:{token[2]}:{token[3]}: content appears after the top-level graph"
+            )
+
+    edges = []
+    consumed_edges = set()
+    consumed_endpoints = set()
+    index = 0
+    while index < len(tokens):
+        endpoint = _topology_endpoint(tokens, index)
+        if endpoint is None:
+            index += 1
+            continue
+        left_device, left_port, edge_cursor, edge_line = endpoint
+        if edge_cursor >= len(tokens) or tokens[edge_cursor][0] != "EDGE":
+            index += 1
+            continue
+        consumed_endpoints.update(range(index, edge_cursor))
+        while edge_cursor < len(tokens) and tokens[edge_cursor][0] == "EDGE":
+            consumed_edges.add(edge_cursor)
+            right = _topology_endpoint(tokens, edge_cursor + 1)
+            if right is None:
+                token = tokens[edge_cursor]
+                raise BackupImportError(
+                    f"topology.dot:{token[2]}:{token[3]}: edge endpoint must be device:port"
+                )
+            right_device, right_port, next_cursor, _right_line = right
+            consumed_endpoints.update(range(edge_cursor + 1, next_cursor))
+            edges.append((left_device, left_port, right_device, right_port, edge_line))
+            left_device, left_port = right_device, right_port
+            edge_cursor = next_cursor
+        index = edge_cursor
+
+    for token_index, token in enumerate(tokens):
+        if token[0] == "EDGE" and token_index not in consumed_edges:
+            raise BackupImportError(
+                f"topology.dot:{token[2]}:{token[3]}: unsupported topology edge syntax"
+            )
+        if token[0] == "COLON" and token_index not in consumed_endpoints:
+            raise BackupImportError(
+                f"topology.dot:{token[2]}:{token[3]}: device:port endpoint is not part of an edge"
+            )
+
+    known_names = [name for edge in edges for name in (edge[0], edge[2])]
+    device_key = _topology_device_key_resolver(known_names)
+    seen_edges = {}
+    seen_endpoints = {}
+    for left_device, left_port, right_device, right_port, edge_line in edges:
+        for label, value in (
+            ("device", left_device), ("interface", left_port),
+            ("device", right_device), ("interface", right_port),
+        ):
+            if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+                raise BackupImportError(
+                    f"topology.dot:{edge_line}: topology {label} {value!r} contains "
+                    "whitespace or control characters unsupported by LLDP reports"
+                )
+        left = (device_key(left_device), left_port.strip().strip(","))
+        right = (device_key(right_device), right_port.strip().strip(","))
+        if left == right:
+            raise BackupImportError(
+                f"topology.dot:{edge_line}: topology edge connects endpoint "
+                f"{left_device}:{left_port} to itself"
+            )
+        edge_key = tuple(sorted((left, right)))
+        if edge_key in seen_edges:
+            raise BackupImportError(
+                f"topology.dot:{edge_line}: duplicate topology edge; first defined "
+                f"on line {seen_edges[edge_key]}"
+            )
+        for endpoint_key, display in (
+            (left, f"{left_device}:{left_port}"),
+            (right, f"{right_device}:{right_port}"),
+        ):
+            if endpoint_key in seen_endpoints:
+                raise BackupImportError(
+                    f"topology.dot:{edge_line}: endpoint {display} is reused; first "
+                    f"used on line {seen_endpoints[endpoint_key]}"
+                )
+            seen_endpoints[endpoint_key] = edge_line
+        seen_edges[edge_key] = edge_line
+
+    # Graphviz is a useful second parser, but never replaces LLDPq's stricter
+    # edge grammar above: Graphviz also accepts directed and non-edge graphs.
+    dot = shutil.which("dot")
+    if dot:
+        try:
+            checked = subprocess.run(
+                [dot, "-Tdot", staged_path, "-o", os.devnull],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BackupImportError("topology.dot validation timed out") from exc
+        except OSError as exc:
+            raise BackupImportError(f"Could not validate topology.dot: {exc}") from exc
+        if checked.returncode != 0:
+            detail = (checked.stderr or checked.stdout or "invalid DOT").strip()
+            raise BackupImportError("Invalid topology.dot: " + detail[:300])
+
+
+def _load_yaml_mapping(text, name, *, allow_empty=False):
+    try:
+        import yaml
+    except ImportError as exc:
+        raise BackupImportError("PyYAML is required to restore configuration") from exc
+
+    class UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader, node, deep=False):
+        loader.flatten_mapping(node)
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise BackupImportError(f"Invalid unhashable YAML key in {name}") from exc
+            if duplicate:
+                raise BackupImportError(f"Duplicate YAML key in {name}: {key!r}")
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping
+    )
+    try:
+        value = yaml.load(text, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise BackupImportError(f"Invalid {name} YAML: {str(exc)[:300]}") from exc
+    if value is None and allow_empty:
+        return {}
+    if not isinstance(value, dict):
+        raise BackupImportError(f"{name} must contain a YAML mapping")
+    return value
+
+
+def _load_json_no_duplicate_keys(text, name):
+    def object_hook(pairs):
+        result = {}
+        seen = {}
+        for key, value in pairs:
+            folded = key.casefold()
+            if folded in seen:
+                raise BackupImportError(
+                    f"Duplicate JSON key in {name}: {seen[folded]!r} and {key!r}"
+                )
+            seen[folded] = key
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(text, object_pairs_hook=object_hook)
+    except json.JSONDecodeError as exc:
+        raise BackupImportError(f"{name} is not valid JSON") from exc
+
+
+def _topology_string(value, field, *, maximum=512):
+    if not isinstance(value, str):
+        raise BackupImportError(f"{field} must be a string")
+    value = value.strip()
+    if not value:
+        raise BackupImportError(f"{field} cannot be empty")
+    if len(value) > maximum or any(char in value for char in ("\x00", "\r", "\n")):
+        raise BackupImportError(
+            f"{field} is too long or contains unsupported control characters"
+        )
+    return value
+
+
+def _topology_layer(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 1000:
+        raise BackupImportError(f"{field} must be an integer between 0 and 1000")
+    return value
+
+
+def _topology_pattern(value, field):
+    value = _topology_string(value, field)
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise BackupImportError(f"{field} is not a valid regular expression: {exc}") from exc
+
+
+def _validate_topology_config(value):
+    topology = value.get("topology", "minimal")
+    if topology not in ("minimal", "full"):
+        raise BackupImportError(
+            "topology_config.yaml 'topology' must be 'minimal' or 'full'"
+        )
+
+    categories = value.get("device_categories", [])
+    if not isinstance(categories, list):
+        raise BackupImportError("'device_categories' must be a list")
+    for index, category in enumerate(categories):
+        prefix = f"device_categories[{index}]"
+        if not isinstance(category, dict):
+            raise BackupImportError(prefix + " must be a mapping")
+        _topology_pattern(category.get("pattern"), prefix + ".pattern")
+        _topology_layer(category.get("layer"), prefix + ".layer")
+        _topology_string(category.get("icon"), prefix + ".icon", maximum=64)
+
+    default = value.get("default", {"layer": 9, "icon": "server"})
+    if not isinstance(default, dict):
+        raise BackupImportError("'default' must be a mapping")
+    _topology_layer(default.get("layer"), "default.layer")
+    _topology_string(default.get("icon"), "default.icon", maximum=64)
+
+    rules = value.get("special_rules", [])
+    if not isinstance(rules, list):
+        raise BackupImportError("'special_rules' must be a list")
+    for index, rule in enumerate(rules):
+        prefix = f"special_rules[{index}]"
+        if not isinstance(rule, dict):
+            raise BackupImportError(prefix + " must be a mapping")
+        _topology_pattern(rule.get("pattern"), prefix + ".pattern")
+        rule_type = _topology_string(rule.get("type"), prefix + ".type", maximum=64)
+        if rule_type not in ("stagger", "even_odd_suffix"):
+            raise BackupImportError(
+                prefix + ".type must be 'stagger' or 'even_odd_suffix'"
+            )
+        if "number_regex" in rule:
+            number_pattern = _topology_pattern(
+                rule["number_regex"], prefix + ".number_regex"
+            )
+            if number_pattern.groups < 1:
+                raise BackupImportError(
+                    prefix + ".number_regex must include a capture group"
+                )
+        _topology_string(rule.get("icon"), prefix + ".icon", maximum=64)
+        if rule_type == "even_odd_suffix":
+            _topology_layer(rule.get("even_layer"), prefix + ".even_layer")
+            _topology_layer(rule.get("odd_layer"), prefix + ".odd_layer")
+        elif "layer" in rule:
+            _topology_layer(rule["layer"], prefix + ".layer")
+
+
+def _optional_mapping(parent, key, path):
+    if key not in parent:
+        return {}
+    value = parent[key]
+    if not isinstance(value, dict):
+        raise BackupImportError(path + " must be a mapping")
+    return value
+
+
+def _known_bool(parent, key, path):
+    if key in parent and not isinstance(parent[key], bool):
+        raise BackupImportError(path + " must be true or false")
+
+
+def _known_text(parent, key, path, *, maximum):
+    if key not in parent:
+        return None
+    value = parent[key]
+    if not isinstance(value, str):
+        raise BackupImportError(path + " must be a string")
+    value = value.strip()
+    if len(value) > maximum or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        raise BackupImportError(path + " is too long or contains control characters")
+    return value
+
+
+def _known_number(parent, key, path, low, high, *, integer=False):
+    if key not in parent:
+        return None
+    value = parent[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BackupImportError(path + " must be a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise BackupImportError(path + " must be a finite number")
+    if integer and int(value) != value:
+        raise BackupImportError(path + " must be a whole number")
+    if value < low or value > high:
+        raise BackupImportError(f"{path} must be between {low} and {high}")
+    return value
+
+
+def _validate_notifications(value):
+    notifications = _optional_mapping(value, "notifications", "notifications")
+    thresholds = _optional_mapping(value, "thresholds", "thresholds")
+    alert_types = _optional_mapping(value, "alert_types", "alert_types")
+    strategy = _optional_mapping(value, "alert_strategy", "alert_strategy")
+    frequency = _optional_mapping(value, "frequency", "frequency")
+
+    _known_bool(notifications, "enabled", "notifications.enabled")
+    server_url = _known_text(
+        notifications, "server_url", "notifications.server_url", maximum=2048
+    )
+    if server_url and not re.fullmatch(r"https?://[^\s]+", server_url):
+        raise BackupImportError("notifications.server_url must be an http(s) URL")
+
+    slack = _optional_mapping(notifications, "slack", "notifications.slack")
+    _known_bool(slack, "enabled", "notifications.slack.enabled")
+    webhook = _known_text(
+        slack, "webhook", "notifications.slack.webhook", maximum=2048
+    )
+    if webhook and not webhook.startswith("https://hooks.slack.com/"):
+        raise BackupImportError(
+            "notifications.slack.webhook must be an https://hooks.slack.com/ URL"
+        )
+    _known_text(slack, "channel", "notifications.slack.channel", maximum=128)
+
+    for key in (
+        "hardware_alerts",
+        "network_alerts",
+        "system_alerts",
+        "topology_alerts",
+        "log_alerts",
+    ):
+        _known_bool(alert_types, key, "alert_types." + key)
+
+    mode = _known_text(strategy, "mode", "alert_strategy.mode", maximum=32)
+    if mode is not None and mode not in ("summary", "immediate", "change_only"):
+        raise BackupImportError("Unsupported alert_strategy.mode")
+    _known_number(
+        frequency,
+        "min_interval_minutes",
+        "frequency.min_interval_minutes",
+        1,
+        10080,
+        integer=True,
+    )
+
+    network = _optional_mapping(thresholds, "network", "thresholds.network")
+    hardware = _optional_mapping(thresholds, "hardware", "thresholds.hardware")
+    system = _optional_mapping(thresholds, "system", "thresholds.system")
+    _known_number(
+        network, "bgp_down_minutes", "thresholds.network.bgp_down_minutes", 0, 10080
+    )
+    flap_warning = _known_number(
+        network,
+        "link_flaps_per_hour",
+        "thresholds.network.link_flaps_per_hour",
+        0,
+        100000,
+    )
+    flap_critical = _known_number(
+        network,
+        "link_flaps_critical",
+        "thresholds.network.link_flaps_critical",
+        0,
+        100000,
+    )
+    if (
+        flap_warning is not None
+        and flap_critical is not None
+        and flap_critical < flap_warning
+    ):
+        raise BackupImportError(
+            "thresholds.network.link_flaps_critical must be greater than or equal "
+            "to link_flaps_per_hour"
+        )
+    _known_number(
+        network,
+        "optical_power_margin",
+        "thresholds.network.optical_power_margin",
+        -100,
+        100,
+    )
+    _known_number(
+        hardware,
+        "cpu_temp_critical",
+        "thresholds.hardware.cpu_temp_critical",
+        0,
+        250,
+    )
+    _known_number(
+        hardware,
+        "asic_temp_critical",
+        "thresholds.hardware.asic_temp_critical",
+        0,
+        250,
+    )
+    _known_number(
+        system,
+        "disk_usage_critical",
+        "thresholds.system.disk_usage_critical",
+        0,
+        100,
+    )
+
+
 def _validate_config(name, content, validation_dir, lldpq_dir):
     try:
         text = content.decode("utf-8")
@@ -988,6 +1995,26 @@ def _validate_config(name, content, validation_dir, lldpq_dir):
     with open(staged, "wb") as handle:
         handle.write(content)
     if name == "devices.yaml":
+        value = _load_yaml_mapping(text, name)
+        if (
+            "devices" not in value
+            or not isinstance(value.get("devices"), dict)
+            or not value["devices"]
+        ):
+            raise BackupImportError(
+                "devices.yaml must contain a non-empty 'devices' mapping"
+            )
+        defaults = value.get("defaults", {})
+        if defaults is not None and not isinstance(defaults, dict):
+            raise BackupImportError("devices.yaml 'defaults' must be a mapping")
+        endpoint_hosts = value.get("endpoint_hosts", [])
+        if endpoint_hosts is not None and (
+            not isinstance(endpoint_hosts, list)
+            or any(not isinstance(item, str) for item in endpoint_hosts)
+        ):
+            raise BackupImportError(
+                "devices.yaml 'endpoint_hosts' must be a list of strings"
+            )
         parser = os.path.join(lldpq_dir, "parse_devices.py")
         if not os.path.isfile(parser):
             raise BackupImportError("Canonical device parser is missing")
@@ -1000,16 +2027,38 @@ def _validate_config(name, content, validation_dir, lldpq_dir):
         if parsed.returncode != 0:
             detail = (parsed.stderr or "invalid inventory").strip()[:180]
             raise BackupImportError(f"devices.yaml is invalid: {detail}")
-    elif name in ("topology_config.yaml", "notifications.yaml"):
-        import yaml
-
-        value = yaml.safe_load(text)
-        if value is not None and not isinstance(value, dict):
-            raise BackupImportError(f"{name} must contain a YAML mapping")
+    elif name == "topology.dot":
+        _validate_project_topology_dot(text, staged)
+    elif name == "topology_config.yaml":
+        _validate_topology_config(_load_yaml_mapping(text, name))
+    elif name == "notifications.yaml":
+        _validate_notifications(_load_yaml_mapping(text, name, allow_empty=True))
+    elif name == "tracking.yaml":
+        validate_tracking_config(_load_yaml_mapping(text, name, allow_empty=True))
     elif name == "display-aliases.json":
-        value = json.loads(text)
-        if not isinstance(value, dict):
-            raise BackupImportError(f"{name} must contain a JSON object")
+        value = _load_json_no_duplicate_keys(text, name)
+        normalized = validate_display_aliases(value)
+        if normalized != value:
+            raise BackupImportError(
+                f"{name} must use trimmed names and include interfaces/devices objects"
+            )
+
+
+def validate_config_for_bundle(name, content, *, lldpq_dir):
+    """Apply restore-time validation before advertising a backup as usable."""
+    supported = {
+        "devices.yaml", "topology.dot", "topology_config.yaml",
+        "notifications.yaml", "tracking.yaml", "display-aliases.json",
+    }
+    if name not in supported:
+        raise BackupImportError(f"Unsupported managed backup config: {name}")
+    if not isinstance(content, bytes):
+        raise BackupImportError(f"Backup config must be bytes: {name}")
+    if len(content) > 2 * 1024 * 1024:
+        raise BackupImportError(f"Backup config is too large: {name}")
+    with tempfile.TemporaryDirectory(prefix="lldpq-export-validate-") as validation_dir:
+        _validate_config(name, content, validation_dir, lldpq_dir)
+    return True
 
 
 def _validate_key(name, content, validation_dir):
@@ -1027,6 +2076,142 @@ def _validate_key(name, content, validation_dir):
     if checked.returncode != 0:
         raise BackupImportError(f"{name} failed SSH key validation")
     return checked.stdout.strip()
+
+
+_PORTABLE_BOOLEAN_KEYS = {
+    "SKIP_OPTICAL", "SKIP_L1", "AUTO_BASE_CONFIG", "AUTO_ZTP_DISABLE",
+    "AUTO_SET_HOSTNAME", "TELEMETRY_ENABLED", "MONITOR_TIMING",
+}
+_PORTABLE_INTEGER_RANGES = {
+    "AI_CONTEXT_WINDOW_TOKENS": (8_000, 2_000_000),
+    "AI_FALLBACK_CONTEXT_WINDOW_TOKENS": (8_000, 2_000_000),
+    "SCAN_INTERVAL": (0, 86400),
+    "MONITOR_MAX_PARALLEL": (1, 1000),
+    "PFC_ECN_MAX_PARALLEL": (1, 8),
+    "PFC_ECN_COLLECTION_BUDGET_SECONDS": (1, 86400),
+    "PFC_ECN_PORT_TIMEOUT_SECONDS": (1, 86400),
+    "OPTICAL_COLLECTION_BUDGET_SECONDS": (1, 86400),
+    "OPTICAL_PORT_TIMEOUT_SECONDS": (1, 86400),
+    "LLDP_MAX_PARALLEL": (1, 1000),
+    "ASSETS_MAX_PARALLEL": (1, 1000),
+    "GET_CONFIGS_MAX_PARALLEL": (1, 1000),
+    "SEND_CMD_MAX_PARALLEL": (1, 1000),
+    "TELEMETRY_MAX_PARALLEL": (1, 1000),
+    "TRANSCEIVER_FW_MAX_PARALLEL": (1, 1000),
+    "GET_CONFIGS_SSH_TIMEOUT": (1, 86400),
+    "TRANSCEIVER_FW_SSH_TIMEOUT": (1, 86400),
+    "TRANSCEIVER_FW_MIN_INTERVAL": (0, 604800),
+}
+_PORTABLE_OPTIONAL_INTEGER_KEYS = {
+    "AI_CONTEXT_WINDOW_TOKENS", "AI_FALLBACK_CONTEXT_WINDOW_TOKENS",
+}
+_PORTABLE_URL_KEYS = {
+    "PROMETHEUS_URL", "AI_API_URL", "OLLAMA_URL", "AI_PROXY_URL", "AI_SEARCH_URL",
+}
+_PORTABLE_OPTIONAL_URL_KEYS = {"AI_PROXY_URL", "AI_SEARCH_URL"}
+_PORTABLE_MODEL_KEYS = {"AI_MODEL", "AI_FALLBACK_MODEL", "AI_SEARCH_MODEL"}
+_PORTABLE_OPTIONAL_MODEL_KEYS = {"AI_FALLBACK_MODEL", "AI_SEARCH_MODEL"}
+
+
+def _portable_scalar(candidate, key):
+    if not isinstance(candidate, str) or len(candidate) > 2048:
+        raise BackupImportError(f"Portable preference {key} is too long")
+    value = candidate.strip()
+    if value[:1] in ("'", '"') or value[-1:] in ("'", '"'):
+        if len(value) < 2 or value[0] != value[-1] or value[0] not in ("'", '"'):
+            raise BackupImportError(f"Portable preference {key} has mismatched quotes")
+        value = value[1:-1]
+    if len(value) > 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise BackupImportError(
+            f"Portable preference {key} contains invalid control text"
+        )
+    return value
+
+
+def _validate_portable_preference(key, candidate, validate_cron):
+    """Validate a portable value and return one shell-safe assignment token."""
+    value = _portable_scalar(candidate, key)
+    if key in ("LLDPQ_CRON", "GETCONF_CRON"):
+        if not value or len(value) > 128 or not validate_cron(value):
+            raise BackupImportError(f"Invalid imported cron schedule: {key}")
+        return shlex.quote(value)
+    if key in _PORTABLE_BOOLEAN_KEYS:
+        normalized = value.casefold()
+        if normalized not in ("true", "false"):
+            raise BackupImportError(
+                f"Portable preference {key} must be true or false"
+            )
+        return normalized
+    if key in _PORTABLE_INTEGER_RANGES:
+        if not value and key in _PORTABLE_OPTIONAL_INTEGER_KEYS:
+            return shlex.quote(value)
+        if not re.fullmatch(r"[0-9]+", value):
+            raise BackupImportError(
+                f"Portable preference {key} must be a whole number"
+            )
+        number = int(value)
+        minimum, maximum = _PORTABLE_INTEGER_RANGES[key]
+        if not minimum <= number <= maximum:
+            raise BackupImportError(
+                f"Portable preference {key} must be between {minimum} and {maximum}"
+            )
+        return str(number)
+    if key == "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY":
+        normalized = value.casefold()
+        if normalized not in ("run", "skip"):
+            raise BackupImportError(
+                "Portable preference TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY "
+                "must be run or skip"
+            )
+        return normalized
+    if key == "TRANSCEIVER_FW_SKIP_MODELS":
+        if len(value) > 512 or (
+            value and not re.fullmatch(r"[A-Za-z0-9_.-]+(?:[\s,]+[A-Za-z0-9_.-]+)*", value)
+        ):
+            raise BackupImportError(
+                "Portable preference TRANSCEIVER_FW_SKIP_MODELS has invalid model names"
+            )
+        return shlex.quote(value)
+    if key == "AI_PROVIDER":
+        normalized = value.casefold()
+        if normalized not in (
+            "ollama", "openai", "claude", "gemini", "custom", "nvidia"
+        ):
+            raise BackupImportError("Portable preference AI_PROVIDER is unsupported")
+        return normalized
+    if key in _PORTABLE_MODEL_KEYS:
+        if not value and key in _PORTABLE_OPTIONAL_MODEL_KEYS:
+            return shlex.quote(value)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@+~-]{0,255}", value):
+            raise BackupImportError(f"Portable preference {key} has an invalid model name")
+        return shlex.quote(value)
+    if key in _PORTABLE_URL_KEYS:
+        if not value and key in _PORTABLE_OPTIONAL_URL_KEYS:
+            return shlex.quote(value)
+        if len(value) > 2048:
+            raise BackupImportError(f"Portable preference {key} URL is too long")
+        parsed = urllib.parse.urlsplit(value)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise BackupImportError(
+                f"Portable preference {key} must be an http(s) URL without credentials"
+            )
+        try:
+            _ = parsed.port
+        except ValueError as exc:
+            raise BackupImportError(
+                f"Portable preference {key} has an invalid URL port"
+            ) from exc
+        return shlex.quote(value)
+    # Future caller-allowlisted keys remain bounded and shell-quoted until a
+    # more specific semantic validator is added here.
+    if len(value) > 512:
+        raise BackupImportError(f"Portable preference {key} is too long")
+    return shlex.quote(value)
 
 
 def _parse_bundle(raw, allowed, key_names, pref_keys, validate_cron, lldpq_dir):
@@ -1061,7 +2246,10 @@ def _parse_bundle(raw, allowed, key_names, pref_keys, validate_cron, lldpq_dir):
                 if member.size < 0 or member.size > 2 * 1024 * 1024:
                     raise BackupImportError(f"Backup entry is too large: {name}")
                 total_size += member.size
-                if total_size > 8 * 1024 * 1024:
+                # Six managed configs, portable preferences and four possible
+                # SSH key members can each legally reach the 2 MiB entry cap.
+                # Keep import at least as permissive as bundles export can make.
+                if total_size > 20 * 1024 * 1024:
                     raise BackupImportError("Expanded backup bundle is too large")
                 extracted = archive.extractfile(member)
                 if extracted is None:
@@ -1091,13 +2279,9 @@ def _parse_bundle(raw, allowed, key_names, pref_keys, validate_cron, lldpq_dir):
                                 f"Duplicate portable preference: {key}"
                             )
                         seen.add(key)
-                        if key in ("LLDPQ_CRON", "GETCONF_CRON"):
-                            cron = candidate.strip().strip('"').strip("'")
-                            if not validate_cron(cron):
-                                raise BackupImportError(
-                                    f"Invalid imported cron schedule: {key}"
-                                )
-                        pref_values[key] = candidate
+                        pref_values[key] = _validate_portable_preference(
+                            key, candidate, validate_cron
+                        )
                     continue
 
                 if is_key:
@@ -1120,6 +2304,22 @@ def _parse_bundle(raw, allowed, key_names, pref_keys, validate_cron, lldpq_dir):
                     entries.append(
                         {"name": name, "content": content, "kind": "config"}
                     )
+
+        private_names = [
+            name for name in ("id_ed25519", "id_rsa")
+            if name in key_validation
+        ]
+        if len(private_names) > 1:
+            raise BackupImportError(
+                "Backup bundle contains multiple SSH private identities"
+            )
+        if private_names:
+            selected = private_names[0]
+            opposite = "id_rsa" if selected == "id_ed25519" else "id_ed25519"
+            if opposite in key_validation or opposite + ".pub" in key_validation:
+                raise BackupImportError(
+                    "A private-key backup may not include opposite-algorithm key material"
+                )
 
         for private_name in ("id_ed25519", "id_rsa"):
             public_name = private_name + ".pub"
@@ -1188,6 +2388,59 @@ def _cleanup_stages(entries, user):
             pass
 
 
+def _restore_root_entries(root_entries):
+    """Synchronously roll privileged targets back from process-owned memory."""
+    errors = []
+    for entry in reversed(root_entries):
+        try:
+            _restore_snapshot(entry["snapshot"])
+        except Exception as exc:
+            errors.append(f"{entry['name']}: {exc}")
+    if errors:
+        raise BackupImportError(
+            "Privileged target rollback is incomplete: " + "; ".join(errors[:2])
+        )
+
+
+def _append_opposite_key_retirements(
+    entries, *, ssh_dir, lldpq_dir, web_root, user, resolved_targets
+):
+    """Add deletion entries for the inactive SSH algorithm to the transaction."""
+    private_entries = [entry for entry in entries if entry["kind"] == "key-private"]
+    if not private_entries:
+        return
+    if len(private_entries) != 1:
+        # Parsing already rejects this; retain the invariant at the mutation
+        # boundary in case restore_bundle is called with a different parser.
+        raise BackupImportError("Backup bundle contains multiple SSH private identities")
+    selected = private_entries[0]["name"]
+    if selected not in ("id_ed25519", "id_rsa"):
+        raise BackupImportError("Unsupported collector SSH private identity")
+    opposite = "id_rsa" if selected == "id_ed25519" else "id_ed25519"
+    for name in (opposite, opposite + ".pub"):
+        logical = os.path.join(ssh_dir, name)
+        target = _safe_target(
+            logical, lldpq_dir, web_root, allow_config_symlink=False
+        )
+        if target in resolved_targets:
+            raise BackupImportError(
+                "Private-key restore conflicts with opposite-algorithm key material"
+            )
+        resolved_targets.add(target)
+        entries.append(
+            {
+                "name": name,
+                "content": b"",
+                "kind": "key-remove",
+                "logical_target": logical,
+                "target": target,
+                "stage": None,
+                "direct_mount": _is_direct_mount(target),
+                "snapshot": _snapshot_file(target, reader=user),
+            }
+        )
+
+
 def restore_bundle(
     encoded_data,
     *,
@@ -1201,6 +2454,7 @@ def restore_bundle(
     """Validate and restore a Setup bundle as one all-or-rollback transaction."""
     allowed = {
         "devices.yaml": lldpq_dir,
+        "tracking.yaml": lldpq_dir,
         "topology.dot": web_root,
         "topology_config.yaml": web_root,
         "notifications.yaml": lldpq_dir,
@@ -1286,8 +2540,12 @@ def restore_bundle(
                 "logical_target": conf_logical,
                 "target": conf_target,
                 "content": _render_conf(original_conf, pref_values).encode(),
-                "mode": 0o664,
-                "uid": 0,
+                "mode": 0o660,
+                # CLI access must not depend on a just-added supplementary
+                # group becoming visible in the caller's existing shell.
+                # Docker's persistent system-config writer already uses the
+                # same service-account ownership for atomic replacements.
+                "uid": account.pw_uid,
                 "gid": config_group.gr_gid,
                 "snapshot": conf_snapshot,
                 "stage": None,
@@ -1330,32 +2588,47 @@ def restore_bundle(
     if os.path.islink(ssh_dir):
         raise BackupImportError("Collector .ssh directory may not be a symbolic link")
     ssh_dir_existed = os.path.isdir(ssh_dir)
-    ssh_dir_stat = os.stat(ssh_dir) if ssh_dir_existed else None
+    _append_opposite_key_retirements(
+        entries,
+        ssh_dir=ssh_dir,
+        lldpq_dir=lldpq_dir,
+        web_root=web_root,
+        user=lldpq_user,
+        resolved_targets=resolved_targets,
+    )
     token = f"{os.getpid()}-{secrets.token_hex(8)}"
     for entry in entries:
-        entry["stage"] = f"{entry['target']}.lldpq-import-stage-{token}"
+        entry["stage"] = (
+            None
+            if entry["kind"] == "key-remove"
+            else f"{entry['target']}.lldpq-import-stage-{token}"
+        )
     ssh_snapshot = None
     if has_keys:
         ssh_snapshot = {
             "path": ssh_dir,
             "present": ssh_dir_existed,
-            "mode": (ssh_dir_stat.st_mode & 0o7777) if ssh_dir_existed else None,
-            "uid": ssh_dir_stat.st_uid if ssh_dir_existed else None,
-            "gid": ssh_dir_stat.st_gid if ssh_dir_existed else None,
+            "mode": 0o700 if ssh_dir_existed else None,
+            "uid": account.pw_uid if ssh_dir_existed else None,
+            "gid": account.pw_gid if ssh_dir_existed else None,
         }
 
     # Publish fsynced rollback authority before creating .ssh, staging beside
     # targets, or performing the first live activation.
-    recovery_dir = _create_recovery_authority(
-        entries, root_entries, ssh_snapshot,
-        lldpq_dir=lldpq_dir, web_root=web_root, user=lldpq_user, token=token,
-    )
+    recovery_dir = None
+    if entries:
+        recovery_dir = _create_recovery_authority(
+            entries, ssh_snapshot,
+            lldpq_dir=lldpq_dir, web_root=web_root, user=lldpq_user, token=token,
+        )
 
     # Stage and verify every service-owned file before the first activation.
     try:
         if has_keys:
             _as_collector(lldpq_user, ["mkdir", "-p", ssh_dir])
         for entry in entries:
+            if entry["kind"] == "key-remove":
+                continue
             _stage_collector_file(
                 entry,
                 lldpq_user,
@@ -1367,11 +2640,11 @@ def restore_bundle(
     except Exception as stage_error:
         _cleanup_stages(entries, lldpq_user)
         try:
-            recovered = _recover_retained_authority(
+            recovered = recovery_dir is not None and _recover_retained_authority(
                 lldpq_dir=lldpq_dir, web_root=web_root, user=lldpq_user,
                 allowed=allowed, key_names=key_names, ssh_dir=ssh_dir,
             )
-            if not recovered:
+            if recovery_dir is not None and not recovered:
                 raise BackupImportError("Durable recovery authority disappeared")
         except Exception as recovery_error:
             raise BackupImportError(
@@ -1382,20 +2655,27 @@ def restore_bundle(
             f"Import staging failed; all targets were restored: {stage_error}"
         ) from stage_error
 
+    root_activation_started = False
     try:
         if has_keys:
-            _run(["sudo", "chown", f"{account.pw_uid}:{account.pw_gid}", ssh_dir])
-            _run(["sudo", "chmod", "700", ssh_dir])
-            stat = os.stat(ssh_dir)
+            _collector_set_metadata(
+                lldpq_user, ssh_dir, 0o700, account.pw_uid, account.pw_gid
+            )
+            ssh_metadata = os.stat(ssh_dir, follow_symlinks=False)
             if (
-                stat.st_mode & 0o7777 != 0o700
-                or stat.st_uid != account.pw_uid
-                or stat.st_gid != account.pw_gid
+                not stat.S_ISDIR(ssh_metadata.st_mode)
+                or ssh_metadata.st_mode & 0o7777 != 0o700
+                or ssh_metadata.st_uid != account.pw_uid
+                or ssh_metadata.st_gid != account.pw_gid
             ):
                 raise BackupImportError("SSH directory metadata verification failed")
             _durable_path(ssh_dir, reader=lldpq_user)
         for entry in entries:
-            _activate_collector_file(entry, lldpq_user)
+            if entry["kind"] == "key-remove":
+                _activate_collector_removal(entry, lldpq_user)
+            else:
+                _activate_collector_file(entry, lldpq_user)
+        root_activation_started = bool(root_entries)
         for entry in root_entries:
             _install_bytes_as_root(
                 entry["content"],
@@ -1406,22 +2686,32 @@ def restore_bundle(
             )
         # Removing the authority is itself part of commit. If it fails, the
         # exception path below consumes the retained authority and rolls back.
-        _commit_recovery_authority(
-            lldpq_user, recovery_dir, _recovery_base(lldpq_dir, lldpq_user), token
-        )
+        if recovery_dir is not None:
+            _commit_recovery_authority(
+                lldpq_user, recovery_dir,
+                _recovery_base(lldpq_dir, lldpq_user), token,
+            )
     except Exception as commit_error:
         _cleanup_stages(entries, lldpq_user)
+        rollback_errors = []
+        if root_activation_started:
+            try:
+                _restore_root_entries(root_entries)
+            except Exception as root_recovery_error:
+                rollback_errors.append(f"privileged recovery: {root_recovery_error}")
         try:
-            recovered = _recover_retained_authority(
+            recovered = recovery_dir is not None and _recover_retained_authority(
                 lldpq_dir=lldpq_dir, web_root=web_root, user=lldpq_user,
                 allowed=allowed, key_names=key_names, ssh_dir=ssh_dir,
             )
-            if not recovered:
+            if recovery_dir is not None and not recovered:
                 raise BackupImportError("Durable recovery authority disappeared")
         except Exception as recovery_error:
+            rollback_errors.append(f"service recovery: {recovery_error}")
+        if rollback_errors:
             raise BackupImportError(
-                f"Import failed and durable recovery is incomplete: {commit_error}; "
-                f"recovery: {recovery_error}"
+                f"Import failed and recovery is incomplete: {commit_error}; "
+                + "; ".join(rollback_errors)
             ) from commit_error
         raise BackupImportError(
             f"Import failed; all targets were rolled back: {commit_error}"
@@ -1437,7 +2727,7 @@ def restore_bundle(
         "keys": sorted(
             entry["name"]
             for entry in entries
-            if entry["kind"].startswith("key-")
+            if entry["kind"] in ("key-private", "key-public")
         ),
         "prefs": sorted(pref_values),
     }
@@ -1447,6 +2737,7 @@ def recover_retained_import(*, lldpq_dir, user, web_root):
     """Recover a retained transaction without reading the potentially partial config."""
     allowed = {
         "devices.yaml": lldpq_dir,
+        "tracking.yaml": lldpq_dir,
         "topology.dot": web_root,
         "topology_config.yaml": web_root,
         "notifications.yaml": lldpq_dir,
@@ -1646,6 +2937,44 @@ def _acquire_configuration_lock(path="/etc/lldpq.conf.lock"):
         raise BackupImportError(f"Could not acquire configuration lock: {exc}") from exc
 
 
+def _acquire_inventory_lock(web_root):
+    """Join Provision's inventory transaction during retained recovery."""
+    path = os.path.join(web_root, ".inventory.lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    handle = None
+    try:
+        descriptor = os.open(path, flags, 0o664)
+        if os.geteuid() == 0:
+            try:
+                inventory_gid = grp.getgrnam("www-data").gr_gid
+            except KeyError as exc:
+                raise BackupImportError(
+                    "Required inventory lock group is unavailable"
+                ) from exc
+            os.fchown(descriptor, 0, inventory_gid)
+            os.fchmod(descriptor, 0o660)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IWOTH:
+            raise BackupImportError("Inventory lock has unsafe type or permissions")
+        handle = os.fdopen(descriptor, "a+")
+        descriptor = None
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return handle
+    except Exception as exc:
+        try:
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+        except OSError:
+            pass
+        if isinstance(exc, BackupImportError):
+            raise
+        raise BackupImportError(f"Could not acquire inventory lock: {exc}") from exc
+
+
 def _main(argv=None):
     parser = argparse.ArgumentParser(description="LLDPq backup-import recovery helper")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1666,12 +2995,16 @@ def _main(argv=None):
             if not os.path.isabs(value) or "\x00" in value:
                 parser.error("recovery paths must be absolute")
     lock_handle = None
+    inventory_lock_handle = None
     try:
         # This is the same lock used by Setup imports. A path-triggered service
         # waits for a normal transaction; after release it either recovers the
         # retained authority or observes that the completed import removed it.
         lock_handle = _acquire_configuration_lock()
         if args.command == "recover":
+            inventory_lock_handle = _acquire_inventory_lock(
+                os.path.normpath(args.web_root)
+            )
             result = recover_retained_import(
                 lldpq_dir=os.path.normpath(args.lldpq_dir), user=args.user,
                 web_root=os.path.normpath(args.web_root),
@@ -1682,6 +3015,11 @@ def _main(argv=None):
         print(f"backup-import recovery failed: {exc}", file=sys.stderr)
         return 1
     finally:
+        if inventory_lock_handle is not None:
+            try:
+                fcntl.flock(inventory_lock_handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                inventory_lock_handle.close()
         if lock_handle is not None:
             try:
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)

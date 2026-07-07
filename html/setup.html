@@ -37,6 +37,13 @@
         .su-step .lbl { color:#e0e0e0; font-weight:600; font-size:14px; }
         .su-step .desc { color:#8f8f8f; font-size:11.5px; margin-top:2px; line-height:1.4; }
         .su-step.active .lbl { color:#fff; }
+        .su-danger-separator { margin:18px 14px 8px; color:#8f8f8f; font-size:10px; font-weight:700; letter-spacing:.11em; text-transform:uppercase; }
+        .su-step.danger .num { background:rgba(244,67,54,.14); color:#ef7770; }
+        .su-step.danger .lbl { color:#ef9a94; }
+        .su-step.danger:hover { background:#302222; }
+        .su-step.danger.active { background:#3a2020; border-color:#f44336; }
+        .su-step.danger.active .num { background:#f44336; color:#fff; }
+        .su-step.danger.active .lbl { color:#fff; }
 
         /* ---- right: active panel ---- */
         .su-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
@@ -65,6 +72,8 @@
         .btn.primary:hover { background:#8ad400; }
         .btn.secondary { background:#3c3c3c; color:#e0e0e0; }
         .btn.secondary:hover { background:#4a4a4a; }
+        .btn.danger { background:#c9362d; color:#fff; }
+        .btn.danger:hover { background:#e0443a; }
         .btn:disabled { opacity:.5; cursor:not-allowed; }
 
         .status { font-size:12.5px; margin-top:10px; min-height:18px; }
@@ -76,6 +85,13 @@
         .key-input input { flex:1; min-width:220px; padding:10px 12px; background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:6px; font-size:14px; }
         .key-input input:focus { outline:none; border-color:#76b900; }
         .note { background:#2a2a1a; border:1px solid #4a4424; border-radius:6px; padding:10px 14px; color:#d6ca8a; font-size:12.5px; line-height:1.55; margin-bottom:14px; }
+        .note.danger-note { background:#302020; border-color:#66332f; color:#efaaa4; }
+        .sched-card.danger-card { border-color:#63332f; }
+        .danger-choice { display:flex; align-items:flex-start; gap:9px; color:#d4d4d4; font-size:13px; line-height:1.45; cursor:pointer; margin:10px 0; }
+        .danger-choice input { width:16px; height:16px; min-width:16px; margin-top:2px; accent-color:#f44336; }
+        .danger-choice small { display:block; color:#8f8f8f; font-size:11.5px; margin-top:2px; }
+        .danger-advanced { margin-top:14px; padding-top:12px; border-top:1px solid #3a3030; }
+        .danger-advanced summary { cursor:pointer; color:#ef9a94; font-size:12.5px; font-weight:600; }
 
         .key-card { background:#202020; border:1px solid #333; border-radius:8px; padding:14px 16px; margin-bottom:16px; }
         .key-row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:13px; }
@@ -97,6 +113,19 @@
         .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
         .badge.green { background:rgba(118,185,0,.2); color:#76b900; }
         .badge.gray { background:rgba(255,255,255,.1); color:#999; }
+
+        /* Alias rows deliberately reuse the existing card/input/button language. */
+        .alias-row { display:flex; gap:8px; align-items:center; margin-bottom:8px; }
+        .alias-row .sched-sel { min-width:0; }
+        .alias-row .alias-real { flex:1; }
+        .alias-row .alias-label { width:180px; }
+        .alias-arrow { color:#76b900; }
+        .alias-remove { min-width:34px; justify-content:center; padding:8px; }
+        .alias-bulk { min-height:72px !important; }
+        @media (max-width:760px) {
+            .alias-row { flex-wrap:wrap; }
+            .alias-row .alias-real, .alias-row .alias-label { flex:1; width:auto; min-width:180px; }
+        }
     </style>
 </head>
 <body>
@@ -114,7 +143,7 @@
         <div class="su-main">
             <div class="su-panels">
                 <!-- Step 1: devices.yaml -->
-                <div class="su-panel" data-step="0">
+                <div class="su-panel" data-step-key="devices">
                     <h2>1. Inventory <span class="p-file">devices.yaml</span></h2>
                     <p class="p-desc">Define every switch LLDPq should reach: management IPs (or hostnames), the default login username, and optional roles/groups. This is the source for collection, assets, key distribution and analysis.</p>
                     <div class="p-toolbar">
@@ -130,7 +159,7 @@
                 </div>
 
                 <!-- Step 2: SSH keys -->
-                <div class="su-panel" data-step="1">
+                <div class="su-panel" data-step-key="keys">
                     <h2>2. SSH Keys</h2>
                     <p class="p-desc">Authorize the collector's SSH key on every device in <code>devices.yaml</code> and enable passwordless <code>sudo</code> for the login user. This is the <strong>same single key pair</strong> used by Provision/ZTP.</p>
 
@@ -169,7 +198,7 @@
                 </div>
 
                 <!-- Step 3: topology.dot -->
-                <div class="su-panel" data-step="2">
+                <div class="su-panel" data-step-key="topology">
                     <h2>3. Topology <span class="p-file">topology.dot</span></h2>
                     <p class="p-desc">Describe the expected cabling as a Graphviz <code>.dot</code> graph (<code>"deviceA":"port" -- "deviceB":"port"</code>). LLDP results are validated against this expected wiring.</p>
                     <div class="p-toolbar">
@@ -185,9 +214,9 @@
                 </div>
 
                 <!-- Step 4: topology_config.yaml -->
-                <div class="su-panel" data-step="3">
+                <div class="su-panel" data-step-key="config">
                     <h2>4. Topology Config <span class="p-file">topology_config.yaml</span></h2>
-                    <p class="p-desc">Tune how the topology is rendered &mdash; tier ordering, which names are endpoint hosts, and special layout rules (e.g. staggered compute racks). Optional, but improves the Topology view.</p>
+                    <p class="p-desc">Tune how the topology is rendered &mdash; tier ordering, layer/icon rules and special layout rules (e.g. staggered compute racks). Endpoint hosts are defined in <code>devices.yaml</code>. Optional, but improves the Topology view.</p>
                     <div class="p-toolbar">
                         <button class="btn secondary" onclick="document.getElementById('up-config').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
                         <input type="file" id="up-config" style="display:none" onchange="uploadFile('config', this)">
@@ -200,9 +229,44 @@
                     <div class="status info" id="st-config"></div>
                 </div>
 
-                <!-- Step 5: Integrate Ansible -->
-                <div class="su-panel" data-step="4">
-                    <h2>5. Integrate Ansible <span class="p-file">optional</span></h2>
+                <!-- Step 5: display-aliases.json -->
+                <div class="su-panel" data-step-key="aliases">
+                    <h2>5. Display Aliases <span class="p-file">display-aliases.json</span></h2>
+                    <p class="p-desc">Map canonical device and interface names to the P2P / field labels shown in LLDPq. Aliases are display-only: collected source data and topology validation are not changed. This step is optional and can be revisited after discovery.</p>
+                    <div class="p-toolbar">
+                        <button class="btn secondary" type="button" onclick="document.getElementById('up-aliases').click()" title="Upload display-aliases.json from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <input type="file" id="up-aliases" accept=".json,application/json" style="display:none" onchange="uploadAliases(this)">
+                        <button class="btn secondary" type="button" onclick="loadAliases(true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" type="button" onclick="downloadAliases()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <div class="spacer"></div>
+                        <button class="btn primary" type="button" id="aliases-save" onclick="saveAliases()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save aliases</button>
+                    </div>
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Device names</span><span class="mono">canonical &rarr; display label</span></div>
+                        <div id="alias-device-rows"></div>
+                        <div class="p-toolbar">
+                            <button class="btn secondary" type="button" onclick="addAliasRow('devices')">+ Add device</button>
+                        </div>
+                        <label class="key-lbl" for="alias-device-bulk">Bulk paste: one <code>display label &lt;tab&gt; canonical name</code> pair per line. Import replaces the device rows.</label>
+                        <textarea class="su-ta alias-bulk" id="alias-device-bulk" spellcheck="false" placeholder="SPINE-01&#9;tan-spine-01"></textarea>
+                        <div class="p-toolbar"><button class="btn secondary" type="button" onclick="importAliasBulk('devices')">Import device rows</button></div>
+                    </div>
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Interface / port names</span><span class="mono">canonical &rarr; display label</span></div>
+                        <div id="alias-interface-rows"></div>
+                        <div class="p-toolbar">
+                            <button class="btn secondary" type="button" onclick="addAliasRow('interfaces')">+ Add interface</button>
+                        </div>
+                        <label class="key-lbl" for="alias-interface-bulk">Bulk paste: one <code>display label &lt;tab&gt; canonical name</code> pair per line. Import replaces the interface rows.</label>
+                        <textarea class="su-ta alias-bulk" id="alias-interface-bulk" spellcheck="false" placeholder="M1&#9;enP22p3s0f0np0"></textarea>
+                        <div class="p-toolbar"><button class="btn secondary" type="button" onclick="importAliasBulk('interfaces')">Import interface rows</button></div>
+                    </div>
+                    <div class="status info" id="aliases-status" role="status" aria-live="polite"></div>
+                </div>
+
+                <!-- Step 6: Integrate Ansible -->
+                <div class="su-panel" data-step-key="ansible">
+                    <h2>6. Integrate Ansible <span class="p-file">optional</span></h2>
                     <p class="p-desc">LLDPq can read your Ansible inventory to power the <strong>Ansible</strong> menu (VLAN Report, VRF Report, Fabric Exit/Config/Editor/Deploy). If you don't use Ansible, disable it here and those menu items disappear.</p>
                     <div class="key-card">
                         <div class="key-row"><span class="k">Status</span><span id="ans-state" class="badge gray">checking&hellip;</span></div>
@@ -213,16 +277,16 @@
                         <div class="p-toolbar">
                             <button class="btn primary" onclick="saveAnsible()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Use this directory</button>
                             <button class="btn secondary" onclick="disableAnsible()">I don't use Ansible (disable)</button>
-                            <button class="btn secondary" onclick="loadAnsible()">Refresh</button>
+                            <button class="btn secondary" onclick="loadAnsible(true)">Refresh</button>
                         </div>
                         <div class="status info" id="ans-status"></div>
                     </div>
-                    <p class="p-desc" style="color:#888;">Changes take effect immediately; reload the app (or switch pages) to see the left menu update.</p>
+                    <p class="p-desc" style="color:#888;">After saving, reload the app (or switch pages) to see the left menu update.</p>
                 </div>
 
-                <!-- Step 6: Run LLDPq -->
-                <div class="su-panel" data-step="6">
-                    <h2>7. Run LLDPq</h2>
+                <!-- Step 8: Run LLDPq -->
+                <div class="su-panel" data-step-key="run">
+                    <h2>8. Run LLDPq</h2>
                     <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
 
                     <div class="sched-card">
@@ -273,9 +337,9 @@
                     <pre id="run-output" class="run-output">Click "Run LLDPq" to start a collection and stream the output here&hellip;</pre>
                 </div>
 
-                <!-- Step 7: Update LLDPq -->
-                <div class="su-panel" data-step="9">
-                    <h2>10. Update LLDPq</h2>
+                <!-- Step 11: Update LLDPq -->
+                <div class="su-panel" data-step-key="update">
+                    <h2>11. Update LLDPq</h2>
                     <p class="p-desc">Pull the latest LLDPq and reinstall. Configs, keys and monitoring data are preserved across the update.</p>
 
                     <!-- Docker deployments: a container can't replace its own image — update on the host. -->
@@ -322,9 +386,9 @@
                     </div>
                 </div>
 
-                <!-- Step 8: Notifications & Alerting -->
-                <div class="su-panel" data-step="5">
-                    <h2>6. Notifications <span class="p-file">notifications.yaml</span></h2>
+                <!-- Step 7: Notifications & Alerting -->
+                <div class="su-panel" data-step-key="notifications">
+                    <h2>7. Notifications <span class="p-file">notifications.yaml</span></h2>
                     <p class="p-desc">Configure Slack alerting for the pipeline's alert stage &mdash; master on/off, the Slack webhook, which categories fire and key thresholds. Use <strong>Send test alert</strong> to confirm the webhook works. (Runs every cycle after the collection stage.)</p>
 
                     <div class="sched-card">
@@ -373,7 +437,7 @@
                     </div>
 
                     <div class="p-toolbar">
-                        <button class="btn secondary" onclick="loadNotifications()"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="loadNotifications(true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
                         <div class="spacer"></div>
                         <button class="btn primary" onclick="saveNotifications()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save notifications.yaml</button>
                     </div>
@@ -381,30 +445,30 @@
                 </div>
 
                 <!-- Step 9: Backup & Restore -->
-                <div class="su-panel" data-step="7">
-                    <h2>8. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
-                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus your tunable <strong>settings</strong> (schedules, parallelism, toggles) and (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. On restore, settings are merged back <em>by key</em> &mdash; host paths &amp; secrets (e.g. AI key) are never carried or overwritten.</p>
+                <div class="su-panel" data-step-key="backup">
+                    <h2>9. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
+                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>tracking.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus your tunable <strong>settings</strong> (schedules, parallelism, toggles) and (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. On restore, settings are merged back <em>by key</em> &mdash; host paths &amp; secrets (e.g. AI key) are never carried or overwritten.</p>
                     <div class="sched-card">
-                        <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(bundle becomes secret: it holds the private key)</strong></label>
+                        <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(adds the private key)</strong></label>
                         <div class="p-toolbar">
                             <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download bundle</button>
                             <span class="status info" id="bk-export-msg"></span>
                         </div>
                     </div>
                     <div class="sched-card">
-                        <label class="key-lbl">Restore from a bundle (overwrites the four config files):</label>
+                        <label class="key-lbl">Restore from a bundle (overwrites the included config files):</label>
                         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
                             <input type="file" id="bk-file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip" style="flex:1;min-width:240px;padding:8px;background:#1a1a1a;color:#d4d4d4;border:1px solid #404040;border-radius:6px;font-size:13px;">
                             <button class="btn secondary" id="bk-import-btn" onclick="backupImport()"><svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M13,13V18H10V13H7L12,8L17,13H13Z"/></svg>Upload &amp; restore</button>
                         </div>
-                        <div class="note">Restore overwrites the config files (and the SSH key, if the bundle contains one) immediately &mdash; run Step&nbsp;7 (Run LLDPq) afterwards to apply.</div>
+                        <div class="note">Bundles can contain notification webhooks and, optionally, the collector private key; always store them securely. Restore overwrites the config files (and the SSH key, if present) immediately &mdash; run Step&nbsp;8 (Run LLDPq) afterwards to apply.</div>
                         <div class="status info" id="bk-import-msg"></div>
                     </div>
                 </div>
 
                 <!-- Step 10: Maintenance -->
-                <div class="su-panel" data-step="8">
-                    <h2>9. Maintenance <span class="p-file">disk &amp; cleanup</span></h2>
+                <div class="su-panel" data-step-key="maintenance">
+                    <h2>10. Maintenance <span class="p-file">disk &amp; cleanup</span></h2>
                     <p class="p-desc">Disk usage and safe cleanup. Update backups (<code>~/lldpq-backup-*</code>) are created by the online/offline update and can pile up over time.</p>
                     <div class="sched-card">
                         <div class="key-row"><span class="k">Disk</span><span id="mt-disk" class="mono">&mdash;</span></div>
@@ -418,11 +482,98 @@
                         <div class="status info" id="mt-status"></div>
                     </div>
                 </div>
+
+                <!-- Non-numbered Danger Zone: deliberately outside the 11-step wizard. -->
+                <div class="su-panel" data-step-key="uninstall">
+                    <h2>Uninstall LLDPq <span class="p-file" style="color:#ef7770;">danger zone</span></h2>
+                    <p class="p-desc">Remove LLDPq services, scheduled jobs, web files and managed system integration from this host. A dry-run preview is required before the destructive action can be enabled.</p>
+
+                    <div id="uninstall-env-note" class="note">Verifying that this is a supported native installation&hellip;</div>
+                    <div class="p-toolbar" id="uninstall-env-retry-row" style="display:none;">
+                        <button class="btn secondary" type="button" onclick="loadUninstallEnvironment(true)">Retry safety check</button>
+                    </div>
+
+                    <div id="uninstall-docker" style="display:none;">
+                        <div class="note danger-note"><strong>Browser uninstall is unavailable for Docker deployments.</strong> A container cannot safely remove its host deployment. Stop/remove LLDPq from the host that runs Docker, using the compose project or container management method used to install it.</div>
+                    </div>
+
+                    <div id="uninstall-native" style="display:none;">
+                        <div class="note danger-note"><strong>This cannot be undone from the browser.</strong> LLDPq&rsquo;s web route is removed during uninstall, so this page is expected to disconnect before it can report a final result. Review the dry run and verify completion over SSH.</div>
+
+                        <div class="sched-card danger-card" id="uninstall-options-card">
+                            <label class="key-lbl">LLDPq data</label>
+                            <label class="danger-choice">
+                                <input type="radio" name="uninstall-data" id="uninstall-keep-data" value="keep" checked>
+                                <span><strong>Keep selected Setup configuration and file-based history (recommended)</strong><small>Preserves five Setup files plus selected results/history. It does not preserve <code>/etc/lldpq.conf</code>, <code>assets.ini</code> or telemetry volumes. The preview lists the exact retained paths.</small></span>
+                            </label>
+                            <label class="danger-choice">
+                                <input type="radio" name="uninstall-data" id="uninstall-remove-data" value="remove">
+                                <span><strong>Remove LLDPq-managed configuration and monitoring data</strong><small>Permanently deletes the LLDPq data and configuration listed by the preview. A separate data-loss acknowledgement will be required.</small></span>
+                            </label>
+
+                            <details class="danger-advanced">
+                                <summary>Advanced removal options</summary>
+                                <label class="key-lbl" style="margin-top:12px;">Installation source</label>
+                                <label class="danger-choice">
+                                    <input type="checkbox" id="uninstall-remove-source">
+                                    <span><strong>Remove the <code>LLDPQ_SRC</code> source checkout</strong><small>Deletes the complete source directory, including any Git history, uncommitted changes and untracked files. The exact verified path and source state are shown by the dry-run preview. This is never selected automatically.</small></span>
+                                </label>
+                                <label class="key-lbl" style="margin-top:16px;">Host-wide packages</label>
+                                <div class="note danger-note">These packages may be shared by unrelated workloads. They are never selected automatically.</div>
+                                <label class="danger-choice">
+                                    <input type="checkbox" id="uninstall-remove-nginx">
+                                    <span><strong>Remove nginx and fcgiwrap packages</strong><small>May stop other websites and CGI applications on this host.</small></span>
+                                </label>
+                                <label class="danger-choice">
+                                    <input type="checkbox" id="uninstall-remove-dhcp">
+                                    <span><strong>Remove ISC DHCP server and its configuration</strong><small>May interrupt DHCP service for clients unrelated to LLDPq.</small></span>
+                                </label>
+                                <label class="danger-choice">
+                                    <input type="checkbox" id="uninstall-remove-docker">
+                                    <span><strong>Remove Docker engine, <code>/var/lib/docker</code> and <code>/var/lib/containerd</code></strong><small>Deletes all host containers, images and volumes, including workloads unrelated to LLDPq.</small></span>
+                                </label>
+                            </details>
+
+                            <div class="p-toolbar" style="margin-top:16px;">
+                                <button class="btn secondary" type="button" id="uninstall-preview-btn" onclick="previewUninstall()"><svg viewBox="0 0 24 24"><path d="M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5M12,17C9.24,17 7,14.76 7,12C7,9.24 9.24,7 12,7C14.76,7 17,9.24 17,12C17,14.76 14.76,17 12,17M12,9C10.34,9 9,10.34 9,12C9,13.66 10.34,15 12,15C13.66,15 15,13.66 15,12C15,10.34 13.66,9 12,9Z"/></svg>Preview uninstall (dry run)</button>
+                            </div>
+                            <div class="status info" id="uninstall-status"></div>
+                        </div>
+
+                        <div id="uninstall-preview-wrap" style="display:none;">
+                            <label class="key-lbl">Dry-run preview &mdash; no changes were made</label>
+                            <pre id="uninstall-output" class="run-output" style="height:300px;">Waiting for preview&hellip;</pre>
+
+                            <div class="sched-card danger-card" id="uninstall-confirm-card" style="margin-top:14px;">
+                                <label class="key-lbl">Required acknowledgements</label>
+                                <label class="danger-choice">
+                                    <input type="checkbox" id="uninstall-ack-disconnect">
+                                    <span>I understand that LLDPq&rsquo;s web interface will disconnect and the browser may not receive the final result.</span>
+                                </label>
+                                <label class="danger-choice" id="uninstall-ack-data-loss-row" style="display:none;">
+                                    <input type="checkbox" id="uninstall-ack-data-loss">
+                                    <span>I understand that the selected LLDPq configuration, monitoring data and/or source checkout will be permanently deleted.</span>
+                                </label>
+                                <label class="danger-choice" id="uninstall-ack-shared-row" style="display:none;">
+                                    <input type="checkbox" id="uninstall-ack-shared-services">
+                                    <span>I understand that the selected host-wide packages/data may be used by unrelated services and workloads.</span>
+                                </label>
+
+                                <label class="key-lbl" for="uninstall-confirm-text">Type <code>UNINSTALL</code> exactly to enable the final action:</label>
+                                <div class="key-input">
+                                    <input type="text" id="uninstall-confirm-text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="UNINSTALL">
+                                    <button class="btn danger" type="button" id="uninstall-start-btn" onclick="startUninstall()" disabled><svg viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></svg>Permanently uninstall LLDPq</button>
+                                </div>
+                                <div class="status info" id="uninstall-launch-status"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <div class="su-nav">
                 <button class="btn secondary" id="nav-back" onclick="goStep(current-1)"><svg viewBox="0 0 24 24"><path d="M15.41,16.58L10.83,12L15.41,7.41L14,6L8,12L14,18L15.41,16.58Z"/></svg>Back</button>
-                <span class="ind" id="nav-ind">Step 1 of 4</span>
+                <span class="ind" id="nav-ind">Step 1 of 11</span>
                 <div class="spacer"></div>
                 <button class="btn primary" id="nav-next" onclick="goStep(current+1)">Next<svg viewBox="0 0 24 24"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"/></svg></button>
             </div>
@@ -435,6 +586,7 @@ const STEPS = [
     { key:'keys',     label:'SSH Keys',         desc:'Authorize collector key + sudo' },
     { key:'topology', label:'Topology',         desc:'topology.dot — expected cabling' },
     { key:'config',   label:'Topology Config',  desc:'topology_config.yaml — layout rules' },
+    { key:'aliases',  label:'Display Aliases',  desc:'Optional — P2P / field display names' },
     { key:'ansible',  label:'Integrate Ansible', desc:'Optional — VLAN/VRF/Fabric reports' },
     { key:'notifications', label:'Notifications', desc:'Slack alerts — webhook, types, thresholds' },
     { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
@@ -443,9 +595,9 @@ const STEPS = [
     { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
 ];
 const FILES = {
-    devices:  { url:'/edit-devices',  file:'devices.yaml',          ta:'ta-devices',  st:'st-devices',  loaded:false },
-    topology: { url:'/edit-topology', file:'topology.dot',          ta:'ta-topology', st:'st-topology', loaded:false },
-    config:   { url:'/edit-config',   file:'topology_config.yaml',  ta:'ta-config',   st:'st-config',   loaded:false },
+    devices:  { url:'/edit-devices',  file:'devices.yaml',          ta:'ta-devices',  st:'st-devices',  loaded:false, dirty:false, editVersion:0, loadSeq:0, opSeq:0, revision:null },
+    topology: { url:'/edit-topology', file:'topology.dot',          ta:'ta-topology', st:'st-topology', loaded:false, dirty:false, editVersion:0, loadSeq:0, opSeq:0, revision:null },
+    config:   { url:'/edit-config',   file:'topology_config.yaml',  ta:'ta-config',   st:'st-config',   loaded:false, dirty:false, editVersion:0, loadSeq:0, opSeq:0, revision:null },
 };
 let current = 0;
 const done = {};   // stepKey -> true
@@ -458,53 +610,153 @@ let genArmed = false;        // two-click guard before replacing an existing key
 let runActive = false;       // an lldpq run is in progress (drives polling)
 let runLogShown = false;     // run log fetched once on entering the step
 let runPollTimer = null;
+let runJobId = null;
+let runPollEpoch = 0;
 let schedLoaded = false;     // cron schedules fetched once on entering the run step
 let parallelLoaded = false;  // parallelism fetched once on entering the run step
 let ansibleLoaded = false;   // ansible status fetched once on entering its step
+let ansibleDirty = false;
+let ansibleEditVersion = 0;
+let ansibleLoadSeq = 0;
+let ansibleOpSeq = 0;
+let ansibleBusy = false;
 let updateActive = false;    // an update is in progress (drives polling)
 let updateLogShown = false;  // update log fetched once on entering the step
 let updatePollTimer = null;
+let updateJobId = null;
+let updatePollEpoch = 0;
+let updatePollController = null;
+let updateReloadScheduled = false;
+const UPDATE_LOG_TIMEOUT_MS = 10000;
+let uninstallEnvironment = 'unknown'; // unknown | checking | native | docker | error
+let uninstallEnvironmentSeq = 0;
+let uninstallPreviewToken = null;
+let uninstallPreviewFingerprint = null;
+let uninstallPreviewOptionFingerprint = null;
+let uninstallPreviewSeq = 0;
+let uninstallPreviewController = null;
+let uninstallStarting = false;
+let uninstallCommitted = false; // accepted or ambiguous start: never offer a second launch
+let uninstallJobId = null;
+let uninstallJobCreatedAt = 0;
+let uninstallStatusMissingCount = 0;
+let uninstallStatusTimer = null;
+let uninstallStatusEpoch = 0;
+const UNINSTALL_STATUS_TIMEOUT_MS = 8000;
+const UNINSTALL_STATUS_MISSING_GRACE_MS = 60000;
+const UNINSTALL_STATUS_MISSING_CONFIRMATIONS = 3;
+const UNINSTALL_JOB_STORAGE_KEY = 'lldpq.setup.uninstall-job.v1';
+let aliasesLoaded = false;
+let aliasesDirty = false;
+let aliasesRevision = null;
+let aliasesEditVersion = 0;
+let aliasesLoadSeq = 0;
+let aliasesOpSeq = 0;
+let suppressAliasDirty = false;
+let notifDirty = false;
+let notificationsReady = false;
+let notifEditVersion = 0;
+let notifLoadSeq = 0;
+let notifOpSeq = 0;
+let notifRevision = null;
+let suppressNotifDirty = false;
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Admin-only: hidden from operators in the menu, and refused here too.
-    if (window.LLDPqAuth) {
-        const ok = await LLDPqAuth.check();
-        if (!ok) return;
-        if (!LLDPqAuth.isAdmin()) {
-            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Setup is admin only.</div>';
-            return;
-        }
+    if (typeof LLDPqAuth === 'undefined') {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Authentication is unavailable.</div>';
+        return;
     }
+    const ok = await LLDPqAuth.check();
+    if (!ok) return;
+    if (!LLDPqAuth.isAdmin()) {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:sans-serif;">Access denied. Setup is admin only.</div>';
+        return;
+    }
+    initDirtyGuards();
     renderSteps();
     // Allow deep-linking to a step, e.g. setup.html?step=update (used by the index "Update Available" popup).
     var startIdx = 0;
+    var startUninstall = restoreUninstallJobState();
     try {
         var sp = new URLSearchParams(location.search).get('step') || (location.hash || '').replace('#', '');
-        if (sp) { var si = STEPS.findIndex(function (s) { return s.key === sp; }); if (si >= 0) startIdx = si; }
+        if (sp === 'uninstall') startUninstall = true;
+        else if (sp) { var si = STEPS.findIndex(function (s) { return s.key === sp; }); if (si >= 0) startIdx = si; }
     } catch (e) {}
-    goStep(startIdx);
+    if (startUninstall) {
+        showUninstall();
+        if (uninstallCommitted && uninstallJobId) resumeUninstallJobStatus();
+    } else goStep(startIdx);
+    // A successful self-update reloads with a one-use cache-busting query so
+    // the browser cannot keep executing the pre-update inline JavaScript.
+    try {
+        const refreshed = new URL(location.href);
+        if (refreshed.searchParams.has('_updated')) {
+            refreshed.searchParams.delete('_updated');
+            history.replaceState(null, '', refreshed.pathname + refreshed.search);
+        }
+    } catch (e) { /* URL cleanup is non-critical */ }
 });
 
 function renderSteps() {
     const c = document.getElementById('steps');
-    c.innerHTML = STEPS.map((s, i) =>
-        `<div class="su-step" id="step-${i}" onclick="goStep(${i})">
-            <div class="num" id="num-${i}">${i + 1}</div>
-            <div><div class="lbl">${s.label}</div><div class="desc">${s.desc}</div></div>
-        </div>`).join('');
+    c.replaceChildren();
+    STEPS.forEach(function (s, i) {
+        const step = document.createElement('div');
+        step.className = 'su-step';
+        step.id = 'step-' + i;
+        step.setAttribute('role', 'button');
+        step.setAttribute('tabindex', '0');
+        step.addEventListener('click', function () { goStep(i); });
+        step.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goStep(i); }
+        });
+        const num = document.createElement('div');
+        num.className = 'num'; num.id = 'num-' + i; num.textContent = String(i + 1);
+        const copy = document.createElement('div');
+        const label = document.createElement('div'); label.className = 'lbl'; label.textContent = s.label;
+        const desc = document.createElement('div'); desc.className = 'desc'; desc.textContent = s.desc;
+        copy.append(label, desc); step.append(num, copy); c.appendChild(step);
+    });
+
+    const separator = document.createElement('div');
+    separator.className = 'su-danger-separator';
+    separator.textContent = 'Danger Zone';
+    const danger = document.createElement('div');
+    danger.className = 'su-step danger';
+    danger.id = 'step-uninstall';
+    danger.setAttribute('role', 'button');
+    danger.setAttribute('tabindex', '0');
+    danger.addEventListener('click', showUninstall);
+    danger.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showUninstall(); }
+    });
+    const mark = document.createElement('div');
+    mark.className = 'num'; mark.textContent = '!';
+    const copy = document.createElement('div');
+    const label = document.createElement('div'); label.className = 'lbl'; label.textContent = 'Uninstall LLDPq';
+    const desc = document.createElement('div'); desc.className = 'desc'; desc.textContent = 'Remove LLDPq from this host';
+    copy.append(label, desc); danger.append(mark, copy); c.append(separator, danger);
 }
 
 function goStep(i) {
     if (i < 0 || i >= STEPS.length) return;
+    if (uninstallCommitted || uninstallStarting) return;
+    if (current === STEPS.length) invalidateUninstallPreview('', true);
     current = i;
-    document.querySelectorAll('.su-step').forEach((el, idx) => el.classList.toggle('active', idx === i));
-    document.querySelectorAll('.su-panel').forEach(el => el.classList.toggle('active', +el.dataset.step === i));
+    const key = STEPS[i].key;
+    document.querySelectorAll('.su-step').forEach((el, idx) => {
+        const active = idx === i;
+        el.classList.toggle('active', active);
+        if (active) el.setAttribute('aria-current', 'step'); else el.removeAttribute('aria-current');
+    });
+    document.querySelectorAll('.su-panel').forEach(el => el.classList.toggle('active', el.dataset.stepKey === key));
     document.getElementById('nav-ind').textContent = `Step ${i + 1} of ${STEPS.length}`;
     document.getElementById('nav-back').disabled = (i === 0);
     document.getElementById('nav-next').style.visibility = (i === STEPS.length - 1) ? 'hidden' : 'visible';
     // Lazy-load file editors the first time their step is shown.
-    const key = STEPS[i].key;
     if (FILES[key] && !FILES[key].loaded) loadFile(key, false);
+    if (key === 'aliases' && !aliasesLoaded) loadAliases(false);
     if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
     if (key === 'ansible' && !ansibleLoaded) { ansibleLoaded = true; loadAnsible(); }
     if (key === 'run' && !runLogShown) { runLogShown = true; showRunLog(); }
@@ -512,10 +764,88 @@ function goStep(i) {
     if (key === 'run' && !parallelLoaded) { parallelLoaded = true; loadParallel(); }
     if (key === 'update') {
         checkDockerForUpdate();
-        if (!updateLogShown) { updateLogShown = true; showUpdateLog(); }
+        if (!updateLogShown || (!updateActive && !updatePollTimer && !updatePollController)) {
+            updateLogShown = true;
+            showUpdateLog();
+        }
     }
     if (key === 'notifications' && !notifLoaded) { notifLoaded = true; loadNotifications(); }
     if (key === 'maintenance' && !maintLoaded) { maintLoaded = true; loadMaintenance(); }
+    try {
+        const u = new URL(location.href);
+        u.searchParams.set('step', key);
+        u.hash = '';
+        history.replaceState(null, '', u.pathname + u.search);
+    } catch (e) { /* deep-link state is non-critical */ }
+}
+
+function showUninstall() {
+    current = STEPS.length; // sentinel: keeps this panel outside numbered wizard steps
+    document.querySelectorAll('.su-step').forEach(function (el) {
+        const active = el.id === 'step-uninstall';
+        el.classList.toggle('active', active);
+        if (active) el.setAttribute('aria-current', 'page'); else el.removeAttribute('aria-current');
+    });
+    document.querySelectorAll('.su-panel').forEach(function (el) {
+        el.classList.toggle('active', el.dataset.stepKey === 'uninstall');
+    });
+    document.getElementById('nav-ind').textContent = 'Danger Zone';
+    document.getElementById('nav-back').disabled = uninstallCommitted;
+    document.getElementById('nav-next').style.visibility = 'hidden';
+    try {
+        const u = new URL(location.href);
+        u.searchParams.set('step', 'uninstall');
+        u.hash = '';
+        history.replaceState(null, '', u.pathname + u.search);
+    } catch (e) { /* deep-link state is non-critical */ }
+    updateUninstallAcknowledgementVisibility();
+    refreshUninstallAvailability();
+    if (uninstallEnvironment === 'unknown' || uninstallEnvironment === 'error') loadUninstallEnvironment();
+    else renderUninstallEnvironment();
+}
+
+function initDirtyGuards() {
+    Object.keys(FILES).forEach(function (key) {
+        const cfg = FILES[key];
+        const ta = document.getElementById(cfg.ta);
+        if (!ta) return;
+        ta.addEventListener('input', function () { cfg.dirty = true; cfg.editVersion++; });
+    });
+    const nfPanel = document.querySelector('[data-step-key="notifications"]');
+    if (nfPanel) nfPanel.querySelectorAll('input,select,textarea').forEach(function (el) {
+        const dirty = function () { if (!suppressNotifDirty) { notifDirty = true; notifEditVersion++; } };
+        el.addEventListener('input', dirty); el.addEventListener('change', dirty);
+    });
+    const ansInput = document.getElementById('ans-input');
+    if (ansInput) ansInput.addEventListener('input', function () { ansibleDirty = true; ansibleEditVersion++; });
+    ['uninstall-keep-data', 'uninstall-remove-data', 'uninstall-remove-source', 'uninstall-remove-nginx',
+     'uninstall-remove-dhcp', 'uninstall-remove-docker'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', function () {
+            updateUninstallAcknowledgementVisibility();
+            invalidateUninstallPreview('Options changed. Run a new dry-run preview before uninstalling.');
+            refreshUninstallAvailability();
+        });
+    });
+    ['uninstall-ack-disconnect', 'uninstall-ack-data-loss',
+     'uninstall-ack-shared-services'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', refreshUninstallConfirmationGate);
+    });
+    const uninstallText = document.getElementById('uninstall-confirm-text');
+    if (uninstallText) uninstallText.addEventListener('input', refreshUninstallConfirmationGate);
+    window.addEventListener('beforeunload', function (e) {
+        if (!hasUnsavedSetupChanges()) return;
+        e.preventDefault(); e.returnValue = '';
+    });
+    document.querySelectorAll('.status').forEach(function (el) {
+        if (!el.hasAttribute('role')) el.setAttribute('role', 'status');
+        if (!el.hasAttribute('aria-live')) el.setAttribute('aria-live', 'polite');
+    });
+}
+
+function hasUnsavedSetupChanges() {
+    return aliasesDirty || notifDirty || ansibleDirty || Object.keys(FILES).some(function (key) { return FILES[key].dirty; });
 }
 
 function markDone(stepKey, isDone) {
@@ -536,22 +866,40 @@ async function loadFile(key, force) {
     if (!cfg) return;
     const ta = document.getElementById(cfg.ta);
     if (cfg.loaded && !force) return;
+    if (force && cfg.dirty && !window.confirm('Reload ' + cfg.file + ' and discard your unsaved editor changes?')) return;
+    const seq = ++cfg.loadSeq;
+    const op = ++cfg.opSeq;
+    const startedVersion = cfg.editVersion;
     setStatus(cfg.st, 'Loading…', 'info');
     try {
         const r = await fetch(cfg.url, { cache: 'no-store' });
-        const data = await r.json();
+        const data = await r.json().catch(() => ({}));
+        if (seq !== cfg.loadSeq || op !== cfg.opSeq) return;
+        if (cfg.editVersion !== startedVersion) {
+            if (data.success && typeof data.revision === 'string') {
+                cfg.loaded = true;
+                cfg.revision = data.revision;
+            }
+            setStatus(cfg.st, 'Server content arrived, but the editor changed while loading; your edits were kept. Reload when ready to review the server version.', 'info');
+            return;
+        }
         if (data.success) {
             ta.value = data.content || '';
             cfg.loaded = true;
+            cfg.dirty = false;
+            cfg.revision = data.revision || null;
             setStatus(cfg.st, ta.value.trim() ? ('Loaded ' + cfg.file) : (cfg.file + ' is empty — fill it in below.'), 'info');
             markDone(key, !!ta.value.trim());
         } else {
             ta.value = '';
             cfg.loaded = true;   // file may not exist yet; let the admin create it
+            cfg.dirty = false;
+            cfg.revision = data.revision || null;
             setStatus(cfg.st, (data.error || 'Not found') + ' — you can create it here and Save.', 'info');
             markDone(key, false);
         }
     } catch (e) {
+        if (op !== cfg.opSeq) return;
         setStatus(cfg.st, 'Load failed: ' + e.message, 'err');
     }
 }
@@ -559,22 +907,41 @@ async function loadFile(key, force) {
 async function saveFile(key) {
     const cfg = FILES[key];
     if (!cfg) return;
+    if (!cfg.loaded || typeof cfg.revision !== 'string') { setStatus(cfg.st, 'Wait for the current server revision to load before saving.', 'err'); return; }
     const ta = document.getElementById(cfg.ta);
+    const content = ta.value;
+    const startedVersion = cfg.editVersion;
+    const op = ++cfg.opSeq;
     setStatus(cfg.st, 'Saving…', 'info');
     try {
+        const payload = { content: content };
+        payload.expected_revision = cfg.revision;
         const r = await fetch(cfg.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: ta.value })
+            body: JSON.stringify(payload)
         });
         const data = await r.json().catch(() => ({}));
+        if (op !== cfg.opSeq) return;
         if (data.success) {
-            setStatus(cfg.st, (data.message || 'Saved ' + cfg.file) + ' \u2713', 'ok');
-            markDone(key, !!ta.value.trim());
+            cfg.loaded = true;
+            cfg.revision = data.revision || cfg.revision;
+            if (cfg.editVersion === startedVersion) {
+                if (typeof data.content === 'string') ta.value = data.content;
+                cfg.dirty = false;
+                setStatus(cfg.st, (data.message || 'Saved ' + cfg.file) + ' \u2713', 'ok');
+            } else {
+                setStatus(cfg.st, 'Saved the submitted version, but newer editor changes remain unsaved.', 'info');
+            }
+            markDone(key, !!content.trim());
         } else {
-            setStatus(cfg.st, data.error || 'Save failed', 'err');
+            const msg = data.conflict
+                ? ((data.error || (cfg.file + ' changed on disk.')) + ' Your editor was kept; reload to review before saving again.')
+                : (data.error || 'Save failed');
+            setStatus(cfg.st, msg, 'err');
         }
     } catch (e) {
+        if (op !== cfg.opSeq) return;
         setStatus(cfg.st, 'Save failed: ' + e.message, 'err');
     }
 }
@@ -599,11 +966,277 @@ function uploadFile(key, input) {
     reader.onload = e => {
         document.getElementById(cfg.ta).value = e.target.result || '';
         cfg.loaded = true;
+        cfg.dirty = true;
+        cfg.editVersion++;
         setStatus(cfg.st, 'Loaded "' + f.name + '" into the editor \u2014 review and click Save to apply.', 'info');
     };
     reader.onerror = () => setStatus(cfg.st, 'Could not read the selected file.', 'err');
     reader.readAsText(f);
     input.value = '';   // allow re-selecting the same file
+}
+
+/* ---- Step 5: Display aliases (P2P / field names) ---- */
+function aliasSectionInfo(section) {
+    return section === 'devices'
+        ? { container:'alias-device-rows', real:'tan-spine-01', label:'SPINE-01', title:'device' }
+        : { container:'alias-interface-rows', real:'enP22p3s0f0np0', label:'M1', title:'interface' };
+}
+
+function markAliasesDirty() {
+    if (suppressAliasDirty) return;
+    aliasesDirty = true;
+    aliasesEditVersion++;
+}
+
+function createAliasRow(section, real, label) {
+    const info = aliasSectionInfo(section);
+    const row = document.createElement('div');
+    row.className = 'alias-row';
+    row.dataset.aliasSection = section;
+
+    const realInput = document.createElement('input');
+    realInput.type = 'text'; realInput.className = 'sched-sel alias-real';
+    realInput.placeholder = info.real; realInput.value = real || '';
+    realInput.autocomplete = 'off'; realInput.spellcheck = false;
+    realInput.setAttribute('aria-label', 'Canonical ' + info.title + ' name');
+
+    const arrow = document.createElement('span');
+    arrow.className = 'alias-arrow'; arrow.textContent = '→'; arrow.setAttribute('aria-hidden', 'true');
+
+    const labelInput = document.createElement('input');
+    labelInput.type = 'text'; labelInput.className = 'sched-sel alias-label';
+    labelInput.placeholder = info.label; labelInput.value = label || '';
+    labelInput.autocomplete = 'off'; labelInput.spellcheck = false;
+    labelInput.setAttribute('aria-label', 'Display label for ' + info.title);
+
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.className = 'btn secondary alias-remove';
+    remove.title = 'Remove'; remove.setAttribute('aria-label', 'Remove alias row'); remove.textContent = '×';
+    remove.addEventListener('click', function () { row.remove(); markAliasesDirty(); });
+    realInput.addEventListener('input', markAliasesDirty);
+    labelInput.addEventListener('input', markAliasesDirty);
+    row.append(realInput, arrow, labelInput, remove);
+    return row;
+}
+
+function addAliasRow(section, real, label) {
+    const info = aliasSectionInfo(section);
+    const row = createAliasRow(section, real || '', label || '');
+    document.getElementById(info.container).appendChild(row);
+    markAliasesDirty();
+    if (!real && !label) row.querySelector('.alias-real').focus();
+}
+
+function fillAliasRows(section, map) {
+    const info = aliasSectionInfo(section);
+    const box = document.getElementById(info.container);
+    box.replaceChildren();
+    const entries = Object.entries(map || {}).sort(function (a, b) { return a[0].localeCompare(b[0]); });
+    if (!entries.length) box.appendChild(createAliasRow(section, '', ''));
+    else entries.forEach(function (entry) { box.appendChild(createAliasRow(section, entry[0], entry[1])); });
+}
+
+function collectAliasRows(section) {
+    const info = aliasSectionInfo(section);
+    const map = {};
+    const seen = new Map();
+    const labelSeen = new Map();
+    const warnings = [];
+    const rows = document.querySelectorAll('#' + info.container + ' .alias-row');
+    for (const row of rows) {
+        const real = row.querySelector('.alias-real').value.trim();
+        const label = row.querySelector('.alias-label').value.trim();
+        if (!real && !label) continue;
+        if (!real || !label) throw new Error('Complete or remove every ' + info.title + ' alias row.');
+        const folded = real.toLowerCase();
+        if (seen.has(folded)) throw new Error('Duplicate ' + info.title + ' canonical name: "' + real + '".');
+        seen.set(folded, real);
+        const labelFolded = label.toLowerCase();
+        if (labelSeen.has(labelFolded) && labelSeen.get(labelFolded) !== real) warnings.push(label);
+        else labelSeen.set(labelFolded, real);
+        map[real] = label;
+    }
+    return { map:map, warnings:warnings };
+}
+
+function collectAliases() {
+    const devices = collectAliasRows('devices');
+    const interfaces = collectAliasRows('interfaces');
+    return {
+        aliases: { devices:devices.map, interfaces:interfaces.map },
+        warnings: devices.warnings.concat(interfaces.warnings)
+    };
+}
+
+async function loadAliases(force) {
+    if (aliasesLoaded && !force) return;
+    if (force && aliasesDirty && !window.confirm('Reload display-aliases.json and discard your unsaved alias changes?')) return;
+    const seq = ++aliasesLoadSeq;
+    const op = ++aliasesOpSeq;
+    const startedVersion = aliasesEditVersion;
+    setStatus('aliases-status', 'Loading…', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ action:'get-aliases' })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (seq !== aliasesLoadSeq || op !== aliasesOpSeq) return;
+        if (aliasesEditVersion !== startedVersion) {
+            if (d.success && typeof d.revision === 'string') {
+                aliasesRevision = d.revision;
+                aliasesLoaded = true;
+            }
+            setStatus('aliases-status', 'Server aliases arrived, but the editor changed while loading; your edits were kept. Reload when ready.', 'info');
+            return;
+        }
+        if (!d.success) { setStatus('aliases-status', d.error || 'Failed to load display-aliases.json', 'err'); return; }
+        const aliases = d.aliases || {};
+        suppressAliasDirty = true;
+        fillAliasRows('devices', aliases.devices || {});
+        fillAliasRows('interfaces', aliases.interfaces || {});
+        suppressAliasDirty = false;
+        aliasesRevision = d.revision || null;
+        aliasesLoaded = true; aliasesDirty = false;
+        setStatus('aliases-status', 'Loaded display-aliases.json', 'info');
+        markDone('aliases', Object.keys(aliases.devices || {}).length + Object.keys(aliases.interfaces || {}).length > 0);
+    } catch (e) {
+        if (op !== aliasesOpSeq) return;
+        suppressAliasDirty = false;
+        setStatus('aliases-status', 'Load failed: ' + e.message, 'err');
+    }
+}
+
+async function saveAliases() {
+    if (!aliasesLoaded || typeof aliasesRevision !== 'string') { setStatus('aliases-status', 'Load the current server alias revision before saving.', 'err'); return; }
+    let collected;
+    try { collected = collectAliases(); }
+    catch (e) { setStatus('aliases-status', e.message, 'err'); return; }
+    const startedVersion = aliasesEditVersion;
+    const op = ++aliasesOpSeq;
+    const payload = {
+        action:'set-aliases',
+        devices:collected.aliases.devices,
+        interfaces:collected.aliases.interfaces
+    };
+    payload.revision = aliasesRevision;
+    const btn = document.getElementById('aliases-save');
+    if (btn) btn.disabled = true;
+    setStatus('aliases-status', 'Saving…', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+        const d = await r.json().catch(() => ({}));
+        if (op !== aliasesOpSeq) return;
+        if (!d.success) {
+            const msg = d.conflict
+                ? ((d.error || 'Aliases changed on disk.') + ' Your editor was kept; reload to review before saving again.')
+                : (d.error || 'Save failed');
+            setStatus('aliases-status', msg, 'err');
+            return;
+        }
+        const normalized = d.aliases || collected.aliases;
+        aliasesRevision = d.revision || aliasesRevision;
+        aliasesLoaded = true;
+        if (aliasesEditVersion === startedVersion) {
+            suppressAliasDirty = true;
+            fillAliasRows('devices', normalized.devices || {});
+            fillAliasRows('interfaces', normalized.interfaces || {});
+            suppressAliasDirty = false;
+            aliasesDirty = false;
+            const duplicateNote = collected.warnings.length ? ' (note: some display labels are shared)' : '';
+            setStatus('aliases-status', (d.message || 'Saved display-aliases.json') + ' \u2713' + duplicateNote, 'ok');
+        } else {
+            setStatus('aliases-status', 'Saved the submitted aliases, but newer editor changes remain unsaved.', 'info');
+        }
+        publishAliasUpdate(aliasesRevision);
+        markDone('aliases', Object.keys(normalized.devices || {}).length + Object.keys(normalized.interfaces || {}).length > 0);
+    } catch (e) {
+        if (op !== aliasesOpSeq) return;
+        setStatus('aliases-status', 'Save failed: ' + e.message, 'err');
+    } finally {
+        suppressAliasDirty = false;
+        if (btn) btn.disabled = false;
+    }
+}
+
+function importAliasBulk(section) {
+    const textId = section === 'devices' ? 'alias-device-bulk' : 'alias-interface-bulk';
+    const text = document.getElementById(textId).value;
+    const rows = [];
+    try {
+        text.split(/\r?\n/).forEach(function (line) {
+            line = line.trim();
+            if (!line || line.startsWith('#')) return;
+            let parts = line.split('\t');
+            if (parts.length < 2) parts = line.split(/\s*,\s*/, 2);
+            if (parts.length < 2) parts = line.split(/\s+/, 2);
+            if (parts.length < 2 || !parts[0].trim() || !parts[1].trim()) throw new Error('Each bulk line needs a display label and canonical name.');
+            rows.push([parts[1].trim(), parts[0].trim()]);
+        });
+    } catch (e) { setStatus('aliases-status', e.message, 'err'); return; }
+    if (!rows.length) { setStatus('aliases-status', 'Paste at least one alias pair first.', 'err'); return; }
+    const info = aliasSectionInfo(section);
+    const box = document.getElementById(info.container);
+    box.replaceChildren();
+    rows.forEach(function (row) { box.appendChild(createAliasRow(section, row[0], row[1])); });
+    document.getElementById(textId).value = '';
+    markAliasesDirty();
+    try { collectAliasRows(section); setStatus('aliases-status', 'Imported ' + rows.length + ' ' + info.title + ' row(s); review and Save.', 'info'); }
+    catch (e) { setStatus('aliases-status', e.message, 'err'); }
+}
+
+function uploadAliases(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function (e) {
+        try {
+            let parsed = JSON.parse(String(e.target.result || ''));
+            if (parsed && parsed.aliases) parsed = parsed.aliases;
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('JSON root must be an object.');
+            const unknown = Object.keys(parsed).filter(function (key) { return key !== 'devices' && key !== 'interfaces'; });
+            if (unknown.length) throw new Error('Unknown alias section: ' + unknown.join(', ') + '.');
+            if (parsed.devices != null && (typeof parsed.devices !== 'object' || Array.isArray(parsed.devices))) throw new Error('devices must be an object.');
+            if (parsed.interfaces != null && (typeof parsed.interfaces !== 'object' || Array.isArray(parsed.interfaces))) throw new Error('interfaces must be an object.');
+            ['devices','interfaces'].forEach(function (section) {
+                Object.entries(parsed[section] || {}).forEach(function (entry) {
+                    if (typeof entry[1] !== 'string') throw new Error(section + ' alias labels must be strings.');
+                });
+            });
+            suppressAliasDirty = true;
+            fillAliasRows('devices', parsed.devices || {});
+            fillAliasRows('interfaces', parsed.interfaces || {});
+            suppressAliasDirty = false;
+            markAliasesDirty();
+            collectAliases();
+            setStatus('aliases-status', 'Loaded "' + file.name + '" into the editor — review and click Save to apply.', 'info');
+        } catch (err) {
+            suppressAliasDirty = false;
+            setStatus('aliases-status', 'Could not import aliases: ' + err.message, 'err');
+        }
+    };
+    reader.onerror = function () { setStatus('aliases-status', 'Could not read the selected file.', 'err'); };
+    reader.readAsText(file); input.value = '';
+}
+
+function downloadAliases() {
+    let collected;
+    try { collected = collectAliases(); }
+    catch (e) { setStatus('aliases-status', e.message, 'err'); return; }
+    const blob = new Blob([JSON.stringify(collected.aliases, null, 2) + '\n'], { type:'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'display-aliases.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(url); a.remove(); }, 100);
+}
+
+function publishAliasUpdate(revision) {
+    const version = String(revision || 'updated') + ':' + Date.now();
+    try { localStorage.setItem('lldpq_aliases_revision', version); } catch (e) {}
+    try {
+        const channel = new BroadcastChannel('lldpq-aliases');
+        channel.postMessage({ type:'updated', revision:revision || null }); channel.close();
+    } catch (e) {}
+    window.dispatchEvent(new CustomEvent('lldpq-aliases-updated', { detail:{ revision:revision || null } }));
 }
 
 /* ---- Step 2: SSH key info / generate / import / verify ---- */
@@ -671,6 +1304,7 @@ function toggleImport() {
 async function importKey() {
     const key = document.getElementById('key-import-text').value.trim();
     if (!key || key.indexOf('PRIVATE KEY') < 0) { setStatus('key-import-msg', 'Paste a valid private key.', 'err'); return; }
+    if (keyExists && !window.confirm('Replace the existing collector key? Devices trusting the old key will need the new key distributed.')) return;
     setStatus('key-import-msg', 'Saving\u2026', 'info');
     try {
         const r = await fetch('/provision-api.sh?action=import-ssh-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ private_key: key }) });
@@ -687,6 +1321,7 @@ function uploadKey(input) {
     reader.onload = async e => {
         const key = (e.target.result || '').trim();
         if (!key || key.indexOf('PRIVATE KEY') < 0) { setStatus('key-progress', 'That file is not a valid OpenSSH private key.', 'err'); return; }
+        if (keyExists && !window.confirm('Replace the existing collector key? Devices trusting the old key will need the new key distributed.')) return;
         setStatus('key-progress', 'Installing uploaded key\u2026', 'info');
         try {
             const r = await fetch('/provision-api.sh?action=import-ssh-key', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ private_key: key }) });
@@ -731,25 +1366,29 @@ async function verifyKeys() {
             document.getElementById('key-pub').value = data.public_key;
             const st = document.getElementById('key-state'); st.textContent = 'present'; st.className = 'badge green'; keyExists = true;
         }
-        document.getElementById('key-results-head').innerHTML = '<tr><th>Device</th><th>IP</th><th>Key trusted</th></tr>';
-        const body = document.getElementById('key-results-body'); body.innerHTML = '';
-        (data.results || []).forEach(x => {
+        setResultHeader(['Device', 'IP', 'Key trusted', 'Sudo']);
+        const body = document.getElementById('key-results-body'); body.replaceChildren();
+        const results = data.results || [];
+        results.forEach(x => {
             const tr = document.createElement('tr');
-            if (!x.trusted) tr.style.background = 'rgba(244,67,54,.08)';
-            tr.innerHTML =
-                `<td style="color:#ddd;">${x.hostname || ''}</td>` +
-                `<td style="color:#999;font-family:monospace;">${x.ip || ''}</td>` +
-                (x.trusted
-                    ? '<td><span style="color:#76b900;">\u2714 trusted</span></td>'
-                    : `<td><span style="color:#f44336;">\u2716 ${x.msg || 'not trusted'}</span></td>`);
+            if (!x.trusted || !x.sudo_ok) tr.style.background = 'rgba(244,67,54,.08)';
+            appendResultTextCell(tr, x.hostname || '', '#ddd');
+            appendResultTextCell(tr, x.ip || '', '#999', true);
+            appendBooleanResultCell(tr, !!x.trusted, x.trusted ? 'trusted' : (x.msg || 'not trusted'));
+            appendBooleanResultCell(tr, !!x.sudo_ok, x.sudo_msg || (x.sudo_ok ? 'passwordless' : 'not passwordless'));
             body.appendChild(tr);
         });
         document.getElementById('key-results').style.display = 'table';
         const sum = document.getElementById('key-summary'); sum.style.display = 'block';
-        sum.innerHTML = `<strong>${data.trusted || 0}/${data.total || 0}</strong> devices already trust the collector key.`;
-        const allOk = (data.trusted || 0) === (data.total || 0) && (data.total || 0) > 0;
-        setStatus('key-progress', allOk ? 'All devices already trust the key \u2014 no password needed \u2713' : 'Some devices don\u2019t trust the key yet \u2014 use Distribute (with password) for those.', allOk ? 'ok' : 'info');
-        markDone('keys', (data.trusted || 0) > 0);
+        const total = data.total || 0;
+        const sudoOk = Number.isFinite(Number(data.sudo_ok)) ? Number(data.sudo_ok) : results.filter(x => x.sudo_ok).length;
+        setKeySummary(sum, [
+            { count:data.trusted || 0, total:total, text:' devices trust the collector key, ' },
+            { count:sudoOk, total:total, text:' have passwordless sudo.' }
+        ]);
+        const allOk = (data.trusted || 0) === total && sudoOk === total && total > 0;
+        setStatus('key-progress', allOk ? 'All devices trust the collector key and have passwordless sudo \u2713' : 'Some devices still need the key or passwordless sudo \u2014 use Distribute and check failed rows.', allOk ? 'ok' : 'info');
+        markDone('keys', allOk);
     } catch (e) {
         setStatus('key-progress', 'Verify failed: ' + e.message, 'err');
     } finally {
@@ -758,15 +1397,54 @@ async function verifyKeys() {
 }
 
 /* ---- Step 2: SSH key distribution (reuses /setup-api.sh) ---- */
-function keyIcon(s) {
-    if (s === 'ok' || s === 'already') return '<span style="color:#76b900;">\u2714</span>';
-    if (s === 'fail') return '<span style="color:#f44336;">\u2716</span>';
-    return '<span style="color:#999;">\u2014</span>';
-}
 function keyColor(s) {
     if (s === 'ok' || s === 'already') return '#76b900';
     if (s === 'fail') return '#f44336';
     return '#999';
+}
+
+function setResultHeader(labels) {
+    const head = document.getElementById('key-results-head');
+    const tr = document.createElement('tr');
+    labels.forEach(function (label) {
+        const th = document.createElement('th'); th.textContent = label; tr.appendChild(th);
+    });
+    head.replaceChildren(tr);
+}
+
+function appendResultTextCell(tr, text, color, mono) {
+    const td = document.createElement('td');
+    td.textContent = text == null ? '' : String(text);
+    td.style.color = color;
+    if (mono) td.style.fontFamily = 'monospace';
+    tr.appendChild(td);
+}
+
+function appendBooleanResultCell(tr, ok, message) {
+    const td = document.createElement('td');
+    const span = document.createElement('span');
+    span.style.color = ok ? '#76b900' : '#f44336';
+    span.textContent = (ok ? '\u2714 ' : '\u2716 ') + (message || (ok ? 'ok' : 'failed'));
+    td.title = message || ''; td.appendChild(span); tr.appendChild(td);
+}
+
+function appendKeyStatusCell(tr, status, message) {
+    const ok = status === 'ok' || status === 'already';
+    const failed = status === 'fail';
+    const td = document.createElement('td');
+    const span = document.createElement('span');
+    span.style.color = keyColor(status);
+    span.textContent = (ok ? '\u2714 ' : (failed ? '\u2716 ' : '\u2014 ')) + (message || status || 'unknown');
+    td.title = message || ''; td.appendChild(span); tr.appendChild(td);
+}
+
+function setKeySummary(container, parts) {
+    container.replaceChildren();
+    parts.forEach(function (part) {
+        const strong = document.createElement('strong');
+        strong.textContent = String(part.count) + '/' + String(part.total);
+        container.append(strong, document.createTextNode(part.text));
+    });
 }
 
 async function distributeKeys() {
@@ -790,28 +1468,30 @@ async function distributeKeys() {
             return;
         }
         document.getElementById('key-pw').value = '';
-        document.getElementById('key-results-head').innerHTML = '<tr><th>Device</th><th>IP</th><th>SSH Key</th><th>Sudo</th></tr>';
+        setResultHeader(['Device', 'IP', 'SSH Key', 'Sudo']);
         const body = document.getElementById('key-results-body');
-        body.innerHTML = '';
+        body.replaceChildren();
         (data.results || []).sort((a, b) => (a.hostname || '').localeCompare(b.hostname || '')).forEach(x => {
             const tr = document.createElement('tr');
             const failed = x.send_key === 'fail' || x.sudo_fix === 'fail';
             if (failed) tr.style.background = 'rgba(244,67,54,.08)';
-            tr.innerHTML =
-                `<td style="color:#ddd;">${x.hostname || ''}</td>` +
-                `<td style="color:#999;font-family:monospace;">${x.ip || ''}</td>` +
-                `<td title="${(x.send_key_msg || '').replace(/"/g, '&quot;')}">${keyIcon(x.send_key)} <span style="color:${keyColor(x.send_key)};">${x.send_key_msg || x.send_key}</span></td>` +
-                `<td title="${(x.sudo_fix_msg || '').replace(/"/g, '&quot;')}">${keyIcon(x.sudo_fix)} <span style="color:${keyColor(x.sudo_fix)};">${x.sudo_fix_msg || x.sudo_fix}</span></td>`;
+            appendResultTextCell(tr, x.hostname || '', '#ddd');
+            appendResultTextCell(tr, x.ip || '', '#999', true);
+            appendKeyStatusCell(tr, x.send_key, x.send_key_msg || x.send_key);
+            appendKeyStatusCell(tr, x.sudo_fix, x.sudo_fix_msg || x.sudo_fix);
             body.appendChild(tr);
         });
         document.getElementById('key-results').style.display = 'table';
         const sum = document.getElementById('key-summary');
         sum.style.display = 'block';
-        sum.innerHTML = `<strong>${data.send_key_ok || 0}/${data.total || 0}</strong> devices have the key, ` +
-                        `<strong>${data.sudo_fix_ok || 0}/${data.total || 0}</strong> have passwordless sudo.`;
-        const allOk = (data.send_key_ok || 0) === (data.total || 0) && (data.total || 0) > 0;
-        setStatus('key-progress', allOk ? 'All devices reachable with the collector key \u2713' : 'Done — check failed rows below.', allOk ? 'ok' : 'info');
-        markDone('keys', (data.send_key_ok || 0) > 0);
+        const total = data.total || 0;
+        setKeySummary(sum, [
+            { count:data.send_key_ok || 0, total:total, text:' devices have the key, ' },
+            { count:data.sudo_fix_ok || 0, total:total, text:' have passwordless sudo.' }
+        ]);
+        const allOk = (data.send_key_ok || 0) === total && (data.sudo_fix_ok || 0) === total && total > 0;
+        setStatus('key-progress', allOk ? 'All devices reachable with the collector key and passwordless sudo \u2713' : 'Done — check failed key or sudo rows below.', allOk ? 'ok' : 'info');
+        markDone('keys', allOk);
     } catch (e) {
         setStatus('key-progress', 'Distribution failed: ' + e.message, 'err');
     } finally {
@@ -819,9 +1499,12 @@ async function distributeKeys() {
     }
 }
 
-/* ---- Step 5: Run LLDPq (lldpq -) with live output ---- */
+/* ---- Step 8: Run LLDPq (lldpq -) with live output ---- */
 async function runLLDPq() {
     const btn = document.getElementById('run-btn');
+    const epoch = ++runPollEpoch;
+    runJobId = null;
+    if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
     btn.disabled = true;
     runActive = true;
     setStatus('run-status', 'Starting LLDPq\u2026', 'info');
@@ -829,20 +1512,33 @@ async function runLLDPq() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run' }) });
         const d = await r.json().catch(() => ({}));
+        if (epoch !== runPollEpoch) return;
         if (!d.success) { setStatus('run-status', d.error || 'Failed to start', 'err'); btn.disabled = false; runActive = false; return; }
+        runJobId = d.job_id || null;
         setStatus('run-status', 'Running\u2026 (this can take a while on large fabrics)', 'info');
-        pollRunLog();
+        pollRunLog(epoch);
     } catch (e) {
+        if (epoch !== runPollEpoch) return;
         setStatus('run-status', 'Failed to start: ' + e.message, 'err');
         btn.disabled = false; runActive = false;
     }
 }
 
-async function pollRunLog() {
+async function pollRunLog(epoch = runPollEpoch) {
+    if (epoch !== runPollEpoch) return;
     if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
     try {
-        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run-log' }) });
+        const payload = { action: 'run-log' };
+        if (runJobId) payload.job_id = runJobId;
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const d = await r.json().catch(() => ({}));
+        if (epoch !== runPollEpoch) return;
+        if (runJobId && d.job_id !== runJobId) {
+            runActive = false;
+            document.getElementById('run-btn').disabled = !!d.running;
+            setStatus('run-status', 'This run\u2019s status was replaced by another job; use Show Log to inspect the current job.', 'info');
+            return;
+        }
         const out = document.getElementById('run-output');
         if (d.success) {
             const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 50;
@@ -872,24 +1568,27 @@ async function pollRunLog() {
             }
         }
     } catch (e) { /* transient — keep polling */ }
-    if (runActive) runPollTimer = setTimeout(pollRunLog, 2000);
+    if (runActive && epoch === runPollEpoch) runPollTimer = setTimeout(() => pollRunLog(epoch), 2000);
 }
 
 async function showRunLog() {
+    const epoch = ++runPollEpoch;
+    if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'run-log' }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success && (d.log || d.done || d.pid_recorded)) {
+        if (epoch !== runPollEpoch) return;
+        if (!d.success) throw new Error(d.error || 'Run log is temporarily unavailable');
+        if (d.log || d.done || d.running || d.job_id || d.pid_recorded) {
+            runJobId = d.job_id || null;
             const out = document.getElementById('run-output');
             out.textContent = d.log; out.scrollTop = out.scrollHeight;
+            runActive = !d.done && !!d.running;
+            document.getElementById('run-btn').disabled = runActive;
             if (!d.done && d.running) {
-                runActive = true;
-                document.getElementById('run-btn').disabled = true;
                 setStatus('run-status', 'A run is in progress\u2026', 'info');
-                pollRunLog();
+                pollRunLog(epoch);
             } else if (!d.done) {
-                runActive = false;
-                document.getElementById('run-btn').disabled = false;
                 setStatus('run-status', 'The previous run was interrupted before an exit status was recorded.', 'err');
                 markDone('run', false);
             } else {
@@ -905,16 +1604,81 @@ async function showRunLog() {
                 }
             }
         }
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+        if (epoch === runPollEpoch && runActive) {
+            runPollTimer = setTimeout(() => pollRunLog(epoch), 2000);
+        }
+    }
 }
 
-/* ---- Step 6: Update LLDPq (git pull + ./install.sh) with live output ---- */
+/* ---- Step 11: Update LLDPq (git pull + ./install.sh) with live output ---- */
 function setUpdateButtons(disabled) {
     ['update-btn', 'offline-upload-btn'].forEach(function (id) { const b = document.getElementById(id); if (b) b.disabled = disabled; });
 }
 
+function cancelUpdateLogRequest() {
+    if (!updatePollController) return;
+    updatePollController.abort();
+    updatePollController = null;
+}
+
+function clearUpdatePolling() {
+    if (updatePollTimer) { clearTimeout(updatePollTimer); updatePollTimer = null; }
+    cancelUpdateLogRequest();
+}
+
+function updateStepIsVisible() {
+    return !!(STEPS[current] && STEPS[current].key === 'update');
+}
+
+async function fetchUpdateLog(payload) {
+    // nginx/fcgiwrap intentionally restart during an update. A request caught
+    // in that window can remain pending instead of rejecting, which used to
+    // stop the polling loop until a hard refresh aborted it.
+    cancelUpdateLogRequest();
+    const controller = new AbortController();
+    updatePollController = controller;
+    const timeout = setTimeout(function () { controller.abort(); }, UPDATE_LOG_TIMEOUT_MS);
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload),
+            cache:'no-store',
+            signal:controller.signal
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        if (!d || d.success !== true) throw new Error((d && d.error) || 'Update log is temporarily unavailable');
+        return d;
+    } finally {
+        clearTimeout(timeout);
+        if (updatePollController === controller) updatePollController = null;
+    }
+}
+
+function reloadUpdatedSetup(jobId) {
+    if (updateReloadScheduled) return;
+    if (hasUnsavedSetupChanges()) {
+        setStatus('update-status', 'Update finished \u2713 \u2014 unsaved Setup edits were kept; reload when ready to use the updated UI.', 'ok');
+        return;
+    }
+    updateReloadScheduled = true;
+    setStatus('update-status', 'Update finished \u2713 \u2014 loading the updated UI\u2026', 'ok');
+    setTimeout(function () {
+        const target = new URL(location.href);
+        target.searchParams.set('step', 'update');
+        target.searchParams.set('_updated', jobId || String(Date.now()));
+        location.replace(target.pathname + target.search);
+    }, 700);
+}
+
 async function updateLLDPq() {
     const backup = document.getElementById('update-backup').checked;
+    const epoch = ++updatePollEpoch;
+    updateJobId = null;
+    updateReloadScheduled = false;
+    clearUpdatePolling();
     setUpdateButtons(true);
     updateActive = true;
     setStatus('update-status', 'Starting update' + (backup ? ' (with backup)' : '') + '\u2026', 'info');
@@ -922,10 +1686,13 @@ async function updateLLDPq() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update', backup: backup }) });
         const d = await r.json().catch(() => ({}));
+        if (epoch !== updatePollEpoch) return;
         if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); setUpdateButtons(false); updateActive = false; return; }
+        updateJobId = d.job_id || null;
         setStatus('update-status', 'Updating\u2026 (the UI may blink while services restart)', 'info');
-        pollUpdateLog();
+        pollUpdateLog(epoch);
     } catch (e) {
+        if (epoch !== updatePollEpoch) return;
         setStatus('update-status', 'Failed to start: ' + e.message, 'err');
         setUpdateButtons(false); updateActive = false;
     }
@@ -936,6 +1703,10 @@ async function uploadAndUpdate() {
     const file = fi && fi.files && fi.files[0];
     if (!file) { setStatus('update-status', 'Choose a .tar.gz file to upload first.', 'err'); return; }
     const backup = document.getElementById('offline-backup').checked;
+    const epoch = ++updatePollEpoch;
+    updateJobId = null;
+    updateReloadScheduled = false;
+    clearUpdatePolling();
     setUpdateButtons(true);
     updateActive = true;
     const mb = Math.max(1, Math.round(file.size / 1048576));
@@ -946,9 +1717,11 @@ async function uploadAndUpdate() {
         const up = await fetch('/setup-api.sh?action=upload-src', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
         if (!up.ok) throw new Error('HTTP ' + up.status + (up.status === 413 ? ' \u2014 file exceeds the server upload limit' : ''));
         const ud = await up.json().catch(() => ({}));
+        if (epoch !== updatePollEpoch) return;
         if (!ud.success) { setStatus('update-status', ud.error || 'Upload failed', 'err'); setUpdateButtons(false); updateActive = false; return; }
         path = ud.path;
     } catch (e) {
+        if (epoch !== updatePollEpoch) return;
         setStatus('update-status', 'Upload failed: ' + e.message, 'err'); setUpdateButtons(false); updateActive = false; return;
     }
     // Uploaded to the host — now run the offline update from the uploaded file.
@@ -957,19 +1730,34 @@ async function uploadAndUpdate() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-offline', path: path, backup: backup }) });
         const d = await r.json().catch(() => ({}));
+        if (epoch !== updatePollEpoch) return;
         if (!d.success) { setStatus('update-status', d.error || 'Failed to start', 'err'); setUpdateButtons(false); updateActive = false; return; }
+        updateJobId = d.job_id || null;
         setStatus('update-status', 'Updating\u2026 (the UI may blink while services restart)', 'info');
-        pollUpdateLog();
+        pollUpdateLog(epoch);
     } catch (e) {
+        if (epoch !== updatePollEpoch) return;
         setStatus('update-status', 'Failed to start: ' + e.message, 'err'); setUpdateButtons(false); updateActive = false;
     }
 }
 
-async function pollUpdateLog() {
+async function pollUpdateLog(epoch = updatePollEpoch) {
+    if (epoch !== updatePollEpoch) return;
     if (updatePollTimer) { clearTimeout(updatePollTimer); updatePollTimer = null; }
     try {
-        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-log' }) });
-        const d = await r.json().catch(() => ({}));
+        const payload = { action: 'update-log' };
+        if (updateJobId) payload.job_id = updateJobId;
+        const d = await fetchUpdateLog(payload);
+        if (epoch !== updatePollEpoch) return;
+        // A restart proxy response can temporarily have no usable job state.
+        // Only an explicit different id means another job really replaced it.
+        if (updateJobId && !d.job_id) throw new Error('Update job identity is temporarily unavailable');
+        if (updateJobId && d.job_id && d.job_id !== updateJobId) {
+            updateActive = false;
+            setUpdateButtons(!!d.running);
+            setStatus('update-status', 'This update\u2019s status was replaced by another job; use Show Log to inspect the current job.', 'info');
+            return;
+        }
         const out = document.getElementById('update-output');
         if (d.success) {
             const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 50;
@@ -977,10 +1765,14 @@ async function pollUpdateLog() {
             if (atBottom) out.scrollTop = out.scrollHeight;
             if (d.done) {
                 updateActive = false;
+                updateJobId = d.job_id || updateJobId;
                 setUpdateButtons(false);
+                // Reveal terminal lines even if the operator scrolled upward
+                // while the job was running.
+                out.scrollTop = out.scrollHeight;
                 if (d.ok) {
-                    setStatus('update-status', 'Update finished \u2713 \u2014 reload the app if the UI looks stale.', 'ok');
                     markDone('update', true);
+                    reloadUpdatedSetup(updateJobId);
                 } else if (!Number.isInteger(d.exit_code)) {
                     setStatus('update-status', 'Update finished, but its exit status is unavailable \u2014 review the log above.', 'info');
                     markDone('update', false);
@@ -990,26 +1782,44 @@ async function pollUpdateLog() {
                 }
                 return;
             }
+            if (!d.running && (d.log || d.job_id || updateJobId)) {
+                updateActive = false;
+                setUpdateButtons(false);
+                setStatus('update-status', 'Update was interrupted before an exit status was recorded \u2014 review the log above.', 'err');
+                markDone('update', false);
+                return;
+            }
         }
     } catch (e) {
         // install.sh restarts nginx/fcgiwrap — the page's own server blinks here.
         // Keep polling; the detached update continues and the log (in $HOME) survives.
-        setStatus('update-status', 'Reconnecting\u2026 (services restarting; the update is still running in the background)', 'info');
+        if (epoch === updatePollEpoch) setStatus('update-status', 'Reconnecting\u2026 (services restarting; the update is still running in the background)', 'info');
     }
-    if (updateActive) updatePollTimer = setTimeout(pollUpdateLog, 2500);
+    if (updateActive && epoch === updatePollEpoch) updatePollTimer = setTimeout(() => pollUpdateLog(epoch), 2500);
 }
 
-async function showUpdateLog() {
+async function showUpdateLog(retryEpoch) {
+    const isRetry = Number.isInteger(retryEpoch);
+    const epoch = isRetry ? retryEpoch : ++updatePollEpoch;
+    // A timer that is currently firing is no longer pending. Clear its stored
+    // id even when the operator has left this step, so re-entering can start a
+    // fresh status discovery without a hard refresh.
+    if (isRetry && updatePollTimer) { clearTimeout(updatePollTimer); updatePollTimer = null; }
+    if (epoch !== updatePollEpoch || (isRetry && !updateStepIsVisible())) return;
+    if (!isRetry) clearUpdatePolling();
     try {
-        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update-log' }) });
-        const d = await r.json().catch(() => ({}));
-        if (d.success && (d.log || d.done)) {
+        const d = await fetchUpdateLog({ action:'update-log' });
+        if (epoch !== updatePollEpoch) return;
+        if (d.log || d.done || d.running || d.job_id) {
             const out = document.getElementById('update-output');
-            out.textContent = d.log; out.scrollTop = out.scrollHeight;
-            // Show the previous run's log for reference, but NEVER lock the button on a
-            // stale/incomplete log (an interrupted run leaves no DONE marker). The user can
-            // always start a fresh update; updateLLDPq() truncates the log first.
-            if (d.done && d.ok) {
+            out.textContent = d.log || '(no output yet)'; out.scrollTop = out.scrollHeight;
+            updateJobId = d.job_id || null;
+            updateActive = !d.done && !!d.running;
+            setUpdateButtons(updateActive);
+            if (!d.done && d.running) {
+                setStatus('update-status', 'An update is in progress\u2026', 'info');
+                pollUpdateLog(epoch);
+            } else if (d.done && d.ok) {
                 setStatus('update-status', 'Last update finished successfully \u2713', 'info');
                 markDone('update', true);
             } else if (d.done && !Number.isInteger(d.exit_code)) {
@@ -1019,10 +1829,22 @@ async function showUpdateLog() {
                 setStatus('update-status', `Last update failed (exit ${d.exit_code}) \u2014 review the log below.`, 'err');
                 markDone('update', false);
             } else {
-                setStatus('update-status', 'Showing the last run log (may be incomplete) \u2014 click Update LLDPq to run again.', 'info');
+                setUpdateButtons(false);
+                setStatus('update-status', 'The previous update was interrupted before an exit status was recorded.', 'err');
+                markDone('update', false);
             }
+        } else {
+            updateJobId = null;
+            updateActive = false;
+            setUpdateButtons(false);
+            setStatus('update-status', '', 'info');
         }
-    } catch (e) { /* ignore */ }
+    } catch (e) {
+        if (epoch === updatePollEpoch && updateStepIsVisible()) {
+            setStatus('update-status', 'Update status is temporarily unavailable \u2014 reconnecting\u2026', 'info');
+            updatePollTimer = setTimeout(() => showUpdateLog(epoch), 2500);
+        }
+    }
 }
 
 /* ---- Schedules (cron) for the Run step ---- */
@@ -1078,45 +1900,103 @@ function dkFallbackCopy(text, cb) {
     ta.remove();
 }
 
-/* ---- Step 5: Integrate Ansible ---- */
-async function loadAnsible() {
+/* ---- Step 6: Integrate Ansible ---- */
+async function loadAnsible(force) {
+    if (ansibleBusy) { if (force) setStatus('ans-status', 'An Ansible operation is already in progress.', 'info'); return; }
+    if (force && ansibleDirty && !window.confirm('Reload the Ansible setting and discard your unsaved directory change?')) return;
+    ansibleBusy = true;
+    const seq = ++ansibleLoadSeq;
+    const op = ++ansibleOpSeq;
+    const startedVersion = ansibleEditVersion;
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-ansible' }) });
         const d = await r.json().catch(() => ({}));
+        if (seq !== ansibleLoadSeq || op !== ansibleOpSeq) return;
+        if (ansibleEditVersion !== startedVersion) { setStatus('ans-status', 'Server setting arrived, but the directory field changed while loading; your edit was kept.', 'info'); return; }
         if (!d.success) return;
         const st = document.getElementById('ans-state');
         if (d.disabled) { st.textContent = 'disabled'; st.className = 'badge gray'; }
-        else if (d.exists) { st.textContent = 'integrated'; st.className = 'badge green'; }
+        else if (d.ready) { st.textContent = 'integrated'; st.className = 'badge green'; }
+        else if (d.exists) { st.textContent = 'needs attention'; st.className = 'badge gray'; }
         else { st.textContent = 'set, folder missing'; st.className = 'badge gray'; }
         document.getElementById('ans-path').textContent = d.path || '\u2014';
         document.getElementById('ans-input').value = d.path || '';
+        ansibleDirty = false;
         const cand = document.getElementById('ans-candidates');
+        cand.replaceChildren();
         if (d.candidates && d.candidates.length) {
-            cand.innerHTML = 'Detected: ' + d.candidates.map(function (c) {
-                return '<a href="#" data-ans="' + c.replace(/"/g, '&quot;') + '" onclick="document.getElementById(\'ans-input\').value=this.getAttribute(\'data-ans\');return false;" style="color:#76b900;">' + c + '</a>';
-            }).join(' &nbsp;|&nbsp; ');
-        } else { cand.textContent = ''; }
-    } catch (e) { /* ignore */ }
+            cand.appendChild(document.createTextNode('Detected: '));
+            d.candidates.forEach(function (candidate, index) {
+                if (index) cand.appendChild(document.createTextNode('  |  '));
+                const link = document.createElement('a');
+                link.href = '#'; link.style.color = '#76b900'; link.textContent = String(candidate);
+                link.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    const input = document.getElementById('ans-input'); input.value = String(candidate); input.dispatchEvent(new Event('input'));
+                });
+                cand.appendChild(link);
+            });
+        }
+        if (Array.isArray(d.warnings) && d.warnings.length) {
+            setStatus('ans-status', d.warnings.join(' · '), 'info');
+        } else if (force) {
+            setStatus('ans-status', 'Ansible setting refreshed.', 'info');
+        }
+    } catch (e) { if (op !== ansibleOpSeq) return; }
+    finally { if (op === ansibleOpSeq) ansibleBusy = false; }
 }
 async function saveAnsible() {
+    if (ansibleBusy) { setStatus('ans-status', 'An Ansible operation is already in progress.', 'info'); return; }
     const dir = document.getElementById('ans-input').value.trim();
     if (!dir) { setStatus('ans-status', 'Enter a directory, or use "I don\u2019t use Ansible".', 'err'); return; }
+    ansibleBusy = true;
     setStatus('ans-status', 'Saving\u2026', 'info');
+    const startedVersion = ansibleEditVersion;
+    const op = ++ansibleOpSeq;
+    let refreshAfterSave = false;
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-ansible', ansible_dir: dir }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success) { setStatus('ans-status', 'Ansible integrated \u2713 \u2014 reload the app to see the menu.', 'ok'); loadAnsible(); }
+        if (op !== ansibleOpSeq) return;
+        if (d.success) {
+            if (ansibleEditVersion === startedVersion) ansibleDirty = false;
+            const warnings = Array.isArray(d.warnings) ? d.warnings : [];
+            const message = ansibleDirty
+                ? 'Saved the submitted directory, but a newer field edit remains unsaved.'
+                : (!d.ready && warnings.length
+                    ? 'Saved, but Ansible is not fully ready: ' + warnings.join(' · ')
+                    : 'Ansible integrated \u2713 \u2014 reload the app to see the menu.');
+            setStatus('ans-status', message, ansibleDirty || !d.ready ? 'info' : 'ok');
+            refreshAfterSave = !ansibleDirty;
+        }
         else setStatus('ans-status', d.error || 'Failed', 'err');
-    } catch (e) { setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+    } catch (e) { if (op !== ansibleOpSeq) return; setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+    finally {
+        if (op === ansibleOpSeq) {
+            ansibleBusy = false;
+            if (refreshAfterSave) loadAnsible();
+        }
+    }
 }
 async function disableAnsible() {
+    if (ansibleBusy) { setStatus('ans-status', 'An Ansible operation is already in progress.', 'info'); return; }
+    ansibleBusy = true;
+    const op = ++ansibleOpSeq;
+    let refreshAfterDisable = false;
     setStatus('ans-status', 'Disabling\u2026', 'info');
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-ansible', disable: true }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success) { setStatus('ans-status', 'Ansible disabled \u2713 \u2014 reload the app; the Ansible menu will hide.', 'ok'); loadAnsible(); }
+        if (op !== ansibleOpSeq) return;
+        if (d.success) { ansibleDirty = false; setStatus('ans-status', 'Ansible disabled \u2713 \u2014 reload the app; the Ansible menu will hide.', 'ok'); refreshAfterDisable = true; }
         else setStatus('ans-status', d.error || 'Failed', 'err');
-    } catch (e) { setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+    } catch (e) { if (op !== ansibleOpSeq) return; setStatus('ans-status', 'Failed: ' + e.message, 'err'); }
+    finally {
+        if (op === ansibleOpSeq) {
+            ansibleBusy = false;
+            if (refreshAfterDisable) loadAnsible();
+        }
+    }
 }
 
 /* ---- Collection parallelism (Run step) ---- */
@@ -1133,7 +2013,11 @@ async function loadParallel() {
             let list = opts.slice();
             if (list.indexOf(cur) < 0) list.push(cur);
             list.sort(function (a, b) { return a - b; });
-            s.innerHTML = list.map(function (v) { return '<option value="' + v + '"' + (v === cur ? ' selected' : '') + '>' + v + '</option>'; }).join('');
+            s.replaceChildren();
+            list.forEach(function (v) {
+                const option = document.createElement('option');
+                option.value = String(v); option.textContent = String(v); option.selected = v === cur; s.appendChild(option);
+            });
         });
     } catch (e) { /* ignore */ }
 }
@@ -1154,19 +2038,24 @@ async function saveParallel() {
     } catch (e) { setStatus('par-status', 'Save failed: ' + e.message, 'err'); }
 }
 
-/* ---- Step 8: Notifications & Alerting (notifications.yaml) ---- */
+/* ---- Step 7: Notifications & Alerting (notifications.yaml) ---- */
 function nfChk(id){ var e=document.getElementById(id); return !!(e && e.checked); }
 function nfSet(id,v){ var e=document.getElementById(id); if(e) e.checked=!!v; }
 function nfVal(id){ var e=document.getElementById(id); return e?e.value:''; }
 function nfPut(id,v){ var e=document.getElementById(id); if(e) e.value=(v==null?'':v); }
 
-async function loadNotifications(){
+async function loadNotifications(force){
+    if(force&&notifDirty&&!window.confirm('Reload notifications.yaml and discard your unsaved notification changes?')) return;
+    const seq=++notifLoadSeq; const op=++notifOpSeq; const startedVersion=notifEditVersion;
     setStatus('nf-status','Loading\u2026','info');
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'get-notifications'})});
         const d=await r.json().catch(()=>({}));
+        if(seq!==notifLoadSeq||op!==notifOpSeq) return;
+        if(notifEditVersion!==startedVersion){ setStatus('nf-status','Server settings arrived, but this form changed while loading; your edits were kept. Reload when ready.','info'); return; }
         if(!d.success){ setStatus('nf-status', d.error||'Failed to load notifications.yaml','err'); return; }
         const n=d.notifications||{};
+        suppressNotifDirty=true;
         nfSet('nf-enabled', n.enabled); nfPut('nf-server', n.server_url);
         nfSet('nf-slack', n.slack_enabled); nfPut('nf-webhook', n.webhook); nfPut('nf-channel', n.channel);
         var m=document.getElementById('nf-mode'); if(m&&n.mode) m.value=n.mode;
@@ -1174,27 +2063,36 @@ async function loadNotifications(){
         nfSet('nf-t-hardware', n.t_hardware); nfSet('nf-t-network', n.t_network); nfSet('nf-t-system', n.t_system); nfSet('nf-t-topology', n.t_topology); nfSet('nf-t-log', n.t_log);
         var th=n.thresholds||{};
         nfPut('thr-bgp',th.bgp); nfPut('thr-flapw',th.flap_warn); nfPut('thr-flapc',th.flap_crit); nfPut('thr-optical',th.optical); nfPut('thr-cpu',th.cpu); nfPut('thr-asic',th.asic); nfPut('thr-disk',th.disk);
+        suppressNotifDirty=false; notifDirty=false; notificationsReady=true; notifRevision=d.revision||null;
         setStatus('nf-status', d.exists===false ? 'notifications.yaml not found \u2014 saving will create it.' : 'Loaded notifications.yaml','info');
-    }catch(e){ setStatus('nf-status','Load failed: '+e.message,'err'); }
+    }catch(e){ if(op!==notifOpSeq) return; suppressNotifDirty=false; setStatus('nf-status','Load failed: '+e.message,'err'); }
 }
 
 function nfPayload(){
-    return { action:'set-notifications',
+    const payload={ action:'set-notifications',
         enabled:nfChk('nf-enabled'), server_url:nfVal('nf-server').trim(),
         slack_enabled:nfChk('nf-slack'), webhook:nfVal('nf-webhook').trim(), channel:nfVal('nf-channel').trim(),
         mode:nfVal('nf-mode'), min_interval:nfVal('nf-interval'),
         t_hardware:nfChk('nf-t-hardware'), t_network:nfChk('nf-t-network'), t_system:nfChk('nf-t-system'), t_topology:nfChk('nf-t-topology'), t_log:nfChk('nf-t-log'),
         thresholds:{ bgp:nfVal('thr-bgp'), flap_warn:nfVal('thr-flapw'), flap_crit:nfVal('thr-flapc'), optical:nfVal('thr-optical'), cpu:nfVal('thr-cpu'), asic:nfVal('thr-asic'), disk:nfVal('thr-disk') } };
+    if(notifRevision) payload.expected_revision=notifRevision;
+    return payload;
 }
 
 async function saveNotifications(){
+    if(!notificationsReady||typeof notifRevision!=='string'){ setStatus('nf-status','Load the current notification settings before saving.','err'); return; }
+    const startedVersion=notifEditVersion; const op=++notifOpSeq;
     setStatus('nf-status','Saving\u2026','info');
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(nfPayload())});
         const d=await r.json().catch(()=>({}));
-        if(d.success) setStatus('nf-status','Saved notifications.yaml \u2713','ok');
-        else setStatus('nf-status', d.error||'Save failed','err');
-    }catch(e){ setStatus('nf-status','Save failed: '+e.message,'err'); }
+        if(op!==notifOpSeq) return;
+        if(d.success){
+            notifRevision=d.revision||notifRevision;
+            if(notifEditVersion===startedVersion){ notifDirty=false; setStatus('nf-status','Saved notifications.yaml \u2713','ok'); }
+            else setStatus('nf-status','Saved the submitted notification settings, but newer form changes remain unsaved.','info');
+        } else setStatus('nf-status', d.conflict ? ((d.error||'notifications.yaml changed on disk.')+' Your form was kept; reload to review.') : (d.error||'Save failed'),'err');
+    }catch(e){ if(op!==notifOpSeq) return; setStatus('nf-status','Save failed: '+e.message,'err'); }
 }
 
 async function testAlert(){
@@ -1220,13 +2118,14 @@ async function backupExport(){
         const blob=new Blob([arr],{type:'application/gzip'}); const url=URL.createObjectURL(blob);
         const a=document.createElement('a'); a.href=url; a.download=d.filename||'lldpq-config.tar.gz';
         document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(url); a.remove();},100);
-        setStatus('bk-export-msg','Downloaded bundle'+(d.has_key?' \u2014 includes SSH key, keep it secret':'')+' \u2713','ok');
+        setStatus('bk-export-msg','Downloaded bundle \u2014 store it securely'+(d.has_key?'; it includes the collector private key':'')+' \u2713','ok');
     }catch(e){ setStatus('bk-export-msg','Export failed: '+e.message,'err'); }
 }
 
 async function backupImport(){
     const fi=document.getElementById('bk-file'); const f=fi&&fi.files&&fi.files[0];
     if(!f){ setStatus('bk-import-msg','Choose a .tar.gz bundle first.','err'); return; }
+    if(hasUnsavedSetupChanges() && !window.confirm('Restore will replace server configuration and discard unsaved Setup editor changes. Continue?')) return;
     setStatus('bk-import-msg','Reading\u2026','info');
     let b64;
     try{
@@ -1236,9 +2135,518 @@ async function backupImport(){
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'backup-import',data:b64})});
         const d=await r.json().catch(()=>({}));
-        if(d.success){ var parts=(d.restored||[]).slice(); if((d.keys||[]).length) parts.push('SSH key'); if((d.prefs||[]).length) parts.push('settings ('+d.prefs.length+')'); setStatus('bk-import-msg','Restored: '+(parts.join(', ')||'nothing')+' \u2713 \u2014 run Step 7 (Run LLDPq) to apply.','ok'); }
+        if(d.success){
+            invalidateSetupCachesAfterRestore();
+            var parts=(d.restored||[]).slice();
+            if((d.keys||[]).length) parts.push('SSH key');
+            if((d.prefs||[]).length) parts.push('settings ('+d.prefs.length+')');
+            setStatus('bk-import-msg','Restored: '+(parts.join(', ')||'nothing')+' \u2713 \u2014 run Step 8 (Run LLDPq) to apply.','ok');
+            fi.value='';
+        }
         else setStatus('bk-import-msg', d.error||'Restore failed','err');
     }catch(e){ setStatus('bk-import-msg','Restore failed: '+e.message,'err'); }
+}
+
+function invalidateSetupCachesAfterRestore(){
+    Object.keys(FILES).forEach(function(key){
+        const cfg=FILES[key];
+        cfg.loadSeq++; cfg.opSeq++; cfg.loaded=false; cfg.dirty=false; cfg.revision=null;
+        const ta=document.getElementById(cfg.ta); if(ta) ta.value='';
+        setStatus(cfg.st,'Restored on server; open this step to load the restored file.','info');
+    });
+    aliasesLoadSeq++; aliasesOpSeq++; aliasesLoaded=false; aliasesDirty=false; aliasesRevision=null;
+    notifLoadSeq++; notifOpSeq++; notifLoaded=false; notifDirty=false; notificationsReady=false; notifRevision=null;
+    ansibleLoadSeq++; ansibleOpSeq++; ansibleLoaded=false; ansibleDirty=false; ansibleBusy=false;
+    keyInfoLoaded=false; schedLoaded=false; parallelLoaded=false; maintLoaded=false;
+    publishAliasUpdate(null);
+}
+
+/* ---- Non-numbered Danger Zone: Uninstall LLDPq ---- */
+function persistUninstallJobState(jobId){
+    if (!/^[a-f0-9]{32}$/.test(jobId || '')) return false;
+    try {
+        const record = {job_id:jobId, created_at:Date.now()};
+        localStorage.setItem(UNINSTALL_JOB_STORAGE_KEY, JSON.stringify(record));
+        const stored = JSON.parse(localStorage.getItem(UNINSTALL_JOB_STORAGE_KEY) || '{}');
+        const persisted = stored.job_id === jobId && Number(stored.created_at) === record.created_at;
+        if (persisted) uninstallJobCreatedAt = record.created_at;
+        return persisted;
+    } catch (e) { return false; }
+}
+
+function clearPersistedUninstallJobState(){
+    try { localStorage.removeItem(UNINSTALL_JOB_STORAGE_KEY); } catch (e) {}
+}
+
+function restoreUninstallJobState(){
+    try {
+        const raw = localStorage.getItem(UNINSTALL_JOB_STORAGE_KEY);
+        if (!raw) return false;
+        const saved = JSON.parse(raw);
+        const age = Date.now() - Number(saved.created_at || 0);
+        if (!/^[a-f0-9]{32}$/.test(saved.job_id || '') || age < 0 || age > 86400000) {
+            clearPersistedUninstallJobState();
+            return false;
+        }
+        uninstallJobId = saved.job_id;
+        uninstallJobCreatedAt = Number(saved.created_at);
+        uninstallStatusMissingCount = 0;
+        uninstallCommitted = true;
+        return true;
+    } catch (e) {
+        clearPersistedUninstallJobState();
+        return false;
+    }
+}
+
+function resumeUninstallJobStatus(){
+    uninstallEnvironment = 'native';
+    renderUninstallEnvironment();
+    document.getElementById('uninstall-preview-wrap').style.display = 'block';
+    const output = document.getElementById('uninstall-output');
+    output.textContent = 'Recovering the previously accepted uninstall status…\n';
+    setUninstallControlsDisabled(true);
+    setStatus('uninstall-launch-status', 'A previously accepted uninstall job is being checked. Do not launch it again.', 'info');
+    const epoch = ++uninstallStatusEpoch;
+    pollUninstallStatus(epoch);
+}
+
+function getUninstallOptions(){
+    return {
+        keep_data: !!document.getElementById('uninstall-keep-data').checked,
+        remove_source: !!document.getElementById('uninstall-remove-source').checked,
+        remove_nginx: !!document.getElementById('uninstall-remove-nginx').checked,
+        remove_dhcp: !!document.getElementById('uninstall-remove-dhcp').checked,
+        remove_docker: !!document.getElementById('uninstall-remove-docker').checked
+    };
+}
+
+function uninstallOptionsFingerprint(options){
+    return JSON.stringify({
+        keep_data: options.keep_data === true,
+        remove_source: options.remove_source === true,
+        remove_nginx: options.remove_nginx === true,
+        remove_dhcp: options.remove_dhcp === true,
+        remove_docker: options.remove_docker === true
+    });
+}
+
+function uninstallHasSharedPackageSelection(options){
+    return options.remove_nginx || options.remove_dhcp || options.remove_docker;
+}
+
+function uninstallHasDataLossSelection(options){
+    return !options.keep_data || options.remove_source;
+}
+
+function updateUninstallAcknowledgementVisibility(){
+    const options = getUninstallOptions();
+    const dataRow = document.getElementById('uninstall-ack-data-loss-row');
+    const dataAck = document.getElementById('uninstall-ack-data-loss');
+    const sharedRow = document.getElementById('uninstall-ack-shared-row');
+    const sharedAck = document.getElementById('uninstall-ack-shared-services');
+    const needsDataAck = uninstallHasDataLossSelection(options);
+    const needsSharedAck = uninstallHasSharedPackageSelection(options);
+    if (dataRow) dataRow.style.display = needsDataAck ? 'flex' : 'none';
+    if (dataAck && !needsDataAck) dataAck.checked = false;
+    if (sharedRow) sharedRow.style.display = needsSharedAck ? 'flex' : 'none';
+    if (sharedAck && !needsSharedAck) sharedAck.checked = false;
+    refreshUninstallConfirmationGate();
+}
+
+function renderUninstallEnvironment(){
+    const note = document.getElementById('uninstall-env-note');
+    const retry = document.getElementById('uninstall-env-retry-row');
+    const docker = document.getElementById('uninstall-docker');
+    const native = document.getElementById('uninstall-native');
+    if (!note || !retry || !docker || !native) return;
+    note.style.display = 'block';
+    retry.style.display = 'none';
+    docker.style.display = 'none';
+    native.style.display = 'none';
+    if (uninstallEnvironment === 'checking') {
+        note.className = 'note';
+        note.textContent = 'Verifying that this is a supported native installation…';
+    } else if (uninstallEnvironment === 'native') {
+        note.style.display = 'none';
+        native.style.display = 'block';
+    } else if (uninstallEnvironment === 'docker') {
+        note.style.display = 'none';
+        docker.style.display = 'block';
+    } else {
+        note.className = 'note danger-note';
+        note.textContent = 'Could not verify the deployment type. Browser uninstall is disabled until this safety check succeeds.';
+        retry.style.display = 'flex';
+    }
+    refreshUninstallAvailability();
+}
+
+async function loadUninstallEnvironment(force){
+    if (uninstallCommitted || uninstallStarting) return false;
+    if (uninstallEnvironment === 'checking' && !force) return false;
+    const seq = ++uninstallEnvironmentSeq;
+    uninstallEnvironment = 'checking';
+    renderUninstallEnvironment();
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({action:'env'})
+        });
+        const d = await r.json().catch(()=>({}));
+        if (seq !== uninstallEnvironmentSeq) return false;
+        if (!d.success) throw new Error(d.error || 'Deployment check failed');
+        uninstallEnvironment = d.docker ? 'docker' : 'native';
+        renderUninstallEnvironment();
+        return uninstallEnvironment === 'native';
+    } catch (e) {
+        if (seq !== uninstallEnvironmentSeq) return false;
+        uninstallEnvironment = 'error';
+        renderUninstallEnvironment();
+        return false;
+    }
+}
+
+function refreshUninstallAvailability(){
+    const preview = document.getElementById('uninstall-preview-btn');
+    if (!preview) return;
+    const unsaved = hasUnsavedSetupChanges();
+    preview.disabled = !!uninstallPreviewController || uninstallStarting || uninstallCommitted ||
+        uninstallEnvironment !== 'native' || unsaved;
+    const status = document.getElementById('uninstall-status');
+    if (unsaved && uninstallEnvironment === 'native' && !uninstallCommitted) {
+        if (status) status.dataset.unsavedBlock = '1';
+        setStatus('uninstall-status', 'Save or reload all unsaved Setup edits before previewing uninstall. The dry run only sees files already saved on the server.', 'err');
+    } else if (status && status.dataset.unsavedBlock === '1') {
+        delete status.dataset.unsavedBlock;
+        setStatus('uninstall-status', '', 'info');
+    }
+    refreshUninstallConfirmationGate();
+}
+
+function clearUninstallStatusTimer(){
+    if (uninstallStatusTimer) { clearTimeout(uninstallStatusTimer); uninstallStatusTimer = null; }
+}
+
+function invalidateUninstallPreview(message, quiet){
+    if (uninstallCommitted) return;
+    uninstallPreviewSeq++;
+    if (uninstallPreviewController) {
+        uninstallPreviewController.abort();
+        uninstallPreviewController = null;
+    }
+    clearUninstallStatusTimer();
+    uninstallPreviewToken = null;
+    uninstallPreviewFingerprint = null;
+    uninstallPreviewOptionFingerprint = null;
+    ['uninstall-ack-disconnect', 'uninstall-ack-data-loss',
+     'uninstall-ack-shared-services'].forEach(function (id) {
+        const el = document.getElementById(id); if (el) el.checked = false;
+    });
+    const confirmText = document.getElementById('uninstall-confirm-text');
+    if (confirmText) confirmText.value = '';
+    const wrap = document.getElementById('uninstall-preview-wrap');
+    if (wrap) wrap.style.display = 'none';
+    const output = document.getElementById('uninstall-output');
+    if (output) output.textContent = 'Waiting for preview…';
+    setStatus('uninstall-launch-status', '', 'info');
+    if (quiet) setStatus('uninstall-status', '', 'info');
+    else if (message) setStatus('uninstall-status', message, 'info');
+    refreshUninstallConfirmationGate();
+}
+
+function formatUninstallPreview(preview){
+    if (typeof preview === 'string') return preview;
+    if (!preview || typeof preview !== 'object') return '';
+    const lines = [];
+    if (typeof preview.summary === 'string' && preview.summary) lines.push(preview.summary);
+    if (Array.isArray(preview.warnings)) preview.warnings.forEach(function (warning) {
+        if (typeof warning === 'string' && warning) lines.push('WARNING: ' + warning);
+    });
+    const output = typeof preview.output === 'string' ? preview.output :
+        (typeof preview.log === 'string' ? preview.log : '');
+    if (output) lines.push(output);
+    if (!lines.length) {
+        try { return JSON.stringify(preview, null, 2); } catch (e) { return ''; }
+    }
+    return lines.join('\n\n');
+}
+
+async function previewUninstall(){
+    if (uninstallCommitted || uninstallStarting) return;
+    if (hasUnsavedSetupChanges()) {
+        refreshUninstallAvailability();
+        return;
+    }
+    if (uninstallEnvironment !== 'native') {
+        const native = await loadUninstallEnvironment(true);
+        if (!native) return;
+    }
+    const options = getUninstallOptions();
+    const optionFingerprint = uninstallOptionsFingerprint(options);
+    invalidateUninstallPreview('', true);
+    const seq = uninstallPreviewSeq;
+    const controller = new AbortController();
+    uninstallPreviewController = controller;
+    const timeout = setTimeout(function () { controller.abort(); }, 150000);
+    refreshUninstallAvailability();
+    setStatus('uninstall-status', 'Running safe dry-run preview…', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST', headers:{'Content-Type':'application/json'}, signal:controller.signal,
+            body:JSON.stringify({
+                action:'uninstall-preview', options:options,
+                acknowledgements:{ack_disconnect:false, ack_data_loss:false, ack_shared_services:false}
+            })
+        });
+        const d = await r.json().catch(()=>({}));
+        if (seq !== uninstallPreviewSeq) return;
+        if (d.docker) {
+            uninstallEnvironment = 'docker';
+            renderUninstallEnvironment();
+            throw new Error('Docker deployment detected; browser uninstall is unavailable.');
+        }
+        if (!d.success) throw new Error(d.error || 'Dry-run preview failed');
+        const text = formatUninstallPreview(d.preview);
+        if (!text || typeof d.preview_token !== 'string' || !d.preview_token ||
+            typeof d.preview_fingerprint !== 'string' || !d.preview_fingerprint) {
+            throw new Error('The server did not return a complete, verifiable dry-run preview.');
+        }
+        uninstallPreviewToken = d.preview_token;
+        uninstallPreviewFingerprint = d.preview_fingerprint;
+        uninstallPreviewOptionFingerprint = optionFingerprint;
+        const output = document.getElementById('uninstall-output');
+        output.textContent = text;
+        output.scrollTop = 0;
+        document.getElementById('uninstall-preview-wrap').style.display = 'block';
+        let status = 'Dry run complete. Review it, acknowledge the impact, then type UNINSTALL exactly.';
+        if (Number.isInteger(d.expires_at)) {
+            status += ' This preview expires at ' + new Date(d.expires_at * 1000).toLocaleTimeString() + '.';
+        } else if (typeof d.expires_at === 'string' && d.expires_at) {
+            status += ' This preview expires at ' + d.expires_at + '.';
+        }
+        setStatus('uninstall-status', status, 'ok');
+        updateUninstallAcknowledgementVisibility();
+    } catch (e) {
+        if (seq !== uninstallPreviewSeq) return;
+        uninstallPreviewToken = null;
+        uninstallPreviewFingerprint = null;
+        uninstallPreviewOptionFingerprint = null;
+        const msg = e && e.name === 'AbortError' ? 'Dry-run preview timed out. No changes were made.' : (e.message || 'Dry-run preview failed');
+        setStatus('uninstall-status', msg, 'err');
+    } finally {
+        clearTimeout(timeout);
+        if (uninstallPreviewController === controller) uninstallPreviewController = null;
+        if (seq === uninstallPreviewSeq) refreshUninstallAvailability();
+    }
+}
+
+function refreshUninstallConfirmationGate(){
+    const button = document.getElementById('uninstall-start-btn');
+    if (!button) return;
+    const options = getUninstallOptions();
+    const currentFingerprint = uninstallOptionsFingerprint(options);
+    const previewValid = !!uninstallPreviewToken && !!uninstallPreviewFingerprint &&
+        uninstallPreviewOptionFingerprint === currentFingerprint;
+    const ackDisconnect = !!document.getElementById('uninstall-ack-disconnect').checked;
+    const ackData = !uninstallHasDataLossSelection(options) ||
+        !!document.getElementById('uninstall-ack-data-loss').checked;
+    const ackShared = !uninstallHasSharedPackageSelection(options) ||
+        !!document.getElementById('uninstall-ack-shared-services').checked;
+    const exact = document.getElementById('uninstall-confirm-text').value === 'UNINSTALL';
+    button.disabled = !previewValid || !ackDisconnect || !ackData || !ackShared || !exact ||
+        hasUnsavedSetupChanges() || uninstallEnvironment !== 'native' ||
+        uninstallStarting || uninstallCommitted;
+}
+
+function setUninstallControlsDisabled(disabled){
+    const native = document.getElementById('uninstall-native');
+    if (native) native.querySelectorAll('input,button').forEach(function (el) { el.disabled = disabled; });
+    document.getElementById('nav-back').disabled = disabled;
+    document.querySelectorAll('.su-step').forEach(function (el) {
+        if (disabled) el.setAttribute('aria-disabled', 'true'); else el.removeAttribute('aria-disabled');
+    });
+    if (!disabled) {
+        refreshUninstallAvailability();
+        refreshUninstallConfirmationGate();
+    }
+}
+
+function newUninstallRequestId(){
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID().replace(/-/g, '').toLowerCase();
+    }
+    if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') {
+        throw new Error('Secure browser randomness is unavailable; uninstall was not started.');
+    }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return Array.from(bytes, function (value) { return value.toString(16).padStart(2, '0'); }).join('');
+}
+
+function markUninstallConnectionLost(message){
+    clearUninstallStatusTimer();
+    const text = message || 'LLDPq\u2019s web endpoint is no longer reachable. This is expected after launch, but the browser cannot prove completion. Do not launch again; verify the result over SSH.';
+    setStatus('uninstall-launch-status', text, 'info');
+}
+
+async function startUninstall(){
+    refreshUninstallConfirmationGate();
+    const button = document.getElementById('uninstall-start-btn');
+    if (!button || button.disabled || uninstallStarting || uninstallCommitted) return;
+    const options = getUninstallOptions();
+    if (uninstallOptionsFingerprint(options) !== uninstallPreviewOptionFingerprint) {
+        invalidateUninstallPreview('Options changed. Run a new dry-run preview before uninstalling.');
+        return;
+    }
+    const acknowledgements = {
+        ack_disconnect: !!document.getElementById('uninstall-ack-disconnect').checked,
+        ack_data_loss: !!document.getElementById('uninstall-ack-data-loss').checked,
+        ack_shared_services: !!document.getElementById('uninstall-ack-shared-services').checked
+    };
+    let requestId;
+    try { requestId = newUninstallRequestId(); }
+    catch (e) { setStatus('uninstall-launch-status', e.message, 'err'); return; }
+    const payload = {
+        action:'uninstall-start', options:options, acknowledgements:acknowledgements,
+        confirmation:document.getElementById('uninstall-confirm-text').value,
+        preview_token:uninstallPreviewToken,
+        preview_fingerprint:uninstallPreviewFingerprint,
+        request_id:requestId
+    };
+    // Persist the browser-generated authoritative request id before the
+    // destructive request leaves this tab. If the tab closes after the
+    // server accepts it, the next page load can still recover status. Only a
+    // definitive rejection below is allowed to clear this record.
+    uninstallJobId = requestId;
+    if (!persistUninstallJobState(requestId)) {
+        uninstallJobId = null;
+        setStatus('uninstall-launch-status', 'The browser could not save the uninstall request ID for reload recovery. No uninstall was started.', 'err');
+        return;
+    }
+    uninstallStarting = true;
+    setUninstallControlsDisabled(true);
+    setStatus('uninstall-launch-status', 'Submitting the verified uninstall job…', 'info');
+    const controller = new AbortController();
+    const timeout = setTimeout(function () { controller.abort(); }, 15000);
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST', headers:{'Content-Type':'application/json'}, signal:controller.signal,
+            body:JSON.stringify(payload)
+        });
+        let d;
+        try { d = await r.json(); }
+        catch (parseError) { throw new Error('The connection closed before a verifiable response was received.'); }
+        if (!d || typeof d !== 'object' || typeof d.success !== 'boolean') {
+            throw new Error('The server returned an unverifiable uninstall response.');
+        }
+        if (d.accepted === false) {
+            clearPersistedUninstallJobState();
+            uninstallJobId = null;
+            uninstallJobCreatedAt = 0;
+            uninstallStatusMissingCount = 0;
+            uninstallStarting = false;
+            setUninstallControlsDisabled(false);
+            invalidateUninstallPreview(d.error || 'The uninstall was not accepted. Run a new dry-run preview.');
+            return;
+        }
+        if (!d.success) throw new Error(d.error || 'The server could not verify whether uninstall was accepted.');
+        uninstallStarting = false;
+        uninstallCommitted = true;
+        uninstallPreviewToken = null;
+        setUninstallControlsDisabled(true);
+        const output = document.getElementById('uninstall-output');
+        output.textContent = typeof d.log === 'string' && d.log ? d.log :
+            'Uninstall accepted. Waiting for the LLDPq web endpoint to close…\n';
+        output.scrollTop = output.scrollHeight;
+        setStatus('uninstall-launch-status', 'Uninstall accepted. This page is expected to disconnect; do not submit it again. Verify completion over SSH.', 'ok');
+        if (typeof d.job_id === 'string' && d.job_id && d.job_id !== requestId) {
+            markUninstallConnectionLost('The uninstall was accepted with an unexpected status identity. Do not launch again; verify completion over SSH.');
+        } else {
+            const epoch = ++uninstallStatusEpoch;
+            pollUninstallStatus(epoch);
+        }
+    } catch (e) {
+        // The request can be accepted immediately before nginx/fcgiwrap goes away.
+        // Never retry a destructive start whose result is ambiguous.
+        uninstallStarting = false;
+        uninstallCommitted = true;
+        uninstallPreviewToken = null;
+        uninstallJobId = requestId;
+        setUninstallControlsDisabled(true);
+        markUninstallConnectionLost('The connection closed before the browser received acceptance. The uninstall may have started. Do not launch again; verify the result over SSH.');
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function pollUninstallStatus(epoch){
+    if (!uninstallCommitted || !uninstallJobId || epoch !== uninstallStatusEpoch) return;
+    clearUninstallStatusTimer();
+    const controller = new AbortController();
+    const timeout = setTimeout(function () { controller.abort(); }, UNINSTALL_STATUS_TIMEOUT_MS);
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method:'POST', headers:{'Content-Type':'application/json'}, signal:controller.signal,
+            body:JSON.stringify({action:'uninstall-status', job_id:uninstallJobId})
+        });
+        const d = await r.json().catch(()=>({}));
+        if (epoch !== uninstallStatusEpoch) return;
+        if (!d.success) {
+            if (typeof d.error === 'string' && /job was not found/i.test(d.error)) {
+                const age = Date.now() - uninstallJobCreatedAt;
+                if (!Number.isFinite(age) || age < 0 || age < UNINSTALL_STATUS_MISSING_GRACE_MS) {
+                    setStatus('uninstall-launch-status', 'The uninstall submission is still being resolved. Do not launch it again.', 'info');
+                    uninstallStatusTimer = setTimeout(function () { pollUninstallStatus(epoch); }, 2000);
+                    return;
+                }
+                uninstallStatusMissingCount++;
+                if (uninstallStatusMissingCount < UNINSTALL_STATUS_MISSING_CONFIRMATIONS) {
+                    setStatus('uninstall-launch-status', 'No uninstall job is visible yet; confirming that absence before allowing another attempt.', 'info');
+                    uninstallStatusTimer = setTimeout(function () { pollUninstallStatus(epoch); }, 2000);
+                    return;
+                }
+                clearPersistedUninstallJobState();
+                uninstallCommitted = false;
+                uninstallJobId = null;
+                uninstallJobCreatedAt = 0;
+                uninstallStatusMissingCount = 0;
+                setUninstallControlsDisabled(false);
+                invalidateUninstallPreview('The saved uninstall request was not accepted. Run a new dry-run preview before trying again.');
+                return;
+            }
+            throw new Error(d.error || 'Status endpoint unavailable');
+        }
+        uninstallStatusMissingCount = 0;
+        if (d.job_id && d.job_id !== uninstallJobId) {
+            markUninstallConnectionLost('The uninstall status identity changed. Do not launch again; verify completion over SSH.');
+            return;
+        }
+        if (typeof d.log === 'string') {
+            const output = document.getElementById('uninstall-output');
+            output.textContent = d.log;
+            output.scrollTop = output.scrollHeight;
+        }
+        if (d.done) {
+            clearPersistedUninstallJobState();
+            const exitCode = Number.isInteger(d.exit_code) ? d.exit_code :
+                (Number.isInteger(d.exit_status) ? d.exit_status : (d.ok === true ? 0 : null));
+            if (d.ok === true && exitCode === 0) setStatus('uninstall-launch-status', 'LLDPq uninstall completed successfully. This page may stop responding now.', 'ok');
+            else if (exitCode === 0) setStatus('uninstall-launch-status', 'The uninstall exited with code 0 but the server could not verify a successful terminal state. Inspect the host over SSH.', 'err');
+            else if (Number.isInteger(exitCode)) setStatus('uninstall-launch-status', 'Uninstall stopped with exit ' + exitCode + '. Review the log and inspect the host over SSH.', 'err');
+            else setStatus('uninstall-launch-status', 'The uninstall stopped without a recorded exit status. Inspect the host over SSH.', 'err');
+            return;
+        }
+        if (d.running === false) {
+            markUninstallConnectionLost('The uninstall is no longer reported as running, but no final status was recorded. Do not launch again; inspect the host over SSH.');
+            return;
+        }
+        uninstallStatusTimer = setTimeout(function () { pollUninstallStatus(epoch); }, 1000);
+    } catch (e) {
+        if (epoch !== uninstallStatusEpoch) return;
+        markUninstallConnectionLost();
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 /* ---- Step 10: Maintenance ---- */

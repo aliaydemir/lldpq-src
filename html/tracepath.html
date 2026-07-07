@@ -523,152 +523,126 @@
 </head>
 <body>
     <div class="page-header">
-        <div class="page-title">Tracepath</div>
-        <div class="device-count"><span id="deviceCount">-</span> devices available</div>
+        <div class="page-title" role="heading" aria-level="1">Tracepath</div>
+        <div class="device-count"><span id="deviceCount" aria-live="polite">-</span> devices available</div>
     </div>
     
     <div class="trace-container">
-        <div class="trace-form">
-            <input type="text" id="sourceIp" placeholder="Source IP" />
-            <select id="srcVrfSelect">
+        <div class="trace-form" role="search" aria-label="Network path trace">
+            <input type="text" id="sourceIp" placeholder="Source IP" aria-label="Source IP address" inputmode="decimal" autocomplete="off" spellcheck="false" />
+            <select id="srcVrfSelect" aria-label="Source VRF">
                 <option value="">VRF: auto</option>
             </select>
-            <span class="arrow-icon" onclick="swapSrcDst()" title="Swap source and destination" style="cursor:pointer;user-select:none;">⇄</span>
-            <input type="text" id="destinationIp" placeholder="Destination IP" />
-            <select id="dstVrfSelect">
+            <span class="arrow-icon" role="button" tabindex="0" aria-label="Swap source and destination" onclick="swapSrcDst()" onkeydown="handleSwapKey(event)" title="Swap source and destination" style="cursor:pointer;user-select:none;">⇄</span>
+            <input type="text" id="destinationIp" placeholder="Destination IP" aria-label="Destination IP address" inputmode="decimal" autocomplete="off" spellcheck="false" />
+            <select id="dstVrfSelect" aria-label="Destination VRF">
                 <option value="">VRF: auto</option>
             </select>
-            <button class="btn-trace" id="traceBtn" onclick="tracePath()">
+            <button type="button" class="btn-trace" id="traceBtn" onclick="tracePath()">
                 <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="currentColor"/></svg>
                 Trace
             </button>
-            <button class="btn-clear" onclick="clearResults()">Clear</button>
+            <button type="button" class="btn-clear" onclick="clearResults()">Clear</button>
         </div>
     </div>
     
-    <div class="results-section">
+    <div class="results-section" role="region" aria-labelledby="resultsTitle">
         <div class="results-header">
-            <div class="results-title">
+            <div class="results-title" id="resultsTitle">
                 <svg viewBox="0 0 24 24"><path d="M3.5 18.49l6-6.01 4 4L22 6.92l-1.41-1.41-7.09 7.97-4-4L2 16.99z"/></svg>
                 Path Results
             </div>
-            <div class="results-info" id="resultsInfo"></div>
+            <div class="results-info" id="resultsInfo" aria-live="polite"></div>
         </div>
-        <div class="results-content" id="resultsContent">
+        <div class="results-content" id="resultsContent" aria-live="polite" aria-busy="false">
             <div class="placeholder-text">
-                Enter a destination IP address and click Trace to discover the network path
+                Enter source and destination IP addresses and click Trace to discover the network path
             </div>
         </div>
     </div>
     
     <script>
-        // Swap source and destination (IP + VRF)
-        function swapSrcDst() {
-            const srcIp = document.getElementById('sourceIp');
-            const dstIp = document.getElementById('destinationIp');
-            const srcVrf = document.getElementById('srcVrfSelect');
-            const dstVrf = document.getElementById('dstVrfSelect');
-            
-            const tmpIp = srcIp.value;
-            const tmpVrf = srcVrf.value;
-            
-            srcIp.value = dstIp.value;
-            dstIp.value = tmpIp;
-            
-            // Swap VRF selections
-            const srcOpts = srcVrf.innerHTML;
-            const dstOpts = dstVrf.innerHTML;
-            srcVrf.innerHTML = dstOpts;
-            dstVrf.innerHTML = srcOpts;
-            srcVrf.value = dstVrf.value || tmpVrf;
-            
-            // Re-detect source VRF for new source IP
-            detectSrcVrfs();
-        }
-        
-        // Load device count on page load
-        document.addEventListener('DOMContentLoaded', function() {
-            loadDeviceCount();
-        });
-        
-        async function loadDeviceCount() {
-            try {
-                const response = await fetch('/search-api.sh?action=list-devices');
-                const text = await response.text();
-                try {
-                    const data = JSON.parse(text);
-                    if (data.devices) {
-                        document.getElementById('deviceCount').textContent = data.devices.length;
-                    }
-                } catch(e) {
-                    // Fallback: count cached fabric-table files
-                    console.error('Error parsing devices:', e);
-                }
-            } catch (error) {
-                console.error('Error loading device count:', error);
-            }
-        }
-        
-        // All known VRFs (loaded once, used for dest VRF dropdown)
+        const TRACE_TIMEOUT_MS = 30000;
+        const LOOKUP_TIMEOUT_MS = 10000;
+        const TRACE_BUTTON_HTML = `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="currentColor"/></svg> Trace`;
+
+        // All known VRFs (loaded once, used for destination VRF dropdown)
         let allKnownVrfs = [];
-        
-        // Load all VRFs from backend
-        async function loadAllVrfs() {
-            try {
-                const response = await fetch('/search-api.sh?action=get-vrfs');
-                const data = await response.json();
-                if (data.vrfs) allKnownVrfs = data.vrfs;
-            } catch(e) {}
+        let srcDetectTimeout = null;
+        let srcVrfRequestController = null;
+        let srcVrfRequestId = 0;
+        let traceController = null;
+        let traceRequestId = 0;
+
+        function toText(value) {
+            return value === null || value === undefined ? '' : String(value);
         }
-        
-        // Auto-detect VRFs for source IP
-        async function detectSrcVrfs() {
-            const ip = document.getElementById('sourceIp').value.trim();
-            const sel = document.getElementById('srcVrfSelect');
-            
-            if (!ip || !/^(\d{1,3}\.){3}\d{1,3}$/.test(ip)) {
-                sel.innerHTML = '<option value="">auto</option>';
-                return;
-            }
-            
-            try {
-                const response = await fetch(`/search-api.sh?action=find-ip-vrf&ip=${encodeURIComponent(ip)}`);
-                const data = await response.json();
-                const prev = sel.value;
-                sel.innerHTML = '<option value="">auto</option>';
-                
-                if (data.vrfs && data.vrfs.length > 0) {
-                    data.vrfs.forEach(vrf => {
-                        const opt = document.createElement('option');
-                        opt.value = vrf;
-                        opt.textContent = vrf;
-                        sel.appendChild(opt);
-                    });
-                    // Select first detected VRF (or keep previous)
-                    if (prev && [...sel.options].some(o => o.value === prev)) {
-                        sel.value = prev;
-                    } else {
-                        sel.value = data.vrfs[0];
-                    }
-                }
-                // Sync dest VRF to match
-                syncDstVrf();
-            } catch(e) {
-                sel.innerHTML = '<option value="">auto</option>';
-            }
+
+        // Every value interpolated into result markup passes through this helper.
+        function escapeHtml(value) {
+            return toText(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
-        
-        // Sync dest VRF: default = source VRF, but show all VRFs as options
-        function syncDstVrf() {
+
+        function isValidIpv4(value) {
+            const octets = toText(value).split('.');
+            return octets.length === 4 && octets.every(octet =>
+                /^\d{1,3}$/.test(octet) &&
+                (octet === '0' || !octet.startsWith('0')) &&
+                Number(octet) >= 0 && Number(octet) <= 255
+            );
+        }
+
+        function normalizeVrfList(vrfs) {
+            if (!Array.isArray(vrfs)) return [];
+            return [...new Set(vrfs
+                .filter(vrf => typeof vrf === 'string')
+                .map(vrf => vrf.trim())
+                .filter(Boolean))];
+        }
+
+        function setVrfOptions(select, vrfs, selectedValue = '', includeSelected = false) {
+            const selected = toText(selectedValue).trim();
+            const values = normalizeVrfList(vrfs);
+            if (includeSelected && selected && !values.includes(selected)) {
+                values.unshift(selected);
+            }
+
+            const options = [];
+            const autoOption = document.createElement('option');
+            autoOption.value = '';
+            autoOption.textContent = 'VRF: auto';
+            options.push(autoOption);
+
+            values.forEach(vrf => {
+                const option = document.createElement('option');
+                option.value = vrf;
+                option.textContent = vrf;
+                options.push(option);
+            });
+
+            select.replaceChildren(...options);
+            select.value = selected && values.includes(selected) ? selected : '';
+        }
+
+        // Sync destination VRF while preserving an explicit user choice by default.
+        function syncDstVrf(options = {}) {
             const srcVrf = document.getElementById('srcVrfSelect').value;
-            const dstSel = document.getElementById('dstVrfSelect');
-            const prev = dstSel.value;
-            
-            dstSel.innerHTML = '';
-            
-            // Build VRF list: source VRF first, then all others
-            const vrfSet = new Set(allKnownVrfs);
+            const dstSelect = document.getElementById('dstVrfSelect');
+            const previous = dstSelect.value;
+            const hasPreferred = Object.prototype.hasOwnProperty.call(options, 'preferredVrf');
+            const preferred = hasPreferred ? toText(options.preferredVrf).trim() : '';
+            const preservePrevious = options.preservePrevious !== false;
+
+            const vrfSet = new Set(normalizeVrfList(allKnownVrfs));
             if (srcVrf) vrfSet.add(srcVrf);
+            if (previous) vrfSet.add(previous);
+            if (preferred) vrfSet.add(preferred);
+
             const vrfList = [...vrfSet].sort((a, b) => {
                 if (a === srcVrf) return -1;
                 if (b === srcVrf) return 1;
@@ -676,35 +650,305 @@
                 if (b === 'mgmt') return -1;
                 return a.localeCompare(b);
             });
-            
-            vrfList.forEach(vrf => {
-                const opt = document.createElement('option');
-                opt.value = vrf;
-                opt.textContent = vrf;
-                dstSel.appendChild(opt);
-            });
-            
-            // Keep previous selection if valid, otherwise default to source VRF
-            if (prev && [...dstSel.options].some(o => o.value === prev)) {
-                dstSel.value = prev;
+
+            let selected = '';
+            if (hasPreferred) {
+                selected = preferred;
+            } else if (preservePrevious && previous) {
+                selected = previous;
             } else if (srcVrf) {
-                dstSel.value = srcVrf;
+                selected = srcVrf;
+            }
+
+            setVrfOptions(dstSelect, vrfList, selected, true);
+        }
+
+        function cancelSrcVrfDetection() {
+            if (srcDetectTimeout !== null) {
+                clearTimeout(srcDetectTimeout);
+                srcDetectTimeout = null;
+            }
+            srcVrfRequestId += 1;
+            if (srcVrfRequestController) {
+                srcVrfRequestController.abort();
+                srcVrfRequestController = null;
+            }
+            document.getElementById('srcVrfSelect').setAttribute('aria-busy', 'false');
+        }
+
+        // Swap source and destination (IP + VRF)
+        function swapSrcDst() {
+            if (traceController) {
+                cancelTraceRequest();
+                resetResultsDisplay();
+            }
+            const srcIp = document.getElementById('sourceIp');
+            const dstIp = document.getElementById('destinationIp');
+            const srcVrf = document.getElementById('srcVrfSelect');
+            const dstVrf = document.getElementById('dstVrfSelect');
+
+            const oldSourceIp = srcIp.value;
+            const oldDestinationIp = dstIp.value;
+            const oldSourceVrf = srcVrf.value;
+            // Destination "auto" has the effective meaning of the source VRF.
+            const oldDestinationVrf = dstVrf.value || oldSourceVrf;
+
+            cancelSrcVrfDetection();
+            srcIp.value = oldDestinationIp;
+            dstIp.value = oldSourceIp;
+
+            setVrfOptions(srcVrf, oldDestinationVrf ? [oldDestinationVrf] : [], oldDestinationVrf, true);
+            syncDstVrf({ preferredVrf: oldSourceVrf, preservePrevious: false });
+
+            // Refresh available VRFs for the new source without losing the swapped choice.
+            detectSrcVrfs(oldDestinationVrf, true);
+        }
+
+        function handleSwapKey(event) {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                swapSrcDst();
+            }
+        }
+        
+        // Load device count on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadDeviceCount();
+        });
+
+        async function fetchJsonWithTimeout(url, timeoutMs = LOOKUP_TIMEOUT_MS) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(url, { signal: controller.signal });
+                return await parseJsonResponse(response);
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+        
+        async function loadDeviceCount() {
+            const countElement = document.getElementById('deviceCount');
+            const countContainer = countElement.parentElement;
+            const safeCount = value => {
+                const number = Number(value);
+                return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+            };
+
+            // Prefer scan coverage: stale cache is still usable, unavailable is not.
+            try {
+                const data = await fetchJsonWithTimeout('/search-api.sh?action=scan-status');
+                const hasCurrent = Object.prototype.hasOwnProperty.call(data, 'current_count');
+                const hasStale = Object.prototype.hasOwnProperty.call(data, 'stale_count');
+                if (data.success === false || !hasCurrent || !hasStale) {
+                    throw new Error('Scan status counts are unavailable');
+                }
+
+                const current = safeCount(data.current_count);
+                const stale = safeCount(data.stale_count);
+                const unavailable = safeCount(data.unavailable_count);
+                countElement.textContent = current + stale;
+                countContainer.title = `Current: ${current} • Stale: ${stale} • Unavailable: ${unavailable}`;
+                return;
+            } catch (scanStatusError) {
+                // Older deployments may not expose scan-status; retain the inventory fallback.
+            }
+
+            try {
+                const data = await fetchJsonWithTimeout('/search-api.sh?action=list-devices');
+                if (Array.isArray(data.devices)) {
+                    countElement.textContent = data.devices.length;
+                    countContainer.title = 'Inventory count (scan status unavailable)';
+                }
+            } catch (error) {
+                console.error('Error loading device count:', error);
+            }
+        }
+        
+        // Load all VRFs from backend
+        async function loadAllVrfs() {
+            try {
+                const response = await fetch('/search-api.sh?action=get-vrfs');
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+                allKnownVrfs = normalizeVrfList(data.vrfs);
+                syncDstVrf();
+            } catch(e) {}
+        }
+        
+        // Auto-detect VRFs for source IP
+        async function detectSrcVrfs(preferredVrf, preservePreferred = false) {
+            if (srcDetectTimeout !== null) {
+                clearTimeout(srcDetectTimeout);
+                srcDetectTimeout = null;
+            }
+            if (srcVrfRequestController) {
+                srcVrfRequestController.abort();
+                srcVrfRequestController = null;
+            }
+
+            const ip = document.getElementById('sourceIp').value.trim();
+            const sel = document.getElementById('srcVrfSelect');
+            sel.setAttribute('aria-busy', 'false');
+            const selectionAtStart = sel.value;
+            const requestedSelection = preferredVrf === undefined
+                ? selectionAtStart
+                : toText(preferredVrf).trim();
+            const requestId = ++srcVrfRequestId;
+
+            if (!ip || !isValidIpv4(ip)) {
+                const fallback = preservePreferred ? requestedSelection : '';
+                setVrfOptions(sel, fallback ? [fallback] : [], fallback, true);
+                syncDstVrf();
+                return;
+            }
+
+            const controller = new AbortController();
+            srcVrfRequestController = controller;
+            sel.setAttribute('aria-busy', 'true');
+            let didTimeout = false;
+            const timeoutId = setTimeout(() => {
+                didTimeout = true;
+                controller.abort();
+            }, LOOKUP_TIMEOUT_MS);
+
+            try {
+                const response = await fetch(
+                    `/search-api.sh?action=find-ip-vrf&ip=${encodeURIComponent(ip)}`,
+                    { signal: controller.signal }
+                );
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+
+                if (requestId !== srcVrfRequestId || controller.signal.aborted ||
+                    document.getElementById('sourceIp').value.trim() !== ip) return;
+
+                const vrfs = normalizeVrfList(data.vrfs);
+                if (preservePreferred && requestedSelection && !vrfs.includes(requestedSelection)) {
+                    vrfs.unshift(requestedSelection);
+                }
+
+                // A manual change made while the lookup was running wins.
+                const currentSelection = sel.value;
+                const candidate = currentSelection !== selectionAtStart
+                    ? currentSelection
+                    : requestedSelection;
+                const selected = candidate && vrfs.includes(candidate)
+                    ? candidate
+                    : (vrfs[0] || '');
+                setVrfOptions(sel, vrfs, selected, preservePreferred);
+                syncDstVrf();
+            } catch(e) {
+                if (requestId !== srcVrfRequestId || (controller.signal.aborted && !didTimeout)) return;
+                if (didTimeout) console.error('Source VRF lookup timed out');
+                const fallback = preservePreferred ? requestedSelection : '';
+                setVrfOptions(sel, fallback ? [fallback] : [], fallback, true);
+                syncDstVrf();
+            } finally {
+                clearTimeout(timeoutId);
+                if (requestId === srcVrfRequestId) {
+                    srcVrfRequestController = null;
+                    sel.setAttribute('aria-busy', 'false');
+                }
             }
         }
         
         // Debounced auto-detect for source IP
-        let srcDetectTimeout;
         document.getElementById('sourceIp').addEventListener('input', function() {
-            clearTimeout(srcDetectTimeout);
+            cancelActiveTraceForChangedInput();
+            cancelSrcVrfDetection();
+            // Never carry a detected VRF from the previous source address.
+            setVrfOptions(document.getElementById('srcVrfSelect'), [], '');
+            syncDstVrf();
             srcDetectTimeout = setTimeout(detectSrcVrfs, 500);
         });
-        document.getElementById('sourceIp').addEventListener('blur', detectSrcVrfs);
+        document.getElementById('sourceIp').addEventListener('blur', function() {
+            if (srcDetectTimeout !== null) clearTimeout(srcDetectTimeout);
+            srcDetectTimeout = null;
+            detectSrcVrfs();
+        });
         
         // Source VRF changed manually → sync dest VRF
-        document.getElementById('srcVrfSelect').addEventListener('change', syncDstVrf);
+        document.getElementById('srcVrfSelect').addEventListener('change', function() {
+            cancelActiveTraceForChangedInput();
+            cancelSrcVrfDetection();
+            syncDstVrf();
+        });
+        document.getElementById('dstVrfSelect').addEventListener('change', cancelActiveTraceForChangedInput);
         
         // Load all VRFs on page load
         document.addEventListener('DOMContentLoaded', loadAllVrfs);
+
+        function setTraceButtonLoading(isLoading) {
+            const button = document.getElementById('traceBtn');
+            button.disabled = isLoading;
+            button.setAttribute('aria-busy', isLoading ? 'true' : 'false');
+            button.innerHTML = isLoading
+                ? `<svg viewBox="0 0 24 24" width="16" height="16" class="spin"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z" fill="currentColor"/></svg> Tracing...`
+                : TRACE_BUTTON_HTML;
+        }
+
+        function renderError(resultsContent, title, message) {
+            resultsContent.innerHTML = `
+                <div class="error-message" role="alert">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+                    <div>
+                        <strong>${escapeHtml(title)}:</strong> ${escapeHtml(message)}
+                    </div>
+                </div>
+            `;
+        }
+
+        async function parseJsonResponse(response) {
+            const text = await response.text();
+            let data = null;
+            try {
+                data = JSON.parse(text);
+            } catch (error) {
+                if (response.ok) throw new Error('The server returned an invalid response');
+            }
+
+            if (!response.ok) {
+                const apiMessage = data && typeof data === 'object' && data.error
+                    ? toText(data.error)
+                    : '';
+                throw new Error(apiMessage || `Request failed (HTTP ${response.status})`);
+            }
+            if (!data || typeof data !== 'object' || Array.isArray(data)) {
+                throw new Error('The server returned an invalid response');
+            }
+            return data;
+        }
+
+        function dataWarningMessages(data) {
+            if (!data || !Array.isArray(data.warnings)) return [];
+            return data.warnings.map(warning => {
+                if (typeof warning === 'string') return warning.trim();
+                if (!warning || typeof warning !== 'object') return '';
+                return toText(warning.message || warning.code).trim();
+            }).filter(Boolean);
+        }
+
+        function setResultsInfo(baseText, data = null) {
+            const resultsInfo = document.getElementById('resultsInfo');
+            const warnings = dataWarningMessages(data);
+            const warningText = warnings.length > 0
+                ? `⚠ ${warnings.length} data warning${warnings.length === 1 ? '' : 's'}`
+                : '';
+            resultsInfo.textContent = baseText && warningText
+                ? `${baseText} • ${warningText}`
+                : (baseText || warningText);
+
+            const tooltipLines = [...warnings];
+            if (data && data.path_basis) {
+                tooltipLines.push('Path inferred from cached FIB and active LLDP data.');
+            }
+            if (tooltipLines.length > 0) {
+                resultsInfo.title = tooltipLines.join('\n');
+            } else {
+                resultsInfo.removeAttribute('title');
+            }
+        }
         
         async function tracePath() {
             const sourceIp = document.getElementById('sourceIp').value.trim();
@@ -715,7 +959,11 @@
             const vrf = srcVrf; // backward compat: primary VRF hint
             const btn = document.getElementById('traceBtn');
             const resultsContent = document.getElementById('resultsContent');
-            const resultsInfo = document.getElementById('resultsInfo');
+
+            // The disabled button does not prevent keyboard handlers from calling this function.
+            if (traceController || btn.disabled) return;
+            // Freeze the VRF selection used by this request.
+            cancelSrcVrfDetection();
             
             if (!sourceIp) {
                 showAlertModal('Please enter a source IP address');
@@ -727,158 +975,188 @@
                 return;
             }
             
-            // Validate IP format
-            const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
-            if (!ipRegex.test(sourceIp)) {
+            // Validate complete IPv4 addresses, including the 0-255 octet range.
+            if (!isValidIpv4(sourceIp)) {
                 showAlertModal('Please enter a valid source IP address');
                 return;
             }
-            if (!ipRegex.test(destIp)) {
+            if (!isValidIpv4(destIp)) {
                 showAlertModal('Please enter a valid destination IP address');
                 return;
             }
-            
+
+            const requestId = ++traceRequestId;
+            const controller = new AbortController();
+            traceController = controller;
+            let didTimeout = false;
+            const timeoutId = setTimeout(() => {
+                didTimeout = true;
+                controller.abort();
+            }, TRACE_TIMEOUT_MS);
+
             // Show loading
-            btn.disabled = true;
-            btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" class="spin"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z" fill="currentColor"/></svg> Tracing...`;
-            
+            setTraceButtonLoading(true);
+            setResultsInfo('');
+            resultsContent.setAttribute('aria-busy', 'true');
             resultsContent.innerHTML = `
                 <div class="loading">
-                    <svg viewBox="0 0 24 24"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg>
-                    <span>Tracing path from ${sourceIp} to ${destIp}...</span>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg>
+                    <span>Tracing path from ${escapeHtml(sourceIp)} to ${escapeHtml(destIp)}...</span>
                 </div>
             `;
-            
+
             try {
-                const response = await fetch(`/search-api.sh?action=trace-path-ip&source_ip=${encodeURIComponent(sourceIp)}&dest_ip=${encodeURIComponent(destIp)}&vrf=${encodeURIComponent(srcVrf)}&dst_vrf=${encodeURIComponent(dstVrf)}`);
-                const data = await response.json();
-                
+                const response = await fetch(
+                    `/search-api.sh?action=trace-path-ip&source_ip=${encodeURIComponent(sourceIp)}&dest_ip=${encodeURIComponent(destIp)}&vrf=${encodeURIComponent(srcVrf)}&dst_vrf=${encodeURIComponent(dstVrf)}`,
+                    { signal: controller.signal }
+                );
+                const data = await parseJsonResponse(response);
+
+                if (requestId !== traceRequestId || controller.signal.aborted) return;
+
                 if (data.error) {
-                    resultsContent.innerHTML = `
-                        <div class="error-message">
-                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-                            <div>
-                                <strong>Error:</strong> ${data.error}
-                            </div>
-                        </div>
-                    `;
-                    resultsInfo.textContent = '';
-                } else if (data.path && data.path.length > 0) {
+                    renderError(resultsContent, 'Error', data.error);
+                    setResultsInfo('', data);
+                } else if (Array.isArray(data.path) && data.path.length > 0) {
                     renderPath(data, sourceIp, destIp, data.vrf || vrf);
                 } else {
                     resultsContent.innerHTML = `
                         <div class="no-path">
-                            <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
                             <h3>No Path Found</h3>
-                            <p>Could not find a route from ${sourceIp} to ${destIp}</p>
+                            <p>Could not find a route from ${escapeHtml(sourceIp)} to ${escapeHtml(destIp)}</p>
                         </div>
                     `;
-                    resultsInfo.textContent = '';
+                    setResultsInfo('', data);
                 }
             } catch (error) {
-                resultsContent.innerHTML = `
-                    <div class="error-message">
-                        <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
-                        <div>
-                            <strong>Connection Error:</strong> ${error.message}
-                        </div>
-                    </div>
-                `;
-                resultsInfo.textContent = '';
+                if (requestId !== traceRequestId || (controller.signal.aborted && !didTimeout)) return;
+                const message = didTimeout
+                    ? 'The trace request timed out. Please try again.'
+                    : (error && error.message ? error.message : 'Unable to complete the trace request');
+                renderError(resultsContent, 'Connection Error', message);
+                setResultsInfo('');
             } finally {
-                btn.disabled = false;
-                btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z" fill="currentColor"/></svg> Trace`;
+                clearTimeout(timeoutId);
+                if (requestId === traceRequestId) {
+                    traceController = null;
+                    resultsContent.setAttribute('aria-busy', 'false');
+                    setTraceButtonLoading(false);
+                }
             }
         }
         
         // Link health badge for ECMP/transit hops
         function linkHealthBadge(hop) {
-            const up = hop.links_up || 0;
-            const down = hop.links_down || 0;
+            const normalizeCount = value => {
+                const number = Number(value);
+                return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+            };
+            const up = normalizeCount(hop.links_up);
+            const down = normalizeCount(hop.links_down);
+            const mismatch = normalizeCount(hop.links_mismatch);
             const total = up + down;
             if (total === 0) return '';
+            const mismatchTitle = mismatch > 0
+                ? ` title="${mismatch} LLDP validation mismatch${mismatch === 1 ? '' : 'es'}"`
+                : '';
             if (down > 0) {
-                return `<span style="color:#f44336;font-size:12px;margin-left:6px;">⚠ ${up}/${total} links up</span>`;
+                return `<span${mismatchTitle} style="color:#f44336;font-size:12px;margin-left:6px;">⚠ ${up}/${total} links up</span>`;
             }
-            return `<span style="color:#555;font-size:12px;margin-left:6px;">${total} links</span>`;
+            return `<span${mismatchTitle} style="color:#555;font-size:12px;margin-left:6px;">${total} links</span>`;
         }
         
         function renderPath(data, sourceIp, destIp, vrf) {
             const resultsContent = document.getElementById('resultsContent');
-            const resultsInfo = document.getElementById('resultsInfo');
-            
-            const path = data.path;
-            const hopCount = path.length;
-            
-            resultsInfo.textContent = `${hopCount} hop${hopCount > 1 ? 's' : ''} from ${sourceIp} to ${destIp}`;
-            
+
+            const path = Array.isArray(data.path)
+                ? data.path.filter(hop => hop && typeof hop === 'object' && !Array.isArray(hop))
+                : [];
+            const hopCount = path.filter(hop =>
+                hop.role !== 'endpoint_src' && hop.role !== 'endpoint_dst'
+            ).length;
+
+            setResultsInfo(
+                `${hopCount} hop${hopCount > 1 ? 's' : ''} from ${sourceIp} to ${destIp}`,
+                data
+            );
+
             // Parse VRFs for source and dest
-            const vrfParts = vrf.includes('->') ? vrf.split('->').map(s => s.trim()) : [vrf, vrf];
-            const srcVrf = vrfParts[0] || vrf;
-            const dstVrf = vrfParts[1] || vrf;
-            
-            const isInterVrf = data.inter_vrf || srcVrf !== dstVrf;
-            
+            const vrfText = toText(vrf);
+            const vrfParts = vrfText.includes('->')
+                ? vrfText.split('->').map(part => part.trim())
+                : [vrfText, vrfText];
+            const srcVrf = vrfParts[0] || vrfText;
+            const dstVrf = vrfParts[1] || vrfText;
+            const sourceDevice = toText(data.source_device);
+            const destinationDevice = toText(data.dest_device);
+            const routeLeak = data.route_leak && typeof data.route_leak === 'object' && !Array.isArray(data.route_leak)
+                ? data.route_leak
+                : null;
+            const isInterVrf = data.inter_vrf === true || srcVrf !== dstVrf;
+
             let html = `
                 <div class="path-summary">
                     <div class="summary-item">
                         <div class="summary-label">Source IP</div>
-                        <div class="summary-value">${sourceIp}</div>
+                        <div class="summary-value">${escapeHtml(sourceIp)}</div>
                     </div>
-                    ${data.source_device ? `
+                    ${sourceDevice ? `
                     <div class="summary-item">
                         <div class="summary-label">Source Device</div>
-                        <div class="summary-value">${data.source_device}</div>
+                        <div class="summary-value">${escapeHtml(sourceDevice)}</div>
                     </div>
                     ` : ''}
                     <div class="summary-item">
                         <div class="summary-label">Source VRF</div>
-                        <div class="summary-value">${srcVrf}</div>
+                        <div class="summary-value">${escapeHtml(srcVrf)}</div>
                     </div>
                     ${isInterVrf ? `
                     <div class="summary-item">
                         <div class="summary-label">VRF Path</div>
-                        <div class="summary-value" style="color:#ff7043;">${srcVrf} → ${dstVrf}</div>
+                        <div class="summary-value" style="color:#ff7043;">${escapeHtml(srcVrf)} → ${escapeHtml(dstVrf)}</div>
                     </div>
                     ` : ''}
                     <div class="summary-item">
                         <div class="summary-label">Destination IP</div>
-                        <div class="summary-value">${destIp}</div>
+                        <div class="summary-value">${escapeHtml(destIp)}</div>
                     </div>
-                    ${data.dest_device ? `
+                    ${destinationDevice ? `
                     <div class="summary-item">
                         <div class="summary-label">Dest Device</div>
-                        <div class="summary-value">${data.dest_device}</div>
+                        <div class="summary-value">${escapeHtml(destinationDevice)}</div>
                     </div>
                     ` : ''}
                     <div class="summary-item">
                         <div class="summary-label">Dest VRF</div>
-                        <div class="summary-value">${dstVrf}</div>
+                        <div class="summary-value">${escapeHtml(dstVrf)}</div>
                     </div>
                     <div class="summary-item">
                         <div class="summary-label">Hops</div>
                         <div class="summary-value hops">${hopCount}</div>
                     </div>
-                    ${data.route_leak ? `
+                    ${routeLeak ? `
                     <div class="summary-item">
                         <div class="summary-label">Route Leak</div>
-                        <div class="summary-value" style="color:#ffa726;">${data.route_leak.from_vrf} → ${data.route_leak.to_vrf} <span style="color:#999;font-size:14px;">(${data.route_leak.prefix})</span></div>
+                        <div class="summary-value" style="color:#ffa726;">${escapeHtml(routeLeak.from_vrf)} → ${escapeHtml(routeLeak.to_vrf)} <span style="color:#999;font-size:14px;">(${escapeHtml(routeLeak.prefix)})</span></div>
                     </div>
                     ` : ''}
                 </div>
-                <div class="path-container">
+                <div class="path-container" role="list" aria-label="Network path hops">
             `;
-            
+
             path.forEach((hop, index) => {
-                const isEndpoint = hop.role === 'endpoint_src' || hop.role === 'endpoint_dst';
-                const isSource = hop.role === 'source' || hop.role === 'source+destination';
-                const isDest = hop.role === 'destination' || hop.role === 'source+destination';
-                const isEcmp = hop.role === 'ecmp';
-                const isCore = isEcmp && hop.tier === 2;
-                const isExternal = hop.role === 'external';
-                const isBorder = hop.role === 'border';
+                const role = toText(hop.role);
+                const tier = Number(hop.tier);
+                const isEndpoint = role === 'endpoint_src' || role === 'endpoint_dst';
+                const isSource = role === 'source' || role === 'source+destination';
+                const isDest = role === 'destination' || role === 'source+destination';
+                const isEcmp = role === 'ecmp';
+                const isCore = tier === 2 && (isEcmp || role === 'transit');
+                const isExternal = role === 'external';
+                const isBorder = role === 'border';
                 const isLast = index === path.length - 1;
-                
+
                 let hopClass = '';
                 if (isEndpoint) hopClass = 'endpoint';
                 else if (isExternal) hopClass = 'external';
@@ -887,106 +1165,120 @@
                 else if (isDest) hopClass = 'destination';
                 else if (isCore) hopClass = 'core';
                 else if (isEcmp) hopClass = 'ecmp';
-                
-                const indent = (hop.indent || 0) * 60;
-                
+
+                const rawIndent = Number(hop.indent);
+                const indentLevel = Number.isFinite(rawIndent)
+                    ? Math.min(20, Math.max(0, rawIndent))
+                    : 0;
+                const indent = Math.round(indentLevel * 60);
+
                 // Endpoint hops (source/dest IP - just a simple line)
                 if (isEndpoint) {
-                    const label = hop.role === 'endpoint_src' ? 'Source Host' : 'Destination Host';
+                    const label = role === 'endpoint_src' ? 'Source Host' : 'Destination Host';
                     html += `
-                        <div class="path-hop" style="margin-left: ${indent}px;">
+                        <div class="path-hop" role="listitem" style="margin-left: ${indent}px;">
                             <div class="hop-line">
-                                <div class="hop-dot endpoint"></div>
+                                <div class="hop-dot endpoint" aria-hidden="true"></div>
                                 ${!isLast ? '<div class="hop-connector"></div>' : ''}
                             </div>
                             <div class="hop-card endpoint">
                                 <div class="hop-header">
-                                    <div class="hop-device">${hop.device} <span style="color:#888;font-size:12px;margin-left:8px;">${label}</span></div>
+                                    <div class="hop-device">${escapeHtml(hop.device)} <span style="color:#888;font-size:12px;margin-left:8px;">${label}</span></div>
                                 </div>
                             </div>
                         </div>
                     `;
                     return;
                 }
-                
+
                 let roleLabel = '';
-                if (hop.role === 'source') roleLabel = `<span style="color:#4fc3f7;font-size:12px;margin-left:8px;">Source Leaf</span>`;
-                else if (hop.role === 'destination') roleLabel = `<span style="color:#26c6da;font-size:12px;margin-left:8px;">Destination Leaf</span>`;
-                else if (hop.role === 'source+destination') roleLabel = `<span style="color:#76b900;font-size:12px;margin-left:8px;">Source & Destination (same device)</span>`;
-                else if (isCore) {
+                if (role === 'source') roleLabel = `<span style="color:#4fc3f7;font-size:12px;margin-left:8px;">Source Leaf</span>`;
+                else if (role === 'destination') roleLabel = `<span style="color:#26c6da;font-size:12px;margin-left:8px;">Destination Leaf</span>`;
+                else if (role === 'source+destination') roleLabel = `<span style="color:#76b900;font-size:12px;margin-left:8px;">Source &amp; Destination (same device)</span>`;
+                else if (isCore && isEcmp) {
                     roleLabel = `<span style="color:#42a5f5;font-size:12px;margin-left:8px;">⇉ ECMP</span>`;
                     roleLabel += linkHealthBadge(hop);
                 }
-                else if (hop.role === 'ecmp') {
+                else if (isEcmp) {
                     roleLabel = `<span style="color:#ffa726;font-size:12px;margin-left:8px;">⇉ ECMP</span>`;
                     roleLabel += linkHealthBadge(hop);
                 }
-                else if (hop.role === 'external') roleLabel = `<span style="color:#ff7043;font-size:12px;margin-left:8px;">⚡ External (Firewall / Router)</span>`;
-                else if (hop.role === 'border') roleLabel = `<span style="color:#ab47bc;font-size:12px;margin-left:8px;">↕ ${hop.label || 'Border Leaf'}</span>`;
-                else if (hop.role === 'transit') {
-                    roleLabel = `<span style="color:#888;font-size:12px;margin-left:8px;">Transit</span>`;
+                else if (role === 'external') roleLabel = `<span style="color:#ff7043;font-size:12px;margin-left:8px;">⚡ External (Firewall / Router)</span>`;
+                else if (role === 'border') roleLabel = `<span style="color:#ab47bc;font-size:12px;margin-left:8px;">↕ ${escapeHtml(hop.label || 'Border Leaf')}</span>`;
+                else if (role === 'transit') {
+                    const transitLabel = toText(hop.label) || (tier === 2 ? 'Core' : (tier === 1 ? 'Spine' : 'Transit'));
+                    const transitColor = isCore ? '#42a5f5' : '#888';
+                    roleLabel = `<span style="color:${transitColor};font-size:12px;margin-left:8px;">${escapeHtml(transitLabel)}</span>`;
                     roleLabel += linkHealthBadge(hop);
                 }
-                
+
                 // ECMP device list
                 let ecmpDevicesHtml = '';
-                if (hop.devices && hop.devices.length > 0) {
+                if (Array.isArray(hop.devices) && hop.devices.length > 0) {
                     ecmpDevicesHtml = `
                         <div class="ecmp-devices">
-                            ${hop.devices.map(d => `<span class="ecmp-device-tag">${d}</span>`).join('')}
+                            ${hop.devices.map(device => `<span class="ecmp-device-tag">${escapeHtml(device)}</span>`).join('')}
                         </div>
                     `;
                 }
-                
+
+                const hopVrf = toText(hop.vrf);
+                const hopInterface = toText(hop.interface);
+                const hopNexthop = toText(hop.nexthop);
+                const hopPrefix = toText(hop.prefix);
+                const hopProtocol = toText(hop.protocol);
+                const hopSourceVrf = toText(hop.src_vrf);
+                const hopDestinationVrf = toText(hop.dst_vrf);
+
                 html += `
-                    <div class="path-hop" style="margin-left: ${indent}px;">
+                    <div class="path-hop" role="listitem" style="margin-left: ${indent}px;">
                         <div class="hop-line">
-                            <div class="hop-dot ${hopClass}"></div>
+                            <div class="hop-dot ${hopClass}" aria-hidden="true"></div>
                             ${!isLast ? '<div class="hop-connector"></div>' : ''}
                         </div>
                         <div class="hop-card ${hopClass}">
                             <div class="hop-header">
                                 <div class="hop-device">
-                                    ${hop.device}
-                                    ${hop.vrf && hop.vrf !== 'default' ? `<span class="vrf-badge">${hop.vrf}</span>` : ''}
+                                    ${escapeHtml(hop.device)}
+                                    ${hopVrf && hopVrf !== 'default' ? `<span class="vrf-badge">${escapeHtml(hopVrf)}</span>` : ''}
                                     ${roleLabel}
                                 </div>
                             </div>
                             <div class="hop-details">
-                                ${hop.interface ? `
+                                ${hopInterface ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">Interface:</span>
-                                    <span class="hop-detail-value interface">${hop.interface}</span>
+                                    <span class="hop-detail-value interface">${escapeHtml(hopInterface)}</span>
                                 </div>
                                 ` : ''}
-                                ${hop.nexthop && hop.nexthop !== 'ECMP' && !isDest ? `
+                                ${hopNexthop && hopNexthop !== 'ECMP' && !isDest ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">Next Hop:</span>
-                                    <span class="hop-detail-value nexthop">${hop.nexthop}</span>
+                                    <span class="hop-detail-value nexthop">${escapeHtml(hopNexthop)}</span>
                                 </div>
                                 ` : ''}
-                                ${hop.nexthop === 'ECMP' ? `
+                                ${hopNexthop === 'ECMP' ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">Next Hop:</span>
                                     <span class="hop-detail-value nexthop">ECMP (multiple paths)</span>
                                 </div>
                                 ` : ''}
-                                ${hop.prefix && hop.prefix !== 'local' ? `
+                                ${hopPrefix && hopPrefix !== 'local' ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">Route:</span>
-                                    <span class="hop-detail-value">${hop.prefix}</span>
+                                    <span class="hop-detail-value">${escapeHtml(hopPrefix)}</span>
                                 </div>
                                 ` : ''}
-                                ${hop.protocol && !isDest && !isExternal ? `
+                                ${hopProtocol && !isDest && !isExternal ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">Protocol:</span>
-                                    <span class="hop-detail-value">${hop.protocol}</span>
+                                    <span class="hop-detail-value">${escapeHtml(hopProtocol)}</span>
                                 </div>
                                 ` : ''}
-                                ${isExternal && hop.src_vrf ? `
+                                ${isExternal && hopSourceVrf ? `
                                 <div class="hop-detail">
                                     <span class="hop-detail-label">VRF Transition:</span>
-                                    <span class="hop-detail-value" style="color:#ff7043;">${hop.src_vrf} → ${hop.dst_vrf}</span>
+                                    <span class="hop-detail-value" style="color:#ff7043;">${escapeHtml(hopSourceVrf)} → ${escapeHtml(hopDestinationVrf)}</span>
                                 </div>
                                 ` : ''}
                             </div>
@@ -999,37 +1291,62 @@
             html += '</div>';
             resultsContent.innerHTML = html;
         }
-        
-        function clearResults() {
-            document.getElementById('destinationIp').value = '';
-            syncDstVrf();
-            document.getElementById('resultsInfo').textContent = '';
-            document.getElementById('resultsContent').innerHTML = `
+
+        function resetResultsDisplay() {
+            const resultsContent = document.getElementById('resultsContent');
+            resultsContent.setAttribute('aria-busy', 'false');
+            setResultsInfo('');
+            resultsContent.innerHTML = `
                 <div class="placeholder-text">
                     Enter source and destination IP addresses and click Trace to discover the network path
                 </div>
             `;
         }
+
+        function cancelTraceRequest() {
+            traceRequestId += 1;
+            const activeController = traceController;
+            traceController = null;
+            if (activeController) activeController.abort();
+            document.getElementById('resultsContent').setAttribute('aria-busy', 'false');
+            setTraceButtonLoading(false);
+        }
+
+        function cancelActiveTraceForChangedInput() {
+            if (!traceController) return;
+            cancelTraceRequest();
+            resetResultsDisplay();
+        }
+
+        function clearResults() {
+            cancelTraceRequest();
+            document.getElementById('destinationIp').value = '';
+            syncDstVrf({ preferredVrf: '', preservePrevious: false });
+            resetResultsDisplay();
+        }
         
         // Allow Enter key to trigger trace
-        document.getElementById('destinationIp').addEventListener('keypress', function(e) {
+        document.getElementById('destinationIp').addEventListener('input', cancelActiveTraceForChangedInput);
+        document.getElementById('destinationIp').addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
+                e.preventDefault();
                 tracePath();
             }
         });
-        document.getElementById('sourceIp').addEventListener('keypress', function(e) {
+        document.getElementById('sourceIp').addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
+                e.preventDefault();
                 document.getElementById('destinationIp').focus();
             }
         });
     </script>
 
     <!-- Alert Modal (dark themed, replaces browser alert()) -->
-    <div id="alert-modal" class="alert-modal" onclick="if(event.target === this) closeAlertModal()">
-        <div class="alert-modal-content">
+    <div id="alert-modal" class="alert-modal" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="alert-modal-title" aria-describedby="alert-modal-message" onclick="if(event.target === this) closeAlertModal()">
+        <div class="alert-modal-content" role="document">
             <div class="alert-modal-header">
                 <h3 id="alert-modal-title">Validation</h3>
-                <button class="alert-modal-close" onclick="closeAlertModal()">&times;</button>
+                <button type="button" class="alert-modal-close" aria-label="Close validation dialog" onclick="closeAlertModal()">&times;</button>
             </div>
             <div class="alert-modal-body">
                 <p id="alert-modal-message"></p>
@@ -1089,14 +1406,49 @@
     </style>
 
     <script>
+        let alertPreviousFocus = null;
+
         function showAlertModal(message, title = 'Validation') {
+            const modal = document.getElementById('alert-modal');
+            alertPreviousFocus = document.activeElement;
             document.getElementById('alert-modal-title').textContent = title;
             document.getElementById('alert-modal-message').textContent = message;
-            document.getElementById('alert-modal').classList.add('visible');
+            modal.setAttribute('aria-hidden', 'false');
+            modal.classList.add('visible');
+            modal.querySelector('.alert-modal-close').focus();
         }
+
         function closeAlertModal() {
-            document.getElementById('alert-modal').classList.remove('visible');
+            const modal = document.getElementById('alert-modal');
+            if (!modal.classList.contains('visible')) return;
+            modal.classList.remove('visible');
+            modal.setAttribute('aria-hidden', 'true');
+            if (alertPreviousFocus && document.contains(alertPreviousFocus)) {
+                alertPreviousFocus.focus();
+            }
+            alertPreviousFocus = null;
         }
+
+        document.getElementById('alert-modal').addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeAlertModal();
+                return;
+            }
+            if (event.key !== 'Tab') return;
+
+            const focusable = [...this.querySelectorAll('button:not([disabled])')];
+            if (focusable.length === 0) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        });
     </script>
 </body>
 </html>

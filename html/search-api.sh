@@ -129,7 +129,7 @@ get_mac_table() {
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         # Get bridge FDB (MAC table)
-        /usr/sbin/bridge fdb show 2>/dev/null | grep -v "permanent\|self" | head -500
+        /usr/sbin/bridge fdb show 2>/dev/null
     ' 2>/dev/null)
     
     if [[ $? -ne 0 ]]; then
@@ -140,15 +140,22 @@ get_mac_table() {
     # Keep SSH output on stdin so device-controlled text is never Python source.
     printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
+import re
 import sys
 
 output = sys.stdin.read()
 search = sys.argv[1].lower()
 
 entries = []
+parse_candidates = 0
+parsed_count = 0
+malformed_count = 0
 for line in output.strip().split('\n'):
     if not line.strip():
         continue
+    if "permanent" in line or "self" in line:
+        continue
+    parse_candidates += 1
     
     parts = line.split()
     if len(parts) >= 3:
@@ -161,6 +168,11 @@ for line in output.strip().split('\n'):
                 iface = parts[i + 1]
             if p == "vlan" and i + 1 < len(parts):
                 vlan = parts[i + 1]
+
+        if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac) or not iface:
+            malformed_count += 1
+            continue
+        parsed_count += 1
         
         entry = {
             "mac": mac,
@@ -175,8 +187,26 @@ for line in output.strip().split('\n'):
                 entries.append(entry)
         else:
             entries.append(entry)
+    else:
+        malformed_count += 1
 
-print(json.dumps({"success": True, "entries": entries[:200], "total": len(entries)}))
+if parse_candidates and parsed_count == 0:
+    print(json.dumps({"success": False, "error": "Unable to parse MAC table response"}))
+else:
+    limit = 200
+    returned = entries[:limit]
+    print(json.dumps({
+        "success": True,
+        "entries": returned,
+        "total": len(entries),
+        "returned_total": len(returned),
+        "limit": limit,
+        "truncated": len(returned) < len(entries),
+        "complete": malformed_count == 0,
+        "partial": malformed_count > 0,
+        "warnings": ([f"Skipped {malformed_count} malformed MAC entr{'y' if malformed_count == 1 else 'ies'}"]
+                     if malformed_count else []),
+    }))
 PYTHON
 }
 
@@ -199,7 +229,9 @@ get_arp_table() {
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         # Get ARP table (single query, no duplicates)
-        /usr/sbin/ip neigh show 2>/dev/null | head -300
+        if ! /usr/sbin/ip neigh show 2>/dev/null; then
+            exit 41
+        fi
         echo "---VRF_MAP---"
         # Get VRF list
         /usr/sbin/ip vrf list 2>/dev/null
@@ -219,6 +251,7 @@ get_arp_table() {
     
     # Keep SSH output on stdin so device-controlled text is never Python source.
     printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
+import ipaddress
 import json
 import re
 import sys
@@ -226,8 +259,14 @@ import sys
 output = sys.stdin.read()
 search = sys.argv[1].lower()
 
-# Parse sections
-sections = output.split("---VRF_MAP---")
+# Parse sections. Both delimiters are emitted by the remote command; missing
+# delimiters mean the response was incomplete and must not look like an empty
+# but successful neighbor table.
+if "---VRF_MAP---" not in output or "---IFACE_VRF---" not in output:
+    print(json.dumps({"success": False, "error": "Incomplete ARP table response"}))
+    raise SystemExit(0)
+
+sections = output.split("---VRF_MAP---", 1)
 arp_lines = sections[0].strip().split('\n') if len(sections) > 0 else []
 
 vrf_list = set()
@@ -251,47 +290,73 @@ if len(sections) > 1:
                     iface_to_vrf[iface] = master
 
 entries = []
+malformed_count = 0
 for line in arp_lines:
     if not line.strip():
         continue
     
     parts = line.split()
-    if len(parts) >= 4:
-        ip_addr = parts[0]
-        mac = ""
-        iface = ""
-        state = ""
-        
-        for i, p in enumerate(parts):
-            if p == "dev" and i + 1 < len(parts):
-                iface = parts[i + 1]
-            if p == "lladdr" and i + 1 < len(parts):
-                mac = parts[i + 1]
-        
-        if parts[-1] in ["REACHABLE", "STALE", "DELAY", "PROBE", "FAILED", "PERMANENT"]:
-            state = parts[-1]
-        
-        if mac:
-            # Skip VRR interfaces
-            if iface and re.search(r'-v\d+$', iface):
-                continue
-            vrf = iface_to_vrf.get(iface, "default")
-            entry = {
-                "ip": ip_addr,
-                "mac": mac,
-                "interface": iface,
-                "vrf": vrf,
-                "state": state
-            }
-            
-            if search:
-                if (search in ip_addr.lower() or search in mac.lower() or 
-                    search in iface.lower() or search in vrf.lower()):
-                    entries.append(entry)
-            else:
-                entries.append(entry)
+    if len(parts) < 2:
+        malformed_count += 1
+        continue
 
-print(json.dumps({"success": True, "entries": entries[:500], "total": len(entries)}))
+    ip_addr = parts[0]
+    try:
+        ipaddress.ip_address(ip_addr)
+    except ValueError:
+        malformed_count += 1
+        continue
+
+    mac = ""
+    iface = ""
+    state = ""
+    for i, p in enumerate(parts):
+        if p == "dev" and i + 1 < len(parts):
+            iface = parts[i + 1]
+        if p == "lladdr" and i + 1 < len(parts):
+            mac = parts[i + 1]
+
+    if not iface:
+        malformed_count += 1
+        continue
+    if parts[-1] in ["REACHABLE", "STALE", "DELAY", "PROBE", "FAILED", "PERMANENT"]:
+        state = parts[-1]
+
+    # FAILED/INCOMPLETE neighbor rows legitimately have no MAC and are not
+    # useful search results, but they are not parser failures.
+    if mac:
+        if re.search(r'-v\d+$', iface):
+            continue
+        vrf = iface_to_vrf.get(iface, "default")
+        entry = {
+            "ip": ip_addr,
+            "mac": mac,
+            "interface": iface,
+            "vrf": vrf,
+            "state": state
+        }
+
+        if search:
+            if (search in ip_addr.lower() or search in mac.lower() or
+                search in iface.lower() or search in vrf.lower()):
+                entries.append(entry)
+        else:
+            entries.append(entry)
+
+limit = 500
+returned = entries[:limit]
+print(json.dumps({
+    "success": True,
+    "entries": returned,
+    "total": len(entries),
+    "returned_total": len(returned),
+    "limit": limit,
+    "truncated": len(returned) < len(entries),
+    "complete": malformed_count == 0,
+    "partial": malformed_count > 0,
+    "warnings": ([f"Skipped {malformed_count} malformed ARP entr{'y' if malformed_count == 1 else 'ies'}"]
+                 if malformed_count else []),
+}))
 PYTHON
 }
 
@@ -334,7 +399,7 @@ def get_device_table(record):
         username = record.get('username', '')
         target = f"{username}@{ip}" if username else ip
         if table_type == "mac":
-            remote_script = "/usr/sbin/bridge fdb show 2>/dev/null | grep -v permanent | head -200"
+            remote_script = "/usr/sbin/bridge fdb show 2>/dev/null"
             cmd_parts = [
                 "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
@@ -342,7 +407,7 @@ def get_device_table(record):
             ]
             result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
         else:  # arp - get ARP with interface VRF mappings
-            remote_script = '/usr/sbin/ip neigh show 2>/dev/null | head -200; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/vlan*/master /sys/class/net/eth*/master; do n=$(basename $(dirname $i)); m=$(readlink $i | xargs basename); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
+            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/vlan*/master /sys/class/net/eth*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
             cmd_parts = [
                 "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
@@ -356,6 +421,8 @@ def get_device_table(record):
         if table_type == "mac":
             for line in result.stdout.strip().split('\n'):
                 if not line.strip():
+                    continue
+                if "permanent" in line:
                     continue
                 parts = line.split()
                 if len(parts) >= 3:
@@ -379,6 +446,8 @@ def get_device_table(record):
         elif table_type == "arp":
             # Parse ARP with VRF info from interface masters
             output = result.stdout.strip()
+            if "---VRF_MAP---" not in output or "---IFACE_VRF---" not in output:
+                return [], hostname
             sections = output.split("---VRF_MAP---")
             arp_lines = sections[0].strip().split('\n') if sections else []
             
@@ -441,7 +510,9 @@ def get_device_table(record):
 try:
     all_entries = []
     failed_devices = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(50, len(device_list))) as executor:
+    # Full tables are collected before filtering so exact searches cannot miss
+    # rows beyond an arbitrary head limit. Bound concurrency to cap memory.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(device_list))) as executor:
         results = executor.map(get_device_table, device_list)
         for entries, failed_device in results:
             all_entries.extend(entries)
@@ -460,8 +531,14 @@ try:
             "success": True,
             "entries": all_entries[:500],
             "total": len(all_entries),
+            "returned_total": min(len(all_entries), 500),
+            "limit": 500,
+            "truncated": len(all_entries) > 500,
+            "complete": not failed_devices,
+            "partial": bool(failed_devices),
             "successful_device_count": successful_devices,
             "failed_devices": failed_devices,
+            "warnings": [f"Failed to query device: {device}" for device in failed_devices],
         }))
 
 except Exception as e:
@@ -486,11 +563,11 @@ get_vtep_table() {
     fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
-        /usr/sbin/bridge fdb show 2>/dev/null | grep "dst " | head -1000
+        /usr/sbin/bridge fdb show 2>/dev/null
     ' 2>/dev/null)
     
     if [[ $? -ne 0 ]]; then
-        echo '{"success": false, "error": "Failed to connect to device"}'
+        echo '{"success": false, "error": "Failed to query VTEP table on device"}'
         return
     fi
     
@@ -504,12 +581,17 @@ search = sys.argv[1].lower()
 
 entries = []
 vtep_summary = {}  # VTEP IP -> {vni_count, mac_count}
+candidate_count = 0
+parse_error_count = 0
 
 for line in output.strip().split('\n'):
     if not line.strip():
         continue
     
     parts = line.split()
+    if "dst" not in parts:
+        continue
+    candidate_count += 1
     mac = parts[0] if parts else ""
     vtep_ip = ""
     vni = ""
@@ -555,6 +637,8 @@ for line in output.strip().split('\n'):
         }
         if not search or search in vtep_ip.lower() or search in vni.lower() or search in mac.lower():
             entries.append(entry)
+    else:
+        parse_error_count += 1
 
 # Sort by VTEP IP, then VNI, then MAC
 def ip_sort_key(ip):
@@ -568,10 +652,28 @@ entries.sort(key=lambda x: (ip_sort_key(x['vtep']), x['vni'], x['mac']))
 # Build summary for header
 summary = {
     "unique_vteps": len(vtep_summary),
-    "total_entries": len(entries)
+    "total_entries": len(entries),
+    "collected_entries": sum(item["macs"] for item in vtep_summary.values()),
 }
 
-print(json.dumps({"success": True, "entries": entries[:500], "total": len(entries), "summary": summary}))
+if candidate_count and candidate_count == parse_error_count:
+    print(json.dumps({"success": False, "error": "Unable to parse VTEP table response"}))
+else:
+    limit = 500
+    returned = entries[:limit]
+    print(json.dumps({
+        "success": True,
+        "entries": returned,
+        "total": len(entries),
+        "returned_total": len(returned),
+        "limit": limit,
+        "truncated": len(returned) < len(entries),
+        "complete": parse_error_count == 0,
+        "partial": parse_error_count > 0,
+        "warnings": ([f"Skipped {parse_error_count} malformed VTEP entr{'y' if parse_error_count == 1 else 'ies'}"]
+                     if parse_error_count else []),
+        "summary": summary,
+    }))
 PYTHON
 }
 
@@ -922,11 +1024,11 @@ get_lldp_neighbors() {
     fi
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
-        sudo lldpctl -f json 2>/dev/null || echo "{}"
+        sudo lldpctl -f json 2>/dev/null
     ' 2>/dev/null)
     
     if [[ $? -ne 0 ]]; then
-        echo '{"success": false, "error": "Failed to connect to device"}'
+        echo '{"success": false, "error": "Failed to query LLDP on device"}'
         return
     fi
     
@@ -942,7 +1044,13 @@ entries = []
 
 try:
     data = json.loads(output)
-    lldp_data = data.get('lldp', [])
+    if not isinstance(data, dict):
+        raise ValueError("LLDP response is not a JSON object")
+    if 'lldp' not in data:
+        raise ValueError("LLDP response is missing the lldp payload")
+    lldp_data = data['lldp']
+    if not isinstance(lldp_data, list):
+        raise ValueError("LLDP payload is not a list")
     
     # Handle array format from lldpctl
     if isinstance(lldp_data, list):
@@ -988,16 +1096,27 @@ try:
                             "mgmt_ip": mgmt_ip
                         }
                         
-                        if not search or search in neighbor.lower() or search in iface_name.lower() or search in str(mgmt_ip).lower():
+                        if (not search or search in neighbor.lower() or
+                                search in iface_name.lower() or
+                                search in remote_port.lower() or
+                                search in str(mgmt_ip).lower()):
                             entries.append(entry)
     
     # Sort by local port
     entries.sort(key=lambda x: x['local_port'])
     
-except Exception as e:
-    pass
+except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
+    print(json.dumps({"success": False, "error": f"Invalid LLDP response: {exc}"}))
+    raise SystemExit(0)
 
-print(json.dumps({"success": True, "entries": entries, "total": len(entries)}))
+print(json.dumps({
+    "success": True,
+    "entries": entries,
+    "total": len(entries),
+    "returned_total": len(entries),
+    "truncated": False,
+    "complete": True,
+}))
 PYTHON
 }
 
@@ -1011,18 +1130,79 @@ from datetime import datetime
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 summary_file = f"{lldpq_dir}/monitor-results/fabric-tables/summary.json"
 
+def parse_timestamp(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+def most_recent_timestamp(values):
+    parsed = [(parse_timestamp(value), value) for value in values]
+    parsed = [(stamp, value) for stamp, value in parsed if stamp is not None]
+    if not parsed:
+        return None
+    # Normalize to a numeric instant so aware and naive values can coexist.
+    return max(parsed, key=lambda item: item[0].timestamp())[1]
+
 try:
     if os.path.exists(summary_file):
         with open(summary_file) as f:
             data = json.load(f)
-        
+        if not isinstance(data, dict):
+            raise ValueError("Fabric scan summary is not a JSON object")
+
         timestamp = data.get('timestamp', '')
-        device_count = len(data.get('devices', []))
+        devices = data.get('devices', [])
+        if not isinstance(devices, list):
+            raise ValueError("Fabric scan summary devices is not a list")
+        device_count = len(devices)
+
+        known_statuses = [
+            device.get('status') for device in devices
+            if isinstance(device, dict) and device.get('status') in {'current', 'stale', 'unavailable'}
+        ]
+        raw_counts = data.get('status_counts', {})
+        if not isinstance(raw_counts, dict):
+            raw_counts = {}
+        status_counts = {}
+        for status in ('current', 'stale', 'unavailable'):
+            fallback = known_statuses.count(status)
+            try:
+                count = int(raw_counts.get(status, fallback))
+            except (TypeError, ValueError):
+                count = fallback
+            status_counts[status] = max(0, count)
+        # The per-device records are authoritative when every device has a
+        # recognized status. This also repairs inconsistent legacy summaries.
+        if device_count and len(known_statuses) == device_count:
+            status_counts = {
+                status: known_statuses.count(status)
+                for status in ('current', 'stale', 'unavailable')
+            }
+
+        complete = bool(data.get(
+            'complete',
+            device_count > 0 and status_counts['current'] == device_count,
+        ))
+        if status_counts['stale'] or status_counts['unavailable']:
+            complete = False
+
+        last_success = data.get('last_success')
+        if not last_success:
+            last_success = most_recent_timestamp([
+                device.get('last_success') for device in devices
+                if isinstance(device, dict)
+            ])
+        if not last_success and complete:
+            last_success = timestamp or None
         
         # Calculate age
-        if timestamp:
-            scan_time = datetime.fromisoformat(timestamp)
-            age_seconds = (datetime.now() - scan_time).total_seconds()
+        scan_time = parse_timestamp(timestamp)
+        if scan_time is not None:
+            now = datetime.now(scan_time.tzinfo) if scan_time.tzinfo else datetime.now()
+            age_seconds = (now - scan_time).total_seconds()
             age_minutes = int(age_seconds / 60)
         else:
             age_minutes = -1
@@ -1031,7 +1211,14 @@ try:
             "success": True,
             "timestamp": timestamp,
             "device_count": device_count,
-            "age_minutes": age_minutes
+            "age_minutes": age_minutes,
+            "complete": complete,
+            "status_counts": status_counts,
+            "current_count": status_counts['current'],
+            "stale_count": status_counts['stale'],
+            "unavailable_count": status_counts['unavailable'],
+            "devices": devices,
+            "last_success": last_success,
         }))
     else:
         print(json.dumps({
@@ -1039,7 +1226,14 @@ try:
             "timestamp": None,
             "device_count": 0,
             "age_minutes": -1,
-            "message": "No scan data available"
+            "message": "No scan data available",
+            "complete": False,
+            "status_counts": {"current": 0, "stale": 0, "unavailable": 0},
+            "current_count": 0,
+            "stale_count": 0,
+            "unavailable_count": 0,
+            "devices": [],
+            "last_success": None,
         }))
 except Exception as e:
     print(json.dumps({"success": False, "error": str(e)}))
@@ -1074,70 +1268,91 @@ search_cached_routes() {
     local search_ip="$1"
     
     python3 - "$search_ip" <<'PYTHON'
+import ipaddress
 import json
 import os
-import struct
-import socket
 import sys
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
-search_ip = sys.argv[1]
+summary_file = os.path.join(tables_dir, "summary.json")
+search_text = sys.argv[1].strip()
 
-def ip_to_int(ip):
-    try:
-        return struct.unpack("!I", socket.inet_aton(ip))[0]
-    except:
-        return 0
-
-def is_ip_in_prefix(ip, prefix):
-    try:
-        if '/' not in prefix:
-            return ip == prefix
-        network, mask = prefix.split('/')
-        mask = int(mask)
-        ip_int = ip_to_int(ip)
-        net_int = ip_to_int(network)
-        mask_bits = (0xFFFFFFFF << (32 - mask)) & 0xFFFFFFFF if mask > 0 else 0
-        return (ip_int & mask_bits) == (net_int & mask_bits)
-    except:
-        return False
-
-def get_prefix_len(prefix):
-    try:
-        if '/' in prefix:
-            return int(prefix.split('/')[1])
-        return 32
-    except:
-        return 0
+# socket.inet_aton accepts legacy abbreviated forms such as "192.168.64" and
+# maps invalid input to zero in the old implementation. Route LPM must only run
+# for a complete, valid IPv4 address.
+try:
+    search_ip = ipaddress.IPv4Address(search_text)
+except ipaddress.AddressValueError:
+    print(json.dumps({
+        "success": False,
+        "error": "A complete valid IPv4 address is required for route search",
+        "code": "invalid_ipv4",
+    }))
+    raise SystemExit(0)
 
 results = {}  # vrf -> [routes with best match]
 all_vrfs = set()  # Collect all unique VRFs
 device_vrfs = {}  # Track which VRFs each device has
+warnings = []
+candidate_file_count = 0
+processed_device_count = 0
+failed_devices = []
+summary_devices = {}
+snapshot_hostnames = set()
 
 try:
     if not os.path.exists(tables_dir):
         print(json.dumps({"success": False, "error": "No cached data. Run Fabric Scan first."}))
         exit()
+
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file) as summary_handle:
+                summary = json.load(summary_handle)
+            for device in summary.get('devices', []):
+                if not isinstance(device, dict) or not device.get('hostname'):
+                    continue
+                summary_devices[str(device['hostname'])] = str(device.get('status', 'unknown'))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            warnings.append(f"summary.json: {exc}")
     
     # First pass: collect all VRFs and find best matches
     for filename in os.listdir(tables_dir):
         if not filename.endswith('.json') or filename == 'summary.json':
             continue
+        candidate_file_count += 1
         
         hostname = filename.replace('.json', '')
+        snapshot_hostnames.add(hostname)
         filepath = os.path.join(tables_dir, filename)
         
         try:
             with open(filepath) as f:
                 data = json.load(f)
-            
-            routes = data.get('routes', {})
+            if not isinstance(data, dict):
+                raise ValueError("snapshot is not a JSON object")
+            if 'routes' not in data:
+                raise ValueError("snapshot is missing routes")
+            routes = data['routes']
+            if not isinstance(routes, dict):
+                raise ValueError("routes is not an object")
+
+            collection = data.get('_collection', {})
+            if isinstance(collection, dict) and collection.get('status') in {'stale', 'unavailable'}:
+                warnings.append(f"{filename}: snapshot status is {collection['status']}")
+
+            processed_device_count += 1
             device_vrfs[hostname] = set()
+            skipped_routes = 0
             
             for vrf, vrf_routes in routes.items():
                 # Skip invalid VRF names
-                if vrf.startswith('-') or not vrf.strip():
+                if not isinstance(vrf, str) or vrf.startswith('-') or not vrf.strip():
+                    skipped_routes += len(vrf_routes) if isinstance(vrf_routes, list) else 1
+                    continue
+                if not isinstance(vrf_routes, list):
+                    warnings.append(f"{filename}: routes for VRF {vrf} is not a list")
                     continue
                     
                 all_vrfs.add(vrf)
@@ -1147,27 +1362,83 @@ try:
                 best_prefix_len = -1
                 
                 for route in vrf_routes:
+                    if not isinstance(route, dict):
+                        skipped_routes += 1
+                        continue
                     prefix = route.get('prefix', '')
-                    if is_ip_in_prefix(search_ip, prefix):
-                        prefix_len = get_prefix_len(prefix)
-                        if prefix_len > best_prefix_len:
-                            best_prefix_len = prefix_len
-                            best_match = route.copy()
-                            best_match['device'] = hostname
-                            best_match['vrf'] = vrf
+                    try:
+                        network = ipaddress.IPv4Network(prefix, strict=False)
+                    except (ipaddress.AddressValueError, ipaddress.NetmaskValueError, TypeError, ValueError):
+                        skipped_routes += 1
+                        continue
+                    if search_ip in network and network.prefixlen > best_prefix_len:
+                        best_prefix_len = network.prefixlen
+                        best_match = route.copy()
+                        best_match['device'] = hostname
+                        best_match['vrf'] = vrf
                 
                 if best_match:
                     if vrf not in results:
                         results[vrf] = []
                     results[vrf].append(best_match)
-        except Exception as e:
-            continue
+            if skipped_routes:
+                warnings.append(
+                    f"{filename}: skipped {skipped_routes} malformed route "
+                    f"entr{'y' if skipped_routes == 1 else 'ies'}"
+                )
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            warnings.append(f"{filename}: {exc}")
+            failed_devices.append(hostname)
+
+    for hostname, status in summary_devices.items():
+        if hostname not in snapshot_hostnames:
+            warnings.append(f"{hostname}: {status} device has no cached snapshot")
+            failed_devices.append(hostname)
+        elif status in {'stale', 'unavailable'}:
+            warnings.append(f"{hostname}: snapshot status is {status}")
+            if status == 'unavailable':
+                failed_devices.append(hostname)
+
+    if candidate_file_count == 0:
+        print(json.dumps({
+            "success": False,
+            "error": "No cached device data. Run Fabric Scan first.",
+            "warnings": warnings,
+            "partial": False,
+            "complete": False,
+        }))
+        raise SystemExit(0)
+    if processed_device_count == 0:
+        print(json.dumps({
+            "success": False,
+            "error": "Cached route data is unreadable or invalid",
+            "warnings": warnings,
+            "partial": True,
+            "complete": False,
+            "processed_device_count": 0,
+            "failed_device_count": candidate_file_count,
+        }))
+        raise SystemExit(0)
     
-    # Second pass: add "No Route" for VRFs without any match
+    # Second pass: preserve the existing synthetic "No Route" row and also
+    # expose per-VRF coverage. Without coverage, one matching device can make a
+    # partially missing route look fabric-wide and consistent.
+    route_coverage = {}
+    devices_without_route = {}
     for vrf in all_vrfs:
+        devices_with_vrf = sorted(d for d, vrfs in device_vrfs.items() if vrf in vrfs)
+        matched_devices = {
+            route.get('device') for route in results.get(vrf, [])
+            if isinstance(route, dict) and route.get('device')
+        }
+        without_route = [device for device in devices_with_vrf if device not in matched_devices]
+        devices_without_route[vrf] = without_route
+        route_coverage[vrf] = {
+            'expected_device_count': len(devices_with_vrf),
+            'matched_device_count': len(matched_devices),
+            'devices_without_route': without_route,
+        }
         if vrf not in results:
-            # Count devices that have this VRF
-            devices_with_vrf = [d for d, vrfs in device_vrfs.items() if vrf in vrfs]
             results[vrf] = [{
                 'device': 'all',
                 'vrf': vrf,
@@ -1176,13 +1447,27 @@ try:
                 'interface': '-',
                 'protocol': '-',
                 'no_route': True,
-                'device_count': len(devices_with_vrf)
+                'device_count': len(devices_with_vrf),
+                'expected_device_count': len(devices_with_vrf),
+                'devices_without_route': without_route,
             }]
     
+    warnings = sorted(set(warnings))
+    failed_devices = sorted(set(failed_devices))
+    expected_device_count = len(summary_devices) if summary_devices else candidate_file_count
     print(json.dumps({
         "success": True,
         "vrf_routes": results,
-        "cached": True
+        "cached": True,
+        "warnings": warnings,
+        "partial": bool(warnings),
+        "complete": not warnings,
+        "processed_device_count": processed_device_count,
+        "failed_device_count": len(failed_devices),
+        "expected_device_count": expected_device_count,
+        "missing_devices": failed_devices,
+        "devices_without_route": devices_without_route,
+        "route_coverage": route_coverage,
     }))
 
 except Exception as e:
@@ -1307,6 +1592,7 @@ import os
 import re
 import ipaddress
 import sys
+from datetime import datetime, timezone
 
 source_ip = sys.argv[1]
 dest_ip = sys.argv[2]
@@ -1317,8 +1603,53 @@ lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
 web_root = os.environ.get('WEB_ROOT', '/var/www/html')
 lldp_file = os.path.join(web_root, 'lldp_results.ini')
+local_timezone = datetime.now().astimezone().tzinfo
 
 # ─── Utility functions ───
+
+def require_ipv4(value, label):
+    """Reject malformed, IPv6 and non-canonical address input at the API edge."""
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        print(json.dumps({"error": f"Invalid {label} IPv4 address."}))
+        raise SystemExit(0)
+    if not isinstance(parsed, ipaddress.IPv4Address):
+        print(json.dumps({"error": f"Invalid {label} IPv4 address."}))
+        raise SystemExit(0)
+    return str(parsed)
+
+source_ip = require_ipv4(source_ip, "source")
+dest_ip = require_ipv4(dest_ip, "destination")
+
+warnings = []
+warning_codes = set()
+
+def add_warning(code, message, **details):
+    """Add a stable, machine-readable warning without changing legacy fields."""
+    if code in warning_codes:
+        return
+    warning = {"code": code, "message": message}
+    warning.update(details)
+    warnings.append(warning)
+    warning_codes.add(code)
+
+def parse_iso_timestamp(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=local_timezone)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+def cache_max_age_seconds():
+    try:
+        return max(60, int(os.environ.get('TRACEPATH_CACHE_MAX_AGE_SECONDS', '300')))
+    except (TypeError, ValueError):
+        return 300
 
 def prefix_match(ip, prefix):
     try:
@@ -1330,33 +1661,136 @@ def prefix_match(ip, prefix):
         return -1
 
 def find_best_route(ip, routes, vrf):
-    best, best_len = None, -1
+    candidates = []
     for r in routes.get(vrf, []):
         p = r.get('prefix', '')
         if p:
             ml = prefix_match(ip, p)
-            if ml > best_len:
-                best_len = ml
-                best = r
-    return best, best_len
+            if ml < 0:
+                continue
+            try:
+                metric = int(r.get('metric') or 0)
+            except (TypeError, ValueError):
+                metric = 0
+            candidates.append((
+                -ml,
+                -int(route_is_usable(r)),
+                metric,
+                json.dumps(r, sort_keys=True, separators=(',', ':')),
+                r,
+            ))
+    if not candidates:
+        return None, -1
+    candidates.sort(key=lambda candidate: candidate[:-1])
+    selected = candidates[0]
+    return selected[-1], -selected[0]
+
+def route_is_usable(route):
+    """Fabric scan normally filters rejects; keep the API safe for old caches too."""
+    if not isinstance(route, dict):
+        return False
+    protocol = str(route.get('protocol', '')).strip().lower()
+    nexthop = str(route.get('nexthop', '')).strip().lower()
+    route_type = str(route.get('type', '')).strip().lower()
+    rejected = {'unreachable', 'blackhole', 'prohibit', 'throw', 'reject'}
+    return protocol not in rejected and nexthop not in rejected and route_type not in rejected
 
 def base(name):
     """Extract base hostname: 'csw-3na-17-39 @core' -> 'csw-3na-17-39'"""
+    if not isinstance(name, str) or not name:
+        return ''
     return name.split(' ')[0] if ' ' in name else name
 
 def load_all_data():
     all_data = {}
+    invalid_files = []
     if not os.path.exists(tables_dir):
         return all_data
-    for fn in os.listdir(tables_dir):
+    for fn in sorted(os.listdir(tables_dir)):
         if not fn.endswith('.json') or fn == 'summary.json':
             continue
         try:
             with open(os.path.join(tables_dir, fn)) as f:
-                all_data[fn.replace('.json', '')] = json.load(f)
-        except:
-            pass
+                data = json.load(f)
+            if isinstance(data, dict):
+                all_data[fn.replace('.json', '')] = data
+            else:
+                invalid_files.append(fn)
+        except (OSError, json.JSONDecodeError):
+            invalid_files.append(fn)
+    if invalid_files:
+        add_warning(
+            'cache_file_invalid',
+            'One or more device cache files could not be read; path coverage may be incomplete.',
+            invalid_files=sorted(invalid_files),
+        )
     return all_data
+
+def load_data_quality(all_data):
+    """Describe cache coverage and surface stale/partial evidence to callers."""
+    summary_path = os.path.join(tables_dir, 'summary.json')
+    summary = None
+    try:
+        with open(summary_path, encoding='utf-8') as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            summary = loaded
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    if summary is None:
+        counts = {'current': 0, 'stale': 0, 'unavailable': 0}
+        for data in all_data.values():
+            collection = data.get('_collection', {})
+            status = collection.get('status', 'current') if isinstance(collection, dict) else 'current'
+            if status not in counts:
+                status = 'unavailable'
+            counts[status] += 1
+        complete = counts['stale'] == 0 and counts['unavailable'] == 0
+        quality = {
+            'complete': complete,
+            'timestamp': None,
+            'status_counts': counts,
+        }
+        add_warning(
+            'collection_summary_missing',
+            'Fabric collection summary is unavailable; path coverage may be incomplete.'
+        )
+    else:
+        raw_counts = summary.get('status_counts', {})
+        counts = {}
+        for status in ('current', 'stale', 'unavailable'):
+            try:
+                counts[status] = max(0, int(raw_counts.get(status, 0)))
+            except (TypeError, ValueError, AttributeError):
+                counts[status] = 0
+        complete = bool(summary.get('complete', False))
+        quality = {
+            'complete': complete,
+            'timestamp': summary.get('timestamp'),
+            'status_counts': counts,
+        }
+
+    counts = quality['status_counts']
+    if not quality['complete'] or counts.get('stale', 0) or counts.get('unavailable', 0):
+        add_warning(
+            'partial_snapshot',
+            'Trace uses partial fabric data; one or more device snapshots are stale or unavailable.',
+            stale_devices=counts.get('stale', 0),
+            unavailable_devices=counts.get('unavailable', 0),
+        )
+
+    timestamp = parse_iso_timestamp(quality.get('timestamp'))
+    if timestamp is not None:
+        age = max(0, int((datetime.now(timezone.utc) - timestamp).total_seconds()))
+        quality['age_seconds'] = age
+        if age > cache_max_age_seconds():
+            add_warning(
+                'stale_snapshot',
+                'Fabric data is older than the Tracepath freshness threshold.',
+                age_seconds=age,
+            )
+    return quality
 
 # ─── LLDP parsing ───
 
@@ -1364,59 +1798,138 @@ def load_lldp_data():
     """Parse lldp_results.ini -> neighbors, port_neighbors, link_status.
     neighbors: {device: set(neighbor_devices)}
     port_neighbors: {device: {port: neighbor_device}}
-    link_status: {(device, neighbor): {'up': N, 'down': N, 'fail': N}}
+    link_status: {(device_a, device_b): {'up': N, 'down': N, 'fail': N}}
+
+    Physical links are keyed by both endpoint ports, so reciprocal LLDP rows
+    count once. Explicitly DOWN links remain in health data but are excluded
+    from the routing graph.
     """
     neighbors = {}
     port_neighbors = {}  # {device: {port: neighbor}}
     link_status = {}
+    quality = {
+        'available': False,
+        'timestamp': None,
+        'age_seconds': None,
+        'rows': 0,
+        'invalid_rows': 0,
+        'down_links': 0,
+    }
     
     if not os.path.exists(lldp_file):
-        return neighbors, port_neighbors, link_status
+        return neighbors, port_neighbors, link_status, quality
     
     try:
-        with open(lldp_file) as f:
+        with open(lldp_file, encoding='utf-8') as f:
             content = f.read()
+
+        if not content.strip():
+            return neighbors, port_neighbors, link_status, quality
+        quality['available'] = True
+        first_nonempty = next((line.strip() for line in content.splitlines() if line.strip()), '')
+        timestamp_match = re.match(
+            r'^Created on (\d{4}-\d{2}-\d{2} \d{2}-\d{2}(?:-\d{2})?)$',
+            first_nonempty,
+        )
+        if timestamp_match:
+            raw_timestamp = timestamp_match.group(1)
+            timestamp_format = '%Y-%m-%d %H-%M-%S' if raw_timestamp.count('-') == 4 else '%Y-%m-%d %H-%M'
+            try:
+                parsed_timestamp = datetime.strptime(raw_timestamp, timestamp_format).replace(tzinfo=local_timezone)
+                quality['timestamp'] = parsed_timestamp.isoformat()
+                quality['age_seconds'] = max(
+                    0, int((datetime.now(timezone.utc) - parsed_timestamp).total_seconds())
+                )
+            except ValueError:
+                quality['timestamp'] = None
         
         current_device = None
+        physical_links = {}
+        invalid_neighbor_values = {
+            '', '-', 'none', 'n/a', 'no-info', 'no_info', 'unknown', 'act-nbr'
+        }
+
+        def physical_link_key(device, local_port, neighbor, neighbor_port):
+            left = (base(device), local_port)
+            right = (base(neighbor), neighbor_port)
+            if neighbor_port.lower() not in invalid_neighbor_values:
+                return tuple(sorted((left, right)))
+            # A legacy row without the remote port cannot be safely paired
+            # with its reciprocal row. Keep the local endpoint in the key to
+            # avoid collapsing genuine parallel links.
+            return (tuple(sorted((base(device), base(neighbor)))), left)
+
+        state_rank = {'up': 0, 'fail': 1, 'down': 2}
         for line in content.split('\n'):
             m = re.match(r'^=+\s+(\S+)\s+=+$', line)
             if m:
-                current_device = m.group(1)
+                current_device = base(m.group(1))
                 neighbors.setdefault(current_device, set())
                 port_neighbors.setdefault(current_device, {})
                 continue
             
-            if not current_device or line.startswith('-') or line.startswith('Port'):
+            stripped = line.strip()
+            if (not current_device or not stripped or stripped.startswith('-') or
+                    stripped.startswith('Port') or stripped.startswith('Created')):
                 continue
             
-            parts = line.split()
-            if len(parts) >= 6:
+            parts = stripped.split()
+            if len(parts) >= 7:
                 local_port = parts[0]   # swp1s0
-                status = parts[1]       # Pass/Fail
-                act_nbr = parts[4]      # Actual neighbor
-                port_status = parts[5] if len(parts) > 5 else ''
-                
-                if act_nbr and act_nbr not in ('-', 'Act-Nbr'):
-                    neighbors[current_device].add(act_nbr)
-                    neighbors.setdefault(act_nbr, set())
-                    neighbors[act_nbr].add(current_device)
-                    
-                    # Track port->neighbor mapping
-                    port_neighbors[current_device][local_port] = act_nbr
-                    
-                    # Track link status
-                    key = (current_device, act_nbr)
-                    if key not in link_status:
-                        link_status[key] = {'up': 0, 'down': 0, 'fail': 0}
-                    
-                    if status == 'Fail' or port_status == 'DOWN':
-                        link_status[key]['down'] += 1
-                    else:
-                        link_status[key]['up'] += 1
-    except:
-        pass
-    
-    return neighbors, port_neighbors, link_status
+                validation_status = parts[1].upper()  # Pass/Fail/No-Info
+                act_nbr_raw = parts[4]                # Actual neighbor
+                act_nbr_port = parts[5]               # Actual neighbor port
+                port_status = parts[6].upper()         # UP/DOWN/UNKNOWN
+
+                if act_nbr_raw.lower() in invalid_neighbor_values:
+                    quality['invalid_rows'] += 1
+                    continue
+
+                act_nbr = base(act_nbr_raw)
+                quality['rows'] += 1
+                if port_status == 'DOWN':
+                    state = 'down'
+                elif validation_status == 'FAIL':
+                    state = 'fail'
+                else:
+                    state = 'up'
+
+                key = physical_link_key(current_device, local_port, act_nbr, act_nbr_port)
+                observation = physical_links.get(key)
+                mapping = (current_device, local_port, act_nbr)
+                if observation is None:
+                    physical_links[key] = {
+                        'devices': tuple(sorted((current_device, act_nbr))),
+                        'state': state,
+                        'mappings': {mapping},
+                    }
+                else:
+                    observation['mappings'].add(mapping)
+                    if state_rank[state] > state_rank[observation['state']]:
+                        observation['state'] = state
+            elif parts and not stripped.startswith('='):
+                quality['invalid_rows'] += 1
+
+        for observation in physical_links.values():
+            device_pair = observation['devices']
+            status = link_status.setdefault(
+                device_pair, {'up': 0, 'down': 0, 'fail': 0}
+            )
+            state = observation['state']
+            status[state] += 1
+            if state == 'down':
+                quality['down_links'] += 1
+                continue
+
+            device_a, device_b = device_pair
+            neighbors.setdefault(device_a, set()).add(device_b)
+            neighbors.setdefault(device_b, set()).add(device_a)
+            for device, local_port, neighbor in observation['mappings']:
+                port_neighbors.setdefault(device, {})[local_port] = neighbor
+    except (OSError, UnicodeError, ValueError):
+        quality['available'] = False
+
+    return neighbors, port_neighbors, link_status, quality
 
 def build_host_set(all_data, port_neighbors):
     """Identify hosts by cross-referencing bond ports with LLDP neighbors.
@@ -1581,14 +2094,17 @@ def find_border_leaf_devices(src_vrf, all_data, tier_func):
     nexthop pattern (pointing to spines). Border leaves have a DIFFERENT
     nexthop pattern (pointing to firewalls/routers).
     
-    The "nexthop signature" is the set of /24 subnets of the ECMP nexthops.
+    The "nexthop signature" is the set of exact ECMP nexthop addresses.
     The most common signature = regular leaves. Outliers = border leaves.
-    This is fully generic — no hardcoded IPs or hostname patterns.
+    A tied majority is intentionally treated as ambiguous: returning no
+    border is safer than presenting a topology-order-dependent egress.
     """
-    # Collect each leaf's default route nexthop signature
-    leaf_signatures = {}  # hostname -> frozenset of /24 subnets
+    # Collect each leaf's default route nexthop signature.
+    leaf_signatures = {}  # hostname -> tuple of exact nexthop addresses
+    signature_tiers = {}
     
-    for hostname, data in all_data.items():
+    for hostname in sorted(all_data):
+        data = all_data[hostname]
         # Don't filter by tier — border leaves may get wrong tier from BFS
         # (they're not host-connected so BFS discovers them late).
         # The majority analysis itself separates border from non-border.
@@ -1601,42 +2117,70 @@ def find_border_leaf_devices(src_vrf, all_data, tier_func):
                 continue
             
             nh = r.get('nexthop', '')
-            nh_subnets = set()
+            nexthops = set()
             
             if nh and nh not in ('', '-', 'ECMP', 'link-local', 'unreachable', 'connected'):
-                # Single nexthop: extract /24 subnet
-                parts = nh.split('.')
-                if len(parts) == 4:
-                    nh_subnets.add('.'.join(parts[:3]))
+                try:
+                    parsed_nh = ipaddress.ip_address(nh)
+                    if isinstance(parsed_nh, ipaddress.IPv4Address):
+                        nexthops.add(str(parsed_nh))
+                except ValueError:
+                    pass
             
             if nh == 'ECMP':
                 ecmp_nhs = r.get('ecmp_nexthops', [])
                 for enh in ecmp_nhs:
                     enh_ip = enh.get('ip', '')
-                    parts = enh_ip.split('.')
-                    if len(parts) == 4:
-                        nh_subnets.add('.'.join(parts[:3]))
+                    try:
+                        parsed_nh = ipaddress.ip_address(enh_ip)
+                        if isinstance(parsed_nh, ipaddress.IPv4Address):
+                            nexthops.add(str(parsed_nh))
+                    except ValueError:
+                        pass
             
-            if nh_subnets:
-                leaf_signatures[hostname] = frozenset(nh_subnets)
+            if nexthops:
+                leaf_signatures[hostname] = tuple(sorted(nexthops))
+                signature_tiers[hostname] = tier_func(hostname)
             break
     
     if not leaf_signatures:
         return []
     
+    # All signatures contribute to the majority because incomplete LLDP often
+    # leaves regular leaves un-tiered. Once outliers are known, however, a
+    # confirmed tier-0 outlier is always preferred; known spine/core outliers
+    # are never returned while any tier-0 signature evidence exists.
+    if len(leaf_signatures) < 2:
+        return []
+
     # Find the most common signature (= regular leaves pointing to spines)
     from collections import Counter
     sig_counts = Counter(leaf_signatures.values())
-    most_common_sig = sig_counts.most_common(1)[0][0] if sig_counts else None
-    
-    if not most_common_sig:
+    ranked_signatures = sorted(
+        sig_counts.items(), key=lambda item: (-item[1], item[0])
+    )
+    if not ranked_signatures:
+        return []
+    if len(ranked_signatures) > 1 and ranked_signatures[0][1] == ranked_signatures[1][1]:
+        return []
+    most_common_sig = ranked_signatures[0][0]
+    most_common_count = ranked_signatures[0][1]
+    if most_common_count < 2 or most_common_count * 2 <= len(leaf_signatures):
         return []
     
     # Border leaves = leaves with a DIFFERENT signature than the majority
-    border_leaves = [h for h, sig in leaf_signatures.items()
-                     if sig != most_common_sig]
-    
-    return sorted(border_leaves)
+    outliers = [h for h, sig in leaf_signatures.items() if sig != most_common_sig]
+    tier_zero_outliers = [h for h in outliers if signature_tiers.get(h) == 0]
+    if tier_zero_outliers:
+        return sorted(tier_zero_outliers)
+    if any(tier == 0 for tier in signature_tiers.values()):
+        return []
+    if outliers:
+        add_warning(
+            'border_inference_low_confidence',
+            'Border inference used devices without a confirmed leaf tier.'
+        )
+    return sorted(outliers)
 
 # ─── Main logic ───
 
@@ -1645,8 +2189,27 @@ try:
     if not all_data:
         print(json.dumps({"error": "No cached data. Run Fabric Scan first."}))
         exit()
-    
-    lldp_neighbors, lldp_port_neighbors, lldp_link_status = load_lldp_data()
+
+    data_quality = load_data_quality(all_data)
+    lldp_neighbors, lldp_port_neighbors, lldp_link_status, lldp_quality = load_lldp_data()
+    data_quality['lldp'] = lldp_quality
+    if not lldp_quality.get('available'):
+        add_warning(
+            'lldp_snapshot_missing',
+            'LLDP topology data is unavailable; transit-hop coverage may be incomplete.'
+        )
+    elif lldp_quality.get('age_seconds') is not None and lldp_quality['age_seconds'] > cache_max_age_seconds():
+        add_warning(
+            'stale_lldp_snapshot',
+            'LLDP topology data is older than the Tracepath freshness threshold.',
+            age_seconds=lldp_quality['age_seconds'],
+        )
+    if lldp_quality.get('invalid_rows', 0):
+        add_warning(
+            'partial_lldp_snapshot',
+            'Some LLDP rows were incomplete or had no usable actual neighbor.',
+            invalid_rows=lldp_quality['invalid_rows'],
+        )
     known_hosts = build_host_set(all_data, lldp_port_neighbors)
     device_tiers = determine_tiers(lldp_neighbors, known_hosts)
     
@@ -1660,12 +2223,16 @@ try:
             if base(d) == b: return t
         return 999
     
-    def find_device_prefer_leaf(ip, prefer_vrf=None):
+    def find_device_prefer_leaf(ip, prefer_vrf=None, require_vrf=False,
+                                allow_route_fallback=True):
         candidates = []
-        for hostname, data in all_data.items():
+        for hostname in sorted(all_data):
+            data = all_data[hostname]
             for arp in data.get('arp', []):
                 if arp.get('ip') == ip:
-                    v = arp.get('vrf', 'default')
+                    v = arp.get('vrf', 'default') or 'default'
+                    if require_vrf and prefer_vrf and v != prefer_vrf:
+                        continue
                     # Check if this device has a CONNECTED route for the IP's subnet.
                     # Connected route = IP is locally attached = real local leaf.
                     # Remote EVPN-learned ARP entries exist on all leaves but
@@ -1684,9 +2251,13 @@ try:
                     fab_degree = len([n for n in lldp_neighbors.get(b, set())
                                      if n not in known_hosts])
                     candidates.append((hostname, v if v else 'default', is_local, fab_degree))
-        if not candidates:
-            for hostname, data in all_data.items():
-                for v, vr in data.get('routes', {}).items():
+        if not candidates and allow_route_fallback:
+            for hostname in sorted(all_data):
+                data = all_data[hostname]
+                for v in sorted(data.get('routes', {})):
+                    if require_vrf and prefer_vrf and v != prefer_vrf:
+                        continue
+                    vr = data.get('routes', {}).get(v, [])
                     for r in vr:
                         if r.get('protocol') in ['kernel', 'connected', 'local']:
                             if r.get('prefix') and prefix_match(ip, r['prefix']) >= 0:
@@ -1699,7 +2270,7 @@ try:
         # Sort: prefer matching VRF, then local (connected route), then lowest degree (leaf < spine)
         def sort_key(x):
             vrf_match = 0 if (prefer_vrf and x[1] == prefer_vrf) else 1
-            return (vrf_match, x[2], x[3])  # vrf_match, is_local, fab_degree
+            return (vrf_match, x[2], x[3], base(x[0]), x[0], x[1])
         candidates.sort(key=sort_key)
         return candidates[0][0], candidates[0][1]
     
@@ -1716,16 +2287,24 @@ try:
         return set()
     
     def get_link_health(src_device, dst_devices):
-        """Count up/down links between src and a set of dst devices."""
-        up, down = 0, 0
+        """Count canonical links; validation mismatches are still physically up."""
+        up, down, mismatch = 0, 0, 0
         b_src = base(src_device)
-        for dst in dst_devices:
+        seen_pairs = set()
+        for dst in sorted(set(dst_devices)):
             b_dst = base(dst)
-            for (a, b_key), status in lldp_link_status.items():
-                if (a == b_src and b_key == b_dst) or (a == b_dst and b_key == b_src):
-                    up += status.get('up', 0)
-                    down += status.get('down', 0) + status.get('fail', 0)
-        return up, down
+            if not b_src or not b_dst or b_src == b_dst:
+                continue
+            pair = tuple(sorted((b_src, b_dst)))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            status = lldp_link_status.get(pair, {})
+            mismatched_links = status.get('fail', 0)
+            up += status.get('up', 0) + mismatched_links
+            down += status.get('down', 0)
+            mismatch += mismatched_links
+        return up, down, mismatch
     
     def find_on_path_layers(src_device, dst_device):
         """Find spine and core layers between source and dest using LLDP.
@@ -1755,6 +2334,12 @@ try:
         dst_spines = sorted([d for d in dst_nbrs
                             if d not in known_hosts and get_tier(d) != -1
                             and d != src_device and is_fabric_device(d)])
+
+        # A layer is only on-path when both leaf sides have an active LLDP
+        # attachment. Do not fill a missing side with the other side's spine;
+        # that would reintroduce an explicitly DOWN edge into the rendering.
+        if not src_spines or not dst_spines:
+            return []
         
         # Shared spines (same pod)
         shared = sorted(set(src_spines) & set(dst_spines))
@@ -1785,99 +2370,161 @@ try:
             layers = []
             if src_spines:
                 layers.append({"tier": 1, "devices": src_spines, "label": "Spine"})
-            if cores:
-                layers.append({"tier": 2, "devices": sorted(cores), "label": "Core"})
+            if not cores:
+                return []
+            layers.append({"tier": 2, "devices": sorted(cores), "label": "Core"})
             if dst_spines and dst_spines != src_spines:
                 layers.append({"tier": 1, "devices": dst_spines, "label": "Spine"})
             
             return layers
     
     # ─── Resolve source and dest ───
-    
+
+    def emit_trace_error(message):
+        response = {"error": message}
+        if warnings:
+            response['warnings'] = warnings
+        response['data_quality'] = data_quality
+        print(json.dumps(response))
+        raise SystemExit(0)
+
     source_leaf, detected_vrf = find_device_prefer_leaf(source_ip, vrf_hint)
-    dest_leaf, dest_vrf = find_device_prefer_leaf(dest_ip, vrf_hint)
-    
     if not source_leaf:
-        print(json.dumps({"error": f"Source IP {source_ip} not found in any device."}))
-        exit()
-    
+        emit_trace_error(f"Source IP {source_ip} not found in any device.")
+
+    # VRF resolution starts with the source. Destination lookup must use the
+    # destination hint, not the source hint, to handle overlapping address
+    # space correctly.
+    src_vrf = vrf_hint if vrf_hint else (detected_vrf or 'default')
+    selected_dst_vrf = dst_vrf_hint if dst_vrf_hint else src_vrf
+
     # Check if dest IP is local to the fabric (in ANY device's ARP, any VRF).
     # Must check BEFORE error handling — external IPs (8.8.8.8) won't be in
     # any device and that's OK.
-    dest_is_local = False
-    for hn, dd in all_data.items():
+    destination_vrfs = set()
+    connected_destination_vrfs = set()
+    for hn in sorted(all_data):
+        dd = all_data[hn]
         for arp in dd.get('arp', []):
             if arp.get('ip') == dest_ip:
-                dest_is_local = True
-                break
-        if dest_is_local:
-            break
-    
-    # External IPs: find_device_prefer_leaf may return a wrong device via
-    # route fallback (e.g. 8.8.8.8 matching a wide connected prefix).
-    # Clear it — external destinations have no fabric device.
-    if not dest_is_local:
+                destination_vrfs.add(arp.get('vrf', 'default') or 'default')
+        for route_vrf, routes in dd.get('routes', {}).items():
+            for route in routes:
+                if str(route.get('protocol', '')).lower() not in {'connected', 'kernel', 'local'}:
+                    continue
+                route_prefix = route.get('prefix', '')
+                if route_prefix and prefix_match(dest_ip, route_prefix) > 0:
+                    connected_destination_vrfs.add(route_vrf or 'default')
+    dest_is_local = bool(destination_vrfs)
+
+    if not dest_is_local and connected_destination_vrfs:
+        add_warning(
+            'fabric_endpoint_unresolved',
+            'Destination belongs to a connected fabric subnet but has no current endpoint/ARP record.',
+            candidate_vrfs=sorted(connected_destination_vrfs),
+        )
+        emit_trace_error(
+            f"Destination IP {dest_ip} is in a connected fabric subnet, but its endpoint could not be resolved."
+        )
+
+    if dest_is_local:
+        # First require the selected destination VRF. If the IP does not exist
+        # there, preserve the old auto-correction behavior, but re-resolve the
+        # leaf in the detected VRF so device and VRF cannot disagree.
+        dest_leaf, detected_dest_vrf = find_device_prefer_leaf(
+            dest_ip, selected_dst_vrf, require_vrf=True,
+            allow_route_fallback=False,
+        )
+        if dest_leaf:
+            dst_vrf = selected_dst_vrf
+        else:
+            dest_leaf, detected_dest_vrf = find_device_prefer_leaf(
+                dest_ip, selected_dst_vrf, allow_route_fallback=False
+            )
+            if not dest_leaf:
+                emit_trace_error(f"Destination IP {dest_ip} not found in any device.")
+            dst_vrf = detected_dest_vrf or sorted(destination_vrfs)[0]
+            if selected_dst_vrf != dst_vrf:
+                add_warning(
+                    'destination_vrf_corrected',
+                    'Destination IP was not present in the selected VRF; the detected VRF was used.',
+                    requested_vrf=selected_dst_vrf,
+                    detected_vrf=dst_vrf,
+                )
+
+        resolved_leaf, resolved_vrf = find_device_prefer_leaf(
+            dest_ip, dst_vrf, require_vrf=True,
+            allow_route_fallback=False,
+        )
+        if not resolved_leaf:
+            emit_trace_error(
+                f"Destination IP {dest_ip} could not be resolved in VRF {dst_vrf}."
+            )
+        dest_leaf, dst_vrf = resolved_leaf, resolved_vrf or dst_vrf
+    else:
+        # An external address has no destination-side fabric VRF. Treat it as
+        # an exit from the source VRF and never pass None as a topology node.
         dest_leaf = None
-    
-    # Only error if dest is local but device not found (shouldn't happen)
-    if not dest_leaf and dest_is_local:
-        print(json.dumps({"error": f"Destination IP {dest_ip} not found in any device."}))
-        exit()
-    
-    # VRF resolution: use explicit hints from user, fall back to auto-detect.
-    src_vrf = vrf_hint if vrf_hint else (detected_vrf or 'default')
-    dst_vrf = dst_vrf_hint if dst_vrf_hint else src_vrf
+        dst_vrf = src_vrf
+        if dst_vrf_hint and dst_vrf_hint != src_vrf:
+            add_warning(
+                'destination_vrf_ignored_external',
+                'Destination VRF was ignored because the destination is external to the fabric.',
+                requested_vrf=dst_vrf_hint,
+                effective_vrf=src_vrf,
+            )
+
     vrf = src_vrf
-    
-    # ─── Dest VRF validation ───
-    # If user manually selected a dest VRF, verify the dest IP actually
-    # exists in that VRF. If it doesn't, auto-correct to the VRF where
-    # the IP was actually found (from ARP). This prevents false inter-VRF
-    # paths when user selects wrong VRF.
-    if dest_is_local and dst_vrf_hint and dest_vrf:
-        # dest_vrf = VRF where find_device_prefer_leaf found the dest IP
-        # dst_vrf_hint = what user selected
-        if dst_vrf_hint != dest_vrf:
-            # Check if dest IP truly exists in the user-selected VRF
-            dest_in_selected_vrf = False
-            for hn, dd in all_data.items():
-                for arp in dd.get('arp', []):
-                    if arp.get('ip') == dest_ip:
-                        v = arp.get('vrf', 'default')
-                        if (v or 'default') == dst_vrf_hint:
-                            dest_in_selected_vrf = True
-                            break
-                if dest_in_selected_vrf:
-                    break
-            
-            if not dest_in_selected_vrf:
-                # Dest IP not in selected VRF → auto-correct
-                dst_vrf = dest_vrf
-    
+
     # ─── Route leak detection ───
-    # If src_vrf != dst_vrf, check if source device has a SPECIFIC route
-    # (not just default 0.0.0.0/0) to dest IP in src_vrf. If yes, the
-    # dest subnet is leaked into src_vrf → traffic stays in src_vrf,
-    # no firewall traversal needed. Treat as intra-VRF.
+    # A specific route alone is not proof of a VRF leak: a firewall route is
+    # also commonly specific/BGP. Only explicit collector metadata or a
+    # dedicated protocol value may suppress the inter-VRF gateway.
+    def route_has_explicit_leak_evidence(route, from_vrf):
+        if not isinstance(route, dict):
+            return False
+        metadata = route.get('route_leak')
+        if metadata is True:
+            return True
+        if isinstance(metadata, dict):
+            metadata_from = metadata.get('from_vrf') or metadata.get('source_vrf')
+            if not metadata_from or metadata_from == from_vrf:
+                return True
+        leaked_from = route.get('leaked_from_vrf') or route.get('imported_from_vrf')
+        if leaked_from and leaked_from == from_vrf:
+            return True
+        protocol = str(route.get('protocol', '')).strip().lower()
+        return protocol in {'vrf-leak', 'route-leak', 'leaked'}
+
     route_leak_info = None  # Track leak for UI display
+    src_data = all_data.get(source_leaf, {})
+    source_route, source_route_len = find_best_route(
+        dest_ip, src_data.get('routes', {}), src_vrf
+    )
+    if not source_route or source_route_len < 0 or not route_is_usable(source_route):
+        emit_trace_error(
+            f"No usable route from {source_ip} to {dest_ip} in VRF {src_vrf}."
+        )
+    if (dest_is_local and src_vrf == dst_vrf and source_leaf != dest_leaf and
+            source_route_len == 0):
+        emit_trace_error(
+            f"No specific intra-VRF route from {source_ip} to {dest_ip} in VRF {src_vrf}."
+        )
+
     if src_vrf != dst_vrf and source_leaf and dest_is_local:
-        src_data = all_data.get(source_leaf, {})
-        leaked_route, leaked_len = find_best_route(dest_ip, src_data.get('routes', {}), src_vrf)
-        if leaked_route and leaked_len > 0:
-            # Source has a specific route (not default) → leaked route exists
+        if source_route_len > 0 and route_has_explicit_leak_evidence(source_route, dst_vrf):
             route_leak_info = {
                 "from_vrf": dst_vrf,
                 "to_vrf": src_vrf,
-                "prefix": leaked_route.get('prefix', ''),
-                "protocol": leaked_route.get('protocol', '')
+                "prefix": source_route.get('prefix', ''),
+                "protocol": source_route.get('protocol', '')
             }
-            # Traffic stays in src_vrf, override dst_vrf
             dst_vrf = src_vrf
-    
+
     has_inter_vrf = (src_vrf != dst_vrf)
-    
+
     # External = dest not in fabric ARP (same VRF, traffic exits via border leaf)
-    dest_is_external = not dest_is_local and not has_inter_vrf
+    dest_is_external = not dest_is_local
     has_external = has_inter_vrf  # keep for backward compat in build_path
     
     # ─── Build path ───
@@ -1885,11 +2532,13 @@ try:
     def map_to_fabric_name(lldp_name):
         """Map LLDP hostname to fabric-table key."""
         b = base(lldp_name)
-        for key in all_data:
+        for key in sorted(all_data):
             if base(key) == b:
                 return key
         return lldp_name
-    
+
+    trace_state = {'egress_resolved': True}
+
     def build_path():
         path = []
         
@@ -1897,8 +2546,7 @@ try:
         path.append({"device": source_ip, "role": "endpoint_src", "indent": 0})
         
         # Source leaf
-        src_data = all_data.get(source_leaf, {})
-        route, _ = find_best_route(dest_ip, src_data.get('routes', {}), src_vrf)
+        route = source_route
         path.append({
             "device": source_leaf, "vrf": src_vrf,
             "prefix": route.get('prefix', '') if route else '',
@@ -1944,6 +2592,7 @@ try:
         # ─── Helper: make border hop (single or ECMP group) ───
         def make_border_hop(borders, vrf, indent):
             """Create a border leaf hop — single device or ECMP group."""
+            borders = sorted(set(borders))
             if len(borders) == 1:
                 return {"device": borders[0], "vrf": vrf,
                         "role": "border", "indent": indent, "label": "Border Leaf"}
@@ -1961,9 +2610,17 @@ try:
             border = borders[0] if borders else None
             
             if borders:
+                mapped_borders = sorted(set(map_to_fabric_name(b) for b in borders))
+                source_is_border = source_leaf in mapped_borders
+                destination_is_border = dest_leaf in mapped_borders
                 # Source → fabric layers → Border
-                if border != source_leaf:
+                if not source_is_border:
                     s2b = find_on_path_layers(source_leaf, border)
+                    if not s2b:
+                        add_warning(
+                            'topology_path_incomplete',
+                            'No active LLDP transit path was found for one or more routed segments.'
+                        )
                     s2b_asc = s2b[: (len(s2b) + 1) // 2]
                     s2b_desc = s2b[(len(s2b) + 1) // 2:]
                     add_ascending(path, s2b_asc, src_vrf)
@@ -1979,16 +2636,30 @@ try:
                 
                 # Border → fabric layers → Dest (symmetric descent)
                 border_indent = ext_indent - 1
-                path.append(make_border_hop(borders, dst_vrf, border_indent))
-                
-                if border != dest_leaf:
+                if not destination_is_border:
+                    path.append(make_border_hop(borders, dst_vrf, border_indent))
                     b2d = find_on_path_layers(border, dest_leaf)
+                    if not b2d:
+                        add_warning(
+                            'topology_path_incomplete',
+                            'No active LLDP transit path was found for one or more routed segments.'
+                        )
                     for idx, layer in enumerate(b2d):
                         devices = sorted(set(map_to_fabric_name(d) for d in layer["devices"]))
                         layer_indent = max(2, border_indent - idx - 1)
                         path.append(make_layer_hop(devices, dst_vrf, layer_indent, layer["label"], layer.get("tier", 1)))
             else:
+                trace_state['egress_resolved'] = False
+                add_warning(
+                    'unknown_egress',
+                    'The routed egress could not be mapped to a unique border leaf.'
+                )
                 layers = find_on_path_layers(source_leaf, dest_leaf)
+                if not layers and source_leaf != dest_leaf:
+                    add_warning(
+                        'topology_path_incomplete',
+                        'No active LLDP transit path was found for one or more routed segments.'
+                    )
                 asc = layers[: (len(layers) + 1) // 2]
                 desc = layers[(len(layers) + 1) // 2:]
                 add_ascending(path, asc, src_vrf)
@@ -2014,21 +2685,35 @@ try:
             border = borders[0] if borders else None
             
             if borders:
-                if border != source_leaf:
+                mapped_borders = sorted(set(map_to_fabric_name(b) for b in borders))
+                source_is_border = source_leaf in mapped_borders
+                if not source_is_border:
                     s2b = find_on_path_layers(source_leaf, border)
+                    if not s2b:
+                        add_warning(
+                            'topology_path_incomplete',
+                            'No active LLDP transit path was found for one or more routed segments.'
+                        )
                     # Add ALL layers as ascending (one-way, no descent)
                     add_ascending(path, s2b, src_vrf)
-                
-                peak = max(h.get('indent', 0) for h in path) + 1
-                path.append(make_border_hop(borders, src_vrf, peak))
-                path.append({"device": "External Network", "role": "external",
-                             "indent": peak + 1, "src_vrf": src_vrf, "dst_vrf": "external"})
-            else:
-                layers = find_on_path_layers(source_leaf, dest_leaf)
-                add_ascending(path, layers, src_vrf)
+                    border_indent = max(h.get('indent', 0) for h in path) + 1
+                    path.append(make_border_hop(borders, src_vrf, border_indent))
+                else:
+                    path[-1]["label"] = "Source & Border Leaf"
+
                 peak = max(h.get('indent', 0) for h in path) + 1
                 path.append({"device": "External Network", "role": "external",
                              "indent": peak, "src_vrf": src_vrf, "dst_vrf": "external"})
+            else:
+                trace_state['egress_resolved'] = False
+                add_warning(
+                    'unknown_egress',
+                    'The routed egress could not be mapped to a unique border leaf.'
+                )
+                peak = max(h.get('indent', 0) for h in path) + 1
+                path.append({"device": "External Network", "role": "external",
+                             "indent": peak, "src_vrf": src_vrf,
+                             "dst_vrf": "external", "resolved": False})
             
             # Dest endpoint (traffic exits fabric)
             path.append({"device": dest_ip, "role": "endpoint_dst", "indent": 0})
@@ -2036,6 +2721,11 @@ try:
         else:
             # ── Same-VRF local: Source → layers → Dest ──
             layers = find_on_path_layers(source_leaf, dest_leaf)
+            if not layers and source_leaf != dest_leaf:
+                add_warning(
+                    'topology_path_incomplete',
+                    'No active LLDP transit path was found for one or more routed segments.'
+                )
             asc = layers[: (len(layers) + 1) // 2]
             desc = layers[(len(layers) + 1) // 2:]
             add_ascending(path, asc, src_vrf)
@@ -2076,7 +2766,7 @@ try:
             if not ecmp_devs:
                 continue
             
-            total_up, total_down = 0, 0
+            total_up, total_down, total_mismatch = 0, 0, 0
             
             # Check links FROM previous hop → this layer
             if i > 0:
@@ -2088,9 +2778,10 @@ try:
                         if pd:
                             pdevs = [pd]
                     for pd in pdevs:
-                        u, d = get_link_health(base(pd), ecmp_devs)
+                        u, d, m = get_link_health(base(pd), ecmp_devs)
                         total_up += u
                         total_down += d
+                        total_mismatch += m
             
             # Check links FROM this layer → next hop
             if i < len(path) - 1:
@@ -2102,20 +2793,23 @@ try:
                         if nd:
                             ndevs = [nd]
                     for nd in ndevs:
-                        u, d = get_link_health(base(nd), ecmp_devs)
+                        u, d, m = get_link_health(base(nd), ecmp_devs)
                         total_up += u
                         total_down += d
+                        total_mismatch += m
             
             if total_up > 0 or total_down > 0:
                 hop['links_up'] = total_up
                 hop['links_down'] = total_down
+                if total_mismatch:
+                    hop['links_mismatch'] = total_mismatch
     
     enrich_link_health(path)
     
     vrf_display = f"{src_vrf} -> {dst_vrf}" if has_external else vrf
     if dest_is_external:
         vrf_display = f"{src_vrf} -> external"
-    
+
     result = {
         "path": path,
         "source_device": source_leaf,
@@ -2123,8 +2817,13 @@ try:
         "destination": dest_ip,
         "vrf": vrf_display,
         "inter_vrf": has_external,
-        "tiers_found": len(set(device_tiers.values())) if device_tiers else 0
+        "tiers_found": len(set(device_tiers.values())) if device_tiers else 0,
+        "path_basis": "cached-fib-active-lldp-inference",
+        "warnings": warnings,
+        "data_quality": data_quality,
     }
+    if has_external or dest_is_external:
+        result['egress_resolved'] = trace_state['egress_resolved']
     # Only include dest_device for fabric-local destinations
     if dest_is_local and dest_leaf:
         result["dest_device"] = dest_leaf
@@ -2136,8 +2835,8 @@ try:
     print(json.dumps(result))
 
 except Exception as e:
-    import traceback
-    print(json.dumps({"error": str(e), "detail": traceback.format_exc()}))
+    print(f"trace-path-ip failed: {type(e).__name__}: {e}", file=sys.stderr)
+    print(json.dumps({"error": "Trace path computation failed."}))
 PYTHON
 }
 
@@ -2422,8 +3121,8 @@ try:
     print(json.dumps(result))
 
 except Exception as e:
-    import traceback
-    print(json.dumps({"error": str(e), "trace": traceback.format_exc()}))
+    print(f"trace-path failed: {type(e).__name__}: {e}", file=sys.stderr)
+    print(json.dumps({"error": "Trace path computation failed."}))
 PYTHON
 }
 
@@ -2433,6 +3132,7 @@ search_cached_tables() {
     local search="$2"
     
     python3 - "$table_type" "$search" <<'PYTHON'
+import ipaddress
 import json
 import os
 import re
@@ -2440,33 +3140,78 @@ import sys
 
 lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
 tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
+summary_file = os.path.join(tables_dir, "summary.json")
 table_type = sys.argv[1]
 search = sys.argv[2].lower()
 
 # Detect if search is a full IP (4 octets) → use exact match on IP/ip fields
-is_full_ip = bool(re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', search))
+try:
+    ipaddress.IPv4Address(search)
+    is_full_ip = True
+except ipaddress.AddressValueError:
+    is_full_ip = False
 
 entries = []
+warnings = []
+candidate_file_count = 0
+processed_device_count = 0
+summary_devices = {}
+snapshot_hostnames = set()
+failed_devices = set()
 
 try:
     if not os.path.exists(tables_dir):
         print(json.dumps({"success": False, "error": "No cached data. Run Fabric Scan first."}))
         exit()
+
+    if os.path.exists(summary_file):
+        try:
+            with open(summary_file) as summary_handle:
+                summary = json.load(summary_handle)
+            for device in summary.get('devices', []):
+                if not isinstance(device, dict) or not device.get('hostname'):
+                    continue
+                summary_devices[str(device['hostname'])] = str(device.get('status', 'unknown'))
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            warnings.append(f"summary.json: {exc}")
     
     for filename in os.listdir(tables_dir):
         if not filename.endswith('.json') or filename == 'summary.json':
             continue
+        candidate_file_count += 1
         
         hostname = filename.replace('.json', '')
+        snapshot_hostnames.add(hostname)
         filepath = os.path.join(tables_dir, filename)
         
         try:
             with open(filepath) as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("snapshot is not a JSON object")
+            processed_device_count += 1
+
+            collection = data.get('_collection', {})
+            if isinstance(collection, dict):
+                collection_status = collection.get('status')
+                if collection_status in {'stale', 'unavailable'}:
+                    warnings.append(f"{filename}: snapshot status is {collection_status}")
+
+            if table_type not in data:
+                warnings.append(f"{filename}: snapshot is missing {table_type}")
+                continue
+            table_data = data[table_type]
+            if not isinstance(table_data, list):
+                warnings.append(f"{filename}: {table_type} is not a list")
+                continue
+
+            skipped_entries = 0
             
-            table_data = data.get(table_type, [])
-            
-            for entry in table_data:
+            for cached_entry in table_data:
+                if not isinstance(cached_entry, dict):
+                    skipped_entries += 1
+                    continue
+                entry = dict(cached_entry)
                 entry['device'] = hostname
                 
                 # Filter by search term
@@ -2492,14 +3237,64 @@ try:
                         continue
                 
                 entries.append(entry)
-        except:
-            continue
+            if skipped_entries:
+                warnings.append(
+                    f"{filename}: skipped {skipped_entries} malformed {table_type} "
+                    f"entr{'y' if skipped_entries == 1 else 'ies'}"
+                )
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            warnings.append(f"{filename}: {exc}")
+            failed_devices.add(hostname)
+
+    for hostname, status in summary_devices.items():
+        if hostname not in snapshot_hostnames:
+            warnings.append(f"{hostname}: {status} device has no cached snapshot")
+            failed_devices.add(hostname)
+        elif status in {'stale', 'unavailable'}:
+            warnings.append(f"{hostname}: snapshot status is {status}")
+            if status == 'unavailable':
+                failed_devices.add(hostname)
+
+    if candidate_file_count == 0:
+        print(json.dumps({
+            "success": False,
+            "error": "No cached device data. Run Fabric Scan first.",
+            "warnings": warnings,
+            "partial": False,
+            "complete": False,
+        }))
+        raise SystemExit(0)
+    if processed_device_count == 0:
+        print(json.dumps({
+            "success": False,
+            "error": "Cached table data is unreadable or invalid",
+            "warnings": warnings,
+            "partial": True,
+            "complete": False,
+            "processed_device_count": 0,
+            "failed_device_count": candidate_file_count,
+        }))
+        raise SystemExit(0)
     
+    warnings = sorted(set(warnings))
+    expected_device_count = len(summary_devices) if summary_devices else candidate_file_count
+    limit = 500
+    returned = entries[:limit]
     print(json.dumps({
         "success": True,
-        "entries": entries[:500],
+        "entries": returned,
         "total": len(entries),
-        "cached": True
+        "returned_total": len(returned),
+        "limit": limit,
+        "truncated": len(returned) < len(entries),
+        "cached": True,
+        "warnings": warnings,
+        "partial": bool(warnings),
+        "complete": not warnings,
+        "processed_device_count": processed_device_count,
+        "failed_device_count": len(failed_devices),
+        "expected_device_count": expected_device_count,
+        "missing_devices": sorted(failed_devices),
     }))
 
 except Exception as e:

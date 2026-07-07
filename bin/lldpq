@@ -12,7 +12,8 @@ lldpq_fatal() {
 LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
-        --require-key LLDPQ_DIR --require-key WEB_ROOT 2>/dev/null); then
+        --require-key LLDPQ_DIR --require-key LLDPQ_USER \
+        --require-key WEB_ROOT 2>/dev/null); then
         lldpq_fatal "required runtime configuration is missing or unreadable"
     fi
     eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
@@ -23,6 +24,7 @@ elif [[ -z "${LLDPQ_DIR:-}" ]]; then
 fi
 [[ -n "${LLDPQ_DIR:-}" ]] || lldpq_fatal "LLDPQ_DIR is empty"
 [[ -n "${WEB_ROOT:-}" ]] || lldpq_fatal "WEB_ROOT is empty"
+LLDPQ_USER="${LLDPQ_USER:-$(id -un)}"
 
 # Parse flags: lldpq - (verbose), lldpq -s (skip optical)
 QUIET=true
@@ -63,8 +65,40 @@ REPORT_DIR="$LLDPQ_DIR/monitor-results"
 STALE_MARKER="$REPORT_DIR/.lldpq-stale"
 PIPELINE_REPORT_STATE=idle
 
+publish_web_pipeline_marker() {
+    local source_marker=$1
+    local web_dir="$WEB_ROOT/monitor-results"
+    local web_marker="$web_dir/.lldpq-stale"
+    local web_temporary=""
+
+    [[ -d "$web_dir" ]] || return 0
+
+    # A legacy Docker layout may expose the source marker directly. Keep the
+    # single inode but still enforce the web-reader contract explicitly.
+    if [[ -e "$web_marker" || -L "$web_marker" ]] && \
+       [[ "$source_marker" -ef "$web_marker" ]]; then
+        sudo chown "$LLDPQ_USER:www-data" "$source_marker" 2>/dev/null && \
+            sudo chmod 0640 "$source_marker" 2>/dev/null
+        return $?
+    fi
+
+    # Build the public marker beside its destination, set final metadata while
+    # it is still private, then expose it with one same-filesystem rename. This
+    # prevents nginx from observing partial content or a root-only sudo-cp file.
+    web_temporary=$(sudo mktemp "$web_dir/.lldpq-stale.tmp.XXXXXXXX" 2>/dev/null) || \
+        return 1
+    if ! sudo cp -- "$source_marker" "$web_temporary" 2>/dev/null || \
+       ! sudo chown "$LLDPQ_USER:www-data" "$web_temporary" 2>/dev/null || \
+       ! sudo chmod 0640 "$web_temporary" 2>/dev/null || \
+       ! sudo mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
+        sudo rm -f -- "$web_temporary" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 write_pipeline_report_marker() {
-    local marker_status=$1 reason=$2 timestamp temporary web_marker
+    local marker_status=$1 reason=$2 timestamp temporary
     mkdir -p "$REPORT_DIR" || return 1
     timestamp=$(date -Is) || return 1
     temporary=$(mktemp "$REPORT_DIR/.lldpq-stale.tmp.XXXXXXXX") || return 1
@@ -72,19 +106,14 @@ write_pipeline_report_marker() {
         printf 'status=%s\n' "$marker_status"
         printf 'timestamp=%s\n' "$timestamp"
         printf 'reason=%s\n' "$reason"
+        printf 'pipeline_id=%s\n' "${LLDPQ_PIPELINE_ID:-}"
     } > "$temporary" || ! chmod 0644 "$temporary" || \
        ! mv -f "$temporary" "$STALE_MARKER"; then
         rm -f "$temporary"
         return 1
     fi
 
-    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
-        web_marker="$WEB_ROOT/monitor-results/.lldpq-stale"
-        if [[ ! -e "$web_marker" || ! "$STALE_MARKER" -ef "$web_marker" ]]; then
-            sudo cp "$STALE_MARKER" "$web_marker" 2>/dev/null || return 1
-        fi
-    fi
-    return 0
+    publish_web_pipeline_marker "$STALE_MARKER"
 }
 
 mark_pipeline_reports_stale() {

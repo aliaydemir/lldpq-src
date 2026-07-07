@@ -10,6 +10,7 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import json
+import html
 import time
 import collections
 from datetime import datetime, timedelta
@@ -614,8 +615,9 @@ class LinkFlapAnalyzer:
 """
             for anomaly in anomalies:
                 severity_class = "warning" if anomaly['severity'] == 'warning' else ""
+                anomaly_device_key = html.escape(str(anomaly['device']), quote=True)
                 html_content += f"""
-            <div class="anomaly-card {severity_class}">
+            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}">
                 <h4>{anomaly['device']} - {anomaly['interface']}</h4>
                 <p><strong>Issue:</strong> {anomaly['message']}</p>
                 <p><strong>Recommended Action:</strong> {anomaly['action']}</p>
@@ -700,8 +702,9 @@ class LinkFlapAnalyzer:
                 transition_class = "transition-good"
 
             dashboard_status = "ok" if status_val == "ok" else "problematic"
+            device_key = html.escape(str(port['device']), quote=True)
             table_rows.append(f"""
-        <tr data-status="{dashboard_status}" data-flap-status="{status_val}">
+        <tr data-device-key="{device_key}" data-status="{dashboard_status}" data-flap-status="{status_val}">
             <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
             <td><span class="{badge_class}">{status_val.upper()}</span></td>
@@ -1077,12 +1080,12 @@ class LinkFlapAnalyzer:
                 Running...
             `;
             let baseline = null;
-            if (typeof window.lldpqCapturePipelineState === 'function') {
-                try { baseline = await window.lldpqCapturePipelineState(); } catch (error) { baseline = null; }
+            if (typeof window.lldpqCaptureAnalysisState === 'function') {
+                try { baseline = await window.lldpqCaptureAnalysisState('flap'); } catch (error) { baseline = null; }
             }
             
             // Send POST request to trigger monitor
-            fetch('/trigger-monitor', {
+            fetch('/trigger-monitor?scope=flap', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -1090,7 +1093,7 @@ class LinkFlapAnalyzer:
             })
             .then(response => response.json())
             .then(data => {
-                if (data.status === 'success') {
+                if (data.status === 'success' && data.trigger_id && data.scope === 'flap') {
                     console.log('✅ Monitor analysis triggered successfully');
                     // Show notification
                     const notification = document.createElement('div');
@@ -1110,12 +1113,13 @@ class LinkFlapAnalyzer:
                     `;
                     notification.innerHTML = `
                         <strong>✅ Monitor Analysis Started</strong><br>
-                        The full system analysis is running in the background.<br>
-                        <small>Waiting for the current pipeline to complete before refreshing.</small>
+                        The link flap analysis is running in the background.<br>
+                        <small>Waiting for the link flap results to be published before refreshing.</small>
                     `;
                     document.body.appendChild(notification);
                     const completion = typeof window.waitForLldpqAnalysisCompletion === 'function'
-                        ? window.waitForLldpqAnalysisCompletion(baseline)
+                        ? window.waitForLldpqAnalysisCompletion(
+                            baseline, { scope: 'flap', pipelineId: data.trigger_id })
                         : new Promise(resolve => setTimeout(resolve, 35000));
                     Promise.resolve(completion)
                         .then(() => window.location.reload())
@@ -1277,7 +1281,7 @@ class LinkFlapAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/analysis-guard.js"></script>
+    <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""
 

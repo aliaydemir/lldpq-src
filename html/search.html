@@ -8,6 +8,10 @@
     <script src="/css/ui-dialogs.js"></script>
     <script src="/css/auth.js"></script>
     <style>
+        :root {
+            --primary-green: #76b900;
+        }
+
         * {
             margin: 0;
             padding: 0;
@@ -619,48 +623,48 @@
     <!-- Global Search -->
     <div class="global-search-container">
         <div class="global-search-box">
-            <input type="text" id="globalSearchInput" placeholder="Search IP or MAC across all devices..." 
+            <input type="text" id="globalSearchInput" aria-label="Search IP or MAC across all devices" placeholder="Search IP or MAC across all devices..."
                    onkeydown="if(event.key==='Enter') globalSearch()">
             <div class="search-buttons">
-                <button class="btn-search" onclick="globalSearch()">
+                <button type="button" class="btn-search" onclick="globalSearch()">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                         <path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/>
                     </svg>
                     Search All
                 </button>
-                <button class="btn-clear" onclick="clearGlobalSearch()">Clear</button>
+                <button type="button" class="btn-clear" onclick="clearGlobalSearch()">Clear</button>
             </div>
         </div>
-        <div id="globalSearchResults" class="global-search-results" style="display: none;"></div>
+        <div id="globalSearchResults" class="global-search-results" aria-live="polite" style="display: none;"></div>
     </div>
     
     <!-- Tabs -->
-    <div class="tabs">
-        <button class="tab active" onclick="switchTab(event, 'mac')">
+    <div class="tabs" role="tablist" aria-label="Fabric search data types">
+        <button type="button" id="tabButton-mac" class="tab active" role="tab" aria-selected="true" aria-controls="tab-mac" onclick="switchTab(event, 'mac')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M4 1h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1m0 8h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1m0 8h16a1 1 0 0 1 1 1v4a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-4a1 1 0 0 1 1-1z"/>
             </svg>
             MAC
         </button>
-        <button class="tab" onclick="switchTab(event, 'arp')">
+        <button type="button" id="tabButton-arp" class="tab" role="tab" aria-selected="false" aria-controls="tab-arp" tabindex="-1" onclick="switchTab(event, 'arp')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
             </svg>
             ARP
         </button>
-        <button class="tab" onclick="switchTab(event, 'vtep')">
+        <button type="button" id="tabButton-vtep" class="tab" role="tab" aria-selected="false" aria-controls="tab-vtep" tabindex="-1" onclick="switchTab(event, 'vtep')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
             </svg>
             VTEP
         </button>
-        <button class="tab" onclick="switchTab(event, 'route')">
+        <button type="button" id="tabButton-route" class="tab" role="tab" aria-selected="false" aria-controls="tab-route" tabindex="-1" onclick="switchTab(event, 'route')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M14 6l-3.75 5 2.85 3.8-1.6 1.2C9.81 13.75 7 10 7 10l-6 8h22L14 6z"/>
             </svg>
             Routes
         </button>
-        <button class="tab" onclick="switchTab(event, 'lldp')">
+        <button type="button" id="tabButton-lldp" class="tab" role="tab" aria-selected="false" aria-controls="tab-lldp" tabindex="-1" onclick="switchTab(event, 'lldp')">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/>
             </svg>
@@ -669,22 +673,22 @@
     </div>
     
     <!-- MAC Table Tab -->
-    <div id="tab-mac" class="tab-content active">
+    <div id="tab-mac" class="tab-content active" role="tabpanel" aria-labelledby="tabButton-mac" aria-hidden="false">
         <div class="dashboard-section">
             <div class="section-content">
                 <div class="search-container">
-                    <select id="macDeviceSelect" class="device-select" onchange="loadMacTable()">
+                    <select id="macDeviceSelect" class="device-select" aria-label="MAC table device">
                         <option value="">All Devices</option>
                     </select>
-                    <input type="text" id="macSearchInput" class="search-input" placeholder="Filter by MAC address or interface..." />
-                    <button onclick="loadMacTable()" class="btn btn-primary">
+                    <input type="text" id="macSearchInput" class="search-input" aria-label="Filter MAC table" placeholder="Filter by MAC address or interface..." />
+                    <button type="button" onclick="loadMacTable()" class="btn btn-primary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
                         </svg>
                         Load
                     </button>
-                    <button onclick="clearTabResults('mac')" class="btn btn-secondary">Clear</button>
-                    <button onclick="exportTable('mac')" class="btn btn-secondary">
+                    <button type="button" onclick="clearTabResults('mac')" class="btn btn-secondary">Clear</button>
+                    <button type="button" onclick="exportTable('mac')" class="btn btn-secondary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M12,19L8,15H10.5V12H13.5V15H16L12,19Z"/>
                         </svg>
@@ -700,29 +704,29 @@
                     <span id="macResultCount">Select a device or click Load</span>
                 </div>
             </div>
-            <div id="macResultsContent" class="results-content">
+            <div id="macResultsContent" class="results-content" aria-live="polite">
                 <div class="status-message">Select a device and click Load to view MAC table</div>
             </div>
         </div>
     </div>
     
     <!-- ARP Table Tab -->
-    <div id="tab-arp" class="tab-content">
+    <div id="tab-arp" class="tab-content" role="tabpanel" aria-labelledby="tabButton-arp" aria-hidden="true">
         <div class="dashboard-section">
             <div class="section-content">
                 <div class="search-container">
-                    <select id="arpDeviceSelect" class="device-select" onchange="loadArpTable()">
+                    <select id="arpDeviceSelect" class="device-select" aria-label="ARP table device">
                         <option value="">All Devices</option>
                     </select>
-                    <input type="text" id="arpSearchInput" class="search-input" placeholder="Filter by IP, MAC, or interface..." />
-                    <button onclick="loadArpTable()" class="btn btn-primary">
+                    <input type="text" id="arpSearchInput" class="search-input" aria-label="Filter ARP table" placeholder="Filter by IP, MAC, or interface..." />
+                    <button type="button" onclick="loadArpTable()" class="btn btn-primary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
                         </svg>
                         Load
                     </button>
-                    <button onclick="clearTabResults('arp')" class="btn btn-secondary">Clear</button>
-                    <button onclick="exportTable('arp')" class="btn btn-secondary">
+                    <button type="button" onclick="clearTabResults('arp')" class="btn btn-secondary">Clear</button>
+                    <button type="button" onclick="exportTable('arp')" class="btn btn-secondary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M12,19L8,15H10.5V12H13.5V15H16L12,19Z"/>
                         </svg>
@@ -738,28 +742,28 @@
                     <span id="arpResultCount">Select a device or click Load</span>
                 </div>
             </div>
-            <div id="arpResultsContent" class="results-content">
+            <div id="arpResultsContent" class="results-content" aria-live="polite">
                 <div class="status-message">Select a device and click Load to view ARP table</div>
             </div>
         </div>
     </div>
     
     <!-- VTEP Table Tab -->
-    <div id="tab-vtep" class="tab-content">
+    <div id="tab-vtep" class="tab-content" role="tabpanel" aria-labelledby="tabButton-vtep" aria-hidden="true">
         <div class="dashboard-section">
             <div class="section-content">
                 <div class="search-container">
-                    <select id="vtepDeviceSelect" class="device-select">
+                    <select id="vtepDeviceSelect" class="device-select" aria-label="VTEP table device">
                         <option value="">Select Device</option>
                     </select>
-                    <input type="text" id="vtepSearchInput" class="search-input" placeholder="Filter by VTEP IP or VNI..." />
-                    <button onclick="loadVtepTable()" class="btn btn-primary">
+                    <input type="text" id="vtepSearchInput" class="search-input" aria-label="Filter VTEP table" placeholder="Filter by VTEP IP or VNI..." />
+                    <button type="button" onclick="loadVtepTable()" class="btn btn-primary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
                         </svg>
                         Load
                     </button>
-                    <button onclick="clearTabResults('vtep')" class="btn btn-secondary">Clear</button>
+                    <button type="button" onclick="clearTabResults('vtep')" class="btn btn-secondary">Clear</button>
                 </div>
             </div>
         </div>
@@ -770,28 +774,28 @@
                     <span id="vtepResultCount">Select a device and click Load</span>
                 </div>
             </div>
-            <div id="vtepResultsContent" class="results-content">
+            <div id="vtepResultsContent" class="results-content" aria-live="polite">
                 <div class="status-message">Select a device and click Load to view remote VTEPs</div>
             </div>
         </div>
     </div>
     
     <!-- Route Table Tab -->
-    <div id="tab-route" class="tab-content">
+    <div id="tab-route" class="tab-content" role="tabpanel" aria-labelledby="tabButton-route" aria-hidden="true">
         <div class="dashboard-section">
             <div class="section-content">
                 <div class="search-container">
-                    <select id="routeDeviceSelect" class="device-select">
+                    <select id="routeDeviceSelect" class="device-select" aria-label="Routing table device">
                         <option value="">Select Device</option>
                     </select>
-                    <input type="text" id="routeSearchInput" class="search-input" placeholder="Filter by prefix, nexthop, or VRF..." />
-                    <button onclick="loadRouteTable()" class="btn btn-primary">
+                    <input type="text" id="routeSearchInput" class="search-input" aria-label="Filter routing table" placeholder="Filter by prefix, nexthop, or VRF..." />
+                    <button type="button" onclick="loadRouteTable()" class="btn btn-primary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
                         </svg>
                         Load
                     </button>
-                    <button onclick="clearTabResults('route')" class="btn btn-secondary">Clear</button>
+                    <button type="button" onclick="clearTabResults('route')" class="btn btn-secondary">Clear</button>
                 </div>
             </div>
         </div>
@@ -805,28 +809,28 @@
             <div id="vrfTabsContainer" class="vrf-tabs-container" style="display: none;">
                 <div class="vrf-tabs" id="vrfTabs"></div>
             </div>
-            <div id="routeResultsContent" class="results-content">
+            <div id="routeResultsContent" class="results-content" aria-live="polite">
                 <div class="status-message">Select a device and click Load to view routes</div>
             </div>
         </div>
     </div>
     
     <!-- LLDP Neighbors Tab -->
-    <div id="tab-lldp" class="tab-content">
+    <div id="tab-lldp" class="tab-content" role="tabpanel" aria-labelledby="tabButton-lldp" aria-hidden="true">
         <div class="dashboard-section">
             <div class="section-content">
                 <div class="search-container">
-                    <select id="lldpDeviceSelect" class="device-select">
+                    <select id="lldpDeviceSelect" class="device-select" aria-label="LLDP neighbor device">
                         <option value="">Select Device</option>
                     </select>
-                    <input type="text" id="lldpSearchInput" class="search-input" placeholder="Filter by neighbor or port..." />
-                    <button onclick="loadLldpNeighbors()" class="btn btn-primary">
+                    <input type="text" id="lldpSearchInput" class="search-input" aria-label="Filter LLDP neighbors" placeholder="Filter by neighbor or port..." />
+                    <button type="button" onclick="loadLldpNeighbors()" class="btn btn-primary">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
                         </svg>
                         Load
                     </button>
-                    <button onclick="clearTabResults('lldp')" class="btn btn-secondary">Clear</button>
+                    <button type="button" onclick="clearTabResults('lldp')" class="btn btn-secondary">Clear</button>
                 </div>
             </div>
         </div>
@@ -837,7 +841,7 @@
                     <span id="lldpResultCount">Select a device and click Load</span>
                 </div>
             </div>
-            <div id="lldpResultsContent" class="results-content">
+            <div id="lldpResultsContent" class="results-content" aria-live="polite">
                 <div class="status-message">Select a device and click Load to view LLDP neighbors</div>
             </div>
         </div>
@@ -846,6 +850,103 @@
     <script>
         let currentMacData = [];
         let currentArpData = [];
+        const requestTokens = {
+            global: 0,
+            mac: 0,
+            arp: 0,
+            vtep: 0,
+            route: 0,
+            lldp: 0
+        };
+
+        const tabResultConfigs = {
+            mac: { search: 'macSearchInput', results: 'macResultsContent', count: 'macResultCount', msg: 'Select a device and click Load to view MAC table' },
+            arp: { search: 'arpSearchInput', results: 'arpResultsContent', count: 'arpResultCount', msg: 'Select a device and click Load to view ARP table' },
+            vtep: { search: 'vtepSearchInput', results: 'vtepResultsContent', count: 'vtepResultCount', msg: 'Select a device and click Load to view remote VTEPs' },
+            route: { search: 'routeSearchInput', results: 'routeResultsContent', count: 'routeResultCount', msg: 'Select a device and click Load to view routes' },
+            lldp: { search: 'lldpSearchInput', results: 'lldpResultsContent', count: 'lldpResultCount', msg: 'Select a device and click Load to view LLDP neighbors' }
+        };
+
+        function beginRequest(scope) {
+            requestTokens[scope] += 1;
+            return requestTokens[scope];
+        }
+
+        function invalidateRequest(scope) {
+            requestTokens[scope] += 1;
+        }
+
+        function isCurrentRequest(scope, token) {
+            return requestTokens[scope] === token;
+        }
+
+        function getSelectedDeviceName(selectId) {
+            const select = document.getElementById(selectId);
+            if (!select || !select.value || select.selectedIndex < 0) return '';
+            return select.options[select.selectedIndex].textContent.trim();
+        }
+
+        function collectDataWarnings(data) {
+            if (!data || typeof data !== 'object') return [];
+
+            const warningValues = [
+                data.warning,
+                data.cache_warning,
+                data.partial_warning,
+                data.success === false ? data.error : '',
+                ...(Array.isArray(data.warnings) ? data.warnings : [])
+            ];
+            const warnings = warningValues
+                .filter(value => typeof value === 'string' && value.trim())
+                .map(value => value.trim());
+
+            if ((data.partial === true || data.complete === false) && warnings.length === 0) {
+                warnings.push('Results are partial and may not include every device.');
+            }
+            if (data.truncated === true) {
+                const returned = Number.isFinite(Number(data.returned_total))
+                    ? Number(data.returned_total)
+                    : (Array.isArray(data.entries) ? data.entries.length : 0);
+                const total = Number.isFinite(Number(data.total)) ? Number(data.total) : null;
+                warnings.push(total === null
+                    ? `Only the first ${returned} results are displayed.`
+                    : `Showing the first ${returned} of ${total} results.`);
+            }
+            return [...new Set(warnings)];
+        }
+
+        function renderDataWarnings(...responses) {
+            const warnings = [...new Set(responses.flatMap(collectDataWarnings))];
+            if (warnings.length === 0) return '';
+            return '<div role="status" style="padding:10px 14px;color:#f0ad4e;text-align:left;">Data warning: ' +
+                warnings.map(escapeHtml).join(' ') + '</div>';
+        }
+
+        function isValidIpv4(value) {
+            const parts = String(value).split('.');
+            return parts.length === 4 && parts.every(part =>
+                /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255
+            );
+        }
+
+        function invalidateTabData(tab, { preserveSearch = true } = {}) {
+            const cfg = tabResultConfigs[tab];
+            if (!cfg) return;
+
+            invalidateRequest(tab);
+            if (!preserveSearch) document.getElementById(cfg.search).value = '';
+            document.getElementById(cfg.results).innerHTML = '<div class="status-message">' + cfg.msg + '</div>';
+            document.getElementById(cfg.count).textContent = 'Select a device or click Load';
+
+            if (tab === 'mac') currentMacData = [];
+            if (tab === 'arp') currentArpData = [];
+            if (tab === 'route') {
+                currentRouteData = null;
+                currentRouteVrf = 'all';
+                document.getElementById('vrfTabs').replaceChildren();
+                document.getElementById('vrfTabsContainer').style.display = 'none';
+            }
+        }
 
         // Network data is untrusted text. Keep the existing HTML templates for
         // layout, but encode every dynamic value before it reaches innerHTML.
@@ -899,24 +1000,58 @@
             return data;
         }
         
-        function setLastUpdated() {
-            const now = new Date();
+        function setLastUpdated(timestamp) {
+            const target = document.getElementById('last-updated');
+            if (!timestamp) {
+                target.textContent = 'No cached data';
+                return;
+            }
+
+            const scanTime = new Date(timestamp);
+            if (Number.isNaN(scanTime.getTime())) {
+                target.textContent = String(timestamp);
+                return;
+            }
             const options = { 
                 year: 'numeric', month: '2-digit', day: '2-digit', 
                 hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true
             };
-            document.getElementById('last-updated').textContent = now.toLocaleString('en-US', options);
+            target.textContent = scanTime.toLocaleString('en-US', options);
         }
         
         function switchTab(event, tabName) {
             // Update tab buttons
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            event.target.closest('.tab').classList.add('active');
+            const activeTab = event.target.closest('.tab');
+            document.querySelectorAll('.tab').forEach(tab => {
+                const isActive = tab === activeTab;
+                tab.classList.toggle('active', isActive);
+                tab.setAttribute('aria-selected', String(isActive));
+                tab.tabIndex = isActive ? 0 : -1;
+            });
             
             // Update tab content
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.getElementById('tab-' + tabName).classList.add('active');
+            document.querySelectorAll('.tab-content').forEach(panel => {
+                const isActive = panel.id === 'tab-' + tabName;
+                panel.classList.toggle('active', isActive);
+                panel.setAttribute('aria-hidden', String(!isActive));
+            });
         }
+
+        document.querySelector('.tabs').addEventListener('keydown', event => {
+            if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+            const tabs = Array.from(document.querySelectorAll('.tab'));
+            const currentIndex = tabs.indexOf(document.activeElement);
+            if (currentIndex < 0) return;
+
+            event.preventDefault();
+            let nextIndex = currentIndex;
+            if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+            if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+            if (event.key === 'Home') nextIndex = 0;
+            if (event.key === 'End') nextIndex = tabs.length - 1;
+            tabs[nextIndex].focus();
+            tabs[nextIndex].click();
+        });
         
         // Table sorting function
         function sortTable(table, colIndex, isNumeric = false) {
@@ -932,13 +1067,16 @@
             // Remove sort classes from all headers
             table.querySelectorAll('th').forEach(h => {
                 h.classList.remove('sort-asc', 'sort-desc');
+                h.setAttribute('aria-sort', 'none');
             });
             
             // Set new sort direction
             if (isAsc) {
                 th.classList.add('sort-desc');
+                th.setAttribute('aria-sort', 'descending');
             } else {
                 th.classList.add('sort-asc');
+                th.setAttribute('aria-sort', 'ascending');
             }
             
             const direction = isAsc ? -1 : 1;
@@ -974,11 +1112,22 @@
         }
         
         function attachSortHandlers(table) {
+            if (!table) return;
             const headers = table.querySelectorAll('th');
             headers.forEach((th, index) => {
-                th.addEventListener('click', () => {
+                th.setAttribute('scope', 'col');
+                th.setAttribute('tabindex', '0');
+                th.setAttribute('aria-sort', th.getAttribute('aria-sort') || 'none');
+                const sort = () => {
                     const isNumeric = th.dataset.numeric === 'true';
                     sortTable(table, index, isNumeric);
+                };
+                th.addEventListener('click', sort);
+                th.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        sort();
+                    }
                 });
             });
         }
@@ -998,8 +1147,13 @@
                     data.devices.forEach(device => {
                         select.add(new Option(device.hostname, device.ip));
                     });
-                    // Sync device selection across all tabs
-                    select.addEventListener('change', () => syncDeviceSelect(selectId));
+                    // Sync first, invalidate every old table, then preserve the
+                    // existing auto-load behavior on MAC and ARP.
+                    select.addEventListener('change', () => {
+                        syncDeviceSelect(selectId);
+                        if (selectId === 'macDeviceSelect') loadMacTable();
+                        if (selectId === 'arpDeviceSelect') loadArpTable();
+                    });
                 });
             } catch (error) {
                 console.error('Failed to load device list:', error);
@@ -1018,14 +1172,21 @@
                     document.getElementById(id).value = value;
                 }
             });
+
+            // A table is only valid for the device shown above it. Invalidate
+            // rows and in-flight work for every tab before any auto-load starts.
+            Object.keys(tabResultConfigs).forEach(tab => invalidateTabData(tab));
         }
         
         // ============ MAC TABLE ============
         async function loadMacTable() {
+            const requestToken = beginRequest('mac');
             const device = document.getElementById('macDeviceSelect').value;
+            const deviceName = getSelectedDeviceName('macDeviceSelect');
             const search = document.getElementById('macSearchInput').value.trim();
             const results = document.getElementById('macResultsContent');
             const resultCount = document.getElementById('macResultCount');
+            currentMacData = [];
             
             results.innerHTML = '<div class="loading-message">Loading MAC table...</div>';
             
@@ -1037,15 +1198,24 @@
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
                 const data = await apiFetchJson(url);
+                if (!isCurrentRequest('mac', requestToken)) return;
                 
                 if (data.success) {
                     // Filter out vxlan interfaces (remote learned MACs)
-                    let entries = data.entries.filter(e => !e.interface || !e.interface.startsWith('vxlan'));
+                    const responseEntries = Array.isArray(data.entries) ? data.entries : [];
+                    let entries = responseEntries
+                        .filter(e => !e.interface || !e.interface.startsWith('vxlan'))
+                        .map(entry => ({
+                            ...entry,
+                            device: entry.device || deviceName || device
+                        }));
                     currentMacData = entries;
-                    resultCount.textContent = entries.length + ' of ' + data.total + ' entries';
+                    const apiTotal = Number.isFinite(Number(data.total)) ? Number(data.total) : responseEntries.length;
+                    resultCount.textContent = entries.length + ' displayed of ' + apiTotal + ' API entries';
+                    const warningHtml = renderDataWarnings(data);
                     
                     if (entries.length === 0) {
-                        results.innerHTML = '<div class="status-message">No local MAC entries found (vxlan filtered)</div>';
+                        results.innerHTML = warningHtml + '<div class="status-message">No local MAC entries found (vxlan filtered)</div>';
                         return;
                     }
                     
@@ -1068,22 +1238,30 @@
                     });
                     
                     html += '</tbody></table>';
-                    results.innerHTML = html;
+                    results.innerHTML = warningHtml + html;
                     attachSortHandlers(document.getElementById('macTable'));
                 } else {
+                    currentMacData = [];
+                    resultCount.textContent = 'Load failed';
                     results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
+                if (!isCurrentRequest('mac', requestToken)) return;
+                currentMacData = [];
+                resultCount.textContent = 'Load failed';
                 results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
         // ============ ARP TABLE ============
         async function loadArpTable() {
+            const requestToken = beginRequest('arp');
             const device = document.getElementById('arpDeviceSelect').value;
+            const deviceName = getSelectedDeviceName('arpDeviceSelect');
             const search = document.getElementById('arpSearchInput').value.trim();
             const results = document.getElementById('arpResultsContent');
             const resultCount = document.getElementById('arpResultCount');
+            currentArpData = [];
             
             results.innerHTML = '<div class="loading-message">Loading ARP table...</div>';
             
@@ -1095,13 +1273,21 @@
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
                 const data = await apiFetchJson(url);
+                if (!isCurrentRequest('arp', requestToken)) return;
                 
                 if (data.success) {
-                    currentArpData = data.entries;
-                    resultCount.textContent = data.entries.length + ' of ' + data.total + ' entries';
+                    const responseEntries = Array.isArray(data.entries) ? data.entries : [];
+                    const entries = responseEntries.map(entry => ({
+                        ...entry,
+                        device: entry.device || deviceName || device
+                    }));
+                    currentArpData = entries;
+                    const apiTotal = Number.isFinite(Number(data.total)) ? Number(data.total) : responseEntries.length;
+                    resultCount.textContent = entries.length + ' displayed of ' + apiTotal + ' API entries';
+                    const warningHtml = renderDataWarnings(data);
                     
-                    if (data.entries.length === 0) {
-                        results.innerHTML = '<div class="status-message">No ARP entries found</div>';
+                    if (entries.length === 0) {
+                        results.innerHTML = warningHtml + '<div class="status-message">No ARP entries found</div>';
                         return;
                     }
                     
@@ -1113,7 +1299,7 @@
                     html += '<th>VRF<span class="sort-icon"></span></th>';
                     html += '<th class="text-right">State<span class="sort-icon"></span></th></tr></thead><tbody>';
                     
-                    data.entries.forEach(entry => {
+                    entries.forEach(entry => {
                         const stateClass = entry.state ? 'badge badge-state-' + entry.state : '';
                         html += '<tr>';
                         if (!device) html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
@@ -1126,24 +1312,31 @@
                     });
                     
                     html += '</tbody></table>';
-                    results.innerHTML = html;
+                    results.innerHTML = warningHtml + html;
                     attachSortHandlers(document.getElementById('arpTable'));
                 } else {
+                    currentArpData = [];
+                    resultCount.textContent = 'Load failed';
                     results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
+                if (!isCurrentRequest('arp', requestToken)) return;
+                currentArpData = [];
+                resultCount.textContent = 'Load failed';
                 results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
         // ============ VTEP TABLE ============
         async function loadVtepTable() {
+            const requestToken = beginRequest('vtep');
             const device = document.getElementById('vtepDeviceSelect').value;
             const search = document.getElementById('vtepSearchInput').value.trim();
             const results = document.getElementById('vtepResultsContent');
             const resultCount = document.getElementById('vtepResultCount');
             
             if (!device) {
+                resultCount.textContent = 'Select a device and click Load';
                 results.innerHTML = '<div class="error-message">Please select a device</div>';
                 return;
             }
@@ -1155,13 +1348,16 @@
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
                 const data = await apiFetchJson(url);
+                if (!isCurrentRequest('vtep', requestToken)) return;
                 
                 if (data.success) {
+                    const entries = Array.isArray(data.entries) ? data.entries : [];
                     const summary = data.summary || {};
-                    resultCount.textContent = data.entries.length + ' entries (' + (summary.unique_vteps || 0) + ' VTEPs)';
+                    resultCount.textContent = entries.length + ' entries (' + (summary.unique_vteps || 0) + ' VTEPs)';
+                    const warningHtml = renderDataWarnings(data);
                     
-                    if (data.entries.length === 0) {
-                        results.innerHTML = '<div class="status-message">No remote VTEPs found</div>';
+                    if (entries.length === 0) {
+                        results.innerHTML = warningHtml + '<div class="status-message">No remote VTEPs found</div>';
                         return;
                     }
                     
@@ -1173,7 +1369,7 @@
                     html += '<th>State<span class="sort-icon"></span></th>';
                     html += '<th class="text-right">Interface<span class="sort-icon"></span></th></tr></thead><tbody>';
                     
-                    data.entries.forEach(entry => {
+                    entries.forEach(entry => {
                         const typeClass = entry.type === 'BUM' ? 'badge badge-orange' : 'badge badge-cyan';
                         const stateClass = entry.state === 'permanent' ? 'badge badge-green' : 
                                           entry.state === 'offload' ? 'badge badge-cyan' : '';
@@ -1188,46 +1384,33 @@
                     });
                     
                     html += '</tbody></table>';
-                    results.innerHTML = html;
+                    results.innerHTML = warningHtml + html;
                     attachSortHandlers(document.getElementById('vtepTable'));
                 } else {
+                    resultCount.textContent = 'Load failed';
                     results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
+                if (!isCurrentRequest('vtep', requestToken)) return;
+                resultCount.textContent = 'Load failed';
                 results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
         // ============ GLOBAL SEARCH ============
         function clearGlobalSearch() {
+            invalidateRequest('global');
             document.getElementById('globalSearchInput').value = '';
             document.getElementById('globalSearchResults').innerHTML = '';
             document.getElementById('globalSearchResults').style.display = 'none';
         }
         
         function clearTabResults(tab) {
-            const configs = {
-                'mac': { search: 'macSearchInput', results: 'macResultsContent', count: 'macResultCount', msg: 'Select a device and click Load to view MAC table' },
-                'arp': { search: 'arpSearchInput', results: 'arpResultsContent', count: 'arpResultCount', msg: 'Select a device and click Load to view ARP table' },
-                'vtep': { search: 'vtepSearchInput', results: 'vtepResultsContent', count: 'vtepResultCount', msg: 'Select a device and click Load to view remote VTEPs' },
-                'route': { search: 'routeSearchInput', results: 'routeResultsContent', count: 'routeResultCount', msg: 'Select a device and click Load to view routes' },
-                'lldp': { search: 'lldpSearchInput', results: 'lldpResultsContent', count: 'lldpResultCount', msg: 'Select a device and click Load to view LLDP neighbors' }
-            };
-            
-            const cfg = configs[tab];
-            if (cfg) {
-                document.getElementById(cfg.search).value = '';
-                document.getElementById(cfg.results).innerHTML = '<div class="status-message">' + cfg.msg + '</div>';
-                document.getElementById(cfg.count).textContent = 'Select a device or click Load';
-                
-                // Hide VRF tabs for route
-                if (tab === 'route') {
-                    document.getElementById('vrfTabsContainer').style.display = 'none';
-                }
-            }
+            invalidateTabData(tab, { preserveSearch: false });
         }
         
         async function globalSearch() {
+            const requestToken = beginRequest('global');
             const searchTerm = document.getElementById('globalSearchInput').value.trim();
             const resultsDiv = document.getElementById('globalSearchResults');
             
@@ -1244,14 +1427,17 @@
                 // Always use cached data (fast) - no need for live SSH queries
                 let macData, arpData;
                 
-                // Detect search type: full IP vs partial/subnet
-                const isFullIp = /^(\d{1,3}\.){3}\d{1,3}$/.test(searchTerm);
-                const isSubnetSearch = /^\d+\.\d+/.test(searchTerm) && !isFullIp;
+                // Longest-prefix matching is valid only for a complete IPv4
+                // address whose four octets are all within 0..255.
+                const isFullIp = isValidIpv4(searchTerm);
+                const isIpLike = /^\d+(?:\.\d*){1,3}$/.test(searchTerm);
+                const isSubnetSearch = isIpLike && !isFullIp;
                 
                 [macData, arpData] = await Promise.all([
                     apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(searchTerm)),
                     apiFetchJson('search-api.sh?action=search-cached-arp&search=' + encodeURIComponent(searchTerm))
                 ]);
+                if (!isCurrentRequest('global', requestToken)) return;
                 
                 // Filter interfaces - vxlan from MAC, VRR from ARP
                 const filterMac = (entries) => entries.filter(e => {
@@ -1266,11 +1452,25 @@
                     return true;
                 });
                 
-                if (macData.success && macData.entries) {
+                if (macData.success && Array.isArray(macData.entries)) {
                     macData.entries = filterMac(macData.entries);
                 }
-                if (arpData.success && arpData.entries) {
+                if (arpData.success && Array.isArray(arpData.entries)) {
                     arpData.entries = filterArp(arpData.entries);
+                }
+
+                const macApiTotal = macData.success
+                    ? (Number.isFinite(Number(macData.total)) ? Number(macData.total) : (macData.entries || []).length)
+                    : 0;
+                const arpApiTotal = arpData.success
+                    ? (Number.isFinite(Number(arpData.total)) ? Number(arpData.total) : (arpData.entries || []).length)
+                    : 0;
+                const directMatchTotal = macApiTotal + arpApiTotal;
+
+                if (!macData.success && !arpData.success) {
+                    resultsDiv.innerHTML = renderDataWarnings(macData, arpData) +
+                        '<div class="error-message">Search data is unavailable. Please check the fabric cache status.</div>';
+                    return;
                 }
                 
                 // Cross-reference: If searching IP, also search for associated MAC
@@ -1281,7 +1481,7 @@
                 let crossRefInfo = [];
                 
                 // Check if search term looks like an IP
-                const isIpSearch = /^\d+\.\d+\.\d+/.test(searchTerm);
+                const isIpSearch = isFullIp;
                 // Check if search term looks like a MAC
                 const isMacSearch = /^[0-9a-f]{2}[:-]?[0-9a-f]{2}/i.test(searchTerm);
                 
@@ -1311,7 +1511,8 @@
                     for (const mac of crossRefMacs) {
                         try {
                             const data = await apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(mac));
-                            if (data.success && data.entries) {
+                            if (!isCurrentRequest('global', requestToken)) return;
+                            if (data.success && Array.isArray(data.entries)) {
                                 crossRefMacResults.push(...filterMac(data.entries));
                             }
                         } catch (e) {
@@ -1320,8 +1521,8 @@
                     }
                 }
                 
-                let html = '';
-                let totalResults = 0;
+                let html = renderDataWarnings(macData, arpData);
+                let displayedRows = 0;
                 
                 // Cross-reference summary - show only unique IP ↔ MAC pairs
                 if (crossRefInfo.length > 0) {
@@ -1364,25 +1565,23 @@
                     }
                 });
                 
-                // Multihoming: Find same bond on ESI peer devices
-                // Skip for subnet searches to keep it fast
+                // Same bond names are only candidates. A bond name alone does
+                // not prove ESI membership and must never fabricate MAC rows.
                 const bondInterfaces = new Set();
-                const foundMacs = new Set();
-                if (isSubnetSearch) { /* skip multihoming for subnet searches */ }
                 allMacEntries.forEach(e => {
                     if (e.interface && e.interface.startsWith('bond')) {
                         bondInterfaces.add(e.interface);
                     }
-                    foundMacs.add(e.mac + '|' + e.device);
                 });
                 
-                // Search for multihoming peers (same bond on different devices)
-                // Skip for subnet searches to keep it fast
-                let multihomingPeers = [];
+                // Search for neutral same-bond candidates. Skip broad subnet
+                // searches to avoid unnecessary requests.
+                let sameBondCandidates = [];
                 for (const bondName of (isSubnetSearch ? [] : bondInterfaces)) {
                     try {
                         const data = await apiFetchJson('search-api.sh?action=search-cached-mac&search=' + encodeURIComponent(bondName));
-                        if (data.success && data.entries) {
+                        if (!isCurrentRequest('global', requestToken)) return;
+                        if (data.success && Array.isArray(data.entries)) {
                             // Get devices that have this bond
                             const bondDevices = new Map();
                             data.entries.forEach(e => {
@@ -1393,26 +1592,7 @@
                                 }
                             });
                             if (bondDevices.size > 1) {
-                                multihomingPeers.push({ bond: bondName, devices: bondDevices });
-                                
-                                // Add peer entries to MAC table if not already there
-                                const originalMac = allMacEntries.find(m => m.interface === bondName)?.mac;
-                                if (originalMac) {
-                                    bondDevices.forEach((info, device) => {
-                                        const key = originalMac + '|' + device;
-                                        if (!foundMacs.has(key)) {
-                                            allMacEntries.push({
-                                                device: device,
-                                                mac: originalMac,
-                                                interface: bondName,
-                                                bond_ports: info.ports,
-                                                vlan: info.vlan,
-                                                peer: true  // Mark as peer entry
-                                            });
-                                            foundMacs.add(key);
-                                        }
-                                    });
-                                }
+                                sameBondCandidates.push({ bond: bondName, devices: bondDevices });
                             }
                         }
                     } catch (e) {
@@ -1420,11 +1600,12 @@
                     }
                 }
                 
-                // Show multihoming info
-                if (multihomingPeers.length > 0) {
+                // Show the observation without asserting ESI peer status.
+                if (sameBondCandidates.length > 0) {
                     html += '<div style="margin-bottom: 12px; padding: 10px 15px; background: linear-gradient(90deg, #1c3d4a, #1e1e1e); border-left: 3px solid #4fc3f7; border-radius: 4px;">';
-                    html += '<div style="color: #4fc3f7; font-weight: 600; margin-bottom: 8px;">Multihoming (ESI Peers)</div>';
-                    multihomingPeers.forEach(info => {
+                    html += '<div style="color: #4fc3f7; font-weight: 600; margin-bottom: 8px;">Same-Bond Candidates</div>';
+                    html += '<div style="color:#888;margin-bottom:8px;">A shared bond name does not by itself confirm ESI peering.</div>';
+                    sameBondCandidates.forEach(info => {
                         html += '<div style="margin: 5px 0;"><span style="color: #888;">Bond:</span> <span style="color: #fff; font-weight: 500;">' + escapeHtml(info.bond) + '</span></div>';
                         info.devices.forEach((devInfo, device) => {
                             const portStr = devInfo.ports.length > 0 ? devInfo.ports.join(', ') : '-';
@@ -1436,13 +1617,22 @@
                 
                 // MAC Results
                 if (allMacEntries.length > 0) {
-                    totalResults += allMacEntries.length;
+                    const entriesToShow = allMacEntries.slice(0, 50);
+                    displayedRows += entriesToShow.length;
+                    let macCountText = entriesToShow.length + ' shown';
+                    if (entriesToShow.length < allMacEntries.length) {
+                        macCountText += ' of ' + allMacEntries.length + ' returned';
+                    }
+                    if (macApiTotal > allMacEntries.length) {
+                        macCountText += ' • ' + macApiTotal + ' API matches';
+                    } else if (crossRefMacResults.length > 0) {
+                        macCountText += ' • includes related MAC locations';
+                    }
                     html += '<div class="global-result-section">';
-                    html += '<div class="global-result-header"><span>MAC Table Matches</span><span>' + allMacEntries.length + ' found</span></div>';
+                    html += '<div class="global-result-header"><span>MAC Table Matches</span><span>' + escapeHtml(macCountText) + '</span></div>';
                     html += '<table class="data-table" style="table-layout:fixed"><thead><tr>';
                     html += '<th style="width:120px">Device</th><th style="width:150px">MAC Address</th><th style="width:110px">Interface</th><th style="width:130px">Physical Ports</th><th style="width:70px" class="text-right">VLAN</th></tr></thead><tbody>';
-                    
-                    const entriesToShow = allMacEntries.slice(0, 50);
+
                     entriesToShow.forEach(entry => {
                         const bondPorts = entry.bond_ports ? entry.bond_ports.join(', ') : '';
                         html += '<tr>';
@@ -1486,13 +1676,20 @@
                         }
                     }
                     
-                    totalResults += arpToShow.length;
+                    const arpEntriesToShow = arpToShow.slice(0, 100);
+                    displayedRows += arpEntriesToShow.length;
+                    let arpCountText = arpEntriesToShow.length + ' shown';
+                    if (arpEntriesToShow.length < arpToShow.length) {
+                        arpCountText += ' of ' + arpToShow.length + ' returned';
+                    }
+                    if (arpApiTotal > arpData.entries.length) {
+                        arpCountText += ' • ' + arpApiTotal + ' API matches';
+                    }
                     html += '<div class="global-result-section">';
-                    html += '<div class="global-result-header"><span>ARP Table Matches</span><span>' + arpToShow.length + ' found' + dedupNote + '</span></div>';
+                    html += '<div class="global-result-header"><span>ARP Table Matches</span><span>' + escapeHtml(arpCountText) + dedupNote + '</span></div>';
                     html += '<table class="data-table" style="table-layout:fixed"><thead><tr>';
                     html += '<th style="width:120px">Device</th><th style="width:150px">MAC Address</th><th style="width:110px">Interface</th><th style="width:130px">IP Address</th><th style="width:70px" class="text-right">VRF</th></tr></thead><tbody>';
-                    
-                    const arpEntriesToShow = arpToShow.slice(0, 100);
+
                     arpEntriesToShow.forEach(entry => {
                         html += '<tr>';
                         html += '<td class="device">' + escapeHtml(entry.device || '-') + '</td>';
@@ -1511,7 +1708,9 @@
                 if (isIpSearch) {
                     try {
                         const routeData = await apiFetchJson('search-api.sh?action=search-cached-routes&search=' + encodeURIComponent(searchTerm));
-                        
+                        if (!isCurrentRequest('global', requestToken)) return;
+                        html += renderDataWarnings(routeData);
+
                         if (routeData.success && routeData.vrf_routes && Object.keys(routeData.vrf_routes).length > 0) {
                             hasRouteBestMatch = true;
                             const vrfGroups = routeData.vrf_routes;
@@ -1521,40 +1720,72 @@
                             html += '<div class="best-match-container" style="margin-bottom: 15px; padding: 12px 16px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;">';
                             html += '<div style="color: #f0ad4e; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px;">';
                             html += '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
-                            html += 'No exact match for <span class="ip">' + escapeHtml(searchTerm) + '</span>. Showing best matching route(s):';
+                            html += (directMatchTotal > 0
+                                ? 'Best matching route(s) for <span class="ip">' + escapeHtml(searchTerm) + '</span>:'
+                                : 'No exact MAC/ARP match for <span class="ip">' + escapeHtml(searchTerm) + '</span>. Showing best matching route(s):');
                             html += '</div>';
                             
                             html += '<table class="data-table" style="margin: 0;"><thead><tr>';
                             html += '<th>VRF</th><th>Best Match</th><th>Next Hop</th><th>Interface</th><th>Protocol</th><th style="text-align: right;">Devices</th></tr></thead><tbody>';
                             
                             sortedVrfs.forEach(vrf => {
-                                const routes = vrfGroups[vrf];
-                                const isNoRoute = routes.length === 1 && routes[0].no_route;
-                                
-                                if (isNoRoute) {
+                                const routes = Array.isArray(vrfGroups[vrf]) ? vrfGroups[vrf] : [];
+                                const coverage = routeData.route_coverage && routeData.route_coverage[vrf]
+                                    ? routeData.route_coverage[vrf]
+                                    : {};
+                                const expectedCount = Number.isFinite(Number(coverage.expected_device_count))
+                                    ? Number(coverage.expected_device_count)
+                                    : null;
+                                const missingDevices = Array.isArray(coverage.devices_without_route)
+                                    ? coverage.devices_without_route
+                                    : [];
+                                const routeRows = routes.filter(route => route && !route.no_route);
+
+                                if (routeRows.length === 0) {
                                     html += '<tr style="opacity: 0.6;">';
                                     html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
                                     html += '<td style="color: #888;">No Route</td>';
                                     html += '<td>-</td><td>-</td><td>-</td>';
-                                    html += '<td style="text-align: right; color: #888;">-</td>';
+                                    html += '<td style="text-align: right; color: #888;">' +
+                                        escapeHtml(expectedCount === null ? '-' : '0/' + expectedCount + ' devices') + '</td>';
                                     html += '</tr>';
                                 } else {
-                                    // Get first route info and count devices
-                                    const r = routes[0];
-                                    const deviceCount = routes.length;
-                                    
-                                    // Check for multiple nexthops
-                                    const nexthops = new Set(routes.map(rt => rt.nexthop).filter(n => n));
-                                    const nexthopDisplay = nexthops.size > 1 ? nexthops.size + ' next-hop' : (r.nexthop || '-');
-                                    
-                                    html += '<tr>';
-                                    html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
-                                    html += '<td style="color: #f0ad4e;">' + escapeHtml(r.prefix) + '</td>';
-                                    html += '<td class="ip">' + escapeHtml(nexthopDisplay) + '</td>';
-                                    html += '<td>' + escapeHtml(r.interface || '-') + '</td>';
-                                    html += '<td>' + escapeHtml(r.protocol || '-') + '</td>';
-                                    html += '<td style="text-align: right; color: #76b900;">✓ ' + deviceCount + ' device</td>';
-                                    html += '</tr>';
+                                    const signatures = new Map();
+                                    routeRows.forEach(route => {
+                                        const key = JSON.stringify([
+                                            route.prefix || '', route.nexthop || '',
+                                            route.interface || '', route.protocol || ''
+                                        ]);
+                                        if (!signatures.has(key)) signatures.set(key, []);
+                                        signatures.get(key).push(route);
+                                    });
+
+                                    const fullyConsistent = routeData.complete !== false && signatures.size === 1 && missingDevices.length === 0 &&
+                                        (expectedCount === null || new Set(routeRows.map(route => route.device).filter(Boolean)).size === expectedCount);
+                                    signatures.forEach(group => {
+                                        const route = group[0];
+                                        const deviceCount = new Set(group.map(item => item.device).filter(Boolean)).size || group.length;
+                                        const deviceText = expectedCount === null
+                                            ? deviceCount + ' reported'
+                                            : deviceCount + '/' + expectedCount + ' devices';
+                                        html += '<tr>';
+                                        html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
+                                        html += '<td style="color: #f0ad4e;">' + escapeHtml(route.prefix || '-') + '</td>';
+                                        html += '<td class="ip">' + escapeHtml(route.nexthop || '-') + '</td>';
+                                        html += '<td>' + escapeHtml(route.interface || '-') + '</td>';
+                                        html += '<td>' + escapeHtml(route.protocol || '-') + '</td>';
+                                        html += '<td style="text-align: right; color:' + (fullyConsistent ? '#76b900' : '#f0ad4e') + ';">' +
+                                            (fullyConsistent ? '✓ ' : '') + escapeHtml(deviceText) + '</td>';
+                                        html += '</tr>';
+                                    });
+
+                                    if (missingDevices.length > 0) {
+                                        html += '<tr style="opacity:0.75;">';
+                                        html += '<td><span class="badge ' + getVrfBadgeClass(vrf) + '">' + escapeHtml(vrf) + '</span></td>';
+                                        html += '<td style="color:#f0ad4e;">No matching route</td><td>-</td><td>-</td><td>-</td>';
+                                        html += '<td style="text-align:right;color:#f0ad4e;">' + escapeHtml(missingDevices.length + ' device(s)') + '</td>';
+                                        html += '</tr>';
+                                    }
                                 }
                             });
                             
@@ -1562,22 +1793,26 @@
                         }
                     } catch (e) {
                         if (e.isAuthError) throw e;
-                        console.error('Route search failed:', e);
+                        if (!isCurrentRequest('global', requestToken)) return;
+                        html += '<div role="status" style="padding:10px 14px;color:#f0ad4e;text-align:left;">Route lookup unavailable: ' +
+                            escapeHtml(e.message) + '</div>';
                     }
                 }
                 
-                if (totalResults === 0 && crossRefInfo.length === 0 && !hasRouteBestMatch) {
-                    html = '<div class="status-message">No results found for "' + escapeHtml(searchTerm) + '"</div>';
-                } else if (totalResults > 0) {
-                    html = '<div style="margin-bottom: 10px; color: #76b900; font-weight: 600;">' + totalResults + ' total matches found</div>' + html;
-                } else if (hasRouteBestMatch && totalResults === 0) {
-                    // Only route best match found
-                    html = '<div style="margin-bottom: 10px; padding: 10px 15px; background: linear-gradient(90deg, #3d3a1c, #1e1e1e); border-left: 3px solid #f0ad4e; border-radius: 4px;"><span style="color: #f0ad4e;">No exact match for <span class="ip">' + escapeHtml(searchTerm) + '</span> in MAC/ARP tables. Showing best matching routes:</span></div>' + html;
+                if (directMatchTotal === 0 && crossRefInfo.length === 0 && !hasRouteBestMatch) {
+                    html += '<div class="status-message">No results found for "' + escapeHtml(searchTerm) + '"</div>';
+                } else if (directMatchTotal > 0 || crossRefInfo.length > 0) {
+                    let summaryText = directMatchTotal + ' direct API match' + (directMatchTotal === 1 ? '' : 'es') + ' found';
+                    if (displayedRows > 0) summaryText += ' • ' + displayedRows + ' table rows shown';
+                    html = '<div style="margin-bottom: 10px; color: #76b900; font-weight: 600;">' +
+                        escapeHtml(summaryText) + '</div>' + html;
                 }
-                
+
+                if (!isCurrentRequest('global', requestToken)) return;
                 resultsDiv.innerHTML = html;
                 
             } catch (e) {
+                if (!isCurrentRequest('global', requestToken)) return;
                 resultsDiv.innerHTML = '<div class="error-message">Search failed: ' + escapeHtml(e.message) + '</div>';
             }
         }
@@ -1649,20 +1884,25 @@
         }
         
         async function loadRouteTable() {
+            const requestToken = beginRequest('route');
             const device = document.getElementById('routeDeviceSelect').value;
             const search = document.getElementById('routeSearchInput').value.trim();
             const results = document.getElementById('routeResultsContent');
             const resultCount = document.getElementById('routeResultCount');
             const vrfTabsContainer = document.getElementById('vrfTabsContainer');
             const vrfTabs = document.getElementById('vrfTabs');
+            currentRouteData = null;
+            currentRouteVrf = 'all';
             
             if (!device) {
+                resultCount.textContent = 'Select a device and click Load';
                 results.innerHTML = '<div class="error-message">Please select a device</div>';
                 vrfTabsContainer.style.display = 'none';
                 return;
             }
             
             results.innerHTML = '<div class="loading-message">Loading routing table...</div>';
+            resultCount.textContent = 'Loading...';
             vrfTabsContainer.style.display = 'none';
             
             try {
@@ -1670,16 +1910,18 @@
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
                 const data = await apiFetchJson(url);
+                if (!isCurrentRequest('route', requestToken)) return;
                 
                 if (data.success) {
                     currentRouteData = data;
                     currentRouteVrf = 'all';
+                    const warningHtml = renderDataWarnings(data);
                     
                     if (data.total === 0 || !data.vrf_order || data.vrf_order.length === 0) {
                         // The API computes LPM from the complete collected route
                         // set and returns only one bounded result per VRF.
                         if (search && data.best_matches && Object.keys(data.best_matches).length > 0) {
-                            results.innerHTML = renderBestMatchResults(
+                            results.innerHTML = warningHtml + renderBestMatchResults(
                                 search,
                                 data.best_matches,
                                 data.best_match_order || []
@@ -1688,7 +1930,8 @@
                             vrfTabsContainer.style.display = 'none';
                             return;
                         }
-                        results.innerHTML = '<div class="status-message">No routes found</div>';
+                        results.innerHTML = warningHtml + '<div class="status-message">No routes found</div>';
+                        resultCount.textContent = '0 routes';
                         vrfTabsContainer.style.display = 'none';
                         return;
                     }
@@ -1698,6 +1941,7 @@
                     vrfTabs.replaceChildren();
                     const addVrfTab = (vrf, label, count, active = false) => {
                         const button = document.createElement('button');
+                        button.type = 'button';
                         button.className = 'vrf-tab' + (active ? ' active' : '');
                         button.dataset.vrf = vrf;
                         button.appendChild(document.createTextNode(label));
@@ -1722,10 +1966,15 @@
                     // Render all routes
                     renderRouteTable(data, 'all', search);
                 } else {
+                    currentRouteData = null;
+                    resultCount.textContent = 'Load failed';
                     results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                     vrfTabsContainer.style.display = 'none';
                 }
             } catch (e) {
+                if (!isCurrentRequest('route', requestToken)) return;
+                currentRouteData = null;
+                resultCount.textContent = 'Load failed';
                 results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
                 document.getElementById('vrfTabsContainer').style.display = 'none';
             }
@@ -1769,7 +2018,7 @@
                 ? `Showing ${returnedRoutes} of ${totalRoutes} routes${routeScope}`
                 : `${totalRoutes} routes${routeScope}`;
             
-            let html = '';
+            let html = renderDataWarnings(data);
             
             // Single VRF or search mode - show single table
             if (selectedVrf !== 'all' || search) {
@@ -1852,29 +2101,35 @@
         
         // ============ LLDP NEIGHBORS ============
         async function loadLldpNeighbors() {
+            const requestToken = beginRequest('lldp');
             const device = document.getElementById('lldpDeviceSelect').value;
             const search = document.getElementById('lldpSearchInput').value.trim();
             const results = document.getElementById('lldpResultsContent');
             const resultCount = document.getElementById('lldpResultCount');
             
             if (!device) {
+                resultCount.textContent = 'Select a device and click Load';
                 results.innerHTML = '<div class="error-message">Please select a device</div>';
                 return;
             }
             
             results.innerHTML = '<div class="loading-message">Loading LLDP neighbors...</div>';
+            resultCount.textContent = 'Loading...';
             
             try {
                 const url = 'search-api.sh?action=get-lldp&device=' + encodeURIComponent(device) +
                             (search ? '&search=' + encodeURIComponent(search) : '');
                 
                 const data = await apiFetchJson(url);
+                if (!isCurrentRequest('lldp', requestToken)) return;
                 
                 if (data.success) {
-                    resultCount.textContent = data.entries.length + ' neighbors';
+                    const entries = Array.isArray(data.entries) ? data.entries : [];
+                    const warningHtml = renderDataWarnings(data);
+                    resultCount.textContent = entries.length + ' neighbors';
                     
-                    if (data.entries.length === 0) {
-                        results.innerHTML = '<div class="status-message">No LLDP neighbors found</div>';
+                    if (entries.length === 0) {
+                        results.innerHTML = warningHtml + '<div class="status-message">No LLDP neighbors found</div>';
                         return;
                     }
                     
@@ -1884,7 +2139,7 @@
                     html += '<th>Remote Port<span class="sort-icon"></span></th>';
                     html += '<th class="text-right">Remote IP<span class="sort-icon"></span></th></tr></thead><tbody>';
                     
-                    data.entries.forEach(entry => {
+                    entries.forEach(entry => {
                         html += '<tr>';
                         html += '<td>' + escapeHtml(entry.local_port) + '</td>';
                         html += '<td class="device">' + escapeHtml(entry.neighbor) + '</td>';
@@ -1894,17 +2149,28 @@
                     });
                     
                     html += '</tbody></table>';
-                    results.innerHTML = html;
+                    results.innerHTML = warningHtml + html;
                     attachSortHandlers(document.getElementById('lldpTable'));
                 } else {
+                    resultCount.textContent = 'Load failed';
                     results.innerHTML = '<div class="error-message">' + escapeHtml(data.error || 'Failed to load') + '</div>';
                 }
             } catch (e) {
+                if (!isCurrentRequest('lldp', requestToken)) return;
+                resultCount.textContent = 'Load failed';
                 results.innerHTML = '<div class="error-message">Error: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
         // ============ EXPORT ============
+        function csvCell(value) {
+            let text = String(value ?? '');
+            // Prevent spreadsheet formula execution when network-controlled
+            // names are opened in Excel or similar applications.
+            if (/^[=+\-@]/.test(text)) text = "'" + text;
+            return '"' + text.replace(/"/g, '""') + '"';
+        }
+
         function exportTable(type) {
             const data = type === 'mac' ? currentMacData : currentArpData;
             if (!data || data.length === 0) {
@@ -1914,14 +2180,15 @@
             
             let csv = '';
             if (type === 'mac') {
-                csv = 'Device,MAC,Interface,VLAN\n';
+                csv = 'Device,MAC,Interface,Physical Ports,VLAN\n';
                 data.forEach(e => {
-                    csv += '"' + (e.device || '') + '","' + e.mac + '","' + (e.interface || '') + '","' + (e.vlan || '') + '"\n';
+                    const bondPorts = Array.isArray(e.bond_ports) ? e.bond_ports.join(', ') : '';
+                    csv += [e.device, e.mac, e.interface, bondPorts, e.vlan].map(csvCell).join(',') + '\n';
                 });
             } else {
                 csv = 'Device,IP,MAC,Interface,VRF,State\n';
                 data.forEach(e => {
-                    csv += '"' + (e.device || '') + '","' + e.ip + '","' + e.mac + '","' + (e.interface || '') + '","' + (e.vrf || '') + '","' + (e.state || '') + '"\n';
+                    csv += [e.device, e.ip, e.mac, e.interface, e.vrf, e.state].map(csvCell).join(',') + '\n';
                 });
             }
             
@@ -1948,18 +2215,44 @@
                 const statusSpan = document.getElementById('scanStatus');
                 
                 if (data.success && data.timestamp) {
-                    const ageMin = data.age_minutes;
+                    setLastUpdated(data.timestamp);
+                    const ageMin = Number(data.age_minutes);
                     let ageText = '';
-                    if (ageMin < 1) ageText = 'just now';
+                    if (!Number.isFinite(ageMin) || ageMin < 0) ageText = 'age unknown';
+                    else if (ageMin < 1) ageText = 'just now';
                     else if (ageMin < 60) ageText = ageMin + 'm ago';
                     else ageText = Math.floor(ageMin / 60) + 'h ago';
-                    
-                    statusSpan.innerHTML = '<span style="color:#76b900;">' + escapeHtml(data.device_count) + ' devices</span> • ' + escapeHtml(ageText);
+
+                    const counts = data.status_counts && typeof data.status_counts === 'object'
+                        ? data.status_counts
+                        : {};
+                    const total = Number.isFinite(Number(data.device_count)) ? Number(data.device_count) : 0;
+                    const current = Number.isFinite(Number(data.current_count))
+                        ? Number(data.current_count)
+                        : Number(counts.current || 0);
+                    const stale = Number.isFinite(Number(data.stale_count))
+                        ? Number(data.stale_count)
+                        : Number(counts.stale || 0);
+                    const unavailable = Number.isFinite(Number(data.unavailable_count))
+                        ? Number(data.unavailable_count)
+                        : Number(counts.unavailable || 0);
+
+                    if (data.complete === false || stale > 0 || unavailable > 0) {
+                        statusSpan.innerHTML = '<span style="color:#f59e0b;">' +
+                            escapeHtml(current + '/' + total + ' current') + '</span> • ' +
+                            escapeHtml(stale + ' stale') + ' • ' +
+                            escapeHtml(unavailable + ' unavailable') + ' • ' + escapeHtml(ageText);
+                    } else {
+                        statusSpan.innerHTML = '<span style="color:#76b900;">' + escapeHtml(total) + ' devices</span> • ' + escapeHtml(ageText);
+                    }
+                    statusSpan.title = 'Fabric cache scan: ' + new Date(data.timestamp).toLocaleString();
                 } else {
+                    setLastUpdated(null);
                     statusSpan.innerHTML = '<span style="color:#f59e0b;">No cached data</span>';
                 }
             } catch (e) {
                 if (!e.isAuthError) {
+                    setLastUpdated(null);
                     document.getElementById('scanStatus').textContent = 'Status unavailable';
                 }
             }
@@ -1967,7 +2260,6 @@
         
         // Init
         window.onload = async function() {
-            setLastUpdated();
             if (!await LLDPqAuth.check()) return;
             clearPageError();
             await Promise.all([loadDeviceList(), checkScanStatus()]);

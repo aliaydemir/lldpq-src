@@ -118,8 +118,15 @@
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: #76b900;
+            background: #666;
+            flex: 0 0 auto;
         }
+
+        .device-icon.status-ok { background: #76b900; }
+        .device-icon.status-ssh-failed,
+        .device-icon.status-unreachable { background: #f44336; }
+        .device-icon.status-no-info { background: #ff9800; }
+        .device-icon.status-unknown { background: #808080; }
         
         .device-name-text {
             font-size: 13px;
@@ -235,6 +242,11 @@
         
         .btn-refresh:hover {
             background: #5a8f00;
+        }
+
+        .btn-refresh:disabled {
+            cursor: wait;
+            opacity: 0.65;
         }
         
         /* Tab Navigation */
@@ -495,6 +507,56 @@
             padding-bottom: 10px;
             border-bottom: 1px solid #333;
         }
+
+        /* NVT uses the same terminal palette as Command Runner, without an inner
+           height limit so the complete table participates in page scrolling. */
+        .nvt-summary {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            margin-bottom: 12px;
+            color: #aaa;
+            font-size: 13px;
+        }
+
+        .nvt-command {
+            color: #9cdcfe;
+            font-family: 'Cascadia Code', Consolas, monospace;
+        }
+
+        .nvt-status {
+            color: #888;
+        }
+
+        .nvt-status.running { color: #ffd54f; }
+        .nvt-status.success { color: #81c784; }
+        .nvt-status.error { color: #ef5350; }
+
+        .nvt-refresh {
+            margin-left: auto;
+        }
+
+        .nvt-output {
+            width: 100%;
+            margin: 0;
+            padding: 12px;
+            background: #111;
+            color: #d4d4d4;
+            border: 1px solid #333;
+            border-radius: 4px;
+            font-family: 'Cascadia Code', Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            white-space: pre;
+            overflow-x: auto;
+            overflow-y: visible;
+            max-height: none;
+        }
+
+        .nvt-output.error {
+            color: #ef5350;
+            white-space: pre-wrap;
+        }
         
         /* Summary cards */
         .summary-cards {
@@ -749,7 +811,7 @@
                 Device Details
             </div>
             <div class="search-box">
-                <input type="text" id="deviceSearch" placeholder="Search devices..." oninput="filterDevices()">
+                <input type="text" id="deviceSearch" aria-label="Search devices" placeholder="Search devices..." oninput="filterDevices()">
             </div>
             <div class="device-list" id="deviceList">
                 <!-- Loading skeleton -->
@@ -767,13 +829,13 @@
             <div class="content-header">
                 <div>
                     <div class="content-title">Device Details</div>
-                    <div class="content-subtitle">Select a device to view details</div>
+                    <div class="content-subtitle" id="contentSubtitle">Select a device to view details</div>
                 </div>
             </div>
             
             <div class="content-area">
                 <!-- Loading overlay -->
-                <div class="content-loading hidden" id="contentLoading">
+                <div class="content-loading hidden" id="contentLoading" role="status" aria-live="polite">
                     <div class="loading-spinner"></div>
                     <div class="loading-text">Loading device data...</div>
                 </div>
@@ -790,47 +852,58 @@
                     <div class="device-header">
                         <div class="device-name" id="deviceName">Loading...</div>
                         <div class="device-actions">
-                            <button class="btn-refresh" onclick="refreshAllData()">Refresh</button>
+                            <button class="btn-refresh" id="btnRefreshAll" onclick="refreshAllData()">Refresh</button>
                         </div>
                     </div>
     
-    <div class="tab-nav">
-        <button class="tab-btn active" data-tab="overview">Overview</button>
-        <button class="tab-btn" data-tab="ports">Ports</button>
-        <button class="tab-btn" data-tab="optical">Optical</button>
-        <button class="tab-btn" data-tab="bgp">BGP</button>
-        <button class="tab-btn" data-tab="logs">Logs</button>
-        <button class="tab-btn" data-tab="config">Config</button>
-        <button class="tab-btn" data-tab="commands">Command Runner</button>
-        <button class="tab-btn" data-tab="capture">Capture</button>
-        <button class="tab-btn" data-tab="clsupport">cl-support</button>
+    <div class="tab-nav" role="tablist" aria-label="Device details">
+        <button class="tab-btn active" id="tab-button-overview" role="tab" aria-selected="true" aria-controls="tab-overview" tabindex="0" data-tab="overview">Overview</button>
+        <button class="tab-btn" id="tab-button-ports" role="tab" aria-selected="false" aria-controls="tab-ports" tabindex="-1" data-tab="ports">Ports</button>
+        <button class="tab-btn" id="tab-button-optical" role="tab" aria-selected="false" aria-controls="tab-optical" tabindex="-1" data-tab="optical">Optical</button>
+        <button class="tab-btn" id="tab-button-nvt" role="tab" aria-selected="false" aria-controls="tab-nvt" tabindex="-1" data-tab="nvt">NVT</button>
+        <button class="tab-btn" id="tab-button-bgp" role="tab" aria-selected="false" aria-controls="tab-bgp" tabindex="-1" data-tab="bgp">BGP</button>
+        <button class="tab-btn" id="tab-button-logs" role="tab" aria-selected="false" aria-controls="tab-logs" tabindex="-1" data-tab="logs">Logs</button>
+        <button class="tab-btn" id="tab-button-config" role="tab" aria-selected="false" aria-controls="tab-config" tabindex="-1" data-tab="config">Config</button>
+        <button class="tab-btn" id="tab-button-commands" role="tab" aria-selected="false" aria-controls="tab-commands" tabindex="-1" data-tab="commands">Command Runner</button>
+        <button class="tab-btn" id="tab-button-capture" role="tab" aria-selected="false" aria-controls="tab-capture" tabindex="-1" data-tab="capture">Capture</button>
+        <button class="tab-btn" id="tab-button-clsupport" role="tab" aria-selected="false" aria-controls="tab-clsupport" tabindex="-1" data-tab="clsupport">cl-support</button>
     </div>
     
     <!-- Overview Tab -->
-    <div class="tab-content active" id="tab-overview">
+    <div class="tab-content active" id="tab-overview" role="tabpanel" aria-labelledby="tab-button-overview">
         <div class="summary-cards" id="overviewCards">
             <div class="loading">Loading device data...</div>
         </div>
     </div>
     
     <!-- Ports Tab -->
-    <div class="tab-content" id="tab-ports">
+    <div class="tab-content" id="tab-ports" role="tabpanel" aria-labelledby="tab-button-ports">
         <div id="portsContent">
             <div class="loading">Loading port status...</div>
         </div>
     </div>
     
     <!-- Optical Tab -->
-    <div class="tab-content" id="tab-optical">
+    <div class="tab-content" id="tab-optical" role="tabpanel" aria-labelledby="tab-button-optical">
         <p style="color: #808080; margin-bottom: 15px;">Click on a port to see detailed L1 diagnostics</p>
         <div id="opticalContent">
             <div class="loading">Loading optical data...</div>
         </div>
         <div class="optical-detail" id="opticalDetail" style="display: none;"></div>
     </div>
+
+    <!-- NVT Tab -->
+    <div class="tab-content" id="tab-nvt" role="tabpanel" aria-labelledby="tab-button-nvt">
+        <div class="nvt-summary">
+            <span class="nvt-command">$ nvt</span>
+            <span class="nvt-status" id="nvtStatus" role="status" aria-live="polite">Open this tab to run NVT</span>
+            <button class="cmd-btn nvt-refresh" id="btnRefreshNvt" type="button" onclick="refreshNvtOutput()">Refresh</button>
+        </div>
+        <pre class="nvt-output" id="nvtOutput" aria-label="NVT command output">Open this tab to load the complete NVT output...</pre>
+    </div>
     
     <!-- BGP Tab -->
-    <div class="tab-content" id="tab-bgp">
+    <div class="tab-content" id="tab-bgp" role="tabpanel" aria-labelledby="tab-button-bgp">
         <div class="vrf-selector">
             <label>VRF:</label>
             <select id="vrfSelect" onchange="loadBGPForVRF()">
@@ -844,7 +917,7 @@
     </div>
     
     <!-- Logs Tab -->
-    <div class="tab-content" id="tab-logs">
+    <div class="tab-content" id="tab-logs" role="tabpanel" aria-labelledby="tab-button-logs">
         <div class="summary-cards" id="logCards">
             <div class="loading">Loading logs...</div>
         </div>
@@ -881,7 +954,7 @@
     </div>
 
     <!-- Config Tab -->
-    <div class="tab-content" id="tab-config">
+    <div class="tab-content" id="tab-config" role="tabpanel" aria-labelledby="tab-button-config">
         <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 15px; flex-wrap: wrap;">
             <select id="configFormat" onchange="loadDeviceConfig()" style="padding: 8px 12px; background: #252526; border: 1px solid #404040; border-radius: 4px; color: #fff; font-size: 13px;">
                 <option value="commands">nv config show -o commands</option>
@@ -889,7 +962,7 @@
                 <option value="diff">nv config diff</option>
             </select>
             <button class="cmd-btn" onclick="loadDeviceConfig()" style="background: #76b900; color: #000; padding: 8px 16px;">Refresh</button>
-            <button class="cmd-btn" onclick="downloadConfig()" style="background: #4ec9b0; color: #000; padding: 8px 16px;">Download</button>
+            <button class="cmd-btn" id="btnDownloadConfig" onclick="downloadConfig()" disabled style="background: #4ec9b0; color: #000; padding: 8px 16px;">Download</button>
             <input type="text" id="configFilter" placeholder="Filter (live grep)..." oninput="filterConfigOutput()" autocomplete="off" style="padding: 8px 12px; background: #252526; border: 1px solid #404040; border-radius: 4px; color: #fff; font-size: 13px; flex: 1; min-width: 200px;">
             <span id="configStatus" style="font-size: 12px; color: #888;"></span>
         </div>
@@ -897,7 +970,7 @@
     </div>
 
     <!-- Command Runner Tab -->
-    <div class="tab-content" id="tab-commands">
+    <div class="tab-content" id="tab-commands" role="tabpanel" aria-labelledby="tab-button-commands">
         <div class="command-section">
             <div class="command-groups-grid">
             <!-- System & Hardware -->
@@ -1082,7 +1155,7 @@
     </div>
     
     <!-- Capture Tab (tcpdump only) -->
-    <div class="tab-content" id="tab-capture">
+    <div class="tab-content" id="tab-capture" role="tabpanel" aria-labelledby="tab-button-capture">
         <div class="capture-section">
             <h3 style="color: #76b900; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1287,7 +1360,7 @@
     </div>
     
     <!-- cl-support Tab -->
-    <div class="tab-content" id="tab-clsupport">
+    <div class="tab-content" id="tab-clsupport" role="tabpanel" aria-labelledby="tab-button-clsupport">
         <div class="capture-section" style="max-width: 700px;">
             <h3 style="color: #ff9800; margin-bottom: 15px; display: flex; align-items: center; gap: 10px;">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1376,18 +1449,239 @@
     <script>
         // ===== Device List Management =====
         let allDevices = [];
-        let devicesByGroup = {};
+        let devicesByGroup = Object.create(null);
+        let deviceStatuses = new Map();
         let groupOrder = [];
+        let deviceRequestGeneration = 0;
+        let deviceDataAbortController = null;
+        let refreshInProgress = false;
+        let refreshAllPromise = null;
+        let configRawOutput = '';
+        let configSourceDevice = null;
+        let configRequestId = 0;
+        let bgpRequestId = 0;
+        let nvtRequestId = 0;
+        let nvtAbortController = null;
+        let nvtOperationPromise = null;
+        let clsupportRequestId = 0;
+        let clsupportOperationId = 0;
+        let opticalDetailRequestId = 0;
+        let logRequestId = 0;
+        let tailStopTimeout = null;
         
         // Track which tabs have been loaded (for lazy loading)
-        let tabsLoaded = { overview: false, ports: false, optical: false, bgp: false, logs: false, config: false, commands: false, capture: false, clsupport: false };
+        let tabsLoaded = { overview: false, ports: false, optical: false, nvt: false, bgp: false, logs: false, config: false, commands: false, capture: false, clsupport: false };
+
+        function getDeviceRequestContext() {
+            return { device: deviceName, generation: deviceRequestGeneration };
+        }
+
+        function isCurrentDeviceRequest(device, generation) {
+            return Boolean(device) && device === deviceName && generation === deviceRequestGeneration;
+        }
+
+        function setElementMessage(elementOrId, message, className = '') {
+            const element = typeof elementOrId === 'string'
+                ? document.getElementById(elementOrId)
+                : elementOrId;
+            if (!element) return null;
+            const messageElement = document.createElement('div');
+            if (className) messageElement.className = className;
+            messageElement.textContent = String(message ?? '');
+            element.replaceChildren(messageElement);
+            return messageElement;
+        }
+
+        function setPreformattedOutput(elementOrId, output) {
+            const element = typeof elementOrId === 'string'
+                ? document.getElementById(elementOrId)
+                : elementOrId;
+            if (!element) return null;
+            const pre = document.createElement('pre');
+            pre.style.fontSize = '12px';
+            pre.style.overflowX = 'auto';
+            pre.textContent = String(output ?? '');
+            element.replaceChildren(pre);
+            return pre;
+        }
+
+        // Same SGR palette/state handling used by Commands, rendered with DOM
+        // nodes so command output can never become executable markup.
+        const NVT_ANSI_COLORS = Object.freeze({
+            30: '#3b3b3b', 31: '#ef5350', 32: '#81c784', 33: '#ffd54f',
+            34: '#64b5f6', 35: '#ba68c8', 36: '#4dd0e1', 37: '#e0e0e0',
+            90: '#777', 91: '#ef9a9a', 92: '#a5d6a7', 93: '#fff59d',
+            94: '#90caf9', 95: '#ce93d8', 96: '#80deea', 97: '#ffffff'
+        });
+
+        function appendAnsiText(fragment, text, color, bold) {
+            if (!text) return;
+            const textNode = document.createTextNode(text);
+            if (!color && !bold) {
+                fragment.appendChild(textNode);
+                return;
+            }
+            const span = document.createElement('span');
+            if (color) span.style.color = color;
+            if (bold) span.style.fontWeight = 'bold';
+            span.appendChild(textNode);
+            fragment.appendChild(span);
+        }
+
+        function renderAnsiOutput(elementOrId, input) {
+            const element = typeof elementOrId === 'string'
+                ? document.getElementById(elementOrId)
+                : elementOrId;
+            if (!element) return null;
+
+            const value = String(input ?? '').replace(/\r/g, '');
+            const fragment = document.createDocumentFragment();
+            const sequence = /\x1b\[([0-9;]*)m/g;
+            let color = null;
+            let bold = false;
+            let cursor = 0;
+            let match;
+
+            while ((match = sequence.exec(value)) !== null) {
+                appendAnsiText(fragment, value.slice(cursor, match.index), color, bold);
+                const codes = match[1].split(';').map(code => code === '' ? 0 : Number.parseInt(code, 10));
+                for (let index = 0; index < codes.length; index += 1) {
+                    const code = codes[index];
+                    if (code === 0) { color = null; bold = false; }
+                    else if (code === 1) bold = true;
+                    else if (code === 22) bold = false;
+                    else if (code === 39) color = null;
+                    else if (code === 38 && codes[index + 1] === 2) {
+                        color = `rgb(${codes[index + 2] || 0},${codes[index + 3] || 0},${codes[index + 4] || 0})`;
+                        index += 4;
+                    } else if (code === 38 && codes[index + 1] === 5) {
+                        index += 2;
+                    } else if (NVT_ANSI_COLORS[code]) {
+                        color = NVT_ANSI_COLORS[code];
+                    }
+                }
+                cursor = sequence.lastIndex;
+            }
+            appendAnsiText(fragment, value.slice(cursor), color, bold);
+            element.replaceChildren(fragment);
+            return element;
+        }
+
+        function setNvtStatus(message, state = '') {
+            const status = document.getElementById('nvtStatus');
+            if (!status) return;
+            status.className = `nvt-status${state ? ` ${state}` : ''}`;
+            status.textContent = String(message ?? '');
+        }
+
+        function setNvtPlainOutput(message, { error = false } = {}) {
+            const output = document.getElementById('nvtOutput');
+            if (!output) return;
+            output.classList.toggle('error', error);
+            output.textContent = String(message ?? '');
+        }
+
+        function replaceSelectOptions(selectOrId, values, selectedValue = null) {
+            const select = typeof selectOrId === 'string'
+                ? document.getElementById(selectOrId)
+                : selectOrId;
+            if (!select) return;
+            const options = values.map(value => {
+                const optionData = typeof value === 'object' && value !== null
+                    ? value
+                    : { value, label: value };
+                const option = document.createElement('option');
+                option.value = String(optionData.value ?? '');
+                option.textContent = String(optionData.label ?? optionData.value ?? '');
+                return option;
+            });
+            select.replaceChildren(...options);
+            if (selectedValue !== null && options.some(option => option.value === String(selectedValue))) {
+                select.value = String(selectedValue);
+            }
+        }
+
+        function normalizeDeviceStatus(status) {
+            const normalized = String(status || '').toUpperCase();
+            return ['OK', 'SSH-FAILED', 'UNREACHABLE', 'NO-INFO'].includes(normalized)
+                ? normalized
+                : 'UNKNOWN';
+        }
+
+        function getDeviceStatusMeta(status) {
+            const normalized = normalizeDeviceStatus(status);
+            const metadata = {
+                'OK': { className: 'status-ok', label: 'Online' },
+                'SSH-FAILED': { className: 'status-ssh-failed', label: 'SSH failed' },
+                'UNREACHABLE': { className: 'status-unreachable', label: 'Unreachable' },
+                'NO-INFO': { className: 'status-no-info', label: 'No status information' },
+                'UNKNOWN': { className: 'status-unknown', label: 'Status unknown' }
+            };
+            return metadata[normalized];
+        }
+
+        function formatSnapshotFreshness(timestamp) {
+            if (!timestamp) return { text: 'Snapshot time unavailable', title: '' };
+            const date = new Date(timestamp);
+            if (Number.isNaN(date.getTime())) {
+                return { text: `Snapshot: ${timestamp}`, title: String(timestamp) };
+            }
+            const ageSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+            let ageText;
+            if (ageSeconds < 60) ageText = 'just now';
+            else if (ageSeconds < 3600) ageText = `${Math.floor(ageSeconds / 60)}m ago`;
+            else if (ageSeconds < 86400) ageText = `${Math.floor(ageSeconds / 3600)}h ago`;
+            else ageText = `${Math.floor(ageSeconds / 86400)}d ago`;
+            return { text: `Snapshot updated ${ageText}`, title: date.toLocaleString() };
+        }
+
+        function updateContentSubtitle(device, timestamp = null, state = 'ready', sources = null) {
+            const subtitle = document.getElementById('contentSubtitle');
+            if (!subtitle) return;
+            if (!device) {
+                subtitle.textContent = 'Select a device to view details';
+                subtitle.removeAttribute('title');
+                return;
+            }
+            if (state === 'loading') {
+                subtitle.textContent = `Loading data for ${device}...`;
+                subtitle.removeAttribute('title');
+                return;
+            }
+            if (state === 'error') {
+                subtitle.textContent = `Viewing ${device} • snapshot unavailable`;
+                subtitle.removeAttribute('title');
+                return;
+            }
+            const freshness = formatSnapshotFreshness(timestamp);
+            const sourceEntries = sources && typeof sources === 'object'
+                ? Object.entries(sources).filter(([, source]) => source && typeof source === 'object')
+                : [];
+            const hasUnavailable = sourceEntries.some(([, source]) => source.status === 'unavailable');
+            const hasStale = sourceEntries.some(([, source]) => source.status === 'stale');
+            const sourceSuffix = hasUnavailable
+                ? ' • some sources unavailable'
+                : (hasStale ? ' • some sources stale' : '');
+            subtitle.textContent = `Viewing ${device} • ${freshness.text}${sourceSuffix}`;
+            const sourceDetails = sourceEntries.map(([name, source]) => {
+                const details = [String(source.status || 'unknown')];
+                if (source.timestamp) details.push(formatSnapshotFreshness(source.timestamp).text);
+                if (source.reason) details.push(String(source.reason));
+                return `${name}: ${details.join(' • ')}`;
+            });
+            const titleLines = [freshness.title, ...sourceDetails].filter(Boolean);
+            if (titleLines.length) subtitle.title = titleLines.join('\n');
+            else subtitle.removeAttribute('title');
+        }
         
         async function loadDeviceList() {
             try {
                 // Load device list and reachability status in parallel
                 const [devResponse, assetsResponse] = await Promise.all([
                     fetch('/fabric-api.sh?action=list-devices'),
-                    fetch('/assets.ini').then(r => r.ok ? r.text() : '').catch(() => '')
+                    fetch('/assets-api', { cache: 'no-store' })
+                        .then(r => r.ok ? r.json() : { success: false, rows: [] })
+                        .catch(() => ({ success: false, rows: [] }))
                 ]);
                 
                 const data = await devResponse.json();
@@ -1396,99 +1690,135 @@
                     throw new Error(data.error || 'Failed to load devices');
                 }
                 
-                // Parse assets.ini to get reachable devices (STATUS=OK or SSH-FAILED)
-                const reachableDevices = new Set();
-                if (assetsResponse) {
-                    assetsResponse.split('\n').forEach(line => {
-                        const parts = line.trim().split(/\s+/);
-                        if (parts.length >= 8 && (parts[parts.length - 2] === 'OK' || parts[parts.length - 2] === 'SSH-FAILED')) {
-                            reachableDevices.add(parts[0]);
+                // Preserve every inventory device and map its actual collection status.
+                deviceStatuses = new Map();
+                if (assetsResponse.success && Array.isArray(assetsResponse.rows)) {
+                    assetsResponse.rows.forEach(row => {
+                        if (row?.device_name) {
+                            deviceStatuses.set(String(row.device_name), normalizeDeviceStatus(row.status));
                         }
                     });
                 }
-                const hasAssets = reachableDevices.size > 0;
+                const hasAssets = assetsResponse.success && Array.isArray(assetsResponse.rows);
                 
                 allDevices = [];
-                devicesByGroup = {};
+                devicesByGroup = Object.create(null);
                 groupOrder = Object.keys(data.devices);
                 
                 const uniqueDevices = new Set();
-                let totalDevices = 0;
                 
                 for (const [group, groupDevices] of Object.entries(data.devices)) {
-                    // Filter to reachable devices only (if assets data available)
                     const hostnames = groupDevices
-                        .map(d => d.hostname)
-                        .filter(name => !hasAssets || reachableDevices.has(name));
-                    totalDevices += groupDevices.length;
+                        .map(d => String(d.hostname || ''))
+                        .filter(Boolean);
                     
                     if (hostnames.length === 0) continue;
                     
                     hostnames.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
                     devicesByGroup[group] = hostnames;
                     hostnames.forEach(name => {
-                        allDevices.push({ name, group });
+                        const status = deviceStatuses.get(name) || 'UNKNOWN';
+                        allDevices.push({ name, group, status });
                         uniqueDevices.add(name);
                     });
                 }
                 
                 renderDeviceList();
-                const reachableCount = uniqueDevices.size;
+                const totalDevices = uniqueDevices.size;
+                const reachableCount = [...uniqueDevices]
+                    .filter(name => deviceStatuses.get(name) === 'OK').length;
                 document.getElementById('deviceCount').textContent = hasAssets 
                     ? `${reachableCount}/${totalDevices} devices`
                     : `${totalDevices} devices`;
                 
             } catch (e) {
                 console.error('Failed to load device list:', e);
-                document.getElementById('deviceList').innerHTML = '<div style="padding: 15px; color: #888;">Failed to load devices</div>';
+                const message = setElementMessage('deviceList', 'Failed to load devices');
+                if (message) {
+                    message.style.padding = '15px';
+                    message.style.color = '#888';
+                }
+                document.getElementById('deviceCount').textContent = 'Unavailable';
             }
         }
         
         function renderDeviceList(filter = '') {
             const container = document.getElementById('deviceList');
-            const filterLower = filter.toLowerCase();
-            
-            let html = '';
+            const filterLower = filter.trim().toLowerCase();
+            const fragment = document.createDocumentFragment();
+            let resultCount = 0;
             
             groupOrder.forEach(group => {
                 const devices = devicesByGroup[group] || [];
                 const filtered = devices.filter(d => d.toLowerCase().includes(filterLower));
                 
                 if (filtered.length === 0) return;
-                
-                // Start collapsed by default (like dev-conf.html)
-                html += `
-                    <div class="device-group">
-                        <div class="group-header collapsed" onclick="toggleDeviceGroup(this)">
-                            <span class="arrow">▶</span>
-                            ${group} (${filtered.length})
-                        </div>
-                        <div class="group-devices collapsed">
-                            ${filtered.map(name => `
-                                <div class="device-item ${name === deviceName ? 'selected' : ''}" 
-                                     onclick="selectDevice('${name}')">
-                                    <span class="device-icon"></span>
-                                    <span class="device-name-text">${name}</span>
-                                </div>
-                            `).join('')}
-                        </div>
-                    </div>
-                `;
+                resultCount += filtered.length;
+
+                const isExpanded = Boolean(filterLower) || filtered.includes(deviceName);
+                const groupElement = document.createElement('div');
+                groupElement.className = 'device-group';
+
+                const header = document.createElement('div');
+                header.className = `group-header${isExpanded ? '' : ' collapsed'}`;
+                header.setAttribute('role', 'button');
+                header.setAttribute('tabindex', '0');
+                header.setAttribute('aria-expanded', String(isExpanded));
+                header.addEventListener('click', () => toggleDeviceGroup(header));
+                header.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        toggleDeviceGroup(header);
+                    }
+                });
+
+                const arrow = document.createElement('span');
+                arrow.className = 'arrow';
+                arrow.setAttribute('aria-hidden', 'true');
+                arrow.textContent = '▼';
+                const headerText = document.createElement('span');
+                headerText.textContent = `${group} (${filtered.length})`;
+                header.append(arrow, headerText);
+
+                const deviceContainer = document.createElement('div');
+                deviceContainer.className = `group-devices${isExpanded ? '' : ' collapsed'}`;
+
+                filtered.forEach(name => {
+                    const statusMeta = getDeviceStatusMeta(deviceStatuses.get(name));
+                    const item = document.createElement('div');
+                    item.className = `device-item${name === deviceName ? ' selected' : ''}`;
+                    item.setAttribute('role', 'button');
+                    item.setAttribute('tabindex', '0');
+                    item.setAttribute('aria-label', `${name}, ${statusMeta.label}`);
+                    item.addEventListener('click', () => selectDevice(name));
+                    item.addEventListener('keydown', event => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            selectDevice(name);
+                        }
+                    });
+
+                    const icon = document.createElement('span');
+                    icon.className = `device-icon ${statusMeta.className}`;
+                    icon.title = statusMeta.label;
+                    icon.setAttribute('aria-hidden', 'true');
+                    const nameElement = document.createElement('span');
+                    nameElement.className = 'device-name-text';
+                    nameElement.textContent = name;
+                    item.append(icon, nameElement);
+                    deviceContainer.appendChild(item);
+                });
+
+                groupElement.append(header, deviceContainer);
+                fragment.appendChild(groupElement);
             });
             
-            container.innerHTML = html || '<div style="padding: 15px; color: #888;">No devices found</div>';
-            
-            // If a device is selected, expand its group
-            if (deviceName) {
-                const selectedItem = document.querySelector('.device-item.selected');
-                if (selectedItem) {
-                    const groupDevices = selectedItem.closest('.group-devices');
-                    const groupHeader = groupDevices?.previousElementSibling;
-                    if (groupHeader && groupDevices) {
-                        groupHeader.classList.remove('collapsed');
-                        groupDevices.classList.remove('collapsed');
-                    }
-                }
+            if (resultCount === 0) {
+                const message = setElementMessage(container, 'No devices found');
+                message.style.padding = '15px';
+                message.style.color = '#888';
+            } else {
+                container.replaceChildren(fragment);
             }
         }
         
@@ -1502,27 +1832,56 @@
             const groupDevices = header.nextElementSibling;
             if (groupDevices) {
                 groupDevices.classList.toggle('collapsed');
+                header.setAttribute('aria-expanded', String(!groupDevices.classList.contains('collapsed')));
             }
         }
         
-        function selectDevice(name) {
-            // Update URL without reloading
-            const newUrl = `${window.location.pathname}?device=${encodeURIComponent(name)}`;
-            window.history.pushState({device: name}, '', newUrl);
-            
-            deviceName = name;
+        function selectDevice(name, { updateHistory = true } = {}) {
+            const nextDevice = String(name || '');
+            if (!nextDevice) return;
+            const previousDevice = deviceName;
+
+            if (updateHistory) {
+                const url = new URL(window.location.href);
+                if (url.searchParams.get('device') !== nextDevice) {
+                    url.searchParams.set('device', nextDevice);
+                    window.history.pushState({device: nextDevice}, '', `${url.pathname}${url.search}${url.hash}`);
+                }
+            }
+
+            deviceRequestGeneration += 1;
+            configRequestId += 1;
+            bgpRequestId += 1;
+            nvtRequestId += 1;
+            clsupportRequestId += 1;
+            clsupportOperationId += 1;
+            opticalDetailRequestId += 1;
+            logRequestId += 1;
+            captureFileOperationId += 1;
+            if (deviceDataAbortController) {
+                deviceDataAbortController.abort();
+                deviceDataAbortController = null;
+            }
+            if (nvtAbortController) {
+                nvtAbortController.abort();
+                nvtAbortController = null;
+            }
+            nvtOperationPromise = null;
+            refreshAllPromise = null;
+            deviceName = nextDevice;
             
             // Show device content, hide placeholder
             document.getElementById('welcomeScreen').style.display = 'none';
             document.getElementById('deviceContent').style.display = 'block';
             
             // Update device name in header immediately
-            document.getElementById('deviceName').textContent = name;
-            document.title = `Device: ${name}`;
+            document.getElementById('deviceName').textContent = nextDevice;
+            document.title = `Device: ${nextDevice}`;
+            updateContentSubtitle(nextDevice, null, 'loading');
             
             // Update selected state in list
             document.querySelectorAll('.device-item').forEach(item => {
-                item.classList.toggle('selected', item.textContent.trim() === name);
+                item.classList.toggle('selected', item.querySelector('.device-name-text')?.textContent === nextDevice);
             });
             
             // Show loading overlay
@@ -1534,42 +1893,60 @@
             const portsEl = document.getElementById('portsContent');
             const opticalEl = document.getElementById('opticalContent');
             const opticalDetailEl = document.getElementById('opticalDetail');
+            const nvtOutputEl = document.getElementById('nvtOutput');
             const bgpEl = document.getElementById('bgpContent');
             const logCardsEl = document.getElementById('logCards');
             
-            if (overviewEl) overviewEl.innerHTML = '<div class="loading">Loading device data...</div>';
-            if (portsEl) portsEl.innerHTML = '<div class="loading">Click to load port status...</div>';
-            if (opticalEl) opticalEl.innerHTML = '<div class="loading">Loading optical data...</div>';
+            if (overviewEl) setElementMessage(overviewEl, 'Loading device data...', 'loading');
+            if (portsEl) setElementMessage(portsEl, 'Click to load port status...', 'loading');
+            if (opticalEl) setElementMessage(opticalEl, 'Loading optical data...', 'loading');
             if (opticalDetailEl) { opticalDetailEl.textContent = ''; opticalDetailEl.style.display = 'none'; }
-            if (bgpEl) bgpEl.innerHTML = '<div class="loading">Click to load BGP data...</div>';
-            if (logCardsEl) logCardsEl.innerHTML = '<div class="loading">Loading logs...</div>';
+            if (nvtOutputEl) {
+                nvtOutputEl.classList.remove('error');
+                nvtOutputEl.removeAttribute('aria-busy');
+                nvtOutputEl.textContent = 'Open this tab to load the complete NVT output...';
+            }
+            const nvtRefreshButton = document.getElementById('btnRefreshNvt');
+            if (nvtRefreshButton) nvtRefreshButton.disabled = false;
+            setNvtStatus('Open this tab to run NVT');
+            if (bgpEl) setElementMessage(bgpEl, 'Click to load BGP data...', 'loading');
+            if (logCardsEl) setElementMessage(logCardsEl, 'Loading logs...', 'loading');
+
+            const logOutput = document.getElementById('logOutput');
+            if (logOutput) { logOutput.textContent = ''; logOutput.style.display = 'none'; }
+
+            configRawOutput = '';
+            configSourceDevice = null;
+            const configOutput = document.getElementById('configOutput');
+            const configStatus = document.getElementById('configStatus');
+            const configFilter = document.getElementById('configFilter');
+            const configDownload = document.getElementById('btnDownloadConfig');
+            if (configOutput) configOutput.textContent = 'Open this tab to load device configuration...';
+            if (configStatus) configStatus.textContent = '';
+            if (configFilter) configFilter.value = '';
+            if (configDownload) configDownload.disabled = true;
+
+            replaceSelectOptions('vrfSelect', ['default'], 'default');
+            replaceSelectOptions('cmdVrfSelect', ['default'], 'default');
+            document.getElementById('portList')?.replaceChildren();
+            document.getElementById('bondList')?.replaceChildren();
             
             // Reset loaded flags for lazy loading
-            tabsLoaded = { overview: false, ports: false, optical: false, bgp: false, logs: false, config: false, commands: false, capture: false, clsupport: false };
+            tabsLoaded = { overview: false, ports: false, optical: false, nvt: false, bgp: false, logs: false, config: false, commands: false, capture: false, clsupport: false };
             
-            // Stop any active capture on previous device
-            if (captureAbortController) {
-                captureAbortController.abort();
-                captureAbortController = null;
+            // Stop device-scoped background work before resetting the UI.
+            void cancelActiveCapture({ updateUi: false });
+            if (activeTailContext || tailPollingInterval || tailOutputFile) {
+                stopLogTail(activeTailContext || previousDevice, { updateUi: false });
             }
-            if (livePollingInterval) {
-                clearInterval(livePollingInterval);
-                livePollingInterval = null;
-            }
-            if (tailPollingInterval) {
-                clearInterval(tailPollingInterval);
-                tailPollingInterval = null;
-                tailOutputFile = null;
-            }
-            if (clsupportPollingInterval) {
-                clearInterval(clsupportPollingInterval);
-                clsupportPollingInterval = null;
-            }
+            stopClSupportPolling();
             
             // Clear capture state and form
             capturePcapPath = null;
+            capturePcapSourceDevice = null;
             liveCaptureFile = null;
             clsupportFilePath = null;
+            clsupportSourceDevice = null;
             
             // Reset Command Runner output, custom command input, and close all dropdown menus
             const commandOutput = document.getElementById('commandOutput');
@@ -1578,8 +1955,19 @@
             const customCmd = document.getElementById('customCmd');
             if (commandOutput) commandOutput.style.display = 'none';
             if (cmdHeader) cmdHeader.textContent = '';
-            if (cmdResult) cmdResult.innerHTML = '';
+            if (cmdResult) { cmdResult.textContent = ''; cmdResult.style.color = ''; }
             if (customCmd) customCmd.value = '';
+
+            const tailOutputContainer = document.getElementById('tailOutputContainer');
+            const tailOutput = document.getElementById('tailOutput');
+            const tailStatus = document.getElementById('tailStatus');
+            const btnStartTail = document.getElementById('btnStartTail');
+            const btnStopTail = document.getElementById('btnStopTail');
+            if (tailOutputContainer) tailOutputContainer.style.display = 'none';
+            if (tailOutput) tailOutput.textContent = '';
+            if (tailStatus) tailStatus.textContent = '';
+            if (btnStartTail) btnStartTail.style.display = 'inline-flex';
+            if (btnStopTail) btnStopTail.style.display = 'none';
             
             // Close all command group dropdowns
             document.querySelectorAll('.command-group').forEach(g => {
@@ -1612,64 +2000,214 @@
             // Reset capture buttons
             const btnStartCapture = document.getElementById('btnStartCapture');
             const btnStopCapture = document.getElementById('btnStopCapture');
+            const btnDownloadPcap = document.getElementById('btnDownloadPcap');
+            const btnDeleteAllPcap = document.getElementById('btnDeleteAllPcap');
             if (btnStartCapture) btnStartCapture.style.display = 'inline-block';
             if (btnStopCapture) btnStopCapture.style.display = 'none';
+            if (btnDownloadPcap) btnDownloadPcap.disabled = false;
+            if (btnDeleteAllPcap) btnDeleteAllPcap.disabled = false;
             
             // Reset cl-support display
             const clsupportStatus = document.getElementById('clsupportStatus');
             const clsupportResult = document.getElementById('clsupportResult');
             const clsupportProgress = document.getElementById('clsupportProgress');
+            const clsupportGenerate = document.getElementById('btnGenerateClsupport');
+            const clsupportDownload = document.getElementById('clsupportDownloadBtn');
             if (clsupportStatus) clsupportStatus.textContent = '';
             if (clsupportResult) clsupportResult.style.display = 'none';
             if (clsupportProgress) clsupportProgress.style.display = 'none';
+            if (clsupportGenerate) {
+                clsupportGenerate.disabled = false;
+                clsupportGenerate.style.opacity = '1';
+            }
+            if (clsupportDownload) clsupportDownload.disabled = false;
+
+            refreshInProgress = false;
+            const refreshButton = document.getElementById('btnRefreshAll');
+            if (refreshButton) {
+                refreshButton.disabled = false;
+                refreshButton.textContent = 'Refresh';
+            }
             
             // Always switch to Overview tab when changing devices
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.querySelector('.tab-btn[data-tab="overview"]').classList.add('active');
-            document.getElementById('tab-overview').classList.add('active');
+            activateTab('overview', { loadContent: false });
             
             // Only load overview data initially (with safety timeout)
+            const requestContext = getDeviceRequestContext();
             const safetyTimeout = setTimeout(() => {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
                 console.warn('Loading timeout reached');
             }, 20000);
             
-            loadDeviceData().then(() => {
+            loadDeviceData(requestContext).then(success => {
                 clearTimeout(safetyTimeout);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
-                tabsLoaded.overview = true;
+                tabsLoaded.overview = success;
             }).catch(e => {
                 clearTimeout(safetyTimeout);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
                 console.error('loadDeviceData failed:', e);
             });
         }
         
+        function activateTab(tabName, { loadContent = true, focus = false } = {}) {
+            const selectedButton = document.querySelector(`.tab-btn[data-tab="${tabName}"]`);
+            const selectedPanel = document.getElementById(`tab-${tabName}`);
+            if (!selectedButton || !selectedPanel) return;
+
+            document.querySelectorAll('.tab-btn').forEach(button => {
+                const isSelected = button === selectedButton;
+                button.classList.toggle('active', isSelected);
+                button.setAttribute('aria-selected', String(isSelected));
+                button.tabIndex = isSelected ? 0 : -1;
+            });
+            document.querySelectorAll('.tab-content').forEach(panel => {
+                panel.classList.toggle('active', panel === selectedPanel);
+            });
+
+            if (focus) selectedButton.focus();
+            if (loadContent) onTabClick(tabName);
+        }
+
         // Lazy load tab content when tab is clicked
+        function trackTabLoad(tabName, promise) {
+            const loadState = tabsLoaded;
+            loadState[tabName] = true;
+            Promise.resolve(promise).then(success => {
+                if (tabsLoaded === loadState) loadState[tabName] = success !== false;
+            }).catch(error => {
+                if (tabsLoaded === loadState) loadState[tabName] = false;
+                console.error(`Failed to load ${tabName} tab:`, error);
+            });
+        }
+
+        function loadNvtOutput(requestContext = getDeviceRequestContext(), options = {}) {
+            const operation = loadNvtOutputOperation(requestContext, options);
+            nvtOperationPromise = operation;
+            const clearOperation = () => {
+                if (nvtOperationPromise === operation) nvtOperationPromise = null;
+            };
+            operation.then(clearOperation, clearOperation);
+            return operation;
+        }
+
+        async function loadNvtOutputOperation(
+            requestContext,
+            { waitForGlobalRefresh = true } = {}
+        ) {
+            if (!requestContext.device) return false;
+            const pendingRefresh = waitForGlobalRefresh ? refreshAllPromise : null;
+            if (pendingRefresh) {
+                setNvtStatus('Waiting for device refresh...', 'running');
+                setNvtPlainOutput('Waiting for device refresh...');
+                await Promise.resolve(pendingRefresh).catch(() => false);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+            }
+
+            const requestId = ++nvtRequestId;
+            if (nvtAbortController) nvtAbortController.abort();
+            const controller = new AbortController();
+            nvtAbortController = controller;
+            const timeoutId = setTimeout(() => controller.abort(), 45000);
+            const output = document.getElementById('nvtOutput');
+            const refreshButton = document.getElementById('btnRefreshNvt');
+            const refreshAllButton = document.getElementById('btnRefreshAll');
+
+            if (output) {
+                output.classList.remove('error');
+                output.setAttribute('aria-busy', 'true');
+                output.textContent = 'Running nvt...';
+            }
+            if (refreshButton) refreshButton.disabled = true;
+            if (refreshAllButton) refreshAllButton.disabled = true;
+            setNvtStatus('Running...', 'running');
+
+            try {
+                const response = await fetch('/fabric-api.sh?action=run-device-command', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({device: requestContext.device, command: 'nvt'}),
+                    signal: controller.signal
+                });
+                if (!response.ok) throw new Error(`Request failed (${response.status})`);
+                const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== nvtRequestId) return false;
+
+                if (!data.success) {
+                    setNvtStatus('Failed', 'error');
+                    setNvtPlainOutput(`Error: ${data.error || 'Unknown error'}`, { error: true });
+                    return false;
+                }
+
+                if (output) {
+                    output.classList.remove('error');
+                    renderAnsiOutput(output, data.output || '(no output)');
+                }
+                setNvtStatus('OK', 'success');
+                return true;
+            } catch (error) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== nvtRequestId) return false;
+                const message = error.name === 'AbortError'
+                    ? 'Timed out after 45 seconds'
+                    : `Request failed: ${error.message}`;
+                setNvtStatus('Failed', 'error');
+                setNvtPlainOutput(message, { error: true });
+                return false;
+            } finally {
+                clearTimeout(timeoutId);
+                if (nvtAbortController === controller) nvtAbortController = null;
+                if (isCurrentDeviceRequest(requestContext.device, requestContext.generation) &&
+                    requestId === nvtRequestId) {
+                    output?.removeAttribute('aria-busy');
+                    if (!refreshInProgress) {
+                        if (refreshButton) refreshButton.disabled = false;
+                        if (refreshAllButton) refreshAllButton.disabled = false;
+                    }
+                }
+            }
+        }
+
+        function refreshNvtOutput() {
+            if (!deviceName) return;
+            trackTabLoad('nvt', loadNvtOutput());
+        }
+
+        async function loadCommandRunnerData(requestContext = getDeviceRequestContext()) {
+            const vrfsLoaded = await loadVRFList({ loadBgp: false, requestContext });
+            if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+            const bondsLoaded = await loadBondList(requestContext);
+            if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+            const portList = document.getElementById('portList');
+            const hasPortOptions = Boolean(portList && portList.children.length > 0);
+            let portsLoaded = true;
+            if (!tabsLoaded.ports && !hasPortOptions) {
+                portsLoaded = await loadPortListOnly(requestContext);
+            }
+            return vrfsLoaded && bondsLoaded && portsLoaded;
+        }
+
         function onTabClick(tabName) {
             if (!deviceName) return;
             
             if (tabName === 'ports' && !tabsLoaded.ports) {
-                tabsLoaded.ports = true;
-                loadPortStatus();
+                trackTabLoad('ports', loadPortStatus());
+            } else if (tabName === 'nvt' && !tabsLoaded.nvt) {
+                trackTabLoad('nvt', loadNvtOutput());
             } else if (tabName === 'bgp' && !tabsLoaded.bgp) {
-                tabsLoaded.bgp = true;
-                loadVRFList();
+                trackTabLoad('bgp', loadVRFList({ loadBgp: true }));
             } else if (tabName === 'commands' && !tabsLoaded.commands) {
-                tabsLoaded.commands = true;
-                loadVRFList();
-                loadBondList();
-                // Also load port list for command runner if not already loaded
-                if (!tabsLoaded.ports) {
-                    loadPortListOnly();
-                }
+                trackTabLoad('commands', loadCommandRunnerData());
             } else if (tabName === 'config' && !tabsLoaded.config) {
-                tabsLoaded.config = true;
-                loadDeviceConfig();
+                trackTabLoad('config', loadDeviceConfig());
             } else if (tabName === 'capture' && !tabsLoaded.capture) {
-                tabsLoaded.capture = true;
-                loadCaptureInterfaces();
+                trackTabLoad('capture', loadCaptureInterfaces());
             } else if (tabName === 'clsupport') {
                 // Always check status when switching to cl-support tab
                 loadClSupportStatus();
@@ -1677,20 +2215,25 @@
         }
         
         // Load only port list (for command runner dropdown, without showing in Ports tab)
-        async function loadPortListOnly() {
+        async function loadPortListOnly(requestContext = getDeviceRequestContext()) {
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show interface --view=brief'})
+                    body: JSON.stringify({device: requestContext.device, command: 'nv show interface --view=brief'})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
                     populatePortList(data.output);
+                    return true;
                 }
+                return false;
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 console.error('Failed to load port list:', e);
+                return false;
             }
         }
         
@@ -1736,13 +2279,62 @@
         function naturalSort(a, b) {
             return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
         }
+
+        function getDeviceNameFromLocation() {
+            const selected = new URLSearchParams(window.location.search).get('device');
+            if (selected) return selected;
+            const match = window.location.pathname.match(/monitor-results\/(.+)\.html/);
+            return match ? decodeURIComponent(match[1]) : null;
+        }
+
+        function showNoDeviceSelection() {
+            const previousDevice = deviceName;
+            deviceRequestGeneration += 1;
+            configRequestId += 1;
+            bgpRequestId += 1;
+            nvtRequestId += 1;
+            clsupportRequestId += 1;
+            clsupportOperationId += 1;
+            opticalDetailRequestId += 1;
+            logRequestId += 1;
+            captureFileOperationId += 1;
+            if (deviceDataAbortController) {
+                deviceDataAbortController.abort();
+                deviceDataAbortController = null;
+            }
+            if (nvtAbortController) {
+                nvtAbortController.abort();
+                nvtAbortController = null;
+            }
+            nvtOperationPromise = null;
+            refreshAllPromise = null;
+            void cancelActiveCapture({ updateUi: false });
+            if (activeTailContext || tailPollingInterval || tailOutputFile) {
+                stopLogTail(activeTailContext || previousDevice, { updateUi: false });
+            }
+            stopClSupportPolling();
+            configRawOutput = '';
+            configSourceDevice = null;
+            clsupportFilePath = null;
+            clsupportSourceDevice = null;
+            refreshInProgress = false;
+            deviceName = null;
+            document.getElementById('welcomeScreen').style.display = 'flex';
+            document.getElementById('deviceContent').style.display = 'none';
+            document.title = 'Device Details';
+            updateContentSubtitle(null);
+            renderDeviceList(document.getElementById('deviceSearch')?.value || '');
+        }
         
         // Initialize auth
         async function initPage() {
             const isAuth = await LLDPqAuth.check();
             if (!isAuth) return;
             if (!LLDPqAuth.isAdmin()) {
-                document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;">Access denied. Admin only.</div>';
+                const denied = document.createElement('div');
+                denied.style.cssText = 'display:flex;align-items:center;justify-content:center;height:100vh;color:#888;';
+                denied.textContent = 'Access denied. Admin only.';
+                document.body.replaceChildren(denied);
                 document.body.style.visibility = 'visible';
                 return;
             }
@@ -1751,161 +2343,219 @@
         }
         initPage();
         
-        // Get device name from URL
-        const urlParams = new URLSearchParams(window.location.search);
-        let deviceName = urlParams.get('device');
-        
-        // Also check if we're at monitor-results/xxx.html format
-        if (!deviceName) {
-            const path = window.location.pathname;
-            const match = path.match(/monitor-results\/(.+)\.html/);
-            if (match) {
-                deviceName = match[1];
-            }
-        }
+        // Get device name from URL and seed a history state for direct links.
+        let deviceName = getDeviceNameFromLocation();
+        window.history.replaceState({device: deviceName}, '', window.location.href);
         
         if (!deviceName) {
             // No device selected - show welcome screen
             document.getElementById('welcomeScreen').style.display = 'flex';
             document.getElementById('deviceContent').style.display = 'none';
+            updateContentSubtitle(null);
         } else {
-            // Device specified - use selectDevice for consistent behavior
+            // Initial direct-link load. Interactive changes use selectDevice().
             document.getElementById('welcomeScreen').style.display = 'none';
             document.getElementById('deviceContent').style.display = 'block';
             document.getElementById('deviceName').textContent = deviceName;
             document.title = `Device: ${deviceName}`;
+            updateContentSubtitle(deviceName, null, 'loading');
             
             // Show loading and load only overview (lazy loading)
             const loadingEl = document.getElementById('contentLoading');
             loadingEl.classList.remove('hidden');
+            const requestContext = getDeviceRequestContext();
             
             // Safety timeout - hide loading after 20 seconds max
             const safetyTimeout = setTimeout(() => {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
                 console.warn('Loading timeout reached');
             }, 20000);
             
-            loadDeviceData().then(() => {
+            loadDeviceData(requestContext).then(success => {
                 clearTimeout(safetyTimeout);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
-                tabsLoaded.overview = true;
+                tabsLoaded.overview = success;
             }).catch(e => {
                 clearTimeout(safetyTimeout);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 loadingEl.classList.add('hidden');
                 console.error('loadDeviceData failed:', e);
             });
         }
         
         // Handle browser back/forward
-        window.addEventListener('popstate', (event) => {
-            if (event.state && event.state.device) {
-                selectDevice(event.state.device);
-            }
+        window.addEventListener('popstate', () => {
+            const historyDevice = getDeviceNameFromLocation();
+            if (historyDevice) selectDevice(historyDevice, { updateHistory: false });
+            else showNoDeviceSelection();
         });
         
         // Tab switching with lazy loading
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', () => {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                btn.classList.add('active');
-                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-                
-                // Lazy load tab content
-                onTabClick(btn.dataset.tab);
+                activateTab(btn.dataset.tab);
+            });
+            btn.addEventListener('keydown', event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    activateTab(btn.dataset.tab, { focus: true });
+                    return;
+                }
+                if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+                const buttons = Array.from(document.querySelectorAll('.tab-btn'));
+                const currentIndex = buttons.indexOf(btn);
+                let nextIndex = currentIndex;
+                if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + buttons.length) % buttons.length;
+                if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % buttons.length;
+                if (event.key === 'Home') nextIndex = 0;
+                if (event.key === 'End') nextIndex = buttons.length - 1;
+                event.preventDefault();
+                buttons.forEach((button, index) => {
+                    button.tabIndex = index === nextIndex ? 0 : -1;
+                });
+                buttons[nextIndex].focus();
             });
         });
         
-        async function loadDeviceData() {
+        async function loadDeviceData(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
+            if (deviceDataAbortController) deviceDataAbortController.abort();
+            const controller = new AbortController();
+            deviceDataAbortController = controller;
+            let timeoutId;
             try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+                timeoutId = setTimeout(() => controller.abort(), 15000);
                 
-                const response = await fetch(`/fabric-api.sh?action=get-device-data&device=${encodeURIComponent(deviceName)}`, {
+                const response = await fetch(`/fabric-api.sh?action=get-device-data&device=${encodeURIComponent(requestContext.device)}`, {
                     signal: controller.signal
                 });
-                clearTimeout(timeoutId);
-                
+                if (!response.ok) throw new Error(`Request failed (${response.status})`);
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
                     renderOverview(data);
-                    renderOptical(data.optical || []);
-                    renderLogs(data.logs || {});
+                    const opticalUnavailable = data.sources?.optical?.status === 'unavailable' || data.optical === null;
+                    if (opticalUnavailable) {
+                        setElementMessage('opticalContent', 'Optical snapshot unavailable', 'error-message');
+                    } else {
+                        renderOptical(Array.isArray(data.optical) ? data.optical : []);
+                    }
+                    renderLogs(data.logs, data.sources?.logs || null);
+                    updateContentSubtitle(requestContext.device, data.last_update, 'ready', data.sources);
+                    return true;
                 } else {
-                    document.getElementById('overviewCards').innerHTML = `<div class="error-message">Error: ${data.error || 'Unknown error'}</div>`;
+                    const message = `Error: ${data.error || 'Unknown error'}`;
+                    setElementMessage('overviewCards', message, 'error-message');
+                    setElementMessage('opticalContent', message, 'error-message');
+                    setElementMessage('logCards', message, 'error-message');
+                    updateContentSubtitle(requestContext.device, null, 'error');
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 const errorMsg = e.name === 'AbortError' ? 'Request timed out' : e.message;
-                document.getElementById('overviewCards').innerHTML = `<div class="error-message">Failed to load: ${errorMsg}</div>`;
+                const message = `Failed to load: ${errorMsg}`;
+                setElementMessage('overviewCards', message, 'error-message');
+                setElementMessage('opticalContent', message, 'error-message');
+                setElementMessage('logCards', message, 'error-message');
+                updateContentSubtitle(requestContext.device, null, 'error');
                 console.error('loadDeviceData error:', e);
+                return false;
+            } finally {
+                clearTimeout(timeoutId);
+                if (deviceDataAbortController === controller) deviceDataAbortController = null;
             }
         }
         
-        async function loadPortStatus() {
-            document.getElementById('portsContent').innerHTML = '<div class="loading">Loading interfaces...</div>';
+        async function loadPortStatus(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
+            setElementMessage('portsContent', 'Loading interfaces...', 'loading');
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show interface --view=brief'})
+                    body: JSON.stringify({device: requestContext.device, command: 'nv show interface --view=brief'})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
-                    document.getElementById('portsContent').innerHTML = `<pre style="font-size: 12px; overflow-x: auto;">${data.output}</pre>`;
+                    setPreformattedOutput('portsContent', data.output || '(no interfaces returned)');
                     // Also populate port datalist from interface list
-                    populatePortList(data.output);
+                    populatePortList(data.output || '');
                 } else {
-                    document.getElementById('portsContent').innerHTML = `<div class="error-message">${data.error}</div>`;
+                    setElementMessage('portsContent', data.error || 'Failed to load interfaces', 'error-message');
+                    return false;
                 }
-                document.getElementById('portsContent').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                if (document.getElementById('tab-ports').classList.contains('active')) {
+                    document.getElementById('portsContent').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+                return true;
             } catch (e) {
-                document.getElementById('portsContent').innerHTML = `<div class="error-message">${e.message}</div>`;
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+                setElementMessage('portsContent', e.message || 'Failed to load interfaces', 'error-message');
+                return false;
             }
         }
 
-        let configRawOutput = '';
-
-        async function loadDeviceConfig() {
-            if (!deviceName) return;
+        async function loadDeviceConfig(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
+            const requestId = ++configRequestId;
             const out = document.getElementById('configOutput');
             const status = document.getElementById('configStatus');
+            const downloadButton = document.getElementById('btnDownloadConfig');
             const fmt = document.getElementById('configFormat').value;
             const cmd = fmt === 'diff' ? 'nv config diff' : `nv config show -o ${fmt}`;
 
-            out.textContent = `Fetching ${cmd} from ${deviceName}...`;
+            configRawOutput = '';
+            configSourceDevice = null;
+            if (downloadButton) downloadButton.disabled = true;
+            out.style.color = '';
+            out.textContent = `Fetching ${cmd} from ${requestContext.device}...`;
             status.textContent = '';
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: cmd})
+                    body: JSON.stringify({device: requestContext.device, command: cmd})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== configRequestId) return false;
                 if (data.success) {
                     configRawOutput = data.output || '';
+                    configSourceDevice = requestContext.device;
                     if (!configRawOutput.trim()) {
                         out.textContent = '(empty)';
                     } else {
                         out.textContent = configRawOutput;
                     }
                     status.textContent = 'Updated: ' + new Date().toLocaleString();
+                    if (downloadButton) downloadButton.disabled = !configRawOutput;
                     filterConfigOutput();
+                    return true;
                 } else {
-                    out.textContent = '';
-                    out.innerHTML = `<span style="color:#f48771;">Error: ${data.error || 'Unknown error'}</span>`;
+                    out.style.color = '#f48771';
+                    out.textContent = `Error: ${data.error || 'Unknown error'}`;
                     status.textContent = '';
+                    return false;
                 }
             } catch (e) {
-                out.innerHTML = `<span style="color:#f48771;">Error: ${e.message}</span>`;
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== configRequestId) return false;
+                out.style.color = '#f48771';
+                out.textContent = `Error: ${e.message}`;
+                return false;
             }
         }
 
         function filterConfigOutput() {
             const filter = document.getElementById('configFilter').value.trim().toLowerCase();
             const out = document.getElementById('configOutput');
-            if (!configRawOutput) return;
+            if (!configRawOutput || configSourceDevice !== deviceName) return;
             if (!filter) {
                 out.textContent = configRawOutput;
                 return;
@@ -1918,7 +2568,7 @@
         }
 
         function downloadConfig() {
-            if (!configRawOutput) return;
+            if (!configRawOutput || configSourceDevice !== deviceName) return;
             const fmt = document.getElementById('configFormat').value;
             const ext = fmt === 'yaml' ? 'yaml' : 'txt';
             const blob = new Blob([configRawOutput], {type: 'text/plain'});
@@ -1946,22 +2596,25 @@
             // Populate datalist
             const portList = document.getElementById('portList');
             if (portList) {
-                portList.innerHTML = ports.map(p => `<option value="${p}">`).join('');
+                replaceSelectOptions(portList, [...new Set(ports)]);
             }
         }
         
-        async function loadVRFList() {
+        async function loadVRFList({ loadBgp = true, requestContext = getDeviceRequestContext() } = {}) {
+            if (!requestContext.device) return false;
+            if (loadBgp) setElementMessage('bgpContent', 'Loading VRFs...', 'loading');
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show vrf'})
+                    body: JSON.stringify({device: requestContext.device, command: 'nv show vrf'})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
                     const vrfs = [];
-                    const lines = data.output.split('\n');
+                    const lines = String(data.output || '').split('\n');
                     lines.forEach(line => {
                         const match = line.match(/^(\S+)\s+/);
                         if (match && !match[1].startsWith('-') && match[1] !== 'vrf' && match[1] !== 'Name' && match[1] !== '==') {
@@ -1969,36 +2622,43 @@
                         }
                     });
                     
+                    const uniqueVrfs = [...new Set(vrfs)];
+                    if (uniqueVrfs.length === 0) uniqueVrfs.push('default');
+                    const values = ['all', ...uniqueVrfs.filter(vrf => vrf !== 'all')];
+
                     // Update both VRF selects (add 'all' option)
                     ['vrfSelect', 'cmdVrfSelect'].forEach(id => {
-                        const select = document.getElementById(id);
-                        if (select) {
-                            select.innerHTML = '<option value="all">all</option>' + vrfs.map(v => `<option value="${v}">${v}</option>`).join('');
-                        }
+                        replaceSelectOptions(id, values, 'all');
                     });
                     
-                    // Load BGP for first VRF
-                    if (vrfs.length > 0) {
-                        loadBGPForVRF();
-                    }
+                    if (loadBgp) return await loadBGPForVRF(requestContext);
+                    return true;
+                } else {
+                    if (loadBgp) setElementMessage('bgpContent', data.error || 'Failed to load VRFs', 'error-message');
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 console.error('Failed to load VRF list:', e);
+                if (loadBgp) setElementMessage('bgpContent', e.message || 'Failed to load VRFs', 'error-message');
+                return false;
             }
         }
         
-        async function loadBondList() {
+        async function loadBondList(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show interface bonds'})
+                    body: JSON.stringify({device: requestContext.device, command: 'nv show interface bonds'})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
                     const bonds = [];
-                    const lines = data.output.split('\n');
+                    const lines = String(data.output || '').split('\n');
                     lines.forEach(line => {
                         // Match bond interfaces (type column shows 'bond')
                         const match = line.match(/^(bond\S+)\s+/);
@@ -2012,11 +2672,15 @@
                     
                     const datalist = document.getElementById('bondList');
                     if (datalist) {
-                        datalist.innerHTML = bonds.map(b => `<option value="${b}">`).join('');
+                        replaceSelectOptions(datalist, [...new Set(bonds)]);
                     }
+                    return true;
                 }
+                return false;
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 console.error('Failed to load bond list:', e);
+                return false;
             }
         }
         
@@ -2036,23 +2700,169 @@
         // ===== Capture Functions =====
         // Store PCAP file path and abort controller
         let capturePcapPath = null;
+        let capturePcapSourceDevice = null;
         let captureAbortController = null;
-        let livePollingInterval = null;
         let liveCaptureFile = null;
+        let activeCaptureContext = null;
+        let captureRunId = 0;
+        let captureFileOperationId = 0;
+        const captureCleanupByDevice = new Map();
+        const failedCaptureCleanupByDevice = new Map();
+        const captureStartBarrierByDevice = new Map();
+        const captureStartIntentByDevice = new Map();
+
+        function safeTempDevicePart(device) {
+            return String(device || '').replace(/[^A-Za-z0-9-]/g, '_');
+        }
+
+        function invalidateCaptureStartIntents(device) {
+            if (!device) return 0;
+            const nextIntent = (captureStartIntentByDevice.get(device) || 0) + 1;
+            captureStartIntentByDevice.set(device, nextIntent);
+            return nextIntent;
+        }
+
+        async function runDeviceCleanupCommand(device, command) {
+            const response = await fetch('/fabric-api.sh?action=run-device-command', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ device, command })
+            });
+            if (!response.ok) throw new Error(`Cleanup request failed (${response.status})`);
+            const data = await response.json();
+            if (command.startsWith('sudo pkill -f ') && data.exit_code === 1) {
+                return data;
+            }
+            if (!data.success) {
+                throw new Error(data.error || data.error_output || 'Remote cleanup failed');
+            }
+            return data;
+        }
+
+        function isCurrentCapture(context) {
+            return Boolean(context) && !context.cancelled && activeCaptureContext === context &&
+                isCurrentDeviceRequest(context.device, context.generation);
+        }
+
+        function releaseCaptureContext(context) {
+            if (!context) return;
+            if (activeCaptureContext === context) activeCaptureContext = null;
+            if (captureAbortController === context.controller) captureAbortController = null;
+            if (context.pollInterval) clearInterval(context.pollInterval);
+            context.pollInterval = null;
+            if (context.stopTimeout) clearTimeout(context.stopTimeout);
+            context.stopTimeout = null;
+        }
+
+        function cleanupCaptureRemote(context, { removePcap = true } = {}) {
+            if (!context?.device) return Promise.resolve();
+            const previousCleanup = captureCleanupByDevice.get(context.device) || Promise.resolve();
+            const cleanup = previousCleanup.catch(() => {}).then(async () => {
+                const commands = [];
+                const exactProcessMarker = context.pcapFile || context.liveFile;
+                if (exactProcessMarker) {
+                    commands.push(`sudo pkill -f "${exactProcessMarker}"`);
+                }
+                if (context.liveFile) commands.push(`sudo rm -f "${context.liveFile}"`);
+                if (removePcap && context.pcapFile) commands.push(`sudo rm -f "${context.pcapFile}"`);
+                let cleanupError = null;
+                for (const command of commands) {
+                    try {
+                        await runDeviceCleanupCommand(context.device, command);
+                    } catch (error) {
+                        cleanupError ||= error;
+                    }
+                }
+                if (cleanupError) {
+                    failedCaptureCleanupByDevice.set(context.device, { context, removePcap });
+                    throw cleanupError;
+                }
+                const failedCleanup = failedCaptureCleanupByDevice.get(context.device);
+                if (failedCleanup?.context?.id === context.id) {
+                    failedCaptureCleanupByDevice.delete(context.device);
+                }
+            });
+            captureCleanupByDevice.set(context.device, cleanup);
+            return cleanup.finally(() => {
+                if (captureCleanupByDevice.get(context.device) === cleanup) {
+                    captureCleanupByDevice.delete(context.device);
+                }
+            });
+        }
+
+        async function cleanupStaleCapture(context, options) {
+            try {
+                await cleanupCaptureRemote(context, options);
+                return true;
+            } catch (error) {
+                if (isCurrentDeviceRequest(context.device, context.generation) &&
+                    (!activeCaptureContext || activeCaptureContext === context)) {
+                    const status = document.getElementById('captureStatus');
+                    status.textContent = 'Capture cancelled - cleanup failed';
+                    status.style.color = '#f44336';
+                    showNotification(error.message || 'Capture cleanup failed', 'error');
+                }
+                return false;
+            }
+        }
+
+        async function cancelActiveCapture({ updateUi = true } = {}) {
+            const context = activeCaptureContext;
+            if (!context) {
+                if (captureAbortController) captureAbortController.abort();
+                captureAbortController = null;
+                return false;
+            }
+
+            const shouldUpdateUi = updateUi &&
+                isCurrentDeviceRequest(context.device, context.generation);
+            context.cancelled = true;
+            releaseCaptureContext(context);
+            context.controller?.abort();
+            liveCaptureFile = null;
+            captureFileOperationId += 1;
+            capturePcapPath = null;
+            capturePcapSourceDevice = null;
+
+            if (shouldUpdateUi) {
+                document.getElementById('btnStartCapture').style.display = 'inline-flex';
+                document.getElementById('btnStopCapture').style.display = 'none';
+                document.getElementById('capturePcapResult').style.display = 'none';
+                const status = document.getElementById('captureStatus');
+                status.textContent = 'Capture cancelled';
+                status.style.color = '#888';
+                showNotification('Capture cancelled', 'info');
+            }
+
+            try {
+                await cleanupCaptureRemote(context, { removePcap: true });
+                return true;
+            } catch (error) {
+                if (shouldUpdateUi && isCurrentDeviceRequest(context.device, context.generation)) {
+                    const status = document.getElementById('captureStatus');
+                    status.textContent = 'Capture cleanup failed';
+                    status.style.color = '#f44336';
+                    showNotification(error.message || 'Capture cleanup failed', 'error');
+                }
+                return false;
+            }
+        }
         
         // Load all interfaces for capture (including SVIs, bonds, etc.)
-        async function loadCaptureInterfaces() {
+        async function loadCaptureInterfaces(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show interface --view=brief'})
+                    body: JSON.stringify({device: requestContext.device, command: 'nv show interface --view=brief'})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success && data.output) {
                     const datalist = document.getElementById('captureInterfaceList');
-                    datalist.innerHTML = '<option value="any">any (all interfaces)</option>';
+                    replaceSelectOptions(datalist, [{ value: 'any', label: 'any (all interfaces)' }]);
                     
                     // Parse output - extract valid interface names only
                     const lines = data.output.trim().split('\n');
@@ -2096,13 +2906,40 @@
                         opt.value = iface;
                         datalist.appendChild(opt);
                     });
+                    return true;
                 }
+                return false;
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 console.error('Failed to load capture interfaces:', e);
+                return false;
             }
         }
         
         async function startCapture() {
+            const requestContext = getDeviceRequestContext();
+            if (!requestContext.device) return false;
+            const intentId = invalidateCaptureStartIntents(requestContext.device);
+            const previousStart = captureStartBarrierByDevice.get(requestContext.device) ||
+                Promise.resolve();
+            const operation = previousStart.catch(() => false).then(() => {
+                if (captureStartIntentByDevice.get(requestContext.device) !== intentId ||
+                    !isCurrentDeviceRequest(requestContext.device, requestContext.generation)) {
+                    return false;
+                }
+                return startCaptureOperation(requestContext);
+            });
+            captureStartBarrierByDevice.set(requestContext.device, operation);
+            try {
+                return await operation;
+            } finally {
+                if (captureStartBarrierByDevice.get(requestContext.device) === operation) {
+                    captureStartBarrierByDevice.delete(requestContext.device);
+                }
+            }
+        }
+
+        async function startCaptureOperation(requestContext) {
             const iface = document.getElementById('captureInterface').value;
             const duration = document.getElementById('captureDuration').value;
             const count = document.getElementById('captureCount').value;
@@ -2111,8 +2948,53 @@
             
             if (!iface) {
                 showNotification('Please select an interface', 'error');
-                return;
+                return false;
             }
+
+            if (activeCaptureContext) {
+                const cancelled = await cancelActiveCapture({ updateUi: false });
+                if (!cancelled) {
+                    showNotification('Previous capture cleanup failed', 'error');
+                    return false;
+                }
+            }
+            const pendingCleanup = captureCleanupByDevice.get(requestContext.device);
+            if (pendingCleanup) {
+                try {
+                    await pendingCleanup;
+                } catch (error) {
+                    showNotification(error.message || 'Previous capture cleanup failed', 'error');
+                    return false;
+                }
+            }
+            const failedCleanup = failedCaptureCleanupByDevice.get(requestContext.device);
+            if (failedCleanup) {
+                try {
+                    await cleanupCaptureRemote(
+                        failedCleanup.context,
+                        { removePcap: failedCleanup.removePcap }
+                    );
+                } catch (error) {
+                    showNotification(error.message || 'Previous capture cleanup failed', 'error');
+                    return false;
+                }
+            }
+            if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+            const captureContext = {
+                id: ++captureRunId,
+                device: requestContext.device,
+                generation: requestContext.generation,
+                mode,
+                cancelled: false,
+                controller: new AbortController(),
+                pcapFile: null,
+                liveFile: null,
+                pollInterval: null,
+                stopTimeout: null
+            };
+            activeCaptureContext = captureContext;
+            captureAbortController = captureContext.controller;
             
             const statusEl = document.getElementById('captureStatus');
             const outputEl = document.getElementById('captureOutput');
@@ -2126,13 +3008,15 @@
             
             // Reset UI
             pcapResultEl.style.display = 'none';
+            captureFileOperationId += 1;
             capturePcapPath = null;
-            
-            // Create abort controller for this capture
-            captureAbortController = new AbortController();
+            capturePcapSourceDevice = null;
+            document.getElementById('btnDownloadPcap').disabled = false;
+            document.getElementById('btnDeleteAllPcap').disabled = false;
             
             // Helper to restore buttons
             const restoreButtons = () => {
+                if (!isCurrentDeviceRequest(captureContext.device, captureContext.generation)) return;
                 btnStartEl.style.display = 'inline-flex';
                 btnStopEl.style.display = 'none';
             };
@@ -2142,28 +3026,39 @@
                 statusEl.textContent = 'Cleaning old captures...';
                 statusEl.style.color = '#ff9800';
                 outputEl.style.display = 'block';
-                outputEl.innerHTML = 'Preparing capture...';
+                outputEl.textContent = 'Preparing capture...';
                 
                 // Clean up old PCAP files for this device (older than 1 hour)
                 try {
                     await fetch('/fabric-api.sh?action=run-device-command', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({device: deviceName, command: 'find /tmp -name "capture_*.pcap" -mmin +60 -delete'})
+                        body: JSON.stringify({device: captureContext.device, command: 'find /tmp -name "capture_*.pcap" -mmin +60 -delete'}),
+                        signal: captureContext.controller.signal
                     });
                 } catch (e) {
-                    // Ignore cleanup errors
+                    if (!isCurrentCapture(captureContext)) {
+                        if (activeCaptureContext === captureContext) {
+                            await cancelActiveCapture({ updateUi: false });
+                        }
+                        return false;
+                    }
+                }
+                if (!isCurrentCapture(captureContext)) {
+                    if (activeCaptureContext === captureContext) {
+                        await cancelActiveCapture({ updateUi: false });
+                    }
+                    return false;
                 }
                 
                 statusEl.textContent = 'Capturing to PCAP file...';
-                outputEl.innerHTML = 'Running tcpdump with PCAP output on ' + iface + '...\nThis will take ' + duration + ' seconds.';
+                outputEl.textContent = 'Running tcpdump with PCAP output on ' + iface + '...\nThis will take ' + duration + ' seconds.';
                 
                 // Generate unique filename
                 const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-                const pcapFile = `/tmp/capture_${deviceName}_${iface}_${timestamp}.pcap`;
-                
-                // Save path immediately so stopCapture() can use it
-                capturePcapPath = pcapFile;
+                const safeDeviceFilePart = safeTempDevicePart(captureContext.device);
+                const pcapFile = `/tmp/capture_${safeDeviceFilePart}_${iface}_${timestamp}.pcap`;
+                captureContext.pcapFile = pcapFile;
                 
                 // Build command with -w for PCAP output, -U (packet-buffered) for immediate write
                 let cmd = `sudo timeout ${duration} tcpdump -U -i ${iface} -nnnn -w ${pcapFile}`;
@@ -2178,43 +3073,67 @@
                     const response = await fetch('/fabric-api.sh?action=run-device-command', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({device: deviceName, command: cmd}),
-                        signal: captureAbortController.signal
+                        body: JSON.stringify({device: captureContext.device, command: cmd}),
+                        signal: captureContext.controller.signal
                     });
                     const data = await response.json();
+                    if (!isCurrentCapture(captureContext)) {
+                        if (activeCaptureContext === captureContext) {
+                            await cancelActiveCapture({ updateUi: false });
+                        } else {
+                            await cleanupStaleCapture(captureContext, { removePcap: true });
+                        }
+                        return false;
+                    }
                     
                     if (data.success) {
+                        capturePcapPath = pcapFile;
+                        capturePcapSourceDevice = captureContext.device;
                         document.getElementById('capturePcapPath').textContent = pcapFile;
+                        document.getElementById('btnDownloadPcap').disabled = false;
                         pcapResultEl.style.display = 'block';
-                        outputEl.innerHTML = escapeHtml(data.output);
+                        outputEl.textContent = data.output || '';
                         statusEl.textContent = 'Capture complete - PCAP ready for download';
                         statusEl.style.color = '#76b900';
+                        return true;
                     } else {
-                        outputEl.innerHTML = 'Error: ' + escapeHtml(data.error);
+                        outputEl.textContent = 'Error: ' + (data.error || 'Unknown error');
                         statusEl.textContent = 'Capture failed';
                         statusEl.style.color = '#f44336';
-                        capturePcapPath = null; // Clear on error
+                        capturePcapPath = null;
+                        capturePcapSourceDevice = null;
+                        return false;
                     }
                 } catch (e) {
-                    // If aborted (stopped early), still show PCAP result since file exists
-                    if (e.name === 'AbortError') {
-                        document.getElementById('capturePcapPath').textContent = pcapFile;
-                        pcapResultEl.style.display = 'block';
-                        statusEl.textContent = 'Capture stopped - PCAP ready for download';
-                        statusEl.style.color = '#76b900';
-                    } else {
-                        outputEl.innerHTML = 'Capture stopped or error: ' + escapeHtml(e.message);
-                        statusEl.textContent = 'Capture ended';
-                        statusEl.style.color = '#888';
+                    if (!isCurrentCapture(captureContext)) {
+                        if (activeCaptureContext === captureContext) {
+                            await cancelActiveCapture({ updateUi: false });
+                        }
+                        return false;
                     }
+                    capturePcapPath = null;
+                    capturePcapSourceDevice = null;
+                    pcapResultEl.style.display = 'none';
+                    outputEl.textContent = e.name === 'AbortError'
+                        ? 'Capture cancelled'
+                        : 'Capture stopped or error: ' + e.message;
+                    statusEl.textContent = e.name === 'AbortError' ? 'Capture cancelled' : 'Capture ended';
+                    statusEl.style.color = '#888';
+                    return false;
+                } finally {
+                    if (activeCaptureContext === captureContext) releaseCaptureContext(captureContext);
+                    restoreButtons();
                 }
-                restoreButtons();
             } else {
                 // Live mode - real-time streaming via dedicated API
                 statusEl.textContent = 'Starting live capture...';
                 statusEl.style.color = '#76b900';
                 outputEl.style.display = 'block';
-                outputEl.innerHTML = '<pre id="liveOutput" style="margin: 0; white-space: pre-wrap; color: #4ec9b0; max-height: 400px; overflow-y: auto;">Initializing...</pre>';
+                const liveOutput = document.createElement('pre');
+                liveOutput.id = 'liveOutput';
+                liveOutput.style.cssText = 'margin:0;white-space:pre-wrap;color:#4ec9b0;max-height:400px;overflow-y:auto;';
+                liveOutput.textContent = 'Initializing...';
+                outputEl.replaceChildren(liveOutput);
                 
                 try {
                     // Start tcpdump via dedicated action (handles background safely)
@@ -2222,7 +3141,7 @@
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
-                            device: deviceName,
+                            device: captureContext.device,
                             interface: iface,
                             duration: duration,
                             count: count,
@@ -2234,21 +3153,38 @@
                     if (!startData.success) {
                         throw new Error(startData.error || 'Failed to start capture');
                     }
+                    captureContext.liveFile = startData.output_file;
+                    if (!isCurrentCapture(captureContext)) {
+                        if (activeCaptureContext === captureContext) {
+                            await cancelActiveCapture({ updateUi: false });
+                        } else {
+                            await cleanupStaleCapture(captureContext, { removePcap: false });
+                        }
+                        return false;
+                    }
                     
-                    liveCaptureFile = startData.output_file;
+                    liveCaptureFile = captureContext.liveFile;
                     statusEl.textContent = 'Live capture running...';
                     
                     // Start polling for output
                     let lastLength = 0;
                     let emptyCount = 0;
-                    livePollingInterval = setInterval(async () => {
+                    captureContext.pollInterval = setInterval(async () => {
+                        if (!isCurrentCapture(captureContext)) {
+                            if (activeCaptureContext === captureContext) {
+                                void cancelActiveCapture({ updateUi: false });
+                            }
+                            return;
+                        }
                         try {
                             const resp = await fetch('/fabric-api.sh?action=run-device-command', {
                                 method: 'POST',
                                 headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify({device: deviceName, command: `cat ${liveCaptureFile}`})
+                                body: JSON.stringify({device: captureContext.device, command: `cat ${captureContext.liveFile}`}),
+                                signal: captureContext.controller.signal
                             });
                             const data = await resp.json();
+                            if (!isCurrentCapture(captureContext)) return;
                             
                             if (data.success && data.output) {
                                 const liveEl = document.getElementById('liveOutput');
@@ -2267,119 +3203,183 @@
                     }, 1000); // Poll every 1 second
                     
                     // Auto-stop after duration + buffer
-                    setTimeout(() => {
-                        if (livePollingInterval) {
-                            stopLiveCapture();
-                        }
+                    captureContext.stopTimeout = setTimeout(() => {
+                        if (isCurrentCapture(captureContext)) stopLiveCapture(captureContext);
                     }, parseInt(duration) * 1000 + 3000);
-                    
+                    return true;
                 } catch (e) {
-                    outputEl.innerHTML = '<div style="color: #f44336;">Error: ' + escapeHtml(e.message) + '</div>';
+                    if (!isCurrentCapture(captureContext)) {
+                        if (activeCaptureContext === captureContext) {
+                            await cancelActiveCapture({ updateUi: false });
+                        }
+                        return false;
+                    }
+                    const error = setElementMessage(outputEl, 'Error: ' + e.message);
+                    error.style.color = '#f44336';
                     statusEl.textContent = 'Error';
                     statusEl.style.color = '#f44336';
+                    releaseCaptureContext(captureContext);
                     restoreButtons();
+                    return false;
                 }
             }
         }
         
         function clearCaptureOutput() {
+            invalidateCaptureStartIntents(deviceName);
+            if (activeCaptureContext) void cancelActiveCapture({ updateUi: false });
             document.getElementById('captureOutput').style.display = 'none';
-            document.getElementById('captureOutput').innerHTML = '';
+            document.getElementById('captureOutput').replaceChildren();
             document.getElementById('capturePcapResult').style.display = 'none';
             document.getElementById('captureStatus').textContent = '';
+            captureFileOperationId += 1;
             capturePcapPath = null;
+            capturePcapSourceDevice = null;
         }
         
         async function stopCapture() {
-            const statusEl = document.getElementById('captureStatus');
-            const btnStartEl = document.getElementById('btnStartCapture');
-            const btnStopEl = document.getElementById('btnStopCapture');
-            const pcapResultEl = document.getElementById('capturePcapResult');
-            
-            statusEl.textContent = 'Stopping capture...';
-            statusEl.style.color = '#ff9800';
-            
-            // Restore buttons immediately - don't wait for response
-            btnStartEl.style.display = 'inline-flex';
-            btnStopEl.style.display = 'none';
-            
-            // Stop live polling if active
-            if (livePollingInterval) {
-                clearInterval(livePollingInterval);
-                livePollingInterval = null;
-            }
-            
-            // Abort the running capture fetch immediately
-            if (captureAbortController) {
-                captureAbortController.abort();
-                captureAbortController = null;
-            }
-            
-            // Kill tcpdump process on device (fire and forget)
-            fetch('/fabric-api.sh?action=run-device-command', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({device: deviceName, command: 'sudo killall tcpdump'})
-            }).catch(() => {});
-            
-            // Clean up live capture file if exists
-            if (liveCaptureFile) {
-                fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: `sudo rm -f ${liveCaptureFile}`})
-                }).catch(() => {});
-                liveCaptureFile = null;
-            }
-            
-            // If PCAP mode was active and we have a file path, show the result
-            if (capturePcapPath) {
-                document.getElementById('capturePcapPath').textContent = capturePcapPath;
-                pcapResultEl.style.display = 'block';
-                statusEl.textContent = 'Capture stopped - PCAP file ready';
-                statusEl.style.color = '#76b900';
-                showNotification('Capture stopped - PCAP ready for download', 'info');
-            } else {
-                statusEl.textContent = 'Capture stopped';
-                statusEl.style.color = '#888';
-                showNotification('Capture stopped', 'info');
-            }
+            invalidateCaptureStartIntents(deviceName);
+            return await cancelActiveCapture({ updateUi: true });
         }
         
-        function stopLiveCapture() {
-            const statusEl = document.getElementById('captureStatus');
-            const btnStartEl = document.getElementById('btnStartCapture');
-            const btnStopEl = document.getElementById('btnStopCapture');
-            
-            // Stop polling
-            if (livePollingInterval) {
-                clearInterval(livePollingInterval);
-                livePollingInterval = null;
+        async function stopLiveCapture(context = activeCaptureContext) {
+            if (!context || activeCaptureContext !== context) return false;
+            invalidateCaptureStartIntents(context.device);
+            const shouldUpdateUi = isCurrentCapture(context);
+            releaseCaptureContext(context);
+            liveCaptureFile = null;
+            let cleanupSucceeded = true;
+            try {
+                await cleanupCaptureRemote(context, { removePcap: false });
+            } catch (error) {
+                cleanupSucceeded = false;
             }
-            
-            // Restore buttons
-            btnStartEl.style.display = 'inline-flex';
-            btnStopEl.style.display = 'none';
-            
-            // Clean up file
-            if (liveCaptureFile) {
-                fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: `sudo rm -f ${liveCaptureFile}`})
-                }).catch(() => {});
-                liveCaptureFile = null;
+
+            if (shouldUpdateUi && isCurrentDeviceRequest(context.device, context.generation)) {
+                document.getElementById('btnStartCapture').style.display = 'inline-flex';
+                document.getElementById('btnStopCapture').style.display = 'none';
+                const status = document.getElementById('captureStatus');
+                status.textContent = cleanupSucceeded
+                    ? 'Capture complete'
+                    : 'Capture complete - cleanup failed';
+                status.style.color = cleanupSucceeded ? '#76b900' : '#f44336';
+                if (!cleanupSucceeded) {
+                    showNotification('Live capture cleanup failed', 'error');
+                }
             }
-            
-            statusEl.textContent = 'Capture complete';
-            statusEl.style.color = '#76b900';
+            return cleanupSucceeded;
         }
         
         // ===================== LOG TAIL =====================
         let tailPollingInterval = null;
         let tailOutputFile = null;
+        let tailDevice = null;
+        let activeTailContext = null;
+        let tailRunId = 0;
+        let tailOperationId = 0;
+        let tailPendingOperationId = null;
+        const tailCleanupByDevice = new Map();
+        const failedTailCleanupByDevice = new Map();
+        const tailStartBarrierByDevice = new Map();
+        const tailStartIntentByDevice = new Map();
+
+        function invalidateTailStartIntents(device) {
+            if (!device) return 0;
+            const nextIntent = (tailStartIntentByDevice.get(device) || 0) + 1;
+            tailStartIntentByDevice.set(device, nextIntent);
+            return nextIntent;
+        }
+
+        function cleanupTailRemote(context) {
+            if (!context?.device || !context.outputFile) return Promise.resolve();
+            const previousCleanup = tailCleanupByDevice.get(context.device) || Promise.resolve();
+            const cleanup = previousCleanup.catch(() => {}).then(async () => {
+                let cleanupError = null;
+                try {
+                    await runDeviceCleanupCommand(
+                        context.device,
+                        `sudo pkill -f "${context.outputFile}"`
+                    );
+                } catch (error) {
+                    cleanupError ||= error;
+                }
+                try {
+                    await runDeviceCleanupCommand(
+                        context.device,
+                        `sudo rm -f "${context.outputFile}"`
+                    );
+                } catch (error) {
+                    cleanupError ||= error;
+                }
+                if (cleanupError) {
+                    failedTailCleanupByDevice.set(context.device, context);
+                    throw cleanupError;
+                }
+                const failedCleanup = failedTailCleanupByDevice.get(context.device);
+                if (failedCleanup?.id === context.id) {
+                    failedTailCleanupByDevice.delete(context.device);
+                }
+            });
+            tailCleanupByDevice.set(context.device, cleanup);
+            return cleanup.finally(() => {
+                if (tailCleanupByDevice.get(context.device) === cleanup) {
+                    tailCleanupByDevice.delete(context.device);
+                }
+            });
+        }
         
         async function startLogTail() {
+            const requestContext = getDeviceRequestContext();
+            if (!requestContext.device) return;
+            const intentId = invalidateTailStartIntents(requestContext.device);
+            const previousStart = tailStartBarrierByDevice.get(requestContext.device) ||
+                Promise.resolve();
+            const operation = previousStart.catch(() => false).then(() => {
+                if (tailStartIntentByDevice.get(requestContext.device) !== intentId ||
+                    !isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
+                return startLogTailOperation(requestContext);
+            });
+            tailStartBarrierByDevice.set(requestContext.device, operation);
+            try {
+                return await operation;
+            } finally {
+                if (tailStartBarrierByDevice.get(requestContext.device) === operation) {
+                    tailStartBarrierByDevice.delete(requestContext.device);
+                }
+            }
+        }
+
+        async function startLogTailOperation(requestContext) {
+            if (activeTailContext) {
+                const stopped = await stopLogTail(activeTailContext, { updateUi: false });
+                if (!stopped) {
+                    showNotification('Previous log-tail cleanup failed', 'error');
+                    return;
+                }
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
+            }
+            const pendingCleanup = tailCleanupByDevice.get(requestContext.device);
+            if (pendingCleanup) {
+                try {
+                    await pendingCleanup;
+                } catch (error) {
+                    showNotification(error.message || 'Previous log-tail cleanup failed', 'error');
+                    return;
+                }
+            }
+            const failedCleanup = failedTailCleanupByDevice.get(requestContext.device);
+            if (failedCleanup) {
+                try {
+                    await cleanupTailRemote(failedCleanup);
+                } catch (error) {
+                    showNotification(error.message || 'Previous log-tail cleanup failed', 'error');
+                    return;
+                }
+            }
+            if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
+            const operationId = ++tailOperationId;
+            tailPendingOperationId = operationId;
+            const tailStartId = ++tailRunId;
             const severity = document.getElementById('tailSeverity').value;
             const keyword = document.getElementById('tailKeyword').value.trim();
             const duration = document.getElementById('tailDuration').value;
@@ -2394,77 +3394,171 @@
             statusEl.textContent = 'Starting...';
             statusEl.style.color = '#ff9800';
             outputEl.style.display = 'block';
-            tailEl.textContent = 'Connecting to ' + deviceName + '...';
+            tailEl.textContent = 'Connecting to ' + requestContext.device + '...';
             
             try {
                 const resp = await fetch('/fabric-api.sh?action=start-log-tail', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ device: deviceName, severity, keyword, duration })
+                    body: JSON.stringify({ device: requestContext.device, severity, keyword, duration })
                 });
                 const data = await resp.json();
                 if (!data.success) throw new Error(data.error || 'Failed to start tail');
+                if (operationId !== tailOperationId ||
+                    !isCurrentDeviceRequest(requestContext.device, requestContext.generation)) {
+                    try {
+                        await cleanupTailRemote({
+                            id: tailStartId,
+                            device: requestContext.device,
+                            outputFile: data.output_file
+                        });
+                    } catch (cleanupError) {
+                        if (isCurrentDeviceRequest(requestContext.device, requestContext.generation) &&
+                            tailPendingOperationId === operationId && !activeTailContext) {
+                            statusEl.textContent = 'Stopped - cleanup failed';
+                            statusEl.style.color = '#f44336';
+                            showNotification(
+                                cleanupError.message || 'Log-tail cleanup failed',
+                                'error'
+                            );
+                        }
+                    }
+                    return;
+                }
                 
-                tailOutputFile = data.output_file;
+                const tailContext = {
+                    id: tailStartId,
+                    device: requestContext.device,
+                    generation: requestContext.generation,
+                    outputFile: data.output_file,
+                    interval: null,
+                    stopTimeout: null
+                };
+                activeTailContext = tailContext;
+                tailOutputFile = tailContext.outputFile;
+                tailDevice = tailContext.device;
                 statusEl.textContent = 'Tailing...';
                 statusEl.style.color = '#76b900';
                 
                 let lastLength = 0;
-                tailPollingInterval = setInterval(async () => {
+                tailContext.interval = setInterval(async () => {
+                    if (activeTailContext !== tailContext ||
+                        !isCurrentDeviceRequest(tailContext.device, tailContext.generation)) {
+                        if (tailContext.interval) clearInterval(tailContext.interval);
+                        tailContext.interval = null;
+                        if (activeTailContext === tailContext) {
+                            void stopLogTail(tailContext, { updateUi: false });
+                        }
+                        return;
+                    }
                     try {
                         const r = await fetch('/fabric-api.sh?action=run-device-command', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify({ device: deviceName, command: `cat ${tailOutputFile} 2>/dev/null` })
+                            body: JSON.stringify({ device: tailContext.device, command: `cat ${tailContext.outputFile} 2>/dev/null` })
                         });
                         const d = await r.json();
-                        if (d.success && d.output && d.output.length > lastLength) {
+                        if (activeTailContext === tailContext &&
+                            isCurrentDeviceRequest(tailContext.device, tailContext.generation) &&
+                            d.success && d.output && d.output.length > lastLength) {
                             tailEl.textContent = d.output;
                             tailEl.scrollTop = tailEl.scrollHeight;
                             lastLength = d.output.length;
                         }
                     } catch (e) {}
                 }, 1000);
+                tailPollingInterval = tailContext.interval;
                 
-                setTimeout(() => { if (tailPollingInterval) stopLogTail(); }, parseInt(duration) * 1000 + 3000);
+                if (tailStopTimeout) clearTimeout(tailStopTimeout);
+                tailContext.stopTimeout = setTimeout(() => {
+                    if (activeTailContext === tailContext) stopLogTail(tailContext);
+                }, parseInt(duration) * 1000 + 3000);
+                tailStopTimeout = tailContext.stopTimeout;
             } catch (e) {
+                if (operationId !== tailOperationId ||
+                    !isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
                 btnStart.style.display = 'inline-flex';
                 btnStop.style.display = 'none';
+            } finally {
+                if (tailPendingOperationId === operationId) {
+                    tailPendingOperationId = null;
+                }
             }
         }
         
-        function stopLogTail() {
-            if (tailPollingInterval) {
-                clearInterval(tailPollingInterval);
+        async function stopLogTail(target = activeTailContext || tailDevice || deviceName, { updateUi = true } = {}) {
+            const stopOperationId = ++tailOperationId;
+            const context = target && typeof target === 'object' ? target : activeTailContext;
+            const targetDevice = context?.device || String(target || tailDevice || deviceName || '');
+            invalidateTailStartIntents(targetDevice);
+            const outputFile = context?.outputFile || tailOutputFile;
+            const shouldUpdateUi = updateUi && (
+                !context || isCurrentDeviceRequest(context.device, context.generation)
+            );
+
+            if (context?.interval) clearInterval(context.interval);
+            if (context?.stopTimeout) clearTimeout(context.stopTimeout);
+            if (!context && tailPollingInterval) clearInterval(tailPollingInterval);
+            if (!context && tailStopTimeout) clearTimeout(tailStopTimeout);
+            if (activeTailContext === context || !context) {
+                activeTailContext = null;
                 tailPollingInterval = null;
-            }
-            document.getElementById('btnStartTail').style.display = 'inline-flex';
-            document.getElementById('btnStopTail').style.display = 'none';
-            
-            if (tailOutputFile) {
-                fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ device: deviceName, command: 'sudo pkill -f "journalctl -f"' })
-                }).catch(() => {});
-                fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ device: deviceName, command: `sudo rm -f ${tailOutputFile}` })
-                }).catch(() => {});
+                tailStopTimeout = null;
                 tailOutputFile = null;
+                tailDevice = null;
             }
-            document.getElementById('tailStatus').textContent = 'Stopped';
-            document.getElementById('tailStatus').style.color = '#888';
+            if (context) {
+                context.interval = null;
+                context.stopTimeout = null;
+            }
+
+            if (shouldUpdateUi) {
+                document.getElementById('btnStartTail').style.display = 'inline-flex';
+                document.getElementById('btnStopTail').style.display = 'none';
+            }
+            
+            if (outputFile && targetDevice) {
+                try {
+                    await cleanupTailRemote({
+                        id: context?.id ?? ++tailRunId,
+                        device: targetDevice,
+                        outputFile
+                    });
+                } catch (error) {
+                    if (updateUi && stopOperationId === tailOperationId && (!context ||
+                        isCurrentDeviceRequest(context.device, context.generation))) {
+                        const status = document.getElementById('tailStatus');
+                        status.textContent = 'Log-tail cleanup failed';
+                        status.style.color = '#f44336';
+                        showNotification(error.message || 'Log-tail cleanup failed', 'error');
+                    }
+                    return false;
+                }
+            }
+            if (updateUi && stopOperationId === tailOperationId && (!context ||
+                isCurrentDeviceRequest(context.device, context.generation))) {
+                document.getElementById('tailStatus').textContent = 'Stopped';
+                document.getElementById('tailStatus').style.color = '#888';
+            }
+            return true;
         }
         
         async function downloadPcap() {
-            if (!capturePcapPath) {
+            const requestContext = getDeviceRequestContext();
+            const filePath = capturePcapPath;
+            if (!filePath || capturePcapSourceDevice !== requestContext.device) {
                 showNotification('No PCAP file to download', 'warning');
-                return;
+                return false;
             }
+            const operationId = ++captureFileOperationId;
+            const isCurrentOperation = () => (
+                operationId === captureFileOperationId &&
+                isCurrentDeviceRequest(requestContext.device, requestContext.generation) &&
+                capturePcapSourceDevice === requestContext.device &&
+                capturePcapPath === filePath
+            );
             
             const statusEl = document.getElementById('captureStatus');
             const btnEl = document.getElementById('btnDownloadPcap');
@@ -2474,18 +3568,19 @@
             statusEl.style.color = '#ff9800';
             
             try {
-                const response = await fetch(`/fabric-api.sh?action=download-file&device=${encodeURIComponent(deviceName)}&file=${encodeURIComponent(capturePcapPath)}`);
+                const response = await fetch(`/fabric-api.sh?action=download-file&device=${encodeURIComponent(requestContext.device)}&file=${encodeURIComponent(filePath)}`);
                 const text = await response.text();
+                if (!isCurrentOperation()) return false;
                 console.log('Download response:', text);
                 let data;
                 try {
                     data = JSON.parse(text);
                 } catch (parseErr) {
+                    if (!isCurrentOperation()) return false;
                     statusEl.textContent = 'Invalid response from server';
                     statusEl.style.color = '#f44336';
                     console.error('Parse error:', parseErr, 'Response:', text.substring(0, 500));
-                    btnEl.disabled = false;
-                    return;
+                    return false;
                 }
                 
                 if (data.success && data.download_url) {
@@ -2499,23 +3594,36 @@
                     statusEl.textContent = 'Download started';
                     statusEl.style.color = '#76b900';
                     showNotification('Downloading: ' + data.filename, 'info');
+                    return true;
                 } else {
                     statusEl.textContent = 'Download failed: ' + (data.error || 'Unknown error');
                     statusEl.style.color = '#f44336';
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentOperation()) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
+            } finally {
+                if (isCurrentOperation()) btnEl.disabled = false;
             }
-            
-            btnEl.disabled = false;
         }
         
         async function deletePcap() {
-            if (!capturePcapPath) {
+            const requestContext = getDeviceRequestContext();
+            const filePath = capturePcapPath;
+            if (!filePath || capturePcapSourceDevice !== requestContext.device) {
                 showNotification('No file to delete', 'warning');
-                return;
+                return false;
             }
+            const operationId = ++captureFileOperationId;
+            const isCurrentOperation = () => (
+                operationId === captureFileOperationId &&
+                isCurrentDeviceRequest(requestContext.device, requestContext.generation) &&
+                capturePcapSourceDevice === requestContext.device &&
+                capturePcapPath === filePath
+            );
             
             const statusEl = document.getElementById('captureStatus');
             statusEl.textContent = 'Deleting...';
@@ -2525,36 +3633,50 @@
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: `sudo rm -f "${capturePcapPath}"`})
+                    body: JSON.stringify({device: requestContext.device, command: `sudo rm -f "${filePath}"`})
                 });
                 const data = await response.json();
+                if (!isCurrentOperation()) return false;
                 
                 if (data.success) {
                     document.getElementById('capturePcapResult').style.display = 'none';
                     document.getElementById('captureOutput').style.display = 'none';
                     capturePcapPath = null;
+                    capturePcapSourceDevice = null;
                     statusEl.textContent = 'File deleted';
                     statusEl.style.color = '#76b900';
                     showNotification('PCAP file deleted', 'info');
+                    return true;
                 } else {
                     statusEl.textContent = 'Delete failed';
                     statusEl.style.color = '#f44336';
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentOperation()) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
             }
         }
         
         function deleteAllPcap() {
+            const requestContext = getDeviceRequestContext();
+            if (!requestContext.device) return;
             showConfirmModal(
                 'Delete All PCAP Files',
                 'Are you sure you want to delete ALL PCAP files from this device?',
-                executeDeleteAllPcap
+                () => executeDeleteAllPcap(requestContext)
             );
         }
         
-        async function executeDeleteAllPcap() {
+        async function executeDeleteAllPcap(requestContext = getDeviceRequestContext()) {
+            if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+            const operationId = ++captureFileOperationId;
+            const isCurrentOperation = () => (
+                operationId === captureFileOperationId &&
+                isCurrentDeviceRequest(requestContext.device, requestContext.generation)
+            );
             const statusEl = document.getElementById('captureStatus');
             const btnEl = document.getElementById('btnDeleteAllPcap');
             
@@ -2566,35 +3688,65 @@
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'sudo rm -f /tmp/capture_*.pcap'})
+                    body: JSON.stringify({device: requestContext.device, command: 'sudo rm -f /tmp/capture_*.pcap'})
                 });
                 const data = await response.json();
+                if (!isCurrentOperation()) return false;
                 
                 if (data.success) {
                     document.getElementById('capturePcapResult').style.display = 'none';
                     document.getElementById('captureOutput').style.display = 'none';
                     capturePcapPath = null;
+                    capturePcapSourceDevice = null;
                     statusEl.textContent = 'All PCAP files deleted';
                     statusEl.style.color = '#76b900';
                     showNotification('All PCAP files deleted from device', 'info');
+                    return true;
                 } else {
                     statusEl.textContent = 'Delete failed: ' + (data.error || 'Unknown error');
                     statusEl.style.color = '#f44336';
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentOperation()) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
+            } finally {
+                if (isCurrentOperation()) btnEl.disabled = false;
             }
-            
-            btnEl.disabled = false;
         }
         
         // Store the generated cl-support file path
         let clsupportFilePath = null;
+        let clsupportSourceDevice = null;
         let clsupportPollingInterval = null;
+        let clsupportPollContext = null;
+
+        function isCurrentClSupportRequest(requestContext, requestId = null) {
+            return isCurrentDeviceRequest(requestContext?.device, requestContext?.generation) &&
+                (requestId === null || requestId === clsupportRequestId);
+        }
+
+        function isCurrentClSupportOperation(requestContext, operationId) {
+            return isCurrentDeviceRequest(requestContext?.device, requestContext?.generation) &&
+                operationId === clsupportOperationId;
+        }
+
+        function stopClSupportPolling(pollContext = clsupportPollContext) {
+            if (!pollContext) return;
+            if (pollContext.interval) clearInterval(pollContext.interval);
+            pollContext.interval = null;
+            if (clsupportPollContext === pollContext) {
+                clsupportPollingInterval = null;
+                clsupportPollContext = null;
+            }
+        }
         
         // Load cl-support status when tab is opened
-        async function loadClSupportStatus() {
+        async function loadClSupportStatus(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
+            const requestId = ++clsupportRequestId;
             const statusEl = document.getElementById('clsupportStatus');
             const progressEl = document.getElementById('clsupportProgress');
             const resultEl = document.getElementById('clsupportResult');
@@ -2608,13 +3760,16 @@
                 const psResponse = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'pgrep -f cl-support'})
+                    body: JSON.stringify({device: requestContext.device, command: 'pgrep -f cl-support'})
                 });
                 const psData = await psResponse.json();
+                if (!isCurrentClSupportRequest(requestContext, requestId)) return false;
                 const isRunning = psData.success && psData.output && psData.output.trim().length > 0;
                 
                 if (isRunning) {
                     // cl-support is running
+                    clsupportFilePath = null;
+                    clsupportSourceDevice = null;
                     progressEl.style.display = 'block';
                     resultEl.style.display = 'none';
                     btnEl.disabled = true;
@@ -2623,26 +3778,29 @@
                     statusEl.style.color = '#ff9800';
                     
                     // Start polling
-                    startClSupportPolling();
-                    return;
+                    startClSupportPolling(requestContext);
+                    return true;
                 }
                 
                 // Check for existing bundle
                 const lsResponse = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'ls -t /var/support/cl_support*.txz 2>/dev/null'})
+                    body: JSON.stringify({device: requestContext.device, command: 'ls -t /var/support/cl_support*.txz 2>/dev/null'})
                 });
                 const lsData = await lsResponse.json();
+                if (!isCurrentClSupportRequest(requestContext, requestId)) return false;
                 
                 if (lsData.success && lsData.output && lsData.output.trim()) {
                     // Bundle exists - show it
                     clsupportFilePath = lsData.output.trim().split('\n')[0]; // Get latest
+                    clsupportSourceDevice = requestContext.device;
                     document.getElementById('clsupportFilePath').textContent = clsupportFilePath;
                     progressEl.style.display = 'none';
                     resultEl.style.display = 'block';
                     btnEl.disabled = false;
                     btnEl.style.opacity = '1';
+                    document.getElementById('clsupportDownloadBtn').disabled = false;
                     statusEl.textContent = 'Bundle ready';
                     statusEl.style.color = '#76b900';
                 } else {
@@ -2651,12 +3809,18 @@
                     resultEl.style.display = 'none';
                     btnEl.disabled = false;
                     btnEl.style.opacity = '1';
+                    document.getElementById('clsupportDownloadBtn').disabled = false;
                     statusEl.textContent = 'No bundle found';
                     statusEl.style.color = '#888';
+                    clsupportFilePath = null;
+                    clsupportSourceDevice = null;
                 }
+                return true;
             } catch (e) {
+                if (!isCurrentClSupportRequest(requestContext, requestId)) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
             }
         }
         
@@ -2669,28 +3833,53 @@
             }
         });
         
-        function startClSupportPolling() {
-            if (clsupportPollingInterval) return; // Already polling
-            
-            clsupportPollingInterval = setInterval(async () => {
-                const psResponse = await fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'pgrep -f cl-support'})
-                });
-                const psData = await psResponse.json();
-                const isRunning = psData.success && psData.output && psData.output.trim().length > 0;
-                
-                if (!isRunning) {
-                    // cl-support finished
-                    clearInterval(clsupportPollingInterval);
-                    clsupportPollingInterval = null;
-                    loadClSupportStatus(); // Reload status
+        function startClSupportPolling(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return;
+            if (clsupportPollingInterval && clsupportPollContext &&
+                clsupportPollContext.device === requestContext.device &&
+                clsupportPollContext.generation === requestContext.generation) return;
+            stopClSupportPolling();
+            const pollContext = {
+                device: requestContext.device,
+                generation: requestContext.generation,
+                interval: null
+            };
+            clsupportPollContext = pollContext;
+
+            pollContext.interval = setInterval(async () => {
+                if (clsupportPollContext !== pollContext || !isCurrentClSupportRequest(pollContext)) {
+                    stopClSupportPolling(pollContext);
+                    return;
                 }
-            }, 3000); // Check every 3 seconds
+                try {
+                    const psResponse = await fetch('/fabric-api.sh?action=run-device-command', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({device: pollContext.device, command: 'pgrep -f cl-support'})
+                    });
+                    const psData = await psResponse.json();
+                    if (clsupportPollContext !== pollContext || !isCurrentClSupportRequest(pollContext)) {
+                        stopClSupportPolling(pollContext);
+                        return;
+                    }
+                    const isRunning = psData.success && psData.output && psData.output.trim().length > 0;
+                    if (!isRunning) {
+                        stopClSupportPolling(pollContext);
+                        await loadClSupportStatus(pollContext);
+                    }
+                } catch (e) {
+                    if (clsupportPollContext !== pollContext || !isCurrentClSupportRequest(pollContext)) {
+                        stopClSupportPolling(pollContext);
+                    }
+                }
+            }, 3000);
+            clsupportPollingInterval = pollContext.interval;
         }
         
         async function generateClSupport() {
+            const requestContext = getDeviceRequestContext();
+            if (!requestContext.device) return false;
+            const operationId = ++clsupportOperationId;
             const statusEl = document.getElementById('clsupportStatus');
             const progressEl = document.getElementById('clsupportProgress');
             const resultEl = document.getElementById('clsupportResult');
@@ -2709,10 +3898,12 @@
                 await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'sudo rm -f /var/support/cl_support*.txz'})
+                    body: JSON.stringify({device: requestContext.device, command: 'sudo rm -f /var/support/cl_support*.txz'})
                 });
+                if (!isCurrentClSupportOperation(requestContext, operationId)) return false;
                 
                 clsupportFilePath = null;
+                clsupportSourceDevice = null;
                 
                 statusEl.textContent = 'Starting cl-support...';
                 
@@ -2720,9 +3911,10 @@
                 const startResp = await fetch('/fabric-api.sh?action=start-clsupport', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName})
+                    body: JSON.stringify({device: requestContext.device})
                 });
                 const startData = await startResp.json();
+                if (!isCurrentClSupportOperation(requestContext, operationId)) return false;
                 
                 if (!startData.success) {
                     throw new Error(startData.error || 'Failed to start cl-support');
@@ -2736,26 +3928,34 @@
                 showNotification('cl-support started. Will auto-update when ready.', 'info');
                 
                 // Start polling for completion
-                startClSupportPolling();
-                
+                startClSupportPolling(requestContext);
+                return true;
             } catch (e) {
+                if (!isCurrentClSupportOperation(requestContext, operationId)) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
                 btnEl.disabled = false;
                 btnEl.style.opacity = '1';
+                return false;
             }
         }
         
         async function checkClSupportStatus() {
-            // Just reload status
-            loadClSupportStatus();
+            return await loadClSupportStatus();
         }
         
         async function downloadClSupport() {
-            if (!clsupportFilePath) {
+            const requestContext = getDeviceRequestContext();
+            const filePath = clsupportFilePath;
+            if (!filePath || clsupportSourceDevice !== requestContext.device) {
                 showNotification('No file to download', 'warning');
-                return;
+                return false;
             }
+            const isCurrentDownload = () => (
+                isCurrentDeviceRequest(requestContext.device, requestContext.generation) &&
+                clsupportSourceDevice === requestContext.device &&
+                clsupportFilePath === filePath
+            );
             
             const statusEl = document.getElementById('clsupportStatus');
             const btnEl = document.getElementById('clsupportDownloadBtn');
@@ -2766,8 +3966,9 @@
             
             try {
                 // First, fetch file to web server
-                const response = await fetch(`/fabric-api.sh?action=download-file&device=${encodeURIComponent(deviceName)}&file=${encodeURIComponent(clsupportFilePath)}`);
+                const response = await fetch(`/fabric-api.sh?action=download-file&device=${encodeURIComponent(requestContext.device)}&file=${encodeURIComponent(filePath)}`);
                 const data = await response.json();
+                if (!isCurrentDownload()) return false;
                 
                 if (data.success && data.download_url) {
                     // Trigger download
@@ -2781,21 +3982,29 @@
                     statusEl.textContent = 'Download started';
                     statusEl.style.color = '#76b900';
                     showNotification('Download started: ' + data.filename, 'info');
+                    return true;
                 } else {
                     statusEl.textContent = 'Download failed: ' + (data.error || 'Unknown error');
                     statusEl.style.color = '#f44336';
                     showNotification('Download failed', 'error');
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentDownload()) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
+            } finally {
+                if (isCurrentDeviceRequest(requestContext.device, requestContext.generation)) {
+                    btnEl.disabled = false;
+                }
             }
-            
-            btnEl.disabled = false;
         }
         
         function deleteClSupport() {
-            if (!clsupportFilePath) {
+            const requestContext = getDeviceRequestContext();
+            const filePath = clsupportFilePath;
+            if (!filePath || clsupportSourceDevice !== requestContext.device) {
                 showNotification('No file to delete', 'warning');
                 return;
             }
@@ -2803,11 +4012,22 @@
             showConfirmModal(
                 'Delete cl-support Bundle',
                 'Are you sure you want to delete this cl-support bundle?',
-                executeDeleteClSupport
+                () => executeDeleteClSupport(requestContext, filePath)
             );
         }
         
-        async function executeDeleteClSupport() {
+        async function executeDeleteClSupport(
+            requestContext = getDeviceRequestContext(),
+            filePath = clsupportFilePath
+        ) {
+            if (!filePath || clsupportSourceDevice !== requestContext.device ||
+                !isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+            const operationId = ++clsupportOperationId;
+            const isCurrentOperation = () => (
+                isCurrentClSupportOperation(requestContext, operationId) &&
+                clsupportSourceDevice === requestContext.device &&
+                clsupportFilePath === filePath
+            );
             const statusEl = document.getElementById('clsupportStatus');
             statusEl.textContent = 'Deleting...';
             statusEl.style.color = '#ff9800';
@@ -2816,14 +4036,16 @@
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: `sudo rm -f "${clsupportFilePath}"`})
+                    body: JSON.stringify({device: requestContext.device, command: `sudo rm -f "${filePath}"`})
                 });
                 const data = await response.json();
+                if (!isCurrentOperation()) return false;
                 
                 if (data.success) {
                     document.getElementById('clsupportResult').style.display = 'none';
                     document.getElementById('clsupportProgress').style.display = 'none';
                     clsupportFilePath = null;
+                    clsupportSourceDevice = null;
                     
                     // Re-enable generate button
                     const btnEl = document.getElementById('btnGenerateClsupport');
@@ -2833,20 +4055,18 @@
                     statusEl.textContent = 'Deleted';
                     statusEl.style.color = '#888';
                     showNotification('cl-support bundle deleted', 'info');
+                    return true;
                 } else {
                     statusEl.textContent = 'Delete failed: ' + data.error;
                     statusEl.style.color = '#f44336';
+                    return false;
                 }
             } catch (e) {
+                if (!isCurrentOperation()) return false;
                 statusEl.textContent = 'Error: ' + e.message;
                 statusEl.style.color = '#f44336';
+                return false;
             }
-        }
-        
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
         
         function showNotification(message, type = 'info') {
@@ -2857,6 +4077,8 @@
             const notification = document.createElement('div');
             notification.className = 'notification notification-' + type;
             notification.textContent = message;
+            notification.setAttribute('role', type === 'error' ? 'alert' : 'status');
+            notification.setAttribute('aria-live', type === 'error' ? 'assertive' : 'polite');
             notification.style.cssText = 'position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 6px; z-index: 1000; font-size: 14px; animation: fadeIn 0.3s;';
             
             if (type === 'warning') {
@@ -2874,9 +4096,11 @@
             setTimeout(() => notification.remove(), 3000);
         }
         
-        async function loadBGPForVRF() {
+        async function loadBGPForVRF(requestContext = getDeviceRequestContext()) {
+            if (!requestContext.device) return false;
+            const requestId = ++bgpRequestId;
             const vrf = document.getElementById('vrfSelect').value || 'default';
-            document.getElementById('bgpContent').innerHTML = '<div class="loading">Loading BGP neighbors...</div>';
+            setElementMessage('bgpContent', 'Loading BGP neighbors...', 'loading');
             
             try {
                 let cmd;
@@ -2891,189 +4115,280 @@
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: cmd})
+                    body: JSON.stringify({device: requestContext.device, command: cmd})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== bgpRequestId) return false;
                 
                 if (data.success) {
-                    document.getElementById('bgpContent').innerHTML = `<pre style="font-size: 12px; overflow-x: auto;">${data.output}</pre>`;
+                    setPreformattedOutput('bgpContent', data.output || 'No BGP neighbors found');
                 } else {
-                    document.getElementById('bgpContent').innerHTML = `<div class="error-message">${data.error}</div>`;
+                    setElementMessage('bgpContent', data.error || 'Failed to load BGP neighbors', 'error-message');
+                    return false;
                 }
-                document.getElementById('bgpContent').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                if (document.getElementById('tab-bgp').classList.contains('active')) {
+                    document.getElementById('bgpContent').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+                return true;
             } catch (e) {
-                document.getElementById('bgpContent').innerHTML = `<div class="error-message">${e.message}</div>`;
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== bgpRequestId) return false;
+                setElementMessage('bgpContent', e.message || 'Failed to load BGP neighbors', 'error-message');
+                return false;
             }
+        }
+
+        function countValue(value) {
+            const numeric = Number(value);
+            return Number.isFinite(numeric) && numeric > 0 ? numeric : 0;
+        }
+
+        function createSummaryCard(value, label, color, title = '') {
+            const card = document.createElement('div');
+            card.className = 'summary-card';
+            if (title) card.title = title;
+            const valueElement = document.createElement('div');
+            valueElement.className = 'value';
+            valueElement.style.color = color;
+            valueElement.textContent = String(value);
+            const labelElement = document.createElement('div');
+            labelElement.className = 'label';
+            labelElement.textContent = label;
+            card.append(valueElement, labelElement);
+            return card;
         }
         
         function renderOverview(data) {
-            const optical = data.optical || [];
-            const logs = data.logs || {};
+            const optical = Array.isArray(data.optical) ? data.optical : [];
+            const opticalAvailable = Array.isArray(data.optical) &&
+                data.sources?.optical?.status !== 'unavailable';
+            const logsAvailable = data.logs !== null && typeof data.logs === 'object' &&
+                data.sources?.logs?.status !== 'unavailable';
+            const logs = logsAvailable ? data.logs : {};
             
             // Count optical health
-            const opticalHealth = {excellent: 0, good: 0, warning: 0, critical: 0};
+            const opticalHealth = {
+                excellent: 0,
+                good: 0,
+                warning: 0,
+                critical: 0,
+                down: 0,
+                unplugged: 0,
+                unknown: 0
+            };
             optical.forEach(o => {
-                if (opticalHealth[o.health] !== undefined) opticalHealth[o.health]++;
+                const health = String(o?.health || 'unknown').toLowerCase();
+                if (Object.prototype.hasOwnProperty.call(opticalHealth, health)) {
+                    opticalHealth[health] += 1;
+                } else {
+                    opticalHealth.unknown += 1;
+                }
             });
-            
-            document.getElementById('overviewCards').innerHTML = `
-                <div class="summary-card">
-                    <div class="value" style="color: #76b900">${optical.length}</div>
-                    <div class="label">Optical Ports</div>
-                </div>
-                <div class="summary-card">
-                    <div class="value" style="color: ${opticalHealth.warning + opticalHealth.critical > 0 ? '#ff9800' : '#4caf50'}">${opticalHealth.excellent + opticalHealth.good}</div>
-                    <div class="label">Optical OK</div>
-                </div>
-                <div class="summary-card">
-                    <div class="value" style="color: ${opticalHealth.warning > 0 ? '#ff9800' : '#808080'}">${opticalHealth.warning}</div>
-                    <div class="label">Optical Warning</div>
-                </div>
-                <div class="summary-card">
-                    <div class="value" style="color: ${logs.error > 0 ? '#f44336' : '#4caf50'}">${logs.error || 0}</div>
-                    <div class="label">Log Errors</div>
-                </div>
-                <div class="summary-card">
-                    <div class="value" style="color: #808080">${logs.info || 0}</div>
-                    <div class="label">Log Info</div>
-                </div>
-            `;
+
+            const opticalOk = opticalHealth.excellent + opticalHealth.good;
+            const opticalIssues = Math.max(0, optical.length - opticalOk);
+            const opticalIssueColor = opticalHealth.critical + opticalHealth.down + opticalHealth.unknown > 0
+                ? '#f44336'
+                : (opticalHealth.warning > 0 ? '#ff9800' : '#808080');
+            const logCritical = countValue(logs.critical);
+            const logErrors = countValue(logs.error);
+            const logWarnings = countValue(logs.warning);
+            const logAlerts = logCritical + logErrors + logWarnings;
+            const logInfo = countValue(logs.info);
+            const unavailableValue = 'N/A';
+
+            const cards = [
+                createSummaryCard(
+                    opticalAvailable ? optical.length : unavailableValue,
+                    'Optical Ports', '#76b900',
+                    opticalAvailable ? `${optical.length} optical records` : 'Optical snapshot unavailable'
+                ),
+                createSummaryCard(
+                    opticalAvailable ? opticalOk : unavailableValue,
+                    'Optical OK', opticalAvailable ? '#4caf50' : '#808080',
+                    `Excellent: ${opticalHealth.excellent} • Good: ${opticalHealth.good}`
+                ),
+                createSummaryCard(
+                    opticalAvailable ? opticalIssues : unavailableValue,
+                    'Optical Issues', opticalAvailable ? opticalIssueColor : '#808080',
+                    `Warning: ${opticalHealth.warning} • Critical: ${opticalHealth.critical} • Down: ${opticalHealth.down} • Unplugged: ${opticalHealth.unplugged} • Unknown: ${opticalHealth.unknown}`
+                ),
+                createSummaryCard(
+                    logsAvailable ? logAlerts : unavailableValue,
+                    'Log Alerts', logsAvailable && logAlerts > 0 ? '#f44336' : (logsAvailable ? '#4caf50' : '#808080'),
+                    logsAvailable
+                        ? `Critical: ${logCritical} • Error: ${logErrors} • Warning: ${logWarnings}`
+                        : 'Log summary unavailable'
+                ),
+                createSummaryCard(
+                    logsAvailable ? logInfo : unavailableValue,
+                    'Log Info', '#808080',
+                    logsAvailable ? `Info: ${logInfo}` : 'Log summary unavailable'
+                )
+            ];
+            document.getElementById('overviewCards').replaceChildren(...cards);
         }
-        
-        async function renderOptical(optical) {
-            // First, get interface status to find down ports
-            let downPorts = [];
-            try {
-                const response = await fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: 'nv show interface --view=brief'})
-                });
-                const data = await response.json();
-                if (data.success) {
-                    const lines = data.output.split('\n');
-                    lines.forEach(line => {
-                        // Match swp interfaces that are down
-                        const match = line.match(/^(swp\S+)\s+\S+\s+down/i);
-                        if (match) {
-                            downPorts.push(match[1]);
-                        }
-                    });
-                }
-            } catch (e) {
-                console.error('Failed to get interface status:', e);
-            }
-            
-            // Create combined list - existing optical + down ports
-            const opticalPorts = new Set(optical.map(o => o.port));
-            downPorts.forEach(port => {
-                if (!opticalPorts.has(port)) {
-                    optical.push({
-                        port: port,
-                        health: 'down',
-                        rx_power_dbm: null,
-                        tx_power_dbm: null,
-                        temperature_c: null,
-                        link_margin_db: null
-                    });
-                }
-            });
-            
-            if (optical.length === 0) {
-                document.getElementById('opticalContent').innerHTML = '<p>No optical data available</p>';
+
+        function formatMetric(value, digits) {
+            if (value === null || value === undefined ||
+                (typeof value === 'string' && value.trim() === '')) return 'N/A';
+            const numeric = Number(value);
+            return Number.isFinite(numeric) ? numeric.toFixed(digits) : 'N/A';
+        }
+
+        function renderOptical(optical) {
+            const records = Array.isArray(optical) ? [...optical] : [];
+            if (records.length === 0) {
+                setElementMessage('opticalContent', 'No optical data available');
                 return;
             }
-            
-            let html = `<table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Port</th>
-                        <th>Health</th>
-                        <th>RX Power (dBm)</th>
-                        <th>TX Power (dBm)</th>
-                        <th>Temperature (C)</th>
-                        <th>Link Margin (dB)</th>
-                    </tr>
-                </thead>
-                <tbody>`;
-            
-            // Sort by port name (natural sort)
-            optical.sort((a, b) => naturalSort(a.port, b.port));
-            
-            optical.forEach(o => {
-                const rowClass = o.health === 'down' ? 'clickable down-row' : 'clickable';
-                html += `<tr class="${rowClass}" onclick="showOpticalDetail('${o.port}')" id="optical-row-${o.port.replace(/[^a-zA-Z0-9]/g, '-')}">
-                    <td><strong>${o.port}</strong></td>
-                    <td class="status-${o.health}">${o.health}</td>
-                    <td>${o.rx_power_dbm?.toFixed(2) || 'N/A'}</td>
-                    <td>${o.tx_power_dbm?.toFixed(2) || 'N/A'}</td>
-                    <td>${o.temperature_c?.toFixed(1) || 'N/A'}</td>
-                    <td>${o.link_margin_db?.toFixed(2) || 'N/A'}</td>
-                </tr>`;
+
+            records.sort((a, b) => naturalSort(String(a?.port || ''), String(b?.port || '')));
+            const table = document.createElement('table');
+            table.className = 'data-table';
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            ['Port', 'Health', 'RX Power (dBm)', 'TX Power (dBm)', 'Temperature (C)', 'Link Margin (dB)']
+                .forEach(label => {
+                    const th = document.createElement('th');
+                    th.textContent = label;
+                    headerRow.appendChild(th);
+                });
+            thead.appendChild(headerRow);
+            const tbody = document.createElement('tbody');
+
+            records.forEach(record => {
+                const port = String(record?.port || 'Unknown');
+                const rawHealth = String(record?.health || 'unknown').toLowerCase();
+                const health = ['excellent', 'good', 'warning', 'critical', 'down', 'unplugged'].includes(rawHealth)
+                    ? rawHealth
+                    : 'unknown';
+                const row = document.createElement('tr');
+                row.className = health === 'down' ? 'clickable down-row' : 'clickable';
+                row.dataset.port = port;
+                row.tabIndex = 0;
+                row.addEventListener('click', () => showOpticalDetail(port));
+                row.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        showOpticalDetail(port);
+                    }
+                });
+
+                const portCell = document.createElement('td');
+                const strong = document.createElement('strong');
+                strong.textContent = port;
+                portCell.appendChild(strong);
+                const healthCell = document.createElement('td');
+                healthCell.className = `status-${health}`;
+                healthCell.textContent = rawHealth;
+                const values = [
+                    formatMetric(record?.rx_power_dbm, 2),
+                    formatMetric(record?.tx_power_dbm, 2),
+                    formatMetric(record?.temperature_c, 1),
+                    formatMetric(record?.link_margin_db, 2)
+                ];
+                row.append(portCell, healthCell);
+                values.forEach(value => {
+                    const cell = document.createElement('td');
+                    cell.textContent = value;
+                    row.appendChild(cell);
+                });
+                tbody.appendChild(row);
             });
-            
-            html += '</tbody></table>';
-            document.getElementById('opticalContent').innerHTML = html;
-            
-            // Port datalist is populated separately by loadPortList()
+
+            table.append(thead, tbody);
+            document.getElementById('opticalContent').replaceChildren(table);
         }
         
         async function showOpticalDetail(port) {
+            const requestContext = getDeviceRequestContext();
+            const requestId = ++opticalDetailRequestId;
             // Highlight selected row
             document.querySelectorAll('#opticalContent tr').forEach(r => r.classList.remove('selected'));
-            const rowId = 'optical-row-' + port.replace(/[^a-zA-Z0-9]/g, '-');
-            document.getElementById(rowId)?.classList.add('selected');
+            [...document.querySelectorAll('#opticalContent tbody tr')]
+                .find(row => row.dataset.port === port)?.classList.add('selected');
             
             const detailDiv = document.getElementById('opticalDetail');
             detailDiv.style.display = 'block';
-            detailDiv.innerHTML = `<div style="color: #76b900; margin-bottom: 10px;">Loading L1 diagnostics for ${port}...</div>`;
+            const loading = document.createElement('div');
+            loading.style.cssText = 'color:#76b900;margin-bottom:10px;';
+            loading.textContent = `Loading L1 diagnostics for ${port}...`;
+            detailDiv.replaceChildren(loading);
             
             try {
                 // Run l1-show for detailed info
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: `sudo l1-show ${port}`})
+                    body: JSON.stringify({device: requestContext.device, command: `sudo l1-show ${port}`})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== opticalDetailRequestId) return;
                 
                 if (data.success) {
-                    detailDiv.innerHTML = `<div style="color: #76b900; margin-bottom: 10px; font-weight: bold;">L1 Diagnostics: ${port}</div>${data.output}`;
+                    const heading = document.createElement('div');
+                    heading.style.cssText = 'color:#76b900;margin-bottom:10px;font-weight:bold;';
+                    heading.textContent = `L1 Diagnostics: ${port}`;
+                    const output = document.createElement('pre');
+                    output.style.cssText = 'margin:0;white-space:pre-wrap;font:inherit;';
+                    output.textContent = data.output || '(no output)';
+                    detailDiv.replaceChildren(heading, output);
                 } else {
-                    detailDiv.innerHTML = `<div style="color: #f44336;">Error: ${data.error}</div>`;
+                    const error = setElementMessage(detailDiv, `Error: ${data.error || 'Unknown error'}`);
+                    error.style.color = '#f44336';
                 }
                 detailDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
             } catch (e) {
-                detailDiv.innerHTML = `<div style="color: #f44336;">Failed: ${e.message}</div>`;
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== opticalDetailRequestId) return;
+                const error = setElementMessage(detailDiv, `Failed: ${e.message}`);
+                error.style.color = '#f44336';
                 detailDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
         }
         
-        function renderLogs(logs) {
-            document.getElementById('logCards').innerHTML = `
-                <div class="summary-card log-card" onclick="showLogs('critical')" id="logCardCritical">
-                    <div class="value" style="color: #f44336">${logs.critical || 0}</div>
-                    <div class="label">Critical</div>
-                </div>
-                <div class="summary-card log-card" onclick="showLogs('error')" id="logCardError">
-                    <div class="value" style="color: #ff5722">${logs.error || 0}</div>
-                    <div class="label">Error</div>
-                </div>
-                <div class="summary-card log-card" onclick="showLogs('warning')" id="logCardWarning">
-                    <div class="value" style="color: #ff9800">${logs.warning || 0}</div>
-                    <div class="label">Warning</div>
-                </div>
-                <div class="summary-card log-card" onclick="showLogs('info')" id="logCardInfo">
-                    <div class="value" style="color: #4caf50">${logs.info || 0}</div>
-                    <div class="label">Info</div>
-                </div>
-            `;
+        function renderLogs(logs, source = null) {
+            const container = document.getElementById('logCards');
+            if (!logs || typeof logs !== 'object' || source?.status === 'unavailable') {
+                setElementMessage(container, source?.reason || 'Log summary unavailable', 'error-message');
+                const output = document.getElementById('logOutput');
+                output.textContent = '';
+                output.style.display = 'none';
+                return;
+            }
+            const definitions = [
+                ['critical', 'Critical', '#f44336'],
+                ['error', 'Error', '#ff5722'],
+                ['warning', 'Warning', '#ff9800'],
+                ['info', 'Info', '#4caf50']
+            ];
+            const cards = definitions.map(([severity, label, color]) => {
+                const card = createSummaryCard(countValue(logs[severity]), label, color);
+                card.classList.add('log-card');
+                card.id = `logCard${severity.charAt(0).toUpperCase()}${severity.slice(1)}`;
+                card.tabIndex = 0;
+                card.setAttribute('role', 'button');
+                card.addEventListener('click', () => showLogs(severity));
+                card.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        showLogs(severity);
+                    }
+                });
+                return card;
+            });
+            container.replaceChildren(...cards);
         }
         
         async function showLogs(severity) {
+            const requestContext = getDeviceRequestContext();
+            const requestId = ++logRequestId;
             // Highlight selected card
             document.querySelectorAll('.log-card').forEach(c => c.classList.remove('selected'));
-            document.getElementById('logCard' + severity.charAt(0).toUpperCase() + severity.slice(1)).classList.add('selected');
+            document.getElementById('logCard' + severity.charAt(0).toUpperCase() + severity.slice(1))?.classList.add('selected');
             
             const logOutput = document.getElementById('logOutput');
             logOutput.style.display = 'block';
@@ -3092,9 +4407,11 @@
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: cmd})
+                    body: JSON.stringify({device: requestContext.device, command: cmd})
                 });
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== logRequestId) return;
                 
                 if (data.success) {
                     logOutput.textContent = data.output || 'No logs found';
@@ -3103,43 +4420,54 @@
                 }
                 logOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
             } catch (e) {
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation) ||
+                    requestId !== logRequestId) return;
                 logOutput.textContent = 'Failed to load logs: ' + e.message;
                 logOutput.scrollIntoView({ behavior: 'smooth', block: 'start' });
             }
         }
         
         function showError(message) {
-            document.getElementById('overviewCards').innerHTML = `<div class="error-message">${message}</div>`;
+            setElementMessage('overviewCards', message, 'error-message');
         }
         
         async function runCommand(cmd) {
+            const requestContext = getDeviceRequestContext();
+            if (!requestContext.device) return false;
             const outputDiv = document.getElementById('commandOutput');
             const cmdHeader = document.getElementById('cmdHeader');
             const cmdResult = document.getElementById('cmdResult');
             
             outputDiv.style.display = 'block';
             cmdHeader.textContent = `$ ${cmd}`;
+            cmdResult.style.color = '';
             cmdResult.textContent = 'Running...';
             
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({device: deviceName, command: cmd})
+                    body: JSON.stringify({device: requestContext.device, command: cmd})
                 });
                 
                 const data = await response.json();
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
                 
                 if (data.success) {
                     cmdResult.textContent = data.output || '(no output)';
                 } else {
-                    cmdResult.innerHTML = `<span style="color: #f44336">Error: ${data.error}</span>`;
+                    cmdResult.style.color = '#f44336';
+                    cmdResult.textContent = `Error: ${data.error || 'Unknown error'}`;
                 }
                 // Scroll to output
                 outputDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                return data.success;
             } catch (e) {
-                cmdResult.innerHTML = `<span style="color: #f44336">Request failed: ${e.message}</span>`;
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+                cmdResult.style.color = '#f44336';
+                cmdResult.textContent = `Request failed: ${e.message}`;
                 outputDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                return false;
             }
         }
         
@@ -3215,47 +4543,151 @@
         });
         
         function refreshAllData() {
-            // Show loading state
-            document.getElementById('overviewCards').innerHTML = '<div class="loading">Refreshing...</div>';
-            document.getElementById('portsContent').innerHTML = '<div class="loading">Refreshing...</div>';
-            document.getElementById('opticalContent').innerHTML = '<div class="loading">Refreshing...</div>';
-            document.getElementById('bgpContent').innerHTML = '<div class="loading">Refreshing...</div>';
-            
-            // Reload all data
-            loadDeviceData();
-            loadPortStatus();
-            loadVRFList();
+            if (refreshAllPromise) return refreshAllPromise;
+            if (!deviceName) return Promise.resolve(false);
+            const pendingNvt = nvtOperationPromise;
+            const operation = refreshAllDataOperation(pendingNvt);
+            refreshAllPromise = operation;
+            const clearOperation = () => {
+                if (refreshAllPromise === operation) refreshAllPromise = null;
+            };
+            operation.then(clearOperation, clearOperation);
+            return operation;
+        }
+
+        async function refreshAllDataOperation(pendingNvt) {
+            if (refreshInProgress || !deviceName) return false;
+            refreshInProgress = true;
+            const requestContext = getDeviceRequestContext();
+            const refreshNvt = Boolean(tabsLoaded.nvt || document.getElementById('tab-nvt')?.classList.contains('active'));
+            const refreshButton = document.getElementById('btnRefreshAll');
+            const nvtRefreshButton = document.getElementById('btnRefreshNvt');
+            if (refreshButton) {
+                refreshButton.disabled = true;
+                refreshButton.textContent = 'Refreshing...';
+            }
+            if (nvtRefreshButton) nvtRefreshButton.disabled = true;
+
+            setElementMessage('overviewCards', 'Refreshing...', 'loading');
+            setElementMessage('portsContent', 'Waiting for overview refresh...', 'loading');
+            setElementMessage('opticalContent', 'Refreshing...', 'loading');
+            if (refreshNvt) {
+                if (pendingNvt) {
+                    setNvtStatus('Finishing current NVT run...', 'running');
+                } else {
+                    setNvtStatus('Waiting for port refresh...', 'running');
+                    setNvtPlainOutput('Waiting for port refresh...');
+                }
+            }
+            setElementMessage('bgpContent', 'Waiting for port refresh...', 'loading');
+            updateContentSubtitle(requestContext.device, null, 'loading');
+
+            try {
+                // If NVT was already running when Refresh started, let that
+                // device command release the backend lock before continuing.
+                let pendingNvtLoaded = false;
+                if (pendingNvt) {
+                    pendingNvtLoaded = await Promise.resolve(pendingNvt).catch(() => false);
+                    if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+                }
+
+                // Keep remote commands serialized to avoid per-device command lock contention.
+                const overviewLoaded = await loadDeviceData(requestContext);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+                const portsLoaded = await loadPortStatus(requestContext);
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+                let nvtLoaded = !refreshNvt || pendingNvtLoaded;
+                if (refreshNvt && !pendingNvtLoaded) {
+                    nvtLoaded = await loadNvtOutput(requestContext, { waitForGlobalRefresh: false });
+                    if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+                }
+
+                const bgpLoaded = await loadVRFList({ loadBgp: true, requestContext });
+                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+
+                tabsLoaded.overview = overviewLoaded;
+                tabsLoaded.ports = portsLoaded;
+                if (refreshNvt) tabsLoaded.nvt = nvtLoaded;
+                tabsLoaded.bgp = bgpLoaded;
+                return overviewLoaded && portsLoaded && nvtLoaded && bgpLoaded;
+            } finally {
+                if (isCurrentDeviceRequest(requestContext.device, requestContext.generation)) {
+                    refreshInProgress = false;
+                    if (refreshButton) {
+                        refreshButton.disabled = false;
+                        refreshButton.textContent = 'Refresh';
+                    }
+                    if (nvtRefreshButton) nvtRefreshButton.disabled = false;
+                }
+            }
         }
         
         // ===== Confirm Modal Functions =====
         let confirmCallback = null;
+        let confirmPreviouslyFocused = null;
+
+        function handleConfirmModalKeydown(event) {
+            const modal = document.getElementById('confirm-modal');
+            if (!modal.classList.contains('visible')) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                closeConfirmModal();
+                return;
+            }
+            if (event.key !== 'Tab') return;
+
+            const focusable = Array.from(modal.querySelectorAll('button:not([disabled])'));
+            if (focusable.length === 0) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            const activeIndex = focusable.indexOf(document.activeElement);
+            if (event.shiftKey && (activeIndex <= 0)) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && (activeIndex === -1 || activeIndex === focusable.length - 1)) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
         
         function showConfirmModal(title, message, callback) {
             document.getElementById('confirm-modal-title').textContent = title;
             document.getElementById('confirm-modal-message').textContent = message;
             confirmCallback = callback;
-            document.getElementById('confirm-modal').classList.add('visible');
+            confirmPreviouslyFocused = document.activeElement;
+            const modal = document.getElementById('confirm-modal');
+            modal.classList.add('visible');
+            document.addEventListener('keydown', handleConfirmModalKeydown);
+            modal.querySelector('.btn-cancel')?.focus();
         }
         
         function closeConfirmModal() {
             document.getElementById('confirm-modal').classList.remove('visible');
+            document.removeEventListener('keydown', handleConfirmModalKeydown);
             confirmCallback = null;
+            const restoreTarget = confirmPreviouslyFocused;
+            confirmPreviouslyFocused = null;
+            if (restoreTarget && document.contains(restoreTarget) &&
+                typeof restoreTarget.focus === 'function' && !restoreTarget.disabled) {
+                restoreTarget.focus();
+            }
         }
         
         function executeConfirm() {
-            if (confirmCallback) {
-                confirmCallback();
-            }
+            const callback = confirmCallback;
             closeConfirmModal();
+            if (callback) callback();
         }
     </script>
     
     <!-- Confirm Modal -->
-    <div id="confirm-modal" class="confirm-modal" onclick="if(event.target === this) closeConfirmModal()">
+    <div id="confirm-modal" class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-message" onclick="if(event.target === this) closeConfirmModal()">
         <div class="confirm-modal-content">
             <div class="confirm-modal-header">
                 <h3 id="confirm-modal-title">Confirm</h3>
-                <button class="confirm-modal-close" onclick="closeConfirmModal()">&times;</button>
+                <button class="confirm-modal-close" aria-label="Close confirmation" onclick="closeConfirmModal()">&times;</button>
             </div>
             <div class="confirm-modal-body">
                 <p id="confirm-modal-message"></p>

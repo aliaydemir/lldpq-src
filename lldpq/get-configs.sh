@@ -624,7 +624,7 @@ if ! command -v timeout >/dev/null 2>&1; then
     echo "timeout is required for bounded configuration collection" >&2
     exit 1
 fi
-if [[ ! "$LLDPQ_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
+if [[ ! "$LLDPQ_USER" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*[$]?$ ]]; then
     echo "Invalid LLDPQ_USER: '$LLDPQ_USER'" >&2
     exit 1
 fi

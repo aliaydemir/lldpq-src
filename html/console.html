@@ -112,7 +112,7 @@
                 <svg viewBox="0 0 24 24"><path d="M20 13H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1v-6c0-.55-.45-1-1-1zM7 19c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zM20 3H4c-.55 0-1 .45-1 1v6c0 .55.45 1 1 1h16c.55 0 1-.45 1-1V4c0-.55-.45-1-1-1zM7 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>
                 Device Console
             </div>
-            <div class="cr-search"><input type="text" id="search" placeholder="Search devices..." autocomplete="off" oninput="renderList()"></div>
+            <div class="cr-search"><input type="text" id="search" placeholder="Search devices..." autocomplete="off" aria-label="Search devices" oninput="renderList()"></div>
             <div class="cr-list" id="list"></div>
             <div class="cr-count" id="count">Loading…</div>
         </aside>
@@ -123,15 +123,15 @@
                 <button class="hbtn" id="bcastBtn" onclick="toggleBroadcast()" title="Broadcast — type once, send to ALL open tabs"><b>B</b></button>
                 <button class="hbtn" onclick="fontStep(-1)" title="Smaller font">A−</button>
                 <button class="hbtn" onclick="fontStep(1)" title="Larger font">A+</button>
-                <button class="hbtn" onclick="openSearch()" title="Search (Ctrl+F)"><svg viewBox="0 0 24 24"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg></button>
-                <button class="hbtn" onclick="copyAll()" title="Copy buffer"><svg viewBox="0 0 24 24"><path d="M16,1H4C2.9,1 2,1.9 2,3V17H4V3H16V1M19,5H8C6.9,5 6,5.9 6,7V21C6,22.1 6.9,23 8,23H19C20.1,23 21,22.1 21,21V7C21,5.9 20.1,5 19,5M19,21H8V7H19V21Z"/></svg></button>
-                <button class="hbtn" onclick="downloadLog()" title="Download session log"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg></button>
+                <button class="hbtn" onclick="openSearch()" title="Search (Ctrl+F)" aria-label="Search terminal"><svg viewBox="0 0 24 24"><path d="M9.5,3A6.5,6.5 0 0,1 16,9.5C16,11.11 15.41,12.59 14.44,13.73L14.71,14H15.5L20.5,19L19,20.5L14,15.5V14.71L13.73,14.44C12.59,15.41 11.11,16 9.5,16A6.5,6.5 0 0,1 3,9.5A6.5,6.5 0 0,1 9.5,3M9.5,5C7,5 5,7 5,9.5C5,12 7,14 9.5,14C12,14 14,12 14,9.5C14,7 12,5 9.5,5Z"/></svg></button>
+                <button class="hbtn" onclick="copyAll()" title="Copy buffer" aria-label="Copy terminal buffer"><svg viewBox="0 0 24 24"><path d="M16,1H4C2.9,1 2,1.9 2,3V17H4V3H16V1M19,5H8C6.9,5 6,5.9 6,7V21C6,22.1 6.9,23 8,23H19C20.1,23 21,22.1 21,21V7C21,5.9 20.1,5 19,5M19,21H8V7H19V21Z"/></svg></button>
+                <button class="hbtn" onclick="downloadLog()" title="Download session log" aria-label="Download session log"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg></button>
             </div>
-            <div class="tabs" id="tabs"></div>
+            <div class="tabs" id="tabs" role="tablist" aria-label="Console sessions"></div>
             <div class="term-stack" id="stack">
                 <div class="empty-hint" id="emptyHint">Select a target on the left to open a session.</div>
                 <div class="searchbar" id="searchbar" hidden>
-                    <input type="text" id="searchInput" placeholder="Find in terminal…" onkeydown="if(event.key==='Enter'){event.shiftKey?searchPrev():searchNext()} if(event.key==='Escape')closeSearch()">
+                    <input type="text" id="searchInput" placeholder="Find in terminal…" aria-label="Find in terminal" onkeydown="if(event.key==='Enter'){event.shiftKey?searchPrev():searchNext()} if(event.key==='Escape')closeSearch()">
                     <button onclick="searchPrev()" title="Previous">↑</button>
                     <button onclick="searchNext()" title="Next">↓</button>
                     <button onclick="closeSearch()" title="Close">✕</button>
@@ -139,7 +139,7 @@
             </div>
             <div class="bcast-bar" id="bcastBar" hidden>
                 <span class="bcast-label">Broadcast →</span>
-                <input id="bcastInput" autocomplete="off" placeholder="send commands to all tabs" onkeydown="if(event.key==='Enter'){broadcastSend()} if(event.key==='Escape'){closeBroadcast()}">
+                <input id="bcastInput" autocomplete="off" placeholder="send commands to all tabs" aria-label="Broadcast command to connected sessions" onkeydown="if(event.key==='Enter'){event.preventDefault();broadcastSend()} if(event.key==='Escape'){closeBroadcast()}">
                 <button onclick="closeBroadcast()" title="Close broadcast">✕</button>
             </div>
         </main>
@@ -167,6 +167,7 @@
     let devicesByGroup = {};   // group -> [hostnames]
     let groupOrder = [];
     let allTargets = [];       // {id,label,group}
+    let inventoryLoadedSuccessfully = false;
     const collapsed = {};
     const sessions = {};       // id -> {target,label,term,fit,search,ws,paneEl,tabEl,log,connected}
     let activeId = null;
@@ -215,6 +216,7 @@
     });
 
     async function loadDevices() {
+        inventoryLoadedSuccessfully = false;
         try {
             const r = await fetch('/fabric-api.sh?action=list-devices', { cache: 'no-store' });
             const data = await r.json();
@@ -227,36 +229,82 @@
                 devicesByGroup[group] = names;
                 names.forEach(n => allTargets.push(n));
             }
+            inventoryLoadedSuccessfully = true;
             renderList();
             document.getElementById('count').textContent = `${allTargets.length} device${allTargets.length === 1 ? '' : 's'} + LLDPq host`;
         } catch (e) {
+            inventoryLoadedSuccessfully = false;
             document.getElementById('list').innerHTML = `<div style="padding:16px;color:#ef5350;">${esc(e.message)}</div>`;
             document.getElementById('count').textContent = '';
         }
     }
 
+    function makeInteractive(el, activate, role) {
+        el.setAttribute('role', role || 'button');
+        el.tabIndex = 0;
+        el.addEventListener('click', activate);
+        el.addEventListener('keydown', e => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            activate(e);
+        });
+        return el;
+    }
+
+    function makeTargetItem(className, text, target, label) {
+        const active = activeTarget() === target;
+        const item = document.createElement('div');
+        item.className = className + (active ? ' active' : '');
+        item.setAttribute('aria-current', active ? 'true' : 'false');
+        makeInteractive(item, () => openTarget(target, label));
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        const caption = document.createElement('span');
+        caption.textContent = text;
+        item.appendChild(dot);
+        item.appendChild(caption);
+        return item;
+    }
+
     function renderList() {
         const f = (document.getElementById('search').value || '').toLowerCase();
-        let html = '';
+        const fragment = document.createDocumentFragment();
         if (!f || 'lldpq host this server'.includes(f)) {
-            html += `<div class="host-item ${activeTarget()===HOST_TARGET?'active':''}" onclick="openTarget('${HOST_TARGET}','LLDPq host')">
-                        <span class="dot"></span><span>★ LLDPq (this server)</span></div>`;
+            fragment.appendChild(makeTargetItem('host-item', '★ LLDPq (this server)', HOST_TARGET, 'LLDPq host'));
         }
-        groupOrder.forEach(group => {
+        groupOrder.forEach((group, groupIndex) => {
             const names = (devicesByGroup[group] || []).filter(n => n.toLowerCase().includes(f));
             if (!names.length) return;
             // Collapsed by default; a group counts as open only if explicitly opened
             // (collapsed[group] === false). While searching, matching groups auto-expand.
             const open = f ? true : (collapsed[group] === false);
-            const isCol = open ? '' : 'collapsed';
-            html += `<div class="group-header ${isCol}" onclick="toggleGroup('${esc(group)}')"><span class="arrow">▼</span>${esc(group)} (${names.length})</div>`;
-            html += `<div class="group-devices ${isCol}" data-group="${esc(group)}">`;
+            const isCol = open ? '' : ' collapsed';
+            const groupId = `console-group-${groupIndex}`;
+
+            const header = document.createElement('div');
+            header.className = 'group-header' + isCol;
+            header.setAttribute('aria-expanded', String(open));
+            header.setAttribute('aria-controls', groupId);
+            makeInteractive(header, () => toggleGroup(group));
+            const arrow = document.createElement('span');
+            arrow.className = 'arrow';
+            arrow.textContent = '▼';
+            header.appendChild(arrow);
+            header.appendChild(document.createTextNode(`${group} (${names.length})`));
+            fragment.appendChild(header);
+
+            const groupDevices = document.createElement('div');
+            groupDevices.className = 'group-devices' + isCol;
+            groupDevices.id = groupId;
+            groupDevices.dataset.group = group;
+            groupDevices.setAttribute('aria-hidden', String(!open));
             names.forEach(n => {
-                html += `<div class="device-item ${activeTarget()===n?'active':''}" onclick="openTarget('${esc(n)}','${esc(n)}')"><span class="dot"></span><span>${esc(n)}</span></div>`;
+                groupDevices.appendChild(makeTargetItem('device-item', n, n, n));
             });
-            html += `</div>`;
+            fragment.appendChild(groupDevices);
         });
-        document.getElementById('list').innerHTML = html;
+        document.getElementById('list').replaceChildren(fragment);
     }
 
     function toggleGroup(g) { collapsed[g] = (collapsed[g] === false) ? true : false; renderList(); }
@@ -272,12 +320,15 @@
         const id = 'cs' + (++seq);
         const pane = document.createElement('div');
         pane.className = 'term-pane';
+        pane.id = id + '-panel';
+        pane.setAttribute('role', 'tabpanel');
         document.getElementById('stack').appendChild(pane);
 
         const term = new Terminal({
             fontFamily: "'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
             fontSize: fontSize, lineHeight: 1.2, cursorBlink: true, cursorStyle: 'block',
-            scrollback: 5000, allowProposedApi: true, theme: XTERM_THEME, macOptionIsMeta: true
+            scrollback: 5000, allowProposedApi: true, theme: XTERM_THEME, macOptionIsMeta: true,
+            screenReaderMode: true
         });
         const fit = new FitAddon.FitAddon();
         const search = new SearchAddon.SearchAddon();
@@ -287,7 +338,7 @@
         try { const u = new Unicode11Addon.Unicode11Addon(); term.loadAddon(u); term.unicode.activeVersion = '11'; } catch(e){}
         term.open(pane);
 
-        const sess = { id, sid, target, label, term, fit, search, ws: null, paneEl: pane, tabEl: null, log: '', connected: false };
+        const sess = { id, sid, target, label, term, fit, search, ws: null, paneEl: pane, tabEl: null, log: '', connected: false, closing: false };
         sessions[id] = sess;
 
         // copy-on-select (PuTTY/iTerm style) — bound to mouseup so the clipboard write
@@ -303,6 +354,16 @@
             return true;
         });
         pane.addEventListener('contextmenu', e => { e.preventDefault(); doPaste(sess); });
+        // Intercept ordinary Ctrl/Cmd+V as well as the explicit shortcuts above. Without
+        // this capture listener xterm's native paste handler would bypass multiline review.
+        pane.addEventListener('paste', e => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+            const txt = e.clipboardData && e.clipboardData.getData('text/plain');
+            if (typeof txt === 'string') pasteText(sess, txt);
+            else doPaste(sess);
+        }, true);
         term.onData(d => { if (sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'i', d })); });
         term.onResize(({ cols, rows }) => { if (sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'r', c: cols, r: rows })); });
 
@@ -316,10 +377,28 @@
     function buildTab(sess) {
         const tab = document.createElement('div');
         tab.className = 'tab';
-        tab.onclick = () => switchTo(sess.id);
-        tab.innerHTML = `<span class="st"></span><span class="lbl">${esc(sess.label)}</span><span class="x" title="Close">✕</span>`;
-        tab.querySelector('.x').onclick = (e) => { e.stopPropagation(); closeSession(sess.id); };
+        tab.id = sess.id + '-tab';
+        tab.setAttribute('aria-controls', sess.paneEl.id);
+        tab.setAttribute('aria-selected', 'false');
+        makeInteractive(tab, () => switchTo(sess.id), 'tab');
+
+        const status = document.createElement('span');
+        status.className = 'st';
+        status.setAttribute('aria-hidden', 'true');
+        const caption = document.createElement('span');
+        caption.className = 'lbl';
+        caption.textContent = sess.label;
+        const close = document.createElement('span');
+        close.className = 'x';
+        close.title = 'Close';
+        close.setAttribute('aria-label', `Close ${sess.label} console`);
+        makeInteractive(close, e => { e.stopPropagation(); closeSession(sess.id); });
+        close.textContent = '✕';
+        tab.appendChild(status);
+        tab.appendChild(caption);
+        tab.appendChild(close);
         document.getElementById('tabs').appendChild(tab);
+        sess.paneEl.setAttribute('aria-labelledby', tab.id);
         sess.tabEl = tab;
     }
 
@@ -332,6 +411,7 @@
             const on = sid === id;
             s.paneEl.classList.toggle('active', on);
             s.tabEl.classList.toggle('active', on);
+            s.tabEl.setAttribute('aria-selected', String(on));
         }
         const s = sessions[id];
         if (s) {
@@ -340,48 +420,114 @@
         renderList();
     }
 
-    function connect(sess) {
-        clearReconnect(sess);
+    function sendTerminalSize(sess) {
+        if (!sess || !sess.ws || sess.ws.readyState !== WebSocket.OPEN) return;
+        const cols = Number(sess.term.cols);
+        const rows = Number(sess.term.rows);
+        if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
+        sess.ws.send(JSON.stringify({ t: 'r', c: cols, r: rows }));
+    }
+
+    function connect(sess, options) {
+        options = options || {};
         const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`);
+        let ws;
+        try {
+            ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`);
+        } catch (e) {
+            const detail = 'unable to start the console connection';
+            sess.connected = false;
+            sess.tabEl.classList.remove('connected'); sess.tabEl.classList.add('closed');
+            showReconnect(sess, detail);
+            return;
+        }
         ws.binaryType = 'arraybuffer';
         sess.ws = ws;
         const dec = new TextDecoder('utf-8', { fatal: false });
         ws.onopen = () => {
+            if (sess.ws !== ws || sess.closing) return;
+            if (options.resetOnOpen) {
+                try { sess.term.reset(); } catch (e) { try { sess.term.clear(); } catch (_) {} }
+                sess.log = '';
+            }
             sess.connected = true;
             sess.tabEl.classList.add('connected'); sess.tabEl.classList.remove('closed');
             snug(sess);
+            // FitAddon only emits onResize when dimensions changed. Explicitly send the
+            // fitted size so a newly opened socket never remains at the bridge's 80x24.
+            sendTerminalSize(sess);
+            clearReconnect(sess);
             sess.term.focus();
         };
         ws.onmessage = (e) => {
+            if (sess.ws !== ws || sess.closing) return;
             let text;
             if (typeof e.data === 'string') { text = e.data; sess.term.write(text); }
             else { const u = new Uint8Array(e.data); text = dec.decode(u, { stream: true }); sess.term.write(u); }
-            sess.log += text;
+            sess.log += text.replace(/\0/g, '');
             if (sess.log.length > 4000000) sess.log = sess.log.slice(-3000000);
         };
-        ws.onclose = () => {
+        ws.onclose = event => {
+            if (sess.ws !== ws || sess.closing) return;
             sess.connected = false;
             sess.tabEl.classList.remove('connected'); sess.tabEl.classList.add('closed');
-            sess.term.write('\r\n\x1b[90m• disconnected\x1b[0m\r\n');
-            showReconnect(sess);
+            const detail = closeDescription(event);
+            sess.term.write(`\r\n\x1b[90m• ${detail}\x1b[0m\r\n`);
+            showReconnect(sess, detail);
         };
         ws.onerror = () => { try { ws.close(); } catch(e){} };
     }
 
-    function showReconnect(sess) {
-        if (sess.paneEl.querySelector('.reconnect')) return;
-        const box = document.createElement('div');
-        box.className = 'reconnect';
-        box.innerHTML = `<div>Session to <b>${esc(sess.label)}</b> closed.</div><button>Reconnect</button>`;
-        box.querySelector('button').onclick = () => { clearReconnect(sess); sess.term.clear(); connect(sess); };
-        sess.paneEl.appendChild(box);
+    function closeDescription(event) {
+        const reason = String((event && event.reason) || '').replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').trim().slice(0, 160);
+        if (reason) return `disconnected: ${reason}`;
+        const code = event && Number(event.code);
+        const descriptions = {
+            1000: 'session closed normally',
+            1001: 'connection closed because the endpoint went away',
+            1005: 'connection closed without a status',
+            1006: 'connection lost unexpectedly',
+            1008: 'connection rejected by the server',
+            1011: 'console service encountered an error',
+            1012: 'console service is restarting',
+            1013: 'console service is temporarily unavailable'
+        };
+        return descriptions[code] || (code ? `connection closed (code ${code})` : 'disconnected');
+    }
+
+    function showReconnect(sess, detail) {
+        let box = sess.paneEl.querySelector('.reconnect');
+        if (!box) {
+            box = document.createElement('div');
+            box.className = 'reconnect';
+            const message = document.createElement('div');
+            message.className = 'reconnect-message';
+            const button = document.createElement('button');
+            button.textContent = 'Reconnect';
+            button.addEventListener('click', () => {
+                button.disabled = true;
+                connect(sess, { resetOnOpen: true });
+            });
+            box.appendChild(message);
+            box.appendChild(button);
+            sess.paneEl.appendChild(box);
+        }
+        const message = box.querySelector('.reconnect-message');
+        message.replaceChildren(document.createTextNode('Session to '));
+        const label = document.createElement('b');
+        label.textContent = sess.label;
+        message.appendChild(label);
+        message.appendChild(document.createTextNode(` ${detail || 'disconnected'}.`));
+        const button = box.querySelector('button');
+        button.disabled = false;
+        button.textContent = 'Reconnect';
     }
     function clearReconnect(sess) { const b = sess.paneEl.querySelector('.reconnect'); if (b) b.remove(); }
 
     function closeSession(id) {
         const s = sessions[id];
         if (!s) return;
+        s.closing = true;
         // Explicit close → tell the bridge to kill the PTY (navigation-away does NOT send this,
         // so those sessions stay alive for reattach).
         try { if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'end' })); } catch(e){}
@@ -399,11 +545,48 @@
         renderList();
     }
 
+    function pasteText(sess, txt) {
+        if (!txt) return;
+        const paste = () => {
+            if (!sess.ws || sess.ws.readyState !== WebSocket.OPEN) {
+                showToast('Paste skipped because this console is disconnected.', 'warning');
+                return;
+            }
+            // xterm's paste API normalizes newlines and applies bracketed-paste mode
+            // before emitting through the existing onData transport.
+            sess.term.paste(txt);
+        };
+        if (/[\r\n]/.test(txt)) {
+            const lines = txt.split(/\r\n|\r|\n/).length;
+            requestConfirmation(
+                'Paste multiple lines',
+                `Paste ${lines} lines into this console? Newlines may execute commands immediately.`,
+                paste,
+                { confirmText: 'Paste', danger: false }
+            );
+        } else {
+            paste();
+        }
+    }
+
     async function doPaste(sess) {
         try {
-            const txt = await navigator.clipboard.readText();
-            if (txt && sess.ws && sess.ws.readyState === 1) sess.ws.send(JSON.stringify({ t: 'i', d: txt }));
-        } catch (e) {}
+            pasteText(sess, await navigator.clipboard.readText());
+        } catch (e) {
+            showToast('Clipboard access was denied. Allow clipboard access and try again.', 'error');
+        }
+    }
+
+    function showToast(message, type) {
+        if (typeof window.lldpqToast === 'function') window.lldpqToast(message, type || 'info');
+    }
+
+    function requestConfirmation(title, message, onConfirm, options) {
+        if (typeof window.lldpqConfirm === 'function') {
+            window.lldpqConfirm(title, esc(message), onConfirm, options || {});
+            return;
+        }
+        if (window.confirm(`${title}\n\n${message}`)) onConfirm();
     }
 
     // Robust copy: async clipboard when allowed, execCommand fallback (http / blocked).
@@ -457,7 +640,7 @@
     }
     function downloadLog() {
         const s = sessions[activeId]; if (!s) return;
-        const blob = new Blob([s.log.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')], { type: 'text/plain' });
+        const blob = new Blob([s.log.replace(/\0/g, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')], { type: 'text/plain' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `console-${s.label.replace(/[^a-z0-9]+/gi, '_')}-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'')}.log`;
@@ -478,9 +661,38 @@
         } catch (e) {}
     }
     function restoreTabs() {
-        let tabs = [];
-        try { tabs = JSON.parse(sessionStorage.getItem('lldpq_console_tabs') || '[]'); } catch (e) {}
-        tabs.forEach(t => { if (t && t.sid && t.target) openTarget(t.target, t.label || t.target, t.sid); });
+        let tabs;
+        try { tabs = JSON.parse(sessionStorage.getItem('lldpq_console_tabs') || '[]'); } catch (e) { tabs = null; }
+        if (!Array.isArray(tabs)) {
+            try { sessionStorage.removeItem('lldpq_console_tabs'); } catch (e) {}
+            return;
+        }
+        const seenSids = new Set();
+        const seenTargets = new Set();
+        const valid = [];
+        for (const t of tabs) {
+            if (!t || typeof t !== 'object' || Array.isArray(t)) continue;
+            if (typeof t.sid !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(t.sid)) continue;
+            if (typeof t.target !== 'string' || t.target.length < 1 || t.target.length > 255 || /[\x00-\x1f\x7f]/.test(t.target)) continue;
+            if (Object.prototype.hasOwnProperty.call(t, 'label') &&
+                (typeof t.label !== 'string' || t.label.length > 255 || /[\x00-\x1f\x7f]/.test(t.label))) continue;
+
+            let target = t.target;
+            if (target !== HOST_TARGET && inventoryLoadedSuccessfully) {
+                const lower = target.toLowerCase();
+                target = allTargets.find(candidate => candidate.toLowerCase() === lower) || null;
+                if (!target) continue;
+            }
+            const targetKey = target === HOST_TARGET ? HOST_TARGET : target.toLowerCase();
+            if (seenSids.has(t.sid) || seenTargets.has(targetKey)) continue;
+            seenSids.add(t.sid); seenTargets.add(targetKey);
+            valid.push({ sid: t.sid, target, label: target === HOST_TARGET ? 'LLDPq host' : target });
+            if (valid.length >= 128) break;
+        }
+        if (JSON.stringify(valid) !== JSON.stringify(tabs)) {
+            try { sessionStorage.setItem('lldpq_console_tabs', JSON.stringify(valid)); } catch (e) {}
+        }
+        valid.forEach(t => openTarget(t.target, t.target === HOST_TARGET ? 'LLDPq host' : t.target, t.sid));
     }
 
     // ---------------- broadcast (type once → all open tabs) ----------------
@@ -517,12 +729,27 @@
     function broadcastSend() {
         const inp = document.getElementById('bcastInput');
         const cmd = inp.value;
-        if (!cmd) return;
-        for (const id in sessions) {
-            const s = sessions[id];
-            if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'i', d: cmd + '\n' }));
+        const all = Object.values(sessions);
+        const connected = all.filter(s => s.ws && s.ws.readyState === WebSocket.OPEN);
+        if (!connected.length) {
+            showToast('Broadcast skipped because no console sessions are connected.', 'warning');
+            return;
         }
-        inp.value = '';   // placeholder stays "send commands to all tabs"
+        const send = () => {
+            let sent = 0;
+            connected.forEach(s => {
+                if (s.ws && s.ws.readyState === WebSocket.OPEN) {
+                    try {
+                        s.ws.send(JSON.stringify({ t: 'i', d: cmd + '\r' }));
+                        sent += 1;
+                    } catch (e) {}
+                }
+            });
+            const nowSkipped = all.length - sent;
+            if (nowSkipped) showToast(`Broadcast skipped ${nowSkipped} disconnected target${nowSkipped === 1 ? '' : 's'}.`, 'warning');
+            if (sent) inp.value = '';   // placeholder stays "send commands to all tabs"
+        };
+        send();
     }
 
     function esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }

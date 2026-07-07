@@ -1120,18 +1120,18 @@ class LogAnalyzer:
             `;
             
             try {
-                const baseline = typeof window.lldpqCapturePipelineState === 'function'
-                    ? await window.lldpqCapturePipelineState()
+                const baseline = typeof window.lldpqCaptureAnalysisState === 'function'
+                    ? await window.lldpqCaptureAnalysisState('logs')
                     : null;
 
-                const response = await fetch('/trigger-monitor', {
+                const response = await fetch('/trigger-monitor?scope=logs', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     }
                 });
                 const data = await response.json();
-                if (!response.ok || data.status !== 'success') {
+                if (!response.ok || data.status !== 'success' || !data.trigger_id || data.scope !== 'logs') {
                     throw new Error(data.message || `HTTP ${response.status}`);
                 }
 
@@ -1155,7 +1155,7 @@ class LogAnalyzer:
                     typeof window.waitForLldpqAnalysisCompletion === 'function';
                 notification.innerHTML = `
                         <strong>Monitor Analysis Started</strong><br>
-                        The full system analysis is running in the background.<br>
+                        The logs analysis is running in the background.<br>
                         <small>${completionHelperAvailable
                             ? 'Page will refresh when the latest results are ready.'
                             : 'Page will automatically refresh in 35 seconds.'}</small>
@@ -1169,7 +1169,8 @@ class LogAnalyzer:
                     return;
                 }
 
-                await window.waitForLldpqAnalysisCompletion(baseline);
+                await window.waitForLldpqAnalysisCompletion(
+                    baseline, { scope: 'logs', pipelineId: data.trigger_id });
                 window.location.reload();
             } catch (error) {
                 console.error('❌ Analysis did not complete:', error);
@@ -1294,7 +1295,7 @@ class LogAnalyzer:
         }
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/analysis-guard.js"></script>
+    <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""
         

@@ -451,7 +451,10 @@
 </head>
 <body>
     <div class="toolbar">
-        <button onclick="runLLDPCheck()" id="runLLDPCheck">▶ Run LLDPq</button>
+        <button onclick="runLLDPCheck()" id="runLLDPCheck">
+            <span aria-hidden="true">▶</span>
+            <span id="runLLDPCheckText">Run LLDPq</span>
+        </button>
         <button onclick="openConfigEditor()" id="btn-edit-order" style="display: none;">⚙ Edit Order</button>
         <button onclick="location.reload()">↻ Refresh</button>
         <button onclick="setLayout('dagre-lr')" id="btn-hlr">→ Horizontal</button>

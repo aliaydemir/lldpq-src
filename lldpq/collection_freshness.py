@@ -6,6 +6,7 @@ import re
 import time
 import tempfile
 import html
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
@@ -21,6 +22,16 @@ ASSET_HEADER = (
 CREATED_PATTERN = re.compile(
     r"^Created on (\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})$"
 )
+
+
+def _nonnegative_environment_number(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(value, 0.0)
 
 
 class AssetStatusMap(dict):
@@ -124,13 +135,9 @@ def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float
     if created_at is None or header_index is None:
         return AssetStatusMap(), snapshot_mtime, True
 
-    try:
-        timestamp_tolerance = max(
-            float(os.environ.get("ASSET_TIMESTAMP_TOLERANCE_SECONDS", "120")),
-            0.0,
-        )
-    except ValueError:
-        timestamp_tolerance = 120.0
+    timestamp_tolerance = _nonnegative_environment_number(
+        "ASSET_TIMESTAMP_TOLERANCE_SECONDS", 120.0
+    )
     now = time.time()
     if (
         abs(snapshot_mtime - created_at) > timestamp_tolerance
@@ -181,11 +188,10 @@ def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float
 
 
 def max_data_age_seconds() -> float:
-    try:
-        minutes = float(os.environ.get("MONITOR_DATA_MAX_AGE_MINUTES", "30"))
-    except ValueError:
-        minutes = 30.0
-    return max(minutes, 0.0) * 60.0
+    minutes = _nonnegative_environment_number(
+        "MONITOR_DATA_MAX_AGE_MINUTES", 30.0
+    )
+    return minutes * 60.0
 
 
 def is_current_collection(

@@ -1,10 +1,16 @@
 # LLDPq Docker Compose
 # Usage: docker compose up -d
 #
-# All 3 config files (devices.yaml, topology.dot, topology_config.yaml) come with
+# Core config files (including devices/tracking/topology) come with
 # example data baked into the image. Override with volume mounts if needed.
 #
-# SSH keys persist in a named volume across container recreation.
+# SSH keys, Provision inventory/cache and job state persist in named volumes
+# across container recreation.
+#
+# This default stack intentionally uses Docker bridge networking and is meant
+# for monitoring. DHCP is runtime-blocked in this mode because L2 broadcasts
+# cannot reach the physical provisioning network. For DHCP/ONIE provisioning
+# on a Linux Docker host, use docker-compose.provisioning.yml instead.
 
 services:
   lldpq:
@@ -20,8 +26,9 @@ services:
       # Recommended: manage ALL config from ONE directory (single mount).
       # On first run the files self-seed from the baked-in defaults; afterwards
       # they persist on the host and are editable (UI or directly). Includes:
-      # devices.yaml, topology.dot, topology_config.yaml, notifications.yaml,
-      # lldpq-users.conf, cumulus-ztp.sh, serial mapping and display aliases.
+      # devices.yaml, tracking.yaml, inventory.json, topology.dot, topology_config.yaml,
+      # notifications.yaml, lldpq-users.conf, cumulus-ztp.sh, serial mapping
+      # and display aliases.
       - lldpq-app-config:/home/lldpq/lldpq/config
 
       # Runtime settings + DHCP configuration persist here without mounting
@@ -53,6 +60,10 @@ services:
       - lldpq-alert-state:/home/lldpq/lldpq/alert-states
       - lldpq-lldp-jobs:/var/lib/lldpq/lldp-jobs
       - lldpq-assets-jobs:/var/lib/lldpq/assets-jobs
+      - lldpq-upgrade-jobs:/var/lib/lldpq/upgrade-jobs
+      - lldpq-ai-state:/var/lib/lldpq/ai
+      - lldpq-provision-jobs:/var/lib/lldpq/provision-jobs
+      - lldpq-provision-state:/var/lib/lldpq/provision-state
       - lldpq-dhcp-state:/var/lib/dhcp
       - lldpq-configs:/var/www/html/configs
       - lldpq-hstr:/var/www/html/hstr
@@ -61,6 +72,11 @@ services:
     restart: unless-stopped
     environment:
       - TZ=${TZ:-UTC}
+      # Bridge-network containers cannot serve DHCP to the physical L2.
+      # The entrypoint enforces this even if a persisted UI preference is running.
+      - LLDPQ_DHCP_MODE=disabled
+      # First-container seed only; monitoring mode always remains stopped.
+      - DHCP_AUTOSTART=false
       # Uncomment if mounting Ansible directory:
       # - ANSIBLE_DIR=/home/lldpq/ansible
 
@@ -70,6 +86,10 @@ volumes:
   lldpq-alert-state: # Alert deduplication/history state
   lldpq-lldp-jobs: # Refresh-LLDP request lifecycle state
   lldpq-assets-jobs: # Refresh-Assets request lifecycle state
+  lldpq-upgrade-jobs: # Provision multi-device upgrade lifecycle state
+  lldpq-ai-state: # Private Ask-AI memory, analysis and change snapshots
+  lldpq-provision-jobs: # Provision discovery/post-provision job lifecycle state
+  lldpq-provision-state: # Provision discovery cache, DHCP preference and scheduler state
   lldpq-dhcp-state: # DHCP lease database
   lldpq-configs:   # Device configurations
   lldpq-hstr:      # Historical data

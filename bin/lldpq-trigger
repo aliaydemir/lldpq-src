@@ -22,7 +22,7 @@ eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
     trigger_fatal "runtime configuration could not be applied"
 unset LLDPQ_CONFIG_ASSIGNMENTS
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
-MONITOR_TRIGGER_FILE="/tmp/.monitor_web_trigger"
+MONITOR_TRIGGER_FILE="${LLDPQ_MONITOR_TRIGGER_FILE:-/tmp/.monitor_web_trigger}"
 CONFIGS_TRIGGER_FILE="/tmp/.configs_web_trigger"
 TRANSCEIVER_TRIGGER_FILE="/tmp/.transceiver_web_trigger"
 DAEMON_PID_FILE="${LLDPQ_TRIGGER_DAEMON_PID_FILE:-/tmp/lldp_trigger_daemon.pid}"
@@ -96,6 +96,43 @@ read_trigger_timestamp() {
     fi
     [[ "$value" =~ ^[0-9]+([.:-][0-9]+)*$ ]] || value=0
     printf '%s\n' "$value"
+}
+
+monitor_scope_valid() {
+    case "${1-}" in
+        all|bgp|duplicate|flap|optical|ber|pfc-ecn|hardware|logs) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Decode the optional numeric scope suffix emitted by trigger-monitor.sh.
+# Legacy opaque tokens have no 7246 sentinel and remain full-run requests.
+read_monitor_trigger_request() {
+    local source_file=$1 token="" extra="" scope_code
+    MONITOR_REQUEST_TOKEN=0
+    MONITOR_REQUEST_SCOPE=all
+    [[ -f "$source_file" ]] || return 1
+    IFS=' ' read -r token extra < "$source_file" || return 1
+    [[ -z "$extra" ]] || return 1
+    [[ "$token" =~ ^[0-9]+([.:-][0-9]+)*$ ]] || return 1
+
+    if [[ "$token" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.7246\.([0-9]+)$ ]]; then
+        scope_code=${BASH_REMATCH[1]}
+        case "$scope_code" in
+            0) MONITOR_REQUEST_SCOPE=all ;;
+            1) MONITOR_REQUEST_SCOPE=bgp ;;
+            2) MONITOR_REQUEST_SCOPE=duplicate ;;
+            3) MONITOR_REQUEST_SCOPE=flap ;;
+            4) MONITOR_REQUEST_SCOPE=optical ;;
+            5) MONITOR_REQUEST_SCOPE=ber ;;
+            6) MONITOR_REQUEST_SCOPE=pfc-ecn ;;
+            7) MONITOR_REQUEST_SCOPE=hardware ;;
+            8) MONITOR_REQUEST_SCOPE=logs ;;
+            *) return 1 ;;
+        esac
+    fi
+    MONITOR_REQUEST_TOKEN=$token
+    return 0
 }
 
 lldp_job_valid_token() {
@@ -264,8 +301,35 @@ cleanup_assets_job_statuses() {
 TRIGGER_REPORT_DIR="$LLDPQ_DIR/monitor-results"
 TRIGGER_STALE_MARKER="$TRIGGER_REPORT_DIR/.lldpq-stale"
 
+publish_trigger_web_marker() {
+    local source_marker=$1
+    local web_dir="$WEB_ROOT/monitor-results"
+    local web_marker="$web_dir/.lldpq-stale"
+    local web_temporary=""
+
+    [[ -d "$web_dir" ]] || return 0
+
+    if [[ -e "$web_marker" || -L "$web_marker" ]] && \
+       [[ "$source_marker" -ef "$web_marker" ]]; then
+        sudo chown "$LLDPQ_USER:www-data" "$source_marker" 2>/dev/null && \
+            sudo chmod 0640 "$source_marker" 2>/dev/null
+        return $?
+    fi
+
+    web_temporary=$(sudo mktemp "$web_dir/.lldpq-stale.tmp.XXXXXXXX" 2>/dev/null) || \
+        return 1
+    if ! sudo cp -- "$source_marker" "$web_temporary" 2>/dev/null || \
+       ! sudo chown "$LLDPQ_USER:www-data" "$web_temporary" 2>/dev/null || \
+       ! sudo chmod 0640 "$web_temporary" 2>/dev/null || \
+       ! sudo mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
+        sudo rm -f -- "$web_temporary" 2>/dev/null || true
+        return 1
+    fi
+    return 0
+}
+
 write_trigger_report_marker() {
-    local marker_status=$1 reason=$2 timestamp temporary web_marker
+    local marker_status=$1 reason=$2 timestamp temporary
     mkdir -p "$TRIGGER_REPORT_DIR" || return 1
     timestamp=$(date -Is) || return 1
     temporary=$(mktemp "$TRIGGER_REPORT_DIR/.lldpq-stale.tmp.XXXXXXXX") || return 1
@@ -273,19 +337,14 @@ write_trigger_report_marker() {
         printf 'status=%s\n' "$marker_status"
         printf 'timestamp=%s\n' "$timestamp"
         printf 'reason=%s\n' "$reason"
+        printf 'pipeline_id=%s\n' "${LLDPQ_PIPELINE_ID:-}"
     } > "$temporary" || ! chmod 0644 "$temporary" || \
        ! mv -f "$temporary" "$TRIGGER_STALE_MARKER"; then
         rm -f "$temporary"
         return 1
     fi
 
-    if [[ -d "$WEB_ROOT/monitor-results" ]]; then
-        web_marker="$WEB_ROOT/monitor-results/.lldpq-stale"
-        if [[ ! -e "$web_marker" || ! "$TRIGGER_STALE_MARKER" -ef "$web_marker" ]]; then
-            sudo cp "$TRIGGER_STALE_MARKER" "$web_marker" 2>/dev/null || return 1
-        fi
-    fi
-    return 0
+    publish_trigger_web_marker "$TRIGGER_STALE_MARKER"
 }
 
 mark_trigger_reports_stale() {
@@ -293,6 +352,54 @@ mark_trigger_reports_stale() {
     write_trigger_report_marker stale "$reason" || return 1
     timestamp=$(date -Is) || timestamp=unknown
     printf '%s %s\n' "$timestamp" "$reason" >> "$LLDPQ_DIR/monitor-failures.log" || true
+}
+
+write_scoped_trigger_state() {
+    local scope=$1 state=$2 reason=$3 pipeline_id=$4
+    local state_dir marker temporary timestamp web_dir web_marker web_temporary
+    monitor_scope_valid "$scope" || return 1
+    [[ "$scope" != "all" ]] || return 1
+    case "$state" in collecting|current|stale) ;; *) return 1 ;; esac
+    [[ "$pipeline_id" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]] || return 1
+    reason=${reason//$'\n'/ }
+    reason=${reason//$'\r'/ }
+    timestamp=$(date -Is) || return 1
+    state_dir="$TRIGGER_REPORT_DIR/.analysis-state"
+    marker="$state_dir/${scope}.status"
+    mkdir -p "$state_dir" || return 1
+    temporary=$(mktemp "$state_dir/.${scope}.status.tmp.XXXXXXXX") || return 1
+    if ! {
+        printf 'status=%s\n' "$state"
+        printf 'timestamp=%s\n' "$timestamp"
+        printf 'reason=%s\n' "$reason"
+        printf 'scope=%s\n' "$scope"
+        printf 'pipeline_id=%s\n' "$pipeline_id"
+    } > "$temporary" || ! chmod 0644 "$temporary" ||
+       ! mv -f "$temporary" "$marker"; then
+        rm -f "$temporary" 2>/dev/null || true
+        return 1
+    fi
+
+    web_dir="$WEB_ROOT/monitor-results/.analysis-state"
+    [[ -d "$WEB_ROOT/monitor-results" ]] || return 0
+    sudo mkdir -p "$web_dir" 2>/dev/null || return 1
+    web_marker="$web_dir/${scope}.status"
+    if [[ -e "$web_marker" || -L "$web_marker" ]] &&
+       [[ "$marker" -ef "$web_marker" ]]; then
+        sudo chown "$LLDPQ_USER:www-data" "$marker" 2>/dev/null &&
+            sudo chmod 0640 "$marker" 2>/dev/null
+        return $?
+    fi
+    web_temporary=$(sudo mktemp \
+        "$web_dir/.${scope}.status.tmp.XXXXXXXX" 2>/dev/null) || return 1
+    if ! sudo cp -- "$marker" "$web_temporary" 2>/dev/null ||
+       ! sudo chown "$LLDPQ_USER:www-data" "$web_temporary" 2>/dev/null ||
+       ! sudo chmod 0640 "$web_temporary" 2>/dev/null ||
+       ! sudo mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
+        sudo rm -f "$web_temporary" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 if [[ "${LLDPQ_TRIGGER_LIB_ONLY:-false}" == "true" ]]; then
@@ -633,7 +740,8 @@ process_assets_jobs() {
 }
 
 refresh_monitor() (
-    local report_state=collecting status
+    local requested_pipeline_id=${1-} requested_scope=${2:-all}
+    local report_state=idle status scope_marker scope_reason
 
     trigger_monitor_exit_guard() {
         local exit_status=$?
@@ -647,8 +755,56 @@ refresh_monitor() (
     trap trigger_monitor_exit_guard EXIT
 
     cd "$LLDPQ_DIR" || return 1
-    export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+    if [[ ! "$requested_pipeline_id" =~ ^[A-Za-z0-9_.:-]{1,128}$ ]]; then
+        if [[ "$requested_scope" == "all" ]]; then
+            mark_trigger_reports_stale "invalid web analysis request identity" || true
+            report_state=stale
+        fi
+        return 1
+    fi
+    monitor_scope_valid "$requested_scope" || return 1
+    export LLDPQ_PIPELINE_ID="$requested_pipeline_id"
     export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
+
+    if [[ "$requested_scope" != "all" ]]; then
+        report_state=scoped
+        LLDPQ_MONITOR_LOCK_HELD=1 ./monitor.sh --only "$requested_scope" \
+            >/dev/null 2>&1
+        status=$?
+        if [[ $status -ne 0 ]]; then
+            scope_marker="$TRIGGER_REPORT_DIR/.analysis-state/${requested_scope}.status"
+            scope_reason="scoped analysis failed with status $status"
+            if [[ "$(lldp_job_field "$scope_marker" pipeline_id)" == \
+                      "$requested_pipeline_id" &&
+                  "$(lldp_job_field "$scope_marker" status)" == "stale" ]]; then
+                scope_reason=$(lldp_job_field "$scope_marker" reason)
+                [[ -n "$scope_reason" ]] || \
+                    scope_reason="scoped analysis failed with status $status"
+            fi
+            # Always republish the terminal state. monitor.sh deliberately
+            # preserves its local stale marker if web publication fails.
+            write_scoped_trigger_state "$requested_scope" stale \
+                "$scope_reason" "$requested_pipeline_id" || true
+            return "$status"
+        fi
+
+        scope_marker="$TRIGGER_REPORT_DIR/.analysis-state/${requested_scope}.status"
+        if [[ "$(lldp_job_field "$scope_marker" status)" != "current" ||
+              "$(lldp_job_field "$scope_marker" scope)" != "$requested_scope" ||
+              "$(lldp_job_field "$scope_marker" pipeline_id)" != \
+                  "$requested_pipeline_id" ]]; then
+            printf 'lldpq-trigger: scoped monitor returned success without matching completion state: %s\n' \
+                "$requested_scope" >&2
+            write_scoped_trigger_state "$requested_scope" stale \
+                "scoped analysis completed without matching report state" \
+                "$requested_pipeline_id" || true
+            return 1
+        fi
+        report_state=current
+        return 0
+    fi
+
+    report_state=collecting
     if ! write_trigger_report_marker collecting web_analysis_collection_in_progress; then
         mark_trigger_reports_stale \
             "could not mark web analysis reports as in-progress" || true
@@ -713,10 +869,11 @@ refresh_transceiver() {
 }
 
 # Main daemon loop - check every 5 seconds
-MONITOR_LAST_CHECK_FILE="$LLDPQ_DIR/.last_monitor_trigger_check"
+MONITOR_LAST_CHECK_FILE="${LLDPQ_MONITOR_LAST_CHECK_FILE:-$LLDPQ_DIR/.last_monitor_trigger_check}"
 CONFIGS_LAST_CHECK_FILE="$LLDPQ_DIR/.last_configs_trigger_check"
 TRANSCEIVER_LAST_CHECK_FILE="$LLDPQ_DIR/.last_transceiver_trigger_check"
 MONITOR_PENDING_TRIGGER_TIME=0
+MONITOR_PENDING_SCOPE=all
 MONITOR_NEXT_RETRY_AT=0
 MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
 CONFIGS_PENDING_TRIGGER_TIME=0
@@ -740,20 +897,29 @@ while true; do
     MONITOR_LAST_CHECK=$(read_trigger_timestamp "$MONITOR_LAST_CHECK_FILE")
 
     if [ -f "$MONITOR_TRIGGER_FILE" ]; then
-        MONITOR_TRIGGER_TIME=$(read_trigger_timestamp "$MONITOR_TRIGGER_FILE")
+        if read_monitor_trigger_request "$MONITOR_TRIGGER_FILE"; then
+            MONITOR_TRIGGER_TIME=$MONITOR_REQUEST_TOKEN
+            MONITOR_TRIGGER_SCOPE=$MONITOR_REQUEST_SCOPE
+        else
+            MONITOR_TRIGGER_TIME=0
+            MONITOR_TRIGGER_SCOPE=all
+        fi
         
         if [[ "$MONITOR_TRIGGER_TIME" != "0" && "$MONITOR_TRIGGER_TIME" != "$MONITOR_LAST_CHECK" ]]; then
             if [ "$MONITOR_PENDING_TRIGGER_TIME" != "$MONITOR_TRIGGER_TIME" ]; then
                 MONITOR_PENDING_TRIGGER_TIME="$MONITOR_TRIGGER_TIME"
+                MONITOR_PENDING_SCOPE="$MONITOR_TRIGGER_SCOPE"
                 MONITOR_NEXT_RETRY_AT=0
                 MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
             fi
             MONITOR_NOW=$(date +%s)
             if (( MONITOR_NOW < MONITOR_NEXT_RETRY_AT )); then
                 : # Pending; bounded retry window has not elapsed yet
-            elif run_under_monitor_lock refresh_monitor && \
+            elif run_under_monitor_lock refresh_monitor \
+                    "$MONITOR_PENDING_TRIGGER_TIME" "$MONITOR_PENDING_SCOPE" && \
                  write_trigger_timestamp "$MONITOR_LAST_CHECK_FILE" "$MONITOR_TRIGGER_TIME"; then
                 MONITOR_PENDING_TRIGGER_TIME=0
+                MONITOR_PENDING_SCOPE=all
                 MONITOR_NEXT_RETRY_AT=0
                 MONITOR_RETRY_DELAY="$TRIGGER_RETRY_BASE_SECONDS"
             else

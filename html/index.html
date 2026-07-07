@@ -411,6 +411,134 @@
             box-shadow: 0 4px 12px rgba(0,0,0,0.3);
             transform: translateY(-2px);
         }
+
+        /* Admin navigation is fail-closed: reveal it only after the
+           authenticated role and optional Ansible capability are known. */
+        .admin-only-menu,
+        #ansible-menu {
+            display: none !important;
+        }
+
+        body.lldpq-admin .admin-only-menu {
+            display: flex !important;
+        }
+
+        body.lldpq-admin.lldpq-ansible-enabled #ansible-menu {
+            display: block !important;
+        }
+
+        .tracking-view-trigger {
+            width: 100%;
+            min-height: 38px;
+            margin: 8px 0 16px;
+            padding: 7px 10px;
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            color: #d4d4d4;
+            background: rgba(0, 0, 0, 0.13);
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 6px;
+            cursor: pointer;
+            text-align: left;
+        }
+
+        .tracking-view-trigger:hover,
+        .tracking-view-trigger:focus-visible {
+            border-color: #76b900;
+            background: #30342c;
+            outline: none;
+        }
+
+        .tracking-view-trigger svg {
+            width: 17px;
+            height: 17px;
+            flex: 0 0 auto;
+            fill: #76b900;
+        }
+
+        .tracking-trigger-copy { min-width: 0; flex: 1; }
+        .tracking-trigger-title { display: block; font-size: 11px; font-weight: 600; }
+        .tracking-trigger-current {
+            display: block;
+            margin-top: 1px;
+            overflow: hidden;
+            color: #909090;
+            font-size: 9px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .tracking-modal-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 10050;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.72);
+        }
+
+        .tracking-modal {
+            width: min(520px, 100%);
+            overflow: hidden;
+            color: #d4d4d4;
+            background: #252526;
+            border: 1px solid #474747;
+            border-radius: 8px;
+            box-shadow: 0 18px 55px rgba(0, 0, 0, 0.55);
+        }
+
+        .tracking-modal-header {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 18px 20px 14px;
+            border-bottom: 1px solid #3b3b3b;
+        }
+        .tracking-modal-header h2 { margin: 0; color: #f0f0f0; font-size: 18px; }
+        .tracking-modal-header p { margin: 5px 0 0; color: #8c8c8c; font-size: 11px; line-height: 1.45; }
+        .tracking-modal-close {
+            padding: 0;
+            color: #999;
+            background: transparent;
+            border: 0;
+            cursor: pointer;
+            font-size: 24px;
+            line-height: 1;
+        }
+        .tracking-modal-options { display: grid; gap: 9px; padding: 16px 20px 20px; }
+        .tracking-modal-option {
+            display: grid;
+            grid-template-columns: 20px 1fr 20px;
+            align-items: center;
+            gap: 11px;
+            padding: 12px 13px;
+            color: #d7d7d7;
+            background: #202020;
+            border: 1px solid #3f3f3f;
+            border-radius: 6px;
+            cursor: pointer;
+            text-align: left;
+        }
+        .tracking-modal-option:hover { border-color: #6b8f28; background: #292d25; }
+        .tracking-modal-option.selected { border-color: #76b900; background: #2a341c; }
+        .tracking-option-dot { width: 10px; height: 10px; border: 2px solid #777; border-radius: 50%; }
+        .tracking-modal-option.selected .tracking-option-dot { border-color: #76b900; background: #76b900; }
+        .tracking-option-title { display: block; font-size: 13px; font-weight: 600; }
+        .tracking-option-desc { display: block; margin-top: 3px; color: #888; font-size: 10px; line-height: 1.35; }
+        .tracking-option-check { color: #76b900; font-size: 16px; opacity: 0; }
+        .tracking-modal-option.selected .tracking-option-check { opacity: 1; }
+
+        #sidebar.collapsed .tracking-view-trigger {
+            width: 48px;
+            margin-left: auto;
+            margin-right: auto;
+            justify-content: center;
+        }
+        #sidebar.collapsed .tracking-trigger-copy { display: none; }
         
     </style>
 </head>
@@ -529,6 +657,10 @@
                 <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M22,21H2V3H4V19H6V10H10V19H12V6H16V19H18V14H22V21Z"/></svg></span>
                 <span class="menu-text">BER</span>
             </a>
+            <a href="/monitor-results/pfc-ecn-analysis.html" target="content-iframe" title="PFC/ECN Analysis" class="menu-item">
+                <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M4,5H8V19H4V5M10,5H14V19H10V5M17,7H20V10H22V14H20V17H17V14H15V10H17V7Z"/></svg></span>
+                <span class="menu-text">PFC/ECN</span>
+            </a>
             <a href="/monitor-results/hardware-analysis.html" target="content-iframe" title="Hardware Analysis" class="menu-item">
                 <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M17,17H7V7H17M21,11V9H19V7C19,5.89 18.1,5 17,5H15V3H13V5H11V3H9V5H7C5.89,5 5,5.89 5,7V9H3V11H5V13H3V15H5V17A2,2 0 0,0 7,19H9V21H11V19H13V21H15V19H17A2,2 0 0,0 19,17V15H21V13H19V11M13,13H11V11H13M15,9H9V15H15V9Z"/></svg></span>
                 <span class="menu-text">Hardware</span>
@@ -620,11 +752,149 @@
         
         // Initialize sidebar state
         document.addEventListener('DOMContentLoaded', restoreSidebarState);
+
+        const TRACKING_VIEW_STORAGE_KEY = 'lldpq_tracking_view';
+        const TRACKING_VIEWS = new Set(['all', 'commissioning', 'handed_over']);
+        const LIFECYCLE_SCOPED_REPORTS = new Set([
+            '/lldp.html', '/bgp-analysis.html', '/duplicate-analysis.html',
+            '/link-flap-analysis.html', '/optical-analysis.html', '/ber-analysis.html',
+            '/pfc-ecn-analysis.html', '/hardware-analysis.html', '/log-analysis.html',
+            '/assets.html', '/transceiver.html'
+        ]);
+
+        function storedTrackingView() {
+            try {
+                const value = sessionStorage.getItem(TRACKING_VIEW_STORAGE_KEY);
+                return TRACKING_VIEWS.has(value) ? value : 'all';
+            } catch (e) {
+                return 'all';
+            }
+        }
+
+        function rememberTrackingView(value) {
+            if (!TRACKING_VIEWS.has(value)) value = 'all';
+            try { sessionStorage.setItem(TRACKING_VIEW_STORAGE_KEY, value); } catch (e) {}
+            const labels = {
+                all: 'All Switches', commissioning: 'Commissioning', handed_over: 'Handed Over'
+            };
+            const current = document.getElementById('tracking-view-current');
+            if (current) current.textContent = labels[value];
+            document.querySelectorAll('.tracking-modal-option').forEach(option => {
+                const selected = option.dataset.trackingView === value;
+                option.classList.toggle('selected', selected);
+                option.setAttribute('aria-checked', selected ? 'true' : 'false');
+            });
+            return value;
+        }
+
+        function installLifecycleScope() {
+            const iframe = document.getElementById('content-iframe');
+            try {
+                const doc = iframe.contentDocument;
+                if (!doc || !doc.head || doc.getElementById('lldpq-lifecycle-scope-script')) return;
+                const script = doc.createElement('script');
+                script.id = 'lldpq-lifecycle-scope-script';
+                script.src = '/lifecycle-scope.js?v=20260707-1';
+                doc.head.appendChild(script);
+            } catch (e) {
+                // Optional cross-origin pages cannot inherit the LLDPq scope.
+            }
+        }
+
+        function currentIframeUsesLifecycleScope() {
+            const iframe = document.getElementById('content-iframe');
+            let pathname = '';
+            try {
+                // Named-target navigation updates the frame's live Location but
+                // does not update its original src attribute.
+                pathname = iframe.contentWindow.location.pathname;
+            } catch (e) {
+                try {
+                    pathname = new URL(iframe.getAttribute('src') || '', window.location.href).pathname;
+                } catch (_) {
+                    return false;
+                }
+            }
+            pathname = pathname.toLowerCase();
+            return Array.from(LIFECYCLE_SCOPED_REPORTS).some(path => pathname.endsWith(path));
+        }
+
+        function applyTrackingView(value, refreshCurrentReport = true) {
+            const previous = storedTrackingView();
+            value = rememberTrackingView(value);
+            // Fabric is always the global dashboard. Scope is a per-tab report
+            // filter, so changing it only refreshes an analysis page that can
+            // actually apply the lifecycle predicate.
+            if (refreshCurrentReport && previous !== value && currentIframeUsesLifecycleScope()) {
+                const iframe = document.getElementById('content-iframe');
+                let currentUrl = iframe.getAttribute('src');
+                try {
+                    currentUrl = iframe.contentWindow.location.href;
+                    iframe.contentWindow.location.reload();
+                } catch (e) {
+                    iframe.src = currentUrl;
+                }
+            }
+        }
+
+        function closeTrackingViewModal() {
+            const overlay = document.getElementById('tracking-view-modal');
+            if (overlay) overlay.style.display = 'none';
+        }
+
+        function openTrackingViewModal() {
+            rememberTrackingView(storedTrackingView());
+            const overlay = document.getElementById('tracking-view-modal');
+            if (!overlay) return;
+            overlay.style.display = 'flex';
+            overlay.querySelector('.tracking-modal-option.selected')?.focus();
+        }
+
+        function selectTrackingView(value) {
+            closeTrackingViewModal();
+            applyTrackingView(value);
+        }
+
+        function addTrackingViewControl() {
+            const container = document.getElementById('user-menu-container');
+            if (!container || document.getElementById('tracking-view-button')) return;
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.id = 'tracking-view-button';
+            button.className = 'tracking-view-trigger';
+            button.title = 'Choose the switch lifecycle scope used by analysis reports';
+            button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v4H4V5m0 5h16v4H4v-4m0 5h16v4H4v-4Z"/></svg><span class="tracking-trigger-copy"><span class="tracking-trigger-title">Analysis Scope</span><span class="tracking-trigger-current" id="tracking-view-current"></span></span>';
+            button.addEventListener('click', openTrackingViewModal);
+            container.appendChild(button);
+
+            if (!document.getElementById('tracking-view-modal')) {
+                const overlay = document.createElement('div');
+                overlay.id = 'tracking-view-modal';
+                overlay.className = 'tracking-modal-overlay';
+                overlay.setAttribute('role', 'dialog');
+                overlay.setAttribute('aria-modal', 'true');
+                overlay.setAttribute('aria-labelledby', 'tracking-modal-title');
+                overlay.innerHTML = '<div class="tracking-modal"><div class="tracking-modal-header"><div><h2 id="tracking-modal-title">Analysis Scope</h2><p>Choose the switch group shown by analysis reports in this browser tab. Fabric always shows all switches.</p></div><button type="button" class="tracking-modal-close" aria-label="Close">×</button></div><div class="tracking-modal-options"><button type="button" class="tracking-modal-option" role="radio" data-tracking-view="all"><span class="tracking-option-dot"></span><span><span class="tracking-option-title">All Switches</span><span class="tracking-option-desc">Show the complete managed inventory in analysis reports.</span></span><span class="tracking-option-check">✓</span></button><button type="button" class="tracking-modal-option" role="radio" data-tracking-view="commissioning"><span class="tracking-option-dot"></span><span><span class="tracking-option-title">Commissioning</span><span class="tracking-option-desc">Show only switches still being commissioned.</span></span><span class="tracking-option-check">✓</span></button><button type="button" class="tracking-modal-option" role="radio" data-tracking-view="handed_over"><span class="tracking-option-dot"></span><span><span class="tracking-option-title">Handed Over</span><span class="tracking-option-desc">Show only switches already handed over to operations.</span></span><span class="tracking-option-check">✓</span></button></div></div>';
+                overlay.addEventListener('click', event => {
+                    if (event.target === overlay) closeTrackingViewModal();
+                });
+                overlay.querySelector('.tracking-modal-close').addEventListener('click', closeTrackingViewModal);
+                overlay.querySelectorAll('.tracking-modal-option').forEach(option => {
+                    option.addEventListener('click', () => selectTrackingView(option.dataset.trackingView));
+                });
+                document.body.appendChild(overlay);
+            }
+            rememberTrackingView(storedTrackingView());
+        }
         
         // Initialize authentication
         async function initAuth() {
             const isAuth = await LLDPqAuth.check();
             if (!isAuth) return;
+
+            if (LLDPqAuth.isAdmin()) {
+                document.body.classList.add('lldpq-admin');
+            }
             
             // Add auth styles
             const style = document.createElement('style');
@@ -633,6 +903,7 @@
             
             // Add user menu
             document.getElementById('user-menu-container').innerHTML = LLDPqAuth.createUserMenu();
+            addTrackingViewControl();
             
             // Add modals (for admin)
             if (LLDPqAuth.isAdmin()) {
@@ -651,16 +922,26 @@
             try {
                 const resp = await fetch('/fabric-api.sh?action=ansible-status');
                 const data = await resp.json();
-                if (!data.configured) {
-                    document.getElementById('ansible-menu').style.display = 'none';
+                if (data.configured && LLDPqAuth.isAdmin()) {
+                    document.body.classList.add('lldpq-ansible-enabled');
+                } else {
+                    document.body.classList.remove('lldpq-ansible-enabled');
+                    const ansibleMenu = document.getElementById('ansible-menu');
+                    if (ansibleMenu) ansibleMenu.style.display = '';
                 }
             } catch (e) {
                 // If check fails, hide Ansible menu (safe default)
-                document.getElementById('ansible-menu').style.display = 'none';
+                document.body.classList.remove('lldpq-ansible-enabled');
+                const ansibleMenu = document.getElementById('ansible-menu');
+                if (ansibleMenu) ansibleMenu.style.display = '';
             }
             
             // Check for updates after auth is ready (admin only)
             checkForUpdates();
+
+            // The selection is per browser tab. It filters supported reports;
+            // the Fabric dashboard remains the full-fabric source of truth.
+            applyTrackingView(storedTrackingView(), false);
         }
         
         // Run auth check
@@ -668,7 +949,7 @@
         
         // Add active state management
         document.querySelectorAll('.menu-item').forEach(item => {
-            item.addEventListener('click', function() {
+            item.addEventListener('click', function(event) {
                 // Remove active class from all items
                 document.querySelectorAll('.menu-item').forEach(i => i.classList.remove('active'));
                 // Add active class to clicked item
@@ -678,6 +959,7 @@
         
         // Set initial active state
         document.querySelector('a[href="start.html"]').classList.add('active');
+        document.getElementById('content-iframe').addEventListener('load', installLifecycleScope);
         
         // Version and update check
         const GITHUB_VERSION_URL = 'https://raw.githubusercontent.com/aliaydemir/lldpq-src/main/VERSION';

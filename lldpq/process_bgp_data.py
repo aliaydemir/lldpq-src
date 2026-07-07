@@ -11,7 +11,7 @@ import re
 import sys
 import copy
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from bgp_analyzer import BGPAnalyzer
 from collection_freshness import (
     asset_snapshot_is_authoritative,
@@ -106,7 +106,7 @@ def mark_collection_unavailable(analyzer, hostname, previous_stats, reason):
         "critical_neighbors": 0,
         "last_update": last_known.get("last_update") if last_known else None,
         "data_status": status,
-        "collection_checked_at": datetime.now().isoformat(),
+        "collection_checked_at": datetime.now(timezone.utc).isoformat(),
         "collection_error": reason,
     }
     if last_known:
@@ -226,7 +226,7 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
             )
             bgp_analyzer.current_bgp_stats[hostname].update({
                 "data_status": "current",
-                "collection_checked_at": datetime.now().isoformat(),
+                "collection_checked_at": datetime.now(timezone.utc).isoformat(),
             })
             current_bgp_hosts.add(hostname)
             

@@ -10,6 +10,7 @@ PURPOSE:
 Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
+import argparse
 import os
 import re
 import json
@@ -18,6 +19,25 @@ import sys
 import tempfile
 import yaml
 from datetime import datetime
+
+try:
+    from topology_edges import (
+        DeviceNameResolver,
+        is_eth0,
+        iter_lldp_neighbors,
+        normalize_advertised_port,
+        parse_topology_file,
+        port_key,
+    )
+except ImportError:  # Source-tree imports used by unit tests.
+    from lldpq.topology_edges import (
+        DeviceNameResolver,
+        is_eth0,
+        iter_lldp_neighbors,
+        normalize_advertised_port,
+        parse_topology_file,
+        port_key,
+    )
 
 def get_web_root():
     """Read WEB_ROOT from /etc/lldpq.conf with fallback to default"""
@@ -288,22 +308,7 @@ def normalize_interface_name(iface_name, known_device_names):
     This function handles device names with dashes (e.g., GB200-1-01).
     Only removes device prefix if interface actually contains it.
     """
-    best_match_device_name = None
-    for device_name in known_device_names:
-        # Only try to normalize if interface name actually starts with device name + dash
-        device_prefix = f"{device_name}-"
-        if iface_name.startswith(device_prefix):
-            if best_match_device_name is None or len(device_name) > len(best_match_device_name):
-                best_match_device_name = device_name
-
-    if best_match_device_name:
-        device_prefix = f"{best_match_device_name}-"
-        normalized_name = iface_name[len(device_prefix):]
-        return normalized_name
-
-    # If no device prefix found, return interface name as-is
-    # This handles cases like eth_rail0, enP6p3s0f0np0, etc.
-    return iface_name
+    return normalize_advertised_port(iface_name, None, known_device_names) or ""
 
 
 def parse_port_status(filepath):
@@ -365,7 +370,8 @@ def format_speed(speed_mbps):
         return f"{speed_mbps // 1000}Gbps"
     return f"{speed_mbps}Mbps"
 
-def parse_lldp_results(directory, device_info, hosts_only_devices):
+def parse_lldp_results(
+        directory, device_info, hosts_only_devices, known_device_names=()):
     topology_data = {
         "links": [],
         "nodes": []
@@ -381,6 +387,8 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
     all_port_speed = {}
 
     known_device_names_for_normalization = set(device_info.keys())
+    known_device_names_for_normalization.update(hosts_only_devices)
+    known_device_names_for_normalization.update(known_device_names)
 
     # Load topology configuration
     topology_config = load_topology_config()
@@ -411,50 +419,94 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
         device_nodes[device_name] = device_id
         device_id += 1
 
+    lldp_filenames = [
+        filename for filename in os.listdir(directory)
+        if filename.endswith("_lldp_result.ini")
+    ]
+    collected_device_names = [
+        filename[:-len("_lldp_result.ini")] for filename in lldp_filenames
+    ]
+    known_device_names_for_normalization.update(collected_device_names)
+    resolver_names = list(device_info)
+    resolver_names.extend(sorted(hosts_only_devices, key=str.casefold))
+    resolver_names.extend(sorted(known_device_names, key=str.casefold))
+    resolver_names.extend(collected_device_names)
+    resolver = DeviceNameResolver(resolver_names)
+    device_node_names = {resolver.key(name): name for name in device_nodes}
+
+    def ensure_discovered_node(raw_name):
+        nonlocal device_id
+        key = resolver.key(raw_name)
+        existing = device_node_names.get(key)
+        if existing:
+            return existing
+        device_name = resolver.canonical(raw_name)
+        known_device_names_for_normalization.add(device_name)
+        layer_sort_preference, dev_icon = categorize_device(device_name, topology_config)
+        node_id = device_id
+        device_nodes[device_name] = node_id
+        device_node_names[key] = device_name
+        node = {
+            "icon": dev_icon,
+            "id": node_id,
+            "layerSortPreference": layer_sort_preference,
+            "name": device_name,
+            "primaryIP": "N/A",
+            "model": "N/A",
+            "serial_number": "N/A",
+            "version": "N/A",
+            "dcimDeviceLink": f"/monitor-results/{device_name}.html"
+        }
+        _srow = stagger_row_for(device_name, topology_config)
+        if _srow is not None:
+            node["staggerRow"] = _srow
+        topology_data["nodes"].append(node)
+        device_id += 1
+        return device_name
+
     link_id = 0
     reachable_devices = set()
 
     # First pass: collect ALL port status and speed from all devices
-    for filename in os.listdir(directory):
-        if not filename.endswith("_lldp_result.ini"):
-            continue
+    for filename in lldp_filenames:
         filepath = os.path.join(directory, filename)
-        device_name = filename.split("_lldp_result.ini")[0]
+        raw_device_name = filename.split("_lldp_result.ini")[0]
+        device_name = ensure_discovered_node(raw_device_name)
         all_port_status[device_name] = parse_port_status(filepath)
         all_port_speed[device_name] = parse_port_speed(filepath)
         if lldp_collection_is_available(filepath):
             reachable_devices.add(device_name)
 
+    # Resolve all advertised identities together before creating LLDP-only
+    # nodes.  A unique short/FQDN pair (X + x.example.test) then shares one
+    # canonical node, while ambiguous FQDN-only first labels stay distinct.
+    advertised_device_names = []
+    for filename in lldp_filenames:
+        filepath = os.path.join(directory, filename)
+        try:
+            with open(filepath, "r") as file:
+                data = file.read()
+        except FileNotFoundError:
+            continue
+        for neighbor in iter_lldp_neighbors(
+                data,
+                resolver=resolver,
+                known_device_names=known_device_names_for_normalization):
+            if neighbor.device:
+                advertised_device_names.append(neighbor.device)
+
+    known_device_names_for_normalization.update(advertised_device_names)
+    resolver = DeviceNameResolver(
+        resolver_names + list(device_nodes) + advertised_device_names
+    )
+    device_node_names = {resolver.key(name): name for name in device_nodes}
+
     # Second pass: process LLDP data and create links
-    for filename in os.listdir(directory):
+    for filename in lldp_filenames:
         filepath = os.path.join(directory, filename)
 
-        if not filename.endswith("_lldp_result.ini"):
-            continue
-
-        device_name_from_lldp = filename.split("_lldp_result.ini")[0]
-
-        # Full mode: add devices found via LLDP even if not in device_info
-        if device_name_from_lldp not in device_nodes:
-            layer_sort_preference, dev_icon = categorize_device(device_name_from_lldp, topology_config)
-            dev_id_for_lldp_only = device_id
-            device_nodes[device_name_from_lldp] = dev_id_for_lldp_only
-            lldp_node = {
-                "icon": dev_icon,
-                "id": dev_id_for_lldp_only,
-                "layerSortPreference": layer_sort_preference,
-                "name": device_name_from_lldp,
-                "primaryIP": "N/A",
-                "model": "N/A",
-                "serial_number": "N/A",
-                "version": "N/A",
-                "dcimDeviceLink": f"/monitor-results/{device_name_from_lldp}.html"
-            }
-            _srow = stagger_row_for(device_name_from_lldp, topology_config)
-            if _srow is not None:
-                lldp_node["staggerRow"] = _srow
-            topology_data["nodes"].append(lldp_node)
-            device_id += 1
+        raw_device_name = filename.split("_lldp_result.ini")[0]
+        device_name_from_lldp = ensure_discovered_node(raw_device_name)
 
         try:
             with open(filepath, 'r') as file:
@@ -462,77 +514,18 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
         except FileNotFoundError:
             continue
 
-        interface_sections = re.split(r'-------------------------------------------------------------------------------', data)
-        interface_sections = [s.strip() for s in interface_sections if s.strip()]
-
-        for section in interface_sections:
-            interface_name = get_lldp_field(section, "Interface", r'Interface:\s*(\S+),')
-            neighbor_device = get_lldp_field(section, "SysName", r'SysName:\s*(\S+)')
-            
-            # Clean up FQDN suffix from neighbor device name (e.g., ".cm.cluster", ".local")
-            # This matches the logic in lldp-validate.py for consistency
-            if neighbor_device:
-                neighbor_device = neighbor_device.split(".cm.cluster")[0]
-                neighbor_device = neighbor_device.split(".local")[0]
-
-            # ifname for Cumulus/Cisco, ifalias for FortiGate
-            raw_port_id_ifname = get_lldp_field(section, "PortID", r'PortID:\s+(?:ifname|ifalias)\s+(\S+)')
-            # Optimized PortDescr parsing - handle multiple formats
-            raw_port_descr = None
-            port_descr_full = get_lldp_field(section, "PortDescr", r'PortDescr:\s*(.*?)(?:\n|$)')
-
-            if port_descr_full:
-                # Format 1: "Interface X as <interface_name>" (HGX/NVSwitch)
-                if " as " in port_descr_full:
-                    as_match = re.search(r' as\s+(\S+)', port_descr_full)
-                    if as_match:
-                        candidate = as_match.group(1)
-                        # Quick validation: avoid TLV data
-                        if "," not in candidate and not candidate.startswith("TLV"):
-                            raw_port_descr = candidate
-                # Format 2: Direct interface name (GB200/Hosts)
-                else:
-                    # Extract first non-TLV word
-                    candidate = port_descr_full.strip().split()[0] if port_descr_full.strip() else None
-                    if candidate and "," not in candidate and not candidate.startswith("TLV"):
-                        raw_port_descr = candidate
-
-            if not interface_name or not neighbor_device:
+        for neighbor in iter_lldp_neighbors(
+                data,
+                resolver=resolver,
+                known_device_names=known_device_names_for_normalization):
+            interface_name = neighbor.local_port
+            neighbor_device = neighbor.device
+            tgt_ifname = neighbor.remote_port
+            if not interface_name or not neighbor_device or not tgt_ifname:
                 continue
-
-            tgt_ifname = ""
-            if raw_port_id_ifname:
-                tgt_ifname = normalize_interface_name(raw_port_id_ifname, known_device_names_for_normalization)
-            elif raw_port_descr:
-                tgt_ifname = normalize_interface_name(raw_port_descr, known_device_names_for_normalization)
-
-            if not tgt_ifname:
+            if is_eth0(interface_name) or is_eth0(tgt_ifname):
                 continue
-
-            if interface_name.lower() == "eth0" or tgt_ifname.lower() == "eth0":
-                continue
-
-            # Full mode: add neighbor devices found via LLDP even if not in device_info
-            if neighbor_device not in device_nodes:
-                layer_sort_preference, dev_icon = categorize_device(neighbor_device, topology_config)
-                neighbor_id = device_id
-                device_nodes[neighbor_device] = neighbor_id
-                neighbor_node = {
-                    "icon": dev_icon,
-                    "id": neighbor_id,
-                    "layerSortPreference": layer_sort_preference,
-                    "name": neighbor_device,
-                    "primaryIP": "N/A",
-                    "model": "N/A",
-                    "serial_number": "N/A",
-                    "version": "N/A",
-                    "dcimDeviceLink": f"/monitor-results/{neighbor_device}.html"
-                }
-                _srow = stagger_row_for(neighbor_device, topology_config)
-                if _srow is not None:
-                    neighbor_node["staggerRow"] = _srow
-                topology_data["nodes"].append(neighbor_node)
-                device_id += 1
+            neighbor_device = ensure_discovered_node(neighbor_device)
 
             # Get port status for both source and target interfaces
             src_port_status = all_port_status.get(device_name_from_lldp, {}).get(interface_name, "N/A")
@@ -571,23 +564,22 @@ def parse_lldp_results(directory, device_info, hosts_only_devices):
     return topology_data, device_nodes, link_id, all_lldp_links_found, all_port_status, all_port_speed
 
 def parse_topology_dot_file(dot_file_path):
-    defined_links = set()
-    try:
-        with open(dot_file_path, 'r') as file:
-            for line in file:
-                line = line.strip()
-                if line.startswith('"') and '--' in line:
-                    parts = re.findall(r'"(.*?)"', line)
-                    if len(parts) == 4:
-                        src_device, src_ifname, tgt_device, tgt_ifname = parts
-                        defined_links.add((src_device, src_ifname, tgt_device, tgt_ifname))
-    except FileNotFoundError:
-        pass
-    return defined_links
+    return {edge.as_tuple() for edge in parse_topology_file(dot_file_path)}
 
 def generate_topology_file(output_filename, directory, assets_file_path, devices_yaml_path, dot_file_path):
     device_info = parse_assets_file(assets_file_path)
     host_names, host_patterns = parse_endpoint_hosts(devices_yaml_path)
+    # assets.ini is the authoritative inventory spelling.  Resolve exact
+    # endpoint entries through it before extending device_info so DNS-style
+    # case/FQDN variants cannot create a second node (for example B + b).
+    asset_name_resolver = DeviceNameResolver(device_info)
+    host_names = {
+        asset_name_resolver.canonical(host) for host in host_names
+    }
+    defined_links = parse_topology_dot_file(dot_file_path)
+    topology_device_names = {
+        name for link in defined_links for name in (link[0], link[2])
+    }
 
     # First pass: add exact hostnames to device_info
     for host in host_names:
@@ -609,23 +601,27 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
         # Add pattern-matched hosts to host_names only (NOT device_info)
         # This way they'll be in hosts_only_devices and get proper icon/layer from categorize_device
         for host in pattern_matched_hosts:
-            host_names.add(host)
+            host_names.add(asset_name_resolver.canonical(host))
 
     # hosts_only_devices = hosts in host_names but NOT in device_info (assets.ini)
     # These will get their icon/layer from topology_config.yaml via categorize_device()
     hosts_only_devices = host_names - set(device_info.keys())
 
     # Parse LLDP to discover all devices (now includes pattern-matched hosts)
-    topology_data, device_nodes, current_link_id, all_lldp_links_found, all_port_status, all_port_speed = parse_lldp_results(directory, device_info, hosts_only_devices)
-
-    defined_links = parse_topology_dot_file(dot_file_path)
+    topology_data, device_nodes, current_link_id, all_lldp_links_found, all_port_status, all_port_speed = parse_lldp_results(
+        directory, device_info, hosts_only_devices, topology_device_names
+    )
 
     # Hostname matching is case-insensitive (DNS-style); interface names stay exact
+    resolver = DeviceNameResolver(
+        list(device_nodes) + list(topology_device_names)
+    )
     def _link_key(s_dev, s_if, t_dev, t_if):
-        return (s_dev.lower(), s_if, t_dev.lower(), t_if)
+        return (resolver.key(s_dev), port_key(s_if), resolver.key(t_dev), port_key(t_if))
     defined_links_lc = {_link_key(*dl) for dl in defined_links}
     all_lldp_links_found_lc = {_link_key(*ll) for ll in all_lldp_links_found}
-    device_nodes_lc = {name.lower(): nid for name, nid in device_nodes.items()}
+    device_nodes_lc = {resolver.key(name): nid for name, nid in device_nodes.items()}
+    device_names_lc = {resolver.key(name): name for name in device_nodes}
 
     for link in topology_data["links"]:
         src_device = link["srcDevice"]
@@ -648,23 +644,27 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
 
         if _link_key(*forward_link_tuple) not in all_lldp_links_found_lc and _link_key(*reverse_link_tuple) not in all_lldp_links_found_lc:
 
-            if src_device.lower() in device_nodes_lc and tgt_device.lower() in device_nodes_lc:
+            src_key = resolver.key(src_device)
+            tgt_key = resolver.key(tgt_device)
+            if src_key in device_nodes_lc and tgt_key in device_nodes_lc:
+                src_node_name = device_names_lc[src_key]
+                tgt_node_name = device_names_lc[tgt_key]
                 # Get port status for both source and target interfaces
-                src_port_status = all_port_status.get(src_device, {}).get(src_ifname, "N/A")
-                tgt_port_status = all_port_status.get(tgt_device, {}).get(tgt_ifname, "N/A")
+                src_port_status = all_port_status.get(src_node_name, {}).get(src_ifname, "N/A")
+                tgt_port_status = all_port_status.get(tgt_node_name, {}).get(tgt_ifname, "N/A")
                 # Get port speed (in Mbps) - for missing links, likely N/A
-                src_port_speed = all_port_speed.get(src_device, {}).get(src_ifname, 0)
-                tgt_port_speed = all_port_speed.get(tgt_device, {}).get(tgt_ifname, 0)
+                src_port_speed = all_port_speed.get(src_node_name, {}).get(src_ifname, 0)
+                tgt_port_speed = all_port_speed.get(tgt_node_name, {}).get(tgt_ifname, 0)
                 
                 link = {
                     "id": current_link_id,
-                    "source": device_nodes_lc[src_device.lower()],
-                    "srcDevice": src_device,
+                    "source": device_nodes_lc[src_key],
+                    "srcDevice": src_node_name,
                     "srcIfName": src_ifname,
                     "srcPortStatus": src_port_status,
                     "srcPortSpeed": format_speed(src_port_speed),
-                    "target": device_nodes_lc[tgt_device.lower()],
-                    "tgtDevice": tgt_device,
+                    "target": device_nodes_lc[tgt_key],
+                    "tgtDevice": tgt_node_name,
                     "tgtIfName": tgt_ifname,
                     "tgtPortStatus": tgt_port_status,
                     "tgtPortSpeed": format_speed(tgt_port_speed),
@@ -684,8 +684,8 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
         src_ifname = link["srcIfName"]
         tgt_ifname = link["tgtIfName"]
 
-        current_link_tuple = (src_device, src_ifname, tgt_device, tgt_ifname)
-        reverse_link_tuple = (tgt_device, tgt_ifname, src_device, src_ifname)
+        current_link_tuple = _link_key(src_device, src_ifname, tgt_device, tgt_ifname)
+        reverse_link_tuple = _link_key(tgt_device, tgt_ifname, src_device, src_ifname)
 
         if current_link_tuple not in seen_links_for_dedup and reverse_link_tuple not in seen_links_for_dedup:
             unique_links_filtered.append(link)
@@ -693,13 +693,16 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
 
     topology_data["links"] = unique_links_filtered
 
-    final_nodes_set = set(device_info.keys())
+    final_nodes_set = {resolver.key(name) for name in device_info}
 
     for link in topology_data["links"]:
-        final_nodes_set.add(link["srcDevice"])
-        final_nodes_set.add(link["tgtDevice"])
+        final_nodes_set.add(resolver.key(link["srcDevice"]))
+        final_nodes_set.add(resolver.key(link["tgtDevice"]))
 
-    topology_data["nodes"] = [node for node in topology_data["nodes"] if node["name"] in final_nodes_set]
+    topology_data["nodes"] = [
+        node for node in topology_data["nodes"]
+        if resolver.key(node["name"]) in final_nodes_set
+    ]
 
     # Natural sort so "...-1-2" comes before "...-1-10" (numeric-aware ordering)
     topology_data["nodes"].sort(key=lambda x: [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', x["name"])])
@@ -755,19 +758,22 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
                 pass
         raise
 
-def main():
-    lldp_results_directory = (
-        sys.argv[1] if len(sys.argv) > 1 else "lldp-results"
-    )
+def main(argv=None):
+    parser = argparse.ArgumentParser(description='Generate LLDPq topology data')
+    parser.add_argument('lldp_results_directory', nargs='?', default='lldp-results')
+    parser.add_argument('output_file', nargs='?')
+    parser.add_argument('--topology-file', default='topology.dot')
+    args = parser.parse_args(argv)
+    lldp_results_directory = args.lldp_results_directory
     assets_file_path = "assets.ini"
     devices_yaml_path = "devices.yaml"
-    dot_file_path = "topology.dot"
+    dot_file_path = args.topology_file
     
     # Get web root from config with fallback
     WEB_ROOT = get_web_root()
-    explicit_output = len(sys.argv) > 2
+    explicit_output = args.output_file is not None
     output_file = (
-        sys.argv[2] if explicit_output else f"{WEB_ROOT}/topology/topology.js"
+        args.output_file if explicit_output else f"{WEB_ROOT}/topology/topology.js"
     )
 
     if not os.path.isdir(lldp_results_directory):

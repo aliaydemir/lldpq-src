@@ -6,3 +6,6 @@ __pycache__
 .cache
 .vscode
 IMPROVEMENT_PLAN.md
+.playwright-cli/
+tests/
+output/

@@ -1,7 +1,8 @@
 #!/bin/bash
 # lldpq-ai-analyze - Autonomous fabric health analysis via AI
 # Called by cron hourly (or as configured)
-# Calls ai-api.sh analyze action via curl
+# Invokes ai-api.sh directly.  Loopback HTTP cannot authenticate a cron job and
+# must not be given a reusable browser session or an nginx auth bypass.
 
 if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
@@ -17,10 +18,18 @@ fi
 # Check if provider is reachable before wasting time
 if [[ "$AI_PROVIDER" == "ollama" ]]; then
     OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
-    if ! curl -sf "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
+    if ! curl --silent --fail --connect-timeout 3 --max-time 10 \
+        "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
         exit 0  # Ollama not running, skip silently
     fi
 fi
 
-# Call the analyze endpoint
-curl -sf "http://localhost/ai-api.sh?action=analyze" > /dev/null 2>&1
+# Run the same CGI entry point with a process-local role.  This environment is
+# created by cron, not from HTTP request parameters; normal web requests still
+# pass through auth-guard.sh and require an administrator session.
+LLDPQ_AUTH_USER="lldpq-ai-cron" \
+LLDPQ_AUTH_ROLE="admin" \
+REQUEST_METHOD="GET" \
+QUERY_STRING="action=analyze" \
+CONTENT_LENGTH="0" \
+bash "$WEB_ROOT/ai-api.sh" > /dev/null

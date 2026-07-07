@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Short-lived Provision scheduler. Cron invokes this once per minute; network
+# work is always delegated to detached workers owned by provision-api.sh.
+
+set -u
+
+CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+if [[ ! -x "$CONFIG_HELPER" ]]; then
+    printf 'lldpq-provision-scheduler: missing config helper: %s\n' "$CONFIG_HELPER" >&2
+    exit 1
+fi
+if ! assignments=$(
+    "$CONFIG_HELPER" --require-config --require-key WEB_ROOT \
+        --require-key LLDPQ_DIR --require-key LLDPQ_USER 2>/dev/null
+); then
+    printf 'lldpq-provision-scheduler: runtime configuration unavailable\n' >&2
+    exit 1
+fi
+eval "$assignments" || exit 1
+unset assignments
+
+api="${WEB_ROOT:-/var/www/html}/provision-api.sh"
+if [[ ! -x "$api" ]]; then
+    printf 'lldpq-provision-scheduler: Provision API is not executable: %s\n' "$api" >&2
+    exit 1
+fi
+
+lock_file="${LLDPQ_PROVISION_SCHEDULER_LOCK:-/var/lib/lldpq/provision-jobs/.scheduler.lock}"
+exec 9<>"$lock_file" || exit 1
+chmod 660 "$lock_file" 2>/dev/null || true
+flock -n 9 || exit 0
+
+status=0
+"$api" --discovery-schedule || status=$?
+"$api" --upgrade-resume || status=$?
+exit "$status"

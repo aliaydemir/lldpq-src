@@ -13,9 +13,9 @@ network, grouped per VLAN/VNI. Combines several signals collected by monitor.sh
   * bridge fdb show                        -> same MAC LOCAL on >=2 switches (non-EVPN + location)
   * ip -4 neigh show                       -> APIPA (169.254/16 = DHCP failed) + IP<->multi-MAC
 
-Severity is driven by *recency* (a duplicate logged in the last hour = actively
-flapping = CRITICAL) and by the EVPN mobility *sequence delta* between monitor
-cycles (climbing seq = active). A flagged-but-stale entry is WARNING.
+IP severity keeps authoritative DAD rows separate from historical context. MAC
+severity additionally compares per-switch mobility samples against the configured
+DAD move-rate policy; a small positive delta alone is not a CRITICAL conflict.
 
 Copyright (c) 2024 LLDPq Project - MIT License
 """
@@ -52,10 +52,14 @@ LOG_RE = re.compile(
 ACTIVE_WINDOW_SEC = 3600       # a dup event within this window = actively flapping
 APIPA_CRITICAL = 50            # APIPA neighbours on one switch >= this = critical
 SEQ_WARN = 10                  # EVPN mobility seq >= this = the entry has moved at all (collection floor)
-# A single-MAC, single-location, non-climbing entry is only treated as a (past) duplicate if its
-# sequence is this high -- real duplicate storms reach 100k+, whereas normal EVPN-MH failover churn
-# stays in the hundreds. This keeps genuine settled duplicates while dropping MH mobility noise.
+# A single-MAC, single-location, non-climbing mobility record is retained as history only when its
+# sequence is this high. Incident counts still keep this separate from confirmed simultaneous MAC
+# conflicts, so ordinary EVPN-MH churn cannot inflate the duplicate total.
 SEQ_STORM = 10000
+DEFAULT_DAD_MOVES = 5          # FRR default/fallback when per-switch policy is unavailable
+DEFAULT_DAD_WINDOW_SEC = 180
+MAC_OBSERVER_STATE_VERSION = 1
+MAC_OBSERVER_STATE_TTL_SEC = 7 * 86400
 LOOP_MIN_MACS = 10             # >= this many MACs flapping between the SAME endpoint pair (no dup IP) = likely L2 loop
 STALE_AGE_SEC = 7 * 86400      # a quiesced dup whose EVPN sequence has not moved for this long = aged/stale
                                # (collapsed out of the main list; still available via the "aged" toggle)
@@ -91,7 +95,7 @@ class DuplicateAnalyzer:
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}
         self.if_desc = {}              # (host, port) -> interface description (ifalias)
         self.arp_pairs = {}            # (vlan, ip) -> {mac -> set(hosts)}
-        self.mac_mob = {}              # (vlan, mac) -> {seq, hosts, vteps, ports, vni}  (EVPN mobility seq>=WARN)
+        self.mac_mob = {}              # (vlan, mac) -> {seq, seq_by_host, hosts, vteps, ports, vni}
         self.ip_mob = {}               # (vlan, ip)  -> {seq, macs, vteps, vni}
         self.log_events = {}           # (vni, ip) -> {'count': int, 'latest': dt, 'macs': set, 'vteps': set}
         self.log_events_mac = {}       # (vni, mac) -> {'count': int, 'latest': dt, 'vteps': set, 'ips': set}  (last VTEP = contender)
@@ -102,7 +106,10 @@ class DuplicateAnalyzer:
         self.analysis_now = datetime.now(timezone.utc)
         self.collection_meta = {}      # host -> collector timestamp/source status
         self.coverage = {
-            "expected": set(), "current": set(), "failures": [], "partial": True,
+            "expected": set(), "current": set(), "mac_current": set(),
+            "mac_dad_current": set(), "mac_mobility_current": set(),
+            "fdb_current": set(),
+            "failures": [], "partial": True,
         }
         self.prev_state = self._load_state()
         self.new_state = {}
@@ -160,7 +167,20 @@ class DuplicateAnalyzer:
             if "_dup.txt" in files:
                 self._parse_dup(ch, self._read(files["_dup.txt"]))
             if "_fdb.txt" in files:
-                self._parse_fdb(ch, self._read(files["_fdb.txt"]))
+                fdb_read_ok, fdb_text = self._read_with_status(
+                    files["_fdb.txt"]
+                )
+                # A successful FDB query may legitimately return no rows on
+                # L3-only devices.  Section presence is guaranteed by the
+                # validated collection bundle; only an explicit collector
+                # error makes the sample unusable.
+                fdb_ok = fdb_read_ok and \
+                    "__LLDPQ_COLLECTION_ERROR__:FDB" not in fdb_text
+                self.collection_meta[ch]["sources"]["FDB_LOCAL"] = (
+                    "OK" if fdb_ok else "ERROR"
+                )
+                if fdb_ok:
+                    self._parse_fdb(ch, fdb_text)
             if "_neigh.txt" in files:
                 self._parse_neigh(ch, self._read(files["_neigh.txt"]))
         self._finalize_coverage()
@@ -169,11 +189,16 @@ class DuplicateAnalyzer:
 
     @staticmethod
     def _read(path):
+        _read_ok, content = DuplicateAnalyzer._read_with_status(path)
+        return content
+
+    @staticmethod
+    def _read_with_status(path):
         try:
             with open(path, "r", errors="replace") as f:
-                return f.read()
+                return True, f.read()
         except Exception:
-            return ""
+            return False, ""
 
     def _split_sections(self, text):
         """Split a _dup.txt into the labelled sections."""
@@ -206,7 +231,8 @@ class DuplicateAnalyzer:
         # into a current duplicate.
         if self.collection_meta[host]["sources"].get("ARP_DUPLICATES") == "OK":
             self._parse_arp_dup(host, sec.get("ARP", []))
-        self._parse_mac_dup(host, sec.get("MAC", []))
+        if self.collection_meta[host]["sources"].get("MAC_DUPLICATES") == "OK":
+            self._parse_mac_dup(host, sec.get("MAC", []))
         self._parse_log(sec.get("LOG", []))
         self._parse_mac_mobility(host, sec.get("MACMOB", []))
         self._parse_ip_mobility(host, sec.get("ARPMOB", []))
@@ -272,8 +298,13 @@ class DuplicateAnalyzer:
             max_age = 30 * 60
 
         current = set()
+        mac_current = set()
+        mac_dad_current = set()
+        mac_mobility_current = set()
+        fdb_current = set()
         failures = []
-        required = ("COLLECTION_TIMESTAMP", "ARP_DUPLICATES")
+        ip_required = ("ARP_DUPLICATES",)
+        mac_required = ("MAC_DUPLICATES", "MAC_MOBILITY", "FDB_LOCAL")
         for host in sorted(expected):
             status = asset_statuses.get(host)
             if status is not None and status != "OK":
@@ -299,20 +330,46 @@ class DuplicateAnalyzer:
                     failures.append("%s:COLLECTION_TIME_FUTURE" % host)
 
             sources = meta.get("sources", {})
-            core_ok = timestamp_ok
-            for source in required:
+            collection_status = sources.get("COLLECTION_TIMESTAMP")
+            base_ok = timestamp_ok and collection_status == "OK"
+            if collection_status != "OK":
+                failures.append("%s:COLLECTION_TIMESTAMP_%s" % (
+                    host, collection_status or "MISSING",
+                ))
+
+            ip_ok = base_ok
+            for source in ip_required:
                 source_status = sources.get(source)
                 if source_status != "OK":
-                    core_ok = False
+                    ip_ok = False
                     failures.append("%s:%s_%s" % (
                         host, source, source_status or "MISSING",
                     ))
             if not meta.get("arp_section_present"):
-                core_ok = False
+                ip_ok = False
                 failures.append("%s:ARP_SECTION_MISSING" % host)
 
-            if core_ok:
+            mac_ok = base_ok
+            for source in mac_required:
+                source_status = sources.get(source)
+                if source_status != "OK":
+                    mac_ok = False
+                    failures.append("%s:%s_%s" % (
+                        host, source, source_status or "MISSING",
+                    ))
+
+            if ip_ok:
                 current.add(host)
+            if base_ok and sources.get("MAC_DUPLICATES") == "OK":
+                mac_dad_current.add(host)
+            if base_ok and sources.get("MAC_MOBILITY") in ("OK", "TRUNCATED"):
+                # Truncation makes zero incomplete, but each emitted row is
+                # still valid positive mobility evidence.
+                mac_mobility_current.add(host)
+            if base_ok and sources.get("FDB_LOCAL") == "OK":
+                fdb_current.add(host)
+            if mac_ok:
+                mac_current.add(host)
 
         # Inventory is the authority for expected devices.  Without a valid
         # snapshot we may parse rows for diagnostics, but must not publish a
@@ -320,13 +377,23 @@ class DuplicateAnalyzer:
         if snapshot_problem:
             failures.append("inventory:%s" % snapshot_problem)
             current.clear()
+            mac_current.clear()
+            mac_dad_current.clear()
+            mac_mobility_current.clear()
+            fdb_current.clear()
 
         failures = sorted(set(failures))
         self.coverage = {
             "expected": expected,
             "current": current,
+            "mac_current": mac_current,
+            "mac_dad_current": mac_dad_current,
+            "mac_mobility_current": mac_mobility_current,
+            "fdb_current": fdb_current,
             "failures": failures,
-            "partial": bool(failures or current != expected),
+            "partial": bool(
+                failures or current != expected or mac_current != expected
+            ),
         }
 
     def _parse_vni_map(self, lines):
@@ -395,6 +462,7 @@ class DuplicateAnalyzer:
             vlan = self._vlan_of(vni)
             rec = self.ip_dups.setdefault((vlan, neighbor), self._blank_ip(vlan, vni, neighbor))
             rec["macs"].add(mac)
+            rec["authoritative_macs"].add(mac)
             rec["seq"] = max(rec["seq"], seq)
             rec["flagged"] = True
             rec["authoritative_hosts"].add(host)
@@ -408,6 +476,7 @@ class DuplicateAnalyzer:
         return {"vlan": vlan, "vni": str(vni), "ip": ip, "macs": set(), "seq": 0,
                 "flagged": False, "local_hosts": set(), "vteps": set(),
                 "authoritative_hosts": set(),
+                "authoritative_macs": set(),
                 "ports": set(), "apipa": False, "recency": None, "delta": None,
                 "events": 0, "latest": None, "mobility": False}
 
@@ -432,7 +501,9 @@ class DuplicateAnalyzer:
             vlan = self._vlan_of(vni)
             rec = self.mac_dups.setdefault((vlan, mac), self._blank_mac(vlan, vni, mac))
             rec["seq"] = max(rec["seq"], seq)
+            rec["seq_by_host"][host] = max(rec["seq_by_host"].get(host, 0), seq)
             rec["flagged"] = True
+            rec["flagged_hosts"].add(host)
             if typ == "local" and port_m:
                 rec["local"].setdefault(host, port_m.group(1))
             elif vtep_m:
@@ -440,8 +511,16 @@ class DuplicateAnalyzer:
 
     def _blank_mac(self, vlan, vni, mac):
         return {"vlan": vlan, "vni": str(vni), "mac": mac, "seq": 0,
-                "flagged": False, "local": {}, "vteps": set(),
-                "delta": None, "fdb_multi": False, "mobility": False,
+                "seq_by_host": {}, "flagged": False, "flagged_hosts": set(),
+                "dad_flagged": False, "dad_event": False,
+                "local": {}, "vteps": set(),
+                "delta": None, "fdb_multi": False, "physical_local_count": 0,
+                "confirmed_conflict": False, "mobility": False,
+                "mobility_only": False, "sequence_active": False,
+                "seq_interval_sec": None, "seq_rate_per_min": None,
+                "seq_activity_threshold": None, "seq_activity_window": None,
+                "incident_type": "unknown", "activity": "settled",
+                "participates_in_ip_conflict": False,
                 "classification": "", "loop_count": 0}
 
     def _parse_log(self, lines):
@@ -487,8 +566,10 @@ class DuplicateAnalyzer:
             mac = mac_m.group(0).lower()
             vlan = self._vlan_of(vni)
             rec = self.mac_mob.setdefault((vlan, mac),
-                                          {"seq": 0, "hosts": set(), "vteps": set(), "ports": {}, "vni": str(vni)})
+                                          {"seq": 0, "seq_by_host": {}, "hosts": set(),
+                                           "vteps": set(), "ports": {}, "vni": str(vni)})
             rec["seq"] = max(rec["seq"], seq)
+            rec["seq_by_host"][host] = max(rec["seq_by_host"].get(host, 0), seq)
             rec["hosts"].add(host)
             port_m = re.search(r'\b(swp\S+|bond\S+)\b', line)
             vtep_m = IPV4_RE.search(line)
@@ -615,6 +696,211 @@ class DuplicateAnalyzer:
         ts = self.new_state.get("%s:%s" % (kind, key), {}).get("ts")
         return (time.time() - ts) if ts else None
 
+    def _dad_policy(self, host):
+        """Return the configured DAD move threshold for one observer."""
+        cfg = self.dup_config.get(host, {})
+        moves = cfg.get("max_moves")
+        window = cfg.get("time")
+        if not isinstance(moves, int) or moves <= 0:
+            moves = DEFAULT_DAD_MOVES
+        if not isinstance(window, int) or window <= 0:
+            window = DEFAULT_DAD_WINDOW_SEC
+        return moves, window
+
+    def _observer_epoch(self, host):
+        ts = self.collection_meta.get(host, {}).get("timestamp")
+        if isinstance(ts, datetime):
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.timestamp()
+        return self.analysis_now.timestamp()
+
+    @staticmethod
+    def _mac_observer_state_key(vni, mac, host):
+        return "mac-observer:%s|%s|%s" % (vni, mac, host)
+
+    def _mac_current_hosts(self):
+        """Hosts with complete MAC DAD, mobility and FDB evidence (zero trust)."""
+        return set(self.coverage.get("mac_current", self.coverage.get("current", set())))
+
+    def _mac_dad_current_hosts(self):
+        return set(self.coverage.get("mac_dad_current", self.coverage.get("current", set())))
+
+    def _mac_mobility_current_hosts(self):
+        return set(self.coverage.get("mac_mobility_current", self.coverage.get("current", set())))
+
+    def _fdb_current_hosts(self):
+        return set(self.coverage.get("fdb_current", self.coverage.get("current", set())))
+
+    def _mac_evidence_current_hosts(self):
+        return (
+            self._mac_dad_current_hosts()
+            | self._mac_mobility_current_hosts()
+            | self._fdb_current_hosts()
+        )
+
+    def _apply_mac_sequence_sample(self, rec):
+        """Compare MAC mobility sequence only against the same observing switch.
+
+        The legacy aggregate sample is accepted for one transition cycle so an
+        existing deployment does not lose its visible delta.  It can establish
+        a below/above-threshold signal, but all subsequent samples are strictly
+        per observer and rate-normalised to the configured DAD window.
+        """
+        samples = []
+        current_hosts = self._mac_mobility_current_hosts()
+        seq_by_host = {
+            host: seq for host, seq in (rec.get("seq_by_host") or {}).items()
+            if host in current_hosts and isinstance(seq, int) and seq >= 0
+        }
+        for host, seq in sorted(seq_by_host.items()):
+            key = self._mac_observer_state_key(rec["vni"], rec["mac"], host)
+            previous = self.prev_state.get(key, {})
+            observed_at = self._observer_epoch(host)
+            prev_seq = previous.get("seq")
+            prev_observed = previous.get("observed_at")
+            delta = None
+            interval = None
+            legacy = False
+
+            if isinstance(prev_seq, int) and isinstance(prev_observed, (int, float)):
+                interval = observed_at - float(prev_observed)
+                if interval > 0 and seq >= prev_seq:
+                    delta = seq - prev_seq
+            elif self.prev_state.get("__mac_observer_state_version__") != MAC_OBSERVER_STATE_VERSION:
+                # Old state tracked only one fabric-wide maximum.  Use it once
+                # for display/threshold continuity, then persist host samples.
+                old = self.prev_state.get(
+                    "mac:%s|%s" % (rec["vni"], rec["mac"]), {}
+                )
+                old_seq = old.get("seq")
+                if isinstance(old_seq, int) and seq >= old_seq:
+                    delta = seq - old_seq
+                    legacy = True
+
+            moves, window = self._dad_policy(host)
+            rate = None
+            meaningful = False
+            if delta is not None:
+                if interval is not None:
+                    rate = delta * 60.0 / interval
+                    meaningful = (
+                        (interval <= window and delta >= moves)
+                        or (interval > window and delta * window / interval >= moves)
+                    )
+                elif legacy:
+                    # The old format has no observation timestamp.  Requiring
+                    # the full move count is conservative and prevents +1/+2
+                    # from becoming a CRITICAL alarm during migration.
+                    meaningful = delta >= moves
+
+            old_changed = previous.get("ts")
+            if old_changed is None and legacy:
+                old_changed = self.prev_state.get(
+                    "mac:%s|%s" % (rec["vni"], rec["mac"]), {}
+                ).get("ts")
+            changed_at = (
+                old_changed if delta == 0 and isinstance(old_changed, (int, float))
+                else observed_at
+            )
+            self.new_state[key] = {
+                "seq": seq, "observed_at": observed_at, "ts": changed_at,
+            }
+            samples.append({
+                "host": host, "delta": delta, "interval": interval,
+                "rate": rate, "moves": moves, "window": window,
+                "meaningful": meaningful,
+            })
+
+        comparable = [sample for sample in samples if sample["delta"] is not None]
+        active = [sample for sample in comparable if sample["meaningful"]]
+        chosen_pool = active or comparable
+        if chosen_pool:
+            chosen = max(
+                chosen_pool,
+                key=lambda sample: (
+                    sample["rate"] if sample["rate"] is not None else sample["delta"],
+                    sample["delta"],
+                ),
+            )
+            rec["delta"] = chosen["delta"]
+            rec["seq_interval_sec"] = chosen["interval"]
+            rec["seq_rate_per_min"] = chosen["rate"]
+            rec["seq_activity_threshold"] = chosen["moves"]
+            rec["seq_activity_window"] = chosen["window"]
+        else:
+            rec["delta"] = None
+            rec["seq_interval_sec"] = None
+            rec["seq_rate_per_min"] = None
+            rec["seq_activity_threshold"] = None
+            rec["seq_activity_window"] = None
+        rec["sequence_active"] = bool(active)
+
+    def _carry_mac_observer_state(self):
+        """Keep temporarily absent observers without reusing aggregate migration state."""
+        cutoff = self.analysis_now.timestamp() - MAC_OBSERVER_STATE_TTL_SEC
+        for key, value in self.prev_state.items():
+            if not key.startswith("mac-observer:") or key in self.new_state:
+                continue
+            if not isinstance(value, dict):
+                continue
+            observed_at = value.get("observed_at")
+            if isinstance(observed_at, (int, float)) and observed_at >= cutoff:
+                self.new_state[key] = value
+        self.new_state["__mac_observer_state_version__"] = MAC_OBSERVER_STATE_VERSION
+
+    def _finalize_mac_semantics(self, vlan, mac, rec):
+        fdb_current_hosts = self._fdb_current_hosts()
+        dad_current_hosts = self._mac_dad_current_hosts()
+        current_fdb = {
+            host: port
+            for host, port in self.fdb_local.get((vlan, mac), {}).items()
+            if host in fdb_current_hosts
+        }
+        for host, port in current_fdb.items():
+            rec["local"][host] = port
+        # Only simultaneous LOCAL attachment on physical switch ports confirms
+        # a MAC conflict.  Bonds are normal EVPN-MH dual attachment.
+        physical = {
+            host: port for host, port in current_fdb.items()
+            if port.startswith("swp")
+        }
+        rec["fdb_multi"] = len(physical) >= 2
+        rec["physical_local_count"] = len(physical)
+        rec["confirmed_conflict"] = rec["fdb_multi"]
+        rec["dad_flagged"] = bool(
+            set(rec.get("flagged_hosts", set())) & dad_current_hosts
+        )
+        rec["flagged"] = rec["dad_flagged"]
+
+        # Keep the aggregate sequence sample only as a quiet-age clock.  It is
+        # never used for active severity because observers may disagree.
+        self._seq_delta("mac", "%s|%s" % (rec["vni"], mac), rec["seq"])
+        self._apply_mac_sequence_sample(rec)
+
+        rec["mobility_only"] = bool(
+            rec.get("mobility") and not rec["confirmed_conflict"]
+            and not rec["dad_flagged"] and not rec.get("dad_event")
+        )
+        if rec["confirmed_conflict"]:
+            rec["incident_type"] = "confirmed_mac_conflict"
+        elif rec.get("dad_event"):
+            rec["incident_type"] = "dad_event_mac"
+        elif rec["dad_flagged"]:
+            rec["incident_type"] = "dad_flagged_mac"
+        elif rec.get("mobility"):
+            rec["incident_type"] = (
+                "mac_mobility_active" if rec["sequence_active"]
+                else "mac_mobility_historical"
+            )
+        else:
+            rec["incident_type"] = "unknown"
+        rec["activity"] = (
+            "active" if rec["confirmed_conflict"] or rec["sequence_active"]
+            or rec.get("dad_event") else "settled"
+        )
+        rec["severity"] = self._mac_sev(rec)
+
     def _finalize(self):
         for host, ips in self.self_vteps.items():
             for ip in ips:
@@ -638,10 +924,8 @@ class DuplicateAnalyzer:
 
         for (vlan, mac), rec in self.mac_dups.items():
             for h, port in self.fdb_local.get((vlan, mac), {}).items():
-                rec["local"].setdefault(h, port)
-            rec["fdb_multi"] = len(rec["local"]) >= 2
-            rec["delta"] = self._seq_delta("mac", "%s|%s" % (rec["vni"], mac), rec["seq"])
-            rec["severity"] = self._mac_sev(rec)
+                if h in self._fdb_current_hosts():
+                    rec["local"].setdefault(h, port)
 
         # FDB-only MAC duplicates: same MAC LOCAL on >=2 switches via PHYSICAL (swp) ports.
         # Bonds are intentionally excluded: a bond is a LAG / EVPN-MH Ethernet Segment, so a
@@ -651,7 +935,10 @@ class DuplicateAnalyzer:
         for (vlan, mac), hosts in self.fdb_local.items():
             if (vlan, mac) in self.mac_dups:
                 continue
-            phys = {h: p for h, p in hosts.items() if p.startswith("swp")}
+            phys = {
+                h: p for h, p in hosts.items()
+                if h in self._fdb_current_hosts() and p.startswith("swp")
+            }
             if len(phys) >= 2:
                 rec = self._blank_mac(vlan, vlan, mac)
                 rec["local"] = dict(phys)
@@ -659,9 +946,8 @@ class DuplicateAnalyzer:
                 rec["severity"] = "CRITICAL"
                 self.mac_dups[(vlan, mac)] = rec
 
-        # Mobility-based detection (high EVPN sequence). Works even where dup-address-detection
-        # is OFF (EVPN-MH fabrics) because the mobility sequence is always tracked. A stable
-        # dual-homed entry is 0/0 (never collected); a climbing/high seq is a real duplicate.
+        # Mobility context (high EVPN sequence). This remains available where DAD is OFF, but it is
+        # evidence of movement rather than proof of a simultaneous duplicate.
         for (vlan, ip), mob in self.ip_mob.items():
             rec = self.ip_dups.get((vlan, ip))
             if rec is None:
@@ -687,23 +973,22 @@ class DuplicateAnalyzer:
         for (vlan, mac), mob in self.mac_mob.items():
             rec = self.mac_dups.get((vlan, mac))
             if rec is None:
-                # Mobility-only: keep only if LOCAL on 2+ switches (real MAC conflict), climbing,
-                # or an extreme seq (past storm). A MAC that is local on one switch (and remote via
-                # its normal VTEP everywhere else) with a modest stable seq is ordinary MH churn.
-                delta = self._seq_delta("mac", "%s|%s" % (mob["vni"], mac), mob["seq"])
-                climbing = delta is not None and delta > 0
-                if not (len(mob.get("ports", {})) >= 2 or climbing or mob["seq"] >= SEQ_STORM):
-                    continue
                 rec = self._blank_mac(vlan, mob["vni"], mac)
-                rec["local"] = dict(mob.get("ports", {}))
-                rec["vteps"].update(mob["vteps"])
-                rec["mobility"] = True
-                rec["delta"] = delta
                 self.mac_dups[(vlan, mac)] = rec
+            elif rec["vni"] == str(vlan) and str(mob["vni"]).isdigit():
+                rec["vni"] = str(mob["vni"])
+            for host, port in mob.get("ports", {}).items():
+                if host in self._mac_mobility_current_hosts():
+                    rec["local"].setdefault(host, port)
+            rec["vteps"].update(mob["vteps"])
+            rec["mobility"] = True
             rec["seq"] = max(rec["seq"], mob["seq"])
-            if rec["delta"] is None:
-                rec["delta"] = self._seq_delta("mac", "%s|%s" % (rec["vni"], mac), rec["seq"])
-            rec["severity"] = self._mac_sev(rec)
+            seq_by_host = dict(mob.get("seq_by_host") or {})
+            if not seq_by_host:
+                # Compatibility with pre-field test fixtures / cached parsers.
+                seq_by_host = {host: mob["seq"] for host in mob.get("hosts", set())}
+            for host, seq in seq_by_host.items():
+                rec["seq_by_host"][host] = max(rec["seq_by_host"].get(host, 0), seq)
 
         # Final reconciliation: attach zebra-log contenders ("last VTEP" = the OTHER end of the
         # flap) + recency to every duplicate, then (re)compute severity.
@@ -734,8 +1019,22 @@ class DuplicateAnalyzer:
                 rec["events"] = evm["count"]
                 rec["latest"] = evm["latest"]
                 rec["recency"] = self._recency(evm["latest"])
-                rec["flagged"] = True
-            rec["severity"] = self._mac_sev(rec)
+                rec["dad_event"] = bool(
+                    rec["recency"] is not None
+                    and rec["recency"] <= ACTIVE_WINDOW_SEC
+                )
+
+        # Resolve the MAC evidence into mutually understandable classes.  A
+        # low positive delta remains visible as a mobility signal, but is not
+        # an active incident unless it reaches the configured moves/window.
+        remove_macs = []
+        for (vlan, mac), rec in self.mac_dups.items():
+            self._finalize_mac_semantics(vlan, mac, rec)
+            if (rec["mobility_only"] and rec["seq"] < SEQ_STORM
+                    and (rec["delta"] is None or rec["delta"] <= 0)):
+                remove_macs.append((vlan, mac))
+        for key in remove_macs:
+            self.mac_dups.pop(key, None)
 
         # Cross-cycle port/MAC memory for duplicate IPs: extreme flappers rarely have BOTH devices
         # captured in one snapshot, so remember each duplicate IP's owner ports + MACs and merge
@@ -760,12 +1059,13 @@ class DuplicateAnalyzer:
             self.new_ip_state[key] = {"ports": ports, "macs": sorted(rec["macs"]), "ts": now_ts}
             rec["severity"] = self._ip_sev(rec)
 
-        # Classify each MAC duplicate: "duplicate" device (a duplicated IP rides on this MAC,
-        # e.g. two power shelves sharing MAC+IP) vs "loop" (many MACs flapping between the SAME
-        # pair of endpoints with no per-MAC IP duplicate = frames circulating).
+        # Cross-link only current authoritative IP evidence.  Mobility/log/history
+        # context must never turn a MAC row into an alleged duplicate device.
         dup_ip_macs = {}
         for (vlan, ip), irec in self.ip_dups.items():
-            for m in irec["macs"]:
+            if not self._is_confirmed_ip(irec):
+                continue
+            for m in irec.get("authoritative_macs", set()):
                 dup_ip_macs.setdefault(vlan, set()).add(m)
 
         def _endpoints(rec):
@@ -780,21 +1080,21 @@ class DuplicateAnalyzer:
         for key, rec in self.mac_dups.items():
             ep = _endpoints(rec)
             ep_by_mac[key] = ep
-            if len(ep) >= 2:
-                pair_count[ep] = pair_count.get(ep, 0) + 1
+            if len(ep) >= 2 and (rec.get("sequence_active") or rec.get("confirmed_conflict")):
+                pair_key = (rec["vlan"], ep)
+                pair_count[pair_key] = pair_count.get(pair_key, 0) + 1
 
         for (vlan, mac), rec in self.mac_dups.items():
             has_dup_ip = mac in dup_ip_macs.get(vlan, set())
-            if not has_dup_ip:
-                evm = self.log_events_mac.get((rec["vni"], mac))
-                if evm:
-                    has_dup_ip = any((vlan, ip) in self.ip_dups for ip in evm["ips"])
             ep = ep_by_mac[(vlan, mac)]
             if has_dup_ip:
-                rec["classification"] = "duplicate"
-            elif len(ep) >= 2 and pair_count.get(ep, 0) >= LOOP_MIN_MACS:
+                rec["participates_in_ip_conflict"] = True
+                rec["classification"] = "ip-conflict-participant"
+            elif (not rec.get("confirmed_conflict") and not rec.get("dad_flagged")
+                  and len(ep) >= 2
+                  and pair_count.get((vlan, ep), 0) >= LOOP_MIN_MACS):
                 rec["classification"] = "loop"
-                rec["loop_count"] = pair_count[ep]
+                rec["loop_count"] = pair_count[(vlan, ep)]
 
         # Age-out: a quiesced (WARNING) duplicate whose EVPN sequence has not moved for a long time
         # AND has no recent log event is "stale" -- still real, just historical (e.g. storage VIPs
@@ -812,15 +1112,13 @@ class DuplicateAnalyzer:
         for (vlan, mac), rec in self.mac_dups.items():
             _mark_stale(rec, "mac", mac)
 
+        self._carry_mac_observer_state()
         self._save_state()
 
     def _ip_sev(self, rec):
-        # A row returned by the successful, current FRR
-        # ``show ... duplicate`` command is the active duplicate truth.
-        if rec.get("authoritative_hosts", set()) & self.coverage["current"]:
-            return "CRITICAL"
         # "Active now" = a duplicate/mobility event within the last hour, or a sequence that climbed
-        # THIS collection cycle. Only an actively-moving duplicate is an urgent (CRITICAL) fire.
+        # THIS collection cycle. A current FRR duplicate row confirms the finding, but FRR can retain
+        # that DAD flag after the conflict settles; presence alone must not make it an active fire.
         active = (rec["recency"] is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
                  (rec["delta"] is not None and rec["delta"] > 0)
         if active:
@@ -833,10 +1131,10 @@ class DuplicateAnalyzer:
         return "OK"
 
     def _mac_sev(self, rec):
-        if (rec.get("recency") is not None and rec["recency"] <= ACTIVE_WINDOW_SEC) or \
-           (rec.get("delta") is not None and rec["delta"] > 0) or rec.get("fdb_multi"):
+        if (rec.get("confirmed_conflict") or rec.get("sequence_active")
+                or rec.get("dad_event")):
             return "CRITICAL"
-        if rec.get("flagged") or rec.get("seq", 0) >= SEQ_WARN:
+        if rec.get("dad_flagged") or rec.get("mobility"):
             return "WARNING"
         return "OK"
 
@@ -844,15 +1142,33 @@ class DuplicateAnalyzer:
         """Current authoritative FRR rows only; mobility/logs are context."""
         return bool(rec.get("authoritative_hosts", set()) & self.coverage["current"])
 
+    @staticmethod
+    def _is_confirmed_mac(rec):
+        return bool(rec.get("confirmed_conflict"))
+
+    @staticmethod
+    def _is_mac_dad(rec):
+        return rec.get("incident_type") in ("dad_flagged_mac", "dad_event_mac")
+
+    @staticmethod
+    def _is_mac_mobility(rec):
+        return rec.get("incident_type") in (
+            "mac_mobility_active", "mac_mobility_historical",
+        )
+
     # -------------------------------------------------------------- summary
     def summary(self):
         confirmed_ips = [r for r in self.ip_dups.values() if self._is_confirmed_ip(r)]
-        ip_active = sum(
-            1 for hosts in self.authoritative_ip_pairs.values()
-            if hosts & self.coverage["current"]
+        ip_active = sum(1 for r in confirmed_ips if r.get("severity") == "CRITICAL")
+        ip_quiesced = sum(1 for r in confirmed_ips if r.get("severity") == "WARNING")
+        macs = list(self.mac_dups.values())
+        confirmed_macs = [r for r in macs if self._is_confirmed_mac(r)]
+        dad_macs = [r for r in macs if self._is_mac_dad(r)]
+        mobility_macs = [r for r in macs if self._is_mac_mobility(r)]
+        mobility_active = sum(
+            1 for r in mobility_macs if r.get("sequence_active")
         )
-        ip_quiesced = 0
-        mac_total = len(self.mac_dups)
+        mac_total = len(confirmed_macs)
         apipa_total = sum(a["total"] for a in self.apipa.values())
         vlans = set(r["vlan"] for r in confirmed_ips) | set(r["vlan"] for r in self.mac_dups.values())
         for h, a in self.apipa.items():
@@ -861,11 +1177,27 @@ class DuplicateAnalyzer:
         return {
             "ip_active": ip_active, "ip_quiesced": ip_quiesced,
             "confirmed_ip_active": ip_active,
-            "mac_total": mac_total, "apipa_total": apipa_total,
+            # Backwards-compatible mac_total now means confirmed simultaneous
+            # conflict; mobility and DAD evidence have their own counters.
+            "mac_total": mac_total,
+            "confirmed_mac_total": mac_total,
+            "confirmed_mac_active": sum(
+                1 for r in confirmed_macs if r.get("severity") == "CRITICAL"
+            ),
+            "mac_dad_total": len(dad_macs),
+            "mac_mobility_total": len(mobility_macs),
+            "mac_mobility_active": mobility_active,
+            "mac_mobility_settled": len(mobility_macs) - mobility_active,
+            "apipa_total": apipa_total,
             "vlans": len(vlans), "disabled": disabled,
-            "ip_total": ip_active,
+            "ip_total": ip_active + ip_quiesced,
             "coverage_expected": len(self.coverage["expected"]),
-            "coverage_current": len(self.coverage["current"]),
+            "coverage_ip_current": len(self.coverage["current"]),
+            "coverage_current": len(
+                set(self.coverage["current"]) & self._mac_current_hosts()
+            ),
+            "coverage_mac_current": len(self._mac_current_hosts()),
+            "coverage_mac_evidence_current": len(self._mac_evidence_current_hosts()),
             "coverage_failures": len(self.coverage["failures"]),
             "coverage_partial": self.coverage["partial"],
         }
@@ -892,12 +1224,15 @@ class DuplicateAnalyzer:
         return '<span class="badge %s">%s</span>' % (cls, sev)
 
     @staticmethod
-    def _seq_cell(seq, delta):
+    def _seq_cell(seq, delta, active=True):
         if not seq:
             return "&mdash;"
         out = "{:,}".format(seq)
         if delta is not None and delta > 0:
-            out += ' <span class="delta-up">(+%s)</span>' % "{:,}".format(delta)
+            delta_class = "delta-up" if active else "delta-muted"
+            out += ' <span class="%s">(+%s)</span>' % (
+                delta_class, "{:,}".format(delta),
+            )
         return out
 
     def _port_label(self, host, port):
@@ -961,7 +1296,9 @@ class DuplicateAnalyzer:
                 if r["severity"] != "CRITICAL":
                     note += " <span class='dim'>(quiesced)</span>"
             elif r["flagged"]:
-                note = "Confirmed &mdash; EVPN/log"
+                note = "Confirmed &mdash; EVPN DAD"
+                if r["severity"] != "CRITICAL":
+                    note += " <span class='dim'>(quiesced / latched)</span>"
             elif r.get("mobility"):
                 # One MAC, one owner at this instant, but a very high EVPN mobility sequence: the
                 # SAME MAC/IP is rapidly re-registering between locations (a flapping endpoint), not
@@ -989,12 +1326,14 @@ class DuplicateAnalyzer:
         # Conflict column can then show switch:port (not just switch).
         mac_ip_ports = {}
         for (ivlan, iip), irec in self.ip_dups.items():
+            if not self._is_confirmed_ip(irec):
+                continue
             ports = {}
             for p in irec["ports"]:
                 if ":" in p:
                     h, pt = p.split(":", 1)
                     ports[h] = pt
-            for m in irec["macs"]:
+            for m in irec.get("authoritative_macs", set()):
                 mac_ip_ports.setdefault((ivlan, m), {}).update(ports)
         mac_rows = sorted(self.mac_dups.values(),
                           key=lambda r: (sev_rank.get(r["severity"], 3), -(r["seq"])))
@@ -1005,32 +1344,58 @@ class DuplicateAnalyzer:
             cport.update(mac_ip_ports.get((r["vlan"], r["mac"]), {}))
             vteps = self._vtep_cell(r["vteps"], set(r["local"].keys()), cport)
             vlanvni = "vlan %s<br><span class='dim'>VNI %s</span>" % (html.escape(r["vlan"]), html.escape(r["vni"]))
-            if r.get("classification") == "duplicate":
-                note = "Duplicate device"
-            elif r.get("classification") == "loop":
+            if r.get("classification") == "loop":
                 note = "Possible loop (%d MACs)" % r.get("loop_count", 0)
-            elif r.get("fdb_multi"):
-                note = "LOCAL on %d switches" % len(r["local"])
-            elif r.get("flagged"):
-                note = "EVPN flagged"
-            elif r.get("mobility"):
-                note = "high mobility seq"
+            elif r.get("confirmed_conflict"):
+                note = "Confirmed MAC conflict: LOCAL on %d physical switches" % r.get(
+                    "physical_local_count", len(r["local"])
+                )
+            elif r.get("incident_type") == "dad_flagged_mac":
+                note = "FRR MAC DAD flag (latched; not proven simultaneous)"
+            elif r.get("incident_type") == "dad_event_mac":
+                note = "Recent FRR MAC DAD event"
+            elif r.get("incident_type") == "mac_mobility_active":
+                note = "Active MAC mobility at/above DAD move-rate threshold"
+            elif r.get("incident_type") == "mac_mobility_historical":
+                if r.get("delta") is not None and r["delta"] > 0:
+                    moves = r.get("seq_activity_threshold") or DEFAULT_DAD_MOVES
+                    window = r.get("seq_activity_window") or DEFAULT_DAD_WINDOW_SEC
+                    note = ("MAC mobility +%d; below %d moves / %ds threshold; "
+                            "not a simultaneous conflict") % (
+                                r["delta"], moves, window,
+                            )
+                else:
+                    note = "Historical MAC mobility (flat); not a simultaneous conflict"
             else:
                 note = ""
+            if r.get("classification") == "ip-conflict-participant":
+                participant = "Participant in current authoritative IP DAD finding"
+                note = "%s; %s" % (note, participant) if note else participant
             note_html = html.escape(note)
             if r.get("stale"):
                 note_html += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
             rowcls = " class='stale-row'" if r.get("stale") else ""
             devs = set(r["local"].keys())
             all_devices |= devs
+            if r.get("confirmed_conflict"):
+                kind = "confirmed"
+            elif self._is_mac_dad(r):
+                kind = "dad"
+            elif self._is_mac_mobility(r):
+                kind = "mobility"
+            else:
+                kind = "context"
             mac_html.append(
-                "<tr data-sev='%d' data-devices='%s'%s><td>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<tr data-sev='%d' data-kind='%s' data-mobility-active='%s' data-devices='%s'%s><td>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
                 "<td class='mono'>%s</td><td class='mono'>%s</td><td>%s</td></tr>" % (
-                    sev_rank.get(r["severity"], 3), html.escape(" ".join(sorted(devs))), rowcls, self._sev_badge(r["severity"]), vlanvni,
+                    sev_rank.get(r["severity"], 3), kind,
+                    str(bool(r.get("sequence_active"))).lower(),
+                    html.escape(" ".join(sorted(devs))), rowcls,
+                    self._sev_badge(r["severity"]), vlanvni,
                     html.escape(r["mac"]), local, vteps,
-                    self._seq_cell(r["seq"], r.get("delta")), note_html))
+                    self._seq_cell(r["seq"], r.get("delta"), r.get("sequence_active", False)), note_html))
         if not mac_html:
-            mac_html.append("<tr><td colspan='7' class='empty'>No duplicate MACs detected &#10003;</td></tr>")
+            mac_html.append("<tr><td colspan='7' class='empty'>No MAC conflict, DAD, or mobility findings &#10003;</td></tr>")
 
         # ---- APIPA rows (real access VLANs only; baseline link-local filtered out)
         apipa_rows = []
@@ -1063,9 +1428,20 @@ class DuplicateAnalyzer:
         cards = [
             ("card-critical", s["ip_active"], "ACTIVE IP DUPLICATES", "active"),
             ("card-warning", s["ip_quiesced"], "QUIESCED IP DUPLICATES", "quiesced"),
-            ("card-critical" if s["mac_total"] else "card-excellent", s["mac_total"], "MAC DUPLICATES", "mac"),
+            ("card-critical" if s["confirmed_mac_total"] else "card-excellent",
+             s["confirmed_mac_total"], "CONFIRMED MAC CONFLICTS",
+             "mac" if s["confirmed_mac_total"] else ""),
+            ("card-warning" if s["mac_dad_total"] else "card-excellent",
+             s["mac_dad_total"], "MAC DAD FINDINGS",
+             "dad" if s["mac_dad_total"] else ""),
+            ("card-critical" if s["mac_mobility_active"] else "card-excellent",
+             s["mac_mobility_active"], "ACTIVE MAC MOBILITY",
+             "mobility-active" if s["mac_mobility_active"] else ""),
+            ("card-warning" if s["mac_mobility_total"] else "card-excellent",
+             s["mac_mobility_total"], "MAC MOBILITY SIGNALS",
+             "mobility" if s["mac_mobility_total"] else ""),
             ("card-warning" if s["apipa_total"] else "card-excellent", s["apipa_total"], "APIPA (DHCP FAILED)", "apipa"),
-            ("card-info", s["vlans"], "VLANS AFFECTED", ""),
+            ("card-info", s["vlans"], "VLANS WITH FINDINGS", ""),
             ("card-warning" if s["disabled"] else "card-excellent", len(s["disabled"]), "DUP-DETECT DISABLED", "disabled"),
         ]
         cards_html = "".join(
@@ -1084,7 +1460,9 @@ class DuplicateAnalyzer:
                     % (STALE_AGE_SEC // 86400, stale_count))
 
         html_doc = _PAGE_TEMPLATE
-        if not s["coverage_expected"] or not s["coverage_current"]:
+        if (not s["coverage_expected"]
+                or (not s["coverage_ip_current"]
+                    and not s["coverage_mac_evidence_current"])):
             collection_status = "unavailable"
         elif s["coverage_partial"]:
             collection_status = "partial"
@@ -1095,15 +1473,27 @@ class DuplicateAnalyzer:
             ' data-collection-status="%s"'
             ' data-confirmed-ip-active="%d"'
             ' data-ip-quiesced="%d"'
+            ' data-confirmed-mac-total="%d"'
+            ' data-mac-dad-total="%d"'
+            ' data-mac-mobility-active="%d"'
+            ' data-mac-mobility-total="%d"'
             ' data-coverage-expected="%d"'
             ' data-coverage-current="%d"'
+            ' data-coverage-ip-current="%d"'
+            ' data-coverage-mac-current="%d"'
+            ' data-coverage-mac-evidence-current="%d"'
             ' data-coverage-failures="%d"'
             ' data-coverage-partial="%s"'
             ' data-coverage-failure-details="%s" style="display:none"></div>'
         ) % (
             collection_status,
             s["confirmed_ip_active"], s["ip_quiesced"],
+            s["confirmed_mac_total"], s["mac_dad_total"],
+            s["mac_mobility_active"], s["mac_mobility_total"],
             s["coverage_expected"], s["coverage_current"],
+            s["coverage_ip_current"],
+            s["coverage_mac_current"],
+            s["coverage_mac_evidence_current"],
             s["coverage_failures"], str(s["coverage_partial"]).lower(),
             html.escape(json.dumps(self.coverage["failures"]), quote=True),
         )
@@ -1168,6 +1558,7 @@ tr.stale-row { opacity:0.55; }
 body:not(.show-aged) tr.stale-row { display:none !important; }
 .empty { text-align:center; color:#76b900; padding:18px; }
 .delta-up { color:#ff6b6b; font-weight:bold; }
+.delta-muted { color:#aaa; font-weight:bold; }
 .badge { display:inline-block; padding:3px 9px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; }
 .badge-green { background:rgba(118,185,0,0.2); color:#76b900; }
 .badge-red { background:rgba(244,67,54,0.2); color:#ff6b6b; }
@@ -1247,10 +1638,10 @@ __MACHINE_SUMMARY__
   </div>
 </div>
 <div class="dashboard-section">
-  <div class="section-header">Duplicate MACs (per VLAN / VNI)</div>
+  <div class="section-header">MAC Findings &mdash; Confirmed Conflicts / DAD / Mobility (per VLAN / VNI)</div>
   <div class="section-content">
     <table class="dup-table" id="mact">
-      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>MAC</th><th>Local On (switch:port)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Note</th></tr></thead>
+      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>MAC</th><th>Local On (switch:port)</th><th>Conflict / Observed VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Meaning</th></tr></thead>
       <tbody>__MAC_ROWS__</tbody>
     </table>
   </div>
@@ -1272,40 +1663,53 @@ __MACHINE_SUMMARY__
     <div class="modal-body">
       <h4>Data sources (collected per switch each cycle)</h4>
       <code>show evpn arp-cache vni all duplicate</code> &mdash; authoritative duplicate IPs + EVPN mobility sequence.<br>
-      <code>show evpn mac vni all duplicate</code> &mdash; duplicate MACs (when FRR latches them).<br>
-      <code>show evpn mac / arp-cache vni all</code> &mdash; mobility-based detection (works with DAD off); a single-owner entry is only counted when climbing or seq &ge; __SEQ_STORM__.<br>
+      <code>show evpn mac vni all duplicate</code> &mdash; current/latched FRR MAC DAD findings.<br>
+      <code>show evpn mac / arp-cache vni all</code> &mdash; mobility evidence (works with DAD off); this is shown separately from confirmed conflicts.<br>
       <code>bridge fdb show</code> &mdash; same MAC LOCAL on &ge;2 <i>physical</i> ports (bonds excluded = EVPN-MH dual-homing).<br>
       <code>ip -4 neigh show</code> &mdash; APIPA (169.254/16 = DHCP failed) + IP&harr;multi-MAC.<br>
       zebra log <code>"detected as duplicate"</code> &mdash; timestamped event history (recency &amp; rate).
       <h4>Severity</h4>
-      <b>CRITICAL (active)</b> &mdash; moving right now: a duplicate event in the last hour, OR the EVPN
-      sequence <b>increased since the previous cycle</b> (climbing &#916;).<br>
-      <b>WARNING (quiesced)</b> &mdash; a real duplicate that is currently settled: EVPN-flagged, 2+ MACs
-      on one IP, or a high but flat sequence. A flat high sequence is NOT "active".<br>
+      <b>IP CRITICAL</b> &mdash; a current duplicate event or an IP sequence that increased in this
+      collection cycle. A current but flat/old authoritative IP DAD row is quiesced WARNING.<br>
+      <b>MAC CRITICAL</b> &mdash; a confirmed simultaneous physical MAC conflict, a recent DAD event,
+      or mobility that reaches the configured move-rate threshold.<br>
+      <b>MAC WARNING</b> &mdash; a latched DAD flag or below-threshold / historical mobility evidence.
+      A positive MAC &#916; below policy is movement context, not proof of a duplicate.<br>
       <b>Aged</b> &mdash; a quiesced duplicate whose sequence has not moved for &ge;__STALE_DAYS__ days is
       collapsed out of the list (use <i>Show aged</i> to reveal). These persist in FRR until the address is
-      removed / re-learned or <code>clear evpn dup-addr</code> is run &mdash; the tool only mirrors that state.<br>
+      removed / re-learned or its DAD flag is cleared &mdash; the tool only mirrors that state.<br>
       APIPA &mdash; CRITICAL when &ge; __APIPA_CRIT__ APIPA addresses on one switch+VLAN, else WARNING.
+      <h4>Clear a resolved FRR DAD flag</h4>
+      After confirming the conflict is resolved, run the targeted command on every VTEP that still reports
+      the duplicate. Replace the placeholders with the row's VNI and address:<br>
+      <code>sudo vtysh -c "clear evpn dup-addr vni &lt;VNI&gt; ip &lt;IP_ADDRESS&gt;"</code><br>
+      For a duplicate MAC, use:<br>
+      <code>sudo vtysh -c "clear evpn dup-addr vni &lt;VNI&gt; mac &lt;MAC_ADDRESS&gt;"</code><br>
+      Use a targeted VNI plus IP/MAC; do not use <code>vni all</code> for routine cleanup.
       <h4>EVPN duplicate-address-detection (DAD) &amp; multihoming</h4>
       Configured threshold: <code>__CFG__</code> (max-moves / window). FRR <b>automatically disables DAD on
       switches where EVPN multihoming (Ethernet Segments / dual-homed bonds) is enabled</b> &mdash; this is
       normal, not a misconfiguration. There the EVPN <i>duplicate</i> flag &amp; zebra log are unavailable;
-      duplicates are instead caught by the mobility sequence below (always tracked).__DAD_NOTE__
+      movement anomalies are instead observed through the mobility sequence below (always tracked).__DAD_NOTE__
       <h4>Mobility sequence &amp; &#916; (works even with DAD off)</h4>
       Every MAC/IP carries an EVPN mobility <b>sequence</b> that increments each time it moves between
       owners. A stable / dual-homed entry stays at <code>0/0</code>. The <code>(+N)</code> next to a seq is
-      the increase since the previous run &mdash; a positive &#916; means it is moving <b>right now</b>.
-      To avoid false positives from ordinary EVPN-MH failover churn, a single-owner entry (one MAC, one
-      location, not climbing) is only reported when its sequence is extreme (&ge; __SEQ_STORM__).
+      the increase seen by the <b>same observing switch</b> since its previous sample. CRITICAL requires
+      the configured <code>moves / window</code> rate; for example <code>+2</code> is below the default
+      <code>5 moves / 180s</code> policy and is not a simultaneous duplicate. A stable single-owner entry
+      is retained as history only when its sequence is extreme (&ge; __SEQ_STORM__).
       <h4>Note column &mdash; conflict vs flapping (IP table)</h4>
       <b>Confirmed &mdash; IP conflict</b> &mdash; 2+ distinct MACs claim the same IP (two devices), or
       EVPN/zebra flagged it. <b>Flapping endpoint (EVPN mobility)</b> &mdash; a <i>single</i> MAC/IP whose
       mobility sequence is very high: the same endpoint is rapidly re-registering between locations (e.g. a
       BMC dual-pathed / not bonded), NOT two devices sharing an address. "active" = climbing now, "settled" =
       high but flat. A flapping endpoint often also shows an APIPA (169.254) address because the churn breaks DHCP.
-      <h4>Note column &mdash; duplicate vs loop</h4>
-      <b>Duplicate device</b> &mdash; the same MAC also owns a duplicated IP (two devices sharing MAC+IP,
-      e.g. power shelves). <b>Possible loop</b> &mdash; &ge; __LOOP_MIN__ MACs flapping between the same
+      <h4>MAC finding types</h4>
+      <b>Confirmed MAC conflict</b> requires the same MAC to be simultaneously LOCAL on at least two
+      physical switch ports. <b>FRR MAC DAD</b> is a current/latched DAD finding but does not by itself
+      prove simultaneous owners. <b>MAC mobility</b> records moves and is not counted as a duplicate.
+      <b>IP DAD participant</b> is shown only when the MAC appears in a current authoritative IP
+      DAD finding. <b>Possible loop</b> &mdash; &ge; __LOOP_MIN__ active MACs moving between the same
       switch pair with no per-MAC IP duplicate (frames circulating, not a single device).
     </div>
   </div>
@@ -1362,8 +1766,20 @@ function cardFilter(kind, card){
     });
     document.getElementById('ipt').scrollIntoView({behavior:'smooth', block:'start'});
     setFilterInfo((kind==='active'?'Active':'Quiesced')+' IP duplicates');
-  } else if(kind==='mac'){
+  } else if(kind==='mac'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
+    if(card) card.classList.add('active');
+    Array.prototype.slice.call(document.querySelectorAll('#mact tbody tr')).forEach(function(r){
+      if(r.querySelector('.empty')) return;
+      var rowKind=r.getAttribute('data-kind');
+      var matches=(kind==='mac'&&rowKind==='confirmed') ||
+        (kind==='dad'&&rowKind==='dad') ||
+        (kind==='mobility'&&rowKind==='mobility') ||
+        (kind==='mobility-active'&&rowKind==='mobility'&&r.getAttribute('data-mobility-active')==='true');
+      r.style.display=matches?'':'none';
+    });
     document.getElementById('mact').scrollIntoView({behavior:'smooth', block:'start'});
+    var labels={mac:'Confirmed MAC conflicts',dad:'MAC DAD findings',mobility:'MAC mobility signals','mobility-active':'Active MAC mobility'};
+    setFilterInfo(labels[kind]);
   } else if(kind==='apipa'){
     document.getElementById('apt').scrollIntoView({behavior:'smooth', block:'start'});
   }
@@ -1381,13 +1797,30 @@ function filterByDevice(dev){
   setFilterInfo('Device: '+dev);
 }
 function clearDeviceSearch(){ showAllDup(); }
-function runAnalysis(){
+async function runAnalysis(){
   var b=document.getElementById('run-analysis'); var o=b.innerHTML;
   b.disabled=true; b.innerHTML='<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" style="animation:spin 1s linear infinite"><path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4Z"/></svg> Running...';
-  fetch('/trigger-monitor',{method:'POST',headers:{'Content-Type':'application/json'}})
-    .then(function(r){return r.json();})
-    .then(function(d){ if(d && d.status==='success'){ setTimeout(function(){ location.reload(); }, 35000); } else { b.disabled=false; b.innerHTML=o; alert('Failed to trigger analysis.'); } })
-    .catch(function(){ b.disabled=false; b.innerHTML=o; alert('Error triggering analysis.'); });
+  try {
+    var baseline = typeof window.lldpqCaptureAnalysisState === 'function'
+      ? await window.lldpqCaptureAnalysisState('duplicate') : null;
+    var response = await fetch('/trigger-monitor?scope=duplicate',{
+      method:'POST', headers:{'Content-Type':'application/json'}
+    });
+    var data = await response.json();
+    if(!response.ok || !data || data.status!=='success' || !data.trigger_id || data.scope!=='duplicate'){
+      throw new Error((data && data.message) || 'Failed to trigger analysis.');
+    }
+    if(typeof window.waitForLldpqAnalysisCompletion === 'function'){
+      await window.waitForLldpqAnalysisCompletion(
+        baseline, {scope:'duplicate', pipelineId:data.trigger_id});
+    }else{
+      await new Promise(function(resolve){ setTimeout(resolve,35000); });
+    }
+    location.reload();
+  }catch(error){
+    b.disabled=false; b.innerHTML=o;
+    alert('Analysis did not complete: '+(error.message||error));
+  }
 }
 function csvEsc(v){ v=(v==null?'':String(v)); return '"'+v.replace(/"/g,'""')+'"'; }
 function downloadCSV(){
@@ -1414,6 +1847,6 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/analysis-guard.js"></script>
+<script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""

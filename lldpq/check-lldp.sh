@@ -743,13 +743,7 @@ PING="ping"
 
 ping_test() {
     local device=$1
-    local hostname=$2
     $PING -c 1 -W 0.5 "$device" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "$device $hostname" >> "$unreachable_hosts_file"
-        return 1
-    fi
-    return 0
 }
 
 # ============================================================================
@@ -774,9 +768,23 @@ execute_commands_optimized() {
         # Port status
         echo ''
         echo '===PORT_STATUS_START==='
-        for port in /sys/class/net/swp*; do
+        # Report every relevant physical data interface.  Cumulus swp devices
+        # are retained even when their sysfs driver does not expose a device
+        # link; enp/enP/ens-style HGX and host NICs are included through it.
+        # Known management and virtual interfaces cannot satisfy topology endpoints.
+        for port in /sys/class/net/*; do
             [ -d \"\$port\" ] || continue
             port_name=\$(basename \"\$port\")
+            case \"\$port_name\" in
+                lo|eth0|mgmt*|docker*|veth*|virbr*|br-*|cni*|flannel*|\
+                vxlan*|vni*|vrf*|dummy*|tun*|tap*) continue ;;
+            esac
+            if [ ! -e \"\$port/device\" ]; then
+                case \"\$port_name\" in
+                    swp*) ;;
+                    *) continue ;;
+                esac
+            fi
             oper_state=\$(cat \"\$port/operstate\" 2>/dev/null || echo 'unknown')
             carrier=\$(cat \"\$port/carrier\" 2>/dev/null || echo '0')
             
@@ -790,12 +798,24 @@ execute_commands_optimized() {
         done | sort -V
         echo '===PORT_STATUS_END==='
         
-        # Port speed
+        # Port speed. Use the same physical-interface selection as the status
+        # section so host/HGX NICs do not become speed=N/A merely because their
+        # kernel name is not swp*.
         echo ''
         echo '===PORT_SPEED_START==='
-        for port in /sys/class/net/swp*; do
+        for port in /sys/class/net/*; do
             [ -d \"\$port\" ] || continue
             port_name=\$(basename \"\$port\")
+            case \"\$port_name\" in
+                lo|eth0|mgmt*|docker*|veth*|virbr*|br-*|cni*|flannel*|\
+                vxlan*|vni*|vrf*|dummy*|tun*|tap*) continue ;;
+            esac
+            if [ ! -e \"\$port/device\" ]; then
+                case \"\$port_name\" in
+                    swp*) ;;
+                    *) continue ;;
+                esac
+            fi
             speed=\$(cat \"\$port/speed\" 2>/dev/null || echo '0')
             if [ \"\$speed\" -gt 0 ] 2>/dev/null; then
                 echo \"\$port_name \$speed\"
@@ -811,7 +831,10 @@ execute_commands_optimized() {
     fi
 
     rm -f "$temporary_file"
-    write_unavailable_lldp_input "$hostname"
+    write_unavailable_lldp_input "$hostname" || return 1
+    # The caller distinguishes an authoritative SSH/LLDP failure from a local
+    # publication error. The former is valid current No-Info evidence.
+    return 2
 }
 
 write_unavailable_lldp_input() {
@@ -829,13 +852,21 @@ process_device() {
     local device=$1
     local user=$2
     local hostname=$3
+    local ssh_status
     
-    if ping_test "$device" "$hostname"; then
-        execute_commands_optimized "$device" "$user" "$hostname" || return 1
+    # ICMP is only a hint: many otherwise reachable devices intentionally drop
+    # echo requests. Always try the authoritative SSH collection before
+    # classifying this inventory member as unavailable.
+    ping_test "$device" || true
+    if execute_commands_optimized "$device" "$user" "$hostname"; then
+        ssh_status=0
     else
-        # Keep this inventory member in the current validation input so every
-        # configured topology edge is reported as No-Info, never stale Pass.
-        write_unavailable_lldp_input "$hostname" || return 1
+        ssh_status=$?
+    fi
+    if [[ $ssh_status -eq 2 ]]; then
+        echo "$device $hostname" >> "$unreachable_hosts_file"
+    elif [[ $ssh_status -ne 0 ]]; then
+        return 1
     fi
     
     # Update progress counter (thread-safe with flock)

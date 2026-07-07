@@ -1,0 +1,69 @@
+# LLDPq Docker Compose - Linux host-network provisioning mode
+#
+# Use this file INSTEAD OF docker-compose.yml when this container must provide
+# DHCP/ONIE services on a physical L2 interface:
+#
+#   DHCP_INTERFACE=YOUR_INTERFACE PROVISION_SERVER_IP=YOUR_SERVER_IP \
+#     docker compose -f docker/docker-compose.provisioning.yml up -d
+#
+# Host networking is supported only by Linux Docker Engine. The selected IP
+# must already be assigned to DHCP_INTERFACE. Port 80 on the host must be free.
+
+services:
+  lldpq:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lldpq:latest
+    container_name: lldpq
+    privileged: true
+    network_mode: host
+    volumes:
+      - lldpq-app-config:/home/lldpq/lldpq/config
+      - lldpq-system-config:/home/lldpq/lldpq/system-config
+      - lldpq-ssh:/home/lldpq/.ssh
+      - lldpq-ansible:/home/lldpq/ansible
+      - lldpq-data:/home/lldpq/lldpq/monitor-results
+      - lldpq-lldp-data:/home/lldpq/lldpq/lldp-results
+      - lldpq-alert-state:/home/lldpq/lldpq/alert-states
+      - lldpq-lldp-jobs:/var/lib/lldpq/lldp-jobs
+      - lldpq-assets-jobs:/var/lib/lldpq/assets-jobs
+      - lldpq-upgrade-jobs:/var/lib/lldpq/upgrade-jobs
+      - lldpq-ai-state:/var/lib/lldpq/ai
+      - lldpq-provision-jobs:/var/lib/lldpq/provision-jobs
+      - lldpq-provision-state:/var/lib/lldpq/provision-state
+      - lldpq-dhcp-state:/var/lib/dhcp
+      - lldpq-configs:/var/www/html/configs
+      - lldpq-hstr:/var/www/html/hstr
+      - lldpq-generated-configs:/var/www/html/generated_config_folder
+      - lldpq-provision-files:/var/www/html/provision-uploads
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-UTC}"
+      LLDPQ_DHCP_MODE: host
+      DHCP_INTERFACE: "${DHCP_INTERFACE:?Set DHCP_INTERFACE to the physical provisioning interface}"
+      PROVISION_SERVER_IP: "${PROVISION_SERVER_IP:?Set PROVISION_SERVER_IP to the LLDPq address on DHCP_INTERFACE}"
+      # First-container preference only. Provision UI Start/Stop is persisted
+      # in lldpq-provision-state and takes precedence on later recreations.
+      DHCP_AUTOSTART: "${DHCP_AUTOSTART:-false}"
+      # ANSIBLE_DIR: /home/lldpq/ansible
+
+volumes:
+  lldpq-data:
+  lldpq-lldp-data:
+  lldpq-alert-state:
+  lldpq-lldp-jobs:
+  lldpq-assets-jobs:
+  lldpq-upgrade-jobs:
+  lldpq-ai-state:
+  lldpq-provision-jobs:
+  lldpq-provision-state: # Discovery cache, DHCP desired state and scheduler state
+  lldpq-dhcp-state:
+  lldpq-configs:
+  lldpq-hstr:
+  lldpq-generated-configs:
+  lldpq-provision-files:
+  lldpq-system-config:
+  lldpq-app-config:
+  lldpq-ssh:
+  lldpq-ansible:

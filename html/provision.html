@@ -130,11 +130,57 @@
             display: block;
         }
 
-        /* Discover and Inventory tabs use flex to fill viewport */
+        /* Table-heavy tabs use flex to fill viewport */
         #tab-discover.active,
-        #tab-bindings.active {
+        #tab-bindings.active,
+        #tab-handover.active {
             display: flex;
             flex-direction: column;
+        }
+
+        #handoverBody tr.handover-selected {
+            background: #1a2e00;
+        }
+
+        #handoverBody input[type="checkbox"],
+        #handoverSelectAll {
+            accent-color: #76b900;
+            cursor: pointer;
+        }
+
+        .handover-bulk-panel {
+            display: flex;
+            gap: 10px;
+            align-items: stretch;
+            padding: 12px;
+            margin-bottom: 15px;
+            background: #1e1e1e;
+            border: 1px solid #3c3c3c;
+            border-radius: 6px;
+        }
+
+        .handover-bulk-panel textarea {
+            flex: 1;
+            min-height: 58px;
+            max-height: 140px;
+            resize: vertical;
+            padding: 8px 12px;
+            background: #1a1a1a;
+            border: 1px solid #555;
+            border-radius: 4px;
+            color: #d4d4d4;
+            font-family: 'Cascadia Code', 'Consolas', monospace;
+            font-size: 12px;
+        }
+
+        .handover-bulk-panel textarea:focus {
+            outline: none;
+            border-color: #76b900;
+        }
+
+        #tab-handover .toolbar-right {
+            flex-wrap: wrap;
+            justify-content: flex-end;
         }
 
         /* Toolbar */
@@ -174,31 +220,32 @@
         }
 
         .btn svg { width: 16px; height: 16px; fill: currentColor; }
+        .btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
         .btn-primary {
             background: #76b900;
             color: #000;
         }
-        .btn-primary:hover { background: #8cd000; }
+        .btn-primary:not(:disabled):hover { background: #8cd000; }
         .btn-primary:disabled { background: #3d5e00; color: #666; cursor: not-allowed; }
 
         .btn-secondary {
             background: #3c3c3c;
             color: #d4d4d4;
         }
-        .btn-secondary:hover { background: #4a4a4a; }
+        .btn-secondary:not(:disabled):hover { background: #4a4a4a; }
 
         .btn-danger {
             background: #c62828;
             color: white;
         }
-        .btn-danger:hover { background: #e53935; }
+        .btn-danger:not(:disabled):hover { background: #e53935; }
 
         .btn-warning {
             background: #e65100;
             color: white;
         }
-        .btn-warning:hover { background: #ff6d00; }
+        .btn-warning:not(:disabled):hover { background: #ff6d00; }
 
         .btn-sm {
             padding: 5px 10px;
@@ -733,6 +780,7 @@
         @media (max-width: 768px) {
             .tab-btn { padding: 10px 16px; font-size: 12px; }
             .toolbar { flex-direction: column; }
+            .handover-bulk-panel { flex-direction: column; }
             .config-grid { grid-template-columns: 1fr; }
         }
     </style>
@@ -751,9 +799,9 @@
             <span id="dhcpStatusText">DHCP: Checking...</span>
         </div>
         <div style="display: flex; gap: 6px; margin-left: 15px;">
-            <button class="btn btn-primary btn-sm" onclick="dhcpServiceAction('start')" title="Start DHCP">Start</button>
-            <button class="btn btn-secondary btn-sm" onclick="dhcpServiceAction('restart')" title="Restart DHCP">Restart</button>
-            <button class="btn btn-danger btn-sm" onclick="dhcpServiceAction('stop')" title="Stop DHCP">Stop</button>
+            <button class="btn btn-primary btn-sm" id="btnDhcpStart" onclick="dhcpServiceAction('start')" title="Start DHCP" disabled>Start</button>
+            <button class="btn btn-secondary btn-sm" id="btnDhcpRestart" onclick="dhcpServiceAction('restart')" title="Restart DHCP" disabled>Restart</button>
+            <button class="btn btn-danger btn-sm" id="btnDhcpStop" onclick="dhcpServiceAction('stop')" title="Stop DHCP" disabled>Stop</button>
         </div>
     </div>
 </div>
@@ -762,6 +810,7 @@
 <div class="tab-nav">
     <button class="tab-btn active" data-tab="discover">Discover</button>
     <button class="tab-btn" data-tab="bindings">Inventory</button>
+    <button class="tab-btn" data-tab="handover">Handover</button>
     <button class="tab-btn" data-tab="dhcpd">DHCP Server</button>
     <button class="tab-btn" data-tab="ztp-script">ZTP</button>
     <button class="tab-btn" data-tab="upgrade">Upgrade</button>
@@ -868,11 +917,11 @@
                     <th style="cursor:pointer;" onclick="sortDiscovered('device_type')">Access <span id="sort-device_type" style="opacity:0.4;">&#9650;</span></th>
                     <th style="cursor:pointer;" onclick="sortDiscovered('post_provision')">Base Config <span id="sort-post_provision" style="opacity:0.4;">&#9650;</span></th>
                     <th style="cursor:pointer;" onclick="sortDiscovered('mac_status')">Status <span id="sort-mac_status" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="width:80px;"></th>
+                    <th style="width:80px;" title="Re-deploy a matching saved NVUE configuration">NVUE Config</th>
                 </tr>
             </thead>
             <tbody id="discoveredBody">
-                <tr><td colspan="8" class="loading">Click Scan to discover devices...</td></tr>
+                <tr><td colspan="9" class="loading">Click Scan to discover devices...</td></tr>
             </tbody>
         </table>
     </div>
@@ -1033,6 +1082,88 @@
             </thead>
             <tbody id="bindingsBody">
                 <tr><td colspan="10" class="loading">Loading inventory...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<!-- ==================== TAB 2: HANDOVER ==================== -->
+<div class="tab-content" id="tab-handover">
+    <div>
+        <div>
+            <div class="section-title">Switch Handover</div>
+            <div class="section-desc" style="margin-bottom:10px;">Admin-only lifecycle tracking. Classification changes monitoring views only; device collection and <code style="color:#76b900;">devices.yaml</code> are not changed.</div>
+            <div id="trackingWarning" style="display:none; margin-bottom:10px; padding:8px 10px; border:1px solid #e65100; border-radius:4px; background:#3b2600; color:#ffb74d; font-size:12px;"></div>
+        </div>
+    </div>
+
+    <div class="stats-row" id="handoverStats">
+        <div class="stat-card" style="border-left-color:#888; cursor:pointer;" onclick="setTrackingStateFilter('all')">
+            <div class="stat-value" id="trackingStatTotal">-</div>
+            <div class="stat-label">All Switches</div>
+        </div>
+        <div class="stat-card" style="border-left-color:#76b900; cursor:pointer;" onclick="setTrackingStateFilter('commissioning')">
+            <div class="stat-value" id="trackingStatCommissioning">-</div>
+            <div class="stat-label">Commissioning</div>
+        </div>
+        <div class="stat-card" style="border-left-color:#42a5f5; cursor:pointer;" onclick="setTrackingStateFilter('handed_over')">
+            <div class="stat-value" id="trackingStatHandedOver">-</div>
+            <div class="stat-label">Handed Over</div>
+        </div>
+        <div class="stat-card" style="border-left-color:#ff9800;">
+            <div class="stat-value" id="trackingStatSelected">0</div>
+            <div class="stat-label">Selected</div>
+        </div>
+    </div>
+
+    <div class="handover-bulk-panel">
+        <textarea id="trackingPasteHostnames" spellcheck="false" aria-label="Paste switch hostnames" placeholder="Paste switch hostnames (one per line, or separated by spaces/commas)"></textarea>
+        <div style="display:flex; flex-direction:column; gap:6px; justify-content:center;">
+            <button class="btn btn-secondary btn-sm" onclick="selectPastedTrackingHostnames()">Select Hostnames</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearTrackingSelection()">Clear Selection</button>
+        </div>
+    </div>
+
+    <div class="toolbar">
+        <div class="toolbar-left">
+            <input type="search" class="search-filter" id="trackingSearch" placeholder="Filter by hostname, IP, or role..." oninput="renderTracking()" autocomplete="off" readonly onfocus="this.removeAttribute('readonly');">
+            <select class="form-input" id="trackingStateFilter" onchange="renderTracking()" style="width:170px;">
+                <option value="all">All states</option>
+                <option value="commissioning">Commissioning</option>
+                <option value="handed_over">Handed Over</option>
+            </select>
+            <select class="form-input" id="trackingRoleFilter" onchange="renderTracking()" style="width:170px;">
+                <option value="all">All roles</option>
+            </select>
+            <span id="trackingListInfo" style="font-size:12px; color:#888;"></span>
+        </div>
+        <div class="toolbar-right">
+            <button class="btn btn-secondary" onclick="selectAllTrackingFiltered(true)" id="btnTrackingSelectFiltered">Select All Filtered</button>
+            <button class="btn btn-secondary" onclick="loadTracking(true)" id="btnTrackingRefresh">
+                <svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+                Refresh
+            </button>
+            <button class="btn btn-primary" onclick="previewTrackingMove('handed_over')" id="btnMoveToHandedOver" disabled>Move to Handed Over</button>
+            <button class="btn btn-secondary" onclick="previewTrackingMove('commissioning')" id="btnMoveToCommissioning" disabled>Move Back to Commissioning</button>
+        </div>
+    </div>
+
+    <div class="table-wrapper">
+        <table class="data-table" id="handoverTable">
+            <thead>
+                <tr>
+                    <th style="width:42px; text-align:center;"><input type="checkbox" id="handoverSelectAll" onchange="selectAllTrackingFiltered(this.checked)" aria-label="Select all filtered switches"></th>
+                    <th>Hostname</th>
+                    <th>IP Address</th>
+                    <th>Role</th>
+                    <th>State</th>
+                    <th>Changed At</th>
+                    <th>Changed By</th>
+                    <th>Note</th>
+                </tr>
+            </thead>
+            <tbody id="handoverBody">
+                <tr><td colspan="8" class="loading">Open this tab to load switch tracking...</td></tr>
             </tbody>
         </table>
     </div>
@@ -1393,6 +1524,20 @@
     </div>
 </div>
 
+<!-- Handover Change Preview Modal -->
+<div class="modal-overlay" id="trackingPreviewModal" style="display:none;" onclick="if(event.target===this)closeTrackingPreview()">
+    <div class="modal" style="width:620px; max-width:90vw;">
+        <h3 id="trackingPreviewTitle">Confirm Handover Change</h3>
+        <div id="trackingPreviewSummary" style="font-size:13px; color:#ccc; line-height:1.6; margin-bottom:12px;"></div>
+        <div id="trackingPreviewList" style="max-height:240px; overflow:auto; padding:10px 12px; background:#1e1e1e; border:1px solid #3c3c3c; border-radius:4px; color:#aaa; font-family:'Cascadia Code','Consolas',monospace; font-size:12px; line-height:1.65;"></div>
+        <div style="margin-top:12px; color:#888; font-size:11px;">This updates tracking classification only. Collection settings and device configuration are unchanged.</div>
+        <div class="modal-actions">
+            <button class="btn btn-secondary" onclick="closeTrackingPreview()">Cancel</button>
+            <button class="btn btn-primary" onclick="saveTrackingMove()" id="btnConfirmTrackingMove">Confirm</button>
+        </div>
+    </div>
+</div>
+
 <!-- Toast container -->
 <div class="toast" id="toast"></div>
 
@@ -1400,10 +1545,19 @@
 // ===================== GLOBAL STATE =====================
 let allBindings = [];
 let bindingsModified = false;
+let inventoryRevision = '';
+let inventoryLoaded = false;
 let allDiscovered = [];
 let deviceList = [];
 let knownRoles = []; // populated from devices.yaml via list-roles API
 let pendingRemovals = []; // hostnames to remove from devices.yaml on save
+let trackingDevices = [];
+let trackingRevision = '';
+let trackingLoaded = false;
+let trackingBusy = false;
+let trackingSelected = new Set();
+let trackingPendingState = '';
+let trackingPendingHostnames = [];
 
 const BASE_CONFIG_FILES = [
     { name: 'bash.bashrc', dest: '/etc/bash.bashrc', destAlt: '/home/cumulus/.bashrc', type: 'config', desc: 'Shell aliases & VRF helpers' },
@@ -1453,8 +1607,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Load initial data
     loadDiscoverySettings();
     loadDiscoveryCache();
-    // Load generated configs up-front so the Deploy button in the discovered table is deterministic.
-    // (Discover is the default tab; without this the button only appeared once some later render
+    // Load generated configs up-front so the NVUE re-deploy action is deterministic.
+    // (Discover is the default tab; without this the action only appeared once some later render
     //  happened to run after configs loaded — hence the "comes and goes" flicker.)
     apiCall('list-generated-configs').then(d => { if (d.success) { generatedConfigs = d.configs || []; renderDiscovered(); } });
     loadDeviceList();
@@ -1468,7 +1622,7 @@ function onTabSwitch(tab) {
     if (tab !== 'dhcpd') stopDhcpLog();   // stop log polling when leaving the DHCP tab
     if (tab === 'discover') {
         loadDiscoveryCache();
-        // Re-render after configs load so the Deploy button appears deterministically (no flicker).
+        // Re-render after configs load so the re-deploy action has no flicker.
         if (generatedConfigs.length === 0) apiCall('list-generated-configs').then(d => { if (d.success) { generatedConfigs = d.configs || []; renderDiscovered(); } });
     }
     if (tab === 'dhcpd') { loadDHCPConfig(); loadDHCPHosts(); updateDhcpLiveBtn(); restartDhcpLogTimer(); }
@@ -1479,6 +1633,10 @@ function onTabSwitch(tab) {
         // Load generated configs for Cfg column (if not loaded yet)
         if (generatedConfigs.length === 0) apiCall('list-generated-configs').then(d => { if (d.success) { generatedConfigs = d.configs || []; renderBindings(); } });
     }
+    if (tab === 'handover') {
+        if (!trackingLoaded) loadTracking();
+        else renderTracking();
+    }
     if (tab === 'ztp-script') loadZTPScript();
     if (tab === 'upgrade') loadUpgradeCandidates();
 }
@@ -1488,6 +1646,325 @@ function setDiscoveredFilter(status) {
     renderDiscovered();
     // Scroll to discovered table
     document.getElementById('discoveredTable').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// ===================== TAB 2: HANDOVER TRACKING =====================
+function normalizeTrackingState(state) {
+    const value = String(state || '').trim().toLowerCase().replace(/[ -]+/g, '_');
+    return value === 'handed_over' ? 'handed_over' : 'commissioning';
+}
+
+function trackingMetadataMap(data) {
+    const switches = (data && data.switches) || (data && data.tracking && data.tracking.switches) || {};
+    if (!switches || Array.isArray(switches) || typeof switches !== 'object') return {};
+    return switches;
+}
+
+function applyTrackingPayload(data, fallbackDevices = []) {
+    const source = Array.isArray(data.devices) ? data.devices : (Array.isArray(fallbackDevices) ? fallbackDevices : []);
+    const hasHandedOverList = Array.isArray(data.handed_over_switches);
+    const handedOver = new Set((hasHandedOverList ? data.handed_over_switches : []).map(value => String(value)));
+    const metadata = trackingMetadataMap(data);
+    const unique = new Map();
+
+    source.forEach(raw => {
+        if (!raw || typeof raw !== 'object') return;
+        const hostname = String(raw.hostname || raw.name || '').trim();
+        if (!hostname || unique.has(hostname)) return;
+        const extra = metadata[hostname] && typeof metadata[hostname] === 'object' ? metadata[hostname] : {};
+        const state = hasHandedOverList
+            ? (handedOver.has(hostname) ? 'handed_over' : data.default_state)
+            : (raw.state || extra.state || data.default_state);
+        unique.set(hostname, {
+            hostname,
+            ip: String(raw.ip || raw.address || ''),
+            role: String(raw.role || 'ungrouped'),
+            state: normalizeTrackingState(state),
+            changed_at: String(raw.changed_at || extra.changed_at || ''),
+            changed_by: String(raw.changed_by || extra.changed_by || ''),
+            note: String(raw.note || extra.note || ''),
+        });
+    });
+
+    trackingDevices = Array.from(unique.values()).sort((a, b) =>
+        a.hostname.localeCompare(b.hostname, undefined, { numeric: true, sensitivity: 'base' })
+    );
+    trackingRevision = data.revision !== undefined ? String(data.revision || '') : trackingRevision;
+    trackingLoaded = true;
+
+    const currentNames = new Set(trackingDevices.map(device => device.hostname));
+    trackingSelected = new Set(Array.from(trackingSelected).filter(hostname => currentNames.has(hostname)));
+
+    const orphaned = Array.isArray(data.orphaned_switches) ? data.orphaned_switches : [];
+    const orphanedNames = orphaned.map(item =>
+        typeof item === 'string' ? item : String((item && (item.hostname || item.name)) || '')
+    ).filter(Boolean);
+    const warning = document.getElementById('trackingWarning');
+    if (orphanedNames.length > 0) {
+        const preview = orphanedNames.slice(0, 6).map(escHtml).join(', ');
+        const more = orphanedNames.length > 6 ? ` and ${orphanedNames.length - 6} more` : '';
+        warning.innerHTML = `<strong>${orphanedNames.length} orphaned tracking entr${orphanedNames.length === 1 ? 'y' : 'ies'}:</strong> ${preview}${more}. These switches are not in devices.yaml and are preserved until they are reconciled.`;
+        warning.style.display = '';
+    } else {
+        warning.textContent = '';
+        warning.style.display = 'none';
+    }
+
+    refreshTrackingRoleFilter();
+    renderTracking();
+}
+
+async function loadTracking(force = false) {
+    if (trackingBusy) return;
+    if (!force && trackingLoaded) {
+        renderTracking();
+        return;
+    }
+
+    trackingBusy = true;
+    updateTrackingControls();
+    document.getElementById('handoverBody').innerHTML = '<tr><td colspan="8" class="loading">Loading switch tracking...</td></tr>';
+    const data = await apiCall('get-tracking');
+    if (!data.success) {
+        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="8" style="color:#f44336;padding:20px;">Error: ${escHtml(String(data.error || 'Unable to load tracking'))}</td></tr>`;
+        showToast('Tracking load failed: ' + (data.error || 'Unknown error'), 'error');
+        trackingBusy = false;
+        updateTrackingControls();
+        return;
+    }
+
+    let fallbackDevices = deviceList;
+    if (!Array.isArray(data.devices) && fallbackDevices.length === 0) {
+        const devicesData = await apiCall('list-devices');
+        if (devicesData.success && Array.isArray(devicesData.devices)) fallbackDevices = devicesData.devices;
+    }
+    trackingSelected.clear();
+    applyTrackingPayload(data, fallbackDevices);
+    trackingBusy = false;
+    updateTrackingControls();
+}
+
+function refreshTrackingRoleFilter() {
+    const select = document.getElementById('trackingRoleFilter');
+    if (!select) return;
+    const current = select.value || 'all';
+    const roles = Array.from(new Set(trackingDevices.map(device => device.role || 'ungrouped')))
+        .sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    select.innerHTML = '<option value="all">All roles</option>' + roles.map(role =>
+        `<option value="${escHtml(role)}">${escHtml(role)}</option>`
+    ).join('');
+    select.value = roles.includes(current) ? current : 'all';
+}
+
+function filteredTrackingDevices() {
+    const search = (document.getElementById('trackingSearch').value || '').trim().toLowerCase();
+    const state = document.getElementById('trackingStateFilter').value || 'all';
+    const role = document.getElementById('trackingRoleFilter').value || 'all';
+    return trackingDevices.filter(device => {
+        if (state !== 'all' && device.state !== state) return false;
+        if (role !== 'all' && device.role !== role) return false;
+        return !search || device.hostname.toLowerCase().includes(search) ||
+            device.ip.toLowerCase().includes(search) || device.role.toLowerCase().includes(search);
+    });
+}
+
+function formatTrackingDate(value) {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return escHtml(String(value));
+    return escHtml(date.toLocaleString());
+}
+
+function renderTracking() {
+    if (!trackingLoaded) return;
+    const filtered = filteredTrackingDevices();
+    const commissioning = trackingDevices.filter(device => device.state === 'commissioning').length;
+    const handedOver = trackingDevices.length - commissioning;
+    document.getElementById('trackingStatTotal').textContent = trackingDevices.length;
+    document.getElementById('trackingStatCommissioning').textContent = commissioning;
+    document.getElementById('trackingStatHandedOver').textContent = handedOver;
+    document.getElementById('trackingStatSelected').textContent = trackingSelected.size;
+    document.getElementById('trackingListInfo').textContent = `${filtered.length} of ${trackingDevices.length} switches`;
+
+    const selectAll = document.getElementById('handoverSelectAll');
+    const selectedFiltered = filtered.filter(device => trackingSelected.has(device.hostname)).length;
+    selectAll.checked = filtered.length > 0 && selectedFiltered === filtered.length;
+    selectAll.indeterminate = selectedFiltered > 0 && selectedFiltered < filtered.length;
+    selectAll.disabled = trackingBusy || filtered.length === 0;
+
+    if (filtered.length === 0) {
+        document.getElementById('handoverBody').innerHTML = `<tr><td colspan="8" style="text-align:center; padding:40px; color:#666;">${trackingDevices.length === 0 ? 'No switches found in devices.yaml.' : 'No switches match the current filters.'}</td></tr>`;
+        updateTrackingControls();
+        return;
+    }
+
+    document.getElementById('handoverBody').innerHTML = filtered.map(device => {
+        const selected = trackingSelected.has(device.hostname);
+        const stateBadge = device.state === 'handed_over'
+            ? '<span class="badge badge-info">Handed Over</span>'
+            : '<span class="badge badge-success">Commissioning</span>';
+        return `<tr class="${selected ? 'handover-selected' : ''}">
+            <td style="text-align:center;"><input type="checkbox" ${selected ? 'checked' : ''} onchange="toggleTrackingSelection('${escAttr(device.hostname)}', this.checked)" aria-label="Select ${escHtml(device.hostname)}"></td>
+            <td><strong>${escHtml(device.hostname)}</strong></td>
+            <td style="font-family:'Cascadia Code','Consolas',monospace; font-size:12px;">${escHtml(device.ip) || '-'}</td>
+            <td>${escHtml(device.role) || '-'}</td>
+            <td>${stateBadge}</td>
+            <td style="color:#888; white-space:nowrap;">${formatTrackingDate(device.changed_at)}</td>
+            <td>${escHtml(device.changed_by) || '-'}</td>
+            <td style="color:#888; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escAttr(device.note)}">${escHtml(device.note) || '-'}</td>
+        </tr>`;
+    }).join('');
+    updateTrackingControls();
+}
+
+function updateTrackingControls() {
+    const selectedDevices = trackingDevices.filter(device => trackingSelected.has(device.hostname));
+    const toHandedOver = selectedDevices.some(device => device.state !== 'handed_over');
+    const toCommissioning = selectedDevices.some(device => device.state === 'handed_over');
+    const refresh = document.getElementById('btnTrackingRefresh');
+    const selectFiltered = document.getElementById('btnTrackingSelectFiltered');
+    const handover = document.getElementById('btnMoveToHandedOver');
+    const commissioning = document.getElementById('btnMoveToCommissioning');
+    if (refresh) refresh.disabled = trackingBusy;
+    if (selectFiltered) selectFiltered.disabled = trackingBusy || filteredTrackingDevices().length === 0;
+    if (handover) handover.disabled = trackingBusy || !toHandedOver;
+    if (commissioning) commissioning.disabled = trackingBusy || !toCommissioning;
+}
+
+function setTrackingStateFilter(state) {
+    document.getElementById('trackingStateFilter').value = state;
+    renderTracking();
+}
+
+function toggleTrackingSelection(hostname, checked) {
+    if (checked) trackingSelected.add(hostname);
+    else trackingSelected.delete(hostname);
+    renderTracking();
+}
+
+function selectAllTrackingFiltered(checked) {
+    filteredTrackingDevices().forEach(device => {
+        if (checked) trackingSelected.add(device.hostname);
+        else trackingSelected.delete(device.hostname);
+    });
+    renderTracking();
+}
+
+function clearTrackingSelection() {
+    trackingSelected.clear();
+    renderTracking();
+}
+
+function selectPastedTrackingHostnames() {
+    const input = document.getElementById('trackingPasteHostnames');
+    const tokens = Array.from(new Set((input.value || '').split(/[\s,;]+/).map(value => value.trim()).filter(Boolean)));
+    if (tokens.length === 0) {
+        showToast('Paste at least one switch hostname', 'info');
+        return;
+    }
+    const canonical = new Map(trackingDevices.map(device => [device.hostname.toLowerCase(), device.hostname]));
+    const unknown = [];
+    let added = 0;
+    tokens.forEach(token => {
+        const hostname = canonical.get(token.toLowerCase());
+        if (!hostname) unknown.push(token);
+        else if (!trackingSelected.has(hostname)) {
+            trackingSelected.add(hostname);
+            added++;
+        }
+    });
+    renderTracking();
+    if (unknown.length > 0) {
+        const preview = unknown.slice(0, 5).join(', ');
+        const more = unknown.length > 5 ? ` and ${unknown.length - 5} more` : '';
+        showToast(`${added} selected; unknown hostname${unknown.length === 1 ? '' : 's'}: ${preview}${more}`, 'error');
+    } else {
+        showToast(`${added} switch${added === 1 ? '' : 'es'} added to selection`, 'success');
+    }
+}
+
+function previewTrackingMove(targetState) {
+    const state = normalizeTrackingState(targetState);
+    const actionable = trackingDevices.filter(device =>
+        trackingSelected.has(device.hostname) && device.state !== state
+    );
+    if (actionable.length === 0) {
+        showToast(`Selected switches are already ${state === 'handed_over' ? 'Handed Over' : 'Commissioning'}`, 'info');
+        return;
+    }
+
+    trackingPendingState = state;
+    trackingPendingHostnames = actionable.map(device => device.hostname).sort((a, b) =>
+        a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+    );
+    const handedOver = state === 'handed_over';
+    document.getElementById('trackingPreviewTitle').textContent = handedOver ? 'Move to Handed Over' : 'Move Back to Commissioning';
+    document.getElementById('trackingPreviewSummary').innerHTML = `<strong>${actionable.length}</strong> switch${actionable.length === 1 ? '' : 'es'} will move to <strong>${handedOver ? 'Handed Over' : 'Commissioning'}</strong>.`;
+    document.getElementById('trackingPreviewList').textContent = trackingPendingHostnames.join('\n');
+    const confirm = document.getElementById('btnConfirmTrackingMove');
+    confirm.textContent = handedOver ? 'Confirm Handover' : 'Confirm Move Back';
+    confirm.disabled = false;
+    document.getElementById('trackingPreviewModal').style.display = 'flex';
+}
+
+function closeTrackingPreview() {
+    if (trackingBusy) return;
+    document.getElementById('trackingPreviewModal').style.display = 'none';
+    trackingPendingState = '';
+    trackingPendingHostnames = [];
+}
+
+async function saveTrackingMove() {
+    if (trackingBusy || !trackingPendingState || trackingPendingHostnames.length === 0) return;
+    const targetState = trackingPendingState;
+    const changedHostnames = trackingPendingHostnames.slice();
+    const handedOver = new Set(
+        trackingDevices.filter(device => device.state === 'handed_over').map(device => device.hostname)
+    );
+    changedHostnames.forEach(hostname => {
+        if (targetState === 'handed_over') handedOver.add(hostname);
+        else handedOver.delete(hostname);
+    });
+
+    trackingBusy = true;
+    updateTrackingControls();
+    const confirm = document.getElementById('btnConfirmTrackingMove');
+    confirm.disabled = true;
+    confirm.textContent = 'Saving...';
+    const data = await apiCall('save-tracking', {
+        revision: trackingRevision,
+        handed_over_switches: Array.from(handedOver).sort((a, b) =>
+            a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+        ),
+    });
+
+    trackingBusy = false;
+    if (data.success) {
+        document.getElementById('trackingPreviewModal').style.display = 'none';
+        trackingPendingState = '';
+        trackingPendingHostnames = [];
+        trackingSelected.clear();
+        document.getElementById('trackingPasteHostnames').value = '';
+        applyTrackingPayload(data, trackingDevices);
+        showToast(data.message || `${changedHostnames.length} switch${changedHostnames.length === 1 ? '' : 'es'} updated`, 'success');
+        return;
+    }
+
+    if (data.error_code === 'tracking_conflict' || data.conflict) {
+        document.getElementById('trackingPreviewModal').style.display = 'none';
+        trackingPendingState = '';
+        trackingPendingHostnames = [];
+        trackingSelected.clear();
+        showToast('Tracking changed by another admin. Reloaded the latest version; review your selection and try again.', 'error');
+        trackingLoaded = false;
+        await loadTracking(true);
+        return;
+    }
+
+    confirm.disabled = false;
+    confirm.textContent = targetState === 'handed_over' ? 'Confirm Handover' : 'Confirm Move Back';
+    updateTrackingControls();
+    showToast('Tracking save failed: ' + (data.error || 'Unknown error'), 'error');
 }
 
 // ===================== API HELPER =====================
@@ -1567,39 +2044,96 @@ function showToast(msg, type = 'info') {
 }
 
 // ===================== DHCP STATUS CHECK =====================
-async function checkDHCPStatus() {
+let _dhcpServiceBusy = false;
+let _dhcpServiceRunning = null;
+let _dhcpStatusRequestId = 0;
+
+function updateDhcpServiceControls() {
+    const start = document.getElementById('btnDhcpStart');
+    const restart = document.getElementById('btnDhcpRestart');
+    const stop = document.getElementById('btnDhcpStop');
+    if (!start || !restart || !stop) return;
+    start.disabled = _dhcpServiceBusy || _dhcpServiceRunning !== false;
+    restart.disabled = _dhcpServiceBusy || _dhcpServiceRunning !== true;
+    stop.disabled = _dhcpServiceBusy || _dhcpServiceRunning !== true;
+}
+
+async function checkDHCPStatus(force = false) {
+    // Ordinary polling is observational and must never race an in-flight
+    // start/stop/restart or config-save transaction.
+    if (_dhcpServiceBusy && !force) return null;
+    const requestId = ++_dhcpStatusRequestId;
     const data = await apiCall('dhcp-service-status');
+    if (requestId !== _dhcpStatusRequestId) return data;
     const dot = document.getElementById('dhcpStatusDot');
     const txt = document.getElementById('dhcpStatusText');
     if (data.success && data.running) {
+        _dhcpServiceRunning = true;
         dot.className = 'status-dot active';
         txt.textContent = 'DHCP: Running';
     } else if (data.success && !data.running) {
+        _dhcpServiceRunning = false;
         dot.className = 'status-dot inactive';
         txt.textContent = 'DHCP: Stopped';
     } else {
+        _dhcpServiceRunning = null;
         dot.className = 'status-dot unknown';
         txt.textContent = 'DHCP: Unknown';
+    }
+    updateDhcpServiceControls();
+    return data;
+}
+
+function beginDhcpServiceOperation() {
+    if (_dhcpServiceBusy) return false;
+    _dhcpServiceBusy = true;
+    // Invalidate a status request that began before this mutation.
+    _dhcpStatusRequestId++;
+    updateDhcpServiceControls();
+    return true;
+}
+
+async function finishDhcpServiceOperation() {
+    try {
+        // This refresh is authoritative for the operation that just ended.
+        await checkDHCPStatus(true);
+    } finally {
+        _dhcpServiceBusy = false;
+        updateDhcpServiceControls();
     }
 }
 
 // ===================== DHCP SERVICE CONTROL =====================
 async function dhcpServiceAction(action) {
+    if (_dhcpServiceBusy) return;
+    if (action === 'restart') {
+        showConfirmModal(
+            'Restart DHCP Server',
+            'Restart DHCP server? New DHCP requests may be briefly interrupted.',
+            () => _dhcpServiceAction(action),
+            'Restart'
+        );
+        return;
+    }
     if (action === 'stop') {
         showConfirmModal('Stop DHCP Server', 'Stop DHCP server? New devices will not get IP addresses.', () => _dhcpServiceAction(action));
         return;
     }
-    _dhcpServiceAction(action);
+    return _dhcpServiceAction(action);
 }
 async function _dhcpServiceAction(action) {
-    showToast(`DHCP: ${action}...`, 'info');
-    const data = await apiCall('dhcp-service-control', { action });
-    if (data.success) {
-        showToast(`DHCP ${action}: ${data.message || 'OK'}`, 'success');
-    } else {
-        showToast(`DHCP ${action} failed: ${data.error || 'Unknown error'}`, 'error');
+    if (!beginDhcpServiceOperation()) return;
+    try {
+        showToast(`DHCP: ${action}...`, 'info');
+        const data = await apiCall('dhcp-service-control', { action });
+        if (data.success) {
+            showToast(`DHCP ${action}: ${data.message || 'OK'}`, 'success');
+        } else {
+            showToast(`DHCP ${action} failed: ${data.error || 'Unknown error'}`, 'error');
+        }
+    } finally {
+        await finishDhcpServiceOperation();
     }
-    checkDHCPStatus();
 }
 
 // ===================== DHCP HOSTS (read-only) =====================
@@ -1686,12 +2220,19 @@ async function saveDHCPConfig() {
         return;
     }
 
-    const data = await apiCall('save-dhcp-config', config);
-    if (data.success) {
-        showToast('DHCP config saved & server restarted', 'success');
-        checkDHCPStatus();
-    } else {
-        showToast('Save failed: ' + (data.error || 'Unknown error'), 'error');
+    if (!beginDhcpServiceOperation()) {
+        showToast('Another DHCP operation is already in progress', 'error');
+        return;
+    }
+    try {
+        const data = await apiCall('save-dhcp-config', config);
+        if (data.success) {
+            showToast(data.message || 'DHCP config saved & server restarted', 'success');
+        } else {
+            showToast('Save failed: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } finally {
+        await finishDhcpServiceOperation();
     }
 }
 
@@ -1767,8 +2308,12 @@ async function rebuildDevicesYaml() {
     msg += `<br><span style="color:#888;font-size:12px;">Grouped by role, sorted by IP within each group.</span>`;
 
     showConfirmModal('Rebuild devices.yaml', msg, async () => {
-        const data = await apiCall('rebuild-devices-yaml', { bindings: allBindings });
+        const data = await apiCall('rebuild-devices-yaml', {
+            bindings: allBindings,
+            revision: inventoryRevision
+        });
         if (data.success) {
+            inventoryRevision = data.revision || inventoryRevision;
             showToast(data.message || 'devices.yaml rebuilt', 'success');
         } else {
             showToast('Failed: ' + (data.error || ''), 'error');
@@ -1815,24 +2360,46 @@ function closeBulkImport() {
 }
 
 function parseBulkText(text) {
-    const lines = text.trim().split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
+    // Do not trim the complete payload: a trailing tab/comma represents an
+    // explicitly provided empty final column.
+    const lines = String(text || '').split(/\r?\n/).filter(l => l.trim() && !l.trim().startsWith('#'));
     const entries = [];
     const errors = [];
 
     const clean = v => (!v || v === '-') ? '' : v.trim();
     const isMAC = v => /^([0-9a-fx]{2}:){5}[0-9a-fx]{2}$/.test(v);
-    const isIP = v => /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v);
+    const isIP = v => {
+        const parts = String(v || '').split('.');
+        return parts.length === 4 && parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+    };
 
     lines.forEach((line, idx) => {
         // Skip CSV header row
         if (idx === 0 && /^hostname/i.test(line.trim())) return;
-        // Split by comma, tab, or whitespace
-        const parts = line.trim().split(/[,\t]\s*|\s+/).filter(Boolean);
+        // Delimited formats must preserve empty columns so our own CSV export
+        // round-trips correctly. Compact whitespace input keeps its legacy
+        // two-column hostname + MAC/IP behaviour.
+        const rawLine = line.replace(/\r$/, '');
+        const trimmedLine = rawLine.trim();
+        let parts;
+        if (rawLine.includes(',')) {
+            parts = rawLine.split(',').map(part => part.trim());
+        } else if (rawLine.includes('\t')) {
+            parts = rawLine.split('\t').map(part => part.trim());
+        } else {
+            parts = trimmedLine.split(/\s+/).filter(Boolean);
+        }
         if (parts.length < 1) return;
 
         // Fixed column order: Hostname  MAC  IP  Serial  Role
         // Use "-" for empty fields. Short lines OK (missing = empty).
         let hostname = parts[0];
+        const provided = {
+            mac: parts.length > 1,
+            ip: parts.length > 2,
+            serial: parts.length > 3,
+            role: parts.length > 4,
+        };
         let mac = clean(parts[1]) || '';
         let ip = clean(parts[2]) || '';
         let serial = clean(parts[3]) || '';
@@ -1841,13 +2408,24 @@ function parseBulkText(text) {
         // Smart fallback for 2-column lines: detect MAC vs IP
         if (parts.length === 2) {
             mac = ''; ip = ''; serial = ''; role = '';
-            if (isIP(parts[1])) ip = parts[1];
-            else if (isMAC(parts[1])) mac = parts[1].toLowerCase();
+            provided.mac = false;
+            provided.ip = false;
+            if (isIP(parts[1])) { ip = parts[1]; provided.ip = true; }
+            else if (isMAC(parts[1])) { mac = parts[1].toLowerCase(); provided.mac = true; }
+            else if (parts[1] !== '-') errors.push(`Line ${idx + 1}: invalid MAC or IP "${parts[1]}"`);
         }
 
         // Normalize MAC
         if (mac && isMAC(mac)) mac = mac.toLowerCase();
-        else if (mac && !isMAC(mac)) mac = '';
+        else if (mac && !isMAC(mac)) {
+            errors.push(`Line ${idx + 1}: invalid MAC "${mac}"`);
+            return;
+        }
+
+        if (ip && !isIP(ip)) {
+            errors.push(`Line ${idx + 1}: invalid IP "${ip}"`);
+            return;
+        }
 
         // Normalize: empty mac shows as '-'
         if (!mac) mac = '-';
@@ -1855,7 +2433,7 @@ function parseBulkText(text) {
         // Auto-detect DHCP: if MAC is provided, device needs DHCP; if no MAC (static IP), it doesn't
         const dhcp = (mac && mac !== '-');
 
-        entries.push({ hostname, mac, ip, serial, role: role.toLowerCase(), commented: false, dhcp });
+        entries.push({ hostname, mac, ip, serial, role: role.toLowerCase(), commented: false, dhcp, _provided: provided });
     });
 
     return { entries, errors };
@@ -1889,16 +2467,22 @@ function applyBulkImport() {
         if (existing >= 0) {
             // Merge: keep existing values for fields not provided in import
             const old = allBindings[existing];
+            const provided = entry._provided || {};
             allBindings[existing] = {
                 ...old,
-                ...entry,
-                mac: entry.mac !== '-' ? entry.mac : old.mac,
-                serial: entry.serial || old.serial || '',
-                role: entry.role || old.role || '',
+                hostname: entry.hostname,
+                mac: provided.mac ? entry.mac : old.mac,
+                ip: provided.ip ? entry.ip : old.ip,
+                serial: provided.serial ? entry.serial : (old.serial || ''),
+                role: provided.role ? entry.role : (old.role || ''),
+                dhcp: provided.mac ? entry.dhcp : old.dhcp,
+                commented: false,
             };
             updated++;
         } else {
-            allBindings.push(entry);
+            const cleanEntry = { ...entry };
+            delete cleanEntry._provided;
+            allBindings.push(cleanEntry);
             added++;
         }
     });
@@ -1916,11 +2500,15 @@ async function loadBindings() {
     const data = await apiCall('list-bindings');
     if (data.success) {
         allBindings = data.bindings || [];
+        inventoryRevision = data.revision || '';
+        inventoryLoaded = true;
         bindingsModified = false;
         document.getElementById('btnSaveBindings').style.display = 'none'; document.getElementById('btnDiscardBindings').style.display = 'none';
         renderBindings();
+        return true;
     } else {
         document.getElementById('bindingsBody').innerHTML = `<tr><td colspan="9" style="color:#f44336;padding:20px;">Error: ${data.error}</td></tr>`;
+        return false;
     }
 }
 
@@ -1979,7 +2567,9 @@ function renderBindings() {
     
     // Count devices in scan but NOT in inventory
     const invIps = new Set(allBindings.map(b => b.ip));
-    const noBinding = (allDiscovered || []).filter(d => d.ip && !invIps.has(d.ip)).length;
+    const noBinding = (allDiscovered || []).filter(
+        d => d.ip && !invIps.has(d.ip) && isDiscoveredNotInInventory(d)
+    ).length;
     
     const parts = [`${filtered.length} of ${allBindings.length} entries`];
     if (statActive) parts.push(`Active: ${statActive}`);
@@ -2460,8 +3050,22 @@ function saveBinding() {
     }
 
     // IP format validation
-    if (!/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(ip)) {
+    const ipParts = ip.split('.');
+    if (ipParts.length !== 4 || !ipParts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
         showToast('Invalid IP format', 'error');
+        return;
+    }
+
+    const duplicate = allBindings.find(x =>
+        x.hostname !== origHostname && (
+            x.hostname.toLowerCase() === hostname.toLowerCase() ||
+            (ip && x.ip === ip) ||
+            (mac !== '-' && x.mac && x.mac !== '-' && x.mac.toLowerCase() === mac) ||
+            (serial && x.serial && x.serial.toLowerCase() === serial.toLowerCase())
+        )
+    );
+    if (duplicate) {
+        showToast(`Duplicate inventory identity conflicts with "${duplicate.hostname}"`, 'error');
         return;
     }
 
@@ -2513,9 +3117,11 @@ async function saveBindings() {
         bindings: allBindings,
         sync_devices: true,
         remove_devices: pendingRemovals,
-        restart_dhcp: false
+        restart_dhcp: false,
+        revision: inventoryRevision
     });
     if (data.success) {
+        inventoryRevision = data.revision || inventoryRevision;
         bindingsModified = false;
         pendingRemovals = [];
         btn.style.display = 'none';
@@ -2525,15 +3131,7 @@ async function saveBindings() {
         // Ask if user wants to restart DHCP
         showConfirmModal('Restart DHCP?',
             'Bindings saved successfully.<br><br>Restart DHCP server to apply changes?<br><span style="color:#888;font-size:12px;">Skip if DHCP is not running (e.g. Docker without DHCP).</span>',
-            async () => {
-                const r = await apiCall('dhcp-service-control', { action: 'restart' });
-                if (r.success) {
-                    showToast('DHCP restarted: ' + (r.message || 'OK'), 'success');
-                } else {
-                    showToast('DHCP restart failed: ' + (r.error || ''), 'error');
-                }
-                checkDHCPStatus();
-            }, 'Restart', 'No');
+            () => _dhcpServiceAction('restart'), 'Restart', 'No');
     } else {
         showToast('Save failed: ' + (data.error || 'Unknown error'), 'error');
     }
@@ -2569,12 +3167,18 @@ async function loadDiscoveryCache() {
         renderDiscoveredStats();
         renderDiscovered();
         updateDiscoveryInfo(data.age_seconds || 0);
-        // If stale, silent background scan (no loading indicators)
-        if (data.stale) silentSubnetScan();
     } else {
-        // No cache — silent scan
-        document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#666;">No scan data yet. Click Scan or wait...</td></tr>';
-        silentSubnetScan();
+        // Opening the page is read-only. The server-side scheduler or the Scan
+        // button creates a persisted discovery job.
+        document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px;color:#666;">No scan data yet. Click Scan or wait...</td></tr>';
+    }
+
+    // Re-attach to a server-side job after reload without starting a new scan.
+    if (!_scanInProgress) {
+        const active = await apiCall('discovery-active');
+        if (active.success && active.job && !active.job.complete) {
+            trackDiscoveryJob(active.job.id, false);
+        }
     }
 }
 
@@ -2585,21 +3189,81 @@ function updateDiscoveryInfo(ageSec) {
     else info.textContent = `${Math.round(ageSec/3600)}h ago`;
 }
 
-// Silent background scan — no loading indicators, just updates data
+// Discovery runs in a persisted server-side job. Browser polling is only
+// observational; closing this page does not stop the scan.
 let _scanInProgress = false;
-async function silentSubnetScan() {
-    if (_scanInProgress) return;  // prevent concurrent scans
-    _scanInProgress = true;
-    const data = await apiCall('subnet-scan');
-    if (data.success) {
-        allDiscovered = data.entries || [];
-        renderDiscoveredStats();
-        renderDiscovered();
-        updateDiscoveryInfo(0);
-        // Refresh bindings table if loaded (uses discovery cache for MAC/Live columns)
-        if (allBindings.length > 0) renderBindings();
+let discoveryJobId = '';
+let discoveryPollTimer = null;
+
+function resetDiscoveryButton() {
+    const btn = document.getElementById('btnScan');
+    if (!btn) return;
+    btn.disabled = false;
+    btn.innerHTML = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg> Scan';
+}
+
+function applyDiscoveryResult(data, interactive) {
+    allDiscovered = data.entries || [];
+    renderDiscoveredStats();
+    renderDiscovered();
+    updateDiscoveryInfo(0);
+    if (allBindings.length > 0) renderBindings();
+    if (!interactive) return;
+    const prov = allDiscovered.filter(d => d.device_type === 'provisioned').length;
+    const overall = Object.values(data.post_provision_overall_results || data.post_provision_results || {});
+    const deployed = overall.filter(s => s === 'deployed').length;
+    const failed = overall.filter(s => s === 'failed').length;
+    let msg = `Scan: ${data.reachable || 0}/${data.total_ips || 0} reachable, ${prov} provisioned`;
+    if (deployed > 0) msg += `, ${deployed} newly configured`;
+    if (failed > 0) msg += `, ${failed} failed`;
+    const resultType = failed > 0 ? 'error' : 'success';
+    if (data.warning) {
+        showToast(data.warning, 'error');
+        setTimeout(() => showToast(msg, resultType), 4500);
+    } else {
+        showToast(msg, resultType);
     }
-    _scanInProgress = false;
+}
+
+function trackDiscoveryJob(jobId, interactive) {
+    if (!jobId) return;
+    discoveryJobId = jobId;
+    _scanInProgress = true;
+    if (discoveryPollTimer) clearTimeout(discoveryPollTimer);
+    const btn = document.getElementById('btnScan');
+    if (btn) { btn.disabled = true; btn.textContent = 'Scanning...'; }
+    let pollAttempts = 0;
+
+    const poll = async () => {
+        const data = await apiCall('discovery-status', { job_id: jobId });
+        if (!data.success) {
+            _scanInProgress = false;
+            discoveryJobId = '';
+            resetDiscoveryButton();
+            if (interactive) showToast('Scan status failed: ' + (data.error || ''), 'error');
+            return;
+        }
+        const job = data.job || {};
+        if (!job.complete) {
+            pollAttempts += 1;
+            discoveryPollTimer = setTimeout(
+                poll, pollAttempts <= 10 ? 1000 : 3000
+            );
+            return;
+        }
+        _scanInProgress = false;
+        discoveryJobId = '';
+        discoveryPollTimer = null;
+        resetDiscoveryButton();
+        if (job.status === 'success' && job.result) {
+            applyDiscoveryResult(job.result, interactive);
+        } else if (interactive) {
+            const msg = job.error || 'Unknown discovery failure';
+            document.getElementById('discoveredBody').innerHTML = `<tr><td colspan="9" style="color:#f44336;padding:20px;">Scan failed: ${escHtml(msg)}</td></tr>`;
+            showToast('Scan failed: ' + msg, 'error');
+        }
+    };
+    poll();
 }
 
 // Periodic background scan — interval controlled by dropdown
@@ -2610,7 +3274,9 @@ function applyScanInterval() {
     const info = document.getElementById('scanIntervalInfo');
     if (scanIntervalId) { clearInterval(scanIntervalId); scanIntervalId = null; }
     if (sec > 0) {
-        scanIntervalId = setInterval(silentSubnetScan, sec * 1000);
+        // The server owns the scan schedule. This timer only refreshes its
+        // cached result while the page is open.
+        scanIntervalId = setInterval(loadDiscoveryCache, Math.max(15000, sec * 1000));
         info.textContent = '';
     } else {
         info.textContent = '(manual only)';
@@ -2620,6 +3286,10 @@ function applyScanInterval() {
 // Scan interval is initialized after loadDiscoverySettings() fetches the server value.
 // Do not call applyScanInterval() here — it would start a timer with the wrong default.
 
+function isDiscoveredNotInInventory(device) {
+    return !device.has_binding && device.device_type !== 'unreachable';
+}
+
 function renderDiscoveredStats() {
     const provisioned = allDiscovered.filter(d => d.device_type === 'provisioned').length;
     const notProv = allDiscovered.filter(d => d.device_type === 'not_provisioned').length;
@@ -2627,7 +3297,7 @@ function renderDiscoveredStats() {
     const unreachable = allDiscovered.filter(d => d.device_type === 'unreachable').length;
     const reachable = allDiscovered.filter(d => d.device_type && d.device_type !== 'unreachable').length;
     const mismatch = allDiscovered.filter(d => d.mac_status === 'mismatch').length;
-    const noBinding = allDiscovered.filter(d => !d.has_binding).length;
+    const noBinding = allDiscovered.filter(isDiscoveredNotInInventory).length;
     document.getElementById('statReachable').textContent = reachable;
     document.getElementById('statProvisioned').textContent = provisioned;
     document.getElementById('statNotProv').textContent = notProv;
@@ -2639,6 +3309,14 @@ function renderDiscoveredStats() {
 }
 
 async function exportDiscoveredToDevicesYaml() {
+    if (bindingsModified) {
+        showToast('Save or discard the current Inventory changes before exporting.', 'error');
+        return;
+    }
+    if (!inventoryLoaded && !(await loadBindings())) {
+        showToast('Inventory could not be loaded; export was cancelled.', 'error');
+        return;
+    }
     // Get provisioned devices from discovery
     const provisioned = (allDiscovered || []).filter(d => d.device_type === 'provisioned' && d.hostname);
     if (provisioned.length === 0) {
@@ -2655,11 +3333,13 @@ async function exportDiscoveredToDevicesYaml() {
     msg += `<br><span style="color:#888;font-size:12px;">Adds missing devices to inventory, saves, then rebuilds devices.yaml (grouped by role, sorted by IP).</span>`;
 
     showConfirmModal('Export to devices.yaml', msg, async () => {
-        // 1. Add missing provisioned devices to inventory
+        // Build a detached candidate. Failed validation/conflict must not
+        // leave unsaved rows in the live UI state.
+        const candidateBindings = allBindings.map(binding => ({ ...binding }));
         let added = 0;
         for (const d of provisioned) {
-            if (!allBindings.some(b => b.ip === d.ip)) {
-                allBindings.push({
+            if (!candidateBindings.some(b => b.ip === d.ip)) {
+                candidateBindings.push({
                     hostname: d.hostname,
                     mac: d.discovered_mac || '-',
                     ip: d.ip,
@@ -2672,25 +3352,25 @@ async function exportDiscoveredToDevicesYaml() {
             }
         }
 
-        // 2. Save inventory
+        // save-bindings stages and commits all three canonical files under
+        // one inventory transaction when sync_devices is enabled.
         const saveData = await apiCall('save-bindings', {
-            bindings: allBindings,
+            bindings: candidateBindings,
             sync_devices: false,
+            rebuild_devices: true,
             remove_devices: [],
-            restart_dhcp: false
+            restart_dhcp: false,
+            revision: inventoryRevision
         });
         if (!saveData.success) {
             showToast('Save failed: ' + (saveData.error || ''), 'error');
             return;
         }
-
-        // 3. Rebuild devices.yaml
-        const rebuildData = await apiCall('rebuild-devices-yaml', { bindings: allBindings });
-        if (rebuildData.success) {
-            showToast(`Exported: ${rebuildData.active || 0} active, ${rebuildData.planned || 0} planned. ${added} new devices added.`, 'success');
-        } else {
-            showToast('Rebuild failed: ' + (rebuildData.error || ''), 'error');
-        }
+        allBindings = candidateBindings;
+        inventoryRevision = saveData.revision || inventoryRevision;
+        const active = Number.isInteger(saveData.active) ? saveData.active : candidateBindings.filter(b => b.hostname && b.ip && (!b.dhcp || (b.mac && b.mac !== '-' && !b.mac.includes('x')))).length;
+        const planned = Number.isInteger(saveData.planned) ? saveData.planned : candidateBindings.length - active;
+        showToast(`Exported: ${active} active, ${planned} planned. ${added} new devices added.`, 'success');
 
         // Refresh bindings if on inventory tab
         if (allBindings.length > 0) renderBindings();
@@ -2703,33 +3383,97 @@ async function runSubnetScan() {
     const btn = document.getElementById('btnScan');
     btn.disabled = true;
     btn.textContent = 'Scanning...';
-    document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="8" class="loading">Scanning subnet: ping + SSH probe + post-provision...</td></tr>';
+    document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="9" class="loading">Scanning subnet: ping + SSH probe + post-provision...</td></tr>';
     
-    const data = await apiCall('subnet-scan');
-    if (data.success) {
-        allDiscovered = data.entries || [];
-        renderDiscoveredStats();
-        renderDiscovered();
-        const prov = allDiscovered.filter(d => d.device_type === 'provisioned').length;
-        const unreach = allDiscovered.filter(d => d.device_type === 'unreachable').length;
-        const deployed = Object.values(data.post_provision_results || {}).filter(s => s === 'deployed').length;
-        let msg = `Scan: ${data.reachable || 0}/${data.total_ips || 0} reachable, ${prov} provisioned`;
-        if (deployed > 0) msg += `, ${deployed} newly configured`;
-        if (data.warning) {
-            showToast(data.warning, 'error');
-            setTimeout(() => showToast(msg, 'success'), 4500);
-        } else {
-            showToast(msg, 'success');
-        }
-        updateDiscoveryInfo(0);
-        if (allBindings.length > 0) renderBindings();
+    const data = await apiCall('discovery-start', { apply_post_provision: true });
+    if (data.success && data.job) {
+        trackDiscoveryJob(data.job.id, true);
+        return;
     } else {
-        document.getElementById('discoveredBody').innerHTML = `<tr><td colspan="8" style="color:#f44336;padding:20px;">Scan failed: ${data.error}</td></tr>`;
+        document.getElementById('discoveredBody').innerHTML = `<tr><td colspan="9" style="color:#f44336;padding:20px;">Scan failed: ${data.error}</td></tr>`;
         showToast('Scan failed: ' + (data.error || ''), 'error');
     }
-    btn.disabled = false;
-    btn.innerHTML = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg> Scan';
+    resetDiscoveryButton();
     _scanInProgress = false;
+}
+
+function renderPostProvisionBadge(device) {
+    const actionLabels = {
+        base_config: 'Base Config',
+        ztp_disable: 'Disable ZTP',
+        hostname: 'Hostname'
+    };
+    const actions = device.post_provision_actions || {};
+    const failedActions = Object.entries(actions)
+        .filter(([, status]) => status === 'failed' || status === 'blocked')
+        .map(([name]) => actionLabels[name] || name);
+    const completedActions = Object.values(actions)
+        .filter(status => status === 'success' || status === 'already').length;
+    if (device.post_provision_overall === 'failed' || failedActions.length > 0) {
+        const label = completedActions > 0 && failedActions.length > 0 ? 'Partial' : 'Failed';
+        const detail = device.identity_error || `Failed: ${failedActions.join(', ') || 'post-provision action'}`;
+        return `<span class="badge badge-error" style="font-size:10px;" title="${escHtml(detail)}">${label}</span>`;
+    }
+    if (device.post_provision === 'deployed') return '<span class="badge badge-match" style="font-size:10px;">Just Now</span>';
+    if (device.post_provision === 'already') return '<span class="badge" style="font-size:10px;background:rgba(100,100,100,0.2);color:#aaa;">Yes</span>';
+    if (device.post_provision === 'failed') return '<span class="badge badge-error" style="font-size:10px;">Failed</span>';
+    if (device.device_type === 'provisioned') return '<span class="badge" style="font-size:10px;background:rgba(255,152,0,0.15);color:#ff9800;">Pending</span>';
+    if (device.device_type === 'not_provisioned') return 'No SSH';
+    return '-';
+}
+
+function generatedConfigDeployState(device, configHostnames) {
+    if (!device.hostname || !configHostnames.has(device.hostname)) {
+        return { visible: false, enabled: false, reason: '' };
+    }
+    if (device.device_type !== 'provisioned') {
+        const reason = device.device_type === 'unreachable'
+            ? 'Re-deploy unavailable: the device is unreachable.'
+            : device.device_type === 'not_provisioned'
+                ? 'Re-deploy unavailable: passwordless SSH key access is not configured.'
+                : 'Re-deploy unavailable: the device is not classified as provisioned.';
+        return { visible: true, enabled: false, reason };
+    }
+    if (device.mac_status === 'mismatch') {
+        return {
+            visible: true,
+            enabled: false,
+            reason: 'Re-deploy blocked: the discovered MAC does not match Inventory.',
+        };
+    }
+    if (device.identity_verified !== true) {
+        const hasVerdict = Object.prototype.hasOwnProperty.call(
+            device, 'identity_verified'
+        );
+        return {
+            visible: true,
+            enabled: false,
+            reason: device.identity_error || (hasVerdict
+                ? 'Re-deploy blocked because the live MAC or serial identity could not be verified.'
+                : 'Re-deploy blocked until a fresh scan verifies the live MAC or serial.'),
+        };
+    }
+    return {
+        visible: true,
+        enabled: true,
+        reason: 'Matching saved NVUE config is available. Re-deploy will fully replace the switch configuration.',
+    };
+}
+
+function renderGeneratedConfigAction(device, configHostnames) {
+    const state = generatedConfigDeployState(device, configHostnames);
+    if (!state.visible) return '';
+    const style = 'font-size:11px;padding:2px 8px;';
+    if (!state.enabled) {
+        const reason = escHtml(state.reason);
+        return `<button type="button" class="btn btn-primary btn-sm" disabled ` +
+            `title="${reason}" aria-label="${reason}" style="${style}">Re-deploy</button>`;
+    }
+    return `<button type="button" class="btn btn-primary btn-sm" ` +
+        `onclick="deployGeneratedConfig('${escAttr(device.hostname)}','${escAttr(device.ip)}')" ` +
+        `title="${escHtml(state.reason)}" ` +
+        `aria-label="Re-deploy NVUE config to ${escHtml(device.hostname)}" ` +
+        `style="${style}">Re-deploy</button>`;
 }
 
 function renderDiscovered() {
@@ -2740,7 +3484,7 @@ function renderDiscovered() {
     if (typeFilter !== 'all') {
         if (typeFilter === 'reachable') filtered = filtered.filter(d => d.device_type && d.device_type !== 'unreachable');
         else if (typeFilter === 'has_binding') filtered = filtered.filter(d => d.has_binding);
-        else if (typeFilter === 'no_binding') filtered = filtered.filter(d => !d.has_binding);
+        else if (typeFilter === 'no_binding') filtered = filtered.filter(isDiscoveredNotInInventory);
         else if (typeFilter === 'mismatch') filtered = filtered.filter(d => d.mac_status === 'mismatch');
         else filtered = filtered.filter(d => d.device_type === typeFilter);
     }
@@ -2774,7 +3518,7 @@ function renderDiscovered() {
         if (totalEntries > 0 && filtered.length === 0 && typeFilter === 'reachable') {
             hint = `No reachable devices found. ${unreachCount} device(s) are unreachable. <a href="#" onclick="setDiscoveredFilter('all');return false;" style="color:#42a5f5;">Show All</a>`;
         }
-        document.getElementById('discoveredBody').innerHTML = `<tr><td colspan="8" style="text-align:center;padding:40px;color:#666;">${hint}</td></tr>`;
+        document.getElementById('discoveredBody').innerHTML = `<tr><td colspan="9" style="text-align:center;padding:40px;color:#666;">${hint}</td></tr>`;
         return;
     }
 
@@ -2788,20 +3532,14 @@ function renderDiscovered() {
         }[d.device_type] || '-';
         
         // Post-provision badge (separate column)
-        let ppBadge = '-';
-        if (d.post_provision === 'deployed') ppBadge = '<span class="badge badge-match" style="font-size:10px;">Just Now</span>';
-        else if (d.post_provision === 'already') ppBadge = '<span class="badge" style="font-size:10px;background:rgba(100,100,100,0.2);color:#aaa;">Yes</span>';
-        else if (d.post_provision === 'failed') ppBadge = '<span class="badge badge-error" style="font-size:10px;">Failed</span>';
-        else if (d.device_type === 'provisioned') ppBadge = '<span class="badge" style="font-size:10px;background:rgba(255,152,0,0.15);color:#ff9800;">Pending</span>';
-        else if (d.device_type === 'not_provisioned') ppBadge = 'No SSH';
-        else if (d.device_type === 'unreachable') ppBadge = '-';
+        const ppBadge = renderPostProvisionBadge(d);
         
         // MAC status badge
         let macBadge = '-';
-        if (d.mac_status === 'match') macBadge = '<span class="badge badge-match" style="font-size:10px;">Match</span>';
+        if (d.device_type === 'unreachable') macBadge = '<span class="badge badge-unreachable" style="font-size:10px;">Unreachable</span>';
+        else if (d.mac_status === 'match') macBadge = '<span class="badge badge-match" style="font-size:10px;">Match</span>';
         else if (d.mac_status === 'mismatch') macBadge = '<span class="badge badge-mismatch" style="font-size:10px;">Mismatch</span>';
         else if (d.mac_status === 'no_binding') macBadge = '<span class="badge badge-info" style="font-size:10px;">Not in Inventory</span>';
-        else if (d.mac_status === 'unreachable' && d.has_binding) macBadge = '<span class="badge badge-unreachable" style="font-size:10px;">Unreachable</span>';
 
         // Discovered MAC color
         const dmac = d.discovered_mac || '-';
@@ -2810,12 +3548,10 @@ function renderDiscovered() {
         // Role badge
         const roleHtml = d.role ? `<span style="padding:2px 8px;border-radius:3px;font-size:11px;background:#2d2d2d;color:#aaa;">${escHtml(d.role)}</span>` : '-';
 
-        // Deploy Config button: show only for provisioned devices with a generated config
+        // A matching generated config is an operator re-deploy capability, not
+        // evidence that this is a new device or that deployment is required.
         const gcSet = new Set((generatedConfigs || []).map(c => c.hostname));
-        const canDeploy = d.device_type === 'provisioned' && d.hostname && gcSet.has(d.hostname);
-        const deployHtml = canDeploy
-            ? `<button class="btn btn-primary btn-sm" onclick="deployGeneratedConfig('${escAttr(d.hostname)}','${escAttr(d.ip)}')" style="font-size:11px;padding:2px 8px;">Deploy</button>`
-            : '';
+        const deployHtml = renderGeneratedConfigAction(d, gcSet);
 
         return `<tr>
             <td><strong>${escHtml(d.hostname || '-')}</strong></td>
@@ -2860,7 +3596,7 @@ function downloadDiscoveredCSV() {
     if (typeFilter !== 'all') {
         if (typeFilter === 'reachable') filtered = filtered.filter(d => d.device_type && d.device_type !== 'unreachable');
         else if (typeFilter === 'has_binding') filtered = filtered.filter(d => d.has_binding);
-        else if (typeFilter === 'no_binding') filtered = filtered.filter(d => !d.has_binding);
+        else if (typeFilter === 'no_binding') filtered = filtered.filter(isDiscoveredNotInInventory);
         else if (typeFilter === 'mismatch') filtered = filtered.filter(d => d.mac_status === 'mismatch');
         else filtered = filtered.filter(d => d.device_type === typeFilter);
     }
@@ -2911,13 +3647,13 @@ function ipToNum(ip) {
 function filterDiscovered() { renderDiscovered(); }
 
 async function deployGeneratedConfig(hostname, ip) {
-    showConfirmModal('Deploy Generated Config',
-        `Deploy NVUE config to <strong>${escHtml(hostname)}</strong> (${escHtml(ip)})?<br><br>` +
+    showConfirmModal('Re-deploy NVUE Config',
+        `Re-deploy the saved NVUE config to <strong>${escHtml(hostname)}</strong> (${escHtml(ip)})?<br><br>` +
         `This will run:<br>` +
         `<code style="font-size:11px;color:#76b900;">nv config replace + apply + save</code><br><br>` +
         `<span style="color:#ff9800;">The switch configuration will be fully replaced.</span>`,
         async () => {
-            showToast(`Deploying config to ${hostname}...`, 'info');
+            showToast(`Re-deploying config to ${hostname}...`, 'info');
             const data = await apiCall('deploy-generated-config', { hostname, ip });
             if (data.success && data.results) {
                 const r = data.results[0];
@@ -2929,7 +3665,8 @@ async function deployGeneratedConfig(hostname, ip) {
             } else {
                 showToast(`Deploy failed: ${data.error || 'Unknown error'}`, 'error');
             }
-        }
+        },
+        'Deploy'
     );
 }
 
@@ -3179,16 +3916,22 @@ async function useImageForZTP(name) {
     const version = imageVersionFromName(name);
     if (!version) { showToast('Cannot detect version from image name', 'error'); return; }
     if (!ztpLoaded) await loadZTPScript();
+    const editor = document.getElementById('ztpEditor');
+    const upgradeLegacyTemplate = ztpTemplateNeedsUpgrade(editor.value);
+    const migrationNotice = upgradeLegacyTemplate
+        ? '<br><br><span style="color:#ff9800;">The saved script is legacy and will be replaced with the hardened v2 template after confirmation.</span>'
+        : '';
     showConfirmModal('Use Image for ZTP',
-        `Set ZTP target version to <strong>${escHtml(version)}</strong> and save <code>cumulus-ztp.sh</code>?<br><br>Image: <code>${escHtml(name)}</code>`,
+        `Set ZTP target version to <strong>${escHtml(version)}</strong> and save <code>cumulus-ztp.sh</code>?<br><br>Image: <code>${escHtml(name)}</code>${migrationNotice}`,
         async () => {
             document.getElementById('ztpTargetOS').value = version;
-            applyQuickSettings();
-            const ok = await saveZTPScript();
-            if (ok) {
-                showToast(`ZTP now targets ${version}`, 'success');
-                loadOSImages();
-            }
+            applyQuickSettings(async () => {
+                const ok = await saveZTPScript();
+                if (ok) {
+                    showToast(`ZTP now targets ${version}`, 'success');
+                    loadOSImages();
+                }
+            }, upgradeLegacyTemplate);
         },
         'Use for ZTP'
     );
@@ -3210,6 +3953,9 @@ async function loadZTPScript() {
         editor.value = data.ztp_script.content || '';
         ztpLoaded = true;
         parseQuickSettings(data.ztp_script.content);
+        if (ztpTemplateNeedsUpgrade(data.ztp_script.content || '')) {
+            showToast('Legacy ZTP script detected — Apply to Script to review the hardened upgrade', 'info');
+        }
     }
 
     // SSH key
@@ -3384,12 +4130,14 @@ function toggleScriptEditor() {
 // --- Quick Settings ---
 function parseQuickSettings(content) {
     const osMatch = content.match(/CUMULUS_TARGET_RELEASE=(\S+)/);
-    const pwMatch = content.match(/echo\s+'cumulus:(.+?)'\s*\|\s*chpasswd/);
+    const pwMatch = content.match(/^\s*echo\s+'cumulus:(.*)'\s*\|\s*chpasswd\s*$/m);
     const ipMatch = content.match(/IMAGE_SERVER_HOSTNAME=(\S+)/);
     // Don't overwrite SSH key from script — loadSSHKey() handles that from actual key file
 
     if (osMatch) document.getElementById('ztpTargetOS').value = osMatch[1];
-    if (pwMatch) document.getElementById('ztpPassword').value = pwMatch[1];
+    if (pwMatch) {
+        document.getElementById('ztpPassword').value = pwMatch[1].replace(/'\\''/g, "'");
+    }
     if (ipMatch) document.getElementById('ztpImageServer').value = ipMatch[1];
     syncUpgradeServerIPFromZTP();
 }
@@ -3400,48 +4148,111 @@ function escapeBashSingleQuote(s) {
     return s.replace(/'/g, "'\\''");
 }
 
-function applyQuickSettings() {
+function escapeBashDoubleQuote(s) {
+    return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+        .replace(/\$/g, '\\$').replace(/`/g, '\\`');
+}
+
+const ZTP_TEMPLATE_VERSION = 2;
+
+function ztpTemplateNeedsUpgrade(content) {
+    if (!content || !content.includes('CUMULUS_TARGET_RELEASE')) return false;
+    const match = content.match(/LLDPQ_ZTP_TEMPLATE_VERSION=(\d+)/);
+    const version = match ? parseInt(match[1], 10) : 0;
+    const requiredFunctions = [
+        'get_current_release', 'is_valid_serial', 'select_hostname_from_mapping', 'resolve_hostname',
+        'find_config_url', 'apply_generated_config', 'init_ztp', 'main'
+    ];
+    const hasFunctions = requiredFunctions.every(name => {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return new RegExp(
+            `^\\s*(?:function\\s+${escaped}\\s*(?:\\(\\))?|${escaped}\\s*\\(\\s*\\))\\s*\\{`,
+            'm'
+        ).test(content);
+    });
+    const hasMainGuard = /if\s+\[\[\s*"\$\{BASH_SOURCE\[0\]\}"\s*==\s*"\$0"\s*\]\]\s*;?\s*then/m.test(content);
+    const hasMainCall = /^\s*main\s+"\$@"\s*$/m.test(content);
+    return version < ZTP_TEMPLATE_VERSION || !hasFunctions || !hasMainGuard || !hasMainCall;
+}
+
+function isValidZtpPublicKey(value) {
+    if (!value) return true;
+    if (/[\r\n\0]/.test(value) || value.length > 16384) return false;
+    return /^(?:ssh-(?:rsa|ed25519)|ecdsa-sha2-[A-Za-z0-9._-]+|sk-(?:ssh-ed25519|ecdsa-sha2-[A-Za-z0-9._-]+)@openssh\.com)\s+[A-Za-z0-9+/=]+(?:\s+.*)?$/.test(value);
+}
+
+function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
     let content = document.getElementById('ztpEditor').value;
     const os = document.getElementById('ztpTargetOS').value.trim() || '5.14.0';
     const pwRaw = document.getElementById('ztpPassword').value.trim() || 'Nvidia@123';
-    const pw = escapeBashSingleQuote(pwRaw);
     const ip = document.getElementById('ztpImageServer').value.trim() || '192.168.100.200';
     const key = document.getElementById('ztpSSHKey').value.trim();
 
-    const hasSerialLogic = content.includes('resolve_hostname') || content.includes('serial-mapping');
-    const isOldTemplate = content.includes('CUMULUS_TARGET_RELEASE') && !hasSerialLogic;
+    if (!/^[0-9][A-Za-z0-9._-]{0,63}$/.test(os)) {
+        showToast('Invalid target OS version', 'error');
+        return false;
+    }
+    if (!isUsableImageServer(ip)) {
+        showToast('Invalid image server IP/hostname', 'error');
+        return false;
+    }
+    if (!pwRaw || pwRaw.length > 128 || /[\r\n\0]/.test(pwRaw)) {
+        showToast('Invalid default password', 'error');
+        return false;
+    }
+    if (!isValidZtpPublicKey(key)) {
+        showToast('Invalid SSH public key', 'error');
+        return false;
+    }
+    const pw = escapeBashSingleQuote(pwRaw);
+    const needsUpgrade = ztpTemplateNeedsUpgrade(content);
 
     // If script is placeholder/empty, generate full template
     if (!content.includes('CUMULUS_TARGET_RELEASE') && !content.includes('init_ztp')) {
         content = generateZTPTemplate(os, pw, ip, key);
-    } else if (isOldTemplate) {
-        // Old template without serial config resolution — offer upgrade
+    } else if (needsUpgrade && !upgradeConfirmed) {
+        // Never silently overwrite a customized persisted script. Upgrade is
+        // explicit, but v1 serial logic is no longer treated as current.
         showConfirmModal('Upgrade ZTP Script',
-            'Current script uses the old template without serial-based config resolution.<br><br>' +
-            'Upgrade to the new template with:<br>' +
-            '&bull; Serial number detection (<code>decode-syseeprom</code>)<br>' +
-            '&bull; Hostname resolution via <code>serial-mapping.txt</code><br>' +
-            '&bull; Auto config download via <code>onie-install -t</code><br>' +
-            '&bull; Direct config apply via <code>nv config replace</code><br><br>' +
+            'Current script uses a legacy or unversioned ZTP template.<br><br>' +
+            'Upgrade to the hardened template with:<br>' +
+            '&bull; Unique, validated serial-to-hostname mapping<br>' +
+            '&bull; Safe <code>.yaml</code>/<code>.yml</code> config selection<br>' +
+            '&bull; Checked download and NVUE apply/save results<br>' +
+            '&bull; Idempotent SSH key installation<br><br>' +
+            '<span style="color:#ff9800;">The editor content will be replaced only after confirmation.</span><br><br>' +
             'Quick Settings (OS version, password, IP, SSH key) will be preserved.',
             () => {
                 const newContent = generateZTPTemplate(os, pw, ip, key);
                 document.getElementById('ztpEditor').value = newContent;
                 if (!scriptEditorVisible) toggleScriptEditor();
-                showToast('Script upgraded to serial-based template (unsaved — click Save)', 'success');
+                showToast('Script upgraded to hardened template (unsaved — click Save)', 'success');
+                if (afterApply) afterApply();
             }
         );
-        return;
+        return false;
+    } else if (needsUpgrade) {
+        content = generateZTPTemplate(os, pw, ip, key);
     } else {
         // Update existing script via regex (already has serial logic or custom)
         if (os) content = content.replace(/CUMULUS_TARGET_RELEASE=\S+/, `CUMULUS_TARGET_RELEASE=${os}`);
-        if (pw) content = content.replace(/echo\s+'cumulus:.+?'\s*\|\s*chpasswd/, `echo 'cumulus:${pw}' | chpasswd`);
+        if (pw) content = content.replace(
+            /^(\s*)echo\s+'cumulus:.*'\s*\|\s*chpasswd\s*$/m,
+            (_match, indent) => `${indent}echo 'cumulus:${pw}' | chpasswd`
+        );
         if (ip) content = content.replace(/IMAGE_SERVER_HOSTNAME=\S+/, `IMAGE_SERVER_HOSTNAME=${ip}`);
         if (key) {
+            const escapedKey = escapeBashDoubleQuote(key);
             if (/^\s*KEY=.*$/m.test(content)) {
-                content = content.replace(/^(\s*)KEY=.*$/m, `$1KEY="${key}"`);
+                content = content.replace(
+                    /^(\s*)KEY=.*$/m,
+                    (_match, indent) => `${indent}KEY="${escapedKey}"`
+                );
             } else {
-                content = content.replace(/(# Copy SSH keys\s*)/m, `$1\n    KEY="${key}"\n`);
+                content = content.replace(
+                    /(# Copy SSH keys\s*)/m,
+                    (_match, prefix) => `${prefix}\n    KEY="${escapedKey}"\n`
+                );
             }
         }
     }
@@ -3450,129 +4261,363 @@ function applyQuickSettings() {
     if (!scriptEditorVisible) toggleScriptEditor();
     document.getElementById('ztpEditor').value = content;
     showToast('Quick settings applied to script (unsaved — click Save)', 'info');
+    if (afterApply) afterApply();
+    return true;
 }
 
 function generateZTPTemplate(os, pw, ip, key) {
-    const keyVar = key ? `KEY="${key}"` : 'KEY=""';
+    const keyVar = key ? `KEY="${escapeBashDoubleQuote(key)}"` : 'KEY=""';
     return `#!/bin/bash
 
 #
 # CUMULUS-AUTOPROVISIONING
 # Generated by LLDPq Provision
+# LLDPQ_ZTP_TEMPLATE_VERSION=2
 #
 
 function ping_until_reachable(){
-    last_code=1
-    max_tries=30
-    tries=0
-    while [ "0" != "$last_code" ] && [ "$tries" -lt "$max_tries" ]; do
+    local target="\${1-}"
+    local max_tries=30
+    local tries=0
+
+    if [ -z "$target" ]; then
+        echo "$(date) ERROR: Image server target is empty." >&2
+        return 1
+    fi
+    while [ "$tries" -lt "$max_tries" ]; do
         tries=$((tries+1))
-        echo "$(date) INFO: ( Attempt $tries of $max_tries ) Pinging $1 Target Until Reachable."
-        ping $1 -c2 --no-vrf-switch &> /dev/null
-        last_code=$?
+        echo "$(date) INFO: ( Attempt $tries of $max_tries ) Pinging $target Target Until Reachable."
+        if ping "$target" -c2 --no-vrf-switch >/dev/null; then
+            return 0
+        fi
         sleep 1
     done
-    if [ "$tries" -eq "$max_tries" ] && [ "$last_code" -ne "0" ]; then
-        echo "$(date) ERROR: Reached maximum number of attempts to ping the target $1 ."
-        exit 1
-    fi
+    echo "$(date) ERROR: Reached maximum number of attempts to ping the target $target ." >&2
+    return 1
 }
 
 function set_password(){
-    passwd -x 99999 cumulus
-    echo 'cumulus:${pw}' | chpasswd
+    passwd -x 99999 cumulus &&
+        echo 'cumulus:${pw}' | chpasswd
 }
 
-# Resolve hostname from serial number via mapping file on HTTP server
-function resolve_hostname(){
-    local serial="$1"
-    local mapping_url="http://$IMAGE_SERVER_HOSTNAME/serial-mapping.txt"
-    local hostname=""
-    local mapping=$(curl -sf "$mapping_url" 2>/dev/null)
-    if [ -n "$mapping" ]; then
-        hostname=$(echo "$mapping" | grep -v '^#' | awk -v s="$serial" 'tolower($1) == tolower(s) {print $2; exit}')
+function get_current_release(){
+    local release_file="\${1:-/etc/lsb-release}"
+    local release=""
+
+    release=$(LC_ALL=C awk -F= '
+        $1 == "DISTRIB_RELEASE" {
+            print substr($0, index($0, "=") + 1)
+            found = 1
+            exit
+        }
+        $1 == "RELEASE" { fallback = substr($0, index($0, "=") + 1) }
+        END { if (!found && fallback != "") print fallback }
+    ' "$release_file") || return 1
+    release=\${release%$'\\r'}
+    case "$release" in
+        \\"*\\") release=\${release#\\"}; release=\${release%\\"} ;;
+        \\'*\\') release=\${release#\\'}; release=\${release%\\'} ;;
+    esac
+    [[ "$release" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]] || return 1
+    printf '%s\\n' "$release"
+}
+
+function is_valid_serial(){
+    local serial="\${1-}"
+    [[ -n "$serial" && \${#serial} -le 128 && "$serial" =~ ^[[:alnum:]_.:-]+$ ]]
+}
+
+function select_hostname_from_mapping(){
+    local serial="\${1-}"
+    local mapping="\${2-}"
+
+    if ! is_valid_serial "$serial" || [ -z "$mapping" ]; then
+        return 2
     fi
-    echo "$hostname"
+
+    printf '%s\\n' "$mapping" | LC_ALL=C awk -v wanted="$serial" '
+        function serial_ok(value) {
+            return length(value) > 0 && length(value) <= 128 && \\
+                value ~ /^[[:alnum:]_.:-]+$/
+        }
+        function hostname_ok(value) {
+            return length(value) > 0 && length(value) <= 253 && \\
+                value ~ /^[[:alnum:]][[:alnum:]_.-]*$/
+        }
+        BEGIN { wanted = tolower(wanted) }
+        { sub(/\\r$/, "") }
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            if (NF != 2 || !serial_ok($1) || !hostname_ok($2)) {
+                invalid = 1
+                next
+            }
+            serial_key = tolower($1)
+            hostname_key = tolower($2)
+            if (++seen_serial[serial_key] > 1 || ++seen_hostname[hostname_key] > 1) {
+                invalid = 1
+            }
+            if (serial_key == wanted) {
+                matches++
+                hostname = $2
+            }
+        }
+        END {
+            if (invalid || matches > 1) exit 2
+            if (matches == 1) {
+                print hostname
+                exit 0
+            }
+            exit 1
+        }
+    '
+}
+
+function resolve_hostname(){
+    local serial="\${1-}"
+    local mapping_url="http://$IMAGE_SERVER_HOSTNAME/serial-mapping.txt"
+    local mapping=""
+
+    if ! is_valid_serial "$serial"; then
+        return 2
+    fi
+    if ! mapping=$(curl --fail --silent --show-error --connect-timeout 5 \\
+        --max-time 15 --retry 2 -- "$mapping_url"); then
+        echo "Unable to download serial mapping from $mapping_url" >&2
+        return 2
+    fi
+    if [ "\${#mapping}" -gt 8388608 ]; then
+        echo "Serial mapping is too large" >&2
+        return 2
+    fi
+    select_hostname_from_mapping "$serial" "$mapping"
+}
+
+function find_config_url(){
+    local hostname="\${1-}"
+    local destination="\${2-}"
+    local extension=""
+    local url=""
+    local candidate=""
+    local http_code=""
+    local byte_count=0
+
+    [[ -n "$hostname" && \${#hostname} -le 253 && \\
+        "$hostname" =~ ^[[:alnum:]][[:alnum:]_.-]*$ ]] || return 2
+    [ -n "$destination" ] || return 2
+    candidate="\${destination}.download"
+    rm -f -- "$candidate"
+
+    for extension in yaml yml; do
+        url="http://$IMAGE_SERVER_HOSTNAME/generated_config_folder/\${hostname}.\${extension}"
+        if ! http_code=$(curl --silent --show-error --connect-timeout 5 \\
+            --max-time 60 --retry 2 --output "$candidate" \\
+            --write-out '%{http_code}' -- "$url"); then
+            rm -f -- "$candidate"
+            echo "Unable to download generated config from $url" >&2
+            return 2
+        fi
+        case "$http_code" in
+            200)
+                if [ ! -s "$candidate" ]; then
+                    rm -f -- "$candidate"
+                    echo "Generated config from $url is empty" >&2
+                    return 2
+                fi
+                byte_count=$(wc -c < "$candidate") || {
+                    rm -f -- "$candidate"
+                    return 2
+                }
+                if [ "$byte_count" -gt 16777216 ]; then
+                    rm -f -- "$candidate"
+                    echo "Generated config from $url is too large" >&2
+                    return 2
+                fi
+                mv -f -- "$candidate" "$destination" || return 2
+                printf '%s\\n' "$url"
+                return 0
+                ;;
+            404)
+                rm -f -- "$candidate"
+                ;;
+            *)
+                rm -f -- "$candidate"
+                echo "Generated config request failed with HTTP $http_code: $url" >&2
+                return 2
+                ;;
+        esac
+    done
+    return 1
+}
+
+function install_authorized_key(){
+    local directory="\${1-}"
+    local owner="\${2-}"
+    local group="\${3-}"
+    local authorized_keys="$directory/authorized_keys"
+
+    [ -n "$KEY" ] || return 0
+    mkdir -p "$directory" || return 1
+    chmod 700 "$directory" || return 1
+    touch "$authorized_keys" || return 1
+    if ! grep -Fqx -- "$KEY" "$authorized_keys"; then
+        if [ -s "$authorized_keys" ] &&
+            [ "$(tail -c 1 "$authorized_keys" | wc -l)" -eq 0 ]; then
+            printf '\\n' >> "$authorized_keys" || return 1
+        fi
+        printf '%s\\n' "$KEY" >> "$authorized_keys" || return 1
+    fi
+    chmod 600 "$authorized_keys" || return 1
+    chown "$owner:$group" "$directory" "$authorized_keys" || return 1
+}
+
+function install_cumulus_sudoers(){
+    local target=/etc/sudoers.d/10_cumulus
+    local staged=""
+
+    staged=$(mktemp /etc/sudoers.d/.10_cumulus.XXXXXX) || return 1
+    if ! printf '%s\\n' 'cumulus ALL=(ALL) NOPASSWD:ALL' > "$staged" || \\
+        ! chmod 440 "$staged"; then
+        rm -f "$staged"
+        return 1
+    fi
+    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$staged" >/dev/null; then
+        rm -f "$staged"
+        return 1
+    fi
+    mv -f "$staged" "$target"
+}
+
+function apply_generated_config(){
+    local staged="\${1-}"
+
+    if [ ! -s "$staged" ]; then
+        echo "Generated config is missing or empty" >&2
+        return 1
+    fi
+    command -v nv >/dev/null 2>&1 || return 1
+    if ! nv config replace "$staged" || ! nv config apply -y || ! nv config save; then
+        echo "Failed to apply generated config for \${MY_HOSTNAME-unknown}" >&2
+        return 1
+    fi
+    echo "Config applied and saved for \${MY_HOSTNAME-unknown}"
 }
 
 function init_ztp(){
     echo "Running ZTP..."
 
-    # Change default password
-    set_password
+    if ! set_password; then
+        echo "Failed to set the cumulus password" >&2
+        return 1
+    fi
+    if ! install_cumulus_sudoers; then
+        echo "Failed to install the cumulus sudoers policy" >&2
+        return 1
+    fi
 
-    # Make user cumulus passwordless sudo
-    echo "cumulus ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/10_cumulus
-
-    # Copy SSH keys
     ${keyVar}
     if [ -n "$KEY" ]; then
-        mkdir -p /root/.ssh /home/cumulus/.ssh
-        echo "$KEY" >> /root/.ssh/authorized_keys
-        echo "$KEY" >> /home/cumulus/.ssh/authorized_keys
-        chown -R cumulus:cumulus /home/cumulus/.ssh
+        if ! install_authorized_key /root/.ssh root root || \\
+            ! install_authorized_key /home/cumulus/.ssh cumulus cumulus; then
+            echo "Failed to install the SSH key" >&2
+            return 1
+        fi
         echo "SSH key installed"
     fi
 
-    # Apply generated config if version was already correct
-    if [ -n "$CONFIG_URL" ]; then
+    if [ -n "\${CONFIG_FILE-}" ]; then
         echo "Applying generated config for $MY_HOSTNAME..."
-        curl -sf "$CONFIG_URL" -o /tmp/startup.yaml
-        if [ -s /tmp/startup.yaml ]; then
-            nv config replace /tmp/startup.yaml
-            nv config apply -y
-            nv config save
-            echo "Config applied and saved for $MY_HOSTNAME"
-        fi
+        apply_generated_config "$CONFIG_FILE" || return 1
+    fi
+    return 0
+}
+
+function main(){
+    umask 077
+
+    IMAGE_SERVER_HOSTNAME=${ip}
+    CUMULUS_TARGET_RELEASE=${os}
+    if ! CUMULUS_CURRENT_RELEASE=$(get_current_release); then
+        echo "Unable to determine the current Cumulus release; refusing OS install" >&2
+        return 1
+    fi
+    if ! [[ "$CUMULUS_TARGET_RELEASE" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        echo "Invalid target Cumulus release" >&2
+        return 1
+    fi
+    IMAGE_SERVER=http://$IMAGE_SERVER_HOSTNAME/cumulus-linux-$CUMULUS_TARGET_RELEASE-mlx-amd64.bin
+    ZTP_URL=http://$IMAGE_SERVER_HOSTNAME/cumulus-ztp.sh
+    IMAGE_SERVER_PING_TARGET=\${IMAGE_SERVER_HOSTNAME%%:*}
+    WORK_DIR=$(mktemp -d /tmp/lldpq-ztp.XXXXXX) || return 1
+    trap 'rm -rf -- "\${WORK_DIR-}"' EXIT
+
+    MY_SERIAL=$(decode-syseeprom 2>/dev/null | awk '/Serial Number/ {print $NF; exit}')
+    [ -z "$MY_SERIAL" ] && MY_SERIAL=$(onie-syseeprom -g 0x23 2>/dev/null | tr -d '[:space:]')
+    echo "Serial: $MY_SERIAL"
+
+    MY_HOSTNAME=$(resolve_hostname "$MY_SERIAL")
+    mapping_status=$?
+    case "$mapping_status" in
+        0) ;;
+        1) MY_HOSTNAME="" ;;
+        *)
+            echo "Serial mapping validation or download failed; refusing provisioning" >&2
+            return 1
+            ;;
+    esac
+    echo "Resolved hostname: $MY_HOSTNAME"
+
+    CONFIG_URL=""
+    CONFIG_FILE=""
+    if [ -n "$MY_HOSTNAME" ]; then
+        CONFIG_FILE="$WORK_DIR/startup.yaml"
+        CONFIG_URL=$(find_config_url "$MY_HOSTNAME" "$CONFIG_FILE")
+        config_status=$?
+        case "$config_status" in
+            0) echo "Config downloaded and verified: $CONFIG_URL" ;;
+            1)
+                CONFIG_URL=""
+                CONFIG_FILE=""
+                echo "No generated config found for $MY_HOSTNAME"
+                ;;
+            *)
+                echo "Generated config lookup failed; refusing provisioning" >&2
+                return 1
+                ;;
+        esac
+    else
+        echo "Serial $MY_SERIAL was not resolved; no config will be applied"
     fi
 
-    exit 0
+    echo "Checking if the device is running the correct version..."
+    if [ "$CUMULUS_TARGET_RELEASE" != "$CUMULUS_CURRENT_RELEASE" ]; then
+        echo "Version mismatch: $CUMULUS_CURRENT_RELEASE -> $CUMULUS_TARGET_RELEASE"
+        ping_until_reachable "$IMAGE_SERVER_PING_TARGET" || return 1
+        if [ -n "$CONFIG_FILE" ]; then
+            echo "Installing OS + config for $MY_HOSTNAME..."
+            /usr/cumulus/bin/onie-install -fa -i "$IMAGE_SERVER" -z "$ZTP_URL" \\
+                -t "$CONFIG_FILE" || return 1
+        else
+            echo "Installing OS only (no config)..."
+            /usr/cumulus/bin/onie-install -fa -i "$IMAGE_SERVER" -z "$ZTP_URL" || return 1
+        fi
+        rm -rf -- "$WORK_DIR"
+        trap - EXIT
+        reboot || return 1
+    else
+        echo "Version is correct: $CUMULUS_TARGET_RELEASE"
+        init_ztp || return 1
+        rm -rf -- "$WORK_DIR"
+        trap - EXIT
+    fi
+    return 0
 }
 
 # ---- Main ----
 
-IMAGE_SERVER_HOSTNAME=${ip}
-CUMULUS_TARGET_RELEASE=${os}
-CUMULUS_CURRENT_RELEASE=$(cat /etc/lsb-release | grep RELEASE | cut -d "=" -f2)
-IMAGE_SERVER=http://$IMAGE_SERVER_HOSTNAME/cumulus-linux-$CUMULUS_TARGET_RELEASE-mlx-amd64.bin
-ZTP_URL=http://$IMAGE_SERVER_HOSTNAME/cumulus-ztp.sh
-
-# Get this switch's serial number and resolve hostname
-MY_SERIAL=$(decode-syseeprom 2>/dev/null | grep "Serial Number" | awk '{print $NF}')
-[ -z "$MY_SERIAL" ] && MY_SERIAL=$(onie-syseeprom -g 0x23 2>/dev/null | tr -d ' ')
-echo "Serial: $MY_SERIAL"
-
-MY_HOSTNAME=$(resolve_hostname "$MY_SERIAL")
-echo "Resolved hostname: $MY_HOSTNAME"
-
-# Check if a generated config exists for this switch
-CONFIG_URL=""
-if [ -n "$MY_HOSTNAME" ]; then
-    URL="http://$IMAGE_SERVER_HOSTNAME/generated_config_folder/\${MY_HOSTNAME}.yaml"
-    if curl -sf --head "$URL" 2>/dev/null | head -1 | grep -q "200"; then
-        CONFIG_URL="$URL"
-        echo "Config available: $CONFIG_URL"
-    else
-        echo "No generated config found for $MY_HOSTNAME"
-    fi
-else
-    echo "Serial $MY_SERIAL not found in mapping — no config will be applied"
-fi
-
-echo "Checking if the device is running the correct version..."
-if [ "$CUMULUS_TARGET_RELEASE" != "$CUMULUS_CURRENT_RELEASE" ]; then
-    echo "Version mismatch: $CUMULUS_CURRENT_RELEASE -> $CUMULUS_TARGET_RELEASE"
-    ping_until_reachable $IMAGE_SERVER_HOSTNAME
-    if [ -n "$CONFIG_URL" ]; then
-        echo "Installing OS + config for $MY_HOSTNAME..."
-        /usr/cumulus/bin/onie-install -fa -i $IMAGE_SERVER -z $ZTP_URL -t $CONFIG_URL && reboot
-    else
-        echo "Installing OS only (no config)..."
-        /usr/cumulus/bin/onie-install -fa -i $IMAGE_SERVER -z $ZTP_URL && reboot
-    fi
-else
-    echo "Version is correct: $CUMULUS_TARGET_RELEASE"
-    init_ztp
+if [[ "\${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
 `;
 }
@@ -3594,6 +4639,7 @@ let upgradeDevices = [];
 let upgradeImages = [];
 let upgradeJobId = null;
 let upgradePollTimer = null;
+let upgradePollGeneration = 0;
 let upgradeDetectedServerIP = '';
 
 function rowIdFromIp(ip) {
@@ -3664,20 +4710,33 @@ async function loadUpgradeCandidates() {
 async function recoverActiveUpgradeJob() {
     const data = await apiCall('upgrade-active');
     if (!data.success || !data.job) return;
-    const job = data.job;
+    attachUpgradeJob(data.job);
+}
+
+function attachUpgradeJob(job, announce = false) {
+    if (!job || !job.id) return;
     upgradeJobId = job.id;
     const target = document.getElementById('upgradeTargetVersion');
     const server = document.getElementById('upgradeServerIP');
     const image = document.getElementById('upgradeImage');
     if (target) target.value = job.target_version || target.value;
     if (server) server.value = job.server_ip || server.value;
-    if (image && Array.from(image.options).some(option => option.value === job.image_name)) {
-        image.value = job.image_name;
+    if (image && job.image_name) {
+        let option = Array.from(image.options).find(item => item.value === job.image_name);
+        if (!option) {
+            option = document.createElement('option');
+            option.value = job.image_name;
+            option.textContent = job.image_name;
+            option.dataset.version = job.target_version || '';
+            image.appendChild(option);
+        }
+        image.value = option.value;
     }
-    document.getElementById('btnStartUpgrade').disabled = true;
-    document.getElementById('btnCancelUpgrade').style.display = '';
+    document.getElementById('btnStartUpgrade').disabled = !job.complete;
+    document.getElementById('btnCancelUpgrade').style.display = job.complete ? 'none' : '';
     renderUpgradeJob(job);
-    pollUpgradeStatus();
+    if (!job.complete) pollUpgradeStatus();
+    if (announce) showToast('An upgrade job is already active; attached to the existing job.', 'info');
 }
 
 function selectedUpgradeDevices() {
@@ -3779,7 +4838,12 @@ function renderUpgradeTable(job = null) {
         const i = indexMap.get(merged.ip);
         const candidate = merged.candidate;
         const status = merged.status;
-        const badgeClass = status === 'done' ? 'badge-success' : status === 'failed' ? 'badge-error' : status === 'already' ? 'badge-info' : status === 'queued' ? 'badge-pending' : status === 'upgrading' || status === 'waiting_reboot' ? 'badge-warning' : candidate ? 'badge-match' : 'badge-unreachable';
+        // A claim is still cancellable until launch authorization is persisted.
+        // Afterwards it is committed work and must not look cancelable.
+        const displayStatus = status === 'starting'
+            ? (merged.launch_attempted_at ? 'upgrading' : 'queued')
+            : status;
+        const badgeClass = displayStatus === 'done' ? 'badge-success' : displayStatus === 'failed' ? 'badge-error' : displayStatus === 'already' ? 'badge-info' : displayStatus === 'queued' ? 'badge-pending' : displayStatus === 'upgrading' || displayStatus === 'waiting_reboot' ? 'badge-warning' : candidate ? 'badge-match' : 'badge-unreachable';
         const detail = merged.error || merged.message || (merged.checks ? merged.checks.join('; ') : '') || (merged.already ? 'Already at selected target version' : '');
         return `<tr id="upgrade-${rowIdFromIp(merged.ip)}" onclick="toggleUpgradeRow(${i})" style="${candidate ? 'cursor:pointer;' : 'opacity:0.75;'}">
             <td><input type="checkbox" class="upgrade-dev-cb" data-index="${i}" ${candidate ? '' : 'disabled'} onclick="event.stopPropagation();" style="accent-color:#76b900;"></td>
@@ -3789,7 +4853,7 @@ function renderUpgradeTable(job = null) {
             <td style="font-family:monospace;">${escHtml(merged.current_version || '-')}</td>
             <td style="font-family:monospace;">${escHtml(target || '-')}</td>
             <td>${merged.startup_config ? '<span style="color:#76b900;">OK</span>' : '<span style="color:#f44336;">Missing</span>'}</td>
-            <td><span class="badge ${badgeClass}">${escHtml(status)}</span></td>
+            <td><span class="badge ${badgeClass}">${escHtml(displayStatus)}</span></td>
             <td style="color:#888;">${escHtml(detail)}</td>
         </tr>`;
     }).join('');
@@ -3841,14 +4905,15 @@ function startUpgradeJob() {
             document.getElementById('btnStartUpgrade').disabled = true;
             const data = await apiCall('upgrade-start', payload);
             if (!data.success) {
+                if (data.error_code === 'upgrade_active' && data.job) {
+                    attachUpgradeJob(data.job, true);
+                    return;
+                }
                 showToast('Upgrade start failed: ' + (data.error || ''), 'error');
                 document.getElementById('btnStartUpgrade').disabled = false;
                 return;
             }
-            upgradeJobId = data.job.id;
-            document.getElementById('btnCancelUpgrade').style.display = '';
-            renderUpgradeJob(data.job);
-            pollUpgradeStatus();
+            attachUpgradeJob(data.job);
         },
         'Start Upgrade'
     );
@@ -3860,11 +4925,12 @@ function renderUpgradeJob(job) {
     renderUpgradeTable(job);
     const done = job.devices.filter(d => d.status === 'done').length;
     const failed = job.devices.filter(d => d.status === 'failed').length;
-    const active = job.devices.filter(d => ['upgrading', 'waiting_reboot'].includes(d.status)).length;
+    const active = job.devices.filter(d => ['starting', 'upgrading', 'waiting_reboot'].includes(d.status)).length;
     document.getElementById('upgradeStatusText').textContent = `Job ${job.id.slice(0, 8)}: ${done} done, ${failed} failed, ${active} active` +
         (job.worker_error ? ` — worker retrying: ${job.worker_error}` : '');
     if (job.complete) {
-        clearInterval(upgradePollTimer);
+        upgradePollGeneration++;
+        clearTimeout(upgradePollTimer);
         upgradePollTimer = null;
         document.getElementById('btnStartUpgrade').disabled = false;
         document.getElementById('btnCancelUpgrade').style.display = 'none';
@@ -3874,13 +4940,22 @@ function renderUpgradeJob(job) {
 
 async function pollUpgradeStatus() {
     if (!upgradeJobId) return;
-    if (upgradePollTimer) clearInterval(upgradePollTimer);
+    const jobId = upgradeJobId;
+    const generation = ++upgradePollGeneration;
+    if (upgradePollTimer) clearTimeout(upgradePollTimer);
+    upgradePollTimer = null;
     const poll = async () => {
-        const data = await apiCall('upgrade-status', { job_id: upgradeJobId });
-        if (data.success) renderUpgradeJob(data.job);
+        const data = await apiCall('upgrade-status', { job_id: jobId });
+        if (generation !== upgradePollGeneration || jobId !== upgradeJobId) return;
+        if (data.success) {
+            renderUpgradeJob(data.job);
+            if (data.job && data.job.complete) return;
+        }
+        if (generation === upgradePollGeneration && jobId === upgradeJobId) {
+            upgradePollTimer = setTimeout(poll, 15000);
+        }
     };
     await poll();
-    upgradePollTimer = setInterval(poll, 15000);
 }
 
 async function cancelUpgradeJob() {

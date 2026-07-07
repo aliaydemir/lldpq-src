@@ -10,6 +10,9 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
+LLDPQ_USER="${LLDPQ_USER:-lldpq}"
+SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 
 # topology.dot is stored in web root for www-data access
 # A symlink in ~/lldpq/topology.dot points to this file
@@ -20,17 +23,24 @@ METHOD="${REQUEST_METHOD:-GET}"
 
 # Output headers
 echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo "X-Content-Type-Options: nosniff"
 echo ""
 
 if [ "$METHOD" = "GET" ]; then
-    # Read and return topology.dot content
-    if [ -f "$TOPOLOGY_FILE" ]; then
-        # Escape content for JSON
-        CONTENT=$(cat "$TOPOLOGY_FILE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-        echo "{\"success\": true, \"content\": $CONTENT}"
-    else
-        echo "{\"success\": false, \"error\": \"File not found\"}"
-    fi
+    TOPOLOGY_FILE="$TOPOLOGY_FILE" python3 - <<'PY'
+import hashlib, json, os
+path = os.environ['TOPOLOGY_FILE']
+try:
+    raw = open(path, 'rb').read()
+    print(json.dumps({'success': True, 'content': raw.decode('utf-8'),
+                      'revision': hashlib.sha256(raw).hexdigest(), 'exists': True}))
+except FileNotFoundError:
+    print(json.dumps({'success': True, 'content': '', 'exists': False,
+                      'revision': hashlib.sha256(b'').hexdigest()}))
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': 'Cannot read topology.dot: ' + str(exc)}))
+PY
     
 elif [ "$METHOD" = "POST" ]; then
     # Read POST data from stdin
@@ -41,31 +51,24 @@ elif [ "$METHOD" = "POST" ]; then
         POST_DATA=$(cat)
     fi
     
-    # Extract content from JSON using Python
-    CONTENT=$(echo "$POST_DATA" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get("content", ""))
-except:
-    print("")
-' 2>/dev/null)
-    
-    if [ -n "$CONTENT" ]; then
-        # Write new content (try direct, fallback to sudo tee)
-        if echo "$CONTENT" > "$TOPOLOGY_FILE" 2>/dev/null; then
-            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$TOPOLOGY_FILE" 2>/dev/null
-            sudo -n chmod 664 "$TOPOLOGY_FILE" 2>/dev/null
-            echo "{\"success\": true, \"message\": \"Topology saved successfully\"}"
-        elif echo "$CONTENT" | sudo -n tee "$TOPOLOGY_FILE" > /dev/null 2>&1; then
-            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$TOPOLOGY_FILE" 2>/dev/null
-            sudo -n chmod 664 "$TOPOLOGY_FILE" 2>/dev/null
-            echo "{\"success\": true, \"message\": \"Topology saved successfully\"}"
-        else
-            echo "{\"success\": false, \"error\": \"Failed to write file\"}"
-        fi
+    if [ ! -f "$SETUP_SAFETY" ]; then
+        echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
+        exit 0
+    fi
+    ARGS=("$SETUP_SAFETY" save-topology --request-json --target "$TOPOLOGY_FILE" --managed-root "$WEB_ROOT" --managed-root "$LLDPQ_DIR")
+    # Newer installs provide a shared semantic parser. Keep Setup compatible
+    # with older installs by treating it as an additive check when present.
+    if [ -f "$LLDPQ_DIR/topology_edges.py" ]; then
+        ARGS+=(--topology-parser "$LLDPQ_DIR/topology_edges.py")
+    fi
+    RESULT=$(printf '%s' "$POST_DATA" | sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c 'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
+    if [ -z "$RESULT" ]; then
+        echo '{"success": false, "error": "Failed to validate or atomically save topology.dot"}'
     else
-        echo "{\"success\": false, \"error\": \"No content provided\"}"
+        RESULT="$RESULT" python3 -c 'import json,os
+r=json.loads(os.environ["RESULT"])
+if r.get("success"): r["message"]="Topology saved successfully"
+print(json.dumps(r))' 2>/dev/null || echo "$RESULT"
     fi
 else
     echo "{\"success\": false, \"error\": \"Invalid method\"}"

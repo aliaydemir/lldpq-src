@@ -17,6 +17,60 @@ server {
             add_header Pragma "no-cache";
             add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
         }
+
+        # Every page omitted from the operator menu is also admin-gated when
+        # its URL is entered directly. The gateway validates the same session
+        # cookie as the APIs before it releases any static HTML bytes.
+        location ~ ^/(?:setup|provision|ai|device|console|commands|vlan-report|vrf-report|fabric-exit|fabric-config|fabric-editor|fabric-deploy|lldpq-ztp-new-device-flow)\.html$ {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/admin-page.sh;
+            fastcgi_param LLDPQ_ADMIN_PAGE $uri;
+            fastcgi_param REQUEST_METHOD $request_method;
+            fastcgi_param HTTP_COOKIE $http_cookie;
+        }
+
+        # Ask-AI state belongs behind the admin API. Block legacy files that
+        # may still exist briefly while an upgraded installation migrates them.
+        location ~ ^/ai-(analysis|learnings|analysis-snapshot)\.json$ {
+            return 404;
+        }
+
+        # Asset inventory contains device addresses, serials and software data.
+        # Serve it only through the session-guarded, schema-validating API below.
+        location = /assets.ini {
+            return 404;
+        }
+        location = /device-cache.json {
+            return 404;
+        }
+        # Provisioning state is available only through its admin API. The
+        # Fabric Deploy cache keeps its existing URL but is session-gated.
+        location = /inventory.json {
+            return 404;
+        }
+        location = /discovery-cache.json {
+            return 404;
+        }
+        location = /fabric-scan-cache.json {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/admin-page.sh;
+            fastcgi_param LLDPQ_ADMIN_PAGE $uri;
+            fastcgi_param REQUEST_METHOD $request_method;
+            fastcgi_param HTTP_COOKIE $http_cookie;
+        }
+        # Setup editors use same-directory lock, backup and temporary files for
+        # atomic replacement. Only the canonical public config names may be read.
+        location ~ ^/\.(?:topology\.dot|topology_config\.yaml|display-aliases\.json) {
+            return 404;
+        }
+        location ~ ^/(?:topology\.dot|topology_config\.yaml|display-aliases\.json)\.(?:bak|lock)$ {
+            return 404;
+        }
+        # Same-directory staging is required for atomic rename. Never expose
+        # those hidden temporary/rollback files if a process is interrupted.
+        location ~ ^/\.(?:assets\.ini|device-cache\.json)\. {
+            return 404;
+        }
         location /configs/ {
             autoindex on;
             autoindex_exact_size off;
@@ -97,6 +151,17 @@ server {
             # Execute trigger script via fcgiwrap
             fastcgi_pass unix:/var/run/fcgiwrap.socket;
             fastcgi_param SCRIPT_FILENAME /var/www/html/trigger-assets.sh;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+            fastcgi_param CONTENT_TYPE $content_type;
+            fastcgi_param CONTENT_LENGTH $content_length;
+            fastcgi_param HTTP_COOKIE $http_cookie;
+        }
+
+        # Authenticated, freshness-checked Assets snapshot endpoint.
+        location = /assets-api {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/assets-api.sh;
             fastcgi_param QUERY_STRING $query_string;
             fastcgi_param REQUEST_METHOD $request_method;
             fastcgi_param CONTENT_TYPE $content_type;
@@ -274,5 +339,16 @@ server {
             fastcgi_read_timeout 180;
             # Allow large OS image uploads (up to 2GB)
             client_max_body_size 2048m;
+        }
+
+        # Authenticated read-only switch lifecycle/tracking endpoint
+        location = /tracking-api.sh {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/tracking-api.sh;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+            fastcgi_param CONTENT_TYPE $content_type;
+            fastcgi_param CONTENT_LENGTH $content_length;
+            fastcgi_param HTTP_COOKIE $http_cookie;
         }
 }

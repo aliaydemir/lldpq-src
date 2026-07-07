@@ -19,6 +19,32 @@ import sys
 import tempfile
 import yaml
 
+try:
+    from topology_edges import (
+        DeviceNameResolver,
+        LLDPNeighbor,
+        TopologyEdge,
+        is_eth0,
+        iter_lldp_neighbors,
+        parse_topology_file,
+        port_key,
+    )
+except ImportError:  # Source-tree imports used by unit tests.
+    from lldpq.topology_edges import (
+        DeviceNameResolver,
+        LLDPNeighbor,
+        TopologyEdge,
+        is_eth0,
+        iter_lldp_neighbors,
+        parse_topology_file,
+        port_key,
+    )
+
+try:
+    from parse_devices import get_all_devices, load_devices_yaml
+except ImportError:  # Source-tree imports used by unit tests.
+    from lldpq.parse_devices import get_all_devices, load_devices_yaml
+
 def load_topology_config(config_path="topology_config.yaml"):
     """Load topology configuration to determine which script to use"""
     if os.path.exists(config_path):
@@ -46,52 +72,51 @@ def get_topology_script_name(config_path="topology_config.yaml"):
 
     return script_name
 
-def parse_lldp_output(filename):
+
+def load_managed_device_names(devices_yaml_path):
+    """Return only collection-required ``devices:``, never endpoint_hosts."""
+    try:
+        config = load_devices_yaml(devices_yaml_path)
+        return [hostname for _address, _user, hostname, _role in get_all_devices(config)]
+    except SystemExit as exc:
+        raise RuntimeError('Could not load managed devices.yaml inventory') from exc
+
+
+def snapshot_topology(source_path, destination_directory):
+    """Take one immutable run-local topology snapshot for report and graph output."""
+    descriptor, snapshot_path = tempfile.mkstemp(
+        prefix='.topology.snapshot.', suffix='.dot', dir=destination_directory
+    )
+    try:
+        with os.fdopen(descriptor, 'wb') as target, open(source_path, 'rb') as source:
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        return snapshot_path
+    except Exception:
+        try:
+            os.unlink(snapshot_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+def parse_lldp_output(filename, known_device_names=()):
     neighbors = []
     port_status = {}
 
-    with open(filename, 'r') as file:
+    resolver = DeviceNameResolver(known_device_names)
+    with open(filename, 'r', encoding='utf-8', errors='replace') as file:
         content = file.read()
 
-        # Parse LLDP neighbors
-        interfaces = re.split(r'-------------------------------------------------------------------------------', content)[1:-1]
-        for interface in interfaces:
-            data = {}
-            interface_match = re.search(r'Interface:\s+(\S+)', interface)
-            sys_name_match = re.search(r'SysName:\s+([^\n]+)', interface)
-
-            sys_descr_match = re.search(r'SysDescr:\s+([^\n]+)', interface)
-            vendor = sys_descr_match.group(1) if sys_descr_match else ""
-
-            if "Cumulus" in vendor or "Cisco" in vendor or "FortiGate" in vendor:
-                # ifname for Cumulus/Cisco, ifalias for FortiGate
-                port_id_match = re.search(r'PortID:\s+(?:ifname|ifalias)\s+(\S+)', interface)
-            else:
-                # For HGX devices, extract just the interface name from "Interface 4 as enp157s0f0np0"
-                port_descr_match = re.search(r'PortDescr:\s+(.+)', interface)
-                if port_descr_match:
-                    port_descr = port_descr_match.group(1).strip()
-                    # Extract interface name from patterns like "Interface 4 as enp157s0f0np0"
-                    interface_name_match = re.search(r'as\s+(\S+)', port_descr)
-                    if interface_name_match:
-                        port_id_match = type('Match', (), {'group': lambda self, n: interface_name_match.group(1)})()
-                    else:
-                        port_id_match = port_descr_match
-                else:
-                    port_id_match = None
-            if interface_match and sys_name_match and port_id_match:
-                sys_name = sys_name_match.group(1).strip()
-                if not "Cumulus" in interface:
-                    sys_name = sys_name.split(".cm.cluster")[0]
-                data['interface'] = interface_match.group(1).strip(',')
-                data['sys_name'] = sys_name
-                data['port_id'] = port_id_match.group(1).strip()
-                neighbors.append(data)
-            elif interface_match and port_id_match:
-                data['interface'] = interface_match.group(1).strip(',')
-                data['sys_name'] = "Unknown"
-                data['port_id'] = port_id_match.group(1).strip()
-                neighbors.append(data)
+        # The topology view and wiring validator share this exact TLV parser and
+        # hostname/interface normalization contract.
+        for neighbor in iter_lldp_neighbors(
+                content, resolver=resolver, known_device_names=known_device_names):
+            neighbors.append({
+                'interface': neighbor.local_port,
+                'sys_name': neighbor.device or 'Unknown',
+                'port_id': neighbor.remote_port or 'Unknown',
+            })
         port_status_matches = re.findall(r'===PORT_STATUS_START===(.*?)===PORT_STATUS_END===', content, re.DOTALL)
         if port_status_matches:
             port_status_section = port_status_matches[-1]
@@ -102,12 +127,12 @@ def parse_lldp_output(filename):
                     parts = line.split()
                     if len(parts) >= 2:
                         port_name = parts[0]
-                        status = parts[-1]
+                        status = parts[-1].upper()
                         port_status[port_name] = status
 
     return neighbors, port_status
 
-def get_device_neighbors(lldp_dir):
+def get_device_neighbors(lldp_dir, known_device_names=()):
     device_neighbors = {}
     device_port_status = {}
     files_in_order = sorted(os.listdir(lldp_dir))
@@ -115,114 +140,235 @@ def get_device_neighbors(lldp_dir):
         if filename.endswith("_lldp_result.ini"):
             device_name = filename.replace("_lldp_result.ini", "")
             filepath = os.path.join(lldp_dir, filename)
-            neighbors, port_status = parse_lldp_output(filepath)
+            neighbors, port_status = parse_lldp_output(filepath, known_device_names)
             device_neighbors[device_name] = neighbors
             device_port_status[device_name] = port_status
     return device_neighbors, device_port_status, files_in_order
 
-def check_connections(topology_file, device_neighbors, device_port_status):
-    with open(topology_file, 'r') as file:
-        expected_connections = file.readlines()
+def _neighbor_sort_key(neighbor, resolver):
+    return (
+        resolver.key(neighbor.device),
+        port_key(neighbor.remote_port),
+        neighbor.device or '',
+        neighbor.remote_port or '',
+    )
+
+
+def _group_neighbors(neighbors, resolver):
+    grouped = {}
+    seen = set()
+    for raw in neighbors:
+        neighbor = LLDPNeighbor(
+            local_port=str(raw.get('interface') or '').strip(', '),
+            device=resolver.canonical(
+                str(raw.get('sys_name') or 'Unknown').strip()
+            ),
+            remote_port=str(raw.get('port_id') or 'Unknown').strip(),
+        )
+        if not neighbor.local_port:
+            continue
+        identity = (
+            neighbor.local_port,
+            resolver.key(neighbor.device),
+            port_key(neighbor.remote_port),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        grouped.setdefault(neighbor.local_port, []).append(neighbor)
+    for candidates in grouped.values():
+        candidates.sort(key=lambda item: _neighbor_sort_key(item, resolver))
+    return grouped
+
+
+def check_connections(
+        topology_file_or_edges, device_neighbors, device_port_status,
+        managed_devices=None, resolver=None):
+    """Compare normalized LLDP observations with one semantic topology.
+
+    Results remain port-oriented for backward compatibility.  A managed device
+    with no collection still receives explicit No-Info rows, while
+    unmanaged endpoint hosts never get synthetic local rows.
+    """
+    if isinstance(topology_file_or_edges, (str, os.PathLike)):
+        edges = parse_topology_file(os.fspath(topology_file_or_edges))
+    else:
+        edges = list(topology_file_or_edges)
+        if any(not isinstance(edge, TopologyEdge) for edge in edges):
+            raise TypeError('topology edges must be TopologyEdge instances')
+
+    if managed_devices is None:
+        managed_devices = list(device_neighbors)
+    else:
+        managed_devices = list(managed_devices)
+    known_names = list(managed_devices) + list(device_neighbors)
+    known_names.extend(
+        name for edge in edges for name in (edge.left_device, edge.right_device)
+    )
+    resolver = resolver or DeviceNameResolver(known_names)
+    managed_device_keys = {
+        resolver.key(name) for name in managed_devices
+    } - {''}
+
+    collected_by_key = {}
+    for collected_name in device_neighbors:
+        key = resolver.key(collected_name)
+        if key in collected_by_key and collected_by_key[key] != collected_name:
+            raise ValueError(
+                'Multiple LLDP collection files resolve to the same device: '
+                f'{collected_by_key[key]} and {collected_name}'
+            )
+        collected_by_key[key] = collected_name
+
+    ordered_devices = []
+    ordered_keys = set()
+    for name in managed_devices:
+        key = resolver.key(name)
+        if key and key not in ordered_keys:
+            ordered_devices.append((resolver.canonical(name), key))
+            ordered_keys.add(key)
+    # Preserve compatibility for direct callers with collection inputs that are
+    # not represented in devices.yaml.
+    for name in device_neighbors:
+        key = resolver.key(name)
+        if key and key not in ordered_keys:
+            ordered_devices.append((resolver.canonical(name), key))
+            ordered_keys.add(key)
+
     results = {}
-    valid_devices = device_neighbors.keys()
-    # Hostname matching is case-insensitive (DNS-style); interface names stay exact
-    valid_devices_lower = {d.lower() for d in valid_devices}
-    edge_re = re.compile(r'"([^"]+)"\s*:\s*"([^"]+)"\s*--\s*"([^"]+)"\s*:\s*"([^"]+)"')
-    for device, neighbors in device_neighbors.items():
-        port_status = device_port_status.get(device, {})
+    for device, device_key in ordered_devices:
+        collected_name = collected_by_key.get(device_key)
+        collection_available = collected_name is not None
+        raw_neighbors = device_neighbors.get(collected_name, []) if collected_name else []
+        port_status = device_port_status.get(collected_name, {}) if collected_name else {}
+        neighbors_by_port = _group_neighbors(raw_neighbors, resolver)
         device_results = []
-        in_block_comment = False
-        for connection in expected_connections:
-            line = connection.strip()
-            if not line:
-                continue
-            if '/*' in line:
-                in_block_comment = True
-            if in_block_comment:
-                if '*/' in line:
-                    in_block_comment = False
-                continue
-            if line.startswith('#') or line.startswith('//') or '--' not in line:
-                continue
-            # Remove edge attributes such as [color=...]
-            line = re.sub(r'\[.*?\]', '', line)
-            m = edge_re.search(line)
-            if m:
-                left, left_interface, right, right_interface = m.groups()
+        expected_local_ports = set()
+
+        for edge in edges:
+            if resolver.key(edge.left_device) == device_key:
+                expected_interface = edge.left_port
+                expected_neighbor_sys_name = edge.right_device
+                expected_neighbor_port = edge.right_port
+            elif resolver.key(edge.right_device) == device_key:
+                expected_interface = edge.right_port
+                expected_neighbor_sys_name = edge.left_device
+                expected_neighbor_port = edge.left_port
             else:
-                # Fallback: unquoted format (Device:Interface -- Device:Interface)
-                parts = line.split('--', 1)
-                if len(parts) != 2:
-                    continue
-                lp = parts[0].replace('"', '').strip().split(':', 1)
-                rp = parts[1].replace('"', '').strip().split(':', 1)
-                if len(lp) != 2 or len(rp) != 2:
-                    continue
-                left, left_interface = lp[0].strip(), lp[1].strip()
-                right, right_interface = rp[0].strip(), rp[1].strip()
-            left_is_device = left.lower() == device.lower()
-            right_is_device = right.lower() == device.lower()
-            if not left_is_device and not right_is_device:
                 continue
-            expected_interface = left_interface if left_is_device else right_interface
-            expected_neighbor_sys_name = right if left_is_device else left
-            expected_neighbor_port = right_interface if left_is_device else left_interface
-            active_neighbor = next((n for n in neighbors if n['interface'] == expected_interface), None)
-            active_neighbor_sys_name = 'None'
-            active_neighbor_port = 'None'
-            
-            # Check if port is DOWN first - this should be considered a Fail
-            interface_port_status = port_status.get(expected_interface, 'N/A')
+
+            # Management links are deliberately excluded as a whole, whether
+            # present or absent, so row counts cannot change when LLDP appears.
+            if is_eth0(expected_interface) or is_eth0(expected_neighbor_port):
+                continue
+            expected_local_ports.add(expected_interface)
+            candidates = [
+                candidate for candidate in neighbors_by_port.get(expected_interface, [])
+                if not is_eth0(candidate.remote_port)
+            ]
+            interface_port_status = str(
+                port_status.get(
+                    expected_interface,
+                    'N/A',
+                )
+            ).upper()
+            active_neighbor = None
+            reason = ''
+
             if interface_port_status == 'DOWN':
                 status = 'Fail'
-            elif not active_neighbor:
+                reason = 'Local port is down'
+            elif not collection_available:
                 status = 'No-Info'
+                reason = 'Managed device collection unavailable'
+            elif not candidates:
+                status = 'No-Info'
+                reason = 'No LLDP neighbor on expected port'
             else:
-                if expected_neighbor_sys_name == 'None':
-                    status = 'Fail'
-                    active_neighbor_sys_name = active_neighbor['sys_name']
-                    active_neighbor_port = active_neighbor['port_id']
-                elif active_neighbor['sys_name'].lower() == expected_neighbor_sys_name.lower() and active_neighbor['port_id'] == expected_neighbor_port:
+                exact = [
+                    candidate for candidate in candidates
+                    if resolver.key(candidate.device) == resolver.key(expected_neighbor_sys_name)
+                    and port_key(candidate.remote_port) == port_key(expected_neighbor_port)
+                ]
+                if exact:
+                    active_neighbor = exact[0]
                     status = 'Pass'
-                    active_neighbor_sys_name = active_neighbor['sys_name']
-                    active_neighbor_port = active_neighbor['port_id']
+                    reason = 'Expected LLDP neighbor selected'
                 else:
+                    active_neighbor = candidates[0]
                     status = 'Fail'
-                    active_neighbor_sys_name = active_neighbor['sys_name']
-                    active_neighbor_port = active_neighbor['port_id']
-            if expected_interface == 'eth0' or active_neighbor_port == 'eth0':
-                continue
-            # Port status was already retrieved above for DOWN check
+                    reason = (
+                        'Ambiguous LLDP neighbors on local port'
+                        if len(candidates) > 1 else 'LLDP neighbor mismatch'
+                    )
+
             device_results.append({
                 'Port': expected_interface,
                 'interface': expected_interface,
                 'Status': status,
                 'Exp-Nbr': expected_neighbor_sys_name,
                 'Exp-Nbr-Port': expected_neighbor_port,
-                'Act-Nbr': active_neighbor_sys_name,
-                'Act-Nbr-Port': active_neighbor_port,
-                'Port-Status': interface_port_status
+                'Act-Nbr': active_neighbor.device if active_neighbor else 'None',
+                'Act-Nbr-Port': active_neighbor.remote_port if active_neighbor else 'None',
+                'Port-Status': interface_port_status,
+                'Reason': reason,
             })
-        for neighbor in neighbors:
-            if neighbor['interface'] == 'eth0' or neighbor['port_id'] == 'eth0':
+
+        # An otherwise-unconfigured local port is a wiring warning only when it
+        # reaches another managed device.  External endpoints commonly advertise
+        # LLDP on server-facing ports without being part of the managed fabric;
+        # they must not inflate wiring failures.  Configured topology ports are
+        # handled above, so an explicitly modeled endpoint (or a wrong endpoint
+        # on a modeled port) still receives the normal exact-match validation.
+        for local_port in sorted(neighbors_by_port):
+            if local_port in expected_local_ports or is_eth0(local_port):
                 continue
-            if neighbor['sys_name'].lower() not in valid_devices_lower:
+            candidates = [
+                candidate for candidate in neighbors_by_port[local_port]
+                if not is_eth0(candidate.remote_port)
+                and resolver.key(candidate.device) in managed_device_keys
+            ]
+            if not candidates:
                 continue
-            if not any(n['interface'] == neighbor['interface'] for n in device_results):
-                # Get port status for this interface
-                interface_port_status = port_status.get(neighbor['interface'], 'N/A')
-                device_results.append({
-                    'Port': neighbor['interface'],
-                    'interface': neighbor['interface'],
-                    'Status': 'Fail',
-                    'Exp-Nbr': 'None',
-                    'Exp-Nbr-Port': 'None',
-                    'Act-Nbr': neighbor['sys_name'],
-                    'Act-Nbr-Port': neighbor['port_id'],
-                    'Port-Status': interface_port_status
-                })
+            active_neighbor = candidates[0]
+            device_results.append({
+                'Port': local_port,
+                'interface': local_port,
+                'Status': 'Fail',
+                'Exp-Nbr': 'None',
+                'Exp-Nbr-Port': 'None',
+                'Act-Nbr': active_neighbor.device or 'Unknown',
+                'Act-Nbr-Port': active_neighbor.remote_port or 'Unknown',
+                'Port-Status': str(port_status.get(local_port, 'N/A')).upper(),
+                'Reason': (
+                    'Ambiguous unexpected LLDP neighbors'
+                    if len(candidates) > 1 else 'Unexpected LLDP neighbor'
+                ),
+            })
         results[device] = device_results
     return results
+
+
+def write_results_report(output_file, results, created_at):
+    """Serialize the backward-compatible aggregate consumed by LLDPq pages."""
+    output_file.write(f"Created on {created_at}\n\n")
+    for device in sorted(results, key=str.casefold):
+        total_length = 96
+        device_length = len(device)
+        # The strict aggregate parser requires visible '=' delimiters even for
+        # the longest hostname accepted by devices.yaml.
+        equal_count = max(3, (total_length - device_length - 2) // 2)
+        equal_str = "=" * equal_count
+        header = f"{equal_str} {device} {equal_str}"
+        if len(header) < total_length:
+            header += "=" * (total_length - len(header))
+        output_file.write(header + "\n\n")
+        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
+        output_file.write(f"{'Port':<10} {'Status':<10} {'Exp-Nbr':<28} {'Exp-Nbr-Port':<16} {'Act-Nbr':<28} {'Act-Nbr-Port':<12} {'Port-Status'}\n")
+        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
+        for res in results[device]:
+            output_file.write(f"{res['Port']:<10} {res['Status']:<10} {res['Exp-Nbr']:<28} {res['Exp-Nbr-Port']:<16} {res['Act-Nbr']:<28} {res['Act-Nbr-Port']:<12} {res['Port-Status']}\n")
+        output_file.write("\n\n")
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -236,15 +382,37 @@ def main():
     topology_file = os.path.join(script_dir, "topology.dot")
     output_file_path = os.path.join(lldp_results_folder, "lldp_results.ini")
     temp_output_path = None
+    topology_snapshot_path = None
     previous_output_path = None
     new_output_active = False
     stage_only = os.environ.get("LLDPQ_LLDP_STAGE_ONLY") == "1"
 
     try:
-        device_neighbors, device_port_status, files_in_order = get_device_neighbors(input_folder)
-        results = check_connections(topology_file, device_neighbors, device_port_status)
+        managed_devices = load_managed_device_names(
+            os.path.join(script_dir, 'devices.yaml')
+        )
+        topology_snapshot_path = snapshot_topology(topology_file, input_folder)
+        topology_edges = parse_topology_file(topology_snapshot_path)
+        known_device_names = list(managed_devices)
+        known_device_names.extend(
+            name for edge in topology_edges
+            for name in (edge.left_device, edge.right_device)
+        )
+        resolver = DeviceNameResolver(known_device_names)
+        device_neighbors, device_port_status, _files_in_order = get_device_neighbors(
+            input_folder, known_device_names
+        )
+        results = check_connections(
+            topology_edges,
+            device_neighbors,
+            device_port_status,
+            managed_devices=managed_devices,
+            resolver=resolver,
+        )
         date_str = subprocess.getoutput("date '+%Y-%m-%d %H-%M-%S'")
-        script_name = get_topology_script_name()
+        script_name = get_topology_script_name(
+            os.path.join(script_dir, 'topology_config.yaml')
+        )
         generate_topology_script = os.path.join(os.path.dirname(__file__), script_name)
 
         with tempfile.NamedTemporaryFile(
@@ -260,25 +428,7 @@ def main():
             except FileNotFoundError:
                 report_mode = 0o664
             os.fchmod(output_file.fileno(), report_mode)
-            output_file.write(f"Created on {date_str}\n\n")
-            for filename in files_in_order:
-                if filename.endswith("_lldp_result.ini"):
-                    device = filename.replace("_lldp_result.ini", "")
-                    if device in results:
-                        total_length = 96
-                        device_length = len(device)
-                        equal_count = (total_length - device_length - 2) // 2
-                        equal_str = "=" * equal_count
-                        header = f"{equal_str} {device} {equal_str}"
-                        if len(header) < total_length:
-                            header += "=" * (total_length - len(header))
-                        output_file.write(header + "\n\n")
-                        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
-                        output_file.write(f"{'Port':<10} {'Status':<10} {'Exp-Nbr':<28} {'Exp-Nbr-Port':<16} {'Act-Nbr':<28} {'Act-Nbr-Port':<12} {'Port-Status'}\n")
-                        output_file.write("--------------------------------------------------------------------------------------------------------------------------\n")
-                        for res in results[device]:
-                            output_file.write(f"{res['Port']:<10} {res['Status']:<10} {res['Exp-Nbr']:<28} {res['Exp-Nbr-Port']:<16} {res['Act-Nbr']:<28} {res['Act-Nbr-Port']:<12} {res['Port-Status']}\n")
-                        output_file.write("\n\n")
+            write_results_report(output_file, results, date_str)
             output_file.flush()
             os.fsync(output_file.fileno())
 
@@ -293,8 +443,9 @@ def main():
             temp_output_path = None
             subprocess.run(
                 [sys.executable, generate_topology_script, input_folder,
-                 staged_topology],
+                 staged_topology, '--topology-file', topology_snapshot_path],
                 check=True,
+                cwd=script_dir,
             )
             if not os.path.isfile(staged_topology) or os.path.getsize(staged_topology) == 0:
                 raise RuntimeError("topology generator did not create a staged output")
@@ -318,8 +469,10 @@ def main():
                 output_file_path, os.path.join(input_folder, "lldp_results.ini")
             )
         subprocess.run(
-            ["sudo", "python3", generate_topology_script, input_folder],
+            ["sudo", "python3", generate_topology_script, input_folder,
+             '--topology-file', topology_snapshot_path],
             check=True,
+            cwd=script_dir,
         )
         if previous_output_path:
             os.unlink(previous_output_path)
@@ -353,6 +506,17 @@ def main():
                 os.unlink(temp_output_path)
             except FileNotFoundError:
                 pass
+        if topology_snapshot_path:
+            try:
+                os.unlink(topology_snapshot_path)
+            except OSError as cleanup_exc:
+                # The report/topology transaction has already reached its
+                # terminal state.  A best-effort snapshot cleanup must not
+                # turn a successful publication into a failed collection.
+                print(
+                    f"Warning: could not remove topology snapshot: {cleanup_exc}",
+                    file=sys.stderr,
+                )
 
 
 if __name__ == "__main__":

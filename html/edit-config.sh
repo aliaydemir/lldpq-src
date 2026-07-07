@@ -11,6 +11,8 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
 fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 LLDPQ_DIR="${LLDPQ_DIR:-/opt/lldpq}"
+LLDPQ_USER="${LLDPQ_USER:-lldpq}"
+SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 # NoNe = explicitly disabled, treat as empty
 if [[ "$ANSIBLE_DIR" == "NoNe" ]]; then
     ANSIBLE_DIR=""
@@ -31,6 +33,8 @@ fi
 
 # Output headers
 echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo "X-Content-Type-Options: nosniff"
 echo ""
 
 # Handle get-inventory action - return device groups
@@ -192,14 +196,19 @@ if [ "$ACTION" = "validate" ]; then
 fi
 
 if [ "$METHOD" = "GET" ]; then
-    # Read and return topology_config.yaml content
-    if [ -f "$CONFIG_FILE" ]; then
-        # Escape content for JSON
-        CONTENT=$(cat "$CONFIG_FILE" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-        echo "{\"success\": true, \"content\": $CONTENT}"
-    else
-        echo "{\"success\": false, \"error\": \"File not found\"}"
-    fi
+    CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY'
+import hashlib, json, os
+path = os.environ['CONFIG_FILE']
+try:
+    raw = open(path, 'rb').read()
+    print(json.dumps({'success': True, 'content': raw.decode('utf-8'),
+                      'revision': hashlib.sha256(raw).hexdigest(), 'exists': True}))
+except FileNotFoundError:
+    print(json.dumps({'success': True, 'content': '', 'exists': False,
+                      'revision': hashlib.sha256(b'').hexdigest()}))
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': 'Cannot read topology_config.yaml: ' + str(exc)}))
+PY
     
 elif [ "$METHOD" = "POST" ]; then
     # Read POST data from stdin
@@ -209,31 +218,19 @@ elif [ "$METHOD" = "POST" ]; then
         POST_DATA=$(cat)
     fi
     
-    # Extract content from JSON using Python
-    CONTENT=$(echo "$POST_DATA" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    print(data.get("content", ""))
-except:
-    print("")
-' 2>/dev/null)
-    
-    if [ -n "$CONTENT" ]; then
-        # Write new content (try direct, fallback to sudo tee)
-        if echo "$CONTENT" > "$CONFIG_FILE" 2>/dev/null; then
-            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$CONFIG_FILE" 2>/dev/null
-            sudo -n chmod 664 "$CONFIG_FILE" 2>/dev/null
-            echo "{\"success\": true, \"message\": \"Config saved successfully\"}"
-        elif echo "$CONTENT" | sudo -n tee "$CONFIG_FILE" > /dev/null 2>&1; then
-            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$CONFIG_FILE" 2>/dev/null
-            sudo -n chmod 664 "$CONFIG_FILE" 2>/dev/null
-            echo "{\"success\": true, \"message\": \"Config saved successfully\"}"
-        else
-            echo "{\"success\": false, \"error\": \"Failed to write file\"}"
-        fi
+    if [ ! -f "$SETUP_SAFETY" ]; then
+        echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
+        exit 0
+    fi
+    ARGS=("$SETUP_SAFETY" save-topology-config --request-json --target "$CONFIG_FILE" --managed-root "$WEB_ROOT" --managed-root "$LLDPQ_DIR")
+    RESULT=$(printf '%s' "$POST_DATA" | sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c 'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
+    if [ -z "$RESULT" ]; then
+        echo '{"success": false, "error": "Failed to validate or atomically save topology_config.yaml"}'
     else
-        echo "{\"success\": false, \"error\": \"No content provided\"}"
+        RESULT="$RESULT" python3 -c 'import json,os
+r=json.loads(os.environ["RESULT"])
+if r.get("success"): r["message"]="Config saved successfully"
+print(json.dumps(r))' 2>/dev/null || echo "$RESULT"
     fi
 else
     echo "{\"success\": false, \"error\": \"Invalid method\"}"

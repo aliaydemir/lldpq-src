@@ -4351,118 +4351,653 @@ PYTHON
         ;;
     get-device-data)
         # Get all monitoring data for a specific device
-        DEVICE=$(echo "$QUERY_STRING" | grep -oP 'device=\K[^&]+' | sed 's/%20/ /g')
-        
-        if [[ -z "$DEVICE" ]]; then
-            echo '{"success": false, "error": "Missing device parameter"}'
-            exit 0
-        fi
-        
-        python3 << PYTHON
+        # Parse the query inside the quoted Python block.  Interpolating a
+        # decoded device name into Python source made malformed query values a
+        # code-injection and parser-confusion boundary.
+        python3 << 'PYTHON'
 import json
+import math
 import os
 import re
-from datetime import datetime
+import time
+import urllib.parse
+from datetime import datetime, timezone
 
-device = "$DEVICE"
-monitor_dir = os.environ.get('WEB_ROOT', '/var/www/html') + '/monitor-results'
+
+def fail(message):
+    print(json.dumps({'success': False, 'error': message}))
+    raise SystemExit(0)
+
+
+raw_query = os.environ.get('QUERY_STRING', '')
+if len(raw_query) > 4096:
+    fail('Query string is too large')
+try:
+    query = urllib.parse.parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        encoding='utf-8',
+        errors='strict',
+        max_num_fields=32,
+    )
+except (UnicodeError, ValueError):
+    fail('Invalid query string')
+
+device_values = query.get('device', [])
+if not device_values or not device_values[0].strip():
+    fail('Missing device parameter')
+if len(device_values) != 1:
+    fail('Device parameter must be specified once')
+device = device_values[0].strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
+
+monitor_dir = os.path.join(
+    os.environ.get('WEB_ROOT', '/var/www/html'), 'monitor-results'
+)
+try:
+    max_age_minutes = float(
+        os.environ.get('MONITOR_DATA_MAX_AGE_MINUTES', '30')
+    )
+    if not math.isfinite(max_age_minutes):
+        raise ValueError('freshness window must be finite')
+    max_age_seconds = max(max_age_minutes, 0.0) * 60.0
+except ValueError:
+    max_age_seconds = 1800.0
+now = time.time()
+
+
+def timestamp_epoch(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            candidate = float(text)
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+                # Legacy BGP files used datetime.now().isoformat(), which is
+                # naive local time. datetime.timestamp() preserves that
+                # producer contract; replacing tzinfo with UTC would move
+                # fresh data into the future on non-UTC servers. Aware values
+                # retain their explicit offset through the same operation.
+                candidate = parsed.timestamp()
+            except ValueError:
+                return None
+    else:
+        return None
+    return candidate if math.isfinite(candidate) and candidate >= 0 else None
+
+
+def iso_timestamp(epoch):
+    if epoch is None:
+        return None
+    try:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace(
+            '+00:00', 'Z'
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def unavailable_source(path, reason, file_epoch=None):
+    return {
+        'status': 'unavailable',
+        'available': False,
+        'current': False,
+        'stale': False,
+        'timestamp': None,
+        'file_timestamp': iso_timestamp(file_epoch),
+        'age_seconds': None,
+        'max_age_seconds': int(max_age_seconds),
+        'record_count': None,
+        'reason': reason,
+    }
+
+
+def source_metadata(path, embedded_timestamp=None):
+    try:
+        file_epoch = os.path.getmtime(path)
+    except OSError:
+        return unavailable_source(path, 'Source file is missing')
+    embedded_epoch = timestamp_epoch(embedded_timestamp)
+    if embedded_timestamp is not None and embedded_epoch is None:
+        return unavailable_source(
+            path, 'Source timestamp is invalid', file_epoch=file_epoch
+        )
+    source_epoch = embedded_epoch if embedded_epoch is not None else file_epoch
+    if source_epoch > now + 300:
+        return unavailable_source(
+            path, 'Source timestamp is in the future', file_epoch=file_epoch
+        )
+    age_seconds = max(0.0, now - source_epoch)
+    stale = age_seconds > max_age_seconds
+    return {
+        'status': 'stale' if stale else 'current',
+        'available': True,
+        'current': not stale,
+        'stale': stale,
+        'timestamp': iso_timestamp(source_epoch),
+        'file_timestamp': iso_timestamp(file_epoch),
+        'age_seconds': int(age_seconds),
+        'max_age_seconds': int(max_age_seconds),
+        'record_count': 0,
+        'reason': (
+            'Source is older than the configured freshness window'
+            if stale else None
+        ),
+    }
+
+
+def load_json_source(filename):
+    path = os.path.join(monitor_dir, filename)
+    try:
+        file_epoch = os.path.getmtime(path)
+    except OSError:
+        return None, unavailable_source(path, 'Source file is missing')
+    try:
+        with open(path, 'r', encoding='utf-8') as source:
+            payload = json.load(source)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, unavailable_source(
+            path, 'Source file is unreadable or invalid', file_epoch=file_epoch
+        )
+    if not isinstance(payload, dict):
+        return None, unavailable_source(
+            path, 'Source payload must be a JSON object', file_epoch=file_epoch
+        )
+    return payload, None
+
+
+def mark_unavailable(metadata, reason):
+    metadata.update({
+        'status': 'unavailable',
+        'available': False,
+        'current': False,
+        'stale': False,
+        'age_seconds': metadata.get('age_seconds'),
+        'record_count': None,
+        'reason': reason,
+    })
+
+
+def valid_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def read_pipeline_marker():
+    path = os.path.join(monitor_dir, '.lldpq-stale')
+    try:
+        file_epoch = os.path.getmtime(path)
+        with open(path, 'r', encoding='utf-8', errors='replace') as marker_file:
+            content = marker_file.read(16384)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return {
+            'status': 'stale',
+            'timestamp': iso_timestamp(timestamp_epoch(file_epoch) if 'file_epoch' in locals() else None),
+            'reason': f'Could not read pipeline stale marker: {exc}',
+        }
+    values = {}
+    for line in content.splitlines():
+        key, separator, value = line.partition('=')
+        if separator and key in {'status', 'timestamp', 'reason'}:
+            values[key] = value.strip()
+    marker_status = values.get('status') or 'stale'
+    marker_epoch = timestamp_epoch(values.get('timestamp'))
+    return {
+        'status': marker_status,
+        'timestamp': iso_timestamp(marker_epoch if marker_epoch is not None else file_epoch),
+        'reason': values.get('reason') or 'Pipeline publication is not current',
+    }
+
+
+def read_current_manifest():
+    path = os.path.join(monitor_dir, '.lldpq-current.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as manifest_file:
+            manifest = json.load(manifest_file)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get('status') != 'current'
+        or manifest.get('pipeline_complete') is not True
+        or not isinstance(manifest.get('analyses'), list)
+        or not all(isinstance(item, str) for item in manifest.get('analyses', []))
+        or not isinstance(manifest.get('skipped', []), list)
+        or not all(isinstance(item, str) for item in manifest.get('skipped', []))
+    ):
+        return None
+    completed_epoch = timestamp_epoch(manifest.get('completed_at'))
+    if (
+        completed_epoch is None
+        or completed_epoch > now + 300
+        or now - completed_epoch > max_age_seconds
+    ):
+        return None
+    return manifest
+
+
+def apply_pipeline_marker(metadata, marker):
+    if not marker:
+        return
+    marker_reason = (
+        f"Pipeline {marker.get('status', 'stale')}: "
+        f"{marker.get('reason', 'publication is not current')}"
+    )
+    prior_reason = metadata.get('reason')
+    metadata['reason'] = (
+        f'{prior_reason}; {marker_reason}' if prior_reason else marker_reason
+    )
+    metadata['pipeline_status'] = marker.get('status')
+    metadata['pipeline_timestamp'] = marker.get('timestamp')
+    if metadata.get('status') != 'unavailable':
+        metadata.update({
+            'status': 'stale',
+            'current': False,
+            'stale': True,
+        })
+
+
+pipeline_marker = read_pipeline_marker()
+current_manifest = read_current_manifest()
 
 result = {
     'success': True,
     'device': device,
-    'optical': [],
-    'logs': {'critical': 0, 'warning': 0, 'error': 0, 'info': 0},
-    'last_update': None
+    # Null means that the source is unavailable.  An empty list/object is only
+    # emitted for a valid current snapshot, avoiding false healthy zeroes.
+    'optical': None,
+    'logs': None,
+    'bgp': None,
+    'sources': {},
+    'timestamps': {},
+    'last_update': None,
+    'pipeline': (
+        {'status': 'stale', **pipeline_marker}
+        if pipeline_marker else (
+            {
+                'status': 'current',
+                'timestamp': current_manifest.get('completed_at'),
+                'reason': None,
+            }
+            if current_manifest else None
+        )
+    ),
 }
 
 try:
-    # Get optical data for this device
-    optical_file = f"{monitor_dir}/optical_history.json"
-    if os.path.exists(optical_file):
-        with open(optical_file, 'r') as f:
-            optical_data = json.load(f)
-        
-        optical_history = optical_data.get('optical_history', {})
-        device_optical = []
-        
-        for port_key, readings in optical_history.items():
-            if port_key.startswith(device + ':'):
-                port_name = port_key.split(':')[1]
-                if readings:
-                    latest = readings[-1]
-                    device_optical.append({
-                        'port': port_name,
-                        'health': latest.get('health', 'unknown'),
-                        'rx_power_dbm': latest.get('rx_power_dbm'),
-                        'tx_power_dbm': latest.get('tx_power_dbm'),
-                        'temperature_c': latest.get('temperature_c'),
-                        'link_margin_db': latest.get('link_margin_db'),
-                        'timestamp': latest.get('timestamp')
-                    })
-        
-        result['optical'] = sorted(device_optical, key=lambda x: x['port'])
-    
-    # Get log summary for this device
-    log_file = f"{monitor_dir}/log_summary.json"
-    if os.path.exists(log_file):
-        with open(log_file, 'r') as f:
-            log_data = json.load(f)
-        
-        device_counts = log_data.get('device_counts', {})
-        if device in device_counts:
-            result['logs'] = device_counts[device]
-        
-        result['last_update'] = log_data.get('timestamp')
-    
-    # Get BGP data for this device
-    bgp_file = f"{monitor_dir}/bgp_history.json"
-    if os.path.exists(bgp_file):
-        with open(bgp_file, 'r') as f:
-            bgp_data = json.load(f)
-        
-        # bgp_history format: device -> neighbor -> readings[]
-        if device in bgp_data:
-            device_bgp = []
-            for neighbor, readings in bgp_data[device].items():
-                if readings:
-                    latest = readings[-1] if isinstance(readings, list) else readings
-                    device_bgp.append({
-                        'neighbor': neighbor,
-                        'state': latest.get('state', 'unknown'),
-                        'vrf': latest.get('vrf', 'default'),
-                        'uptime': latest.get('uptime'),
-                        'prefixes_received': latest.get('prefixes_received', 0)
-                    })
-            result['bgp'] = device_bgp
-    
+    # Optical: current_optical_stats is the collection snapshot.  Historical
+    # readings must never be presented as current device state.
+    optical_data, optical_error = load_json_source('optical_history.json')
+    if optical_error:
+        optical_meta = optical_error
+    else:
+        optical_meta = source_metadata(
+            os.path.join(monitor_dir, 'optical_history.json'),
+            optical_data.get('last_update'),
+        )
+        current_stats = optical_data.get('current_optical_stats')
+        manifest_analyses = set(current_manifest.get('analyses', [])) if current_manifest else set()
+        manifest_skipped = set(current_manifest.get('skipped', [])) if current_manifest else set()
+        if current_manifest and 'optical' in manifest_skipped:
+            mark_unavailable(optical_meta, 'Optical analysis was skipped in the current pipeline')
+        elif not isinstance(current_stats, dict):
+            mark_unavailable(optical_meta, 'Current optical snapshot is unavailable')
+        elif not current_stats:
+            if (
+                current_manifest
+                and not pipeline_marker
+                and 'optical' in manifest_analyses
+                and 'optical' not in manifest_skipped
+            ):
+                # A completed manifest proves the analyzer intentionally
+                # published an empty snapshot (for example, an all-DAC fabric).
+                result['optical'] = []
+                optical_meta['record_count'] = 0
+                optical_meta['device_records_present'] = False
+                optical_meta['empty_snapshot_validated'] = True
+            else:
+                mark_unavailable(optical_meta, 'Current optical snapshot is empty and unverified')
+        else:
+            device_optical = []
+            prefix = device + ':'
+            for port_key, stats in current_stats.items():
+                if not isinstance(port_key, str) or not port_key.startswith(prefix):
+                    continue
+                if not isinstance(stats, dict):
+                    continue
+                port_name = port_key.split(':', 1)[1]
+                if not port_name:
+                    continue
+                device_optical.append({
+                    'port': port_name,
+                    'health': stats.get('health_status', 'unknown'),
+                    'rx_power_dbm': stats.get('rx_power_dbm'),
+                    'tx_power_dbm': stats.get('tx_power_dbm'),
+                    'temperature_c': stats.get('temperature_c'),
+                    'link_margin_db': stats.get('link_margin_db'),
+                    'timestamp': iso_timestamp(
+                        timestamp_epoch(stats.get('last_updated'))
+                    ),
+                })
+            result['optical'] = sorted(
+                device_optical, key=lambda entry: entry['port']
+            )
+            optical_meta['record_count'] = len(device_optical)
+            optical_meta['device_records_present'] = bool(device_optical)
+    result['sources']['optical'] = optical_meta
+
+    # Logs: require an explicit device record.  Missing/partial coverage is not
+    # equivalent to a healthy device with zero events.
+    log_data, log_error = load_json_source('log_summary.json')
+    collection_status = ''
+    if log_error:
+        log_meta = log_error
+    else:
+        log_meta = source_metadata(
+            os.path.join(monitor_dir, 'log_summary.json'),
+            log_data.get('timestamp'),
+        )
+        coverage = log_data.get('coverage')
+        collection_status = str(log_data.get('collection_status', '')).lower()
+        partial_devices = set()
+        current_devices = None
+        if isinstance(coverage, dict):
+            if isinstance(coverage.get('partial_devices'), list):
+                partial_devices = {
+                    name for name in coverage['partial_devices']
+                    if isinstance(name, str)
+                }
+            if isinstance(coverage.get('current_devices'), list):
+                current_devices = {
+                    name for name in coverage['current_devices']
+                    if isinstance(name, str)
+                }
+        counts_by_device = log_data.get('device_counts')
+        counts = (
+            counts_by_device.get(device)
+            if isinstance(counts_by_device, dict) else None
+        )
+        if collection_status == 'unavailable':
+            mark_unavailable(log_meta, 'Log collection is unavailable')
+        elif device in partial_devices or (
+            current_devices is not None and device not in current_devices
+        ):
+            mark_unavailable(log_meta, 'No complete current log collection for device')
+        elif not isinstance(counts, dict):
+            mark_unavailable(log_meta, 'No current log summary for device')
+        elif not all(valid_count(counts.get(level)) for level in (
+            'critical', 'warning', 'error', 'info'
+        )):
+            mark_unavailable(log_meta, 'Current log summary is malformed')
+        else:
+            result['logs'] = {
+                level: int(counts[level])
+                for level in ('critical', 'warning', 'error', 'info')
+            }
+            log_meta['record_count'] = sum(result['logs'].values())
+    result['sources']['logs'] = log_meta
+    if (
+        result['sources'].get('optical', {}).get('empty_snapshot_validated')
+        and collection_status == 'unavailable'
+    ):
+        # A completed optical analyzer with zero rows is only a trustworthy
+        # all-DAC/no-optics result when the same pipeline had device telemetry.
+        result['optical'] = None
+        mark_unavailable(
+            result['sources']['optical'],
+            'Optical collection has no device telemetry in the current pipeline',
+        )
+    elif (
+        result['sources'].get('optical', {}).get('device_records_present') is False
+        and log_meta.get('status') != 'current'
+    ):
+        # A non-empty fabric-wide optical snapshot does not prove that this
+        # particular device was collected. Only current per-device coverage
+        # may turn zero matching rows into a trustworthy all-DAC/no-optics []
+        # result.
+        result['optical'] = None
+        mark_unavailable(
+            result['sources']['optical'],
+            'No complete current device collection validates empty optical data',
+        )
+
+    # BGP has the same current-vs-history distinction.  Preserve the compact
+    # response rows expected by existing clients while sourcing current stats.
+    bgp_data, bgp_error = load_json_source('bgp_history.json')
+    if bgp_error:
+        bgp_meta = bgp_error
+    else:
+        current_bgp = bgp_data.get('current_bgp_stats')
+        device_bgp = (
+            current_bgp.get(device) if isinstance(current_bgp, dict) else None
+        )
+        data_status = (
+            str(device_bgp.get('data_status', '')).strip().lower()
+            if isinstance(device_bgp, dict) else ''
+        )
+        selected_bgp = device_bgp
+        if data_status == 'stale' and isinstance(
+            device_bgp.get('last_known_stats'), dict
+        ):
+            selected_bgp = device_bgp['last_known_stats']
+        bgp_timestamp = (
+            selected_bgp.get('last_update')
+            if isinstance(selected_bgp, dict) else bgp_data.get('last_update')
+        )
+        bgp_meta = source_metadata(
+            os.path.join(monitor_dir, 'bgp_history.json'), bgp_timestamp
+        )
+        coverage = bgp_data.get('collection_coverage')
+        unavailable_devices = set()
+        if isinstance(coverage, dict) and isinstance(
+            coverage.get('unavailable_bgp_devices'), list
+        ):
+            unavailable_devices = {
+                name for name in coverage['unavailable_bgp_devices']
+                if isinstance(name, str)
+            }
+        if not isinstance(current_bgp, dict):
+            mark_unavailable(bgp_meta, 'Current BGP snapshot is unavailable')
+        elif not isinstance(device_bgp, dict):
+            mark_unavailable(bgp_meta, 'No current BGP summary for device')
+        elif data_status == 'unknown':
+            mark_unavailable(
+                bgp_meta,
+                'BGP collection is unavailable for device: '
+                + str(device_bgp.get('collection_error') or 'unknown collection state'),
+            )
+        elif data_status not in {'', 'current', 'stale'}:
+            mark_unavailable(bgp_meta, 'Current BGP summary has an invalid data status')
+        elif data_status in {'', 'current'} and device in unavailable_devices:
+            mark_unavailable(bgp_meta, 'BGP collection coverage is unavailable for device')
+        elif not isinstance(selected_bgp, dict) or not isinstance(
+            selected_bgp.get('neighbors'), list
+        ):
+            mark_unavailable(bgp_meta, 'Current BGP summary is malformed')
+        else:
+            rows = []
+            for neighbor in selected_bgp['neighbors']:
+                if not isinstance(neighbor, dict):
+                    continue
+                rows.append({
+                    'neighbor': (
+                        neighbor.get('neighbor')
+                        or neighbor.get('neighbor_ip')
+                        or neighbor.get('neighbor_name')
+                    ),
+                    'state': neighbor.get('state', 'unknown'),
+                    'vrf': neighbor.get('vrf', 'default'),
+                    'uptime': neighbor.get('uptime'),
+                    'prefixes_received': neighbor.get('prefixes_received'),
+                })
+            result['bgp'] = rows
+            bgp_meta['record_count'] = len(rows)
+            bgp_meta['data_status'] = data_status or 'legacy-current'
+            if data_status == 'stale':
+                collection_error = str(
+                    device_bgp.get('collection_error') or 'collection is stale'
+                )
+                prior_reason = bgp_meta.get('reason')
+                bgp_meta.update({
+                    'status': 'stale',
+                    'available': True,
+                    'current': False,
+                    'stale': True,
+                    'reason': (
+                        f'{prior_reason}; {collection_error}'
+                        if prior_reason else collection_error
+                    ),
+                })
+    result['sources']['bgp'] = bgp_meta
+
+    for metadata in result['sources'].values():
+        apply_pipeline_marker(metadata, pipeline_marker)
+
+    # Keep the wire contract unambiguous for every client, not just the
+    # Device Details UI: unavailable sources never carry apparently usable
+    # measurements or counts. Stale sources remain visible and labeled stale.
+    for source_name, payload_name in (
+        ('optical', 'optical'), ('logs', 'logs'), ('bgp', 'bgp')
+    ):
+        if result['sources'][source_name].get('status') == 'unavailable':
+            result[payload_name] = None
+            result['sources'][source_name]['record_count'] = None
+
+    source_epochs = []
+    for source_name, metadata in result['sources'].items():
+        result['timestamps'][source_name] = metadata.get('timestamp')
+        epoch = timestamp_epoch(metadata.get('timestamp'))
+        if epoch is not None:
+            source_epochs.append(epoch)
+    if source_epochs:
+        result['last_update'] = iso_timestamp(max(source_epochs))
+    statuses = {metadata['status'] for metadata in result['sources'].values()}
+    if pipeline_marker:
+        result['collection_status'] = 'stale'
+        result['collection_reason'] = (
+            f"Pipeline {pipeline_marker.get('status', 'stale')}: "
+            f"{pipeline_marker.get('reason', 'publication is not current')}"
+        )
+    elif 'stale' in statuses:
+        result['collection_status'] = 'stale'
+        result['collection_reason'] = 'One or more device data sources are stale'
+    elif 'current' in statuses and 'unavailable' in statuses:
+        result['collection_status'] = 'partial'
+        result['collection_reason'] = 'One or more device data sources are unavailable'
+    elif 'current' in statuses:
+        result['collection_status'] = 'current'
+    else:
+        result['collection_status'] = 'unavailable'
+
     print(json.dumps(result))
 
-except Exception as e:
-    print(json.dumps({'success': False, 'error': str(e)}))
+except Exception as exc:
+    print(json.dumps({'success': False, 'error': str(exc)}))
 PYTHON
         ;;
     download-file)
         # Download a file from a device (for cl-support bundles and PCAP files)
         # Header already printed at script start
-        
-        DEVICE=$(echo "$QUERY_STRING" | grep -oP 'device=\K[^&]+' | sed 's/%20/ /g' | sed 's/%2F/\//g')
-        FILE_PATH=$(echo "$QUERY_STRING" | grep -oP 'file=\K[^&]+' | sed 's/%2F/\//g' | sed 's/%20/ /g')
-        
-        # Security: Only allow downloading from approved paths
-        if [[ ! "$FILE_PATH" =~ ^/var/support/cl_support.*\.(txz|tar\.xz|tar\.gz)$ ]] && [[ ! "$FILE_PATH" =~ ^/tmp/capture_.*\.pcap$ ]]; then
-            echo '{"success": false, "error": "Only cl-support files from /var/support/ or PCAP files from /tmp/ can be downloaded"}'
-            exit 0
-        fi
-        
-        export DEVICE FILE_PATH
         python3 << 'PYDOWNLOAD'
 import os
 import re
 import json
+import hashlib
+import secrets
+import shlex
 import subprocess
+import tempfile
+import urllib.parse
+from pathlib import PurePosixPath
 
-device = os.environ.get('DEVICE', '')
-file_path = os.environ.get('FILE_PATH', '')
+
+def fail(message):
+    print(json.dumps({'success': False, 'error': message}))
+    raise SystemExit(0)
+
+
+def safe_device_component(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    if len(component) > 80:
+        digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]
+        component = f'{component[:64]}_{digest}'
+    return component
+
+
+raw_query = os.environ.get('QUERY_STRING', '')
+if len(raw_query) > 4096:
+    fail('Query string is too large')
+try:
+    query = urllib.parse.parse_qs(
+        raw_query,
+        keep_blank_values=True,
+        encoding='utf-8',
+        errors='strict',
+        max_num_fields=32,
+    )
+except (UnicodeError, ValueError):
+    fail('Invalid query string')
+
+
+def single_query_value(name):
+    values = query.get(name, [])
+    if not values:
+        fail(f'Missing {name} parameter')
+    if len(values) != 1:
+        fail(f'{name.capitalize()} parameter must be specified once')
+    if not values[0]:
+        fail(f'Missing {name} parameter')
+    return values[0]
+
+
+device = single_query_value('device').strip()
+file_path = single_query_value('file')
+
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
+
+if (
+    len(file_path) > 512
+    or '..' in file_path
+    or not (
+        re.fullmatch(
+            r'/var/support/cl_support[A-Za-z0-9_.:-]{0,180}'
+            r'\.(?:txz|tar\.xz|tar\.gz)',
+            file_path,
+        )
+        or re.fullmatch(
+            r'/tmp/capture_[A-Za-z0-9_.:-]{1,220}\.pcap',
+            file_path,
+        )
+    )
+):
+    fail(
+        'Only cl-support files from /var/support/ or PCAP files from /tmp/ '
+        'can be downloaded'
+    )
+
+filename = PurePosixPath(file_path).name
+if (
+    not filename
+    or filename in {'.', '..'}
+    or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,239}', filename) is None
+):
+    fail('Invalid download filename')
 
 # Read config from lldpq.conf (same method as run-device-command)
 def read_lldpq_conf():
@@ -4482,9 +5017,7 @@ def read_lldpq_conf():
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
-max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
-max_workers = max(1, min(max_workers, 50))
-web_root = '/var/www/html'
+web_root = os.environ.get('WEB_ROOT', '/var/www/html')
 
 # Get device IP and username
 # Priority: devices.yaml (always available) -> Ansible inventory (optional)
@@ -4535,38 +5068,70 @@ if not device_ip:
     exit()
 
 # Create downloads directory
-download_dir = f"{web_root}/downloads"
+download_dir = os.path.join(web_root, 'downloads')
 os.makedirs(download_dir, exist_ok=True)
 
-# Get filename
-filename = os.path.basename(file_path)
-local_file = f"{download_dir}/{filename}"
+storage_extension = next(
+    extension for extension in ('.tar.xz', '.tar.gz', '.pcap', '.txz')
+    if filename.endswith(extension)
+)
+storage_name = (
+    f'lldpq-{safe_device_component(device)}-'
+    f'{secrets.token_hex(12)}{storage_extension}'
+)
+local_file = os.path.join(download_dir, storage_name)
 
 # Copy file using SSH + cat (uses same sudo -u lldpq_user as run-device-command)
+temporary_file = None
 try:
-    # Use SSH with cat to stream the file content
     ssh_command = [
         'sudo', '-u', lldpq_user,
         'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=30', '-o', 'BatchMode=yes',
         f'{ssh_user}@{device_ip}',
-        f'cat {file_path}'
+        f'cat -- {shlex.quote(file_path)}'
     ]
-    
-    with open(local_file, 'wb') as f:
-        result = subprocess.run(ssh_command, stdout=f, stderr=subprocess.PIPE, timeout=120)
-    
-    if result.returncode == 0 and os.path.exists(local_file) and os.path.getsize(local_file) > 0:
-        # Fix permissions
-        os.chmod(local_file, 0o664)
-        print(json.dumps({'success': True, 'download_url': f'/downloads/{filename}', 'filename': filename}))
+
+    with tempfile.NamedTemporaryFile(
+        mode='wb', dir=download_dir, prefix='.download-', delete=False
+    ) as output:
+        temporary_file = output.name
+        result = subprocess.run(
+            ssh_command,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            timeout=120,
+        )
+
+    if (
+        result.returncode == 0
+        and os.path.exists(temporary_file)
+        and os.path.getsize(temporary_file) > 0
+    ):
+        os.chmod(temporary_file, 0o664)
+        os.replace(temporary_file, local_file)
+        temporary_file = None
+        download_url = '/downloads/' + urllib.parse.quote(
+            storage_name, safe='._-:'
+        )
+        print(json.dumps({
+            'success': True,
+            'download_url': download_url,
+            'filename': filename,
+        }))
     else:
-        if os.path.exists(local_file):
-            os.unlink(local_file)
-        print(json.dumps({'success': False, 'error': 'SSH cat failed: ' + result.stderr.decode()[:100]}))
+        stderr = result.stderr.decode('utf-8', errors='replace').strip()
+        print(json.dumps({
+            'success': False,
+            'error': ('SSH cat failed: ' + stderr)[:200],
+            'exit_code': result.returncode,
+        }))
 except subprocess.TimeoutExpired:
     print(json.dumps({'success': False, 'error': 'Download timeout'}))
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}))
+finally:
+    if temporary_file and os.path.exists(temporary_file):
+        os.unlink(temporary_file)
 PYDOWNLOAD
         exit 0
         ;;
@@ -4581,6 +5146,8 @@ import subprocess
 import re
 import os
 import fcntl
+import hashlib
+import stat
 
 def read_lldpq_conf():
     conf = {}
@@ -4596,16 +5163,33 @@ def read_lldpq_conf():
             break
     return conf
 
+def fail(message):
+    print(json.dumps({'success': False, 'error': message}))
+    raise SystemExit(0)
+
+
+def lock_device_key(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]
+    return f'{component[:48]}_{digest}'
+
+
 try:
     data = json.loads(os.environ.get('POST_DATA', '{}'))
-except:
-    data = {}
+except (TypeError, ValueError, json.JSONDecodeError):
+    fail('Invalid JSON body')
+if not isinstance(data, dict):
+    fail('JSON body must be an object')
 
 device = data.get('device', '')
-
-if not device:
-    print(json.dumps({'success': False, 'error': 'Device required'}))
-    exit()
+if not isinstance(device, str):
+    fail('Device must be text')
+device = device.strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
 
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -4658,19 +5242,83 @@ if not device_ip:
     print(json.dumps({'success': False, 'error': f'Device {device} not found in devices.yaml or inventory'}))
     exit()
 
-# Start cl-support in background
-remote_cmd = "nohup sudo cl-support -M -T0 > /tmp/clsupport.log 2>&1 &"
-
-ssh_command = [
-    'sudo', '-u', lldpq_user,
-    'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
-    f'{ssh_user}@{device_ip}',
-    remote_cmd
-]
-
 try:
-    result = subprocess.run(ssh_command, capture_output=True, text=True, timeout=15)
-    print(json.dumps({'success': True, 'message': 'cl-support started in background'}))
+    lock_path = (
+        f'/tmp/lldpq-start-clsupport-{lock_device_key(device)}.lock'
+    )
+    if not hasattr(os, 'O_NOFOLLOW'):
+        raise RuntimeError('Secure lock files are not supported on this host')
+    lock_flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, 'O_CLOEXEC'):
+        lock_flags |= os.O_CLOEXEC
+    lock_fd = os.open(lock_path, lock_flags, 0o600)
+    lock_metadata = os.fstat(lock_fd)
+    if (
+        not stat.S_ISREG(lock_metadata.st_mode)
+        or lock_metadata.st_uid != os.geteuid()
+    ):
+        os.close(lock_fd)
+        raise PermissionError('Unsafe cl-support lock file')
+    os.fchmod(lock_fd, 0o600)
+    with os.fdopen(lock_fd, 'w') as lock_file:
+        # Serialize the remote check and launch so two browser sessions cannot
+        # both observe "not running" and start expensive bundles concurrently.
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        ssh_base = [
+            'sudo', '-u', lldpq_user,
+            'ssh', '-o', 'StrictHostKeyChecking=no',
+            '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
+            f'{ssh_user}@{device_ip}',
+        ]
+        running = subprocess.run(
+            ssh_base + ["pgrep -f '[c]l-support'"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if running.returncode == 0:
+            print(json.dumps({
+                'success': False,
+                'error': 'cl-support is already running on this device',
+                'already_running': True,
+            }))
+            raise SystemExit(0)
+        if running.returncode != 1:
+            error = (running.stderr or running.stdout or
+                     f'SSH process check exited with status {running.returncode}').strip()
+            print(json.dumps({
+                'success': False,
+                'error': error[:200],
+                'exit_code': running.returncode,
+            }))
+            raise SystemExit(0)
+
+        remote_cmd = (
+            'nohup sudo cl-support -M -T0 '
+            '> /tmp/clsupport.log 2>&1 &'
+        )
+        result = subprocess.run(
+            ssh_base + [remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            print(json.dumps({
+                'success': True,
+                'message': 'cl-support started in background'
+            }))
+        else:
+            error = (result.stderr or result.stdout or
+                     f'SSH exited with status {result.returncode}').strip()
+            print(json.dumps({
+                'success': False,
+                'error': error[:200],
+                'exit_code': result.returncode,
+            }))
+except subprocess.TimeoutExpired:
+    print(json.dumps({'success': False, 'error': 'SSH launch timed out'}))
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}))
 
@@ -5639,6 +6287,9 @@ import subprocess
 import re
 import os
 import time
+import hashlib
+import secrets
+import shlex
 
 def read_lldpq_conf():
     conf = {}
@@ -5654,30 +6305,97 @@ def read_lldpq_conf():
             break
     return conf
 
+def fail(message, **extra):
+    response = {'success': False, 'error': message}
+    response.update(extra)
+    print(json.dumps(response))
+    raise SystemExit(0)
+
+
+def parse_bounded_integer(value, field, minimum, maximum):
+    if isinstance(value, bool):
+        fail(f'{field} must be an integer')
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if (
+            len(value) > len(str(maximum))
+            or re.fullmatch(r'(?:0|[1-9][0-9]*)', value) is None
+        ):
+            fail(f'{field} must be an integer')
+        parsed = int(value)
+    else:
+        fail(f'{field} must be an integer')
+    if not minimum <= parsed <= maximum:
+        fail(f'{field} must be between {minimum} and {maximum}')
+    return parsed
+
+
+def safe_device_component(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    if len(component) > 80:
+        digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]
+        component = f'{component[:64]}_{digest}'
+    return component
+
+
 try:
     data = json.loads(os.environ.get('POST_DATA', '{}'))
-except:
-    data = {}
+except (TypeError, ValueError, json.JSONDecodeError):
+    fail('Invalid JSON body')
+if not isinstance(data, dict):
+    fail('JSON body must be an object')
 
 device = data.get('device', '')
 iface = data.get('interface', 'any')
-duration = int(data.get('duration', 30))
-count = data.get('count', '1000')
 filter_expr = data.get('filter', '')
 
-if not device:
-    print(json.dumps({'success': False, 'error': 'Device required'}))
-    exit()
+if not isinstance(device, str):
+    fail('Device must be text')
+device = device.strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
 
-# Validate interface name
-if not re.match(r'^[a-zA-Z0-9_.-]+$', iface):
-    print(json.dumps({'success': False, 'error': 'Invalid interface name'}))
-    exit()
+if not isinstance(iface, str) or not re.fullmatch(
+    r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}', iface
+):
+    fail('Invalid interface name')
 
-# Validate filter (basic check - alphanumeric, spaces, and common operators)
-if filter_expr and not re.match(r'^[a-zA-Z0-9\s\.\:\-\(\)]+$', filter_expr):
-    print(json.dumps({'success': False, 'error': 'Invalid filter expression'}))
-    exit()
+duration = parse_bounded_integer(data.get('duration', 30), 'Duration', 1, 300)
+count = parse_bounded_integer(data.get('count', 1000), 'Count', 0, 999999)
+
+if not isinstance(filter_expr, str):
+    fail('Filter must be text')
+if any(ord(char) < 32 or ord(char) == 127 for char in filter_expr):
+    fail('Invalid filter expression')
+filter_expr = filter_expr.strip()
+filter_tokens = []
+if filter_expr:
+    if (
+        len(filter_expr) > 256
+        or not re.fullmatch(r'[A-Za-z0-9_.:/()\[\] -]+', filter_expr)
+    ):
+        fail('Invalid filter expression')
+    filter_tokens = re.findall(r'[()]|[^() ]+', filter_expr)
+    if len(filter_tokens) > 64:
+        fail('Filter expression is too complex')
+    depth = 0
+    for token in filter_tokens:
+        if token == '(':
+            depth += 1
+        elif token == ')':
+            depth -= 1
+            if depth < 0:
+                fail('Invalid filter expression')
+        elif token.startswith('-') or not re.fullmatch(
+            r'[A-Za-z0-9_.:/\[\]-]+', token
+        ):
+            fail('Invalid filter expression')
+    if depth != 0:
+        fail('Invalid filter expression')
 
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -5730,20 +6448,36 @@ if not device_ip:
     print(json.dumps({'success': False, 'error': f'Device {device} not found in devices.yaml or inventory'}))
     exit()
 
-# Generate unique output file
+# Generate a collision-resistant output file with a shell-safe device component.
 timestamp = time.strftime('%Y%m%d-%H%M%S')
-output_file = f'/tmp/live_{device}_{timestamp}.txt'
+safe_device = safe_device_component(device)
+output_file = f'/tmp/live_{safe_device}_{timestamp}_{secrets.token_hex(6)}.txt'
 
 # Build tcpdump command
 cmd_parts = ['sudo', 'timeout', str(duration), 'tcpdump', '-l', '-i', iface, '-nnnn', '-vvv']
-if count and count != '0':
-    cmd_parts.extend(['-c', count])
+if count:
+    cmd_parts.extend(['-c', str(count)])
+cmd_parts.extend(filter_tokens)
 
-# Build the remote command with output redirection
-tcpdump_cmd = ' '.join(cmd_parts)
-if filter_expr:
-    tcpdump_cmd += f' {filter_expr}'
-remote_cmd = f"nohup sh -c '{tcpdump_cmd} > {output_file} 2>&1' > /dev/null 2>&1 & echo $!"
+# Quote every field before it reaches the remote shell. The outer shell remains
+# necessary for backgrounding and redirection, but request data is argv data.
+tcpdump_cmd = shlex.join(cmd_parts)
+capture_worker = shlex.join(['setsid', 'sh', '-c', tcpdump_cmd])
+remote_capture = (
+    'child_pid=; '
+    'terminate_child() { '
+    'if [ -n "$child_pid" ]; then '
+    'kill -TERM -- "-${child_pid}" 2>/dev/null; '
+    'fi; exit 143; }; '
+    'trap terminate_child TERM INT; '
+    f'{capture_worker} > {shlex.quote(output_file)} 2>&1 & '
+    'child_pid=$!; wait "$child_pid"; status=$?; '
+    'trap - TERM INT; exit "$status"'
+)
+remote_cmd = (
+    f'nohup sh -c {shlex.quote(remote_capture)} '
+    f'{shlex.quote(output_file)} > /dev/null 2>&1 & echo $!'
+)
 
 ssh_command = [
     'sudo', '-u', lldpq_user,
@@ -5752,19 +6486,30 @@ ssh_command = [
     remote_cmd
 ]
 
-result = subprocess.run(ssh_command, capture_output=True, text=True, timeout=15)
+try:
+    result = subprocess.run(
+        ssh_command, capture_output=True, text=True, timeout=15
+    )
+except subprocess.TimeoutExpired:
+    fail('SSH launch timed out')
+except Exception as exc:
+    fail(str(exc))
 
-if result.returncode == 0:
-    pid = result.stdout.strip()
-    print(json.dumps({
-        'success': True,
-        'output_file': output_file,
-        'pid': pid,
-        'device': device,
-        'duration': duration
-    }))
-else:
-    print(json.dumps({'success': False, 'error': result.stderr[:200]}))
+if result.returncode != 0:
+    error = (result.stderr or result.stdout or
+             f'SSH exited with status {result.returncode}').strip()
+    fail(error[:200], exit_code=result.returncode)
+
+pid = result.stdout.strip()
+if re.fullmatch(r'[1-9][0-9]{0,19}', pid) is None:
+    fail('Remote launch did not return a valid PID')
+print(json.dumps({
+    'success': True,
+    'output_file': output_file,
+    'pid': pid,
+    'device': device,
+    'duration': duration
+}))
 
 PYTHON_LIVE
         exit 0
@@ -5779,6 +6524,9 @@ import subprocess
 import re
 import os
 import time
+import hashlib
+import secrets
+import shlex
 
 def read_lldpq_conf():
     conf = {}
@@ -5793,23 +6541,77 @@ def read_lldpq_conf():
             break
     return conf
 
+def fail(message, **extra):
+    response = {'success': False, 'error': message}
+    response.update(extra)
+    print(json.dumps(response))
+    raise SystemExit(0)
+
+
+def parse_bounded_integer(value, field, minimum, maximum):
+    if isinstance(value, bool):
+        fail(f'{field} must be an integer')
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if (
+            len(value) > len(str(maximum))
+            or re.fullmatch(r'(?:0|[1-9][0-9]*)', value) is None
+        ):
+            fail(f'{field} must be an integer')
+        parsed = int(value)
+    else:
+        fail(f'{field} must be an integer')
+    if not minimum <= parsed <= maximum:
+        fail(f'{field} must be between {minimum} and {maximum}')
+    return parsed
+
+
+def safe_device_component(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    if len(component) > 80:
+        digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]
+        component = f'{component[:64]}_{digest}'
+    return component
+
+
 try:
     data = json.loads(os.environ.get('POST_DATA', '{}'))
-except:
-    data = {}
+except (TypeError, ValueError, json.JSONDecodeError):
+    fail('Invalid JSON body')
+if not isinstance(data, dict):
+    fail('JSON body must be an object')
 
 device = data.get('device', '')
 severity = data.get('severity', 'all')
-keyword = data.get('keyword', '').strip()
-duration = min(int(data.get('duration', 60)), 300)
+keyword = data.get('keyword', '')
 
-if not device:
-    print(json.dumps({'success': False, 'error': 'Device required'}))
-    exit()
+if not isinstance(device, str):
+    fail('Device must be text')
+device = device.strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
 
-if keyword and not re.match(r'^[a-zA-Z0-9\s\.\:\-\_\|\[\]]+$', keyword):
-    print(json.dumps({'success': False, 'error': 'Invalid keyword'}))
-    exit()
+if not isinstance(severity, str) or severity not in {
+    'all', 'critical', 'error', 'warning', 'info'
+}:
+    fail('Invalid severity')
+
+if not isinstance(keyword, str):
+    fail('Keyword must be text')
+if any(ord(char) < 32 or ord(char) == 127 for char in keyword):
+    fail('Invalid keyword')
+keyword = keyword.strip()
+if keyword and (
+    len(keyword) > 128
+    or re.fullmatch(r'[A-Za-z0-9 _.:/@%+,\-\[\]()]+', keyword) is None
+):
+    fail('Invalid keyword')
+
+duration = parse_bounded_integer(data.get('duration', 60), 'Duration', 1, 300)
 
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -5862,16 +6664,38 @@ if not device_ip:
     exit()
 
 timestamp = time.strftime('%Y%m%d-%H%M%S')
-output_file = f'/tmp/tail_{device}_{timestamp}.txt'
+safe_device = safe_device_component(device)
+output_file = f'/tmp/tail_{safe_device}_{timestamp}_{secrets.token_hex(6)}.txt'
 
 priority_map = {'critical': '0..2', 'error': '0..3', 'warning': '0..4', 'info': '0..6'}
-journal_cmd = f'sudo timeout {duration} stdbuf -oL journalctl -f --no-pager'
-if severity != 'all' and severity in priority_map:
-    journal_cmd += f' -p {priority_map[severity]}'
+journal_parts = [
+    'sudo', 'timeout', str(duration), 'stdbuf', '-oL',
+    'journalctl', '-f', '--no-pager'
+]
+if severity != 'all':
+    journal_parts.extend(['-p', priority_map[severity]])
+journal_cmd = shlex.join(journal_parts)
 if keyword:
-    journal_cmd += f' | stdbuf -oL grep --line-buffered -i "{keyword}"'
+    journal_cmd += ' | ' + shlex.join([
+        'stdbuf', '-oL', 'grep', '--line-buffered', '-F', '-i', '--', keyword
+    ])
 
-remote_cmd = f"nohup sh -c '{journal_cmd}' > {output_file} 2>&1 & echo $!"
+tail_worker = shlex.join(['setsid', 'sh', '-c', journal_cmd])
+remote_tail = (
+    'child_pid=; '
+    'terminate_child() { '
+    'if [ -n "$child_pid" ]; then '
+    'kill -TERM -- "-${child_pid}" 2>/dev/null; '
+    'fi; exit 143; }; '
+    'trap terminate_child TERM INT; '
+    f'{tail_worker} > {shlex.quote(output_file)} 2>&1 & '
+    'child_pid=$!; wait "$child_pid"; status=$?; '
+    'trap - TERM INT; exit "$status"'
+)
+remote_cmd = (
+    f'nohup sh -c {shlex.quote(remote_tail)} '
+    f'{shlex.quote(output_file)} > /dev/null 2>&1 & echo $!'
+)
 
 ssh_command = [
     'sudo', '-u', lldpq_user,
@@ -5880,18 +6704,30 @@ ssh_command = [
     remote_cmd
 ]
 
-result = subprocess.run(ssh_command, capture_output=True, text=True, timeout=15)
+try:
+    result = subprocess.run(
+        ssh_command, capture_output=True, text=True, timeout=15
+    )
+except subprocess.TimeoutExpired:
+    fail('SSH launch timed out')
+except Exception as exc:
+    fail(str(exc))
 
-if result.returncode == 0:
-    print(json.dumps({
-        'success': True,
-        'output_file': output_file,
-        'pid': result.stdout.strip(),
-        'device': device,
-        'duration': duration
-    }))
-else:
-    print(json.dumps({'success': False, 'error': result.stderr[:200]}))
+if result.returncode != 0:
+    error = (result.stderr or result.stdout or
+             f'SSH exited with status {result.returncode}').strip()
+    fail(error[:200], exit_code=result.returncode)
+
+pid = result.stdout.strip()
+if re.fullmatch(r'[1-9][0-9]{0,19}', pid) is None:
+    fail('Remote launch did not return a valid PID')
+print(json.dumps({
+    'success': True,
+    'output_file': output_file,
+    'pid': pid,
+    'device': device,
+    'duration': duration
+}))
 
 PYTHON_TAIL
         exit 0
@@ -5907,6 +6743,10 @@ import subprocess
 import re
 import os
 import fcntl
+import shlex
+import hashlib
+import stat
+from pathlib import PurePosixPath
 
 # Parse input
 post_data = os.environ.get('POST_DATA', '{}')
@@ -5916,7 +6756,15 @@ except:
     params = {}
 
 device = params.get('device', '')
-command = params.get('command', '').strip()
+command = params.get('command', '')
+policy = params.get('policy', '')
+
+if not isinstance(device, str) or not isinstance(command, str):
+    print(json.dumps({'success': False, 'error': 'Device and command must be text'}))
+    exit()
+
+device = device.strip()
+command = command.strip()
 
 if not device or not command:
     print(json.dumps({'success': False, 'error': 'Missing device or command'}))
@@ -5925,6 +6773,29 @@ if not device or not command:
 if any(ord(ch) < 32 for ch in command):
     print(json.dumps({'success': False, 'error': 'Command contains control characters'}))
     exit()
+
+if policy not in ('', 'ai-readonly'):
+    print(json.dumps({'success': False, 'error': 'Unknown command policy'}))
+    exit()
+
+# Model-generated commands have a narrower, fail-closed policy than the
+# interactive Device Details command runner. Keep this boundary independent so
+# tightening Ask-AI cannot break existing manual diagnostic workflows.
+if policy == 'ai-readonly':
+    import sys
+    policy_dir = os.path.dirname(os.environ.get('SCRIPT_FILENAME', ''))
+    if not policy_dir:
+        policy_dir = os.environ.get('WEB_ROOT', '/var/www/html')
+    if policy_dir not in sys.path:
+        sys.path.insert(0, policy_dir)
+    try:
+        from ai_command_policy import validate_ai_readonly_command
+        command_allowed, policy_error = validate_ai_readonly_command(command)
+    except Exception:
+        command_allowed, policy_error = False, 'Ask-AI command policy is unavailable'
+    if not command_allowed:
+        print(json.dumps({'success': False, 'error': policy_error}))
+        exit()
 
 FORBIDDEN_PATTERNS = [
     r'\bmlxlink\b',
@@ -5966,12 +6837,16 @@ ALLOWED_PATTERNS = [
     r'^ip neigh\b',
     r'^/sbin/bridge fdb\b',
     r'^/sbin/bridge vlan\b',
+    r'^bridge fdb\b',
+    r'^bridge vlan\b',
     r'^lldpctl\b',
     r'^sudo lldpctl\b',
     # Bonding/LAG / MLAG (read-only status only)
-    r'^cat /proc/net/bonding/',
+    r'^cat /proc/net/bonding/[A-Za-z0-9_.:-]+$',
     r'^clagctl$',
     r'^sudo clagctl$',
+    r'^clagctl status$',
+    r'^sudo clagctl status$',
     # LLDPq on-switch colored interface view (read-only)
     r'^nvt$',
     r'^/usr/local/bin/nvt$',
@@ -5985,11 +6860,10 @@ ALLOWED_PATTERNS = [
     r'^cl-resource-query\b',
     r'^sudo cl-resource-query\b',
     # Logs
-    r'^cat /var/log/',
-    r'^cat /tmp/live_',
-    r'^cat /tmp/tail_',
-    r'^cat /tmp/tail_',
-    r'^sudo cat /var/log/',
+    r'^cat /var/log/[A-Za-z0-9_.@:/+-]+$',
+    r'^cat /tmp/live_[A-Za-z0-9_.:-]+$',
+    r'^cat /tmp/tail_[A-Za-z0-9_.:-]+$',
+    r'^sudo cat /var/log/[A-Za-z0-9_.@:/+-]+$',
     r'^tail\b',
     r'^sudo tail\b',
     r'^journalctl\b',
@@ -6000,28 +6874,108 @@ ALLOWED_PATTERNS = [
     r'^uptime$',
     r'^free\b',
     r'^df\b',
-    r'^ls\b',
+    r'^ls -t /var/support/cl_support\*\.txz$',
     r'^pgrep\b',
-    r'^sudo killall tcpdump$',
-    r'^sudo pkill -f ["\']journalctl -f["\']$',
-    r'^find /tmp -name "capture_\*\.pcap"',
+    # Process cleanup is limited to a quoted LLDPq-owned temp path. A later
+    # device-bound validator ensures the path belongs to the selected device.
+    r'^sudo pkill -f "/tmp/(?:capture_[A-Za-z0-9_.:-]+\.pcap|(?:live|tail)_[A-Za-z0-9_.:-]+)"$',
+    r'^find /tmp -name "capture_\*\.pcap"(?: -mmin \+[0-9]+ -delete)?$',
     # Packet capture
     r'^sudo timeout ([1-9]|[1-9][0-9]|[12][0-9]{2}|300) tcpdump -U -i [A-Za-z0-9_.:-]+ -nnnn -w /tmp/capture_[A-Za-z0-9_.:-]+\.pcap( -c [1-9][0-9]{0,5})?( [A-Za-z0-9_.:/ -]+)?$',
     # Diagnostic bundle
     # Delete cl-support files only
-    r'^sudo rm -f "/var/support/cl_support',
+    r'^sudo rm -f "/var/support/cl_support[A-Za-z0-9_.:-]+\.(?:txz|tar\.xz|tar\.gz)"$',
     r'^sudo rm -f /var/support/cl_support\*\.txz$',
     # Delete PCAP capture files
-    r'^sudo rm -f "/tmp/capture_',
+    r'^sudo rm -f "/tmp/capture_[A-Za-z0-9_.:-]+\.pcap"$',
     r'^sudo rm -f /tmp/capture_\*\.pcap$',
-    r'^sudo rm -f /tmp/live_',
-    r'^sudo rm -f /tmp/tail_',
+    r'^sudo rm -f "/tmp/live_[A-Za-z0-9_.:-]+\.txt"$',
+    r'^sudo rm -f "/tmp/tail_[A-Za-z0-9_.:-]+\.txt"$',
 ]
 
-# Check if command is in whitelist
+# A single stderr-to-/dev/null suffix is used by the existing status polling
+# commands.  Preserve that exact form, but reject every other redirection.
+validation_command = command
+if validation_command.endswith(' 2>/dev/null'):
+    validation_command = validation_command[:-len(' 2>/dev/null')].rstrip()
+
+# Reject shell operators before considering command prefixes.  Pipes are
+# parsed separately below and only safe filter commands may appear on the RHS.
+if re.search(r'[;&`$<>\\\r\n]', validation_command):
+    print(json.dumps({'success': False, 'error': 'Command contains unsafe characters'}))
+    exit()
+
+
+def split_unquoted_pipes(text):
+    """Split shell pipelines without treating quoted pattern pipes as syntax."""
+    segments = []
+    quote = None
+    start = 0
+    for index, char in enumerate(text):
+        if char in ('"', "'"):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            continue
+        if char == '|' and quote is None:
+            if ((index > 0 and text[index - 1] == '|') or
+                    (index + 1 < len(text) and text[index + 1] == '|')):
+                raise ValueError('Shell logical operators are not allowed')
+            segment = text[start:index].strip()
+            if not segment:
+                raise ValueError('Pipeline contains an empty command')
+            segments.append(segment)
+            start = index + 1
+    if quote is not None:
+        raise ValueError('Command contains an unmatched quote')
+    final = text[start:].strip()
+    if not final:
+        raise ValueError('Pipeline contains an empty command')
+    segments.append(final)
+    return segments
+
+
+def has_unquoted_expansion(text):
+    """Detect glob/brace/tilde expansion that could create file operands."""
+    quote = None
+    for char in text:
+        if char in ('"', "'"):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            continue
+        if quote is None and char in '*?[]{}~':
+            return True
+    return False
+
+
+try:
+    pipeline = split_unquoted_pipes(validation_command)
+    pipeline_tokens = [shlex.split(segment, posix=True) for segment in pipeline]
+except ValueError as exc:
+    print(json.dumps({'success': False, 'error': str(exc)}))
+    exit()
+
+if any(not tokens for tokens in pipeline_tokens):
+    print(json.dumps({'success': False, 'error': 'Pipeline contains an empty command'}))
+    exit()
+
+if any(has_unquoted_expansion(segment) for segment in pipeline[1:]):
+    print(json.dumps({
+        'success': False,
+        'error': 'Pipeline filters cannot use shell pathname expansion',
+    }))
+    exit()
+
+base_command = pipeline[0]
+
+# Check the source command against the whitelist.  Matching only the first
+# pipeline segment prevents a safe prefix from authorizing an arbitrary RHS.
 command_allowed = False
 for pattern in ALLOWED_PATTERNS:
-    if re.match(pattern, command, re.IGNORECASE):
+    if re.match(pattern, base_command, re.IGNORECASE):
         command_allowed = True
         break
 
@@ -6030,16 +6984,497 @@ if not command_allowed:
     print(json.dumps({'success': False, 'error': 'Command not in whitelist. Allowed: nv show, sudo vtysh -c "show...", ethtool, journalctl, uptime, dmesg'}))
     exit()
 
-# Even if whitelisted, check for shell injection attempts
-# Pipe (|) is allowed to enable read-only filtering (grep, head, tail, wc, awk, sed, sort, uniq, cut)
-INJECTION_PATTERNS = [r'[;&`\$]', r'>>', r'<<', r'[\r\n]']
-for pattern in INJECTION_PATTERNS:
-    if re.search(pattern, command):
-        print(json.dumps({'success': False, 'error': 'Command contains unsafe characters'}))
+
+def has_parent_traversal(token):
+    return '/' in token and '..' in PurePosixPath(token).parts
+
+
+if any(
+    has_parent_traversal(token)
+    for tokens in pipeline_tokens
+    for token in tokens
+):
+    print(json.dumps({'success': False, 'error': 'Command path traversal is not allowed'}))
+    exit()
+
+
+def approved_read_path(path):
+    if has_parent_traversal(path):
+        return False
+    return bool(
+        re.fullmatch(r'/proc/net/bonding/[A-Za-z0-9_.:-]+', path)
+        or re.fullmatch(r'/var/log/[A-Za-z0-9_.@:/+-]+', path)
+        or re.fullmatch(r'/tmp/(?:live|tail)_[A-Za-z0-9_.:-]+', path)
+    )
+
+
+def strip_sudo(tokens):
+    return tokens[1:] if tokens and tokens[0] == 'sudo' else tokens
+
+
+def safe_device_component(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    if len(component) > 80:
+        digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]
+        component = f'{component[:64]}_{digest}'
+    return component
+
+
+def lock_device_key(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]
+    return f'{component[:48]}_{digest}'
+
+
+def open_owned_lock(path):
+    if not hasattr(os, 'O_NOFOLLOW'):
+        raise RuntimeError('Secure lock files are not supported on this host')
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(path, flags, 0o600)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        os.close(descriptor)
+        raise PermissionError('Unsafe command lock file')
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, 'w')
+
+
+def classify_scoped_cleanup(tokens):
+    """Return the lock-bypass cleanup kind for this device, or None."""
+    if len(tokens) != 4 or tokens[0] != 'sudo':
+        return None
+    # Browser-created PCAP names use the full sanitized hostname. Dedicated
+    # live/tail builders cap long names and add a hash to stay below NAME_MAX.
+    capture_device = re.sub(r'[^A-Za-z0-9-]', '_', device)
+    runtime_device = safe_device_component(device)
+    capture_prefix = f'/tmp/capture_{capture_device}_'
+    live_prefix = f'/tmp/live_{runtime_device}_'
+    tail_prefix = f'/tmp/tail_{runtime_device}_'
+
+    if tokens[1:3] == ['pkill', '-f']:
+        pattern = tokens[3]
+        if '..' in pattern:
+            return None
+        if pattern in {live_prefix, tail_prefix}:
+            return 'kill'
+        if (
+            pattern.startswith(capture_prefix)
+            and re.fullmatch(r'/tmp/capture_[A-Za-z0-9_.:-]+\.pcap', pattern)
+        ):
+            return 'kill'
+        if (
+            pattern.startswith((live_prefix, tail_prefix))
+            and re.fullmatch(r'/tmp/(?:live|tail)_[A-Za-z0-9_.:-]+\.txt', pattern)
+        ):
+            return 'kill'
+        return None
+
+    if tokens[1:3] == ['rm', '-f']:
+        path = tokens[3]
+        if '..' in path:
+            return None
+        if (
+            path.startswith(capture_prefix)
+            and re.fullmatch(r'/tmp/capture_[A-Za-z0-9_.:-]+\.pcap', path)
+        ):
+            return 'remove'
+        if (
+            path.startswith((live_prefix, tail_prefix))
+            and re.fullmatch(r'/tmp/(?:live|tail)_[A-Za-z0-9_.:-]+\.txt', path)
+        ):
+            return 'remove'
+    return None
+
+
+def validate_ip_command(tokens):
+    if len(tokens) < 2 or tokens[0] != 'ip':
+        return False
+    family = tokens[1]
+    allowed_actions = {
+        'link': {'show', 'list'},
+        'addr': {'show', 'list'},
+        'route': {'show', 'list', 'get'},
+        'neigh': {'show', 'list', 'get'},
+    }
+    if family not in allowed_actions:
+        return False
+    return len(tokens) == 2 or tokens[2] in allowed_actions[family]
+
+
+def validate_bridge_command(tokens):
+    if not tokens or tokens[0] not in {'bridge', '/sbin/bridge'}:
+        return False
+    if len(tokens) < 2 or tokens[1] not in {'fdb', 'vlan'}:
+        return False
+    return len(tokens) == 2 or tokens[2] in {'show', 'list'}
+
+
+def validate_vtysh_command(tokens):
+    bare = strip_sudo(tokens)
+    if len(bare) != 3 or bare[:2] != ['vtysh', '-c']:
+        return False
+    inner = bare[2].strip()
+    return bool(
+        re.match(r'^show(?:\s|$)', inner, re.IGNORECASE)
+        and not re.search(r'[|<>;&`$\\\r\n]', inner)
+    )
+
+
+def validate_journalctl_command(tokens):
+    bare = strip_sudo(tokens)
+    if not bare or bare[0] != 'journalctl':
+        return False
+    flags = {
+        '-k', '--dmesg', '--no-pager', '--utc', '--reverse', '--quiet',
+        '--merge', '-b', '--boot', '-x', '--catalog', '--all', '-f',
+        '--follow', '-e', '--pager-end', '--no-full', '--full',
+        '--no-hostname', '--no-tail', '--show-cursor', '--disk-usage',
+        '--list-boots', '--list-fields', '--header', '--facility',
+    }
+    value_options = {
+        '-n', '--lines', '-u', '--unit', '-p', '--priority', '-o',
+        '--output', '-S', '--since', '-U', '--until', '-g', '--grep',
+        '-t', '--identifier', '--cursor', '--after-cursor',
+        '--namespace', '--output-fields',
+    }
+    # Namespace selection does not read a path and remains a read-only source
+    # selector. File/directory/root/image/cursor-file and every maintenance
+    # option are intentionally absent.
+    index = 1
+    while index < len(bare):
+        token = bare[index]
+        if token in flags or re.fullmatch(r'-[kxarqfe]+', token):
+            index += 1
+            continue
+        if token in value_options:
+            index += 1
+            if index >= len(bare) or not bare[index] or len(bare[index]) > 512:
+                return False
+            index += 1
+            continue
+        if any(
+            token.startswith(option + '=')
+            for option in value_options if option.startswith('--')
+        ):
+            _option, value = token.split('=', 1)
+            if not value or len(value) > 512:
+                return False
+            index += 1
+            continue
+        if re.fullmatch(r'-(?:n|u|p|o|S|U|g|t).{1,256}', token):
+            index += 1
+            continue
+        if re.fullmatch(
+            r'[A-Z][A-Z0-9_]{1,63}=[A-Za-z0-9_.:@%+/-]{1,256}', token
+        ):
+            index += 1
+            continue
+        return False
+    return True
+
+
+def validate_dmesg_command(tokens):
+    bare = strip_sudo(tokens)
+    if not bare or bare[0] != 'dmesg':
+        return False
+    safe_flags = {
+        '-T', '--ctime', '--reltime', '--notime', '-x', '--decode',
+        '--nopager', '-H', '--human', '-w', '--follow', '-W',
+        '--follow-new', '-k', '--kernel', '-u', '--userspace', '-P',
+        '--nopager', '-L', '--color', '-J', '--json',
+    }
+    for token in bare[1:]:
+        if token in safe_flags:
+            continue
+        if token.startswith(('--level=', '--facility=', '--color=', '--time-format=')):
+            continue
+        return False
+    return True
+
+
+def validate_lldpctl_command(tokens):
+    bare = strip_sudo(tokens)
+    if not bare or bare[0] != 'lldpctl':
+        return False
+    rest = bare[1:]
+    if rest[:1] == ['-f']:
+        if len(rest) < 2 or rest[1] not in {'plain', 'keyvalue', 'json', 'xml', 'json0'}:
+            return False
+        rest = rest[2:]
+    return len(rest) <= 1 and (
+        not rest or re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', rest[0]) is not None
+    )
+
+
+def validate_tcpdump_command(tokens):
+    if len(tokens) < 10 or tokens[:2] != ['sudo', 'timeout']:
+        return False
+    try:
+        duration = int(tokens[2])
+    except (TypeError, ValueError):
+        return False
+    if not 1 <= duration <= 300 or tokens[3:6] != ['tcpdump', '-U', '-i']:
+        return False
+    if re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', tokens[6]) is None:
+        return False
+    if tokens[7:9] != ['-nnnn', '-w']:
+        return False
+    if re.fullmatch(r'/tmp/capture_[A-Za-z0-9_.:-]+\.pcap', tokens[9]) is None:
+        return False
+    index = 10
+    if index < len(tokens) and tokens[index] == '-c':
+        index += 1
+        if index >= len(tokens) or re.fullmatch(r'[1-9][0-9]{0,5}', tokens[index]) is None:
+            return False
+        index += 1
+    # The remaining argv is a deliberately small BPF-token subset. No token
+    # may begin with '-' so tcpdump options such as -w/-F/-r/-C/-z/-Z cannot
+    # be smuggled through the user-facing filter field.
+    for token in tokens[index:]:
+        if token.startswith('-') or re.fullmatch(r'[A-Za-z0-9_.:/-]+', token) is None:
+            return False
+    return True
+
+
+def validate_base_argv(tokens):
+    bare = strip_sudo(tokens)
+    if not bare:
+        return False
+    executable = bare[0]
+    if executable == 'killall':
+        return False
+    if executable == 'pkill':
+        return classify_scoped_cleanup(tokens) == 'kill'
+    if executable == 'rm' and len(bare) == 3 and bare[:2] == ['rm', '-f']:
+        path = bare[2]
+        if path == '/tmp/capture_*.pcap':
+            return True
+        if path.startswith(('/tmp/capture_', '/tmp/live_', '/tmp/tail_')):
+            return classify_scoped_cleanup(tokens) == 'remove'
+    if executable == 'ip':
+        return tokens == bare and validate_ip_command(bare)
+    if executable in {'bridge', '/sbin/bridge'}:
+        return tokens == bare and validate_bridge_command(bare)
+    if executable == 'vtysh':
+        return validate_vtysh_command(tokens)
+    if executable == 'journalctl':
+        return validate_journalctl_command(tokens)
+    if executable == 'dmesg':
+        return validate_dmesg_command(tokens)
+    if executable == 'sensors':
+        return bare == ['sensors']
+    if executable in {'smonctl', 'decode-syseeprom', 'cl-resource-query'}:
+        return len(bare) == 1
+    if executable == 'lldpctl':
+        return validate_lldpctl_command(tokens)
+    if executable == 'clagctl':
+        return bare in (['clagctl'], ['clagctl', 'status'])
+    if executable == 'timeout' and len(bare) >= 3 and bare[2] == 'tcpdump':
+        return validate_tcpdump_command(tokens)
+    return True
+
+
+def validate_base_paths(tokens):
+    offset = 1 if tokens and tokens[0] == 'sudo' else 0
+    if len(tokens) <= offset:
+        return False
+    executable = tokens[offset]
+    args = tokens[offset + 1:]
+    if executable == 'cat':
+        return len(args) == 1 and approved_read_path(args[0])
+    if executable == 'tail':
+        paths = []
+        index = 0
+        value_options = {'-n', '--lines', '-c', '--bytes'}
+        flag_options = {'-q', '--quiet', '--silent', '-v', '--verbose', '-z', '--zero-terminated'}
+        while index < len(args):
+            arg = args[index]
+            if arg in value_options:
+                index += 1
+                if index >= len(args) or not re.fullmatch(r'[+-]?[0-9]+', args[index]):
+                    return False
+            elif arg in flag_options or re.fullmatch(r'-(?:[nc])?[+-]?[0-9]+', arg):
+                pass
+            elif arg.startswith('-'):
+                return False
+            else:
+                paths.append(arg)
+            index += 1
+        return all(approved_read_path(path) for path in paths)
+    return True
+
+
+if not validate_base_paths(pipeline_tokens[0]):
+    print(json.dumps({'success': False, 'error': 'Command may only read approved diagnostic paths'}))
+    exit()
+
+if not validate_base_argv(pipeline_tokens[0]):
+    print(json.dumps({'success': False, 'error': 'Command arguments are not allowed'}))
+    exit()
+
+scoped_cleanup_kind = (
+    classify_scoped_cleanup(pipeline_tokens[0])
+    if len(pipeline_tokens) == 1 else None
+)
+
+
+def validate_grep(args):
+    value_options = {
+        '-A', '-B', '-C', '-m', '--after-context', '--before-context',
+        '--context', '--max-count', '-e', '--regexp',
+    }
+    safe_flags = re.compile(r'-(?:[ivnHhsoqwxEFG]+|[ABCm][0-9]+)$')
+    positionals = []
+    explicit_pattern = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if '/' in arg or arg in {'-f', '--file', '-r', '-R', '--recursive'}:
+            return False
+        if arg in value_options:
+            index += 1
+            if index >= len(args):
+                return False
+            value = args[index]
+            if arg in {'-e', '--regexp'}:
+                explicit_pattern = True
+            elif not re.fullmatch(r'[0-9]+', value):
+                return False
+        elif arg.startswith('--'):
+            if not re.fullmatch(
+                r'--(?:color(?:=(?:never|always|auto))?|line-buffered|'
+                r'binary-files=(?:binary|text|without-match)|word-regexp|'
+                r'line-regexp|ignore-case|invert-match|line-number|quiet)', arg
+            ):
+                return False
+        elif arg.startswith('-'):
+            if not safe_flags.fullmatch(arg):
+                return False
+        else:
+            positionals.append(arg)
+        index += 1
+    return len(positionals) == (0 if explicit_pattern else 1)
+
+
+def validate_line_selector(name, args):
+    if name in {'head', 'tail'}:
+        value_options = {'-n', '--lines', '-c', '--bytes'}
+        flags = {'-q', '--quiet', '--silent', '-v', '--verbose', '-z', '--zero-terminated'}
+    else:
+        value_options = set()
+        flags = set()
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in value_options:
+            index += 1
+            if index >= len(args) or not re.fullmatch(r'[+-]?[0-9]+', args[index]):
+                return False
+        elif arg in flags or re.fullmatch(r'-(?:[nc])?[+-]?[0-9]+', arg):
+            pass
+        else:
+            return False
+        index += 1
+    return True
+
+
+def validate_filter(tokens):
+    name = tokens[0]
+    args = tokens[1:]
+    if '/' in name or name not in {
+        'grep', 'head', 'tail', 'wc', 'sort', 'uniq', 'cut', 'awk', 'sed'
+    }:
+        return False
+    if name == 'grep':
+        return validate_grep(args)
+    if name in {'head', 'tail'}:
+        return validate_line_selector(name, args)
+    if name == 'wc':
+        return all(re.fullmatch(r'-[clmwL]+', arg) for arg in args)
+    if name == 'sort':
+        # Sorting stdin is safe; file operands and output-file options are not.
+        return all(
+            re.fullmatch(r'-(?:[bdfgiMhnRrSsuVz]+|k[0-9.,]+|t.)', arg)
+            or re.fullmatch(r'--(?:numeric-sort|reverse|unique|stable|ignore-case)', arg)
+            for arg in args
+        )
+    if name == 'uniq':
+        return all(
+            re.fullmatch(r'-(?:[cdiu]+|[fsw][0-9]+)', arg)
+            for arg in args
+        )
+    if name == 'cut':
+        return bool(args) and all(
+            re.fullmatch(r'-(?:[bcf][0-9,.-]+|d.)', arg)
+            or arg in {'-s', '--only-delimited', '--complement'}
+            for arg in args
+        )
+    if name == 'awk':
+        if len(args) != 1:
+            return False
+        program = args[0]
+        return not re.search(
+            r'\b(?:system|getline|close)\s*\(|\bgetline\b|@(?:include|load)|\|',
+            program,
+            re.IGNORECASE,
+        )
+    if name == 'sed':
+        scripts = []
+        index = 0
+        while index < len(args):
+            if args[index] in {'-n', '-E', '-r'}:
+                index += 1
+                continue
+            if args[index] in {'-e', '--expression'}:
+                index += 1
+                if index >= len(args):
+                    return False
+                scripts.append(args[index])
+            elif args[index].startswith('-'):
+                return False
+            elif scripts:
+                return False
+            else:
+                scripts.append(args[index])
+            index += 1
+        if not scripts:
+            return False
+        for script in scripts:
+            if len(script) >= 4 and script[0] == 's':
+                delimiter = script[1]
+                if delimiter.isalnum() or delimiter.isspace():
+                    return False
+                parts = script.split(delimiter)
+                if len(parts) != 4 or not re.fullmatch(r'[gIp0-9]*', parts[3]):
+                    return False
+            elif not re.fullmatch(
+                r'(?:[0-9]+(?:,[0-9$]+)?|/[^/]+/)[pd]', script
+            ):
+                return False
+        return True
+    return False
+
+
+if len(pipeline_tokens) > 1:
+    # Cleanup/capture commands have side effects and are never valid pipeline
+    # sources, even though they are retained for existing UI workflows.
+    if re.match(r'^(?:sudo (?:rm|killall|pkill|timeout)|find\b)', base_command):
+        print(json.dumps({'success': False, 'error': 'This command cannot be piped'}))
+        exit()
+    if not all(validate_filter(tokens) for tokens in pipeline_tokens[1:]):
+        print(json.dumps({
+            'success': False,
+            'error': 'Pipeline filters must be read-only and cannot read files',
+        }))
         exit()
 
 # Validate device name (must be a valid hostname pattern)
-if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9]$', device):
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
     print(json.dumps({'success': False, 'error': 'Invalid device name format'}))
     exit()
 
@@ -6114,14 +7549,18 @@ if not device_ip:
 
 # Execute command via SSH using management IP
 try:
-    safe_device = re.sub(r'[^A-Za-z0-9_.-]', '_', device)
-    lock_path = f"/tmp/lldpq-run-device-command-{safe_device}.lock"
-    lock_fd = open(lock_path, "w")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(json.dumps({'success': False, 'error': 'Another command is already running on this device'}))
-        exit()
+    lock_path = f"/tmp/lldpq-run-device-command-{lock_device_key(device)}.lock"
+    lock_fd = None
+    # A long tcpdump owns the normal per-device command lock. Only a command
+    # already proven to target this device's LLDPq temp path may bypass it, so
+    # Stop can interrupt that process. Every other command keeps serialization.
+    if scoped_cleanup_kind is None:
+        lock_fd = open_owned_lock(lock_path)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({'success': False, 'error': 'Another command is already running on this device'}))
+            exit()
 
     # Determine timeout based on command - longer for tcpdump, cl-support
     cmd_timeout = 30
@@ -6132,6 +7571,18 @@ try:
             cmd_timeout = int(timeout_match.group(1)) + 10  # Add 10s buffer
         else:
             cmd_timeout = 120  # Default 2 minutes for long commands
+
+    execution_command = command
+    if scoped_cleanup_kind == 'kill':
+        # Avoid pkill matching the short-lived remote shell that contains the
+        # literal requested path. `[/]tmp/...` matches the worker marker but
+        # not its own bracketed pattern text. Validation has already limited
+        # the marker charset, so only filename dots need regex escaping.
+        marker = pipeline_tokens[0][3]
+        process_pattern = '[/]' + marker[1:].replace('.', '[.]')
+        execution_command = (
+            f'sudo pkill -f {shlex.quote(process_pattern)}'
+        )
     
     ssh_command = [
         'sudo', '-u', lldpq_user,
@@ -6141,7 +7592,7 @@ try:
         '-o', 'BatchMode=yes',
         '-o', 'LogLevel=ERROR',  # Suppress warnings
         f'{ssh_user}@{device_ip}',  # Use username@IP from devices.yaml/inventory
-        command
+        execution_command
     ]
     
     result = subprocess.run(
@@ -6151,14 +7602,19 @@ try:
         timeout=cmd_timeout
     )
     
-    print(json.dumps({
-        'success': True,
+    command_ok = result.returncode == 0
+    response = {
+        'success': command_ok,
         'device': device,
         'command': command,
         'output': result.stdout,
         'error_output': result.stderr,
         'exit_code': result.returncode
-    }))
+    }
+    if not command_ok:
+        response['error'] = (result.stderr or result.stdout or
+                             f'Command exited with status {result.returncode}').strip()[:1000]
+    print(json.dumps(response))
 
 except subprocess.TimeoutExpired:
     print(json.dumps({'success': False, 'error': f'Command timed out ({cmd_timeout}s)'}))
@@ -6194,41 +7650,49 @@ PYTHON_END
         # (e.g. enP22p3s0f0np0 -> M1) and devices (e.g. tan-spine-01 -> SPINE-01).
         # Display-only (consumed by lldp.html); does not touch validation data.
         # Admin only (default auth gate at top of file). Generic: no naming hardcoded.
-        read -r POST_DATA
-        export POST_DATA
+        ALIAS_MAX_BODY=1048576
+        if [[ "${CONTENT_LENGTH:-}" =~ ^[0-9]+$ ]] && \
+           (( CONTENT_LENGTH > ALIAS_MAX_BODY )); then
+            echo '{"success": false, "error": "Aliases payload is too large"}'
+            exit 0
+        fi
+        if [[ "${CONTENT_LENGTH:-}" =~ ^[0-9]+$ ]] && (( CONTENT_LENGTH > 0 )); then
+            POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) \
+                2>/dev/null | head -c "$CONTENT_LENGTH")
+        else
+            POST_DATA=$(cat)
+        fi
         if [[ -x /usr/local/bin/lldpq-config ]]; then
             eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
         fi
         WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+        LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
+        LLDPQ_USER="${LLDPQ_USER:-lldpq}"
         ALIAS_FILE="$WEB_ROOT/display-aliases.json"
-        CLEAN_JSON=$(python3 -c '
-import sys, json, os
-def clean_map(m, klen, vlen):
-    out = {}
-    if isinstance(m, dict):
-        for k, v in list(m.items())[:2000]:
-            k = str(k).strip(); v = str(v).strip()
-            if k and v and len(k) <= klen and len(v) <= vlen:
-                out[k] = v
-    return out
-try:
-    data = json.loads(os.environ.get("POST_DATA", "{}"))
-    result = {
-        "interfaces": clean_map(data.get("interfaces", {}), 64, 32),
-        "devices": clean_map(data.get("devices", {}), 128, 64),
-    }
-    print(json.dumps(result, indent=2))
-except Exception:
-    pass
-' 2>/dev/null)
-        if [ -z "$CLEAN_JSON" ]; then
-            echo '{"success": false, "error": "Invalid aliases payload"}'
-        elif echo "$CLEAN_JSON" > "$ALIAS_FILE" 2>/dev/null || echo "$CLEAN_JSON" | sudo -n tee "$ALIAS_FILE" > /dev/null 2>&1; then
-            sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$ALIAS_FILE" 2>/dev/null
-            sudo -n chmod 664 "$ALIAS_FILE" 2>/dev/null
-            echo '{"success": true}'
+        SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
+        if [[ ! -f "$SETUP_SAFETY" ]]; then
+            echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
+            exit 0
+        fi
+        ALIAS_ARGS=(
+            "$SETUP_SAFETY" save-aliases
+            --target "$ALIAS_FILE"
+            --managed-root "$WEB_ROOT"
+            --managed-root "$LLDPQ_DIR"
+        )
+        ALIAS_RESPONSE=$(printf '%s' "$POST_DATA" | \
+            sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c \
+            'exec python3 "$@"' -- "${ALIAS_ARGS[@]}" 2>/dev/null)
+        ALIAS_STATUS=$?
+        if (( ALIAS_STATUS == 0 )); then
+            if ! sudo -n chown "${LLDPQ_USER:-lldpq}:www-data" "$ALIAS_FILE" 2>/dev/null || \
+               ! sudo -n chmod 664 "$ALIAS_FILE" 2>/dev/null; then
+                echo '{"success": false, "error": "Aliases were saved but file permissions could not be normalized"}'
+            else
+                echo "$ALIAS_RESPONSE"
+            fi
         else
-            echo '{"success": false, "error": "Failed to write alias file"}'
+            echo "${ALIAS_RESPONSE:-{\"success\": false, \"error\": \"Invalid aliases payload\"}}"
         fi
         ;;
     *)
