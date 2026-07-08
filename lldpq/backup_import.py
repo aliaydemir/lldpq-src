@@ -3023,7 +3023,7 @@ def _main(argv=None):
     purge.add_argument("--user", required=True)
     args = parser.parse_args(argv)
     if not args.user or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
         for character in args.user
     ):
         parser.error("invalid service user")
