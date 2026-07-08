@@ -56,7 +56,7 @@ GIT = "/usr/bin/git"
 SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 TOKEN_RE = re.compile(r"^[a-f0-9]{64}$")
 JOB_RE = re.compile(r"^[a-f0-9]{32}$")
-USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+USER_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9._-]*\$?$")
 OPTION_KEYS = (
     "keep_data",
     "remove_source",
