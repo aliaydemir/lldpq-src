@@ -7,7 +7,7 @@
 #
 # Output: ~/lldpq.tar.gz
 
-set -e
+set -euo pipefail
 
 # Colors
 GREEN='\033[0;32m'
@@ -32,6 +32,7 @@ OUTPUT_FILE="$HOME/lldpq-${ARCH_LABEL}.tar.gz"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERSION=$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo "dev")
+GIT_COMMIT=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')
 
 echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║    LLDPq Docker Build v${VERSION}         ║${NC}"
@@ -46,7 +47,13 @@ fi
 
 echo -e "${YELLOW}[1/4]${NC} Building Docker image..."
 cd "$REPO_ROOT"
-sudo docker build -f docker/Dockerfile --build-arg TARGETARCH=${ARCH_LABEL} -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:${VERSION} . 2>&1 | tail -5
+sudo docker build \
+    -f docker/Dockerfile \
+    --build-arg TARGETARCH="${ARCH_LABEL}" \
+    --label "org.opencontainers.image.revision=${GIT_COMMIT}" \
+    -t "${IMAGE_NAME}:${IMAGE_TAG}" \
+    -t "${IMAGE_NAME}:${VERSION}" \
+    . 2>&1 | tail -5
 echo -e "${GREEN}  ✓ Built${NC}"
 echo ""
 
@@ -57,7 +64,7 @@ echo ""
 echo -e "${YELLOW}[3/4]${NC} Exporting to ${OUTPUT_FILE}..."
 sudo docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > "${OUTPUT_FILE}"
 chmod 644 "${OUTPUT_FILE}"
-SIZE=$(ls -lh "${OUTPUT_FILE}" | awk '{print $5}')
+SIZE=$(du -h "${OUTPUT_FILE}" | awk 'NR == 1 {print $1}')
 echo -e "${GREEN}  ✓ Exported (${SIZE})${NC}"
 echo ""
 
@@ -71,6 +78,7 @@ echo -e "${GREEN}║    Build Complete!                   ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════╝${NC}"
 echo ""
 echo -e "Image:  ${CYAN}${IMAGE_NAME}:${VERSION}${NC} (${SIZE})"
+echo -e "Commit: ${CYAN}${GIT_COMMIT}${NC}"
 echo -e "Arch:   ${CYAN}${ARCH_LABEL}${NC}"
 echo -e "File:   ${CYAN}${OUTPUT_FILE}${NC}"
 echo ""
