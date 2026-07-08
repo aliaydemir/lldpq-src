@@ -1536,11 +1536,50 @@ echo "Starting services..."
 service cron start > /dev/null 2>&1
 echo "  ✓ cron"
 
-# Start fcgiwrap (CGI scripts for web API)
-/usr/sbin/fcgiwrap -f -s unix:/var/run/fcgiwrap.socket &
-sleep 0.5
-chown www-data:www-data /var/run/fcgiwrap.socket
-chmod 660 /var/run/fcgiwrap.socket
+# Start fcgiwrap (CGI scripts for web API). A Docker restart reuses the
+# container writable layer, so the socket pathname can outlive the old process.
+# Remove only that stale runtime artifact and do not report readiness until the
+# replacement process is alive and has created a real Unix socket.
+FCGIWRAP_SOCKET=/var/run/fcgiwrap.socket
+rm -f -- "$FCGIWRAP_SOCKET"
+/usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &
+FCGIWRAP_PID=$!
+FCGIWRAP_READY=false
+
+for _ in {1..50}; do
+    if ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
+        if wait "$FCGIWRAP_PID" 2>/dev/null; then
+            FCGIWRAP_STATUS=0
+        else
+            FCGIWRAP_STATUS=$?
+        fi
+        rm -f -- "$FCGIWRAP_SOCKET"
+        echo "ERROR: fcgiwrap exited during startup (status $FCGIWRAP_STATUS)" >&2
+        exit 1
+    fi
+    if [ -S "$FCGIWRAP_SOCKET" ]; then
+        FCGIWRAP_READY=true
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$FCGIWRAP_READY" != true ] || ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
+    kill "$FCGIWRAP_PID" 2>/dev/null || true
+    wait "$FCGIWRAP_PID" 2>/dev/null || true
+    rm -f -- "$FCGIWRAP_SOCKET"
+    echo "ERROR: fcgiwrap did not create a live socket within 5 seconds" >&2
+    exit 1
+fi
+
+chown www-data:www-data "$FCGIWRAP_SOCKET"
+chmod 660 "$FCGIWRAP_SOCKET"
+if ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
+    wait "$FCGIWRAP_PID" 2>/dev/null || true
+    rm -f -- "$FCGIWRAP_SOCKET"
+    echo "ERROR: fcgiwrap exited before startup completed" >&2
+    exit 1
+fi
 echo "  ✓ fcgiwrap"
 
 # Start SSH server (port 2033)
