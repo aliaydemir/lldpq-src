@@ -10,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -373,6 +375,142 @@ switches:
             TrackingConfigError, "not the managed Docker config target"
         ):
             self.save(initial["revision"], ["LEAF-01"])
+
+
+class DockerRecoveryStartupTest(unittest.TestCase):
+    def test_fresh_docker_config_has_no_recovery_work(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "system-config").mkdir()
+            with (
+                mock.patch.object(
+                    backup_import, "_docker_environment", return_value=True
+                ),
+                mock.patch.object(
+                    backup_import, "_secure_list_dir", return_value=[]
+                ),
+                mock.patch.object(backup_import, "_ensure_recovery_base") as ensure,
+            ):
+                result = backup_import._load_recovery_authority(
+                    lldpq_dir=str(root),
+                    web_root=str(root / "web"),
+                    user="lldpq",
+                    allowed={},
+                    key_names=set(),
+                    ssh_dir=str(root / ".ssh"),
+                )
+
+            self.assertIsNone(result)
+            ensure.assert_not_called()
+
+    def test_docker_recovery_base_uses_shared_setgid_mode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary) / "system-config"
+            base.mkdir()
+            os.chmod(base, 0o750)
+            account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            group = SimpleNamespace(gr_gid=os.getgid())
+            real_stat = os.stat
+
+            def apply_directory_metadata(_user, _script, path, _gid, **_kwargs):
+                return SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+
+            def docker_stat(path, *args, **kwargs):
+                metadata = real_stat(path, *args, **kwargs)
+                if (
+                    os.fspath(path) == os.fspath(base)
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    return SimpleNamespace(
+                        st_uid=account.pw_uid,
+                        st_gid=group.gr_gid,
+                        st_mode=(metadata.st_mode & ~0o7777) | 0o2770,
+                    )
+                return metadata
+
+            with (
+                mock.patch.object(
+                    backup_import, "_docker_environment", return_value=True
+                ),
+                mock.patch.object(
+                    backup_import.pwd, "getpwnam", return_value=account
+                ),
+                mock.patch.object(
+                    backup_import.grp, "getgrnam", return_value=group
+                ),
+                mock.patch.object(
+                    backup_import,
+                    "_collector_shell",
+                    side_effect=apply_directory_metadata,
+                ) as collector_shell,
+                mock.patch.object(backup_import.os, "stat", side_effect=docker_stat),
+                mock.patch.object(backup_import, "_durable_path"),
+            ):
+                backup_import._ensure_recovery_base("lldpq", str(base))
+
+            command = collector_shell.call_args.args
+            self.assertIn('chmod -- 2770 "$1"', command[1])
+            self.assertEqual(command[2:], (str(base), str(os.getgid())))
+
+    def test_docker_recovery_base_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "real-config").mkdir()
+            (root / "system-config").symlink_to(root / "real-config")
+            with mock.patch.object(
+                backup_import, "_docker_environment", return_value=True
+            ):
+                with self.assertRaisesRegex(
+                    backup_import.BackupImportError, "may not be a symlink"
+                ):
+                    backup_import._recovery_base(str(root), "lldpq")
+
+    def test_recovery_authority_clears_inherited_shared_directory_bits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            base = root / "system-config"
+            recovery = base / backup_import.RECOVERY_DIR_NAME
+            account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            completed = SimpleNamespace(stdout=b"", stderr=b"", returncode=0)
+            with (
+                mock.patch.object(
+                    backup_import, "_recovery_base", return_value=str(base)
+                ),
+                mock.patch.object(backup_import, "_ensure_recovery_base"),
+                mock.patch.object(backup_import, "_cleanup_recovery_debris"),
+                mock.patch.object(
+                    backup_import.pwd, "getpwnam", return_value=account
+                ),
+                mock.patch.object(
+                    backup_import, "_recovery_path", return_value=str(recovery)
+                ),
+                mock.patch.object(
+                    backup_import, "_secure_path_state", return_value="missing"
+                ),
+                mock.patch.object(backup_import, "_as_collector"),
+                mock.patch.object(
+                    backup_import, "_collector_shell", return_value=completed
+                ) as collector_shell,
+                mock.patch.object(backup_import, "_secure_require_private_dir"),
+                mock.patch.object(backup_import, "_secure_write"),
+            ):
+                backup_import._create_recovery_authority(
+                    [],
+                    None,
+                    lldpq_dir=str(root),
+                    web_root=str(root / "web"),
+                    user="lldpq",
+                    token="123-0123456789abcdef",
+                )
+
+            command = collector_shell.call_args_list[0].args
+            self.assertIn('chgrp -- "$2" "$1"', command[1])
+            self.assertIn('chmod -- g-s,u-s "$1"', command[1])
+            self.assertIn('chmod -- 700 "$1"', command[1])
+            self.assertEqual(
+                command[2:],
+                (f"{recovery}.tmp-123-0123456789abcdef", str(os.getgid())),
+            )
 
 
 if __name__ == "__main__":

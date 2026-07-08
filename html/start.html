@@ -268,6 +268,13 @@
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
+
+        .card-caption {
+            margin-top: 4px;
+            color: #666;
+            font-size: 10px;
+            line-height: 1.3;
+        }
         
         /* Card Border Colors */
         .card-total { border-left-color: #4fc3f7; }
@@ -727,6 +734,50 @@
             </div>
         </div>
 
+        <!-- PFC/ECN Analysis Section -->
+        <div class="analysis-section" id="pfc-ecn-dashboard-section">
+            <div class="section-header">
+                <h2 class="section-title" onclick="window.location.href='/monitor-results/pfc-ecn-analysis.html'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4,5H8V19H4V5M10,5H14V19H10V5M17,7H20V10H22V14H20V17H17V14H15V10H17V7Z"/></svg>
+                    PFC/ECN Analysis
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <a class="summary-card card-total" href="/monitor-results/pfc-ecn-analysis.html?filter=all">
+                    <div class="card-value" id="pfc-total">--</div>
+                    <div class="card-label">Monitored Ports</div>
+                    <div class="card-caption" id="pfc-coverage-caption">--/-- devices reporting</div>
+                </a>
+                <a class="summary-card card-info" href="/monitor-results/pfc-ecn-analysis.html">
+                    <div class="card-value status-info" id="pfc-ready">--/--</div>
+                    <div class="card-label">Data Ready</div>
+                    <div class="card-caption" id="pfc-ready-caption">Usable interval samples</div>
+                </a>
+                <a class="summary-card card-info" href="/monitor-results/pfc-ecn-analysis.html?filter=ecn">
+                    <div class="card-value status-info" id="pfc-ecn">--</div>
+                    <div class="card-label">ECN Active</div>
+                    <div class="card-caption pfc-signal-caption" id="pfc-ecn-caption" data-default-caption="Ports · latest interval">Ports · latest interval</div>
+                </a>
+                <a class="summary-card card-info" href="/monitor-results/pfc-ecn-analysis.html?filter=rx">
+                    <div class="card-value status-info" id="pfc-rx">--</div>
+                    <div class="card-label">PFC RX Active</div>
+                    <div class="card-caption pfc-signal-caption" id="pfc-rx-caption" data-default-caption="Peer paused us · latest interval">Peer paused us · latest interval</div>
+                </a>
+                <a class="summary-card card-info" href="/monitor-results/pfc-ecn-analysis.html?filter=tx">
+                    <div class="card-value status-info" id="pfc-tx">--</div>
+                    <div class="card-label">PFC TX Active</div>
+                    <div class="card-caption pfc-signal-caption" id="pfc-tx-caption" data-default-caption="We paused peer · latest interval">We paused peer · latest interval</div>
+                </a>
+                <a class="summary-card card-info" href="/monitor-results/pfc-ecn-analysis.html?filter=loss">
+                    <div class="card-value status-info" id="pfc-discards">--</div>
+                    <div class="card-label">Discarding Ports</div>
+                    <div class="card-caption pfc-signal-caption" id="pfc-discards-caption" data-default-caption="Direct drop evidence · latest interval">Direct drop evidence · latest interval</div>
+                </a>
+            </div>
+            </div>
+        </div>
+
 
     </div>
 
@@ -774,7 +825,9 @@
                 manifest.skipped.some(item => typeof item !== 'string' || !item)) {
                 return null;
             }
-            const requiredAnalyses = ['bgp', 'flap', 'ber', 'hardware', 'log', 'duplicate'];
+            const requiredAnalyses = [
+                'bgp', 'flap', 'ber', 'pfc-ecn', 'hardware', 'log', 'duplicate'
+            ];
             if (requiredAnalyses.some(name => !manifest.analyses.includes(name)) ||
                 (!manifest.skipped.includes('optical') && !manifest.analyses.includes('optical'))) {
                 return null;
@@ -1498,12 +1551,13 @@
                     summaryData = parseDuplicateSummary(doc);
                     
                 } else {
-                    // BGP, BER and Link Flap expose summary cards as the report
-                    // contract.  Re-counting only rendered table rows loses stale,
-                    // unknown and currently-flapping states.
+                    // BGP, BER, PFC/ECN and Link Flap expose report-level summary
+                    // contracts. Re-counting rendered rows loses unavailable,
+                    // baseline, reset and status-precedence semantics.
                     const pageMap = {
                         'bgp': 'monitor-results/bgp-analysis.html',
                         'ber': 'monitor-results/ber-analysis.html',
+                        'pfc': 'monitor-results/pfc-ecn-analysis.html',
                         'flap': 'monitor-results/link-flap-analysis.html'
                     };
                     
@@ -1565,6 +1619,57 @@
                             summaryData.critical = metric('#critical-ports') || 0;
                             summaryData.unknown = metric('#unknown-ports') || 0;
                             summaryData.coveragePartial = summaryData.coveragePartial || summaryData.unknown > 0;
+                        } else if (dataType === 'pfc') {
+                            const requiredMetrics = {
+                                totalPorts: metadataNumber('totalPorts'),
+                                readyPorts: metadataNumber('readyPorts'),
+                                ecnActivePorts: metadataNumber('ecnActivePorts'),
+                                pfcRxActivePorts: metadataNumber('pfcRxActivePorts'),
+                                pfcTxActivePorts: metadataNumber('pfcTxActivePorts'),
+                                discardReadyPorts: metadataNumber('discardReadyPorts'),
+                                discardActivePorts: metadataNumber('discardActivePorts')
+                            };
+                            const intervalStatus = String(
+                                reportMeta?.dataset?.intervalStatus || ''
+                            ).toLowerCase();
+                            const coverageStatus = String(
+                                reportMeta?.dataset?.coverageStatus || ''
+                            ).toLowerCase();
+                            const metricValues = Object.values(requiredMetrics);
+                            const intervalConsistent =
+                                (intervalStatus === 'complete' &&
+                                 requiredMetrics.readyPorts === requiredMetrics.totalPorts &&
+                                 requiredMetrics.totalPorts > 0 && coverageStatus === 'complete') ||
+                                (intervalStatus === 'partial' && requiredMetrics.readyPorts > 0 &&
+                                 (requiredMetrics.readyPorts < requiredMetrics.totalPorts ||
+                                  coverageStatus === 'partial')) ||
+                                (intervalStatus === 'unavailable' &&
+                                 requiredMetrics.readyPorts === 0);
+                            const metricsValid = reportMeta?.dataset?.analysisSummary === 'pfc-ecn' &&
+                                metricValues.every(value => Number.isInteger(value) && value >= 0) &&
+                                requiredMetrics.readyPorts <= requiredMetrics.totalPorts &&
+                                requiredMetrics.discardReadyPorts <= requiredMetrics.readyPorts &&
+                                requiredMetrics.discardActivePorts <=
+                                    requiredMetrics.discardReadyPorts &&
+                                [requiredMetrics.ecnActivePorts, requiredMetrics.pfcRxActivePorts,
+                                 requiredMetrics.pfcTxActivePorts]
+                                    .every(value => value <= requiredMetrics.readyPorts) &&
+                                intervalConsistent;
+                            if (!metricsValid) {
+                                summaryData.unavailable = true;
+                                summaryData.coveragePartial = true;
+                            } else {
+                                Object.assign(summaryData, requiredMetrics);
+                                summaryData.notReady = summaryData.totalPorts - summaryData.readyPorts;
+                                summaryData.intervalStatus = intervalStatus;
+                                summaryData.intervalUnavailable = intervalStatus === 'unavailable';
+                                summaryData.signalPartial = summaryData.coveragePartial ||
+                                    intervalStatus !== 'complete';
+                                summaryData.discardPartial =
+                                    summaryData.discardReadyPorts < summaryData.readyPorts;
+                                summaryData.coveragePartial = summaryData.signalPartial ||
+                                    summaryData.discardPartial;
+                            }
                         } else if (dataType === 'flap') {
                             summaryData.totalDevices = metric('#total-devices');
                             summaryData.totalPorts = metric('#total-ports');
@@ -1607,13 +1712,15 @@
             try {
                 let pipelineState = await readDashboardPipelineState();
                 // Fetch data directly from raw data files
-                const [assetsData, lldpData, bgpData, evpnData, opticalData, berData, flapData, hardwareData, logData, dupData] = await Promise.all([
+                const [assetsData, lldpData, bgpData, evpnData, opticalData, berData,
+                    pfcData, flapData, hardwareData, logData, dupData] = await Promise.all([
                     fetchRawDataSummary('assets', pipelineState),
                     fetchRawDataSummary('lldp', pipelineState),
                     fetchRawDataSummary('bgp', pipelineState),
                     fetchRawDataSummary('evpn', pipelineState),
                     fetchRawDataSummary('optical', pipelineState),
                     fetchRawDataSummary('ber', pipelineState),
+                    fetchRawDataSummary('pfc', pipelineState),
                     fetchRawDataSummary('flap', pipelineState),
                     fetchRawDataSummary('hardware', pipelineState),
                     fetchRawDataSummary('log', pipelineState),
@@ -1682,6 +1789,92 @@
                 updateDashboardCard('ber-warning', dashboardMetric(berData, berData.warning));
                 updateDashboardCard('ber-critical', dashboardMetric(berData, berData.critical));
 
+                const pfcCoverageAvailable = Number.isFinite(Number(pfcData.coverageCurrent)) &&
+                    Number.isFinite(Number(pfcData.coverageExpected));
+                const pfcCoverageText = pfcCoverageAvailable
+                    ? `${pfcData.coverageCurrent}/${pfcData.coverageExpected}`
+                    : 'N/A';
+                const pfcReadyText = pfcData.unavailable
+                    ? 'N/A'
+                    : `${pfcData.readyPorts}/${pfcData.totalPorts}`;
+                const pfcSignalMetric = value =>
+                    pfcData.unavailable || pfcData.intervalUnavailable ? 'N/A' : value;
+                const pfcDiscardComplete = !pfcData.unavailable &&
+                    !pfcData.intervalUnavailable &&
+                    pfcData.discardReadyPorts === pfcData.readyPorts;
+                const pfcDiscardMetric = pfcDiscardComplete
+                    ? pfcData.discardActivePorts
+                    : !pfcData.unavailable && !pfcData.intervalUnavailable &&
+                        pfcData.discardActivePorts > 0
+                        ? `≥${pfcData.discardActivePorts}`
+                        : 'N/A';
+                updateDashboardCard('pfc-total', dashboardMetric(pfcData, pfcData.totalPorts));
+                updateDashboardCard('pfc-ready', pfcReadyText);
+                updateDashboardCard('pfc-ecn', pfcSignalMetric(pfcData.ecnActivePorts));
+                updateDashboardCard('pfc-rx', pfcSignalMetric(pfcData.pfcRxActivePorts));
+                updateDashboardCard('pfc-tx', pfcSignalMetric(pfcData.pfcTxActivePorts));
+                updateDashboardCard('pfc-discards', pfcDiscardMetric);
+                document.getElementById('pfc-coverage-caption').textContent =
+                    `${pfcCoverageText} devices reporting`;
+                document.getElementById('pfc-ready-caption').textContent = pfcData.unavailable
+                    ? 'Analysis unavailable'
+                    : pfcData.notReady > 0
+                        ? `${pfcData.notReady} ports need another usable sample`
+                        : pfcData.signalPartial
+                            ? 'All collected ports have a usable interval'
+                            : 'All ports have a usable interval';
+
+                const pfcCaptionState = pfcData.unavailable
+                    ? 'Analysis unavailable'
+                    : pfcData.intervalUnavailable
+                        ? 'No usable comparison window'
+                        : pfcData.signalPartial
+                            ? 'Observed ports · partial coverage'
+                            : null;
+                document.querySelectorAll('.pfc-signal-caption').forEach(caption => {
+                    caption.textContent = pfcCaptionState || caption.dataset.defaultCaption;
+                });
+                const discardCaption = document.getElementById('pfc-discards-caption');
+                if (!pfcData.unavailable && !pfcData.intervalUnavailable && !pfcDiscardComplete) {
+                    discardCaption.textContent = pfcData.discardActivePorts > 0
+                        ? `At least ${pfcData.discardActivePorts} ports · partial discard data`
+                        : 'Discard counters incomplete';
+                }
+
+                const pfcCoverageMissing = pfcCoverageAvailable
+                    ? Math.max(0, Number(pfcData.coverageExpected) - Number(pfcData.coverageCurrent))
+                    : null;
+                const pfcScopeWarning = pfcCoverageMissing === null
+                    ? (pfcData.coveragePartial ? 1 : null)
+                    : pfcCoverageMissing;
+                const pfcSignalState = pfcData.unavailable || pfcData.intervalUnavailable
+                    ? { unavailable: true }
+                    : pfcData;
+                setDashboardProblemSeverity(
+                    'pfc-total', pfcData, 0, pfcScopeWarning, 'info'
+                );
+                setDashboardProblemSeverity(
+                    'pfc-ready', pfcData, 0,
+                    pfcData.signalPartial ? 1 : pfcData.notReady
+                );
+                setDashboardProblemSeverity(
+                    'pfc-ecn', pfcSignalState, 0,
+                    pfcData.signalPartial ? 1 : 0, 'info'
+                );
+                setDashboardProblemSeverity(
+                    'pfc-rx', pfcSignalState, 0,
+                    pfcData.signalPartial ? 1 : pfcData.pfcRxActivePorts
+                );
+                setDashboardProblemSeverity(
+                    'pfc-tx', pfcSignalState, 0,
+                    pfcData.signalPartial ? 1 : pfcData.pfcTxActivePorts
+                );
+                setDashboardProblemSeverity(
+                    'pfc-discards', pfcSignalState,
+                    pfcData.discardActivePorts,
+                    pfcData.coveragePartial || !pfcDiscardComplete ? 1 : 0
+                );
+
                 updateDashboardCard('flap-devices', dashboardMetric(flapData, flapData.totalDevices));
                 updateDashboardCard('flap-ports', dashboardMetric(flapData, flapData.totalPorts));
                 updateDashboardCard('flap-stable', dashboardMetric(flapData, flapData.stable));
@@ -1726,7 +1919,7 @@
                     coveragePartial: Boolean(bgpData.coveragePartial || evpnData.coveragePartial)
                 };
                 const nonDuplicateReports = [assetsData, lldpData, bgpEvpnState, opticalData,
-                    berData, flapData, hardwareData, logData];
+                    berData, pfcData, flapData, hardwareData, logData];
                 const analysisReports = [...nonDuplicateReports, dupData];
                 const unavailableAnalyses = analysisReports.filter(data =>
                     !data || data.unavailable
@@ -1741,7 +1934,7 @@
                 const pipelineNotCurrent = Boolean(markerStatus) || !pipelineState.manifestValid;
                 const analysisCoverageProblems = unavailableAnalyses + partialAnalyses +
                     (pipelineNotCurrent ? 1 : 0);
-                const interfaceSources = [opticalData, berData].filter(data =>
+                const interfaceSources = [opticalData, berData, pfcData].filter(data =>
                     data && !data.unavailable && Number.isFinite(Number(data.totalPorts))
                 );
                 const totalInterfaces = interfaceSources.length
@@ -1766,6 +1959,8 @@
                 'Optical Unknown': opticalData.unknown || 0,
                 'BER Critical': berData.critical || 0,
                 'BER Warning': berData.warning || 0,
+                'PFC Data Not Ready': pfcData.notReady || 0,
+                'PFC Discarding Ports': pfcData.discardActivePorts || 0,
                 'Link Flap Critical': flapData.critical || 0,
                 'Link Flap Warning': flapData.warning || 0,
                 'Hardware Critical': hardwareData.critical || 0,
@@ -1787,7 +1982,8 @@
             // Hard failures render red; advisory / warning-severity signals render yellow.
             const CRITICAL_SOURCES = new Set([
                 'Assets Failed', 'LLDP Failed Ports', 'BGP Critical',
-                'Optical Critical', 'BER Critical', 'Link Flap Critical',
+                'Optical Critical', 'BER Critical', 'PFC Discarding Ports',
+                'Link Flap Critical',
                 'Hardware Critical', 'Log Critical', 'Active IP Duplicates',
                 'Confirmed MAC Conflicts'
             ]);
@@ -1894,7 +2090,9 @@
         // Keep the existing card layout while making a mixed problem counter
         // reflect its highest current severity. Warning-only states must remain
         // advisory (orange), not hard failures (red).
-        function setDashboardProblemSeverity(elementId, data, criticalCount, warningCount) {
+        function setDashboardProblemSeverity(
+            elementId, data, criticalCount, warningCount, healthyState = 'excellent'
+        ) {
             const element = document.getElementById(elementId);
             const card = element && element.closest('.summary-card');
             if (!element || !card) return;
@@ -1914,6 +2112,9 @@
             } else if ((Number(warningCount) || 0) > 0) {
                 card.classList.add('card-warning');
                 element.classList.add('status-warning');
+            } else if (healthyState === 'info') {
+                card.classList.add('card-info');
+                element.classList.add('status-info');
             } else {
                 card.classList.add('card-excellent');
                 element.classList.add('status-excellent');

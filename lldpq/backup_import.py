@@ -730,8 +730,11 @@ _RECOVERY_TARGET_KEYS = {
 
 def _recovery_base(lldpq_dir, user):
     if _docker_environment():
-        base = os.path.realpath(os.path.join(lldpq_dir, "system-config"))
         managed_root = os.path.realpath(lldpq_dir)
+        candidate = os.path.join(managed_root, "system-config")
+        if os.path.lexists(candidate) and os.path.islink(candidate):
+            raise BackupImportError("Docker recovery state directory may not be a symlink")
+        base = os.path.realpath(candidate)
         try:
             managed = os.path.commonpath((base, managed_root)) == managed_root
         except ValueError:
@@ -758,15 +761,33 @@ def _ensure_recovery_base(user, base):
         )
     except KeyError as exc:
         raise BackupImportError(f"Recovery owner/group is unavailable: {exc}") from exc
-    expected_mode = 0o750 if _docker_environment() else 0o700
+    # system-config is intentionally shared with www-data for atomic web
+    # updates.  The Docker entrypoint publishes that directory as 2770; using
+    # a different recovery-only mode here both breaks that contract and leaves
+    # GNU chmod's preserved setgid bit failing the exact-mode verification.
+    expected_mode = 0o2770 if _docker_environment() else 0o700
     if os.path.lexists(base):
         if os.path.islink(base) or not os.path.isdir(base):
             raise BackupImportError("Recovery base is not a safe directory")
     else:
         _as_collector(user, ["mkdir", "-p", base])
-    _collector_set_metadata(
-        user, base, expected_mode, account.pw_uid, expected_gid
-    )
+    if _docker_environment():
+        # This is a shared directory, not a recovery payload file.  Keep the
+        # generic file metadata helper strict about special bits and normalize
+        # this one validated directory explicitly.
+        _collector_shell(
+            user,
+            'test -d "$1" && test ! -L "$1" || exit 4; '
+            'chgrp -- "$2" "$1" && chmod -- 2770 "$1"; '
+            'test -d "$1" && test ! -L "$1"',
+            base,
+            str(expected_gid),
+            timeout=10,
+        )
+    else:
+        _collector_set_metadata(
+            user, base, expected_mode, account.pw_uid, expected_gid
+        )
     metadata = os.stat(base, follow_symlinks=False)
     if (
         metadata.st_uid != account.pw_uid
@@ -939,6 +960,10 @@ def _create_recovery_authority(
     recovery_base = _recovery_base(lldpq_dir, user)
     _ensure_recovery_base(user, recovery_base)
     _cleanup_recovery_debris(user, recovery_base)
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError as exc:
+        raise BackupImportError(f"Recovery owner is unavailable: {exc}") from exc
     recovery_dir = _recovery_path(lldpq_dir, user)
     temporary_dir = f"{recovery_dir}.tmp-{token}"
     if _secure_path_state(user, recovery_dir) != "missing":
@@ -971,8 +996,11 @@ def _create_recovery_authority(
         _as_collector(user, ["mkdir", temporary_dir])
         _collector_shell(
             user,
-            'chmod 700 "$1" && sync -f -- "$1" && sync -f -- "$(dirname -- "$1")"',
+            'test -d "$1" && test ! -L "$1" || exit 4; '
+            'chgrp -- "$2" "$1" && chmod -- g-s,u-s "$1" && chmod -- 700 "$1"; '
+            'sync -f -- "$1" && sync -f -- "$(dirname -- "$1")"',
             temporary_dir,
+            str(account.pw_gid),
             timeout=20,
         )
         _secure_require_private_dir(user, temporary_dir)
@@ -1020,10 +1048,19 @@ def _load_recovery_authority(
     *, lldpq_dir, web_root, user, allowed, key_names, ssh_dir
 ):
     recovery_base = _recovery_base(lldpq_dir, user)
-    if os.path.isdir(recovery_base):
-        _ensure_recovery_base(user, recovery_base)
-        _cleanup_recovery_debris(user, recovery_base)
-    recovery_dir = _recovery_path(lldpq_dir, user)
+    if os.path.lexists(recovery_base) and not os.path.isdir(recovery_base):
+        raise BackupImportError("Recovery base is not a safe directory")
+    if not os.path.isdir(recovery_base):
+        return None
+    try:
+        recovery_entries = _secure_list_dir(user, recovery_base)
+    except (OSError, BackupImportError) as exc:
+        raise BackupImportError(f"Could not inspect recovery base: {exc}") from exc
+    if not any(_is_native_recovery_artifact_name(name) for name in recovery_entries):
+        return None
+    recovery_dir = os.path.join(recovery_base, RECOVERY_DIR_NAME)
+    _ensure_recovery_base(user, recovery_base)
+    _cleanup_recovery_debris(user, recovery_base)
     recovery_state = _secure_path_state(user, recovery_dir)
     if recovery_state == "missing":
         return None

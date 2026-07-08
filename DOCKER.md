@@ -19,14 +19,17 @@ Docker CLI already runs as your user, as is usual with Docker Desktop.
 
 ```bash
 # Download — pick the right architecture
+
 curl -O https://aliaydemir.com/lldpq-amd64.tar.gz   # x86_64 (Linux servers, Cumulus switches)
 
 curl -O https://aliaydemir.com/lldpq-arm64.tar.gz   # ARM64  (Apple Silicon Mac, Ampere, RPi)
 
 # Load image
+
 sudo docker load < lldpq-amd64.tar.gz   # or lldpq-arm64.tar.gz
 
 # Evaluation mode: publish only the web UI, and only on host loopback
+
 sudo docker run -d --name lldpq \
   --privileged \
   --restart unless-stopped \
@@ -36,8 +39,11 @@ sudo docker run -d --name lldpq \
   lldpq:latest
 
 # Shell into container
+
 sudo docker exec -it -u lldpq lldpq bash
 ```
+
+
 
 Open `http://127.0.0.1:8080` on the Docker host. For remote access, forward the
 loopback port through the Docker host's normal SSH service, then open the same
@@ -72,6 +78,8 @@ device credentials. DHCP/ONIE provisioning is disabled unless the explicit
 Linux host-network mode is selected.
 
 ## Persistent deployment
+
+
 
 ### Direct `docker run`
 
@@ -152,7 +160,7 @@ TLS reverse proxy restricted to trusted management sources:
 
 1. Login as admin and go to **Assets**.
 2. Click **Edit Devices** and add switch hostnames and management IPs (see the
-   [devices.yaml format](README.md#devicesyaml-format)).
+  [devices.yaml format](README.md#devicesyaml-format)).
 3. Click the orange **SSH Setup** button.
 4. Enter the device password twice to confirm it.
 5. Click **Run Setup** to generate and distribute SSH keys.
@@ -185,6 +193,8 @@ nv config diff
 # Run only if the diff contains no unrelated pending changes:
 nv config apply -y
 ```
+
+
 
 ## DHCP/ONIE provisioning
 
@@ -221,6 +231,8 @@ monitoring only.
 > Restrict both at the host/network boundary to the exact provisioning and
 > administration source ranges required. Never expose TCP/2033 publicly, and
 > use a TLS-protected management path for web administration.
+
+
 
 ## Ansible integration
 
@@ -259,6 +271,8 @@ See [Ansible Integration](README.md#15-ansible-integration) for the required
 project structure.
 
 ## Updating
+
+
 
 ### Compose deployments
 
@@ -624,6 +638,8 @@ echo "Rollback image retained as: $rollback_image"
 echo "After final acceptance, use the removal section to inspect and delete retained rollback volumes."
 ```
 
+
+
 If you need an image/container rollback after the readiness check, the old
 container and old image are retained. The migration uses per-attempt named
 volumes, so its copied state is not shared with the old container; only bind
@@ -686,14 +702,14 @@ authentication; Prometheus also enables its lifecycle and admin APIs.
 
 - Pin the three `latest` images to reviewed versions or digests.
 - Remove the host mapping for 8889; Prometheus reaches it on the internal
-  Compose network.
+Compose network.
 - Publish only the OTLP receiver actually used, bind it to a specific
-  management address, and firewall it to the switch source prefixes.
+management address, and firewall it to the switch source prefixes.
 - Remove the Alertmanager host mapping unless administrators need it. Bind any
-  required UI/API port to loopback or a protected management address.
+required UI/API port to loopback or a protected management address.
 - Remove Prometheus's `--web.enable-admin-api` unless explicitly required.
-  Bind 9090 to loopback for host-network LLDPq, or to a protected host address
-  reachable only by the LLDPq bridge network and trusted administrators.
+Bind 9090 to loopback for host-network LLDPq, or to a protected host address
+reachable only by the LLDPq bridge network and trusted administrators.
 
 Do not start the stack until those bindings and firewall rules are in place:
 
@@ -748,6 +764,8 @@ sudo docker compose \
   -f "$HOME/lldpq-telemetry/docker-compose.yaml" \
   down -v
 ```
+
+
 
 ## Removing LLDPq completely
 
@@ -883,6 +901,8 @@ sudo docker exec -it lldpq bash               # Shell as root
 sudo docker restart lldpq                     # Restart (keeps data + SSH keys)
 sudo docker ps -a --filter name=lldpq          # Container status
 ```
+
+
 
 ### Built-in tools
 
