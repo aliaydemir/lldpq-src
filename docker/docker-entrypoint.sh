@@ -11,7 +11,7 @@ SETUP_SAFETY_HELPER=/usr/local/libexec/lldpq-setup-safety.py
 
 echo "╔══════════════════════════════════════╗"
 echo "║      LLDPq Network Monitoring        ║"
-echo "║      Docker Container v$(cat /var/www/html/VERSION 2>/dev/null || echo '?')        ║"
+echo "║      Docker Container v$(cat /var/www/html/VERSION 2>/dev/null || echo '?')         ║"
 echo "╚══════════════════════════════════════╝"
 
 # ─── VRF Setup (Cumulus switch only) ───
