@@ -7,6 +7,7 @@ set -e
 
 BACKUP_IMPORT_HELPER=/usr/local/libexec/lldpq-backup-import.py
 INSTALL_LIBRARY=/usr/local/libexec/lldpq-install-library.sh
+SETUP_SAFETY_HELPER=/usr/local/libexec/lldpq-setup-safety.py
 
 echo "╔══════════════════════════════════════╗"
 echo "║      LLDPq Network Monitoring        ║"
@@ -136,11 +137,56 @@ for path in sys.argv[1:]:
 PYTHON
 }
 
+# Prepare config-write recovery authority early.  Recovery runs after the core
+# runtime identity is loaded, but before application-config seeding/consumers.
+# Normalize this mounted state once; later broad permission repair skips it.
+PROVISION_STATE_DIR="${LLDPQ_PROVISION_STATE_DIR:-/var/lib/lldpq/provision-state}"
+while [ "$PROVISION_STATE_DIR" != "/" ] && \
+      [ "${PROVISION_STATE_DIR%/}" != "$PROVISION_STATE_DIR" ]; do
+    PROVISION_STATE_DIR="${PROVISION_STATE_DIR%/}"
+done
+case "$PROVISION_STATE_DIR" in
+    /*) ;;
+    *)
+        echo "ERROR: persistent Provision state path must be absolute" >&2
+        exit 1
+        ;;
+esac
+if [ "$PROVISION_STATE_DIR" = "/" ] || [ "$PROVISION_STATE_DIR" = "/var/lib/lldpq" ]; then
+    echo "ERROR: persistent Provision state path is too broad: $PROVISION_STATE_DIR" >&2
+    exit 1
+fi
+export LLDPQ_PROVISION_STATE_DIR="$PROVISION_STATE_DIR"
+if [ -L "$PROVISION_STATE_DIR" ] || \
+   { [ -e "$PROVISION_STATE_DIR" ] && [ ! -d "$PROVISION_STATE_DIR" ]; }; then
+    echo "ERROR: unsafe persistent Provision state path: $PROVISION_STATE_DIR" >&2
+    exit 1
+fi
+mkdir -p "$PROVISION_STATE_DIR"
+chown lldpq:www-data "$PROVISION_STATE_DIR" 2>/dev/null || true
+chmod 2770 "$PROVISION_STATE_DIR" 2>/dev/null || true
+
+CONFIG_WRITE_JOURNAL_DIR="$PROVISION_STATE_DIR/config-write-journals"
+export LLDPQ_DIRECT_WRITE_STATE_DIR="$CONFIG_WRITE_JOURNAL_DIR"
+if [ -L "$CONFIG_WRITE_JOURNAL_DIR" ] || \
+   { [ -e "$CONFIG_WRITE_JOURNAL_DIR" ] && [ ! -d "$CONFIG_WRITE_JOURNAL_DIR" ]; }; then
+    echo "ERROR: unsafe persistent config-write journal path: $CONFIG_WRITE_JOURNAL_DIR" >&2
+    exit 1
+fi
+mkdir -p "$CONFIG_WRITE_JOURNAL_DIR"
+chown lldpq:www-data "$CONFIG_WRITE_JOURNAL_DIR"
+chmod 0700 "$CONFIG_WRITE_JOURNAL_DIR"
+if [ "$(stat -c '%U:%G:%a' -- "$CONFIG_WRITE_JOURNAL_DIR" 2>/dev/null || true)" != \
+     "lldpq:www-data:700" ]; then
+    echo "ERROR: could not secure persistent config-write journal directory" >&2
+    exit 1
+fi
+
 _persist_system_file lldpq.conf /etc/lldpq.conf lldpq:www-data 660
 _persist_system_file dhcpd.conf /etc/dhcp/dhcpd.conf lldpq:www-data 664
 _persist_system_file dhcpd.hosts /etc/dhcp/dhcpd.hosts lldpq:www-data 664
 _persist_system_file isc-dhcp-server /etc/default/isc-dhcp-server lldpq:www-data 664
-_prepare_shared_lock_files /etc/lldpq.conf.lock
+_prepare_shared_lock_files /etc/lldpq.conf.lock /etc/lldpq-users.conf.lock
 
 # A killed Setup restore may have left /etc/lldpq.conf only partly activated.
 # Recover from the persistent, hashed authority before asking lldpq-config to
@@ -171,16 +217,20 @@ fi
 LLDPQ_CONF_REAL=$(readlink -f /etc/lldpq.conf 2>/dev/null || echo /etc/lldpq.conf)
 
 _set_lldpq_conf_value() {
-    local key="$1" value="$2" direct_mount=false
+    local key="$1" value="$2" only_if_missing="${3:-false}" direct_mount=false
     if _is_direct_mount /etc/lldpq.conf; then
         direct_mount=true
     fi
-    # A bind-mounted file cannot be replaced with rename(2) (EBUSY). Update
-    # that inode in place; for the persistent-volume target use a same-folder
-    # fsync + atomic replace while retaining its owner and mode.
-    python3 - "$LLDPQ_CONF_REAL" "$key" "$value" "$direct_mount" <<'PYTHON'
+    # Never truncate a live single-file bind mount.  Docker rejects replacing
+    # that mountpoint with rename(2), and an in-place rewrite has no crash-safe
+    # rollback boundary.  Normal system-config targets are updated under the
+    # shared lock with a same-directory, durably staged atomic replacement.
+    python3 - "$LLDPQ_CONF_REAL" "$key" "$value" "$direct_mount" \
+        "$only_if_missing" /etc/lldpq.conf.lock <<'PYTHON_SET_LLDPQ_CONF'
+import fcntl
 import os
 import pathlib
+import stat
 import tempfile
 import sys
 
@@ -188,37 +238,55 @@ path = pathlib.Path(sys.argv[1])
 key = sys.argv[2]
 value = sys.argv[3]
 direct_mount = sys.argv[4] == "true"
+only_if_missing = sys.argv[5] == "true"
+lock_path = pathlib.Path(sys.argv[6])
 if any(character in value for character in ("\x00", "\n", "\r")):
     raise SystemExit(f"invalid control character in {key}")
 
-original = path.read_text(encoding="utf-8")
-lines = original.splitlines(keepends=True)
-replacement = f"{key}={value}\n"
-output = []
-replaced = False
-for line in lines:
-    if line.startswith(f"{key}="):
-        if not replaced:
-            output.append(replacement)
-            replaced = True
-        continue
-    output.append(line)
-if not replaced:
-    if output and not output[-1].endswith("\n"):
-        output[-1] += "\n"
-    output.append(replacement)
-content = "".join(output)
+lock_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+lock_descriptor = os.open(lock_path, lock_flags)
+temporary = None
+try:
+    lock_metadata = os.fstat(lock_descriptor)
+    if not stat.S_ISREG(lock_metadata.st_mode):
+        raise SystemExit("LLDPq configuration lock is not a regular file")
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
 
-metadata = path.stat()
-if direct_mount:
-    with path.open("r+", encoding="utf-8") as handle:
-        handle.seek(0)
-        handle.write(content)
-        handle.truncate()
-        handle.flush()
-        os.fsync(handle.fileno())
-else:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    replacement = f"{key}={value}\n"
+    output = []
+    replaced = False
+    for line in lines:
+        if line.startswith(f"{key}="):
+            if only_if_missing:
+                output.append(line)
+            elif not replaced:
+                output.append(replacement)
+            replaced = True
+            continue
+        output.append(line)
+    if not replaced:
+        if output and not output[-1].endswith("\n"):
+            output[-1] += "\n"
+        output.append(replacement)
+    content = "".join(output)
+
+    if content == original:
+        raise SystemExit(0)
+    if direct_mount:
+        raise SystemExit(
+            f"ERROR: {path} is a legacy single-file Docker mount and {key} "
+            "requires a change. The live file was not modified. Remove that "
+            "file mount and use the lldpq-system-config directory/named volume "
+            "at /home/lldpq/lldpq/system-config, then restart."
+        )
+
+    metadata = path.stat()
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
@@ -227,13 +295,88 @@ else:
         os.chmod(temporary, metadata.st_mode & 0o7777)
         os.chown(temporary, metadata.st_uid, metadata.st_gid)
         os.replace(temporary, path)
+        temporary = None
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+        if path.read_text(encoding="utf-8") != content:
+            raise SystemExit("LLDPq configuration readback mismatch")
     except Exception:
+        raise
+finally:
+    if temporary is not None:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
-        raise
-PYTHON
+    os.close(lock_descriptor)
+PYTHON_SET_LLDPQ_CONF
+}
+
+_set_isc_dhcp_interfaces() {
+    local interface="$1" direct_mount=false target
+    target=$(readlink -f /etc/default/isc-dhcp-server 2>/dev/null || \
+        echo /etc/default/isc-dhcp-server)
+    if _is_direct_mount /etc/default/isc-dhcp-server; then
+        direct_mount=true
+    fi
+    python3 - "$target" "$interface" "$direct_mount" <<'PYTHON_SET_ISC_DHCP_DEFAULT'
+import os
+import pathlib
+import stat
+import sys
+import tempfile
+
+path = pathlib.Path(sys.argv[1])
+interface = sys.argv[2]
+direct_mount = sys.argv[3] == "true"
+if not interface or any(character in interface for character in ('\x00', '\n', '\r', '"')):
+    raise SystemExit("invalid DHCP interface value")
+desired = f'INTERFACES="{interface}"\n'.encode("utf-8")
+current = path.read_bytes()
+if current == desired:
+    raise SystemExit(0)
+if direct_mount:
+    raise SystemExit(
+        "ERROR: /etc/default/isc-dhcp-server is a legacy single-file Docker "
+        "mount and requires a change. The live file was not modified. Remove "
+        "that file mount and use the lldpq-system-config directory/named volume "
+        "at /home/lldpq/lldpq/system-config, then restart."
+    )
+
+metadata = path.stat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("ISC DHCP defaults target is not a regular file")
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{path.name}.", dir=path.parent
+)
+try:
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(desired)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, stat.S_IMODE(metadata.st_mode))
+    os.chown(temporary, metadata.st_uid, metadata.st_gid)
+    os.replace(temporary, path)
+    temporary = None
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_descriptor = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    if path.read_bytes() != desired:
+        raise SystemExit("ISC DHCP defaults readback mismatch")
+finally:
+    if temporary is not None:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+PYTHON_SET_ISC_DHCP_DEFAULT
 }
 
 # ─── Ansible Directory Setup ───
@@ -254,7 +397,29 @@ usermod -aG lldpq www-data 2>/dev/null || true
 usermod -aG www-data lldpq 2>/dev/null || true
 chown lldpq:www-data /etc/lldpq.conf
 chmod 660 /etc/lldpq.conf
-_prepare_shared_lock_files /etc/lldpq.conf.lock
+_prepare_shared_lock_files /etc/lldpq.conf.lock /etc/lldpq-users.conf.lock
+
+# Resolve any killed legacy direct-file editor transaction before config
+# seeding, devices parsing, upgrade reconciliation, or cron startup.  The
+# helper owns a fixed target allowlist and takes global -> inventory -> file
+# locks; an unknown/corrupt retained authority stops startup.
+_prepare_shared_lock_files /var/www/html/.inventory.lock
+if [ -L "$SETUP_SAFETY_HELPER" ] || [ ! -f "$SETUP_SAFETY_HELPER" ] || \
+   [ "$(stat -c '%u:%g:%a' -- "$SETUP_SAFETY_HELPER" 2>/dev/null || true)" != "0:0:755" ]; then
+    echo "ERROR: root-owned setup recovery helper is missing or unsafe; rebuild the image" >&2
+    exit 1
+fi
+if ! CONFIG_WRITE_RECOVERY=$(sudo -n -H -u lldpq /usr/bin/python3 \
+    "$SETUP_SAFETY_HELPER" recover-all \
+    --lldpq-dir /home/lldpq/lldpq \
+    --web-root /var/www/html \
+    --inventory-lock /var/www/html/.inventory.lock \
+    --direct-write-state-dir "$CONFIG_WRITE_JOURNAL_DIR" 2>&1); then
+    echo "ERROR: retained config-write journal could not be recovered; startup stopped" >&2
+    echo "$CONFIG_WRITE_RECOVERY" >&2
+    exit 1
+fi
+echo "✓ Persistent config-write recovery checked"
 
 # ─── Single config directory (optional, backward compatible) ───
 # Manage ALL user config from ONE mounted dir (like monitor-results):
@@ -530,10 +695,6 @@ done
 # ─── Cache files (assets.sh, fabric-scan.sh, provision, AI need these writable by lldpq) ───
 # The discovery cache is operational Provision state rather than image content.
 # Keep it in its own named volume while retaining a legacy direct bind mount.
-PROVISION_STATE_DIR="${LLDPQ_PROVISION_STATE_DIR:-/var/lib/lldpq/provision-state}"
-mkdir -p "$PROVISION_STATE_DIR"
-chown lldpq:www-data "$PROVISION_STATE_DIR" 2>/dev/null || true
-chmod 2770 "$PROVISION_STATE_DIR" 2>/dev/null || true
 
 # Persist the operator's DHCP service preference across container recreation.
 # DHCP_AUTOSTART is only a first-run seed: afterwards the Provision API writes
@@ -637,7 +798,15 @@ mkdir -p /var/lib/lldpq/ai
 mkdir -p /var/lib/lldpq/provision-jobs
 mkdir -p /var/lib/lldpq/lldp-jobs
 mkdir -p /var/lib/lldpq/assets-jobs
-chown -R www-data:www-data /var/lib/lldpq
+# Keep the persistent Provision state out of the broad runtime-state chown.
+# In particular, config-write recovery journals must retain their lldpq owner
+# across container recreation.  Do not recursively rewrite unrelated files in
+# the shared Provision volume.
+chown www-data:www-data /var/lib/lldpq
+for runtime_state in /var/lib/lldpq/*; do
+    [ "$runtime_state" = "$PROVISION_STATE_DIR" ] && continue
+    chown -R www-data:www-data "$runtime_state"
+done
 chown lldpq:www-data /var/lib/lldpq/upgrade-jobs
 chown lldpq:www-data /var/lib/lldpq/ai
 chown lldpq:www-data /var/lib/lldpq/provision-jobs
@@ -649,6 +818,7 @@ chmod 2770 /var/lib/lldpq/ai
 chmod 2770 /var/lib/lldpq/provision-jobs
 chmod 2770 /var/lib/lldpq/lldp-jobs
 chmod 2770 /var/lib/lldpq/assets-jobs
+
 _prepare_shared_lock_files /var/lib/lldpq/ssh-key.lock
 
 # A Docker image update replaces application code before the persistent
@@ -785,7 +955,7 @@ chmod 664 /etc/dhcp/dhcpd.hosts
 # Default post-provision settings in lldpq.conf (if not present)
 for key_val in "AUTO_BASE_CONFIG=true" "AUTO_ZTP_DISABLE=true" "AUTO_SET_HOSTNAME=true"; do
     key="${key_val%%=*}"
-    grep -q "^${key}=" /etc/lldpq.conf 2>/dev/null || echo "$key_val" >> /etc/lldpq.conf
+    _set_lldpq_conf_value "$key" "${key_val#*=}" true
 done
 
 _docker_dhcp_is_managed() {
@@ -862,13 +1032,25 @@ _install_docker_dhcp_config() {
         return 1
     fi
 
+    # A single-file bind mount cannot be replaced atomically.  If the exact
+    # generated bytes are already installed this is a no-op; otherwise fail
+    # before a backup, chmod, truncate, or any other live-target mutation.
+    if _is_direct_mount /etc/dhcp/dhcpd.conf; then
+        if cmp -s "$temp_file" /etc/dhcp/dhcpd.conf; then
+            rm -f "$temp_file"
+            return 0
+        fi
+        echo "ERROR: /etc/dhcp/dhcpd.conf is a legacy single-file Docker mount and needs an update." >&2
+        echo "       The live file was not modified. Remove that file mount and use the" >&2
+        echo "       lldpq-system-config directory/named volume at" >&2
+        echo "       /home/lldpq/lldpq/system-config, then restart." >&2
+        rm -f "$temp_file"
+        return 1
+    fi
+
     target_file=$(readlink -f /etc/dhcp/dhcpd.conf 2>/dev/null || echo /etc/dhcp/dhcpd.conf)
     if [ "$backup_existing" = "true" ] && [ -s /etc/dhcp/dhcpd.conf ]; then
-        if _is_direct_mount /etc/dhcp/dhcpd.conf; then
-            backup_file="$SYSTEM_CONFIG_DIR/dhcpd.conf.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
-        else
-            backup_file="$(dirname "$target_file")/dhcpd.conf.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
-        fi
+        backup_file="$(dirname "$target_file")/dhcpd.conf.pre-lldpq-$(date +%Y%m%d-%H%M%S)-$$.bak"
         cp -p /etc/dhcp/dhcpd.conf "$backup_file" || {
             echo "ERROR: existing Docker DHCP config could not be backed up" >&2
             rm -f "$temp_file"
@@ -877,16 +1059,14 @@ _install_docker_dhcp_config() {
         echo "  Existing DHCP config backed up to: $backup_file"
     fi
 
-    if _is_direct_mount /etc/dhcp/dhcpd.conf; then
-        cp "$temp_file" /etc/dhcp/dhcpd.conf || { rm -f "$temp_file"; return 1; }
-    else
-        mkdir -p "$(dirname "$target_file")"
-        staged_file=$(mktemp "$(dirname "$target_file")/.dhcpd.conf.new.XXXXXXXX")
-        cp "$temp_file" "$staged_file"
-        chown lldpq:www-data "$staged_file"
-        chmod 664 "$staged_file"
-        mv -f "$staged_file" "$target_file"
-    fi
+    mkdir -p "$(dirname "$target_file")"
+    staged_file=$(mktemp "$(dirname "$target_file")/.dhcpd.conf.new.XXXXXXXX")
+    cp "$temp_file" "$staged_file"
+    chown lldpq:www-data "$staged_file"
+    chmod 664 "$staged_file"
+    sync -f "$staged_file"
+    mv -f "$staged_file" "$target_file"
+    sync -f "$(dirname "$target_file")"
     chown lldpq:www-data /etc/dhcp/dhcpd.conf 2>/dev/null || true
     chmod 664 /etc/dhcp/dhcpd.conf
     rm -f "$temp_file"
@@ -1235,9 +1415,7 @@ _configure_dhcp_runtime() {
             fi
             export DHCP_AUTOSTART
             _write_dhcp_runtime_state true host "$interface" "$server_ip"
-            printf 'INTERFACES="%s"\n' "$interface" > /etc/default/isc-dhcp-server
-            chown lldpq:www-data /etc/default/isc-dhcp-server 2>/dev/null || true
-            chmod 664 /etc/default/isc-dhcp-server
+            _set_isc_dhcp_interfaces "$interface"
             echo "✓ Docker DHCP host mode: $server_ip on $interface"
             ;;
         *)
@@ -1469,7 +1647,7 @@ fi
 # Write a legacy default only outside explicit provisioning mode. The runtime
 # guard still blocks any actual bridge-mode start.
 if [ "$LLDPQ_DHCP_MODE" != "host" ] && ! grep -q '^INTERFACES=' /etc/default/isc-dhcp-server 2>/dev/null; then
-    echo 'INTERFACES="eth0"' > /etc/default/isc-dhcp-server
+    _set_isc_dhcp_interfaces eth0
 fi
 
 # ZTP script in web root (writable by lldpq)

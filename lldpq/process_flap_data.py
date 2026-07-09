@@ -79,13 +79,14 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     ]
 
     expected_current_hosts = set()
+    collected_hosts = {
+        filename.removesuffix("_carrier_transitions.txt")
+        for filename in current_files
+    }
+    missing_hosts = []
     if snapshot_valid:
         expected_current_hosts = {
             host for host, status in statuses.items() if status == "OK"
-        }
-        collected_hosts = {
-            filename.removesuffix("_carrier_transitions.txt")
-            for filename in current_files
         }
         missing_hosts = sorted(expected_current_hosts - collected_hosts)
         if missing_hosts:
@@ -93,15 +94,16 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                 "Missing current carrier transition collections for: "
                 + ", ".join(missing_hosts)
             )
-            return False
 
     all_devices_unavailable = snapshot_valid and not expected_current_hosts
     if not current_files and not all_devices_unavailable:
         print("No current carrier transition collections found")
-        return False
+        print("Publishing flap report with unavailable device coverage")
     
     processed_devices = 0
     processing_errors = 0
+    category_failed_hosts = set()
+    processed_hosts = set()
     for filename in current_files:
         hostname = filename.removesuffix("_carrier_transitions.txt")
         filepath = os.path.join(data_dir, filename)
@@ -123,8 +125,12 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
         for line in content.splitlines():
             if not line or line.startswith("==="):
                 continue
-            if "__LLDPQ_COLLECTION_ERROR__:" in line:
+            if line == "__LLDPQ_COLLECTION_ERROR__:LINK_INVENTORY":
                 print(f"Device collection error in {filename}: {line}")
+                category_failed_hosts.add(hostname)
+                continue
+            if "__LLDPQ_COLLECTION_ERROR__:" in line:
+                print(f"Unknown device collection error in {filename}: {line}")
                 processing_errors += 1
                 continue
             if ":" not in line:
@@ -149,19 +155,22 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
             )
             processed_interfaces += 1
         if processed_interfaces == 0:
-            print(f"No carrier transition rows found for current host {hostname}")
-            processing_errors += 1
+            if hostname not in category_failed_hosts:
+                print(f"No carrier transition rows found for current host {hostname}")
+                processing_errors += 1
         else:
             processed_devices += 1
+            processed_hosts.add(hostname)
 
-    if (processed_devices == 0 and not all_devices_unavailable) or processing_errors:
+    if processing_errors:
         print("Carrier transition collection was incomplete; preserving the prior report")
         return False
+    if (processed_devices == 0 and not all_devices_unavailable
+            and not category_failed_hosts and not missing_hosts):
+        print("No usable carrier transition data was collected")
+        return False
 
-    current_hosts = {
-        filename.removesuffix("_carrier_transitions.txt")
-        for filename in current_files
-    }
+    current_hosts = processed_hosts - category_failed_hosts
     expected_hosts = set(statuses) if snapshot_valid else current_hosts
     flap_analyzer.set_collection_coverage(expected_hosts, current_hosts)
     
@@ -211,8 +220,11 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     total_problematic = len(summary['critical_ports']) + len(summary['warning_ports'])
     stability_ratio = ((summary['total_ports'] - total_problematic) / summary['total_ports'] * 100) if summary['total_ports'] > 0 else 0
     
+    coverage_unavailable = bool(expected_hosts and not current_hosts)
     if all_devices_unavailable:
         print("\nNetwork Stability: UNAVAILABLE (no reachable devices)")
+    elif coverage_unavailable:
+        print("\nNetwork Stability: UNAVAILABLE (carrier collection incomplete)")
     elif stability_ratio >= 95:
         print(f"\nNetwork Stability: EXCELLENT ({stability_ratio:.1f}%)")
     elif stability_ratio >= 85:

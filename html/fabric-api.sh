@@ -5,6 +5,8 @@
 # Auth guard. Most actions are admin-only; a few read-only ones (used by sidebar
 # and operator-visible pages) are open to any authenticated user.
 source "$(dirname "$0")/auth-guard.sh"
+LLDPQ_CONFIG_WRITE_HELPER="${LLDPQ_CONFIG_WRITE_HELPER:-$(dirname "$0")/lldpq_config_write.py}"
+export LLDPQ_CONFIG_WRITE_HELPER
 _FABRIC_ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 case "$_FABRIC_ACTION" in
     ansible-status|list-devices)
@@ -5948,9 +5950,24 @@ PYTHON_ACTIVE_DEVICES
         export POST_DATA
         
         python3 << 'PYTHON_SAVE_TELEM'
+import importlib.util
+import ipaddress
 import json
 import os
-import subprocess
+
+
+def load_config_writer():
+    helper = os.environ.get(
+        'LLDPQ_CONFIG_WRITE_HELPER', '/var/www/html/lldpq_config_write.py'
+    )
+    if not os.path.isfile(helper):
+        raise RuntimeError('configuration write helper is not installed')
+    spec = importlib.util.spec_from_file_location('lldpq_config_write', helper)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('configuration write helper cannot be loaded')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.update_lldpq_config
 
 try:
     data = json.loads(os.environ.get('POST_DATA', '{}'))
@@ -5976,42 +5993,15 @@ if not collector_vrf.replace('-', '').replace('_', '').isalnum():
     print(json.dumps({'success': False, 'error': 'Invalid collector VRF'}))
     exit()
 
-# Update /etc/lldpq.conf with sudo
-config_updates = [
-    f"TELEMETRY_COLLECTOR_IP={collector_ip}",
-    f"TELEMETRY_COLLECTOR_PORT={collector_port}",
-    f"TELEMETRY_COLLECTOR_VRF={collector_vrf}"
-]
+# Merge into the latest generation only after taking the shared config lock.
+config_updates = {
+    'TELEMETRY_COLLECTOR_IP': collector_ip,
+    'TELEMETRY_COLLECTOR_PORT': collector_port,
+    'TELEMETRY_COLLECTOR_VRF': collector_vrf,
+}
 
 try:
-    # Read current config
-    config_lines = []
-    if os.path.exists('/etc/lldpq.conf'):
-        with open('/etc/lldpq.conf', 'r') as f:
-            config_lines = f.readlines()
-    
-    # Update or add each config key
-    for update in config_updates:
-        key = update.split('=')[0]
-        # Remove existing key
-        config_lines = [l for l in config_lines if not l.strip().startswith(f'{key}=')]
-        # Add new value
-        config_lines.append(update + '\n')
-    
-    # Write back with the same lock file used by other config writers.
-    content = ''.join(config_lines)
-    lock_fd = open('/etc/lldpq.conf.lock', 'w')
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    try:
-        try:
-            with open('/etc/lldpq.conf', 'w') as f:
-                f.write(content)
-        except PermissionError:
-            subprocess.run(['sudo', '-n', 'tee', '/etc/lldpq.conf'], input=content, capture_output=True, text=True, timeout=5, check=True)
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        lock_fd.close()
-    
+    load_config_writer()(config_updates, quote_values=True)
     print(json.dumps({'success': True}))
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}))
@@ -6158,19 +6148,40 @@ PYTHON_STOP_STACK
     remove-telemetry-stack)
         # Remove Docker telemetry stack (down -v: containers + volumes) + mark disabled
         python3 << 'PYTHON_REMOVE_STACK'
-import json, os, subprocess
+import importlib.util
+import json
+import os
+import subprocess
+
+
+def load_config_helper():
+    helper = os.environ.get(
+        'LLDPQ_CONFIG_WRITE_HELPER', '/var/www/html/lldpq_config_write.py'
+    )
+    if not os.path.isfile(helper):
+        raise RuntimeError('configuration write helper is not installed')
+    spec = importlib.util.spec_from_file_location('lldpq_config_write', helper)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('configuration write helper cannot be loaded')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.read_lldpq_config, module.update_lldpq_config
 
 conf_lines = []
 lldpq_dir = None
 try:
-    with open('/etc/lldpq.conf', 'r') as f:
-        conf_lines = f.readlines()
+    read_config, update_config = load_config_helper()
+    conf_lines = read_config()['content'].splitlines(keepends=True)
     for line in conf_lines:
         if line.startswith('LLDPQ_DIR='):
             lldpq_dir = line.strip().split('=', 1)[1].strip('"\'')
             break
-except Exception:
-    pass
+except Exception as exc:
+    print(json.dumps({
+        'success': False,
+        'error': f'Cannot safely read LLDPq configuration: {exc}',
+    }))
+    exit()
 
 if not lldpq_dir:
     print(json.dumps({'success': False, 'error': 'LLDPQ_DIR not configured'}))
@@ -6198,25 +6209,28 @@ if os.path.exists(f"{telemetry_dir}/docker-compose.yaml"):
 else:
     last_error = 'Telemetry stack files not found'
 
-# Best-effort: mark telemetry disabled in lldpq.conf
+# Mark telemetry disabled with the same lock/atomic writer as every other web
+# config update.  A legacy direct-file mount is rejected without touching it.
+config_warning = ''
 try:
-    out, seen = [], False
-    for line in conf_lines:
-        if line.startswith('TELEMETRY_ENABLED='):
-            out.append('TELEMETRY_ENABLED=false\n'); seen = True
-        else:
-            out.append(line)
-    if not seen:
-        out.append('TELEMETRY_ENABLED=false\n')
-    with open('/etc/lldpq.conf', 'w') as f:
-        f.writelines(out)
-except Exception:
-    pass
+    update_config({'TELEMETRY_ENABLED': 'false'}, quote_values=True)
+except Exception as exc:
+    config_warning = f'Telemetry stack state changed, but config was not changed: {exc}'
 
 if removed:
-    print(json.dumps({'success': True, 'message': 'Collector stack removed (containers + stored metrics)'}))
+    response = {
+        'success': True,
+        'message': 'Collector stack removed (containers + stored metrics)',
+        'config_saved': not bool(config_warning),
+    }
+    if config_warning:
+        response['warning'] = config_warning
+    print(json.dumps(response))
 else:
-    print(json.dumps({'success': False, 'error': last_error or 'Could not remove stack'}))
+    response = {'success': False, 'error': last_error or 'Could not remove stack'}
+    if config_warning:
+        response['warning'] = config_warning
+    print(json.dumps(response))
 PYTHON_REMOVE_STACK
         exit 0
         ;;
@@ -7668,6 +7682,8 @@ PYTHON_END
         WEB_ROOT="${WEB_ROOT:-/var/www/html}"
         LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
         LLDPQ_USER="${LLDPQ_USER:-lldpq}"
+        PROVISION_STATE_DIR="${LLDPQ_PROVISION_STATE_DIR:-/var/lib/lldpq/provision-state}"
+        DIRECT_WRITE_STATE_DIR="${LLDPQ_DIRECT_WRITE_STATE_DIR:-$PROVISION_STATE_DIR/config-write-journals}"
         ALIAS_FILE="$WEB_ROOT/display-aliases.json"
         SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
         if [[ ! -f "$SETUP_SAFETY" ]]; then
@@ -7679,6 +7695,7 @@ PYTHON_END
             --target "$ALIAS_FILE"
             --managed-root "$WEB_ROOT"
             --managed-root "$LLDPQ_DIR"
+            --direct-write-state-dir "$DIRECT_WRITE_STATE_DIR"
         )
         ALIAS_RESPONSE=$(printf '%s' "$POST_DATA" | \
             sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c \

@@ -60,7 +60,8 @@ RUN useradd -m -s /bin/bash -G www-data lldpq \
 # Allow www-data to run only the commands needed by CGI workflows.
 RUN echo "www-data ALL=(lldpq) NOPASSWD: /usr/bin/timeout, /usr/bin/ssh, /usr/bin/scp, /usr/bin/mkdir, /usr/bin/rm, /usr/bin/tee, /usr/bin/cat, /usr/bin/ssh-keygen, /usr/bin/bash, /bin/bash" > /etc/sudoers.d/www-data-lldpq \
     && echo "www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start isc-dhcp-server, /usr/bin/systemctl stop isc-dhcp-server, /usr/bin/systemctl restart isc-dhcp-server, /usr/bin/systemctl disable isc-dhcp-server, /usr/bin/systemctl enable isc-dhcp-server, /usr/bin/tee /etc/dhcp/dhcpd.conf, /usr/bin/tee /etc/dhcp/dhcpd.hosts, /usr/bin/tee /etc/default/isc-dhcp-server, /usr/bin/tee /etc/lldpq.conf, /usr/bin/cp, /usr/bin/mkdir, /usr/bin/rm, /usr/bin/mv -fT -- /etc/lldpq.conf.lldpq-root-stage /etc/lldpq.conf, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.conf.lldpq-root-stage /etc/dhcp/dhcpd.conf, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.hosts.lldpq-root-stage /etc/dhcp/dhcpd.hosts, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.host.lldpq-root-stage /etc/dhcp/dhcpd.host, /usr/bin/mv -fT -- /etc/default/isc-dhcp-server.lldpq-root-stage /etc/default/isc-dhcp-server, /usr/bin/sync -f /etc/lldpq.conf.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.conf.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.hosts.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.host.lldpq-root-stage, /usr/bin/sync -f /etc/default/isc-dhcp-server.lldpq-root-stage, /usr/bin/sync -f /etc, /usr/bin/sync -f /etc/dhcp, /usr/bin/sync -f /etc/default, /usr/bin/mv -fT -- /etc/crontab.lldpq-root-stage /etc/crontab, /usr/bin/mv -fT -- /etc/cron.d/lldpq.lldpq-root-stage /etc/cron.d/lldpq, /usr/bin/pkill -x dhcpd, /usr/sbin/dhcpd, /usr/bin/cat /etc/dhcp/dhcpd.conf, /usr/bin/chmod, /usr/bin/chown" > /etc/sudoers.d/www-data-provision \
-    && chmod 440 /etc/sudoers.d/www-data-lldpq /etc/sudoers.d/www-data-provision
+    && echo 'www-data ALL=(root) NOPASSWD: /usr/local/libexec/lldpq-auth-users.py ""' > /etc/sudoers.d/www-data-lldpq-auth \
+    && chmod 440 /etc/sudoers.d/www-data-lldpq /etc/sudoers.d/www-data-provision /etc/sudoers.d/www-data-lldpq-auth
 
 # Create directory structure
 RUN mkdir -p /home/lldpq/lldpq/monitor-results/fabric-tables \
@@ -121,15 +122,23 @@ RUN chown -R lldpq:lldpq /home/lldpq/ \
 # Install the backup/import engine outside the service-user-writable app tree.
 # This COPY deliberately occurs after the recursive /home ownership change.
 RUN install -d -o root -g root -m 0755 /usr/local/libexec \
-    && rm -f /home/lldpq/lldpq/backup_import.py
+    && rm -f /home/lldpq/lldpq/backup_import.py /home/lldpq/lldpq/auth_users.py
 COPY --chown=root:root lldpq/backup_import.py /usr/local/libexec/lldpq-backup-import.py
+COPY --chown=root:root lldpq/auth_users.py /usr/local/libexec/lldpq-auth-users.py
 COPY --chown=root:root install.sh /usr/local/libexec/lldpq-install-library.sh
+COPY --chown=root:root html/setup_safety.py /usr/local/libexec/lldpq-setup-safety.py
 RUN chmod 0755 /usr/local/libexec/lldpq-backup-import.py \
+        /usr/local/libexec/lldpq-auth-users.py \
         /usr/local/libexec/lldpq-install-library.sh \
+        /usr/local/libexec/lldpq-setup-safety.py \
     && test ! -L /usr/local/libexec/lldpq-backup-import.py \
+    && test ! -L /usr/local/libexec/lldpq-auth-users.py \
     && test ! -L /usr/local/libexec/lldpq-install-library.sh \
+    && test ! -L /usr/local/libexec/lldpq-setup-safety.py \
     && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-backup-import.py)" = "0:0:755" \
-    && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-install-library.sh)" = "0:0:755"
+    && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-auth-users.py)" = "0:0:755" \
+    && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-install-library.sh)" = "0:0:755" \
+    && test "$(stat -c '%u:%g:%a' /usr/local/libexec/lldpq-setup-safety.py)" = "0:0:755"
 
 # Setup topology files: real files in web root, symlinks in lldpq dir
 # Same pattern as native install - web UI edits files in /var/www/html/
@@ -166,6 +175,7 @@ RUN printf '%s\n' \
     'SKIP_L1=false' \
     'MONITOR_TIMING=false' \
     'MONITOR_MAX_PARALLEL=100' \
+    'MONITOR_COMMAND_TIMEOUT_SECONDS=20' \
     'PFC_ECN_MAX_PARALLEL=4' \
     'PFC_ECN_COLLECTION_BUDGET_SECONDS=60' \
     'PFC_ECN_PORT_TIMEOUT_SECONDS=5' \

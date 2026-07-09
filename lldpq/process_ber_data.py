@@ -97,9 +97,11 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     data_dir = os.path.abspath(data_dir)
     result_dir = os.path.dirname(data_dir.rstrip(os.sep))
     ber_analyzer = BERAnalyzer(result_dir)
-    # Keep historical/baseline data, but rebuild the current snapshot solely
-    # from this run's successful raw files.
-    ber_analyzer.current_ber_stats = {}
+    # BERAnalyzer intentionally loads persisted history, baseline, and the
+    # prior generation's current snapshot.  History/baseline remain useful,
+    # but current evidence must start empty on every generation so a marker or
+    # missing host can never republish an old port as current.
+    ber_analyzer.current_ber_stats.clear()
     
     print("Processing link error analysis data")
     print(
@@ -126,6 +128,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     total_interfaces_processed = 0
     processing_errors = 0
     hosts_with_interfaces = set()
+    category_failed_hosts = set()
     
     assets_file = os.path.join(os.path.dirname(result_dir), "assets.ini")
     asset_snapshot = read_asset_snapshot(assets_file)
@@ -168,6 +171,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             asset_snapshot,
         )
     ]
+    missing_hosts = []
     if snapshot_valid:
         expected_hosts = {
             host for host, status in statuses.items() if status == "OK"
@@ -179,10 +183,9 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
         missing_hosts = sorted(expected_hosts - collected_hosts)
         if missing_hosts:
             print(
-                "❌ Missing current BER collections for: "
+                "⚠️  Missing current BER collections for: "
                 + ", ".join(missing_hosts)
             )
-            return False
     else:
         expected_hosts = set()
     all_devices_unavailable = snapshot_valid and not expected_hosts
@@ -199,6 +202,18 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 if not content:
                     print(f"⚠️  Empty file: {filename}")
+                    processing_errors += 1
+                    continue
+
+                if content.strip() == "__LLDPQ_COLLECTION_ERROR__:INTERFACE_COUNTERS":
+                    print(
+                        f"⚠️  Interface counter collection unavailable for {hostname}; "
+                        "publishing partial BER coverage"
+                    )
+                    category_failed_hosts.add(hostname)
+                    continue
+                if "__LLDPQ_COLLECTION_ERROR__:" in content:
+                    print(f"❌ Unknown collection marker in {filename}")
                     processing_errors += 1
                     continue
                 
@@ -350,16 +365,16 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 print(f"❌ Error processing {filename}: {e}")
                 processing_errors += 1
     
-    if processed_devices == 0 and not all_devices_unavailable:
+    if (processed_devices == 0 and not all_devices_unavailable
+            and not category_failed_hosts and not missing_hosts):
         print("❌ No BER data files found to process")
         return False
     missing_interface_hosts = sorted(expected_hosts - hosts_with_interfaces)
     if missing_interface_hosts:
         print(
-            "❌ No physical interface counters for current hosts: "
+            "⚠️  No physical interface counters for current hosts: "
             + ", ".join(missing_interface_hosts)
         )
-        return False
     
     # Save baseline data once after all interfaces processed.  History is
     # saved after classification because _analyze_port enriches the current
@@ -367,7 +382,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     if not ber_analyzer.save_baseline_data():
         print("❌ BER baseline state could not be saved")
         return False
-    if total_interfaces_processed == 0 and not all_devices_unavailable:
+    if (total_interfaces_processed == 0 and not all_devices_unavailable
+            and not category_failed_hosts and not missing_hosts):
         print("❌ No physical interface counters were processed")
         return False
 

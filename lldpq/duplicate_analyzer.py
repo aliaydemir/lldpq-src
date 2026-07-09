@@ -182,7 +182,19 @@ class DuplicateAnalyzer:
                 if fdb_ok:
                     self._parse_fdb(ch, fdb_text)
             if "_neigh.txt" in files:
-                self._parse_neigh(ch, self._read(files["_neigh.txt"]))
+                neigh_read_ok, neigh_text = self._read_with_status(
+                    files["_neigh.txt"]
+                )
+                # An empty neighbour table is a valid current zero.  Only the
+                # typed collector marker (or a local read failure) makes this
+                # evidence unavailable.
+                neigh_ok = neigh_read_ok and \
+                    "__LLDPQ_COLLECTION_ERROR__:NEIGH" not in neigh_text
+                self.collection_meta[ch]["sources"]["NEIGH"] = (
+                    "OK" if neigh_ok else "ERROR"
+                )
+                if neigh_ok:
+                    self._parse_neigh(ch, neigh_text)
         self._finalize_coverage()
         self._merge_arp_conflicts()
         self._finalize()
@@ -357,6 +369,15 @@ class DuplicateAnalyzer:
                     failures.append("%s:%s_%s" % (
                         host, source, source_status or "MISSING",
                     ))
+
+            # Neighbour evidence feeds APIPA and IP-to-multiple-MAC context.
+            # Losing it does not invalidate authoritative FRR DAD/FDB evidence,
+            # but zero findings for the combined report are necessarily partial.
+            neighbour_status = sources.get("NEIGH")
+            if neighbour_status != "OK":
+                failures.append("%s:NEIGH_%s" % (
+                    host, neighbour_status or "MISSING",
+                ))
 
             if ip_ok:
                 current.add(host)

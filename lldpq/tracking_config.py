@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import grp
 import hashlib
@@ -459,6 +460,29 @@ def _resolve_tracking_write_target(path: Path) -> Path:
     return resolved
 
 
+def _is_exact_mountpoint(
+    path: Path, mountinfo_path: str = "/proc/self/mountinfo"
+) -> bool:
+    """Return True only when *path itself* is a Linux mount point."""
+    expected = os.path.normpath(os.path.abspath(path))
+    try:
+        with open(mountinfo_path, encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.split(" - ", 1)[0].split()
+                if len(fields) < 5:
+                    continue
+                mountpoint = re.sub(
+                    r"\\([0-7]{3})",
+                    lambda match: chr(int(match.group(1), 8)),
+                    fields[4],
+                )
+                if os.path.normpath(mountpoint) == expected:
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _atomic_write(
     path: Path, content: str, *, file_group: Optional[str] = None
 ) -> None:
@@ -490,7 +514,17 @@ def _atomic_write(
                 raise TrackingConfigError(
                     f"Could not set tracking.yaml group to {file_group}: {exc}"
                 ) from exc
-        os.replace(temporary, path)
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            if exc.errno == errno.EBUSY and _is_exact_mountpoint(path):
+                raise TrackingConfigError(
+                    "tracking.yaml is a legacy direct-file Docker mount and "
+                    "cannot be replaced safely. Migrate it to the persistent "
+                    "configuration directory or lldpq-app-config named volume, "
+                    "then retry."
+                ) from exc
+            raise
         temporary = None
         directory_fd = os.open(
             str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)

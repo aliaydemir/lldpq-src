@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused regression tests for switch-level lifecycle tracking."""
 
+import errno
 import grp
 import io
 import json
@@ -19,6 +20,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import backup_import
+import tracking_config
 from tracking_config import (
     TrackingConfigError,
     TrackingConflictError,
@@ -375,6 +377,99 @@ switches:
             TrackingConfigError, "not the managed Docker config target"
         ):
             self.save(initial["revision"], ["LEAF-01"])
+
+    def test_exact_direct_mount_ebusy_fails_with_migration_guidance(self):
+        self.tracking.write_text(
+            "version: 1\ndefault_state: commissioning\nswitches: {}\n",
+            encoding="utf-8",
+        )
+        original = self.tracking.read_bytes()
+        initial = self.payload()
+
+        with (
+            mock.patch.object(
+                tracking_config.os,
+                "replace",
+                side_effect=OSError(errno.EBUSY, "Device or resource busy"),
+            ),
+            mock.patch.object(
+                tracking_config, "_is_exact_mountpoint", return_value=True
+            ) as is_mountpoint,
+        ):
+            with self.assertRaisesRegex(
+                TrackingConfigError,
+                "legacy direct-file Docker mount.*lldpq-app-config",
+            ):
+                self.save(initial["revision"], ["LEAF-01"])
+
+        is_mountpoint.assert_called_once_with(
+            Path(os.path.realpath(self.tracking))
+        )
+        self.assertEqual(self.tracking.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".tracking.yaml.*.tmp")), [])
+
+    def test_non_mount_ebusy_remains_generic_and_target_is_unchanged(self):
+        self.tracking.write_text(
+            "version: 1\ndefault_state: commissioning\nswitches: {}\n",
+            encoding="utf-8",
+        )
+        original = self.tracking.read_bytes()
+        initial = self.payload()
+
+        with (
+            mock.patch.object(
+                tracking_config.os,
+                "replace",
+                side_effect=OSError(errno.EBUSY, "Device or resource busy"),
+            ),
+            mock.patch.object(
+                tracking_config, "_is_exact_mountpoint", return_value=False
+            ) as is_mountpoint,
+        ):
+            with self.assertRaisesRegex(
+                TrackingConfigError, "Could not write tracking.yaml"
+            ):
+                self.save(initial["revision"], ["LEAF-01"])
+
+        is_mountpoint.assert_called_once_with(
+            Path(os.path.realpath(self.tracking))
+        )
+        self.assertEqual(self.tracking.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".tracking.yaml.*.tmp")), [])
+
+
+class TrackingMountDetectionTest(unittest.TestCase):
+    def test_mountinfo_requires_the_exact_file_mountpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "mounted config" / "tracking.yaml"
+            encoded = str(target).replace("\\", "\\134").replace(" ", "\\040")
+            mountinfo = root / "mountinfo"
+            mountinfo.write_text(
+                f"41 25 0:42 / {encoded} rw,relatime - ext4 /dev/sda rw\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(
+                tracking_config._is_exact_mountpoint(target, str(mountinfo))
+            )
+            self.assertFalse(
+                tracking_config._is_exact_mountpoint(target.parent, str(mountinfo))
+            )
+            self.assertFalse(
+                tracking_config._is_exact_mountpoint(
+                    target.with_name("other.yaml"), str(mountinfo)
+                )
+            )
+
+    def test_missing_mountinfo_is_not_treated_as_a_mount(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.assertFalse(
+                tracking_config._is_exact_mountpoint(
+                    root / "tracking.yaml", str(root / "missing-mountinfo")
+                )
+            )
 
 
 class DockerRecoveryStartupTest(unittest.TestCase):

@@ -23,6 +23,13 @@ NO_TRANSCEIVER_DATA_RE = re.compile(
     r'\bno\s+(?:transceiver|module)\s+data(?:\s+available)?\b',
     re.IGNORECASE,
 )
+OPTICAL_COLLECTION_ERROR_RE = re.compile(
+    r'^__LLDPQ_COLLECTION_ERROR__:'
+    r'(?P<reason>OPTICAL_LINK_INVENTORY|OPTICAL_BUDGET|OPTICAL_TIMEOUT|'
+    r'OPTICAL_TOOL_UNAVAILABLE)'
+    r'(?::(?P<interface>[A-Za-z0-9_.:-]+))?$',
+    re.MULTILINE,
+)
 
 
 def record_optical_state(analyzer, port_name, hostname, health_status,
@@ -42,38 +49,65 @@ def record_optical_state(analyzer, port_name, hostname, health_status,
         'raw_data': raw_data[:500],
     }
 
-def parse_optical_diagnostics_file(filepath):
-    """Parse optical diagnostics file"""
+def parse_optical_collection_errors(content):
+    """Return validated category-local optical collection failures."""
+    failures = []
+    for match in OPTICAL_COLLECTION_ERROR_RE.finditer(content):
+        reason = match.group('reason')
+        interface = match.group('interface')
+        if reason == 'OPTICAL_LINK_INVENTORY':
+            if interface is not None:
+                continue
+        elif interface is None:
+            continue
+        failures.append((reason, interface))
+    return failures
+
+
+def _parse_optical_diagnostics_content(content):
     port_data = {}
-
-    try:
-        with open(filepath, "r") as f:
-            content = f.read()
-
-        # Split by interface sections
-        sections = content.split("--- Interface:")
-        
-        for section in sections[1:]:  # Skip first empty section
-            lines = section.strip().split('\n')
-            if not lines:
-                continue
-
-            # Extract interface name from first line
-            interface_line = lines[0].strip()
-            interface_match = re.match(r'(\w+)', interface_line)
-            if not interface_match:
-                continue
-
-            interface = interface_match.group(1)
-
-            # Combine all data for this interface
-            interface_data = '\n'.join(lines[1:])
-            port_data[interface] = interface_data
-
-    except Exception as e:
-        print(f"Error parsing {filepath}: {e}")
-
+    sections = content.split("--- Interface:")
+    for section in sections[1:]:  # Skip the collection preamble.
+        lines = section.strip().split('\n')
+        if not lines:
+            continue
+        interface_match = re.match(r'(\w+)', lines[0].strip())
+        if not interface_match:
+            continue
+        port_data[interface_match.group(1)] = '\n'.join(lines[1:])
     return port_data
+
+
+def read_optical_diagnostics_file(filepath):
+    """Read one optical file once and return ports plus collection failures."""
+    try:
+        with open(filepath, "r") as stream:
+            content = stream.read()
+    except Exception as exc:
+        print(f"Error parsing {filepath}: {exc}")
+        return {}, []
+    return (
+        _parse_optical_diagnostics_content(content),
+        parse_optical_collection_errors(content),
+    )
+
+
+def parse_optical_diagnostics_file(filepath):
+    """Parse optical diagnostics file, retaining the legacy dict return type."""
+    port_data, _failures = read_optical_diagnostics_file(filepath)
+    return port_data
+
+
+def describe_optical_collection_failure(reason, interface=None):
+    if reason == 'OPTICAL_LINK_INVENTORY':
+        return 'Physical interface inventory was unavailable'
+    if reason == 'OPTICAL_BUDGET':
+        return f'Optical collection budget was exhausted at {interface}'
+    if reason == 'OPTICAL_TIMEOUT':
+        return f'Optical diagnostics timed out for {interface}'
+    if reason == 'OPTICAL_TOOL_UNAVAILABLE':
+        return f'Bounded optical diagnostics are unavailable for {interface}'
+    return 'Optical diagnostics collection was incomplete'
 
 def process_optical_data_files(data_dir="monitor-results/optical-data"):
     """Process optical data files and update optical analyzer"""
@@ -124,31 +158,48 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     collected_hosts = {
         filename.removesuffix("_optical.txt") for filename in files
     }
-    if snapshot_valid and current_expected_hosts - collected_hosts:
+    missing_current_hosts = current_expected_hosts - collected_hosts
+    if snapshot_valid and missing_current_hosts:
         print(
-            "❌ Missing current optical collections for: "
-            + ", ".join(sorted(current_expected_hosts - collected_hosts))
+            "⚠ Missing current optical collections for: "
+            + ", ".join(sorted(missing_current_hosts))
         )
-        return False
     if not files and not all_devices_unavailable:
-        print("❌ No current optical collection files found")
-        optical_analyzer.save_optical_history()
-        return False
+        print("⚠ No current optical collection files found; publishing partial coverage")
 
     # Process all optical diagnostic files
     total_processed = 0
+    failed_collection_hosts = set()
+    collection_failures = {}
     for filename in files:
         if filename.endswith("_optical.txt"):
             hostname = filename.replace("_optical.txt", "")
             filepath = os.path.join(data_dir, filename)
 
 
-            # Parse optical diagnostics file
-            port_data = parse_optical_diagnostics_file(filepath)
+            # Category-local collector failures remain in this file so the
+            # optical report can expose incomplete coverage without invalidating
+            # BGP, BER, PFC, hardware, logs, or other complete categories.
+            port_data, file_failures = read_optical_diagnostics_file(filepath)
+            failed_interfaces = {
+                interface for _reason, interface in file_failures if interface
+            }
+            if file_failures:
+                failed_collection_hosts.add(hostname)
+                collection_failures[hostname] = [
+                    describe_optical_collection_failure(reason, interface)
+                    for reason, interface in file_failures
+                ]
             total_processed += 1
 
             for interface, optical_data in port_data.items():
                 port_name = f"{hostname}:{interface}"
+
+                if interface in failed_interfaces:
+                    record_optical_state(
+                        optical_analyzer, port_name, hostname, 'unknown', optical_data
+                    )
+                    continue
 
                 # Skip non-optical interfaces (management, virtual interfaces)
                 if any(skip_iface in interface.lower() for skip_iface in ['eth0', 'lo', 'bond', 'mgmt', 'vlan']):
@@ -249,6 +300,16 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                 else:
                     pass  # No optical parameters detected
 
+            # A well-formed timeout marker normally sits inside its interface
+            # block.  Retain visibility even if a future collector emits the
+            # marker without that block.
+            for reason, interface in file_failures:
+                if interface and interface not in port_data:
+                    record_optical_state(
+                        optical_analyzer, f"{hostname}:{interface}", hostname,
+                        'unknown', describe_optical_collection_failure(reason, interface),
+                    )
+
     print(f"\nProcessed {total_processed} files total")
 
     # Save updated optical history
@@ -258,8 +319,25 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     # Generate web report
     output_file = os.path.join(result_dir, "optical-analysis.html")
     if snapshot_valid:
+        successful_hosts = collected_hosts - failed_collection_hosts
+        coverage_missing_hosts = inventory_hosts - successful_hosts
+        for hostname in coverage_missing_hosts:
+            if hostname not in collection_failures:
+                if hostname in missing_current_hosts:
+                    collection_failures[hostname] = [
+                        'No current optical collection was published'
+                    ]
+                else:
+                    collection_failures[hostname] = [
+                        f'Device collection status is {statuses.get(hostname, "unavailable")}'
+                    ]
         optical_analyzer.coverage_expected_hosts = len(inventory_hosts)
-        optical_analyzer.coverage_current_hosts = len(collected_hosts)
+        optical_analyzer.coverage_current_hosts = len(successful_hosts)
+        optical_analyzer.coverage_missing_hosts = sorted(coverage_missing_hosts)
+        optical_analyzer.coverage_failures = collection_failures
+    elif collection_failures:
+        optical_analyzer.coverage_missing_hosts = sorted(collection_failures)
+        optical_analyzer.coverage_failures = collection_failures
     optical_analyzer.export_optical_data_for_web(output_file)
     if all_devices_unavailable:
         mark_html_collection_unavailable(output_file)

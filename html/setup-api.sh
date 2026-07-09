@@ -29,6 +29,8 @@ eval "$LLDPQ_CONFIG_ASSIGNMENTS"
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+LLDPQ_PROVISION_STATE_DIR="${LLDPQ_PROVISION_STATE_DIR:-/var/lib/lldpq/provision-state}"
+LLDPQ_DIRECT_WRITE_STATE_DIR="${LLDPQ_DIRECT_WRITE_STATE_DIR:-$LLDPQ_PROVISION_STATE_DIR/config-write-journals}"
 SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 
 # ─── Fast path: raw tarball upload (Setup → Update → Offline). The request body IS the file
@@ -138,7 +140,8 @@ else
 fi
 
 # Export for Python
-export LLDPQ_DIR LLDPQ_USER WEB_ROOT POST_DATA_FILE SETUP_SAFETY
+export LLDPQ_DIR LLDPQ_USER WEB_ROOT LLDPQ_PROVISION_STATE_DIR
+export LLDPQ_DIRECT_WRITE_STATE_DIR POST_DATA_FILE SETUP_SAFETY
 
 python3 << 'PYTHON'
 import json
@@ -186,6 +189,9 @@ def service_atomic_write(command, target, content, *, expected_revision=None, pa
     for root in (os.environ.get('LLDPQ_DIR'), os.environ.get('WEB_ROOT')):
         if root:
             argv.extend(['--managed-root', root])
+    state_dir = os.environ.get('LLDPQ_DIRECT_WRITE_STATE_DIR')
+    if state_dir:
+        argv.extend(['--direct-write-state-dir', state_dir])
     if parser:
         argv.extend(['--parser', parser])
     if expected_revision is not None:
@@ -204,6 +210,29 @@ def service_atomic_write(command, target, content, *, expected_revision=None, pa
         detail = (result.stderr or result.stdout or 'helper returned no result').strip()
         return {'success': False, 'error': 'Atomic write failed: ' + detail[:300]}
     return response
+
+def service_safe_read(target):
+    """Recover a retained direct-mount journal and return one locked snapshot."""
+    argv = [SETUP_SAFETY, 'read-text', '--target', target]
+    for root in (os.environ.get('LLDPQ_DIR'), os.environ.get('WEB_ROOT')):
+        if root:
+            argv.extend(['--managed-root', root])
+    state_dir = os.environ.get('LLDPQ_DIRECT_WRITE_STATE_DIR')
+    if state_dir:
+        argv.extend(['--direct-write-state-dir', state_dir])
+    try:
+        result = subprocess.run(
+            ['sudo', '-n', '-H', '-u', os.environ.get('LLDPQ_USER', 'lldpq'),
+             '/usr/bin/bash', '-c', 'exec python3 "$@"', '--'] + argv,
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:
+        return {'success': False, 'error': 'Safe read failed: ' + str(exc)[:300]}
+    try:
+        return json.loads(result.stdout)
+    except Exception:
+        detail = (result.stderr or result.stdout or 'helper returned no result').strip()
+        return {'success': False, 'error': 'Safe read failed: ' + detail[:300]}
 
 def parse_completion_log(content):
     """Return cleaned log and the real exit status recorded by a detached runner."""
@@ -723,7 +752,8 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 # or secrets (AI_API_KEY).
 LLDPQ_PREF_KEYS = (
     'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL', 'SKIP_OPTICAL', 'SKIP_L1',
-    'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'PFC_ECN_MAX_PARALLEL',
+    'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'MONITOR_COMMAND_TIMEOUT_SECONDS',
+    'PFC_ECN_MAX_PARALLEL',
     'PFC_ECN_COLLECTION_BUDGET_SECONDS', 'PFC_ECN_PORT_TIMEOUT_SECONDS',
     'OPTICAL_COLLECTION_BUDGET_SECONDS', 'OPTICAL_PORT_TIMEOUT_SECONDS',
     'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
@@ -1078,8 +1108,18 @@ if action == 'uninstall-status':
 if action == 'get-aliases':
     alias_file = os.path.join(web_root, 'display-aliases.json')
     try:
+        snapshot = service_safe_read(alias_file)
+        if not snapshot.get('success'):
+            raise RuntimeError(snapshot.get('error', 'safe read failed'))
         safety = load_setup_safety()
-        aliases, revision = safety.load_aliases(alias_file)
+        if snapshot.get('exists'):
+            value = safety.parse_json_no_duplicate_keys(
+                snapshot.get('content', ''), 'display-aliases.json'
+            )
+            aliases = safety.normalize_aliases(value)
+        else:
+            aliases = {'interfaces': {}, 'devices': {}}
+        revision = snapshot['revision']
         print(json.dumps({'success': True, 'aliases': aliases, 'revision': revision}))
     except Exception as exc:
         print(json.dumps({'success': False, 'error': 'Cannot load display aliases: ' + str(exc)[:300]}))
@@ -1108,7 +1148,10 @@ if action == 'set-aliases':
     )
     if response.get('success'):
         response['aliases'] = aliases
-        response['message'] = 'Display aliases saved successfully'
+        response['message'] = (
+            'Display aliases saved through a journaled legacy direct-file mount'
+            if response.get('atomic') is False else 'Display aliases saved successfully'
+        )
     print(json.dumps(response))
     sys.exit(0)
 
@@ -1931,14 +1974,18 @@ if action == 'set-schedules':
 if action == 'get-notifications':
     import yaml
     notif_yaml = os.path.join(lldpq_dir, 'notifications.yaml')
-    exists = os.path.exists(notif_yaml)
+    snapshot = service_safe_read(notif_yaml)
+    if not snapshot.get('success'):
+        print(json.dumps({'success': False,
+                          'error': 'Cannot read notifications.yaml: ' +
+                                   str(snapshot.get('error', 'safe read failed'))[:300]}))
+        sys.exit(0)
+    exists = bool(snapshot.get('exists'))
     cfg = {}
-    revision = hashlib.sha256(b'').hexdigest()
+    revision = snapshot['revision']
     if exists:
         try:
-            raw_notifications = open(notif_yaml, 'rb').read()
-            revision = hashlib.sha256(raw_notifications).hexdigest()
-            cfg = yaml.safe_load(raw_notifications.decode('utf-8')) or {}
+            cfg = yaml.safe_load(snapshot.get('content', '')) or {}
         except Exception as e:
             print(json.dumps({'success': False, 'error': 'Cannot parse notifications.yaml: ' + str(e)}))
             sys.exit(0)
@@ -2017,8 +2064,12 @@ if action == 'test-alert':
     if not webhook:
         try:
             import yaml
-            with open(os.path.join(lldpq_dir, 'notifications.yaml')) as f:
-                c = yaml.safe_load(f) or {}
+            notification_snapshot = service_safe_read(
+                os.path.join(lldpq_dir, 'notifications.yaml')
+            )
+            if not notification_snapshot.get('success'):
+                raise RuntimeError(notification_snapshot.get('error', 'safe read failed'))
+            c = yaml.safe_load(notification_snapshot.get('content', '')) or {}
             webhook = (((c.get('notifications') or {}).get('slack') or {}).get('webhook') or '').strip()
         except Exception:
             pass

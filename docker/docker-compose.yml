@@ -33,13 +33,16 @@ services:
 
       # Runtime settings + DHCP configuration persist here without mounting
       # over /etc itself. The entrypoint seeds this volume and keeps the normal
-      # application paths as symlinks, so existing direct file mounts continue
-      # to work as a backward-compatible alternative.
+      # application paths as symlinks. Legacy direct-file mounts remain readable
+      # for migration, but changing writes require this directory volume.
       - lldpq-system-config:/home/lldpq/lldpq/system-config
       - lldpq-ssh:/home/lldpq/.ssh
       - lldpq-ansible:/home/lldpq/ansible
 
-      # Legacy alternative: override baked-in files individually
+      # Legacy migration compatibility. Setup can journal writes to the first
+      # three files because lldpq-provision-state is mounted below. Changing
+      # lldpq.conf or DHCP through the application requires the named
+      # lldpq-system-config volume and fails safely while individually mounted.
       # - ./devices.yaml:/home/lldpq/lldpq/devices.yaml
       # - ./topology.dot:/var/www/html/topology.dot
       # - ./topology_config.yaml:/var/www/html/topology_config.yaml
@@ -89,7 +92,7 @@ volumes:
   lldpq-upgrade-jobs: # Provision multi-device upgrade lifecycle state
   lldpq-ai-state: # Private Ask-AI memory, analysis and change snapshots
   lldpq-provision-jobs: # Provision discovery/post-provision job lifecycle state
-  lldpq-provision-state: # Provision discovery cache, DHCP preference and scheduler state
+  lldpq-provision-state: # Provision state + direct-file editor recovery journals
   lldpq-dhcp-state: # DHCP lease database
   lldpq-configs:   # Device configurations
   lldpq-hstr:      # Historical data

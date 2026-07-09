@@ -172,6 +172,40 @@ DHCP_DESIRED_STATE_FILE = os.environ.get(
 )
 LLDPQ_CONF_FILE = os.environ.get('LLDPQ_CONF_FILE', '/etc/lldpq.conf')
 
+
+def _mountinfo_path(value):
+    """Decode one mountpoint field from Linux /proc/self/mountinfo."""
+    for escaped, plain in (
+        ('\\040', ' '), ('\\011', '\t'), ('\\012', '\n'), ('\\134', '\\')
+    ):
+        value = value.replace(escaped, plain)
+    return os.path.normpath(value)
+
+
+def is_direct_file_mount(path):
+    """True only when the resolved file itself, not its directory, is mounted."""
+    resolved = os.path.normpath(os.path.abspath(os.path.realpath(path)))
+    try:
+        metadata = os.stat(resolved, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            return False
+        with open('/proc/self/mountinfo', 'r', encoding='utf-8') as mountinfo:
+            for line in mountinfo:
+                fields = line.split(' - ', 1)[0].split()
+                if len(fields) >= 5 and _mountinfo_path(fields[4]) == resolved:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def direct_file_mount_error(path):
+    return OSError(
+        'Provision cannot transactionally replace the legacy direct-file mount '
+        f'{path}. Preserve the current file, remove its individual bind mount, '
+        'and mount /home/lldpq/lldpq/config as a directory or named volume.'
+    )
+
 def _read_text_with_privileged_fallback(path, missing_ok=False):
     try:
         with open(path, 'r', encoding='utf-8') as handle:
@@ -380,6 +414,22 @@ def atomic_write_text(path, content, mode=0o664):
             raise OSError(f'Could not resolve LLDPq config ownership: {exc}') from exc
     directory = os.path.dirname(path) or '.'
     encoded = content.encode('utf-8')
+
+    # A file bind mount is itself a mountpoint, so rename(2) cannot replace it.
+    # Provision may update several inventory/DHCP files in one durable
+    # transaction; discovering EBUSY after an earlier target was activated can
+    # also make rollback hit EBUSY.  Reject a changing legacy target before the
+    # first pathname mutation.  Setup's validated editor owns the explicitly
+    # journaled compatibility path for service-owned app configuration.
+    if is_direct_file_mount(normalized_path):
+        try:
+            current = _read_text_with_privileged_fallback(normalized_path)
+        except OSError:
+            current = None
+        if current == content:
+            return
+        raise direct_file_mount_error(logical_path)
+
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path),
@@ -675,6 +725,23 @@ def begin_provision_transaction(kind, candidates, service_before, service_after)
         raise RuntimeError(
             'A previous Provision transaction requires recovery before saving'
         )
+
+    # Preflight every candidate before publishing the transaction authority or
+    # changing the first target.  A legacy single-file Docker bind mount cannot
+    # participate in rename-based atomic activation/rollback.  Unchanged
+    # direct-mounted members are harmless no-ops; changing ones must migrate to
+    # the documented config-directory volume first.
+    for candidate_path, candidate_content, _candidate_mode in candidates:
+        resolved_candidate = os.path.abspath(candidate_path)
+        if os.path.islink(resolved_candidate):
+            resolved_candidate = os.path.realpath(resolved_candidate)
+        if not is_direct_file_mount(resolved_candidate):
+            continue
+        current = snapshot_file(resolved_candidate)
+        candidate_bytes = candidate_content.encode('utf-8')
+        if not current.get('exists') or current.get('content') != candidate_bytes:
+            raise direct_file_mount_error(candidate_path)
+
     entries = []
     allowed = _transaction_allowed_paths()
     for path, content, mode in candidates:

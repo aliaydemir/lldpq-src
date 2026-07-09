@@ -152,6 +152,9 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
     bgp_analyzer = BGPAnalyzer(result_dir)
     previous_current_stats = copy.deepcopy(bgp_analyzer.current_bgp_stats)
     bgp_analyzer.current_bgp_stats = {}
+    # EVPN summary values are also a current snapshot.  Never carry the prior
+    # generation forward when this run has an EVPN-only command failure.
+    bgp_analyzer.current_evpn_stats = {}
     processed_hosts = set()
     current_bgp_hosts = set()
     assets_file = os.path.join(os.path.dirname(result_dir), "assets.ini")
@@ -279,9 +282,11 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
                 # Parse EVPN data file
                 evpn_data = parse_data_file(filepath)
                 if not evpn_output_is_valid(evpn_data):
-                    raise RuntimeError(
-                        f"invalid current EVPN collection for: {hostname}"
+                    print(
+                        f"EVPN collection unavailable for {hostname}; "
+                        "publishing partial BGP/EVPN coverage"
                     )
+                    continue
                 bgp_analyzer.update_evpn_stats(hostname, evpn_data)
                 evpn_processed_hosts.add(hostname)
 
@@ -291,8 +296,8 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
         }
         missing_bgp_hosts = sorted(expected_bgp_hosts - current_bgp_hosts)
         if missing_bgp_hosts:
-            raise RuntimeError(
-                "missing or invalid current BGP collections for: "
+            print(
+                "Missing or invalid current BGP collections for: "
                 + ", ".join(missing_bgp_hosts)
             )
         expected_evpn_hosts = {
@@ -300,8 +305,8 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
         }
         missing_evpn_hosts = sorted(expected_evpn_hosts - evpn_processed_hosts)
         if missing_evpn_hosts:
-            raise RuntimeError(
-                "missing current EVPN collections for: "
+            print(
+                "Missing or invalid current EVPN collections for: "
                 + ", ".join(missing_evpn_hosts)
             )
 

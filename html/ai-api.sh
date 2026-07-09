@@ -88,6 +88,26 @@ AI_CONTEXT_WINDOW_TOKENS = os.environ.get('AI_CONTEXT_WINDOW_TOKENS', '')
 AI_FALLBACK_CONTEXT_WINDOW_TOKENS = os.environ.get(
     'AI_FALLBACK_CONTEXT_WINDOW_TOKENS', ''
 )
+
+# Configuration writes share one locked, durable implementation with the
+# Fabric API.  Keep the import optional for read-only/chat actions during an
+# interrupted package upgrade; save-config fails closed below when unavailable.
+_config_write_update = None
+_config_write_import_error = ''
+try:
+    _config_write_path = os.path.join(WEB_ROOT, 'lldpq_config_write.py')
+    if not os.path.isfile(_config_write_path):
+        raise ImportError('configuration write helper is not installed')
+    _config_write_spec = importlib.util.spec_from_file_location(
+        'lldpq_config_write', _config_write_path
+    )
+    if _config_write_spec is None or _config_write_spec.loader is None:
+        raise ImportError('configuration write helper cannot be loaded')
+    _config_write_module = importlib.util.module_from_spec(_config_write_spec)
+    _config_write_spec.loader.exec_module(_config_write_module)
+    _config_write_update = _config_write_module.update_lldpq_config
+except Exception as _config_write_error:
+    _config_write_import_error = str(_config_write_error)
 # Web-research model (OpenAI-compatible). URL/key fall back to the main AI endpoint.
 AI_SEARCH_MODEL = os.environ.get('AI_SEARCH_MODEL', '')
 _AI_SEARCH_URL_CONFIG = os.environ.get('AI_SEARCH_URL', '').strip()
@@ -4303,8 +4323,6 @@ def action_save_config():
     if not isinstance(data, dict):
         error_json("Configuration must be an object")
     
-    import shlex
-    import subprocess, fcntl
     conf = os.environ.get('LLDPQ_CONFIG_FILE', '/etc/lldpq.conf')
     
     updates = {}
@@ -4339,37 +4357,17 @@ def action_save_config():
         updates['AI_API_KEY'] = ''
     
     try:
-        lock_fd = open(conf + '.lock', 'w')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        try:
-            with open(conf, 'r') as f:
-                lines = f.readlines()
-            for key, value in updates.items():
-                rendered = shlex.quote(str(value))
-                found = False
-                for i, line in enumerate(lines):
-                    if line.startswith(f'{key}='):
-                        lines[i] = f'{key}={rendered}\n'
-                        found = True
-                        break
-                if not found:
-                    lines.append(f'{key}={rendered}\n')
-            content = ''.join(lines)
-            try:
-                with open(conf, 'w') as f:
-                    f.write(content)
-            except PermissionError:
-                result = subprocess.run(
-                    ['sudo', '-n', 'tee', conf], input=content,
-                    capture_output=True, text=True, timeout=5
-                )
-                if result.returncode != 0:
-                    raise PermissionError(
-                        result.stderr.strip() or 'Cannot write AI configuration'
-                    )
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
+        if _config_write_update is None:
+            raise RuntimeError(
+                _config_write_import_error
+                or 'configuration write helper is unavailable'
+            )
+        _config_write_update(
+            updates,
+            config_path=conf,
+            lock_path=conf + '.lock',
+            quote_values=True,
+        )
     except Exception as e:
         error_json(f"Failed to save config: {e}")
     

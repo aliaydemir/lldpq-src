@@ -83,6 +83,8 @@ set -e
 # execute copies under LLDPQ_DIR: that tree is intentionally writable by the
 # service account.
 LLDPQ_BACKUP_IMPORT_HELPER="/usr/local/libexec/lldpq-backup-import.py"
+LLDPQ_AUTH_USERS_HELPER="/usr/local/libexec/lldpq-auth-users.py"
+LLDPQ_AUTH_USERS_SUDOERS="/etc/sudoers.d/www-data-lldpq-auth"
 LLDPQ_UNINSTALL_SCRIPT="/usr/local/libexec/lldpq-uninstall.sh"
 LLDPQ_UNINSTALL_WEB_GATEWAY="/usr/local/libexec/lldpq-uninstall-web.py"
 LLDPQ_UNINSTALL_SUDOERS="/etc/sudoers.d/www-data-lldpq-uninstall"
@@ -353,7 +355,7 @@ load_lldpq_config() {
             ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR|DHCP_HOSTS_FILE|DHCP_CONF_FILE|\
             DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
             AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|MONITOR_TIMING|\
-            MONITOR_MAX_PARALLEL|PFC_ECN_MAX_PARALLEL|\
+            MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
             OPTICAL_COLLECTION_BUDGET_SECONDS|OPTICAL_PORT_TIMEOUT_SECONDS|\
             LLDP_MAX_PARALLEL|ASSETS_MAX_PARALLEL|\
@@ -851,17 +853,30 @@ render_runtime_tuning_config() {
     local pfc_parallel="${13:-4}" pfc_budget="${14:-60}"
     local pfc_port_timeout="${15:-5}" optical_budget="${16:-120}"
     local optical_port_timeout="${17:-10}" monitor_timing="${18:-false}"
+    local monitor_command_timeout="${19:-20}"
     case "$scan_interval" in
         ''|*[!0-9]*) scan_interval=300 ;;
     esac
     case "$getconfigs_ssh_timeout" in
         ''|*[!0-9]*|0) getconfigs_ssh_timeout=60 ;;
     esac
+    case "$monitor_command_timeout" in
+        ''|*[!0-9]*|????*) monitor_command_timeout=20 ;;
+        *)
+            monitor_command_timeout=$((10#$monitor_command_timeout))
+            if (( monitor_command_timeout == 0 )); then
+                monitor_command_timeout=20
+            elif (( monitor_command_timeout > 120 )); then
+                monitor_command_timeout=120
+            fi
+            ;;
+    esac
     printf 'LLDPQ_CRON="%s"\n' "$lldpq_cron"
     printf 'GETCONF_CRON="%s"\n' "$getconf_cron"
     printf 'SKIP_OPTICAL=%s\n' "$skip_optical"
     printf 'SKIP_L1=%s\n' "$skip_l1"
     printf 'MONITOR_MAX_PARALLEL=%s\n' "$monitor_parallel"
+    printf 'MONITOR_COMMAND_TIMEOUT_SECONDS=%s\n' "$monitor_command_timeout"
     printf 'PFC_ECN_MAX_PARALLEL=%s\n' "$pfc_parallel"
     printf 'PFC_ECN_COLLECTION_BUDGET_SECONDS=%s\n' "$pfc_budget"
     printf 'PFC_ECN_PORT_TIMEOUT_SECONDS=%s\n' "$pfc_port_timeout"
@@ -3395,10 +3410,12 @@ def restore_snapshot(snapshot, web_root):
         (Path("/etc/dhcp/dhcpd.hosts"), "dhcpd.hosts"),
         (Path("/etc/default/isc-dhcp-server"), "isc-dhcp-default"),
         (Path("/usr/local/libexec/lldpq-backup-import.py"), "backup-import-helper"),
+        (Path("/usr/local/libexec/lldpq-auth-users.py"), "auth-users-helper"),
         (Path("/usr/local/libexec/lldpq-uninstall.sh"), "uninstall-script"),
         (Path("/usr/local/libexec/lldpq-uninstall-web.py"), "uninstall-web-gateway"),
         (Path("/etc/sudoers.d/www-data-lldpq"), "sudoers-www-data-lldpq"),
         (Path("/etc/sudoers.d/www-data-provision"), "sudoers-www-data-provision"),
+        (Path("/etc/sudoers.d/www-data-lldpq-auth"), "sudoers-www-data-lldpq-auth"),
         (Path("/etc/sudoers.d/www-data-lldpq-uninstall"), "sudoers-www-data-lldpq-uninstall"),
         (Path("/etc/nginx/sites-enabled/lldpq"), "nginx-enabled-lldpq"),
         (Path("/etc/nginx/sites-enabled/default"), "nginx-enabled-default"),
@@ -3652,10 +3669,12 @@ prepare_update_rollback() {
        ! snapshot_update_file /etc/dhcp/dhcpd.hosts dhcpd.hosts || \
        ! snapshot_update_file /etc/default/isc-dhcp-server isc-dhcp-default || \
        ! snapshot_update_file "$LLDPQ_BACKUP_IMPORT_HELPER" backup-import-helper || \
+       ! snapshot_update_file "$LLDPQ_AUTH_USERS_HELPER" auth-users-helper || \
        ! snapshot_update_file "$LLDPQ_UNINSTALL_SCRIPT" uninstall-script || \
        ! snapshot_update_file "$LLDPQ_UNINSTALL_WEB_GATEWAY" uninstall-web-gateway || \
        ! snapshot_update_file /etc/sudoers.d/www-data-lldpq sudoers-www-data-lldpq || \
        ! snapshot_update_file /etc/sudoers.d/www-data-provision sudoers-www-data-provision || \
+       ! snapshot_update_file "$LLDPQ_AUTH_USERS_SUDOERS" sudoers-www-data-lldpq-auth || \
        ! snapshot_update_file "$LLDPQ_UNINSTALL_SUDOERS" sudoers-www-data-lldpq-uninstall || \
        ! snapshot_update_file /etc/nginx/sites-enabled/lldpq nginx-enabled-lldpq || \
        ! snapshot_update_file /etc/nginx/sites-enabled/default nginx-enabled-default || \
@@ -3766,10 +3785,12 @@ rollback_failed_update() {
     restore_update_file /etc/dhcp/dhcpd.hosts dhcpd.hosts || rollback_restore_failed=true
     restore_update_file /etc/default/isc-dhcp-server isc-dhcp-default || rollback_restore_failed=true
     restore_update_file "$LLDPQ_BACKUP_IMPORT_HELPER" backup-import-helper || rollback_restore_failed=true
+    restore_update_file "$LLDPQ_AUTH_USERS_HELPER" auth-users-helper || rollback_restore_failed=true
     restore_update_file "$LLDPQ_UNINSTALL_SCRIPT" uninstall-script || rollback_restore_failed=true
     restore_update_file "$LLDPQ_UNINSTALL_WEB_GATEWAY" uninstall-web-gateway || rollback_restore_failed=true
     restore_update_file /etc/sudoers.d/www-data-lldpq sudoers-www-data-lldpq || rollback_restore_failed=true
     restore_update_file /etc/sudoers.d/www-data-provision sudoers-www-data-provision || rollback_restore_failed=true
+    restore_update_file "$LLDPQ_AUTH_USERS_SUDOERS" sudoers-www-data-lldpq-auth || rollback_restore_failed=true
     restore_update_file "$LLDPQ_UNINSTALL_SUDOERS" sudoers-www-data-lldpq-uninstall || rollback_restore_failed=true
     restore_update_file /etc/nginx/sites-enabled/lldpq nginx-enabled-lldpq || rollback_restore_failed=true
     restore_update_file /etc/nginx/sites-enabled/default nginx-enabled-default || rollback_restore_failed=true
@@ -4990,6 +5011,32 @@ if [[ -L "$_backup_helper_dir" ]] || \
     exit 1
 fi
 
+echo "  - Installing root-owned authentication users helper"
+if [[ ! -f lldpq/auth_users.py || -L lldpq/auth_users.py ]] || \
+   ! python3 -c 'import pathlib,sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+        lldpq/auth_users.py; then
+    echo "[!] Packaged authentication users helper is missing, linked, or invalid" >&2
+    exit 1
+fi
+_auth_users_stage="${LLDPQ_AUTH_USERS_HELPER}.lldpq-new"
+sudo rm -f -- "$_auth_users_stage"
+if ! sudo install -o root -g root -m 0755 -- \
+        lldpq/auth_users.py "$_auth_users_stage" || \
+   ! sudo mv -fT -- "$_auth_users_stage" "$LLDPQ_AUTH_USERS_HELPER"; then
+    sudo rm -f -- "$_auth_users_stage" 2>/dev/null || true
+    echo "[!] Could not install the root-owned authentication users helper" >&2
+    exit 1
+fi
+_auth_users_metadata=$(sudo stat -c '%u:%g:%a:%h' -- \
+    "$LLDPQ_AUTH_USERS_HELPER" 2>/dev/null || true)
+if [[ -L "$LLDPQ_AUTH_USERS_HELPER" ]] || \
+   [[ ! -f "$LLDPQ_AUTH_USERS_HELPER" ]] || \
+   [[ "$_auth_users_metadata" != "0:0:755:1" ]] || \
+   ! sudo cmp -s -- lldpq/auth_users.py "$LLDPQ_AUTH_USERS_HELPER"; then
+    echo "[!] Root-owned authentication users helper verification failed" >&2
+    exit 1
+fi
+
 echo "  - Installing root-owned web uninstall gateway"
 if [[ ! -f uninstall.sh || -L uninstall.sh ]]; then
     echo "[!] Packaged uninstaller is missing or is a symlink" >&2
@@ -5094,6 +5141,7 @@ sudo cp -r lldpq/* "$LLDPQ_INSTALL_DIR/"
 # may import or execute either service-user-writable privileged helper copy.
 sudo rm -f \
     "$LLDPQ_INSTALL_DIR/backup_import.py" \
+    "$LLDPQ_INSTALL_DIR/auth_users.py" \
     "$LLDPQ_INSTALL_DIR/uninstall_web.py"
 sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR"
 
@@ -5419,7 +5467,8 @@ render_runtime_tuning_config \
     "${PFC_ECN_PORT_TIMEOUT_SECONDS:-5}" \
     "${OPTICAL_COLLECTION_BUDGET_SECONDS:-120}" \
     "${OPTICAL_PORT_TIMEOUT_SECONDS:-10}" \
-    "${MONITOR_TIMING:-false}" | \
+    "${MONITOR_TIMING:-false}" \
+    "${MONITOR_COMMAND_TIMEOUT_SECONDS:-20}" | \
     sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_SKIP_MODELS=\"\"" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=skip" | sudo tee -a /etc/lldpq.conf > /dev/null
@@ -5502,6 +5551,26 @@ sudo chmod 440 /etc/sudoers.d/www-data-lldpq
 echo "www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start isc-dhcp-server, /usr/bin/systemctl stop isc-dhcp-server, /usr/bin/systemctl restart isc-dhcp-server, /usr/bin/systemctl disable isc-dhcp-server, /usr/bin/systemctl enable isc-dhcp-server, /usr/bin/tee /etc/dhcp/dhcpd.conf, /usr/bin/tee /etc/dhcp/dhcpd.hosts, /usr/bin/tee /etc/default/isc-dhcp-server, /usr/bin/tee /etc/lldpq.conf, /usr/bin/cp, /usr/bin/mkdir, /usr/bin/rm, /usr/bin/mv -fT -- /etc/lldpq.conf.lldpq-root-stage /etc/lldpq.conf, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.conf.lldpq-root-stage /etc/dhcp/dhcpd.conf, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.hosts.lldpq-root-stage /etc/dhcp/dhcpd.hosts, /usr/bin/mv -fT -- /etc/dhcp/dhcpd.host.lldpq-root-stage /etc/dhcp/dhcpd.host, /usr/bin/mv -fT -- /etc/default/isc-dhcp-server.lldpq-root-stage /etc/default/isc-dhcp-server, /usr/bin/sync -f /etc/lldpq.conf.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.conf.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.hosts.lldpq-root-stage, /usr/bin/sync -f /etc/dhcp/dhcpd.host.lldpq-root-stage, /usr/bin/sync -f /etc/default/isc-dhcp-server.lldpq-root-stage, /usr/bin/sync -f /etc, /usr/bin/sync -f /etc/dhcp, /usr/bin/sync -f /etc/default, /usr/bin/mv -fT -- /etc/crontab.lldpq-root-stage /etc/crontab, /usr/bin/mv -fT -- /etc/cron.d/lldpq.lldpq-root-stage /etc/cron.d/lldpq, /usr/bin/pkill -x dhcpd, /usr/sbin/dhcpd, /usr/bin/cat /etc/dhcp/dhcpd.conf, /usr/bin/chmod, /usr/bin/chown" | \
     sudo tee /etc/sudoers.d/www-data-provision > /dev/null
 sudo chmod 440 /etc/sudoers.d/www-data-provision
+
+_auth_sudoers_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-auth-sudoers.XXXXXX") || exit 1
+if ! printf '%s\n' \
+    "www-data ALL=(root) NOPASSWD: $LLDPQ_AUTH_USERS_HELPER \"\"" \
+    > "$_auth_sudoers_tmp" || \
+   ! chmod 0440 "$_auth_sudoers_tmp" || \
+   ! sudo /usr/sbin/visudo -cf "$_auth_sudoers_tmp" >/dev/null || \
+   ! sudo install -o root -g root -m 0440 -- \
+        "$_auth_sudoers_tmp" "$LLDPQ_AUTH_USERS_SUDOERS"; then
+    rm -f "$_auth_sudoers_tmp"
+    echo "[!] Could not install the authentication users sudoers policy" >&2
+    exit 1
+fi
+rm -f "$_auth_sudoers_tmp"
+if [[ -L "$LLDPQ_AUTH_USERS_SUDOERS" ]] || \
+   [[ "$(sudo stat -c '%u:%g:%a' -- "$LLDPQ_AUTH_USERS_SUDOERS" 2>/dev/null || true)" != \
+      "0:0:440" ]]; then
+    echo "[!] Authentication users sudoers policy verification failed" >&2
+    exit 1
+fi
 echo "  Sudoers configured (SSH/SCP + DHCP/Provision + SSH key mgmt)"
 
 # ============================================================================
@@ -5966,6 +6035,10 @@ else
 fi
 sudo chmod 600 /etc/lldpq-users.conf
 sudo chown www-data:www-data /etc/lldpq-users.conf
+if ! prepare_shared_lock_files /etc/lldpq-users.conf.lock; then
+    echo "[!] Could not prepare the authentication users transaction lock" >&2
+    exit 1
+fi
 
 # ============================================================================
 # COMMON: Verify Python packages (update mode — fresh already installed them)

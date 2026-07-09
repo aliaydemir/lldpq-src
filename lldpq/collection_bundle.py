@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 from typing import BinaryIO, Dict, Mapping, Optional, Sequence, Tuple, Union
@@ -36,9 +37,53 @@ SECTIONS: Tuple[str, ...] = (
 
 COLLECTION_ERROR_PREFIX = b"__LLDPQ_COLLECTION_ERROR__:"
 
+# Individual monitoring commands are category data.  A command failure must
+# remain visible to its owning analyzer, but it must not invalidate unrelated
+# complete sections collected through the same SSH session.  Keep this
+# allowlist strict: unknown markers and known markers in the wrong section
+# retain the fail-closed whole-bundle behavior.
+ISOLATED_SECTION_ERROR_PATTERNS = {
+    "BGP_DATA": (
+        re.compile(rb"^BGP_SUMMARY$"),
+    ),
+    "EVPN_DATA": (
+        re.compile(rb"^EVPN_(?:VNI|TEMPFILE|ROUTES)$"),
+    ),
+    "FDB_DATA": (
+        re.compile(rb"^FDB$"),
+    ),
+    "NEIGH_DATA": (
+        re.compile(rb"^NEIGH$"),
+    ),
+    "CARRIER_DATA": (
+        re.compile(rb"^LINK_INVENTORY$"),
+    ),
+    "OPTICAL_DATA": (
+        re.compile(rb"^OPTICAL_LINK_INVENTORY$"),
+        re.compile(
+            rb"^OPTICAL_(?:BUDGET|TIMEOUT|TOOL_UNAVAILABLE):"
+            rb"[A-Za-z0-9_.:-]+$"
+        ),
+    ),
+    "BER_DATA": (
+        re.compile(rb"^INTERFACE_COUNTERS$"),
+    ),
+}
+
 
 class CollectionBundleError(Exception):
     """Raised when a bundle cannot be safely split."""
+
+
+def _is_isolated_section_error(section: Optional[str], marker: bytes) -> bool:
+    """Return whether *marker* is an allowlisted category-local failure."""
+    if section is None or not marker.startswith(COLLECTION_ERROR_PREFIX):
+        return False
+    payload = marker[len(COLLECTION_ERROR_PREFIX):]
+    return any(
+        pattern.fullmatch(payload)
+        for pattern in ISOLATED_SECTION_ERROR_PATTERNS.get(section, ())
+    )
 
 
 def _markers(section: str) -> Tuple[bytes, bytes]:
@@ -168,7 +213,8 @@ def split_collection_bundle(
         # preserves a CR before LF exactly as the old awk extractor did.
         for line_number, record in enumerate(raw_handle):
             line = record[:-1] if record.endswith(b"\n") else record
-            if line.startswith(COLLECTION_ERROR_PREFIX):
+            if (line.startswith(COLLECTION_ERROR_PREFIX)
+                    and not _is_isolated_section_error(active_section, line)):
                 command_errors.append(line)
 
             start_section = start_markers.get(line)

@@ -196,6 +196,7 @@ apply_monitor_tuning() {
     PFC_ECN_MAX_PARALLEL="${PFC_ECN_MAX_PARALLEL:-4}"
     OPTICAL_COLLECTION_BUDGET_SECONDS="${OPTICAL_COLLECTION_BUDGET_SECONDS:-120}"
     OPTICAL_PORT_TIMEOUT_SECONDS="${OPTICAL_PORT_TIMEOUT_SECONDS:-10}"
+    MONITOR_COMMAND_TIMEOUT_SECONDS="${MONITOR_COMMAND_TIMEOUT_SECONDS:-20}"
     case "$PFC_ECN_COLLECTION_BUDGET_SECONDS" in
         ''|*[!0-9]*|0) PFC_ECN_COLLECTION_BUDGET_SECONDS=60 ;;
     esac
@@ -212,6 +213,17 @@ apply_monitor_tuning() {
     esac
     case "$OPTICAL_PORT_TIMEOUT_SECONDS" in
         ''|*[!0-9]*|0) OPTICAL_PORT_TIMEOUT_SECONDS=10 ;;
+    esac
+    case "$MONITOR_COMMAND_TIMEOUT_SECONDS" in
+        ''|*[!0-9]*|????*) MONITOR_COMMAND_TIMEOUT_SECONDS=20 ;;
+        *)
+            MONITOR_COMMAND_TIMEOUT_SECONDS=$((10#$MONITOR_COMMAND_TIMEOUT_SECONDS))
+            if (( MONITOR_COMMAND_TIMEOUT_SECONDS == 0 )); then
+                MONITOR_COMMAND_TIMEOUT_SECONDS=20
+            elif (( MONITOR_COMMAND_TIMEOUT_SECONDS > 120 )); then
+                MONITOR_COMMAND_TIMEOUT_SECONDS=120
+            fi
+            ;;
     esac
 }
 apply_monitor_tuning
@@ -2093,12 +2105,20 @@ EOF
         PFC_ECN_MAX_PARALLEL="'"$PFC_ECN_MAX_PARALLEL"'"
         OPTICAL_COLLECTION_BUDGET_SECONDS="'"$OPTICAL_COLLECTION_BUDGET_SECONDS"'"
         OPTICAL_PORT_TIMEOUT_SECONDS="'"$OPTICAL_PORT_TIMEOUT_SECONDS"'"
+        MONITOR_COMMAND_TIMEOUT_SECONDS="'"$MONITOR_COMMAND_TIMEOUT_SECONDS"'"
         MONITOR_TIMING="'"$MONITOR_TIMING"'"
         MONITOR_SCOPE="'"$MONITOR_SCOPE"'"
 
         _lldpq_scope_selected() {
             [ "$MONITOR_SCOPE" = "all" ] || [ "$MONITOR_SCOPE" = "$1" ]
         }
+        _lldpq_run_bounded() {
+            # Never fall back to an unbounded command: older switch images
+            # without coreutils timeout report source-local unavailability.
+            command -v timeout >/dev/null 2>&1 || return 125
+            timeout -k 2s "${MONITOR_COMMAND_TIMEOUT_SECONDS}s" "$@"
+        }
+        _lldpq_net_class_root=/sys/class/net
 
         # Take shared snapshots once.  Several reports consume the same
         # underlying state; re-running these commands was both slower and
@@ -2136,37 +2156,46 @@ EOF
         : > "$_lldpq_snapshot_dir/fdb"
         : > "$_lldpq_snapshot_dir/bgp-summary"
         : > "$_lldpq_snapshot_dir/evpn-vni"
+        : > "$_lldpq_snapshot_dir/vlan"
         _lldpq_link_status=1
         _lldpq_addr_status=1
         _lldpq_neigh_status=1
         _lldpq_fdb_status=1
         _lldpq_bgp_status=1
         _lldpq_evpn_vni_status=1
+        _lldpq_vlan_status=1
 
         if _lldpq_scope_selected flap || _lldpq_scope_selected optical ||
            _lldpq_scope_selected pfc-ecn || _lldpq_scope_selected duplicate; then
-            ip link show > "$_lldpq_snapshot_dir/link" 2>/dev/null
+            _lldpq_run_bounded ip link show > "$_lldpq_snapshot_dir/link" 2>/dev/null
             _lldpq_link_status=$?
         fi
         if _lldpq_scope_selected all; then
-            ip addr show > "$_lldpq_snapshot_dir/addr" 2>/dev/null
+            _lldpq_run_bounded ip addr show > "$_lldpq_snapshot_dir/addr" 2>/dev/null
             _lldpq_addr_status=$?
+            _lldpq_run_bounded sudo /usr/sbin/bridge vlan \
+                > "$_lldpq_snapshot_dir/vlan" 2>/dev/null
+            _lldpq_vlan_status=$?
         fi
         if _lldpq_scope_selected duplicate; then
-            ip neighbour show > "$_lldpq_snapshot_dir/neigh" 2>/dev/null
+            _lldpq_run_bounded ip neighbour show > "$_lldpq_snapshot_dir/neigh" 2>/dev/null
             _lldpq_neigh_status=$?
-            sudo /usr/sbin/bridge fdb show > "$_lldpq_snapshot_dir/fdb" 2>/dev/null
+            _lldpq_run_bounded sudo /usr/sbin/bridge fdb show \
+                > "$_lldpq_snapshot_dir/fdb" 2>/dev/null
             _lldpq_fdb_status=$?
         fi
         if _lldpq_scope_selected bgp; then
-            sudo vtysh -c "show bgp vrf all sum" > "$_lldpq_snapshot_dir/bgp-summary" 2>/dev/null
+            _lldpq_run_bounded sudo vtysh -c "show bgp vrf all sum" \
+                > "$_lldpq_snapshot_dir/bgp-summary" 2>/dev/null
             _lldpq_bgp_status=$?
         fi
         if _lldpq_scope_selected bgp || _lldpq_scope_selected duplicate; then
-            sudo vtysh -c "show evpn vni" > "$_lldpq_snapshot_dir/evpn-vni" 2>/dev/null
+            _lldpq_run_bounded sudo vtysh -c "show evpn vni" \
+                > "$_lldpq_snapshot_dir/evpn-vni" 2>/dev/null
             _lldpq_evpn_vni_status=$?
         fi
 
+        : > "$_lldpq_snapshot_dir/interfaces"
         if [ "$_lldpq_link_status" -eq 0 ]; then
             awk '\''
                 function emit() {
@@ -2182,20 +2211,38 @@ EOF
                 }
                 END { emit() }
             '\'' "$_lldpq_snapshot_dir/link" > "$_lldpq_snapshot_dir/interfaces"
-            sort -V "$_lldpq_snapshot_dir/interfaces" > "$_lldpq_snapshot_dir/interfaces-sorted"
-            awk '\''/^swp[0-9]+(s[0-9]+)?$/ { print }'\'' \
-                "$_lldpq_snapshot_dir/interfaces-sorted" \
-                > "$_lldpq_snapshot_dir/pfc-interfaces"
         else
-            : > "$_lldpq_snapshot_dir/interfaces"
-            : > "$_lldpq_snapshot_dir/interfaces-sorted"
-            : > "$_lldpq_snapshot_dir/pfc-interfaces"
+            # A timeout-less image cannot safely run `ip`, but sysfs itself is
+            # a bounded kernel snapshot.  Recover the physical-port inventory
+            # without launching any potentially blocking command so optical,
+            # flap and PFC can publish typed per-port unavailability.
+            for _lldpq_interface_path in "$_lldpq_net_class_root"/swp*; do
+                [ -e "$_lldpq_interface_path" ] || continue
+                _lldpq_interface_name=${_lldpq_interface_path##*/}
+                _lldpq_interface_suffix=${_lldpq_interface_name#swp}
+                case "$_lldpq_interface_name" in
+                    swp[0-9]*) ;;
+                    *) continue ;;
+                esac
+                case "$_lldpq_interface_suffix" in
+                    ""|*[!0-9s]*|*s*s*|s*|*s) continue ;;
+                esac
+                printf "%s\n" "$_lldpq_interface_name" \
+                    >> "$_lldpq_snapshot_dir/interfaces"
+            done
+            if [ -s "$_lldpq_snapshot_dir/interfaces" ]; then
+                _lldpq_link_status=0
+            fi
         fi
+        sort -V "$_lldpq_snapshot_dir/interfaces" > "$_lldpq_snapshot_dir/interfaces-sorted"
+        awk '\''/^swp[0-9]+(s[0-9]+)?$/ { print }'\'' \
+            "$_lldpq_snapshot_dir/interfaces-sorted" \
+            > "$_lldpq_snapshot_dir/pfc-interfaces"
         : > "$_lldpq_snapshot_dir/ifalias"
         : > "$_lldpq_snapshot_dir/swp-ifalias"
         : > "$_lldpq_snapshot_dir/swp-ifalias-html"
         if _lldpq_scope_selected all; then
-        for _lldpq_alias_path in /sys/class/net/*/ifalias; do
+        for _lldpq_alias_path in "$_lldpq_net_class_root"/*/ifalias; do
             [ -r "$_lldpq_alias_path" ] || continue
             IFS= read -r _lldpq_alias < "$_lldpq_alias_path" 2>/dev/null || _lldpq_alias=""
             [ -n "$_lldpq_alias" ] || continue
@@ -2208,7 +2255,7 @@ EOF
             [ -n "$_lldpq_alias_name" ] || continue
             _lldpq_alias=""
             IFS= read -r _lldpq_alias \
-                < "/sys/class/net/${_lldpq_alias_name}/ifalias" 2>/dev/null || _lldpq_alias=""
+                < "$_lldpq_net_class_root/${_lldpq_alias_name}/ifalias" 2>/dev/null || _lldpq_alias=""
             printf "%s|%s\n" "$_lldpq_alias_name" "$_lldpq_alias" \
                 >> "$_lldpq_snapshot_dir/swp-ifalias"
         done < "$_lldpq_snapshot_dir/interfaces-sorted"
@@ -2236,8 +2283,8 @@ EOF
 
         while IFS="|" read -r interface description; do
             [ -n "$interface" ] || continue
-            if [ -e "/sys/class/net/$interface" ]; then
-                IFS= read -r state < "/sys/class/net/$interface/operstate" 2>/dev/null || state="unknown"
+            if [ -e "$_lldpq_net_class_root/$interface" ]; then
+                IFS= read -r state < "$_lldpq_net_class_root/$interface/operstate" 2>/dev/null || state="unknown"
                 if [ "$state" = "up" ]; then
                     link_status="up"
                     color="lime"
@@ -2280,7 +2327,8 @@ EOF
         echo "<h1></h1><h1><font color=\"#b57614\">VLAN Configuration Table '"$hostname"'</font></h1><h3></h3>"
         echo "<pre style=\"font-family:monospace;\">"
         printf "<span style=\"color:green;\">%-20s %-12s %s</span>\n" "PORT" "PVID" "VLANs"
-        sudo /usr/sbin/bridge vlan 2>/dev/null | \
+        if [ "$_lldpq_vlan_status" -eq 0 ]; then
+        cat "$_lldpq_snapshot_dir/vlan" | \
           awk '\''BEGIN{cp=""}
                NR==1||NF==0{next}
                NF>=2{
@@ -2307,6 +2355,9 @@ EOF
                pvid_pad = 12 - pvid_text_len
                printf "%s%*s %s%*s VLANs=%s\n", port_colored, port_pad, "", pvid_colored, pvid_pad, "", vlan_colored
           }'\''
+        else
+            echo "<span style=\"color:orange;\">VLAN collection unavailable</span>"
+        fi
         echo "</pre>"
 
         echo "<h1></h1><h1><font color=\"#b57614\">ARP Table '"$hostname"'</font></h1><h3></h3>"
@@ -2362,7 +2413,8 @@ EOF
             _evpn_tmp=""
         }
         if [ -n "$_evpn_tmp" ]; then
-            if sudo vtysh -c "show bgp l2vpn evpn" > "$_evpn_tmp" 2>/dev/null; then
+            if _lldpq_run_bounded sudo vtysh -c "show bgp l2vpn evpn" \
+                    > "$_evpn_tmp" 2>/dev/null; then
                 awk '\''
                     index($0, "[2]:") { type2++ }
                     index($0, "[5]:") { type5++ }
@@ -2462,15 +2514,15 @@ EOF
             echo "__LLDPQ_DUP_COVERAGE__:VNI_MAP:ERROR"
         fi
         echo "=== DUP CONFIG ==="
-        _dup_filter CONFIG "duplicate|max-moves[[:space:]]+[0-9]+|time[[:space:]]+[0-9]+|freeze|warning-only" sudo vtysh -c "show evpn"
+        _dup_filter CONFIG "duplicate|max-moves[[:space:]]+[0-9]+|time[[:space:]]+[0-9]+|freeze|warning-only" _lldpq_run_bounded sudo vtysh -c "show evpn"
         echo "=== DUP SELF ==="
-        _dup_filter SELF "Local Vtep Ip" sudo vtysh -c "show evpn vni detail"
+        _dup_filter SELF "Local Vtep Ip" _lldpq_run_bounded sudo vtysh -c "show evpn vni detail"
         echo "=== DUP ARP ==="
-        _dup_run ARP_DUPLICATES sudo vtysh -c "show evpn arp-cache vni all duplicate"
+        _dup_run ARP_DUPLICATES _lldpq_run_bounded sudo vtysh -c "show evpn arp-cache vni all duplicate"
         echo "=== DUP MAC ==="
-        _dup_run MAC_DUPLICATES sudo vtysh -c "show evpn mac vni all duplicate"
+        _dup_run MAC_DUPLICATES _lldpq_run_bounded sudo vtysh -c "show evpn mac vni all duplicate"
         echo "=== DUP LOG ==="
-        if sudo test -r /var/log/frr/frr.log 2>/dev/null; then
+        if _lldpq_run_bounded sudo test -r /var/log/frr/frr.log 2>/dev/null; then
             _dup_log_cap=300
             _dup_log_tmp=$(mktemp /tmp/lldpq-dup-log.XXXXXXXX) || {
                 echo "__LLDPQ_DUP_SAMPLE_META__:FRR_LOG:MATCHES=UNKNOWN:EMITTED=0:CAP=${_dup_log_cap}:TRUNCATED=UNKNOWN"
@@ -2478,7 +2530,7 @@ EOF
                 _dup_log_tmp=""
             }
             if [ -n "$_dup_log_tmp" ]; then
-                sudo grep -i "detected as duplicate" /var/log/frr/frr.log \
+                _lldpq_run_bounded sudo grep -i "detected as duplicate" /var/log/frr/frr.log \
                     > "$_dup_log_tmp" 2>/dev/null
                 _dup_log_status=$?
                 if [ "$_dup_log_status" -eq 0 ] || [ "$_dup_log_status" -eq 1 ]; then
@@ -2519,9 +2571,9 @@ EOF
         # mobility sequence is ALWAYS tracked. Stable MACs (0/0) and normal failovers (<10)
         # are filtered out on-device to keep this small.
         echo "=== DUP MACMOB ==="
-        _dup_filter MAC_MOBILITY "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" sudo vtysh -c "show evpn mac vni all"
+        _dup_filter MAC_MOBILITY "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" _lldpq_run_bounded sudo vtysh -c "show evpn mac vni all"
         echo "=== DUP ARPMOB ==="
-        _dup_filter ARP_MOBILITY "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" sudo vtysh -c "show evpn arp-cache vni all"
+        _dup_filter ARP_MOBILITY "^VNI |[0-9][0-9]+/[0-9]+$|/[0-9][0-9]+$" _lldpq_run_bounded sudo vtysh -c "show evpn arp-cache vni all"
         # Interface descriptions (nv set interface swpX description = kernel ifalias): names the
         # device attached to each switch:port so the analysis can show WHICH box is duplicating.
         echo "=== DUP IFALIAS ==="
@@ -2565,8 +2617,8 @@ EOF
         fi
         while IFS= read -r interface; do
             [ -n "$interface" ] || continue
-            if [ -e "/sys/class/net/$interface" ]; then
-                IFS= read -r carrier_count < "/sys/class/net/$interface/carrier_changes" 2>/dev/null || carrier_count="0"
+            if [ -e "$_lldpq_net_class_root/$interface" ]; then
+                IFS= read -r carrier_count < "$_lldpq_net_class_root/$interface/carrier_changes" 2>/dev/null || carrier_count="0"
                 echo "$interface:$carrier_count"
             fi
         done < "$_lldpq_snapshot_dir/interfaces"
@@ -2589,21 +2641,20 @@ EOF
                 while IFS= read -r interface; do
                     [ -n "$interface" ] || continue
                     echo "--- Interface: $interface"
-                    if [ ! -e "/sys/class/net/$interface" ]; then
+                    if [ ! -e "$_lldpq_net_class_root/$interface" ]; then
                         echo "Interface state: unknown"
                         echo "No transceiver data"
                         continue
                     fi
-                    IFS= read -r state < "/sys/class/net/$interface/operstate" 2>/dev/null || state="unknown"
+                    IFS= read -r state < "$_lldpq_net_class_root/$interface/operstate" 2>/dev/null || state="unknown"
                     echo "Interface state: ${state:-unknown}"
                     if [ "$state" = "up" ]; then
                         if [ "$_optical_has_timeout" = "true" ]; then
                             _optical_remaining=$((_optical_deadline - $(date +%s)))
                             if [ "$_optical_remaining" -le 0 ]; then
                                 # A current report must never silently omit
-                                # the unvisited tail.  Reject this device
-                                # generation and preserve its last-known-good
-                                # bundle instead.
+                                # the unvisited tail.  Keep every unvisited
+                                # port as explicit partial optical coverage.
                                 echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:${interface}"
                                 ethtool_output=""
                             else
@@ -2620,9 +2671,12 @@ EOF
                                 fi
                             fi
                         else
-                            # Older Cumulus releases without timeout retain
-                            # the previous successful collection behavior.
-                            ethtool_output=$(sudo ethtool -m "$interface" 2>/dev/null || true)
+                            # Never run DOM reads without a deadline.  Keep the
+                            # port visible as an optical-local coverage gap so
+                            # unrelated sections from this SSH generation can
+                            # still be published safely.
+                            echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TOOL_UNAVAILABLE:${interface}"
+                            ethtool_output=""
                         fi
                         if [ -n "$ethtool_output" ]; then
                             echo "$ethtool_output"
@@ -2659,7 +2713,7 @@ EOF
         if [ "$SKIP_L1" = "true" ]; then
             echo "l1-show skipped"
         elif command -v l1-show >/dev/null 2>&1; then
-            sudo l1-show all -p 2>/dev/null || echo "l1-show failed"
+            _lldpq_run_bounded sudo l1-show all -p 2>/dev/null || echo "l1-show failed"
         else
             echo "l1-show not available"
         fi
@@ -2768,7 +2822,7 @@ EOF
         if _lldpq_scope_selected hardware; then
         echo "HARDWARE_HEALTH:"
         if command -v sensors >/dev/null 2>&1; then
-            _hardware_output=$(sensors 2>/dev/null)
+            _hardware_output=$(_lldpq_run_bounded sensors 2>/dev/null)
             _hardware_status=$?
             if [ "$_hardware_status" -eq 0 ]; then
                 echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:SENSORS:OK"
@@ -2879,8 +2933,8 @@ EOF
 
         # FRR Routing Logs
         echo "FRR_ROUTING_LOGS:"
-        if systemctl is-active --quiet frr 2>/dev/null; then
-            _source_output=$(sudo journalctl -u frr --since="2 hours ago" --no-pager --lines=200 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet frr 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl -u frr --since="2 hours ago" --no-pager --lines=200 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status FRR OK
@@ -2889,7 +2943,7 @@ EOF
                 _lldpq_log_status FRR ERROR
             fi
         elif [ -f "/var/log/frr/frr.log" ]; then
-            _source_output=$(sudo cat /var/log/frr/frr.log 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/frr/frr.log 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status FRR OK
@@ -2904,8 +2958,8 @@ EOF
 
         # Switch daemon logs
         echo "SWITCHD_LOGS:"
-        if systemctl is-active --quiet switchd 2>/dev/null; then
-            _source_output=$(sudo journalctl -u switchd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet switchd 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl -u switchd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status SWITCHD OK
@@ -2914,7 +2968,7 @@ EOF
                 _lldpq_log_status SWITCHD ERROR
             fi
         elif [ -f "/var/log/switchd.log" ]; then
-            _source_output=$(sudo cat /var/log/switchd.log 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/switchd.log 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status SWITCHD OK
@@ -2929,8 +2983,8 @@ EOF
 
         # NVUE configuration logs
         echo "NVUE_CONFIG_LOGS:"
-        if systemctl is-active --quiet nvued 2>/dev/null; then
-            _source_output=$(sudo journalctl -u nvued --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet nvued 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl -u nvued --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status NVUE OK
@@ -2939,7 +2993,7 @@ EOF
                 _lldpq_log_status NVUE ERROR
             fi
         elif [ -f "/var/log/nvued.log" ]; then
-            _source_output=$(sudo cat /var/log/nvued.log 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/nvued.log 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status NVUE OK
@@ -2954,8 +3008,8 @@ EOF
 
         # Spanning Tree Protocol logs
         echo "MSTPD_STP_LOGS:"
-        if systemctl is-active --quiet mstpd 2>/dev/null; then
-            _source_output=$(sudo journalctl -u mstpd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet mstpd 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl -u mstpd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status MSTPD OK
@@ -2964,7 +3018,7 @@ EOF
                 _lldpq_log_status MSTPD ERROR
             fi
         elif [ -f "/var/log/mstpd" ]; then
-            _source_output=$(sudo cat /var/log/mstpd 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/mstpd 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status MSTPD OK
@@ -2979,8 +3033,8 @@ EOF
 
         # MLAG coordination logs
         echo "CLAGD_MLAG_LOGS:"
-        if systemctl is-active --quiet clagd 2>/dev/null; then
-            _source_output=$(sudo journalctl -u clagd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet clagd 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl -u clagd --since="2 hours ago" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status CLAGD OK
@@ -2989,7 +3043,7 @@ EOF
                 _lldpq_log_status CLAGD ERROR
             fi
         elif [ -f "/var/log/clagd.log" ]; then
-            _source_output=$(sudo cat /var/log/clagd.log 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/clagd.log 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status CLAGD OK
@@ -3004,8 +3058,8 @@ EOF
 
         # Authentication and security logs
         echo "AUTH_SECURITY_LOGS:"
-        if systemctl is-active --quiet systemd-journald 2>/dev/null; then
-            _source_output=$(sudo journalctl --since="2 hours ago" --grep="FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet systemd-journald 2>/dev/null; then
+            _source_output=$(_lldpq_run_bounded sudo journalctl --since="2 hours ago" --grep="FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status AUTH OK
@@ -3014,7 +3068,7 @@ EOF
                 _lldpq_log_status AUTH ERROR
             fi
         elif [ -f "/var/log/auth.log" ]; then
-            _source_output=$(sudo cat /var/log/auth.log 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/auth.log 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status AUTH OK
@@ -3030,11 +3084,11 @@ EOF
         # System critical logs
         echo "SYSTEM_CRITICAL_LOGS:"
         CRITICAL_LOGS=""
-        if systemctl is-active --quiet systemd-journald 2>/dev/null; then
-            CRITICAL_LOGS=$(sudo journalctl --since="2 hours ago" --priority=0..3 --grep="ERROR|CRIT|ALERT|EMERG|FAIL|kernel|oom|segfault" --no-pager --lines=50 2>/dev/null)
+        if _lldpq_run_bounded systemctl is-active --quiet systemd-journald 2>/dev/null; then
+            CRITICAL_LOGS=$(_lldpq_run_bounded sudo journalctl --since="2 hours ago" --priority=0..3 --grep="ERROR|CRIT|ALERT|EMERG|FAIL|kernel|oom|segfault" --no-pager --lines=50 2>/dev/null)
             _source_status=$?
         elif [ -f "/var/log/syslog" ]; then
-            _source_output=$(sudo cat /var/log/syslog 2>/dev/null)
+            _source_output=$(_lldpq_run_bounded sudo cat /var/log/syslog 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 CRITICAL_LOGS=$(printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -50 | grep -E "(ERROR|CRIT|ALERT|EMERG|FAIL|kernel|oom|segfault)" || true)
@@ -3057,7 +3111,7 @@ EOF
 
         # High priority journalctl logs
         echo "JOURNALCTL_PRIORITY_LOGS:"
-        _source_output=$(sudo journalctl --since="3 hours ago" --priority=0..3 --no-pager --lines=75 2>/dev/null)
+        _source_output=$(_lldpq_run_bounded sudo journalctl --since="3 hours ago" --priority=0..3 --no-pager --lines=75 2>/dev/null)
         _source_status=$?
         if [ "$_source_status" -eq 0 ]; then
             _lldpq_log_status JOURNAL_PRIORITY OK
@@ -3068,7 +3122,7 @@ EOF
 
         # Hardware and kernel critical messages
         echo "DMESG_HARDWARE_LOGS:"
-        _source_output=$(sudo dmesg --since="3 hours ago" --level=crit,alert,emerg 2>/dev/null)
+        _source_output=$(_lldpq_run_bounded sudo dmesg --since="3 hours ago" --level=crit,alert,emerg 2>/dev/null)
         _source_status=$?
         if [ "$_source_status" -eq 0 ]; then
             _lldpq_log_status DMESG OK
@@ -3079,7 +3133,7 @@ EOF
 
         # Network interface state changes
         echo "NETWORK_INTERFACE_LOGS:"
-        _source_output=$(sudo journalctl --since="3 hours ago" --grep="swp|bond|vlan|carrier|link.*up|link.*down|port.*up|port.*down" --no-pager --lines=40 2>/dev/null)
+        _source_output=$(_lldpq_run_bounded sudo journalctl --since="3 hours ago" --grep="swp|bond|vlan|carrier|link.*up|link.*down|port.*up|port.*down" --no-pager --lines=40 2>/dev/null)
         _source_status=$?
         if [ "$_source_status" -eq 0 ]; then
             _lldpq_log_status NETWORK_INTERFACE OK

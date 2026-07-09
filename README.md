@@ -774,8 +774,9 @@ replaced.
 
 Failure handling depends on the failure type:
 
-- malformed, truncated, or command-error bundles are not activated; the previous valid device artifacts remain in place and the run is marked stale
-- an optical DOM port or collection-budget timeout invalidates that device's bundle instead of publishing a silently incomplete optical result
+- malformed or truncated bundles are not activated; the previous valid device artifacts remain in place and the run is marked stale
+- typed category-command failures publish explicit partial/unavailable coverage for that category while complete sections from the same device generation remain usable
+- optical DOM port or collection-budget timeouts publish explicit unknown/partial optical coverage instead of silently omitting ports
 - during a full run, if both SSH and the reachability check fail, old raw measurements are removed from the current generation and an explicit **Current collection unavailable** device page is produced; a scoped run preserves unrelated prior artifacts
 - PFC/ECN port timeouts are represented in the new report as **Collection failed** or **Data missing**; unavailable counters are never shown as zero
 - analyzer, validation, or web-publication failures roll analyzer state back and preserve the previous published reports
@@ -783,6 +784,7 @@ Failure handling depends on the failure type:
 The following optional values tune bounded collection:
 
 - `MONITOR_MAX_PARALLEL=100` — concurrent per-device collection workers
+- `MONITOR_COMMAND_TIMEOUT_SECONDS=20` — timeout for otherwise-unbounded remote category commands (`1..120`)
 - `PFC_ECN_MAX_PARALLEL=4` — concurrent per-port NVUE QoS reads on each switch (`1..8`)
 - `PFC_ECN_COLLECTION_BUDGET_SECONDS=60` — QoS collection budget per switch
 - `PFC_ECN_PORT_TIMEOUT_SECONDS=5` — timeout for one QoS read

@@ -808,6 +808,8 @@ class OpticalAnalyzer:
         anomalies = self.detect_optical_anomalies()
         expected_hosts = getattr(self, 'coverage_expected_hosts', None)
         current_hosts = getattr(self, 'coverage_current_hosts', None)
+        missing_hosts = sorted(set(getattr(self, 'coverage_missing_hosts', []) or []))
+        coverage_failures = getattr(self, 'coverage_failures', {}) or {}
         coverage_attrs = ''
         if isinstance(expected_hosts, int) and isinstance(current_hosts, int):
             coverage_status = (
@@ -818,6 +820,10 @@ class OpticalAnalyzer:
                 f' data-coverage-expected="{expected_hosts}"'
                 f' data-coverage-current="{current_hosts}"'
             )
+        coverage_attrs += (
+            f' data-coverage-missing-hosts="{len(missing_hosts)}"'
+            f' data-coverage-failed-hosts="{len(coverage_failures)}"'
+        )
         # Machine-readable categories keep dashboard/alert consumers from
         # treating an intentionally empty cage as missing diagnostics. They are
         # attributes only and do not alter the report's visual layout.
@@ -826,6 +832,25 @@ class OpticalAnalyzer:
             f' data-optical-unplugged="{len(summary["unplugged_ports"])}"'
             f' data-optical-unknown="{len(summary["unknown_ports"])}"'
         )
+
+        coverage_warning_html = ''
+        if missing_hosts:
+            coverage_rows = []
+            for hostname in missing_hosts:
+                reasons = coverage_failures.get(hostname) or [
+                    'No current optical collection was published'
+                ]
+                rendered_reasons = '; '.join(str(reason) for reason in reasons)
+                coverage_rows.append(
+                    '<li><strong>' + html.escape(str(hostname)) + '</strong>: '
+                    + html.escape(rendered_reasons) + '</li>'
+                )
+            coverage_warning_html = (
+                '<div class="coverage-warning" data-optical-coverage-warning="true">'
+                '<div class="coverage-warning-title">Partial optical collection</div>'
+                '<p>Other monitoring categories remain current. Optical data was '
+                'incomplete for:</p><ul>' + ''.join(coverage_rows) + '</ul></div>'
+            )
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -901,6 +926,9 @@ class OpticalAnalyzer:
         .select2-container--default .select2-results__option[aria-selected=true] {{ background: #3c3c3c; }}
         .clear-search-btn {{ background: #f44336; color: white; border: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; display: none; }}
         .clear-search-btn:hover {{ background: #d32f2f; }}
+        .coverage-warning {{ background: rgba(255, 152, 0, 0.12); border: 1px solid #ff9800; border-radius: 6px; margin-bottom: 20px; padding: 14px 16px; color: #ffd180; }}
+        .coverage-warning-title {{ color: #ffb74d; font-weight: 700; margin-bottom: 6px; }}
+        .coverage-warning ul {{ margin: 8px 0 0 22px; }}
         ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
         ::-webkit-scrollbar-track {{ background: #1e1e1e; }}
         ::-webkit-scrollbar-thumb {{ background: #404040; border-radius: 4px; }}
@@ -933,7 +961,7 @@ class OpticalAnalyzer:
             </button>
         </div>
     </div>
-    
+    {coverage_warning_html}
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>

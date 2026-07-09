@@ -126,12 +126,19 @@ duplicate recovery/outage notifications after a container replacement.
 The LLDP/Assets/Provision job volumes retain queued and resumable work,
 `lldpq-upgrade-jobs` retains multi-device upgrade progress,
 `lldpq-ai-state` retains private Ask-AI memory/analysis snapshots, and
-`lldpq-provision-state` retains discovery cache, DHCP desired state and
-scheduler state.
+`lldpq-provision-state` retains discovery cache, DHCP desired state, scheduler
+state and legacy direct-file editor recovery journals.
 `lldpq-dhcp-state` retains the DHCP lease database. Generated NVUE ZTP files
 and uploaded OS images/ONIE aliases live in `lldpq-generated-configs` and
 `lldpq-provision-files` respectively.
-Existing direct file mounts remain supported. The web report tree is
+Existing direct file mounts remain readable for migration. The Setup editors
+for `devices.yaml`, topology, notifications and display aliases retain a
+journaled compatibility path; their crash-recovery journal lives in
+`lldpq-provision-state`, which must remain an actual Docker volume mount.
+Changing runtime/system configuration, DHCP, lifecycle tracking or login users,
+and multi-file Provision transactions require the documented configuration
+directory/named volumes. Those writes fail before modifying a legacy
+single-file mount and return a migration hint. The web report tree is
 intentionally separate from raw monitoring data and is re-seeded from the
 last-known-good source data when a container is recreated.
 

@@ -57,7 +57,7 @@ volumes:
   lldpq-upgrade-jobs:
   lldpq-ai-state:
   lldpq-provision-jobs:
-  lldpq-provision-state: # Discovery cache, DHCP desired state and scheduler state
+  lldpq-provision-state: # Provision state + direct-file editor recovery journals
   lldpq-dhcp-state:
   lldpq-configs:
   lldpq-hstr:

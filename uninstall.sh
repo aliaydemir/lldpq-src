@@ -38,6 +38,7 @@ set -u
 set -o pipefail
 
 LLDPQ_BACKUP_IMPORT_HELPER="/usr/local/libexec/lldpq-backup-import.py"
+LLDPQ_AUTH_USERS_HELPER="/usr/local/libexec/lldpq-auth-users.py"
 LLDPQ_UPDATE_RECOVERY_HELPER="/usr/local/libexec/lldpq-update-recovery.py"
 LLDPQ_UNINSTALL_HELPER="/usr/local/libexec/lldpq-uninstall.sh"
 LLDPQ_UNINSTALL_GATEWAY="/usr/local/libexec/lldpq-uninstall-web.py"
@@ -2731,6 +2732,18 @@ if ! $DRY_RUN && \
 fi
 echo "  root-owned backup/import helper removed"
 
+if [[ -d "$LLDPQ_AUTH_USERS_HELPER" ]] && [[ ! -L "$LLDPQ_AUTH_USERS_HELPER" ]]; then
+    echo "[!] Refusing to recursively remove unexpected auth helper directory: $LLDPQ_AUTH_USERS_HELPER" >&2
+    exit 1
+fi
+run "sudo rm -f '$LLDPQ_AUTH_USERS_HELPER'"
+if ! $DRY_RUN && \
+   { [[ -e "$LLDPQ_AUTH_USERS_HELPER" ]] || [[ -L "$LLDPQ_AUTH_USERS_HELPER" ]]; }; then
+    echo "[!] Root-owned authentication users helper could not be removed" >&2
+    exit 1
+fi
+echo "  root-owned authentication users helper removed"
+
 # ─── 2. Telemetry stack ───────────────────────────────────────────────
 step "Removing telemetry stack..."
 if [[ -f "$LLDPQ_INSTALL_DIR/telemetry/docker-compose.yaml" ]]; then
@@ -2830,19 +2843,20 @@ done
 
 # ─── 5. Sudoers ───────────────────────────────────────────────────────
 step "Removing sudoers files..."
-for f in www-data-lldpq www-data-provision; do
+for f in www-data-lldpq www-data-provision www-data-lldpq-auth; do
     if [[ -e "/etc/sudoers.d/$f" || -L "/etc/sudoers.d/$f" ]]; then
         run_required "Sudoers policy could not be removed: /etc/sudoers.d/$f" \
             "sudo rm -f '/etc/sudoers.d/$f'" && echo "  removed /etc/sudoers.d/$f"
     fi
 done
 verify_absent "LLDPq sudoers policy" \
-    /etc/sudoers.d/www-data-lldpq /etc/sudoers.d/www-data-provision || true
+    /etc/sudoers.d/www-data-lldpq /etc/sudoers.d/www-data-provision \
+    /etc/sudoers.d/www-data-lldpq-auth || true
 
 # ─── 6. Auth + sessions + config ──────────────────────────────────────
 step "Removing config + auth files..."
 for f in \
-    /etc/lldpq.conf.lock /etc/lldpq-users.conf \
+    /etc/lldpq.conf.lock /etc/lldpq-users.conf.lock /etc/lldpq-users.conf \
     /etc/lldpq.conf.lldpq-root-stage /etc/crontab.lldpq-root-stage \
     /etc/cron.d/lldpq.lldpq-root-stage \
     /etc/dhcp/dhcpd.conf.lldpq-root-stage \

@@ -12,6 +12,8 @@ fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
+PROVISION_STATE_DIR="${LLDPQ_PROVISION_STATE_DIR:-/var/lib/lldpq/provision-state}"
+DIRECT_WRITE_STATE_DIR="${LLDPQ_DIRECT_WRITE_STATE_DIR:-$PROVISION_STATE_DIR/config-write-journals}"
 SETUP_SAFETY="$(dirname "$0")/setup_safety.py"
 
 # topology.dot is stored in web root for www-data access
@@ -28,19 +30,20 @@ echo "X-Content-Type-Options: nosniff"
 echo ""
 
 if [ "$METHOD" = "GET" ]; then
-    TOPOLOGY_FILE="$TOPOLOGY_FILE" python3 - <<'PY'
-import hashlib, json, os
-path = os.environ['TOPOLOGY_FILE']
-try:
-    raw = open(path, 'rb').read()
-    print(json.dumps({'success': True, 'content': raw.decode('utf-8'),
-                      'revision': hashlib.sha256(raw).hexdigest(), 'exists': True}))
-except FileNotFoundError:
-    print(json.dumps({'success': True, 'content': '', 'exists': False,
-                      'revision': hashlib.sha256(b'').hexdigest()}))
-except Exception as exc:
-    print(json.dumps({'success': False, 'error': 'Cannot read topology.dot: ' + str(exc)}))
-PY
+    if [ ! -f "$SETUP_SAFETY" ]; then
+        echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
+        exit 0
+    fi
+    ARGS=("$SETUP_SAFETY" read-text --target "$TOPOLOGY_FILE" \
+        --managed-root "$WEB_ROOT" --managed-root "$LLDPQ_DIR" \
+        --direct-write-state-dir "$DIRECT_WRITE_STATE_DIR")
+    RESULT=$(sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c \
+        'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
+    if [ -n "$RESULT" ]; then
+        echo "$RESULT"
+    else
+        echo '{"success": false, "error": "Failed to recover or read topology.dot"}'
+    fi
     
 elif [ "$METHOD" = "POST" ]; then
     # Read POST data from stdin
@@ -55,7 +58,7 @@ elif [ "$METHOD" = "POST" ]; then
         echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
         exit 0
     fi
-    ARGS=("$SETUP_SAFETY" save-topology --request-json --target "$TOPOLOGY_FILE" --managed-root "$WEB_ROOT" --managed-root "$LLDPQ_DIR")
+    ARGS=("$SETUP_SAFETY" save-topology --request-json --target "$TOPOLOGY_FILE" --managed-root "$WEB_ROOT" --managed-root "$LLDPQ_DIR" --direct-write-state-dir "$DIRECT_WRITE_STATE_DIR")
     # Newer installs provide a shared semantic parser. Keep Setup compatible
     # with older installs by treating it as an additive check when present.
     if [ -f "$LLDPQ_DIR/topology_edges.py" ]; then
@@ -67,7 +70,9 @@ elif [ "$METHOD" = "POST" ]; then
     else
         RESULT="$RESULT" python3 -c 'import json,os
 r=json.loads(os.environ["RESULT"])
-if r.get("success"): r["message"]="Topology saved successfully"
+if r.get("success"):
+    r["message"]=("Topology saved through a journaled legacy direct-file mount"
+                  if r.get("atomic") is False else "Topology saved successfully")
 print(json.dumps(r))' 2>/dev/null || echo "$RESULT"
     fi
 else

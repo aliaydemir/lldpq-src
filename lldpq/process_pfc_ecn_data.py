@@ -533,6 +533,7 @@ def render_report(
     expected_hosts: Optional[int] = None,
     current_hosts: Optional[int] = None,
     collection_unavailable: bool = False,
+    coverage_failures: Optional[Mapping[str, str]] = None,
 ) -> str:
     records = sorted(records, key=lambda row: (row["hostname"], row["interface"]))
     total = len(records)
@@ -593,11 +594,19 @@ def render_report(
         coverage_metadata_attrs += f' data-coverage-current="{current_hosts}"'
     if expected_hosts is not None:
         coverage_metadata_attrs += f' data-coverage-expected="{expected_hosts}"'
+    failure_hosts = sorted(coverage_failures or {})
+    failure_metadata = (
+        ' data-coverage-failed-hosts="'
+        + html.escape(",".join(failure_hosts), quote=True)
+        + '"'
+        if failure_hosts else ""
+    )
     summary_metadata = (
         '<div hidden data-analysis-summary="pfc-ecn"'
         f' data-collection-status="{collection_status}"'
         f' data-coverage-status="{coverage_status}"'
         f'{coverage_metadata_attrs}'
+        f'{failure_metadata}'
         f' data-interval-status="{interval_status}"'
         f' data-total-ports="{total}" data-ready-ports="{ready}"'
         f' data-ecn-active-ports="{ecn_active}"'
@@ -689,6 +698,16 @@ def render_report(
         'the table intentionally shows no current counters.</div>'
         if collection_unavailable else ""
     )
+    partial_banner = ""
+    if coverage_failures and not collection_unavailable:
+        failure_text = "; ".join(
+            f"{host}: {coverage_failures[host]}" for host in failure_hosts
+        )
+        partial_banner = (
+            '<div class="notice">Partial PFC/ECN collection. '
+            + html.escape(failure_text)
+            + '</div>'
+        )
     return f'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>PFC/ECN Analysis</title>
@@ -734,6 +753,7 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
   </div>
 </div>
 {unavailable_banner}
+{partial_banner}
 <section class="dashboard-section"><div class="section-header">PFC/ECN Summary</div><div class="section-content"><div class="summary-grid">
 <div id="devices-card" class="summary-card card-info" data-card-filter="all" data-filter-label="All reporting devices" role="button" tabindex="0" aria-pressed="false"><div class="metric">{device_coverage}</div><div class="metric-label">Devices reporting</div></div>
 <div id="ports-card" class="summary-card card-good" data-card-filter="all" data-filter-label="All checked ports" role="button" tabindex="0" aria-pressed="false"><div class="metric">{total:,}</div><div class="metric-label">Ports checked</div></div>
@@ -1077,13 +1097,22 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         if snapshot_valid else set()
     )
     collected_hosts = {path.name.removesuffix("_pfc_ecn.txt") for path in current_files}
-    if snapshot_valid and expected_hosts - collected_hosts:
+    coverage_failures: Dict[str, str] = {}
+    if snapshot_valid:
+        coverage_failures.update({
+            host: f"asset status {status}"
+            for host, status in statuses.items()
+            if status != "OK"
+        })
+    missing_collections = expected_hosts - collected_hosts
+    if snapshot_valid and missing_collections:
+        for host in missing_collections:
+            coverage_failures[host] = "current collection missing"
         print(
             "Missing current PFC/ECN collections for: "
-            + ", ".join(sorted(expected_hosts - collected_hosts)),
+            + ", ".join(sorted(missing_collections)),
             file=sys.stderr,
         )
-        return False
     all_devices_unavailable = snapshot_valid and not expected_hosts
 
     baseline_path = result_dir / "pfc_ecn_baseline.json"
@@ -1114,13 +1143,27 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         try:
             raw_content = raw_file.read_text(encoding="utf-8", errors="replace")
             parsed_ports = parse_pfc_ecn_snapshot(raw_content)
+            timestamp = raw_file.stat().st_mtime
         except OSError as exc:
+            coverage_failures[hostname] = f"snapshot read failed: {exc}"
             print(f"Could not read {raw_file}: {exc}", file=sys.stderr)
-            return False
+            continue
         inventory_valid, inventory_error = validate_inventory_contract(
             raw_content, parsed_ports
         )
         if not inventory_valid:
+            # An explicit collector-side inventory failure is a category-local
+            # coverage gap.  Contract contradictions (duplicates, count
+            # mismatches, or truncation) remain fatal because accepting them
+            # would publish a structurally ambiguous snapshot.
+            if inventory_error == "collector reported an inventory error":
+                coverage_failures[hostname] = inventory_error
+                print(
+                    f"PFC/ECN inventory unavailable for {hostname}: "
+                    f"{inventory_error}",
+                    file=sys.stderr,
+                )
+                continue
             print(
                 f"Invalid PFC/ECN inventory for {hostname}: {inventory_error}",
                 file=sys.stderr,
@@ -1130,10 +1173,10 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             name: entry for name, entry in parsed_ports.items() if PORT_RE.fullmatch(name)
         }
         if not physical_ports:
+            coverage_failures[hostname] = "no physical port records"
             print(f"No physical PFC/ECN port records for {hostname}", file=sys.stderr)
-            return False
+            continue
         hosts_with_ports.add(hostname)
-        timestamp = raw_file.stat().st_mtime
         for interface, entry in sorted(physical_ports.items()):
             key = f"{hostname}:{interface}"
             counters = (
@@ -1160,14 +1203,16 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
                 port_history = histories[key] = []
             port_history.append(record)
 
-    if expected_hosts - hosts_with_ports:
+    hosts_without_ports = expected_hosts - hosts_with_ports
+    if hosts_without_ports:
+        for host in hosts_without_ports:
+            coverage_failures.setdefault(host, "no physical counter records")
         print(
             "No physical PFC/ECN counters for: "
-            + ", ".join(sorted(expected_hosts - hosts_with_ports)),
+            + ", ".join(sorted(hosts_without_ports)),
             file=sys.stderr,
         )
-        return False
-    if not records and not all_devices_unavailable:
+    if not records and not all_devices_unavailable and not snapshot_valid:
         print("No current PFC/ECN records", file=sys.stderr)
         return False
 
@@ -1193,6 +1238,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         len(inventory_hosts) if snapshot_valid else None,
         len(hosts_with_ports) if snapshot_valid else None,
         collection_unavailable=all_devices_unavailable,
+        coverage_failures=coverage_failures,
     )
     _atomic_json(baseline_path, baseline_output)
     _atomic_json(history_path, history_output)

@@ -4,6 +4,8 @@
 
 # Configuration
 USERS_FILE="/etc/lldpq-users.conf"
+USERS_LOCK_FILE="/etc/lldpq-users.conf.lock"
+AUTH_USERS_HELPER="/usr/local/libexec/lldpq-auth-users.py"
 SESSIONS_DIR="/var/lib/lldpq/sessions"
 SESSION_TIMEOUT=28800  # 8 hours in seconds
 REMEMBER_TIMEOUT=604800  # 7 days in seconds
@@ -32,7 +34,33 @@ generate_token() {
 
 # Function to hash password
 hash_password() {
-    echo -n "$1" | openssl dgst -sha256 | awk '{print $2}'
+    printf '%s' "$1" | openssl dgst -sha256 | awk '{print $2}'
+}
+
+auth_users_mutate() {
+    local action="$1" username="$2" password_hash="${3:-}"
+    local payload result status
+    payload=$(AUTH_MUTATION_ACTION="$action" \
+        AUTH_MUTATION_USERNAME="$username" \
+        AUTH_MUTATION_PASSWORD_HASH="$password_hash" \
+        python3 -c 'import json,os
+request={"action":os.environ["AUTH_MUTATION_ACTION"],
+         "username":os.environ["AUTH_MUTATION_USERNAME"]}
+password_hash=os.environ.get("AUTH_MUTATION_PASSWORD_HASH", "")
+if password_hash:
+    request["password_hash"]=password_hash
+print(json.dumps(request, separators=(",", ":")))') || {
+        echo '{"success":false,"error":"Could not encode users mutation"}'
+        return 2
+    }
+    result=$(printf '%s' "$payload" | sudo -n "$AUTH_USERS_HELPER" 2>/dev/null)
+    status=$?
+    if [ -z "$result" ]; then
+        echo '{"success":false,"error":"Users mutation helper failed; repair the installation"}'
+        return 2
+    fi
+    printf '%s\n' "$result"
+    return "$status"
 }
 
 # Function to get cookie
@@ -53,6 +81,24 @@ get_user_record() {
     awk -F: -v u="$username" '$1 == u { print; exit }' "$USERS_FILE" 2>/dev/null
 }
 
+acquire_users_read_lock() {
+    if ! exec {USERS_READ_LOCK_FD}<>"$USERS_LOCK_FILE"; then
+        return 1
+    fi
+    if ! flock -s "$USERS_READ_LOCK_FD"; then
+        exec {USERS_READ_LOCK_FD}>&-
+        USERS_READ_LOCK_FD=""
+        return 1
+    fi
+}
+
+release_users_read_lock() {
+    [ -n "${USERS_READ_LOCK_FD:-}" ] || return 0
+    flock -u "$USERS_READ_LOCK_FD" 2>/dev/null || true
+    exec {USERS_READ_LOCK_FD}>&-
+    USERS_READ_LOCK_FD=""
+}
+
 # Function to validate session
 validate_session() {
     local token="$1"
@@ -68,7 +114,19 @@ validate_session() {
     local expiry=$(head -1 "$session_file")
     local now=$(date +%s)
     
-    if [ "$now" -gt "$expiry" ]; then
+    if ! [[ "$expiry" =~ ^[0-9]+$ ]] || [ "$now" -gt "$expiry" ]; then
+        rm -f "$session_file"
+        return 1
+    fi
+    # A delete racing with login can create a session just after the delete
+    # cleanup scan. Revalidate account existence/role on every session use so
+    # such a session can never authenticate.
+    local session_user session_role current_record current_role
+    session_user=$(sed -n '2p' "$session_file" 2>/dev/null)
+    session_role=$(sed -n '3p' "$session_file" 2>/dev/null)
+    current_record=$(get_user_record "$session_user")
+    current_role=$(printf '%s' "$current_record" | cut -d':' -f3)
+    if [ -z "$current_record" ] || [ "$session_role" != "$current_role" ]; then
         rm -f "$session_file"
         return 1
     fi
@@ -150,7 +208,11 @@ case "$ACTION" in
         USERNAME=$(get_post_param "username")
         PASSWORD=$(get_post_param "password")
         REMEMBER=$(get_post_param "remember")
-        
+
+        if ! acquire_users_read_lock; then
+            json_response '{"success": false, "error": "Authentication database is unavailable"}'
+            exit 0
+        fi
         if verify_credentials "$USERNAME" "$PASSWORD"; then
             TOKEN=$(generate_token)
             ROLE=$(get_user_role "$USERNAME")
@@ -165,6 +227,7 @@ case "$ACTION" in
             
             # Create session file (single write)
             printf '%s\n%s\n%s\n' "$EXPIRY" "$USERNAME" "$ROLE" > "$SESSIONS_DIR/$TOKEN"
+            release_users_read_lock
             
             # Set cookie and return success
             USERNAME_JSON=$(printf '%s' "$USERNAME" | json_escape)
@@ -174,6 +237,7 @@ case "$ACTION" in
             echo ""
             echo "{\"success\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON}"
         else
+            release_users_read_lock
             json_response '{"success": false, "error": "Invalid username or password"}'
         fi
         ;;
@@ -228,12 +292,6 @@ case "$ACTION" in
         TARGET_USER=$(get_post_param "target_user")
         NEW_PASSWORD=$(get_post_param "new_password")
         
-        # Validate target user exists
-        if [ -z "$(get_user_record "$TARGET_USER")" ]; then
-            json_response '{"success": false, "error": "User not found"}'
-            exit 0
-        fi
-        
         # Validate password length
         if [ ${#NEW_PASSWORD} -lt 6 ]; then
             json_response '{"success": false, "error": "Password must be at least 6 characters"}'
@@ -243,18 +301,8 @@ case "$ACTION" in
         # Hash new password
         NEW_HASH=$(hash_password "$NEW_PASSWORD")
         
-        # Get current role for target user
-        TARGET_ROLE=$(get_user_role "$TARGET_USER")
-        
-        # Update users file (use /tmp for temp file — www-data can't create files in /etc/)
-        TMP_FILE=$(mktemp)
-        awk -F: -v u="$TARGET_USER" '$1 != u' "$USERS_FILE" > "$TMP_FILE"
-        echo "$TARGET_USER:$NEW_HASH:$TARGET_ROLE" >> "$TMP_FILE"
-        cat "$TMP_FILE" > "$USERS_FILE"
-        rm -f "$TMP_FILE"
-        chmod 600 "$USERS_FILE"
-        
-        json_response '{"success": true, "message": "Password changed successfully"}'
+        RESULT=$(auth_users_mutate change-password "$TARGET_USER" "$NEW_HASH")
+        json_response "$RESULT"
         ;;
     
     list-users)
@@ -320,30 +368,17 @@ case "$ACTION" in
             exit 0
         fi
         
-        # Check if user already exists
-        if [ -n "$(get_user_record "$NEW_USERNAME")" ]; then
-            json_response '{"success": false, "error": "User already exists"}'
-            exit 0
-        fi
-        
-        # Cannot create admin users
-        if [ "$NEW_USERNAME" = "admin" ]; then
-            json_response '{"success": false, "error": "Cannot create admin user"}'
-            exit 0
-        fi
-        
         # Validate password length
         if [ ${#NEW_PASSWORD} -lt 6 ]; then
             json_response '{"success": false, "error": "Password must be at least 6 characters"}'
             exit 0
         fi
         
-        # Hash password and add user (always as operator role)
+        # Hash password; the locked root-owned helper performs duplicate and
+        # protected-admin checks against the post-lock snapshot.
         NEW_HASH=$(hash_password "$NEW_PASSWORD")
-        echo "$NEW_USERNAME:$NEW_HASH:operator" >> "$USERS_FILE"
-        chmod 600 "$USERS_FILE"
-        
-        json_response "{\"success\": true, \"message\": \"User '$NEW_USERNAME' created successfully\"}"
+        RESULT=$(auth_users_mutate create-user "$NEW_USERNAME" "$NEW_HASH")
+        json_response "$RESULT"
         ;;
     
     delete-user)
@@ -378,18 +413,12 @@ case "$ACTION" in
             exit 0
         fi
         
-        # Check if user exists
-        if [ -z "$(get_user_record "$TARGET_USER")" ]; then
-            json_response '{"success": false, "error": "User not found"}'
+        RESULT=$(auth_users_mutate delete-user "$TARGET_USER")
+        MUTATION_STATUS=$?
+        if [ "$MUTATION_STATUS" -ne 0 ]; then
+            json_response "$RESULT"
             exit 0
         fi
-        
-        # Delete user from file (use /tmp for temp file — www-data can't create files in /etc/)
-        TMP_FILE=$(mktemp)
-        awk -F: -v u="$TARGET_USER" '$1 != u' "$USERS_FILE" > "$TMP_FILE"
-        cat "$TMP_FILE" > "$USERS_FILE"
-        rm -f "$TMP_FILE"
-        chmod 600 "$USERS_FILE"
         
         # Remove any active sessions for this user
         for session_file in "$SESSIONS_DIR"/*; do
@@ -401,7 +430,7 @@ case "$ACTION" in
             fi
         done
         
-        json_response "{\"success\": true, \"message\": \"User '$TARGET_USER' deleted successfully\"}"
+        json_response "$RESULT"
         ;;
         
     *)
