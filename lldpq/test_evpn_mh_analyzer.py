@@ -87,6 +87,7 @@ def snapshot(host, *, df, remote=True, oper=True, bypass=False):
             {
                 "ifname": bond,
                 "operstate": "UP" if oper else "DOWN",
+                "ifalias": "GB300-1-14-Tray-18",
                 "linkinfo": {
                     "info_kind": "bond",
                     "info_data": {
@@ -103,6 +104,7 @@ def snapshot(host, *, df, remote=True, oper=True, bypass=False):
             },
             {
                 "ifname": member,
+                "master": bond,
                 "linkinfo": {
                     "info_slave_kind": "bond",
                     "info_slave_data": {
@@ -147,6 +149,18 @@ class EvpnMhAnalyzerTests(unittest.TestCase):
         })
         self.assertEqual(rows[0]["status"], "healthy")
         self.assertEqual(len(rows[0]["attachments"]), 2)
+
+    def test_runtime_member_and_ifalias_fallback(self):
+        left = snapshot("tan-leaf-06", df=True)
+        right = snapshot("tan-leaf-08", df=False)
+        left["interfaces"] = {}
+        right["interfaces"] = {}
+        rows = correlate_snapshots({"tan-leaf-06": left, "tan-leaf-08": right})
+        self.assertEqual(rows[0]["status"], "healthy")
+        self.assertEqual(rows[0]["attachments"][0]["members"], ["swp18s1"])
+        self.assertEqual(
+            rows[0]["attachments"][0]["description"], "GB300-1-14-Tray-18"
+        )
 
     def test_parse_snapshot_contract(self):
         content = """__LLDPQ_EVPN_MH_COLLECTION_UTC__:2026-07-10T01:02:03Z

@@ -194,6 +194,7 @@ def _lacp_state(
     bypass: Mapping[Tuple[str, str], int],
     bond: str,
     bond_up: bool,
+    mode: str,
 ) -> Tuple[str, bool, List[Dict[str, Any]]]:
     details: List[Dict[str, Any]] = []
     active_bypass = False
@@ -219,6 +220,12 @@ def _lacp_state(
                 "info_slave_data", {}
             ).get("speed", ""),
         })
+    if str(mode).lower() in {"static", "balance-xor", "xor"}:
+        all_up = bool(details) and all(
+            item["mii"].upper() == "UP" or item["state"].upper() == "ACTIVE"
+            for item in details
+        )
+        return ("Static" if bond_up and all_up else "Degraded"), False, details
     if active_bypass:
         return "Bypass", True, details
     if not bond_up:
@@ -259,12 +266,13 @@ def build_attachment(
             and _mapping(link.get("linkinfo")).get("info_slave_kind") == "bond"
         )
     runtime = _bond_runtime(bond_link)
+    bond_mode = str(bond_config.get("mode") or runtime.get("mode") or "")
     ad_info = _mapping(runtime.get("ad_info"))
     bond_up = _flag(operational, "oper-up") or str(
         bond_link.get("operstate", "")
     ).upper() == "UP"
     lacp, bypass_active, member_details = _lacp_state(
-        members, links, _mapping(snapshot.get("bypass")), bond, bond_up
+        members, links, _mapping(snapshot.get("bypass")), bond, bond_up, bond_mode
     )
     bgp_item = _mapping(_mapping(snapshot.get("bgp_esi")).get(esi))
     evi_rows = _mapping(snapshot.get("bgp_es_evi")).get(esi, [])
@@ -355,7 +363,7 @@ def correlate_snapshots(
             len(attachments) == 2 and all_oper and all_remote and df_count == 0
         )
         lacp_degraded = any(
-            item["lacp"] not in {"Synced", "Bypass"} for item in attachments
+            item["lacp"] not in {"Synced", "Bypass", "Static"} for item in attachments
             if item["oper_up"]
         )
         vni_sets = {tuple(item["vnis"]) for item in attachments}
@@ -574,16 +582,22 @@ select {{ width:210px; padding:7px 28px 7px 10px; background:#333; border:1px so
 .summary-card:nth-child(3) {{ border-left-color:#888; }} .summary-card:nth-child(4) {{ border-left-color:#ff9800; }}
 .summary-card:nth-child(5) {{ border-left-color:#f44336; }} .summary-card:nth-child(6) {{ border-left-color:#ba68c8; }}
 .metric {{ font-size:24px; font-weight:700; color:#76b900; }} .metric-label {{ color:#999; font-size:10px; text-transform:uppercase; margin-top:5px; }}
-.dashboard-section {{ background:#292929; border:1px solid #383838; margin-top:12px; }}
-.section-header {{ padding:9px 12px; color:#76b900; font-weight:700; border-bottom:1px solid #383838; }}
+.dashboard-section {{ background:#292929; border:1px solid #383838; border-radius:8px; margin:12px 0 20px; overflow:hidden; }}
+.section-header {{ padding:12px 16px; background:#333; color:#76b900; font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px; }}
 .table-wrap {{ overflow:auto; }}
-table {{ border-collapse:collapse; width:100%; min-width:1320px; table-layout:auto; }}
-th {{ background:#242424; color:#bbb; font-size:10px; text-transform:uppercase; padding:9px 8px; text-align:left; border-bottom:1px solid #444; white-space:nowrap; }}
-.sortable {{ cursor:pointer; user-select:none; }} .sortable:hover {{ color:#fff; background:#303030; }}
-.sort-arrow {{ display:inline-block; min-width:10px; margin-left:5px; color:#777; font-size:9px; }}
-.sortable[aria-sort="ascending"] .sort-arrow,.sortable[aria-sort="descending"] .sort-arrow {{ color:#76b900; }}
-td {{ padding:8px; border-bottom:1px solid #383838; color:#ccc; white-space:nowrap; max-width:220px; overflow:hidden; text-overflow:ellipsis; }}
-tr.mh-row {{ cursor:pointer; border-left:3px solid #76b900; }} tr.mh-row:hover {{ background:#303030; }}
+table {{ border-collapse:collapse; width:100%; min-width:1320px; table-layout:auto; font-size:13px; }}
+th,td {{ border:1px solid #404040; padding:10px 12px; text-align:left; }}
+th {{ background:#333; color:#76b900; font-weight:600; font-size:12px; white-space:nowrap; }}
+.sortable {{ cursor:pointer; user-select:none; padding-right:20px; }}
+.sortable:hover {{ background:#3c3c3c; }}
+.sortable:focus-visible {{ outline:2px solid #76b900; outline-offset:-2px; }}
+.sort-arrow {{ font-size:10px; color:#666; margin-left:5px; opacity:.5; }}
+.sort-arrow::before {{ content:'▲▼'; }}
+.sortable.asc .sort-arrow::before {{ content:'▲'; color:#76b900; opacity:1; }}
+.sortable.desc .sort-arrow::before {{ content:'▼'; color:#76b900; opacity:1; }}
+.sortable.asc .sort-arrow,.sortable.desc .sort-arrow {{ opacity:1; }}
+td {{ color:#ccc; white-space:nowrap; max-width:220px; overflow:hidden; text-overflow:ellipsis; }}
+tbody tr {{ background:#252526; }} tr.mh-row {{ cursor:pointer; border-left:3px solid #76b900; }} tr.mh-row:hover {{ background:#2d2d2d; }}
 tr.status-bypass {{ border-left-color:#ff9800; }} tr.status-warning {{ border-left-color:#ffc107; }}
 tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-left-color:#f44336; }}
 .cell-device,.cell-peer {{ font-weight:600; color:#a5d64d; }} code {{ color:#6fc7df; }}
@@ -630,20 +644,23 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
   <div class="summary-card" onclick="setOrphan()"><div class="metric" id="orphan-es">{counts['orphan']}</div><div class="metric-label">Orphan ESI</div></div>
 </div>
 <div class="dashboard-section">
-  <div class="section-header">Device &amp; Peer Health</div>
+  <div class="section-header">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M4,1H20A1,1 0 0,1 21,2V6A1,1 0 0,1 20,7H4A1,1 0 0,1 3,6V2A1,1 0 0,1 4,1M4,9H20A1,1 0 0,1 21,10V14A1,1 0 0,1 20,15H4A1,1 0 0,1 3,14V10A1,1 0 0,1 4,9M4,17H20A1,1 0 0,1 21,18V22A1,1 0 0,1 20,23H4A1,1 0 0,1 3,22V18A1,1 0 0,1 4,17Z"/></svg>
+    Device &amp; Peer Health ({counts['total']} total)
+  </div>
   <div class="table-wrap">
   <table id="evpn-mh-table">
     <thead><tr>
-      <th class="sortable" aria-sort="none" onclick="sortTable(0,this)">Device<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(1,this)">Peer Device<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(2,this)">Local Bond<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(3,this)">Peer Bond<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(4,this)">ESI<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(5,this)">Endpoint<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(6,this)">DF Local / Peer<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(7,this)">LACP Local / Peer<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(8,this)">VNI<span class="sort-arrow">↕</span></th>
-      <th class="sortable" aria-sort="none" onclick="sortTable(9,this)">Status<span class="sort-arrow">↕</span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(0,this)">Device<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(1,this)">Peer Device<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(2,this)">Local Bond<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(3,this)">Peer Bond<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(4,this)">ESI<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(5,this)">Endpoint<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(6,this)">DF Local / Peer<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(7,this)">LACP Local / Peer<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(8,this)">VNI<span class="sort-arrow"></span></th>
+      <th class="sortable" aria-sort="none" onclick="sortTable(9,this)">Status<span class="sort-arrow"></span></th>
     </tr></thead>
     <tbody id="evpn-mh-body">{table_rows}</tbody>
   </table>
@@ -727,10 +744,10 @@ function sortTable(column,header){{
   rows.forEach(row=>body.appendChild(row));
   document.querySelectorAll('th.sortable').forEach(th=>{{
     th.setAttribute('aria-sort','none');
-    const arrow=th.querySelector('.sort-arrow');if(arrow)arrow.textContent='↕';
+    th.classList.remove('asc','desc');
   }});
+  header.classList.add(ascending?'asc':'desc');
   header.setAttribute('aria-sort',ascending?'ascending':'descending');
-  header.querySelector('.sort-arrow').textContent=ascending?'▲':'▼';
 }}
 function toggleDetails(row){{
   const next=row.nextElementSibling;
