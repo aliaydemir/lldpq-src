@@ -3695,7 +3695,7 @@ start_analysis() {
     (
         local started finished status
         started=$(analysis_now_ms)
-        "$@"
+        LLDPQ_ANALYZER_TIMING=1 "$@"
         status=$?
         finished=$(analysis_now_ms)
         printf '%s\n' "$((finished - started))" > "$timing_file"
@@ -3786,21 +3786,10 @@ validate_analysis_outputs() {
         fi
     done
 
-    python3 - "$SCRIPT_DIR/monitor-results" "${json_files[@]}" <<'PYTHON'
-import json
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-for relative in sys.argv[2:]:
-    path = root / relative
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            json.load(handle)
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
-        print(f"Invalid analysis JSON {relative}: {exc}", file=sys.stderr)
-        raise SystemExit(1)
-PYTHON
+    if [[ "${#json_files[@]}" -gt 0 ]]; then
+        python3 "$SCRIPT_DIR/validate_analysis_json.py" \
+            "$SCRIPT_DIR/monitor-results" "${json_files[@]}"
+    fi
 }
 
 analysis_output_marker="$analysis_log_dir/.analysis-start"
@@ -3856,6 +3845,18 @@ for index in "${!analysis_labels[@]}"; do
             "$((duration_ms / 1000))" "$((duration_ms % 1000))"
     else
         printf '  %-12s unavailable\n' "${analysis_labels[$index]}"
+    fi
+    subphase_summary=$(
+        awk -F: -v label="${analysis_labels[$index]}" '
+            $1 == "__LLDPQ_ANALYZER_TIMING__" && $2 == label && $4 ~ /^[0-9]+$/ {
+                value = sprintf("%s=%.3fs", $3, $4 / 1000)
+                output = output (output ? " " : "") value
+            }
+            END { print output }
+        ' "${analysis_logs[$index]}" 2>/dev/null
+    ) || subphase_summary=""
+    if [[ -n "$subphase_summary" ]]; then
+        printf '    phases: %s\n' "$subphase_summary"
     fi
 done
 analyzer_jobs_end=$(date +%s)

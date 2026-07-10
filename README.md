@@ -804,6 +804,13 @@ measured and does not require `MONITOR_TIMING`; normal `lldpq` runs remain
 quiet. `MONITOR_TIMING=true` is the deeper diagnostic mode for per-device SSH,
 bundle parsing, and individual collection-section timings.
 
+The PFC/ECN analyzer additionally reports its load, record parsing, history
+pruning, HTML rendering, and atomic-write subphases. Analyzer JSON artifacts
+are fully parsed with a bounded parallel validator (two processes by default);
+verbose output lists deterministic per-file validation timings. Any malformed,
+missing, empty, or stale artifact remains fail-closed and rolls the analyzer
+transaction back exactly as before.
+
 The separate transceiver firmware scan uses
 `TRANSCEIVER_FW_MIN_INTERVAL=1800`, `TRANSCEIVER_FW_MAX_PARALLEL=10`,
 `TRANSCEIVER_FW_SSH_TIMEOUT=300`, and

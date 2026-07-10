@@ -13,6 +13,8 @@ import json
 import html
 import time
 import collections
+import stat
+import tempfile
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
@@ -162,6 +164,10 @@ class LinkFlapAnalyzer:
     def save_flap_history(self):
         """Save flap history to file"""
         try:
+            # Cleanup is a global O(number-of-ports) sweep. Running it after
+            # every individual port update made a full analysis O(ports²)
+            # without changing the final persisted state.
+            self._cleanup_old_entries(time.time())
             data = {
                 "flapping_hist": {port: list(deq) for port, deq in self.flapping_hist.items()},
                 "carrier_transitions_lookback": {port: list(deq) for port, deq in self.carrier_transitions_lookback.items()},
@@ -170,10 +176,50 @@ class LinkFlapAnalyzer:
                 "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
             }
-            with open(f"{self.data_dir}/flap_history.json", "w") as f:
-                json.dump(data, f, indent=2)
+            self._atomic_json_write(f"{self.data_dir}/flap_history.json", data)
         except Exception as e:
             print(f"Error saving flap history: {e}")
+
+    @staticmethod
+    def _atomic_json_write(path: str, value: Any) -> None:
+        """Write compact JSON durably without exposing a partial generation."""
+        target = os.path.abspath(path)
+        directory = os.path.dirname(target)
+        os.makedirs(directory, exist_ok=True)
+        metadata = None
+        if os.path.lexists(target):
+            if os.path.islink(target) or not stat.S_ISREG(os.lstat(target).st_mode):
+                raise OSError(f"unsafe flap history target: {target}")
+            metadata = os.stat(target, follow_symlinks=False)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=directory
+        )
+        try:
+            mode = stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o664
+            os.fchmod(descriptor, mode)
+            if metadata is not None:
+                os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                json.dump(value, stream, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            temporary = ""
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
     
     def update_carrier_transitions(self, port_name: str, current_transitions: int):
         """Update carrier transition count for a port, and record any NEW flaps since the previous
@@ -225,9 +271,6 @@ class LinkFlapAnalyzer:
         self.carrier_transitions_lookback[port_name].append((curr_time, current_transitions))
         self.carrier_transitions_stats[port_name] = current_transitions
 
-        # Clean old entries
-        self._cleanup_old_entries(curr_time)
-    
     def _cleanup_old_entries(self, curr_time: float):
         """Remove entries older than thresholds"""
         # Remove entries older than flapping interval

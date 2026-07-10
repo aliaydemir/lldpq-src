@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression tests for host-local PFC/ECN collection failures."""
 
+import contextlib
+import io
+import os
 import sys
 import tempfile
 import unittest
@@ -122,6 +125,26 @@ class PfcEcnCollectionIsolationTests(unittest.TestCase):
 
         self.assertFalse(result)
         self.assertEqual(report, "")
+
+    def test_successful_analysis_emits_ordered_subphase_timings_when_enabled(self):
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"LLDPQ_ANALYZER_TIMING": "1"}):
+            with contextlib.redirect_stdout(output):
+                result, _report = self._process(
+                    {"leaf1": "OK"},
+                    {"leaf1": "__LLDPQ_PFC_ECN_INVENTORY_STATUS__:EMPTY:0\n"},
+                )
+        self.assertTrue(result)
+        text = output.getvalue()
+        phases = [
+            "load", "parse_records", "history_prune", "render", "write_state"
+        ]
+        positions = []
+        for phase in phases:
+            marker = f"__LLDPQ_ANALYZER_TIMING__:pfc-ecn:{phase}:"
+            self.assertIn(marker, text)
+            positions.append(text.index(marker))
+        self.assertEqual(positions, sorted(positions))
 
 
 if __name__ == "__main__":

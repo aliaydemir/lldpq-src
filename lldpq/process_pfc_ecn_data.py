@@ -1067,6 +1067,22 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         print(f"PFC/ECN data directory not found: {data_path}", file=sys.stderr)
         return False
 
+    timing_enabled = os.environ.get("LLDPQ_ANALYZER_TIMING", "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    phase_started = time.monotonic()
+
+    def finish_phase(name: str) -> None:
+        nonlocal phase_started
+        now = time.monotonic()
+        if timing_enabled:
+            elapsed_ms = max(0, int((now - phase_started) * 1000))
+            print(
+                f"__LLDPQ_ANALYZER_TIMING__:pfc-ecn:{name}:{elapsed_ms}",
+                flush=True,
+            )
+        phase_started = now
+
     asset_snapshot = read_asset_snapshot(str(result_dir.parent / "assets.ini"))
     statuses, _asset_mtime, assets_available = asset_snapshot
     snapshot_valid = asset_snapshot_is_valid(asset_snapshot)
@@ -1135,6 +1151,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             key: value for key, value in histories.items()
             if key.split(":", 1)[0] in statuses
         }
+    finish_phase("load")
 
     records: List[Dict[str, Any]] = []
     hosts_with_ports = set()
@@ -1215,6 +1232,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     if not records and not all_devices_unavailable and not snapshot_valid:
         print("No current PFC/ECN records", file=sys.stderr)
         return False
+    finish_phase("parse_records")
 
     cutoff = time.time() - HISTORY_SECONDS
     for key in list(histories):
@@ -1232,6 +1250,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     now = time.time()
     baseline_output = {"version": 1, "updated_at": _iso(now), "ports": baselines}
     history_output = {"version": 1, "updated_at": _iso(now), "history": histories}
+    finish_phase("history_prune")
     report = render_report(
         records,
         histories,
@@ -1240,9 +1259,11 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         collection_unavailable=all_devices_unavailable,
         coverage_failures=coverage_failures,
     )
+    finish_phase("render")
     _atomic_json(baseline_path, baseline_output)
     _atomic_json(history_path, history_output)
     _atomic_write(report_path, report)
+    finish_phase("write_state")
     print(f"PFC/ECN analysis report generated: {report_path}")
     return True
 

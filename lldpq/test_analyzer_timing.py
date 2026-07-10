@@ -29,6 +29,14 @@ class AnalyzerTimingContractTests(unittest.TestCase):
         self.assertNotIn("MONITOR_TIMING", output)
         self.assertIn("%-12s %d.%03ds", output)
         self.assertIn("analysis_timing_files", output)
+        self.assertIn("__LLDPQ_ANALYZER_TIMING__", output)
+        self.assertIn("phases: %s", output)
+
+    def test_subphase_instrumentation_is_enabled_inside_analyzer_job(self):
+        section = MONITOR.split("start_analysis() {", 1)[1].split(
+            "validate_analysis_outputs()", 1
+        )[0]
+        self.assertIn('LLDPQ_ANALYZER_TIMING=1 "$@"', section)
 
     def test_existing_verbose_flag_controls_visibility(self):
         self.assertIn("-) QUIET=false", WRAPPER)
