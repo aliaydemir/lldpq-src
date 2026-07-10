@@ -51,6 +51,7 @@ done
 case "$TRIGGER_SCOPE" in
     all) SCOPE_CODE=0 ;;
     bgp) SCOPE_CODE=1 ;;
+    evpn-mh) SCOPE_CODE=9 ;;
     duplicate) SCOPE_CODE=2 ;;
     flap) SCOPE_CODE=3 ;;
     optical) SCOPE_CODE=4 ;;

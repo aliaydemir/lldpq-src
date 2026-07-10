@@ -28,7 +28,7 @@
     function supportedPath() {
         var path = location.pathname.toLowerCase();
         return [
-            '/lldp.html', '/bgp-analysis.html', '/duplicate-analysis.html',
+            '/lldp.html', '/bgp-analysis.html', '/evpn-mh-analysis.html', '/duplicate-analysis.html',
             '/link-flap-analysis.html', '/optical-analysis.html', '/ber-analysis.html',
             '/pfc-ecn-analysis.html', '/hardware-analysis.html', '/log-analysis.html',
             '/assets.html', '/transceiver.html'
@@ -340,6 +340,19 @@
         metric('#attention-card .metric', flag('attention'));
     }
 
+    function updateEvpnMh() {
+        var rows = scopedRows('#evpn-mh-table > tbody > tr.mh-row');
+        function count(predicate) {
+            return rows.filter(predicate).length;
+        }
+        metric('#total-es', rows.length);
+        metric('#healthy-es', count(function (row) { return row.dataset.status === 'healthy'; }));
+        metric('#inactive-es', count(function (row) { return row.dataset.status === 'inactive'; }));
+        metric('#bypass-es', count(function (row) { return row.dataset.bypassActive === '1'; }));
+        metric('#inconsistent-es', count(function (row) { return row.dataset.inconsistent === '1'; }));
+        metric('#orphan-es', count(function (row) { return row.dataset.orphan === '1'; }));
+    }
+
     function updateDuplicate() {
         var ipRows = scopedRows('#ipt > tbody > tr');
         var macRows = scopedRows('#mact > tbody > tr');
@@ -397,6 +410,7 @@
         var path = location.pathname.toLowerCase();
         if (path.endsWith('/lldp.html')) return updateLLDP();
         if (path.endsWith('/bgp-analysis.html')) return updateBGP();
+        if (path.endsWith('/evpn-mh-analysis.html')) return updateEvpnMh();
         if (path.endsWith('/duplicate-analysis.html')) return updateDuplicate();
         if (path.endsWith('/link-flap-analysis.html')) return updateFlap();
         if (path.endsWith('/optical-analysis.html')) {
@@ -447,6 +461,7 @@
         var path = location.pathname.toLowerCase();
         if (path.endsWith('/lldp.html')) return document.querySelector('#lldp-table');
         if (path.endsWith('/bgp-analysis.html')) return document.querySelector('#bgp-table');
+        if (path.endsWith('/evpn-mh-analysis.html')) return document.querySelector('#evpn-mh-table');
         if (path.endsWith('/duplicate-analysis.html')) return document.querySelector('#ipt');
         if (path.endsWith('/link-flap-analysis.html')) return document.querySelector('#flap-table');
         if (path.endsWith('/optical-analysis.html')) return document.querySelector('#optical-table');

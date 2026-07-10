@@ -17,6 +17,7 @@ option, monitor.sh runs every collection and analyzer.
 Options:
   --only SCOPE          Refresh exactly one analysis scope:
                           bgp        BGP neighbors and EVPN summary
+                          evpn-mh    EVPN multihoming and LACP health
                           duplicate  Duplicate IP/MAC analysis
                           flap       Link flap analysis
                           optical    Optical diagnostics
@@ -31,6 +32,7 @@ Options:
 Examples:
   ./monitor.sh
   ./monitor.sh --only bgp
+  ./monitor.sh --only evpn-mh
   ./monitor.sh --only pfc-ecn
   ./monitor.sh -s
 
@@ -97,7 +99,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MONITOR_SCOPE" in
-    all|bgp|duplicate|flap|optical|ber|pfc-ecn|hardware|logs) ;;
+    all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs) ;;
     "")
         echo "Error: --only requires a non-empty scope" >&2
         show_usage >&2
@@ -236,6 +238,7 @@ mkdir -p \
     "$SCRIPT_DIR/monitor-results/flap-data" \
     "$SCRIPT_DIR/monitor-results/bgp-data" \
     "$SCRIPT_DIR/monitor-results/evpn-data" \
+    "$SCRIPT_DIR/monitor-results/evpn-mh-data" \
     "$SCRIPT_DIR/monitor-results/dup-data" \
     "$SCRIPT_DIR/monitor-results/optical-data" \
     "$SCRIPT_DIR/monitor-results/ber-data" \
@@ -262,6 +265,7 @@ analysis_artifacts=(
     .lldpq-current.json
     .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
     bgp-analysis.html bgp_history.json
+    evpn-mh-analysis.html
     link-flap-analysis.html flap_history.json
     optical-analysis.html optical_history.json
     ber-analysis.html ber_history.json ber_baseline.json
@@ -281,6 +285,20 @@ analysis_artifacts_legacy_v1=(
     link-flap-analysis.html flap_history.json
     optical-analysis.html optical_history.json
     ber-analysis.html ber_history.json ber_baseline.json
+    hardware-analysis.html
+    log-analysis.html log_summary.json
+    duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+)
+
+# Snapshot schema used after PFC/ECN was introduced but before EVPN-MH.
+analysis_artifacts_legacy_v2=(
+    .lldpq-current.json
+    .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    bgp-analysis.html bgp_history.json
+    link-flap-analysis.html flap_history.json
+    optical-analysis.html optical_history.json
+    ber-analysis.html ber_history.json ber_baseline.json
+    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
     hardware-analysis.html
     log-analysis.html log_summary.json
     duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
@@ -461,7 +479,7 @@ PYTHON
 validate_analysis_backup_manifest() {
     local manifest="$analysis_backup_dir/manifest"
     local status relative extra expected expected_artifact backup count=0 valid=true
-    local current_schema=true legacy_schema=true
+    local current_schema=true legacy_schema_v1=true legacy_schema_v2=true
     local -A seen=()
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
 
@@ -496,11 +514,16 @@ validate_analysis_backup_manifest() {
     for expected_artifact in "${analysis_artifacts[@]}"; do
         [[ -n "${seen[$expected_artifact]+x}" ]] || current_schema=false
     done
-    [[ "$count" -eq "${#analysis_artifacts_legacy_v1[@]}" ]] || legacy_schema=false
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v1[@]}" ]] || legacy_schema_v1=false
     for expected_artifact in "${analysis_artifacts_legacy_v1[@]}"; do
-        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema=false
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v1=false
     done
-    [[ "$current_schema" == "true" || "$legacy_schema" == "true" ]]
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v2[@]}" ]] || legacy_schema_v2=false
+    for expected_artifact in "${analysis_artifacts_legacy_v2[@]}"; do
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v2=false
+    done
+    [[ "$current_schema" == "true" || "$legacy_schema_v1" == "true" ||
+       "$legacy_schema_v2" == "true" ]]
 }
 
 commit_analysis_state() {
@@ -997,6 +1020,9 @@ select_scope_web_overlays() {
                 bgp-analysis.html bgp_history.json bgp-data evpn-data
             )
             ;;
+        evpn-mh)
+            SCOPE_WEB_OVERLAYS=(evpn-mh-analysis.html evpn-mh-data)
+            ;;
         duplicate)
             SCOPE_WEB_OVERLAYS=(duplicate-analysis.html dup-data)
             ;;
@@ -1174,6 +1200,7 @@ clear_current_device_artifacts() {
         "$SCRIPT_DIR/monitor-results/${hostname}.html" \
         "$SCRIPT_DIR/monitor-results/bgp-data/${hostname}_bgp.txt" \
         "$SCRIPT_DIR/monitor-results/evpn-data/${hostname}_evpn.txt" \
+        "$SCRIPT_DIR/monitor-results/evpn-mh-data/${hostname}_evpn_mh.txt" \
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_dup.txt" \
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_fdb.txt" \
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_neigh.txt" \
@@ -1211,6 +1238,7 @@ split_collection_bundle() {
         --output HTML_OUTPUT "$stage_dir/html.body" \
         --output BGP_DATA "$stage_dir/bgp.txt" \
         --output EVPN_DATA "$stage_dir/evpn.txt" \
+        --output EVPN_MH_DATA "$stage_dir/evpn-mh.txt" \
         --output DUP_DATA "$stage_dir/dup.txt" \
         --output FDB_DATA "$stage_dir/fdb.txt" \
         --output NEIGH_DATA "$stage_dir/neigh.txt" \
@@ -1298,7 +1326,7 @@ try:
     payload = json.loads(marker_bytes.decode("utf-8"))
     base_keys = {"version", "status", "hostname", "records"}
     version = payload.get("version")
-    if version in {1, 2}:
+    if version in {1, 2, 4}:
         if set(payload) != base_keys:
             fail("device recovery marker has an unexpected schema")
     elif version == 3:
@@ -1350,11 +1378,32 @@ try:
         expected_sources = [
             os.path.join(stage_dir, name) for name in source_names
         ] + [None]
+    elif version == 4:
+        version_two_sources = (
+            legacy_source_names[:10] + ["pfc-ecn.txt"] + legacy_source_names[10:]
+        )
+        version_two_destinations = (
+            legacy_destinations[:10]
+            + [f"monitor-results/pfc-ecn-data/{hostname}_pfc_ecn.txt"]
+            + legacy_destinations[10:]
+        )
+        source_names = version_two_sources[:3] + ["evpn-mh.txt"] + version_two_sources[3:]
+        destinations = (
+            version_two_destinations[:3]
+            + [f"monitor-results/evpn-mh-data/{hostname}_evpn_mh.txt"]
+            + version_two_destinations[3:]
+        )
+        expected_sources = [
+            os.path.join(stage_dir, name) for name in source_names
+        ] + [None]
     else:
         scoped_layouts = {
             "bgp": [
                 ("bgp.txt", f"monitor-results/bgp-data/{hostname}_bgp.txt"),
                 ("evpn.txt", f"monitor-results/evpn-data/{hostname}_evpn.txt"),
+            ],
+            "evpn-mh": [
+                ("evpn-mh.txt", f"monitor-results/evpn-mh-data/{hostname}_evpn_mh.txt"),
             ],
             "duplicate": [
                 ("dup.txt", f"monitor-results/dup-data/{hostname}_dup.txt"),
@@ -1538,6 +1587,7 @@ commit_device_bundle() {
                 "$stage_dir/device.html"
                 "$stage_dir/bgp.txt"
                 "$stage_dir/evpn.txt"
+                "$stage_dir/evpn-mh.txt"
                 "$stage_dir/dup.txt"
                 "$stage_dir/fdb.txt"
                 "$stage_dir/neigh.txt"
@@ -1553,6 +1603,7 @@ commit_device_bundle() {
                 "$SCRIPT_DIR/monitor-results/${hostname}.html"
                 "$SCRIPT_DIR/monitor-results/bgp-data/${hostname}_bgp.txt"
                 "$SCRIPT_DIR/monitor-results/evpn-data/${hostname}_evpn.txt"
+                "$SCRIPT_DIR/monitor-results/evpn-mh-data/${hostname}_evpn_mh.txt"
                 "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_dup.txt"
                 "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_fdb.txt"
                 "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_neigh.txt"
@@ -1573,6 +1624,10 @@ commit_device_bundle() {
                 "$SCRIPT_DIR/monitor-results/bgp-data/${hostname}_bgp.txt"
                 "$SCRIPT_DIR/monitor-results/evpn-data/${hostname}_evpn.txt"
             )
+            ;;
+        evpn-mh)
+            sources=("$stage_dir/evpn-mh.txt")
+            destinations=("$SCRIPT_DIR/monitor-results/evpn-mh-data/${hostname}_evpn_mh.txt")
             ;;
         duplicate)
             sources=("$stage_dir/dup.txt" "$stage_dir/fdb.txt" "$stage_dir/neigh.txt")
@@ -1635,7 +1690,7 @@ source_count = int(sys.argv[6])
 sources = [os.path.abspath(value) for value in sys.argv[7:7 + source_count]]
 destinations = [os.path.abspath(value) for value in sys.argv[7 + source_count:]]
 valid_scopes = {
-    "all", "bgp", "duplicate", "flap", "optical", "ber",
+    "all", "bgp", "evpn-mh", "duplicate", "flap", "optical", "ber",
     "pfc-ecn", "hardware", "logs",
 }
 if scope not in valid_scopes:
@@ -1713,7 +1768,7 @@ descriptor, temporary = tempfile.mkstemp(
 try:
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         payload = {
-            "version": 2,
+            "version": 4,
             "status": "rollback-required",
             "hostname": hostname,
             "records": records,
@@ -1774,15 +1829,15 @@ if len(marker_bytes) != marker_stat.st_size:
 payload = json.loads(marker_bytes.decode("utf-8"))
 records = payload.get("records")
 base_keys = {"version", "status", "hostname", "records"}
-valid_v2 = (
+valid_v4 = (
     scope == "all" and set(payload) == base_keys
-    and payload.get("version") == 2
+    and payload.get("version") == 4
 )
 valid_v3 = (
     scope != "all" and set(payload) == base_keys | {"scope"}
     and payload.get("version") == 3 and payload.get("scope") == scope
 )
-if (not (valid_v2 or valid_v3)
+if (not (valid_v4 or valid_v3)
         or payload.get("status") != "rollback-required"
         or not isinstance(records, list) or len(records) != len(destinations)):
     raise SystemExit("invalid device recovery authority")
@@ -1893,15 +1948,15 @@ with open(marker, "r", encoding="utf-8") as handle:
     payload = json.load(handle)
 records = payload.get("records")
 base_keys = {"version", "status", "hostname", "records"}
-valid_v2 = (
+valid_v4 = (
     scope == "all" and set(payload) == base_keys
-    and payload.get("version") == 2
+    and payload.get("version") == 4
 )
 valid_v3 = (
     scope != "all" and set(payload) == base_keys | {"scope"}
     and payload.get("version") == 3 and payload.get("scope") == scope
 )
-if (not (valid_v2 or valid_v3)
+if (not (valid_v4 or valid_v3)
         or payload.get("status") != "rollback-required"
         or not isinstance(records, list) or len(records) != len(destinations)):
     raise SystemExit("invalid device recovery authority before backup sync")
@@ -2433,7 +2488,120 @@ EOF
         _lldpq_timing_end EVPN_DATA
 
         # =====================================================================
-        # SECTION 2c: Duplicate IP/MAC Data (EVPN dup-detection + FDB + neighbours)
+        # SECTION 2c: EVPN Multi-Homing (ESI, BGP EAD, bond and LACP state)
+        # =====================================================================
+        echo "===EVPN_MH_DATA_START==="
+        if _lldpq_scope_selected evpn-mh; then
+        _evpn_mh_collection_utc=$(date -u "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
+        echo "__LLDPQ_EVPN_MH_COLLECTION_UTC__:${_evpn_mh_collection_utc:-UNKNOWN}"
+        echo "__LLDPQ_EVPN_MH_FORMAT__:1"
+
+        echo "=== EVPN MH GLOBAL JSON ==="
+        if _lldpq_run_bounded nv show evpn multihoming -o json \
+                > "$_lldpq_snapshot_dir/evpn-mh-global" 2>/dev/null; then
+            cat "$_lldpq_snapshot_dir/evpn-mh-global"
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:GLOBAL:OK"
+        else
+            echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_GLOBAL"
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:GLOBAL:ERROR"
+        fi
+
+        echo "=== EVPN MH ESI JSON ==="
+        _evpn_mh_local_count=0
+        if _lldpq_run_bounded nv show evpn multihoming esi -o json \
+                > "$_lldpq_snapshot_dir/evpn-mh-esi" 2>/dev/null; then
+            cat "$_lldpq_snapshot_dir/evpn-mh-esi"
+            _evpn_mh_local_count=$(
+                grep -c "\"local-interface\"" "$_lldpq_snapshot_dir/evpn-mh-esi" 2>/dev/null
+            ) || _evpn_mh_local_count=0
+            case "$_evpn_mh_local_count" in
+                ""|*[!0-9]*) _evpn_mh_local_count=0 ;;
+            esac
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:ESI:OK"
+        else
+            echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_ESI"
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:ESI:ERROR"
+        fi
+        echo "__LLDPQ_EVPN_MH_LOCAL_ESI__:${_evpn_mh_local_count}"
+
+        if [ "$_evpn_mh_local_count" -gt 0 ]; then
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:DETAIL:ACTIVE"
+
+            echo "=== EVPN MH BGP ESI JSON ==="
+            if _lldpq_run_bounded nv show evpn multihoming bgp-info esi -o json \
+                    > "$_lldpq_snapshot_dir/evpn-mh-bgp-esi" 2>/dev/null; then
+                cat "$_lldpq_snapshot_dir/evpn-mh-bgp-esi"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BGP_ESI:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_BGP_ESI"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BGP_ESI:ERROR"
+            fi
+
+            echo "=== EVPN MH ES EVI TEXT ==="
+            if _lldpq_run_bounded sudo vtysh -c "show evpn es-evi"; then
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:ES_EVI:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_ES_EVI"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:ES_EVI:ERROR"
+            fi
+
+            echo "=== EVPN MH BGP ES EVI TEXT ==="
+            if _lldpq_run_bounded sudo vtysh -c "show bgp l2vpn evpn es-evi"; then
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BGP_ES_EVI:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_BGP_ES_EVI"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BGP_ES_EVI:ERROR"
+            fi
+
+            echo "=== EVPN MH INTERFACES APPLIED JSON ==="
+            if _lldpq_run_bounded nv show interface --applied -o json; then
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:INTERFACES:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_INTERFACES"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:INTERFACES:ERROR"
+            fi
+
+            echo "=== EVPN MH LINK DETAIL JSON ==="
+            if _lldpq_run_bounded ip -d -j link show; then
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:LINKS:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_LINKS"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:LINKS:ERROR"
+            fi
+
+            echo "=== EVPN MH BYPASS STATE ==="
+            _evpn_mh_bypass_ok=true
+            for _evpn_mh_bypass_path in /sys/class/net/*/bonding_slave/ad_rx_bypass; do
+                [ -e "$_evpn_mh_bypass_path" ] || continue
+                _evpn_mh_member=${_evpn_mh_bypass_path#/sys/class/net/}
+                _evpn_mh_member=${_evpn_mh_member%%/bonding_slave/*}
+                _evpn_mh_master=$(
+                    basename "$(readlink -f "/sys/class/net/${_evpn_mh_member}/master" 2>/dev/null)" \
+                        2>/dev/null
+                ) || _evpn_mh_master=""
+                if [ -z "$_evpn_mh_master" ] ||
+                   ! _evpn_mh_bypass_value=$(cat "$_evpn_mh_bypass_path" 2>/dev/null); then
+                    _evpn_mh_bypass_ok=false
+                    continue
+                fi
+                printf "%s|%s|%s\n" \
+                    "$_evpn_mh_master" "$_evpn_mh_member" "$_evpn_mh_bypass_value"
+            done
+            if [ "$_evpn_mh_bypass_ok" = "true" ]; then
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BYPASS:OK"
+            else
+                echo "__LLDPQ_COLLECTION_ERROR__:EVPN_MH_BYPASS"
+                echo "__LLDPQ_EVPN_MH_COVERAGE__:BYPASS:ERROR"
+            fi
+        else
+            echo "__LLDPQ_EVPN_MH_COVERAGE__:DETAIL:SKIPPED_NO_LOCAL_ESI"
+        fi
+        fi
+        echo "===EVPN_MH_DATA_END==="
+        _lldpq_timing_end EVPN_MH_DATA
+
+        # =====================================================================
+        # SECTION 2d: Duplicate IP/MAC Data (EVPN dup-detection + FDB + neighbours)
         # =====================================================================
         echo "===DUP_DATA_START==="
         if _lldpq_scope_selected duplicate; then
@@ -3529,6 +3697,7 @@ validate_analysis_outputs() {
         all)
             required=(
                 bgp-analysis.html bgp_history.json
+                evpn-mh-analysis.html
                 link-flap-analysis.html flap_history.json
                 ber-analysis.html ber_history.json ber_baseline.json
                 pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
@@ -3549,6 +3718,9 @@ validate_analysis_outputs() {
         bgp)
             required=(bgp-analysis.html bgp_history.json)
             json_files=(bgp_history.json)
+            ;;
+        evpn-mh)
+            required=(evpn-mh-analysis.html)
             ;;
         duplicate)
             required=(
@@ -3618,6 +3790,9 @@ analysis_output_marker="$analysis_log_dir/.analysis-start"
 analyzer_jobs_start=$(date +%s)
 if scope_selected bgp; then
     start_analysis bgp python3 process_bgp_data.py
+fi
+if scope_selected evpn-mh; then
+    start_analysis evpn-mh python3 process_evpn_mh_data.py
 fi
 if scope_selected flap; then
     start_analysis flap python3 process_flap_data.py

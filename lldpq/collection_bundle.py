@@ -23,6 +23,7 @@ SECTIONS: Tuple[str, ...] = (
     "HTML_OUTPUT",
     "BGP_DATA",
     "EVPN_DATA",
+    "EVPN_MH_DATA",
     "DUP_DATA",
     "FDB_DATA",
     "NEIGH_DATA",
@@ -48,6 +49,12 @@ ISOLATED_SECTION_ERROR_PATTERNS = {
     ),
     "EVPN_DATA": (
         re.compile(rb"^EVPN_(?:VNI|TEMPFILE|ROUTES)$"),
+    ),
+    "EVPN_MH_DATA": (
+        re.compile(
+            rb"^EVPN_MH_(?:GLOBAL|ESI|BGP_ESI|ES_EVI|BGP_ES_EVI|"
+            rb"INTERFACES|LINKS|BYPASS)$"
+        ),
     ),
     "FDB_DATA": (
         re.compile(rb"^FDB$"),

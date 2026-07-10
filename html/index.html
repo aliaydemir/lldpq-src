@@ -641,6 +641,10 @@
                 <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4M12,6A6,6 0 0,0 6,12A6,6 0 0,0 12,18A6,6 0 0,0 18,12A6,6 0 0,0 12,6M12,8A4,4 0 0,1 16,12A4,4 0 0,1 12,16A4,4 0 0,1 8,12A4,4 0 0,1 12,8Z"/></svg></span>
                 <span class="menu-text">BGP</span>
             </a>
+            <a href="/monitor-results/evpn-mh-analysis.html" target="content-iframe" title="EVPN Multi-Homing Analysis" class="menu-item">
+                <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M7.5,4A3.5,3.5 0 0,1 11,7.5C11,8.15 10.82,8.76 10.5,9.28L14.72,13.5C15.24,13.18 15.85,13 16.5,13A3.5,3.5 0 1,1 13,16.5C13,15.85 13.18,15.24 13.5,14.72L9.28,10.5C8.76,10.82 8.15,11 7.5,11A3.5,3.5 0 1,1 7.5,4M7.5,6A1.5,1.5 0 1,0 7.5,9A1.5,1.5 0 0,0 7.5,6M16.5,15A1.5,1.5 0 1,0 16.5,18A1.5,1.5 0 0,0 16.5,15M16.5,4A3.5,3.5 0 1,1 13,7.5C13,6.85 13.18,6.24 13.5,5.72L11.86,4.08C12.35,3.54 12.91,3.08 13.54,2.72L14.72,3.9C15.24,3.58 15.85,3.4 16.5,3.4V4M16.5,6A1.5,1.5 0 1,0 16.5,9A1.5,1.5 0 0,0 16.5,6Z"/></svg></span>
+                <span class="menu-text">EVPN-MH</span>
+            </a>
             <a href="/monitor-results/duplicate-analysis.html" target="content-iframe" title="Duplicate IP / MAC Analysis" class="menu-item">
                 <span class="menu-icon"><svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg></span>
                 <span class="menu-text">Duplicate</span>
@@ -756,7 +760,7 @@
         const TRACKING_VIEW_STORAGE_KEY = 'lldpq_tracking_view';
         const TRACKING_VIEWS = new Set(['all', 'commissioning', 'handed_over']);
         const LIFECYCLE_SCOPED_REPORTS = new Set([
-            '/lldp.html', '/bgp-analysis.html', '/duplicate-analysis.html',
+            '/lldp.html', '/bgp-analysis.html', '/evpn-mh-analysis.html', '/duplicate-analysis.html',
             '/link-flap-analysis.html', '/optical-analysis.html', '/ber-analysis.html',
             '/pfc-ecn-analysis.html', '/hardware-analysis.html', '/log-analysis.html',
             '/assets.html', '/transceiver.html'

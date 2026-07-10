@@ -94,6 +94,7 @@
 
     var analysisScopes = {
         bgp: true,
+        'evpn-mh': true,
         duplicate: true,
         flap: true,
         optical: true,
@@ -261,6 +262,7 @@
 
     var analysisPages = {
         'bgp-analysis.html': { scope: 'bgp', label: 'BGP' },
+        'evpn-mh-analysis.html': { scope: 'evpn-mh', label: 'EVPN-MH' },
         'duplicate-analysis.html': { scope: 'duplicate', label: 'duplicate IP/MAC' },
         'link-flap-analysis.html': { scope: 'flap', label: 'link flap' },
         'optical-analysis.html': { scope: 'optical', label: 'optical' },
