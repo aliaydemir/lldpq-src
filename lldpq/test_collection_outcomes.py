@@ -25,6 +25,8 @@ from lldpq import process_log_data
 
 ROOT = Path(__file__).resolve().parents[1]
 MONITOR = (ROOT / "lldpq/monitor.sh").read_text(encoding="utf-8")
+CHECK_LLDP = (ROOT / "lldpq/check-lldp.sh").read_text(encoding="utf-8")
+FABRIC_SCAN = (ROOT / "lldpq/fabric-scan.sh").read_text(encoding="utf-8")
 HARDWARE_HTML = (ROOT / "lldpq/generate_hardware_html.py").read_text(
     encoding="utf-8"
 )
@@ -195,6 +197,11 @@ class CollectionOutcomeTests(unittest.TestCase):
         self.assertIn(".pipeline-inputs/collection_status.json", MONITOR)
         self.assertIn('2>"$ssh_error_file"', MONITOR)
         self.assertIn("last marker:", MONITOR)
+        handshake = MONITOR.index('printf "__LLDPQ_REMOTE_CONNECTED__')
+        snapshots = MONITOR.index("_lldpq_snapshot_dir=$(mktemp", handshake)
+        self.assertLess(handshake, snapshots)
+        self.assertNotIn("ssh $SSH_OPTS -q", MONITOR)
+        self.assertIn("COLLECTION_FAILURE_KIND=ssh-unavailable", MONITOR)
         optical = MONITOR.split(
             "# SECTION 4: Optical Transceiver Data", 1
         )[1].split("===OPTICAL_DATA_END===", 1)[0]
@@ -209,7 +216,7 @@ class CollectionOutcomeTests(unittest.TestCase):
         scoped = MONITOR.split(
             "Scoped collection could not reach", 1
         )[1].split("fi", 1)[0]
-        self.assertIn("ssh-unreachable", scoped)
+        self.assertIn('"$availability_reason"', scoped)
         self.assertIn("return $?", scoped)
         self.assertIn(
             'read_collection_outcomes()', HARDWARE_HTML
@@ -230,6 +237,92 @@ class CollectionOutcomeTests(unittest.TestCase):
         self.assertLess(manifest_write, publication)
         install_failure = MONITOR[install:manifest_write]
         self.assertIn("rollback_analysis_state", install_failure)
+
+    def test_missing_ssh_handshake_is_unavailable_even_when_ping_works(self):
+        match = re.search(r"(?ms)^process_device\(\) \{.*?^\}", MONITOR)
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as temporary:
+            unreachable = Path(temporary) / "unreachable"
+            script = match.group(0) + f"""
+scoped_run=false
+unreachable_hosts_file="{unreachable}"
+ping_test() {{ return 0; }}
+execute_commands_optimized() {{
+    COLLECTION_FAILURE_KIND=ssh-unavailable
+    return 255
+}}
+record_collection_status() {{
+    printf 'STATUS:%s:%s:%s:%s\\n' "$1" "$2" "$3" "$4"
+}}
+clear_current_device_artifacts() {{ return 0; }}
+write_unreachable_device_report() {{ return 0; }}
+process_device 192.0.2.10 user leaf1
+"""
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(
+                "STATUS:leaf1:unavailable:255:ssh-no-session",
+                completed.stdout,
+            )
+            self.assertEqual(
+                unreachable.read_text(encoding="utf-8"),
+                "192.0.2.10 leaf1\n",
+            )
+
+    def test_started_remote_collection_failure_remains_fatal(self):
+        match = re.search(r"(?ms)^process_device\(\) \{.*?^\}", MONITOR)
+        self.assertIsNotNone(match)
+        script = match.group(0) + """
+scoped_run=false
+unreachable_hosts_file=/dev/null
+ping_test() { return 1; }
+execute_commands_optimized() {
+    COLLECTION_FAILURE_KIND=ssh
+    return 255
+}
+record_collection_status() {
+    printf 'STATUS:%s:%s:%s:%s\\n' "$1" "$2" "$3" "$4"
+}
+clear_current_device_artifacts() { return 0; }
+write_unreachable_device_report() { return 0; }
+process_device 192.0.2.10 user leaf1
+"""
+        completed = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 255, completed.stderr)
+        self.assertIn("STATUS:leaf1:failed:255:ssh", completed.stdout)
+
+    def test_scheduled_fabric_scan_shares_pipeline_lock(self):
+        inherited = FABRIC_SCAN.index("global_lock_is_inherited=false")
+        pipeline_lock = FABRIC_SCAN.index('exec 9>"$GLOBAL_LOCK_FILE"')
+        fabric_lock = FABRIC_SCAN.index('exec 8>"$LOCK_FILE"')
+        self.assertLess(inherited, pipeline_lock)
+        self.assertLess(pipeline_lock, fabric_lock)
+        self.assertIn("LLDPQ_MONITOR_LOCK_HELD", FABRIC_SCAN)
+        self.assertIn("scheduled fabric scan skipped", FABRIC_SCAN)
+        partial = FABRIC_SCAN.split(
+            'if [[ ${#scan_failures[@]} -gt 0 ]]', 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("partial coverage", partial)
+        self.assertNotIn("exit 1", partial)
+
+    def test_lldp_cleanup_reaps_collectors_before_removing_stage(self):
+        cleanup = CHECK_LLDP.split("cleanup_check_lldp() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+        self.assertLess(cleanup.index('kill "$pid"'), cleanup.index("rm -f"))
+        self.assertLess(cleanup.index('wait "$pid"'), cleanup.index("rm -f"))
+        self.assertIn('tmp.${BASHPID:-$$}', CHECK_LLDP)
+        self.assertIn('collection_pids+=("$!")', CHECK_LLDP)
 
 
 if __name__ == "__main__":

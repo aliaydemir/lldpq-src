@@ -330,14 +330,29 @@ completed_count_file=$(mktemp)
 echo "0" > "$completed_count_file"
 postprocess_dir=""
 collection_dir=""
+declare -a collection_pids=()
 
 cleanup_check_lldp() {
+    local pid
+    # If the parent is interrupted, stop and reap every collector before its
+    # private generation directory is removed. Otherwise an orphaned SSH job
+    # can wake up later and write into a path that cleanup already deleted.
+    for pid in "${collection_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${collection_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    collection_pids=()
     rm -f "$unreachable_hosts_file" "$active_jobs_file" \
         "$completed_count_file" "$completed_count_file.lock"
     [[ -n "$postprocess_dir" ]] && rm -rf "$postprocess_dir"
     [[ -n "$collection_dir" ]] && rm -rf "$collection_dir"
 }
 trap cleanup_check_lldp EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 publish_web_file() {
     local source_file="$1" destination_file="$2" temp_file
@@ -755,7 +770,7 @@ execute_commands_optimized() {
     local hostname=$3
     
     local output_file="$collection_dir/${hostname}_lldp_result.ini"
-    local temporary_file="$collection_dir/.${hostname}.tmp.$$"
+    local temporary_file="$collection_dir/.${hostname}.tmp.${BASHPID:-$$}"
 
     # Single SSH connection collects everything into this run's private tree.
     if timeout 180 ssh $SSH_OPTS -T -q "$user@$device" "
@@ -892,6 +907,7 @@ for device in "${!devices[@]}"; do
     
     # Start job in background
     process_device "$device" "$user" "$hostname" 9>&- &
+    collection_pids+=("$!")
     
     job_count=$((job_count + 1))
     
@@ -904,6 +920,7 @@ done
 
 # Wait for all remaining jobs
 wait
+collection_pids=()
 
 echo ""
 echo ""

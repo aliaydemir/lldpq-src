@@ -2279,7 +2279,12 @@ EOF
     # Verbose output removed for performance
     local ssh_start=$(date +%s)
 
-    timeout 300 ssh $SSH_OPTS -q "$user@$device" '
+    timeout 300 ssh $SSH_OPTS "$user@$device" '
+        # Emit an immediate transport handshake before snapshots or analysis
+        # commands run.  ICMP is only a hint; this marker is the authoritative
+        # distinction between "SSH never established a remote shell" and
+        # "collection started remotely, then failed".
+        printf "__LLDPQ_REMOTE_CONNECTED__\n"
         HOSTNAME_VAR="'"$hostname"'"
         SKIP_OPTICAL="'"$SKIP_OPTICAL"'"
         SKIP_L1="'"$SKIP_L1"'"
@@ -3468,7 +3473,11 @@ EOF
     local ssh_status=$?
 
     if [[ $ssh_status -ne 0 ]]; then
-        local last_marker="" ssh_detail=""
+        local last_marker="" ssh_detail="" remote_connected=false
+        if [[ -f "$raw_file" ]] &&
+           grep -Fqx '__LLDPQ_REMOTE_CONNECTED__' "$raw_file" 2>/dev/null; then
+            remote_connected=true
+        fi
         if [[ -f "$raw_file" ]]; then
             last_marker=$(awk '
                 /^===[A-Z0-9_]+_(START|END)===$/ { marker=$0 }
@@ -3484,10 +3493,16 @@ EOF
                 }
             ' "$ssh_error_file" 2>/dev/null) || ssh_detail=""
         fi
-        COLLECTION_FAILURE_KIND=ssh
-        printf 'Data collection failed for %s (ssh status %s, last marker: %s)%s\n' \
-            "$hostname" "$ssh_status" "${last_marker:-none}" \
-            "${ssh_detail:+ — $ssh_detail}" >&2
+        if [[ "$remote_connected" == "true" ]]; then
+            COLLECTION_FAILURE_KIND=ssh
+            printf 'Data collection failed for %s (ssh status %s, last marker: %s)%s\n' \
+                "$hostname" "$ssh_status" "${last_marker:-none}" \
+                "${ssh_detail:+ — $ssh_detail}" >&2
+        else
+            COLLECTION_FAILURE_KIND=ssh-unavailable
+            printf 'SSH session unavailable for %s (status %s)%s\n' \
+                "$hostname" "$ssh_status" "${ssh_detail:+ — $ssh_detail}" >&2
+        fi
         rm -rf "$bundle_stage"
         return "$ssh_status"
     fi
@@ -3607,7 +3622,8 @@ process_device() {
     local device=$1
     local user=$2
     local hostname=$3
-    local ping_reachable=true collection_status COLLECTION_FAILURE_KIND=""
+    local ping_reachable=true collection_status availability_reason
+    local COLLECTION_FAILURE_KIND=""
 
     # ICMP is only a fast hint.  A dropped/filtered echo must not suppress a
     # valid SSH collection; the existing 300-second collection timeout remains
@@ -3620,22 +3636,25 @@ process_device() {
         collection_status=$?
     fi
 
-    if [[ "$ping_reachable" == "false" && \
-          "${COLLECTION_FAILURE_KIND:-}" == "ssh" ]]; then
+    if [[ "${COLLECTION_FAILURE_KIND:-}" == "ssh-unavailable" ]]; then
+        availability_reason=ssh-no-session
+        [[ "$ping_reachable" == "false" ]] && \
+            availability_reason=ssh-unreachable
         if [[ "$scoped_run" == "true" ]]; then
             echo "Scoped collection could not reach ${hostname}; preserving its previous artifacts" >&2
             record_collection_status \
-                "$hostname" unavailable "$collection_status" ssh-unreachable
+                "$hostname" unavailable "$collection_status" "$availability_reason"
             return $?
         fi
         echo "$device $hostname" >> "$unreachable_hosts_file"
         # Do not let a previous raw snapshot or per-device page look current.
-        # Both ICMP and the authoritative SSH attempt failed, so preserve the
-        # established explicit-unavailable behavior for this device.
+        # The remote SSH handshake never appeared, so no collection began.
+        # ICMP only refines the diagnostic reason; it cannot turn an absent
+        # SSH session into a fatal analyzer-generation failure.
         clear_current_device_artifacts "$hostname" || return 1
         if write_unreachable_device_report "$device" "$hostname"; then
             record_collection_status \
-                "$hostname" unavailable "$collection_status" ssh-unreachable
+                "$hostname" unavailable "$collection_status" "$availability_reason"
             return $?
         fi
         record_collection_status \
@@ -3643,9 +3662,9 @@ process_device() {
         return 1
     fi
 
-    # Ping succeeded, or SSH reached the device but returned an invalid bundle.
-    # Keep the prior fail-closed generation semantics for those collection
-    # errors instead of disguising them as an unreachable host.
+    # The SSH handshake was observed, or a local staging/commit operation
+    # failed. Keep fail-closed generation semantics once collection actually
+    # started instead of disguising a partial bundle as an unavailable host.
     record_collection_status \
         "$hostname" failed "$collection_status" \
         "${COLLECTION_FAILURE_KIND:-collection-failed}" || true

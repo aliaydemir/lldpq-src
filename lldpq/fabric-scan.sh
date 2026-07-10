@@ -42,6 +42,29 @@ if ! command -v flock >/dev/null 2>&1; then
     echo "fabric-scan requires flock (util-linux)" >&2
     exit 1
 fi
+
+# The main LLDPq pipeline invokes this scanner after report publication while
+# still holding descriptor 9.  Scheduled standalone scans must acquire that
+# same global lock first so their SSH fan-out cannot overlap asset, LLDP or
+# monitor collection.  Keep the dedicated fabric lock as the second lock in a
+# consistent global->fabric order.
+global_lock_is_inherited=false
+if [[ "${LLDPQ_MONITOR_LOCK_HELD:-0}" == "1" ]] && { : >&9; } 2>/dev/null; then
+    global_lock_is_inherited=true
+fi
+if [[ "$global_lock_is_inherited" != "true" ]]; then
+    GLOBAL_LOCK_FILE="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
+    exec 9>"$GLOBAL_LOCK_FILE" || {
+        echo "Could not open LLDPq pipeline lock: $GLOBAL_LOCK_FILE" >&2
+        exit 1
+    }
+    if ! flock -n 9; then
+        echo "LLDPq collection is running; scheduled fabric scan skipped" >&2
+        exit 75
+    fi
+    export LLDPQ_MONITOR_LOCK_HELD=1
+fi
+
 exec 8>"$LOCK_FILE" || {
     echo "Could not open fabric scan lock: $LOCK_FILE" >&2
     exit 1
@@ -853,7 +876,7 @@ print(f"Results: {sys.argv[2]}/")
 PYEOF
 
 if [[ ${#scan_failures[@]} -gt 0 ]]; then
-    echo "Fabric collection failures: ${scan_failures[*]}" >&2
-    exit 1
+    printf 'Fabric scan completed with partial coverage: %d device collections unavailable or stale\n' \
+        "${#scan_failures[@]}" >&2
 fi
 exit 0
