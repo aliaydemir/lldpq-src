@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -47,6 +49,32 @@ def manifest(path: Path, pipeline: str, statuses):
 
 
 class CollectionOutcomeTests(unittest.TestCase):
+    def test_shell_status_writer_uses_locked_file_not_stdout(self):
+        match = re.search(
+            r"(?ms)^record_collection_status\(\) \{.*?^\}$",
+            MONITOR,
+        )
+        self.assertIsNotNone(match)
+        with tempfile.TemporaryDirectory() as temporary:
+            status_file = Path(temporary) / "status.tsv"
+            script = (
+                match.group(0)
+                + f'\ncollection_status_file="{status_file}"\n'
+                + "record_collection_status leaf1 current 0 ok\n"
+            )
+            completed = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(
+                status_file.read_text(encoding="utf-8"),
+                "leaf1\tcurrent\t0\tok\n",
+            )
+
     def test_manifest_is_generation_bound_and_validated(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "status.json"

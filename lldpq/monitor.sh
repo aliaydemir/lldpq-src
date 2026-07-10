@@ -1207,7 +1207,8 @@ record_collection_status() {
     [[ "$reason" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
     (
         flock -x 8 || exit 1
-        printf '%s\t%s\t%s\t%s\n' "$hostname" "$status" "$code" "$reason"
+        printf '%s\t%s\t%s\t%s\n' \
+            "$hostname" "$status" "$code" "$reason" >&8
     ) 8>>"$collection_status_file"
 }
 
