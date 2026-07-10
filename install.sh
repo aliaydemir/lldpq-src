@@ -34,7 +34,7 @@
 # │   • Check/stop Apache2 (port 80 conflict)                │
 # │   • apt install (nginx, fcgiwrap, python3, sshpass, etc) │
 # │   • Download Monaco Editor (offline code editor)         │
-# │   • pip install (requests, ruamel.yaml)                  │
+# │   • apt install Python requests + ruamel.yaml            │
 # ├──────────────────────────────────────────────────────────┤
 # │ UPDATE MODE ONLY:                                        │
 # │   • Safely parse /etc/lldpq.conf → save existing settings│
@@ -3188,6 +3188,14 @@ DEPENDENCIES
             missing_commands+=" python3-yaml"
             packages+=" python3-yaml"
         fi
+        if ! sudo -H -u "$LLDPQ_USER" python3 -c 'import ruamel.yaml' >/dev/null 2>&1; then
+            missing_commands+=" python3-ruamel.yaml"
+            packages+=" python3-ruamel.yaml"
+        fi
+        if ! sudo -H -u "$LLDPQ_USER" python3 -c 'import requests' >/dev/null 2>&1; then
+            missing_commands+=" python3-requests"
+            packages+=" python3-requests"
+        fi
     fi
 
     [[ -n "$missing_commands" ]] || {
@@ -3239,6 +3247,8 @@ systemd-analyze systemd
 DEPENDENCIES
     sudo -H -u "$LLDPQ_USER" python3 -m pip --version >/dev/null 2>&1 || return 1
     sudo -H -u "$LLDPQ_USER" python3 -c 'import yaml' >/dev/null 2>&1 || return 1
+    sudo -H -u "$LLDPQ_USER" python3 -c 'import ruamel.yaml' >/dev/null 2>&1 || return 1
+    sudo -H -u "$LLDPQ_USER" python3 -c 'import requests' >/dev/null 2>&1 || return 1
     echo "  Required operating-system runtime dependencies installed and verified"
 }
 
@@ -3597,16 +3607,22 @@ ensure_ruamel_for_lldpq_user() {
     fi
     if [[ "$INSTALL_MODE" == "update" && "${LLDPQ_OFFLINE_UPDATE:-0}" == "1" ]]; then
         echo "[!] Offline update preflight: ruamel.yaml is unavailable to $LLDPQ_USER" >&2
-        echo "    Install it for that account before retrying (for example: sudo -H -u $LLDPQ_USER python3 -m pip install --user ruamel.yaml)." >&2
+        echo "    Install the OS package before retrying: sudo apt-get install python3-ruamel.yaml" >&2
         echo "    No package download was attempted and the existing runtime was not changed." >&2
         return 1
     fi
-    echo "  Installing ruamel.yaml for $LLDPQ_USER..."
-    sudo -H -u "$LLDPQ_USER" python3 -m pip install --user ruamel.yaml \
-        >/dev/null 2>&1 || true
+    echo "  Installing OS package python3-ruamel.yaml..."
+    sudo apt-get update || {
+        echo "[!] Could not refresh package metadata for ruamel.yaml" >&2
+        return 1
+    }
+    sudo apt-get install -y python3-ruamel.yaml || {
+        echo "[!] Could not install python3-ruamel.yaml" >&2
+        return 1
+    }
     if ! sudo -H -u "$LLDPQ_USER" python3 -c 'import ruamel.yaml' 2>/dev/null; then
         echo "[!] ruamel.yaml is unavailable to $LLDPQ_USER; Notifications cannot preserve comments safely" >&2
-        echo "    Install ruamel.yaml for that user, then rerun install.sh" >&2
+        echo "    The selected python3 does not expose the installed OS package" >&2
         return 1
     fi
 }
@@ -4484,7 +4500,7 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
 
     step "Installing required packages..."
     sudo apt update || { echo "[!] apt update failed"; exit 1; }
-    sudo apt install -y nginx fcgiwrap python3 python3-pip python3-yaml util-linux bsdextrautils \
+    sudo apt install -y nginx fcgiwrap python3 python3-pip python3-yaml python3-ruamel.yaml python3-requests util-linux bsdextrautils \
         openssh-client sshpass iproute2 iputils-ping procps curl unzip acl isc-dhcp-server || {
         echo "[!] Package installation failed"
         echo "    Try running: sudo apt --fix-broken install"
@@ -4521,9 +4537,7 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
         echo "  Monaco Editor already exists, skipping download"
     fi
 
-    echo "  Installing Python packages for $LLDPQ_USER..."
-    sudo -H -u "$LLDPQ_USER" python3 -m pip install --user requests ruamel.yaml \
-        >/dev/null 2>&1 || true
+    echo "  Required Python packages installed from OS packages"
 fi
 
 # Update mode skips the fresh-install apt block. Verify the complete runtime
@@ -4543,9 +4557,15 @@ if [[ "$INSTALL_MODE" == "update" ]] && \
         echo "    Install it for that account before retrying; no download was attempted and the existing runtime was not changed." >&2
         exit 1
     fi
-    echo "  Installing requests for $LLDPQ_USER..."
-    sudo -H -u "$LLDPQ_USER" python3 -m pip install --user requests \
-        >/dev/null 2>&1 || true
+    echo "  Installing OS package python3-requests..."
+    sudo apt-get update >/dev/null || {
+        echo "[!] Could not refresh package metadata for requests" >&2
+        exit 1
+    }
+    sudo apt-get install -y python3-requests >/dev/null || {
+        echo "[!] Could not install python3-requests" >&2
+        exit 1
+    }
     sudo -H -u "$LLDPQ_USER" python3 -c 'import requests' 2>/dev/null || {
         echo "[!] Python requests remains unavailable to $LLDPQ_USER" >&2
         exit 1

@@ -484,7 +484,35 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
-    _atomic_write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+    """Stream compact JSON to the atomic stage without duplicating it in RAM."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        mode = (path.stat().st_mode & 0o7777) if path.exists() else 0o664
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(value, handle, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = ""
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def _fmt_total(value: Optional[int]) -> str:
