@@ -11,13 +11,21 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from lldpq.collection_freshness import read_collection_outcomes
+from lldpq.collection_freshness import (
+    AssetStatusMap,
+    _read_collection_outcomes_cached,
+    is_current_collection,
+    read_collection_outcomes,
+)
 from lldpq import process_hardware_data
 from lldpq import process_log_data
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MONITOR = (ROOT / "lldpq/monitor.sh").read_text(encoding="utf-8")
+HARDWARE_HTML = (ROOT / "lldpq/generate_hardware_html.py").read_text(
+    encoding="utf-8"
+)
 
 
 def manifest(path: Path, pipeline: str, statuses):
@@ -58,6 +66,25 @@ class CollectionOutcomeTests(unittest.TestCase):
             }):
                 with self.assertRaisesRegex(ValueError, "invalid collection"):
                     read_collection_outcomes()
+
+    def test_manifest_unavailable_rejects_preserved_raw_as_current(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "leaf1.txt"
+            raw.write_text("old-but-fresh", encoding="utf-8")
+            status = root / "status.json"
+            manifest(status, "pipeline-1", {"leaf1": "unavailable"})
+            statuses = AssetStatusMap(
+                {"leaf1": "OK"}, snapshot_valid=True, authoritative=True
+            )
+            _read_collection_outcomes_cached.cache_clear()
+            with mock.patch.dict(os.environ, {
+                "LLDPQ_COLLECTION_STATUS_FILE": str(status),
+                "LLDPQ_PIPELINE_ID": "pipeline-1",
+            }):
+                self.assertFalse(is_current_collection(
+                    str(raw), "leaf1", (statuses, 0.0, True)
+                ))
 
     def test_hardware_unavailable_device_is_partial_not_fatal(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -146,6 +173,35 @@ class CollectionOutcomeTests(unittest.TestCase):
         self.assertIn("Retry once", optical)
         self.assertEqual(optical.count("sudo ethtool -m"), 2)
         self.assertIn("_optical_retry_limit", optical)
+        self.assertIn(
+            ".pipeline-inputs/collection_status.json", MONITOR.split(
+                "analysis_artifacts=(", 1
+            )[1].split(")", 1)[0]
+        )
+        scoped = MONITOR.split(
+            "Scoped collection could not reach", 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("ssh-unreachable", scoped)
+        self.assertIn("return $?", scoped)
+        self.assertIn(
+            'read_collection_outcomes()', HARDWARE_HTML
+        )
+        self.assertIn(
+            "len(collection_outcomes)", HARDWARE_HTML
+        )
+        validation = MONITOR.index(
+            'if ! validate_analysis_outputs "$analysis_output_marker"; then'
+        )
+        install = MONITOR.index(
+            "if ! install_collection_status_manifest; then"
+        )
+        manifest_write = MONITOR.index("if ! write_current_manifest; then")
+        publication = MONITOR.index("if ! publish_monitor_results; then")
+        self.assertLess(validation, install)
+        self.assertLess(install, manifest_write)
+        self.assertLess(manifest_write, publication)
+        install_failure = MONITOR[install:manifest_write]
+        self.assertIn("rollback_analysis_state", install_failure)
 
 
 if __name__ == "__main__":

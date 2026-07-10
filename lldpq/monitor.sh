@@ -3624,8 +3624,8 @@ process_device() {
         if [[ "$scoped_run" == "true" ]]; then
             echo "Scoped collection could not reach ${hostname}; preserving its previous artifacts" >&2
             record_collection_status \
-                "$hostname" unavailable "$collection_status" ssh-unreachable || true
-            return "$collection_status"
+                "$hostname" unavailable "$collection_status" ssh-unreachable
+            return $?
         fi
         echo "$device $hostname" >> "$unreachable_hosts_file"
         # Do not let a previous raw snapshot or per-device page look current.
@@ -3843,6 +3843,17 @@ export LLDPQ_COLLECTION_STATUS_FILE="$collection_status_manifest"
 if [ "${#collection_failures[@]}" -gt 0 ]; then
     failure_text="collection jobs failed: ${collection_failures[*]}"
     mark_reports_stale "$failure_text"
+    exit 1
+fi
+if ! python3 - "$collection_status_manifest" <<'PYTHON'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+raise SystemExit(0 if payload.get("counts", {}).get("failed") == 0 else 1)
+PYTHON
+then
+    mark_reports_stale "collection outcome manifest contains failed devices"
     exit 1
 fi
 

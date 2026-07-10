@@ -1395,7 +1395,11 @@ class LogAnalyzer:
         collected_hosts = {
             filename.removesuffix('_logs.txt') for filename in log_files
         }
-        self.expected_devices = set(inventory_hosts or collected_hosts)
+        self.expected_devices = set(
+            collection_outcomes
+            if collection_outcomes is not None
+            else (inventory_hosts or collected_hosts)
+        )
         self.current_devices = set(collected_hosts)
         missing_hosts = sorted(expected_current_hosts - collected_hosts)
         if missing_hosts:

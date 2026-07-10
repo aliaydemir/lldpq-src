@@ -16,7 +16,11 @@ import os
 import re
 import html
 from datetime import datetime, timezone
-from collection_freshness import is_current_collection, read_asset_snapshot
+from collection_freshness import (
+    is_current_collection,
+    read_asset_snapshot,
+    read_collection_outcomes,
+)
 
 try:
     from device_names import canonical
@@ -808,6 +812,7 @@ def generate_hardware_html():
     latest_devices = {}
     hardware_data_dir = "monitor-results/hardware-data"
     asset_snapshot = read_asset_snapshot()
+    collection_outcomes = read_collection_outcomes()
     current_device_files = []
     if os.path.exists(hardware_data_dir):
         current_device_files = [
@@ -876,7 +881,11 @@ def generate_hardware_html():
     asset_statuses = asset_snapshot[0] if asset_snapshot else {}
     # Coverage represents the whole inventory, including devices that were
     # unreachable in this run; current data still contains only OK devices.
-    expected_devices = len(asset_statuses) or total_devices
+    expected_devices = (
+        len(collection_outcomes)
+        if collection_outcomes is not None
+        else (len(asset_statuses) or total_devices)
+    )
     unknown_device_count = len(summary['unknown_devices'])
     coverage_partial = (
         current_device_count < expected_devices or unknown_device_count > 0

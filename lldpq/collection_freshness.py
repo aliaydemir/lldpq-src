@@ -8,6 +8,7 @@ import tempfile
 import html
 import json
 import math
+from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
@@ -105,22 +106,16 @@ def asset_snapshot_is_authoritative(asset_snapshot) -> bool:
     )
 
 
-def read_collection_outcomes() -> Optional[Dict[str, str]]:
-    """Return this monitor generation's explicit per-device outcomes.
-
-    Older/direct analyzer invocations have no environment path and retain the
-    legacy assets-based behavior. A configured but malformed/mixed-generation
-    manifest is a structural error and must fail the analyzer.
-    """
-    configured = os.environ.get("LLDPQ_COLLECTION_STATUS_FILE")
-    if not configured:
-        return None
+@lru_cache(maxsize=8)
+def _read_collection_outcomes_cached(
+    configured: str, pipeline_id: str
+) -> Dict[str, str]:
     path = Path(configured)
     payload = json.loads(path.read_text(encoding="utf-8"))
     if (
         not isinstance(payload, dict)
         or payload.get("version") != 1
-        or payload.get("pipeline_id") != os.environ.get("LLDPQ_PIPELINE_ID")
+        or payload.get("pipeline_id") != pipeline_id
         or not isinstance(payload.get("devices"), dict)
         or payload.get("expected_devices") != len(payload["devices"])
     ):
@@ -144,6 +139,20 @@ def read_collection_outcomes() -> Optional[Dict[str, str]]:
     ):
         raise ValueError("invalid collection outcome counts")
     return outcomes
+
+
+def read_collection_outcomes() -> Optional[Dict[str, str]]:
+    """Return this monitor generation's explicit per-device outcomes.
+
+    Older/direct analyzer invocations have no environment path and retain the
+    legacy assets-based behavior. A configured but malformed/mixed-generation
+    manifest is a structural error and must fail the analyzer.
+    """
+    configured = os.environ.get("LLDPQ_COLLECTION_STATUS_FILE")
+    if not configured:
+        return None
+    pipeline_id = os.environ.get("LLDPQ_PIPELINE_ID", "")
+    return dict(_read_collection_outcomes_cached(configured, pipeline_id))
 
 
 def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float, bool]:
@@ -254,6 +263,12 @@ def is_current_collection(
     statuses, asset_mtime, assets_available = (
         asset_snapshot if asset_snapshot is not None else read_asset_snapshot()
     )
+    collection_outcomes = read_collection_outcomes()
+    if (
+        collection_outcomes is not None
+        and collection_outcomes.get(hostname) != "current"
+    ):
+        return False
     if assets_available:
         # assets.ini is the inventory snapshot for this run. Missing hosts are
         # retired/not-current; non-OK hosts did not produce trustworthy data.
