@@ -174,13 +174,15 @@ __LLDPQ_EVPN_MH_COVERAGE__:BYPASS:OK
             coverage_failures={},
             generated_at=datetime.now(timezone.utc),
         )
-        self.assertLess(page.index("<th>Device</th>"), page.index("<th>Peer Device</th>"))
+        self.assertLess(page.index(">Device<span"), page.index(">Peer Device<span"))
         self.assertIn('id="deviceSearch"', page)
         self.assertIn('id="run-analysis"', page)
         self.assertIn("/p2p-alias.js", page)
         self.assertIn("/css/analysis-guard.js", page)
         self.assertIn('data-analysis-summary="evpn-mh"', page)
         self.assertIn('id="evpn-mh-table"', page)
+        self.assertEqual(page.count('class="sortable"'), 10)
+        self.assertIn("function sortTable(column,header)", page)
 
 
 class EvpnMhIntegrationContractTests(unittest.TestCase):
