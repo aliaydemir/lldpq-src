@@ -399,6 +399,12 @@ Admin-only **Setup** page (`http://<server>/setup.html`) — a guided, 11-step w
 | 10 | Maintenance | Disk-usage report & safe cleanup of old update backups |
 | 11 | Update LLDPq | Online Git update or validated offline tarball update, with live output |
 
+Step 8 also exposes the update-safe dashboard instance name. `LLDPQ_HOSTNAME`
+defaults to `lldpq` and changes only the title above the main dashboard logo;
+it does not modify the operating-system hostname. The value is stored in
+`/etc/lldpq.conf`, survives native and Docker updates, and is included in the
+portable Setup preferences.
+
 ### Display Aliases (step 5)
 
 Edit `display-aliases.json` without leaving Setup. Device names and interface/port names are separate maps from canonical names to display labels. The editor supports structured rows, bulk paste (`display-label<TAB>canonical-name`), and JSON upload/download. Aliases affect presentation only; collected source data and topology validation remain unchanged.
@@ -791,6 +797,12 @@ The following optional values tune bounded collection:
 - `OPTICAL_COLLECTION_BUDGET_SECONDS=120` — DOM collection budget per switch
 - `OPTICAL_PORT_TIMEOUT_SECONDS=10` — timeout for one DOM read
 - `MONITOR_TIMING=true` — emit per-device section timings
+
+Verbose `lldpq -` runs also print one lightweight **Analyzer timings
+(parallel)** block with the elapsed time of every analyzer. This is always
+measured and does not require `MONITOR_TIMING`; normal `lldpq` runs remain
+quiet. `MONITOR_TIMING=true` is the deeper diagnostic mode for per-device SSH,
+bundle parsing, and individual collection-section timings.
 
 The separate transceiver firmware scan uses
 `TRANSCEIVER_FW_MIN_INTERVAL=1800`, `TRANSCEIVER_FW_MAX_PARALLEL=10`,

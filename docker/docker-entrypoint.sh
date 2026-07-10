@@ -952,8 +952,9 @@ chmod 664 /var/lib/dhcp/dhcpd.leases
 chown lldpq:www-data /etc/dhcp/dhcpd.hosts
 chmod 664 /etc/dhcp/dhcpd.hosts
 
-# Default post-provision settings in lldpq.conf (if not present)
-for key_val in "AUTO_BASE_CONFIG=true" "AUTO_ZTP_DISABLE=true" "AUTO_SET_HOSTNAME=true"; do
+# Default display/post-provision settings in lldpq.conf (if not present)
+for key_val in "LLDPQ_HOSTNAME=lldpq" "AUTO_BASE_CONFIG=true" \
+               "AUTO_ZTP_DISABLE=true" "AUTO_SET_HOSTNAME=true"; do
     key="${key_val%%=*}"
     _set_lldpq_conf_value "$key" "${key_val#*=}" true
 done

@@ -26,7 +26,8 @@ fi
 [[ -n "${WEB_ROOT:-}" ]] || lldpq_fatal "WEB_ROOT is empty"
 LLDPQ_USER="${LLDPQ_USER:-$(id -un)}"
 
-# Parse flags: lldpq - (verbose), lldpq -s (skip optical)
+# Parse flags: lldpq - (verbose, including per-analyzer timing),
+# lldpq -s (skip optical).
 QUIET=true
 MONITOR_FLAGS=()
 for arg in "$@"; do

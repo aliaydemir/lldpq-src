@@ -351,7 +351,7 @@ load_lldpq_config() {
         # Only variables that LLDPq itself writes/consumes are accepted.  This
         # also prevents assignment to shell internals such as PATH or BASH_ENV.
         case "$key" in
-            LLDPQ_DIR|LLDPQ_USER|LLDPQ_SRC|LLDPQ_CRON|GETCONF_CRON|WEB_ROOT|\
+            LLDPQ_DIR|LLDPQ_USER|LLDPQ_SRC|LLDPQ_HOSTNAME|LLDPQ_CRON|GETCONF_CRON|WEB_ROOT|\
             ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR|DHCP_HOSTS_FILE|DHCP_CONF_FILE|\
             DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
             AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|MONITOR_TIMING|\
@@ -5432,6 +5432,13 @@ echo "# LLDPq Configuration" | sudo tee /etc/lldpq.conf > /dev/null
 echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "LLDPQ_USER=$LLDPQ_USER" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
+_LLDPQ_HOSTNAME_TO_WRITE="${LLDPQ_HOSTNAME:-lldpq}"
+if [[ ! "$_LLDPQ_HOSTNAME_TO_WRITE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    echo "  [!] Invalid LLDPQ_HOSTNAME; using default 'lldpq'" >&2
+    _LLDPQ_HOSTNAME_TO_WRITE=lldpq
+fi
+printf 'LLDPQ_HOSTNAME=%s\n' "$_LLDPQ_HOSTNAME_TO_WRITE" | \
+    sudo tee -a /etc/lldpq.conf > /dev/null
 echo "WEB_ROOT=$WEB_ROOT" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "ANSIBLE_DIR=$ANSIBLE_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
 echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | sudo tee -a /etc/lldpq.conf > /dev/null

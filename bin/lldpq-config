@@ -27,6 +27,7 @@ ALLOWED_KEYS = frozenset({
     "LLDPQ_DIR",
     "LLDPQ_USER",
     "LLDPQ_SRC",
+    "LLDPQ_HOSTNAME",
     "WEB_ROOT",
     "ANSIBLE_DIR",
     "EDITOR_ROOT",

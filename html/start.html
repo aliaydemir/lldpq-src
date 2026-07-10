@@ -315,7 +315,7 @@
     <div class="dashboard-container">
         <!-- Page Header -->
         <div class="page-header">
-            <h1 class="main-title">LLDPq</h1>
+            <h1 class="main-title" id="lldpq-dashboard-title">lldpq</h1>
             <div class="lldpq-logo">
                 <img src="/png/lldpq-banner.png" alt="LLDPq">
             </div>
@@ -600,6 +600,46 @@
             </div>
         </div>
 
+        <!-- EVPN Multi-Homing Analysis Section -->
+        <div class="analysis-section">
+            <div class="section-header">
+                <h2 class="section-title">
+                    <a class="section-title-link" href="/monitor-results/evpn-mh-analysis.html">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7.5,4A3.5,3.5 0 0,1 11,7.5C11,8.15 10.82,8.76 10.5,9.28L14.72,13.5C15.24,13.18 15.85,13 16.5,13A3.5,3.5 0 1,1 13,16.5C13,15.85 13.18,15.24 13.5,14.72L9.28,10.5C8.76,10.82 8.15,11 7.5,11A3.5,3.5 0 1,1 7.5,4M7.5,6A1.5,1.5 0 1,0 7.5,9A1.5,1.5 0 0,0 7.5,6M16.5,15A1.5,1.5 0 1,0 16.5,18A1.5,1.5 0 0,0 16.5,15Z"/></svg>
+                        EVPN Multi-Homing Analysis
+                    </a>
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <a class="summary-card card-total" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value" id="evpn-mh-total">--</div>
+                    <div class="card-label">Total Ethernet Segments</div>
+                </a>
+                <a class="summary-card card-excellent" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value status-excellent" id="evpn-mh-healthy">--</div>
+                    <div class="card-label">Healthy</div>
+                </a>
+                <a class="summary-card card-warning" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value status-warning" id="evpn-mh-inactive">--</div>
+                    <div class="card-label">Inactive / Down</div>
+                </a>
+                <a class="summary-card card-warning" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value status-warning" id="evpn-mh-bypass">--</div>
+                    <div class="card-label">LACP Bypass Active</div>
+                </a>
+                <a class="summary-card card-critical" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value status-critical" id="evpn-mh-inconsistent">--</div>
+                    <div class="card-label">BGP Inconsistent</div>
+                </a>
+                <a class="summary-card card-warning" href="/monitor-results/evpn-mh-analysis.html">
+                    <div class="card-value status-warning" id="evpn-mh-orphan">--</div>
+                    <div class="card-label">Orphan ESI</div>
+                </a>
+            </div>
+            </div>
+        </div>
+
         <!-- Duplicate Address Analysis Section -->
         <div class="analysis-section">
             <div class="section-header">
@@ -826,7 +866,8 @@
                 return null;
             }
             const requiredAnalyses = [
-                'bgp', 'flap', 'ber', 'pfc-ecn', 'hardware', 'log', 'duplicate'
+                'bgp', 'evpn-mh', 'flap', 'ber', 'pfc-ecn', 'hardware',
+                'log', 'duplicate'
             ];
             if (requiredAnalyses.some(name => !manifest.analyses.includes(name)) ||
                 (!manifest.skipped.includes('optical') && !manifest.analyses.includes('optical'))) {
@@ -1556,6 +1597,7 @@
                     // baseline, reset and status-precedence semantics.
                     const pageMap = {
                         'bgp': 'monitor-results/bgp-analysis.html',
+                        'evpn-mh': 'monitor-results/evpn-mh-analysis.html',
                         'ber': 'monitor-results/ber-analysis.html',
                         'pfc': 'monitor-results/pfc-ecn-analysis.html',
                         'flap': 'monitor-results/link-flap-analysis.html'
@@ -1611,6 +1653,46 @@
                             summaryData.healthPercent = metric('#health-ratio');
                             summaryData.coveragePartial = summaryData.coveragePartial ||
                                 summaryData.stale > 0 || summaryData.unknown > 0;
+                        } else if (dataType === 'evpn-mh') {
+                            const requiredMetrics = {
+                                totalEs: metadataNumber('totalEs'),
+                                healthyEs: metadataNumber('healthyEs'),
+                                inactiveEs: metadataNumber('inactiveEs'),
+                                bypassEs: metadataNumber('bypassEs'),
+                                bypassIssueEs: metadataNumber('bypassIssueEs'),
+                                criticalEs: metadataNumber('criticalEs'),
+                                warningEs: metadataNumber('warningEs'),
+                                inconsistentEs: metadataNumber('inconsistentEs'),
+                                orphanEs: metadataNumber('orphanEs')
+                            };
+                            const partitionTotal = requiredMetrics.healthyEs +
+                                requiredMetrics.inactiveEs + requiredMetrics.bypassIssueEs +
+                                requiredMetrics.criticalEs + requiredMetrics.warningEs;
+                            const metricsValid =
+                                reportMeta?.dataset?.analysisSummary === 'evpn-mh' &&
+                                Object.values(requiredMetrics).every(value =>
+                                    Number.isInteger(value) && value >= 0
+                                ) &&
+                                partitionTotal === requiredMetrics.totalEs &&
+                                requiredMetrics.bypassIssueEs <= requiredMetrics.bypassEs &&
+                                requiredMetrics.bypassEs <= requiredMetrics.totalEs &&
+                                requiredMetrics.inconsistentEs <= requiredMetrics.totalEs &&
+                                requiredMetrics.orphanEs <= requiredMetrics.totalEs;
+                            if (!metricsValid) {
+                                summaryData.unavailable = true;
+                                summaryData.coveragePartial = true;
+                            } else {
+                                Object.assign(summaryData, requiredMetrics);
+                                summaryData.total = summaryData.totalEs;
+                                summaryData.healthy = summaryData.healthyEs;
+                                summaryData.inactive = summaryData.inactiveEs;
+                                summaryData.bypass = summaryData.bypassEs;
+                                summaryData.bypassIssues = summaryData.bypassIssueEs;
+                                summaryData.critical = summaryData.criticalEs;
+                                summaryData.warning = summaryData.warningEs;
+                                summaryData.inconsistent = summaryData.inconsistentEs;
+                                summaryData.orphan = summaryData.orphanEs;
+                            }
                         } else if (dataType === 'ber') {
                             summaryData.totalPorts = metric('#total-ports');
                             summaryData.excellent = metric('#excellent-ports') || 0;
@@ -1712,12 +1794,14 @@
             try {
                 let pipelineState = await readDashboardPipelineState();
                 // Fetch data directly from raw data files
-                const [assetsData, lldpData, bgpData, evpnData, opticalData, berData,
-                    pfcData, flapData, hardwareData, logData, dupData] = await Promise.all([
+                const [assetsData, lldpData, bgpData, evpnData, evpnMhData,
+                    opticalData, berData, pfcData, flapData, hardwareData,
+                    logData, dupData] = await Promise.all([
                     fetchRawDataSummary('assets', pipelineState),
                     fetchRawDataSummary('lldp', pipelineState),
                     fetchRawDataSummary('bgp', pipelineState),
                     fetchRawDataSummary('evpn', pipelineState),
+                    fetchRawDataSummary('evpn-mh', pipelineState),
                     fetchRawDataSummary('optical', pipelineState),
                     fetchRawDataSummary('ber', pipelineState),
                     fetchRawDataSummary('pfc', pipelineState),
@@ -1775,6 +1859,19 @@
                 updateDashboardCard('evpn-l3-vnis', dashboardMetric(evpnData, evpnData.l3Vnis));
                 updateDashboardCard('evpn-type2', dashboardMetric(evpnData, evpnData.type2Routes));
                 updateDashboardCard('evpn-type5', dashboardMetric(evpnData, evpnData.type5Routes));
+
+                updateDashboardCard('evpn-mh-total', dashboardMetric(evpnMhData, evpnMhData.total));
+                updateDashboardCard('evpn-mh-healthy', dashboardMetric(evpnMhData, evpnMhData.healthy));
+                updateDashboardCard('evpn-mh-inactive', dashboardMetric(evpnMhData, evpnMhData.inactive));
+                updateDashboardCard('evpn-mh-bypass', dashboardMetric(evpnMhData, evpnMhData.bypass));
+                updateDashboardCard('evpn-mh-inconsistent', dashboardMetric(
+                    evpnMhData, evpnMhData.inconsistent
+                ));
+                updateDashboardCard('evpn-mh-orphan', dashboardMetric(evpnMhData, evpnMhData.orphan));
+                setDashboardProblemSeverity(
+                    'evpn-mh-inconsistent', evpnMhData,
+                    evpnMhData.inconsistent, 0
+                );
 
                 updateDashboardCard('optical-total', dashboardMetric(opticalData, opticalData.totalPorts));
                 updateDashboardCard('optical-excellent', dashboardMetric(opticalData, opticalData.excellent));
@@ -1918,8 +2015,9 @@
                     unavailable: Boolean(bgpData.unavailable || evpnData.unavailable),
                     coveragePartial: Boolean(bgpData.coveragePartial || evpnData.coveragePartial)
                 };
-                const nonDuplicateReports = [assetsData, lldpData, bgpEvpnState, opticalData,
-                    berData, pfcData, flapData, hardwareData, logData];
+                const nonDuplicateReports = [assetsData, lldpData, bgpEvpnState,
+                    evpnMhData, opticalData, berData, pfcData, flapData,
+                    hardwareData, logData];
                 const analysisReports = [...nonDuplicateReports, dupData];
                 const unavailableAnalyses = analysisReports.filter(data =>
                     !data || data.unavailable
@@ -1952,6 +2050,10 @@
                 'LLDP No Info': lldpData.noInfo || 0,
                 'BGP Critical': bgpData.critical || 0,
                 'BGP Warning': bgpData.warning || 0,
+                'EVPN-MH Critical': evpnMhData.critical || 0,
+                'EVPN-MH Warning': evpnMhData.warning || 0,
+                'EVPN-MH Bypass Active': evpnMhData.bypassIssues || 0,
+                'EVPN-MH Inactive / Down': evpnMhData.inactive || 0,
                 'Optical Critical': opticalData.critical || 0,
                 'Optical Warning': opticalData.warning || 0,
                 'Optical Down': opticalData.down || 0,
@@ -1982,6 +2084,7 @@
             // Hard failures render red; advisory / warning-severity signals render yellow.
             const CRITICAL_SOURCES = new Set([
                 'Assets Failed', 'LLDP Failed Ports', 'BGP Critical',
+                'EVPN-MH Critical',
                 'Optical Critical', 'BER Critical', 'PFC Discarding Ports',
                 'Link Flap Critical',
                 'Hardware Critical', 'Log Critical', 'Active IP Duplicates',
@@ -2012,6 +2115,11 @@
             addHealthDomain(assetsData.successful, assetsData.totalDevices, assetsData);
             addHealthDomain(lldpData.totalConnections - (lldpData.failed || 0), lldpData.totalConnections, lldpData);
             addHealthDomain(bgpData.totalNeighbors - (bgpData.critical || 0), bgpData.totalNeighbors, bgpData);
+            addHealthDomain(
+                evpnMhData.total - (evpnMhData.critical || 0),
+                evpnMhData.total,
+                evpnMhData
+            );
             const opticalComparablePorts = Number(opticalData.totalPorts) -
                 Number(opticalData.unplugged || 0);
             addHealthDomain(opticalComparablePorts - (opticalData.critical || 0),
@@ -2219,6 +2327,9 @@
             try {
                 const authenticated = await LLDPqAuth.check();
                 if (!authenticated) return;
+                const dashboardTitle = LLDPqAuth.hostname || 'lldpq';
+                document.getElementById('lldpq-dashboard-title').textContent = dashboardTitle;
+                document.title = dashboardTitle + ' - LLDPq';
                 if (LLDPqAuth.isAdmin()) document.body.classList.add('lldpq-admin');
             } catch (error) {
                 console.warn('Could not resolve dashboard role:', error);

@@ -524,6 +524,9 @@ def render_report(
         "healthy": sum(row["status"] == "healthy" for row in rows),
         "inactive": sum(row["status"] == "inactive" for row in rows),
         "bypass": sum(bool(row["bypass_active"]) for row in rows),
+        "bypass_status": sum(row["status"] == "bypass" for row in rows),
+        "critical": sum(row["status"] == "critical" for row in rows),
+        "warning": sum(row["status"] == "warning" for row in rows),
         "inconsistent": sum(bool(row["inconsistent"]) for row in rows),
         "orphan": sum(bool(row["orphan"]) for row in rows),
     }
@@ -624,7 +627,13 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
 </head>
 <body data-coverage-status="{_h(coverage_status)}">
 <div hidden data-analysis-summary="evpn-mh" data-coverage-status="{_h(coverage_status)}"
-     data-coverage-partial="{partial}" data-metric-key="total_es" data-metric-value="{counts['total']}"></div>
+     data-coverage-partial="{partial}" data-total-es="{counts['total']}"
+     data-healthy-es="{counts['healthy']}" data-inactive-es="{counts['inactive']}"
+     data-bypass-es="{counts['bypass']}" data-bypass-issue-es="{counts['bypass_status']}"
+     data-critical-es="{counts['critical']}"
+     data-warning-es="{counts['warning']}" data-inconsistent-es="{counts['inconsistent']}"
+     data-orphan-es="{counts['orphan']}" data-metric-key="total_es"
+     data-metric-value="{counts['total']}"></div>
 <div class="page-header">
   <div><div class="page-title">EVPN Multi-Homing Analysis</div><div class="last-updated">Last Updated: {_h(updated)}</div></div>
   <div class="action-buttons">

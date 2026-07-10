@@ -20,6 +20,7 @@
 const LLDPqAuth = {
     user: null,
     role: null,
+    hostname: 'lldpq',
     
     // Check if user is authenticated
     async check() {
@@ -30,6 +31,10 @@ const LLDPqAuth = {
             if (data.authenticated) {
                 this.user = data.username;
                 this.role = data.role;
+                this.hostname = (
+                    typeof data.lldpq_hostname === 'string' &&
+                    /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(data.lldpq_hostname)
+                ) ? data.lldpq_hostname : 'lldpq';
                 try { localStorage.setItem('lldpq_role', data.role || ''); } catch (e) {}
                 return true;
             } else {

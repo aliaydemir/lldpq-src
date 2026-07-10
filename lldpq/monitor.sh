@@ -3677,16 +3677,34 @@ analysis_log_dir=$(mktemp -d "${TMPDIR:-/tmp}/lldpq-analysis.XXXXXX") || exit 1
 declare -a analysis_pids=()
 declare -a analysis_labels=()
 declare -a analysis_logs=()
+declare -a analysis_timing_files=()
 declare -a analysis_failures=()
+
+analysis_now_ms() {
+    local value
+    value=$(date +%s%3N 2>/dev/null) || value=""
+    [[ "$value" =~ ^[0-9]+$ ]] || value="$(date +%s)000"
+    printf '%s\n' "$value"
+}
 
 start_analysis() {
     local label=$1
     shift
     local log_file="$analysis_log_dir/${label}.log"
-    "$@" >"$log_file" 2>&1 9>&- &
+    local timing_file="$analysis_log_dir/${label}.timing"
+    (
+        local started finished status
+        started=$(analysis_now_ms)
+        "$@"
+        status=$?
+        finished=$(analysis_now_ms)
+        printf '%s\n' "$((finished - started))" > "$timing_file"
+        exit "$status"
+    ) >"$log_file" 2>&1 9>&- &
     analysis_pids+=("$!")
     analysis_labels+=("$label")
     analysis_logs+=("$log_file")
+    analysis_timing_files+=("$timing_file")
 }
 
 validate_analysis_outputs() {
@@ -3824,6 +3842,20 @@ for index in "${!analysis_pids[@]}"; do
         analysis_failures+=("${analysis_labels[$index]}:${status}")
         echo "Analysis '${analysis_labels[$index]}' failed with status ${status}:" >&2
         tail -20 "${analysis_logs[$index]}" >&2 || true
+    fi
+done
+echo "Analyzer timings (parallel):"
+for index in "${!analysis_labels[@]}"; do
+    duration_ms=""
+    if [[ -f "${analysis_timing_files[$index]}" ]]; then
+        IFS= read -r duration_ms < "${analysis_timing_files[$index]}" || duration_ms=""
+    fi
+    if [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
+        printf '  %-12s %d.%03ds\n' \
+            "${analysis_labels[$index]}" \
+            "$((duration_ms / 1000))" "$((duration_ms % 1000))"
+    else
+        printf '  %-12s unavailable\n' "${analysis_labels[$index]}"
     fi
 done
 analyzer_jobs_end=$(date +%s)

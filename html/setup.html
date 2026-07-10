@@ -290,6 +290,20 @@
                     <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
 
                     <div class="sched-card">
+                        <div class="key-row"><span class="k">Dashboard instance name</span></div>
+                        <label class="key-lbl" for="lldpq-hostname">Displayed above the main dashboard logo (does not change the operating-system hostname):</label>
+                        <input type="text" id="lldpq-hostname" class="sched-sel"
+                               style="width:100%; min-width:0;" maxlength="64"
+                               value="lldpq" autocomplete="off" spellcheck="false"
+                               pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+                               onkeydown="if(event.key==='Enter'){event.preventDefault();saveHostname();}">
+                        <div class="p-toolbar" style="margin-top:10px;">
+                            <button class="btn secondary" onclick="saveHostname()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save dashboard name</button>
+                            <span class="status info" id="hostname-status" style="margin-top:0;"></span>
+                        </div>
+                    </div>
+
+                    <div class="sched-card">
                         <div class="key-row">
                             <span class="k">Auto-run LLDPq (collection)</span>
                             <select id="sched-lldpq" class="sched-sel">
@@ -614,6 +628,7 @@ let runJobId = null;
 let runPollEpoch = 0;
 let schedLoaded = false;     // cron schedules fetched once on entering the run step
 let parallelLoaded = false;  // parallelism fetched once on entering the run step
+let hostnameLoaded = false;  // dashboard instance name fetched once on entering run
 let ansibleLoaded = false;   // ansible status fetched once on entering its step
 let ansibleDirty = false;
 let ansibleEditVersion = 0;
@@ -760,6 +775,7 @@ function goStep(i) {
     if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
     if (key === 'ansible' && !ansibleLoaded) { ansibleLoaded = true; loadAnsible(); }
     if (key === 'run' && !runLogShown) { runLogShown = true; showRunLog(); }
+    if (key === 'run' && !hostnameLoaded) { hostnameLoaded = true; loadHostname(); }
     if (key === 'run' && !schedLoaded) { schedLoaded = true; loadSchedules(); }
     if (key === 'run' && !parallelLoaded) { parallelLoaded = true; loadParallel(); }
     if (key === 'update') {
@@ -1848,6 +1864,46 @@ async function showUpdateLog(retryEpoch) {
 }
 
 /* ---- Schedules (cron) for the Run step ---- */
+async function loadHostname() {
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'get-hostname' })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (d.success && d.hostname) {
+            document.getElementById('lldpq-hostname').value = d.hostname;
+        }
+    } catch (e) { /* keep the safe default */ }
+}
+
+async function saveHostname() {
+    const input = document.getElementById('lldpq-hostname');
+    const hostname = (input.value || '').trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(hostname)) {
+        setStatus('hostname-status', 'Use 1-64 letters, numbers, dots, underscores or hyphens.', 'err');
+        return;
+    }
+    setStatus('hostname-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'set-hostname', hostname })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) {
+            input.value = d.hostname;
+            setStatus('hostname-status', 'Saved \u2713 \u2014 reopen the dashboard to see the new name.', 'ok');
+        } else {
+            setStatus('hostname-status', d.error || 'Save failed', 'err');
+        }
+    } catch (e) {
+        setStatus('hostname-status', 'Save failed: ' + e.message, 'err');
+    }
+}
+
 async function loadSchedules() {
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-schedules' }) });

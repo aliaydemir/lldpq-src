@@ -164,6 +164,7 @@ RUN printf '%s\n' \
     '# LLDPq Configuration (Docker)' \
     'LLDPQ_DIR=/home/lldpq/lldpq' \
     'LLDPQ_USER=lldpq' \
+    'LLDPQ_HOSTNAME=lldpq' \
     'WEB_ROOT=/var/www/html' \
     'DHCP_HOSTS_FILE=/etc/dhcp/dhcpd.hosts' \
     'DHCP_CONF_FILE=/etc/dhcp/dhcpd.conf' \

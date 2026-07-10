@@ -747,11 +747,12 @@ web_root = os.environ.get('WEB_ROOT', '/var/www/html')
 config_owner = f'{lldpq_user}:www-data'
 devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 
-# /etc/lldpq.conf keys that are portable (safe to carry in a backup): tunable knobs only.
-# NEVER include host paths/identity (LLDPQ_DIR/USER/SRC, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE)
-# or secrets (AI_API_KEY).
+# /etc/lldpq.conf values safe to carry in a portable bundle: the user-defined
+# dashboard label plus tunable knobs. Never include OS account/path identity
+# (LLDPQ_DIR/USER/SRC, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE) or secrets.
 LLDPQ_PREF_KEYS = (
-    'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL', 'SKIP_OPTICAL', 'SKIP_L1',
+    'LLDPQ_HOSTNAME', 'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL',
+    'SKIP_OPTICAL', 'SKIP_L1',
     'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'MONITOR_COMMAND_TIMEOUT_SECONDS',
     'PFC_ECN_MAX_PARALLEL',
     'PFC_ECN_COLLECTION_BUDGET_SECONDS', 'PFC_ECN_PORT_TIMEOUT_SECONDS',
@@ -767,6 +768,7 @@ LLDPQ_PREF_KEYS = (
     'AI_FALLBACK_CONTEXT_WINDOW_TOKENS', 'AI_PROXY_URL', 'AI_SEARCH_MODEL',
     'AI_SEARCH_URL',
 )
+LLDPQ_HOSTNAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 action = post_data.get('action', 'setup')
 
 def read_conf():
@@ -1435,6 +1437,33 @@ if action == 'set-ansible':
                           'path': '' if new_val == 'NoNe' else new_val,
                           'editor_root': '' if new_val == 'NoNe' else new_val,
                           'ready': ready, 'warnings': warnings}))
+    else:
+        print(json.dumps({'success': False, 'error': 'Failed to write config'}))
+    sys.exit(0)
+
+# ─── Action: read dashboard instance name ───
+if action == 'get-hostname':
+    value = read_conf().get('LLDPQ_HOSTNAME', 'lldpq').strip()
+    if not LLDPQ_HOSTNAME_RE.fullmatch(value):
+        value = 'lldpq'
+    print(json.dumps({'success': True, 'hostname': value}))
+    sys.exit(0)
+
+# ─── Action: set dashboard instance name ───
+if action == 'set-hostname':
+    value = post_data.get('hostname')
+    if not isinstance(value, str):
+        print(json.dumps({'success': False, 'error': 'Hostname must be a string'}))
+        sys.exit(0)
+    value = value.strip()
+    if not LLDPQ_HOSTNAME_RE.fullmatch(value):
+        print(json.dumps({
+            'success': False,
+            'error': 'Use 1-64 letters, numbers, dots, underscores or hyphens',
+        }))
+        sys.exit(0)
+    if write_conf({'LLDPQ_HOSTNAME': value}):
+        print(json.dumps({'success': True, 'hostname': value}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)

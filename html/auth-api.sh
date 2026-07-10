@@ -6,6 +6,8 @@
 USERS_FILE="/etc/lldpq-users.conf"
 USERS_LOCK_FILE="/etc/lldpq-users.conf.lock"
 AUTH_USERS_HELPER="/usr/local/libexec/lldpq-auth-users.py"
+LLDPQ_CONFIG_FILE="/etc/lldpq.conf"
+LLDPQ_CONFIG_LOCK="/etc/lldpq.conf.lock"
 SESSIONS_DIR="/var/lib/lldpq/sessions"
 SESSION_TIMEOUT=28800  # 8 hours in seconds
 REMEMBER_TIMEOUT=604800  # 7 days in seconds
@@ -74,6 +76,27 @@ valid_token() {
 
 json_escape() {
     python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+}
+
+get_lldpq_hostname() {
+    local value=""
+    if [ -r "$LLDPQ_CONFIG_FILE" ]; then
+        if [ -e "$LLDPQ_CONFIG_LOCK" ] && command -v flock >/dev/null 2>&1; then
+            value=$(flock -s "$LLDPQ_CONFIG_LOCK" awk -F= \
+                '$1 == "LLDPQ_HOSTNAME" { print substr($0, index($0, "=") + 1); exit }' \
+                "$LLDPQ_CONFIG_FILE" 2>/dev/null) || value=""
+        else
+            value=$(awk -F= \
+                '$1 == "LLDPQ_HOSTNAME" { print substr($0, index($0, "=") + 1); exit }' \
+                "$LLDPQ_CONFIG_FILE" 2>/dev/null) || value=""
+        fi
+    fi
+    case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || value=lldpq
+    printf '%s\n' "$value"
 }
 
 get_user_record() {
@@ -232,10 +255,11 @@ case "$ACTION" in
             # Set cookie and return success
             USERNAME_JSON=$(printf '%s' "$USERNAME" | json_escape)
             ROLE_JSON=$(printf '%s' "$ROLE" | json_escape)
+            LLDPQ_HOSTNAME_JSON=$(get_lldpq_hostname | json_escape)
             echo "Content-Type: application/json"
             echo "Set-Cookie: lldpq_session=$TOKEN; Path=/; HttpOnly; SameSite=Strict; $COOKIE_EXPIRY"
             echo ""
-            echo "{\"success\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON}"
+            echo "{\"success\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON, \"lldpq_hostname\": $LLDPQ_HOSTNAME_JSON}"
         else
             release_users_read_lock
             json_response '{"success": false, "error": "Invalid username or password"}'
@@ -265,7 +289,8 @@ case "$ACTION" in
             ROLE=$(echo "$INFO" | tail -1)
             USERNAME_JSON=$(printf '%s' "$USERNAME" | json_escape)
             ROLE_JSON=$(printf '%s' "$ROLE" | json_escape)
-            json_response "{\"authenticated\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON}"
+            LLDPQ_HOSTNAME_JSON=$(get_lldpq_hostname | json_escape)
+            json_response "{\"authenticated\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON, \"lldpq_hostname\": $LLDPQ_HOSTNAME_JSON}"
         else
             json_response '{"authenticated": false}'
         fi
