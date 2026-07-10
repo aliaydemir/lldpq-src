@@ -16,6 +16,7 @@ from collection_freshness import (
     is_current_collection,
     mark_html_collection_unavailable,
     read_asset_snapshot,
+    read_collection_outcomes,
 )
 
 
@@ -40,9 +41,21 @@ def main():
     if assets_available and not snapshot_valid:
         print("❌ Asset snapshot is invalid or incomplete")
         return 1
+    try:
+        collection_outcomes = read_collection_outcomes()
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"❌ Collection outcome manifest is invalid: {exc}")
+        return 1
     expected_hosts = (
-        {host for host, status in statuses.items() if status == "OK"}
-        if snapshot_valid else set()
+        {
+            host for host, status in collection_outcomes.items()
+            if status == "current"
+        }
+        if collection_outcomes is not None else
+        (
+            {host for host, status in statuses.items() if status == "OK"}
+            if snapshot_valid else set()
+        )
     )
     all_devices_unavailable = snapshot_valid and not expected_hosts
     
@@ -63,10 +76,9 @@ def main():
         missing_hosts = sorted(expected_hosts - collected_hosts)
         if missing_hosts:
             print(
-                "❌ Missing current hardware collections for: "
+                "⚠ Missing current hardware collections; publishing partial coverage for: "
                 + ", ".join(missing_hosts)
             )
-            return 1
         if processed_count > 0:
             print(f"Found {processed_count} hardware data files")
         else:

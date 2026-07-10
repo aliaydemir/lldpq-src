@@ -18,6 +18,7 @@ from collection_freshness import (
     is_current_collection,
     mark_html_collection_unavailable,
     read_asset_snapshot,
+    read_collection_outcomes,
 )
 
 try:
@@ -1364,9 +1365,21 @@ class LogAnalyzer:
             print("❌ Asset snapshot is invalid or incomplete")
             return False
         inventory_hosts = set(statuses) if snapshot_valid else set()
+        try:
+            collection_outcomes = read_collection_outcomes()
+        except (OSError, UnicodeError, ValueError) as exc:
+            print(f"❌ Collection outcome manifest is invalid: {exc}")
+            return False
         expected_current_hosts = (
-            {host for host, status in statuses.items() if status == "OK"}
-            if snapshot_valid else set()
+            {
+                host for host, status in collection_outcomes.items()
+                if status == "current"
+            }
+            if collection_outcomes is not None else
+            (
+                {host for host, status in statuses.items() if status == "OK"}
+                if snapshot_valid else set()
+            )
         )
         all_devices_unavailable = snapshot_valid and not expected_current_hosts
         log_files = [
@@ -1387,10 +1400,9 @@ class LogAnalyzer:
         missing_hosts = sorted(expected_current_hosts - collected_hosts)
         if missing_hosts:
             print(
-                "❌ Missing current log collections for: "
+                "⚠ Missing current log collections; publishing partial coverage for: "
                 + ", ".join(missing_hosts)
             )
-            return False
         if not log_files and not all_devices_unavailable:
             print("⚠️  No log files found")
             return False

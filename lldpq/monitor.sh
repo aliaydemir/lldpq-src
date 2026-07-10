@@ -253,6 +253,8 @@ active_jobs_file=$(mktemp) || {
 }
 completed_file=""
 scope_expected_hosts_file=""
+collection_status_file=""
+collection_status_manifest=""
 analysis_log_dir=""
 bundle_parent="$SCRIPT_DIR/.monitor-bundles"
 bundle_root=""
@@ -264,6 +266,7 @@ recovery_bundle_must_be_preserved=false
 analysis_artifacts=(
     .lldpq-current.json
     .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    .pipeline-inputs/collection_status.json
     bgp-analysis.html bgp_history.json
     evpn-mh-analysis.html
     link-flap-analysis.html flap_history.json
@@ -573,6 +576,7 @@ cleanup_monitor_temp() {
     [[ -n "$active_jobs_file" ]] && rm -f "$active_jobs_file"
     [[ -n "$completed_file" ]] && rm -f "$completed_file"
     [[ -n "$scope_expected_hosts_file" ]] && rm -f "$scope_expected_hosts_file"
+    [[ -n "$collection_status_file" ]] && rm -f "$collection_status_file"
     [[ -n "$analysis_log_dir" ]] && rm -rf "$analysis_log_dir"
     if [[ -n "$bundle_root" ]] && \
        find "$bundle_root" -name '.retain-device-recovery' -print -quit \
@@ -1192,6 +1196,128 @@ PING="ping"
 ping_test() {
     local device=$1
     $PING -c 1 -W 0.5 "$device" > /dev/null 2>&1
+}
+
+record_collection_status() {
+    local hostname=$1 status=$2 code=${3:-0} reason=${4:-unknown}
+    [[ -n "$collection_status_file" ]] || return 1
+    [[ "$hostname" != *$'\t'* && "$hostname" != *$'\n'* ]] || return 1
+    [[ "$status" =~ ^(current|unavailable|failed)$ ]] || return 1
+    [[ "$code" =~ ^[0-9]+$ ]] || return 1
+    [[ "$reason" =~ ^[A-Za-z0-9_.-]+$ ]] || return 1
+    (
+        flock -x 8 || exit 1
+        printf '%s\t%s\t%s\t%s\n' "$hostname" "$status" "$code" "$reason"
+    ) 8>>"$collection_status_file"
+}
+
+build_collection_status_manifest() {
+    python3 - "$collection_status_file" "$collection_status_manifest" \
+        "${LLDPQ_PIPELINE_ID:-}" "${collection_labels[@]}" <<'PYTHON'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+events_path = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+pipeline_id = sys.argv[3]
+expected = sys.argv[4:]
+if not pipeline_id or len(expected) != len(set(expected)):
+    raise SystemExit("invalid collection status identity")
+
+devices = {}
+for raw in events_path.read_text(encoding="utf-8").splitlines():
+    fields = raw.split("\t")
+    if len(fields) != 4:
+        raise SystemExit("invalid collection status record")
+    hostname, status, code_text, reason = fields
+    if hostname in devices or hostname not in expected:
+        raise SystemExit("duplicate or unexpected collection status host")
+    if status not in {"current", "unavailable", "failed"}:
+        raise SystemExit("invalid collection status value")
+    try:
+        code = int(code_text)
+    except ValueError as exc:
+        raise SystemExit("invalid collection status code") from exc
+    devices[hostname] = {"status": status, "code": code, "reason": reason}
+
+missing = sorted(set(expected) - set(devices))
+if missing:
+    raise SystemExit("missing collection status for: " + ", ".join(missing))
+counts = {
+    status: sum(item["status"] == status for item in devices.values())
+    for status in ("current", "unavailable", "failed")
+}
+payload = {
+    "version": 1,
+    "pipeline_id": pipeline_id,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "expected_devices": len(expected),
+    "counts": counts,
+    "devices": devices,
+}
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+print(
+    "Collection results: "
+    f"current={counts['current']} "
+    f"unavailable={counts['unavailable']} failed={counts['failed']}"
+)
+PYTHON
+}
+
+install_collection_status_manifest() {
+    local destination="$SCRIPT_DIR/monitor-results/.pipeline-inputs/collection_status.json"
+    python3 - "$collection_status_manifest" "$destination" <<'PYTHON'
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+content = source.read_bytes()
+destination.parent.mkdir(parents=True, exist_ok=True)
+descriptor, temporary = tempfile.mkstemp(
+    prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+)
+try:
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(temporary, 0o664)
+    os.replace(temporary, destination)
+    directory_fd = os.open(destination.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PYTHON
 }
 
 clear_current_device_artifacts() {
@@ -2068,7 +2194,7 @@ execute_commands_optimized() {
     local device=$1
     local user=$2
     local hostname=$3
-    local bundle_stage html_temp raw_file carrier_body optical_body
+    local bundle_stage html_temp raw_file carrier_body optical_body ssh_error_file
     # process_device runs in its own subshell, so this result classification is
     # private to one device.  process_device owns the dynamically-scoped local;
     # assigning it here lets the caller distinguish an actual SSH failure from
@@ -2086,6 +2212,7 @@ execute_commands_optimized() {
     trap 'exit 143' TERM
     html_temp="$bundle_stage/device.html"
     raw_file="$bundle_stage/raw.txt"
+    ssh_error_file="$bundle_stage/ssh.stderr"
     carrier_body="$bundle_stage/carrier.body"
     optical_body="$bundle_stage/optical.body"
 
@@ -2835,7 +2962,28 @@ EOF
                                 _optical_status=$?
                                 if [ "$_optical_status" -eq 124 ] || \
                                    [ "$_optical_status" -eq 137 ]; then
-                                    echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
+                                    # CMIS/EEPROM access can transiently collide
+                                    # even while the link stays up. Retry once,
+                                    # but never exceed the per-switch budget.
+                                    ethtool_output=""
+                                    _optical_remaining=$((_optical_deadline - $(date +%s)))
+                                    if [ "$_optical_remaining" -gt 1 ]; then
+                                        sleep 1
+                                        _optical_remaining=$((_optical_deadline - $(date +%s)))
+                                        _optical_retry_limit=$OPTICAL_PORT_TIMEOUT_SECONDS
+                                        if [ "$_optical_remaining" -lt "$_optical_retry_limit" ]; then
+                                            _optical_retry_limit=$_optical_remaining
+                                        fi
+                                        if [ "$_optical_retry_limit" -gt 0 ]; then
+                                            ethtool_output=$(timeout -k 1s \
+                                                "${_optical_retry_limit}s" \
+                                                sudo ethtool -m "$interface" 2>/dev/null)
+                                            _optical_status=$?
+                                        fi
+                                    fi
+                                    if [ "$_optical_status" -ne 0 ]; then
+                                        echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
+                                    fi
                                 fi
                             fi
                         else
@@ -3315,12 +3463,30 @@ EOF
         _lldpq_timing_end LOG_DATA
 
 
-    ' > "$raw_file" 2>/dev/null
+    ' > "$raw_file" 2>"$ssh_error_file"
     local ssh_status=$?
 
     if [[ $ssh_status -ne 0 ]]; then
+        local last_marker="" ssh_detail=""
+        if [[ -f "$raw_file" ]]; then
+            last_marker=$(awk '
+                /^===[A-Z0-9_]+_(START|END)===$/ { marker=$0 }
+                END { print marker }
+            ' "$raw_file" 2>/dev/null) || last_marker=""
+        fi
+        if [[ -s "$ssh_error_file" ]]; then
+            ssh_detail=$(awk '
+                NF { line=$0 }
+                END {
+                    gsub(/[^[:print:]\t]/, "?", line)
+                    print substr(line, 1, 300)
+                }
+            ' "$ssh_error_file" 2>/dev/null) || ssh_detail=""
+        fi
         COLLECTION_FAILURE_KIND=ssh
-        echo "Data collection failed for ${hostname} (ssh status ${ssh_status})" >&2
+        printf 'Data collection failed for %s (ssh status %s, last marker: %s)%s\n' \
+            "$hostname" "$ssh_status" "${last_marker:-none}" \
+            "${ssh_detail:+ — $ssh_detail}" >&2
         rm -rf "$bundle_stage"
         return "$ssh_status"
     fi
@@ -3447,6 +3613,7 @@ process_device() {
     # the authoritative reachability bound.
     ping_test "$device" || ping_reachable=false
     if execute_commands_optimized "$device" "$user" "$hostname"; then
+        record_collection_status "$hostname" current 0 ok || return 1
         return 0
     else
         collection_status=$?
@@ -3456,6 +3623,8 @@ process_device() {
           "${COLLECTION_FAILURE_KIND:-}" == "ssh" ]]; then
         if [[ "$scoped_run" == "true" ]]; then
             echo "Scoped collection could not reach ${hostname}; preserving its previous artifacts" >&2
+            record_collection_status \
+                "$hostname" unavailable "$collection_status" ssh-unreachable || true
             return "$collection_status"
         fi
         echo "$device $hostname" >> "$unreachable_hosts_file"
@@ -3463,13 +3632,22 @@ process_device() {
         # Both ICMP and the authoritative SSH attempt failed, so preserve the
         # established explicit-unavailable behavior for this device.
         clear_current_device_artifacts "$hostname" || return 1
-        write_unreachable_device_report "$device" "$hostname"
-        return $?
+        if write_unreachable_device_report "$device" "$hostname"; then
+            record_collection_status \
+                "$hostname" unavailable "$collection_status" ssh-unreachable
+            return $?
+        fi
+        record_collection_status \
+            "$hostname" failed "$collection_status" unavailable-report-failed || true
+        return 1
     fi
 
     # Ping succeeded, or SSH reached the device but returned an invalid bundle.
     # Keep the prior fail-closed generation semantics for those collection
     # errors instead of disguising them as an unreachable host.
+    record_collection_status \
+        "$hostname" failed "$collection_status" \
+        "${COLLECTION_FAILURE_KIND:-collection-failed}" || true
     return "$collection_status"
 }
 
@@ -3559,6 +3737,10 @@ LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 bundle_root=$(mktemp -d "$bundle_parent/run-XXXXXXXX") || exit 1
 chmod 700 "$bundle_root" || exit 1
+collection_status_file="$bundle_root/collection-status.tsv"
+collection_status_manifest="$bundle_root/collection-status.json"
+: > "$collection_status_file" || exit 1
+chmod 600 "$collection_status_file" || exit 1
 
 monitor_run_started=true
 if ! mark_reports_in_progress; then
@@ -3651,6 +3833,12 @@ echo "Collected $device_count devices"
 data_collection_end=$(date +%s)
 data_collection_duration=$((data_collection_end - START_TIME))
 collection_wall_duration=$((data_collection_end - collection_phase_start))
+
+if ! build_collection_status_manifest; then
+    mark_reports_stale "could not build collection outcome manifest"
+    exit 1
+fi
+export LLDPQ_COLLECTION_STATUS_FILE="$collection_status_manifest"
 
 if [ "${#collection_failures[@]}" -gt 0 ]; then
     failure_text="collection jobs failed: ${collection_failures[*]}"
@@ -3883,6 +4071,11 @@ validation_duration=$((validation_end - validation_start))
 
 manifest_start=$(date +%s)
 if [[ "$scoped_run" != "true" ]]; then
+    if ! install_collection_status_manifest; then
+        rollback_analysis_state || true
+        mark_reports_stale "could not install collection outcome manifest"
+        exit 1
+    fi
     if ! write_current_manifest; then
         rollback_analysis_state || true
         mark_reports_stale "could not write current-run manifest"

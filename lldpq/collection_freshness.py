@@ -6,6 +6,7 @@ import re
 import time
 import tempfile
 import html
+import json
 import math
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,7 @@ ASSET_HEADER = (
 CREATED_PATTERN = re.compile(
     r"^Created on (\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2})$"
 )
+COLLECTION_OUTCOME_STATUSES = {"current", "unavailable", "failed"}
 
 
 def _nonnegative_environment_number(name: str, default: float) -> float:
@@ -101,6 +103,47 @@ def asset_snapshot_is_authoritative(asset_snapshot) -> bool:
         assets_available
         and getattr(statuses, "authoritative", bool(statuses))
     )
+
+
+def read_collection_outcomes() -> Optional[Dict[str, str]]:
+    """Return this monitor generation's explicit per-device outcomes.
+
+    Older/direct analyzer invocations have no environment path and retain the
+    legacy assets-based behavior. A configured but malformed/mixed-generation
+    manifest is a structural error and must fail the analyzer.
+    """
+    configured = os.environ.get("LLDPQ_COLLECTION_STATUS_FILE")
+    if not configured:
+        return None
+    path = Path(configured)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != 1
+        or payload.get("pipeline_id") != os.environ.get("LLDPQ_PIPELINE_ID")
+        or not isinstance(payload.get("devices"), dict)
+        or payload.get("expected_devices") != len(payload["devices"])
+    ):
+        raise ValueError("invalid collection outcome manifest")
+    outcomes: Dict[str, str] = {}
+    for hostname, item in payload["devices"].items():
+        if (
+            not isinstance(hostname, str)
+            or not hostname
+            or not isinstance(item, dict)
+            or item.get("status") not in COLLECTION_OUTCOME_STATUSES
+            or not isinstance(item.get("code"), int)
+            or not isinstance(item.get("reason"), str)
+        ):
+            raise ValueError("invalid collection outcome record")
+        outcomes[hostname] = item["status"]
+    counts = payload.get("counts")
+    if not isinstance(counts, dict) or any(
+        counts.get(status) != sum(value == status for value in outcomes.values())
+        for status in COLLECTION_OUTCOME_STATUSES
+    ):
+        raise ValueError("invalid collection outcome counts")
+    return outcomes
 
 
 def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float, bool]:

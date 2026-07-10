@@ -64,6 +64,7 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
                 'MONITOR_TIMING="false"',
                 f'MONITOR_SCOPE="{scope}"',
                 f'raw_file="{raw_file}"',
+                f'ssh_error_file="{root / "ssh.stderr"}"',
             )
         )
         env = dict(os.environ)
