@@ -332,6 +332,7 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                         f'Device collection status is {statuses.get(hostname, "unavailable")}'
                     ]
         optical_analyzer.coverage_expected_hosts = len(inventory_hosts)
+        optical_analyzer.coverage_collected_hosts = len(collected_hosts)
         optical_analyzer.coverage_current_hosts = len(successful_hosts)
         optical_analyzer.coverage_missing_hosts = sorted(coverage_missing_hosts)
         optical_analyzer.coverage_failures = collection_failures

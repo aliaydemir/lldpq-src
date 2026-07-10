@@ -736,6 +736,14 @@
                     <div class="card-value status-critical" id="optical-critical">187</div>
                     <div class="card-label">Critical</div>
                 </div>
+                <div class="summary-card" style="border-left-color:#78909c;" onclick="window.location.href='monitor-results/optical-analysis.html'">
+                    <div class="card-value" style="color:#90a4ae;" id="optical-unplugged">0</div>
+                    <div class="card-label">Unplugged</div>
+                </div>
+                <div class="summary-card" style="border-left-color:#9e9e9e;" onclick="window.location.href='monitor-results/optical-analysis.html'">
+                    <div class="card-value" style="color:#9e9e9e;" id="optical-unknown">0</div>
+                    <div class="card-label">Unknown</div>
+                </div>
             </div>
             </div>
         </div>
@@ -1485,6 +1493,7 @@
                         rowCount('unplugged');
                     summaryData.unknown = metadataCount('opticalUnknown') ??
                         rowCount('unknown');
+                    summaryData.coverageCollected = metadataCount('coverageCollected');
                     const categories = [
                         summaryData.excellent, summaryData.good, summaryData.warning,
                         summaryData.critical, summaryData.down, summaryData.unplugged,
@@ -1879,6 +1888,12 @@
                 updateDashboardCard('optical-warning', dashboardMetric(opticalData, opticalData.warning));
                 updateDashboardCard('optical-down', dashboardMetric(opticalData, opticalData.down));
                 updateDashboardCard('optical-critical', dashboardMetric(opticalData, opticalData.critical));
+                updateDashboardCard('optical-unplugged', dashboardMetric(
+                    opticalData, opticalData.unplugged
+                ));
+                updateDashboardCard('optical-unknown', dashboardMetric(
+                    opticalData, opticalData.unknown
+                ));
 
                 updateDashboardCard('ber-total', dashboardMetric(berData, berData.totalPorts));
                 updateDashboardCard('ber-excellent', dashboardMetric(berData, berData.excellent));
@@ -2030,7 +2045,11 @@
                 ).length;
                 const markerStatus = pipelineState.marker && pipelineState.marker.status;
                 const pipelineNotCurrent = Boolean(markerStatus) || !pipelineState.manifestValid;
-                const analysisCoverageProblems = unavailableAnalyses + partialAnalyses +
+                // Partial reports remain visible in Open Issues, but do not
+                // invalidate every complete health domain. Only a fully
+                // unavailable report or a non-current pipeline blocks the
+                // aggregate percentage.
+                const blockingAnalysisProblems = unavailableAnalyses +
                     (pipelineNotCurrent ? 1 : 0);
                 const interfaceSources = [opticalData, berData, pfcData].filter(data =>
                     data && !data.unavailable && Number.isFinite(Number(data.totalPorts))
@@ -2102,10 +2121,10 @@
             // Average comparable domain health ratios.  Raw log-message volume
             // is an issue signal, not a population of healthy network objects.
             const healthDomains = [];
-            function addHealthDomain(healthy, total, data) {
+            function addHealthDomain(healthy, total, data, allowPartial = false) {
                 const healthyNumber = Number(healthy);
                 const totalNumber = Number(total);
-                if (data?.unavailable || data?.coveragePartial ||
+                if (data?.unavailable || (data?.coveragePartial && !allowPartial) ||
                     !Number.isFinite(healthyNumber) || !Number.isFinite(totalNumber) ||
                     totalNumber <= 0) return;
                 healthDomains.push(Math.max(0, Math.min(1, healthyNumber / totalNumber)));
@@ -2121,9 +2140,15 @@
                 evpnMhData
             );
             const opticalComparablePorts = Number(opticalData.totalPorts) -
-                Number(opticalData.unplugged || 0);
+                Number(opticalData.unplugged || 0) -
+                Number(opticalData.unknown || 0);
+            const opticalHostCoverageComplete =
+                Number.isFinite(Number(opticalData.coverageExpected)) &&
+                Number.isFinite(Number(opticalData.coverageCollected)) &&
+                Number(opticalData.coverageCollected) >=
+                    Number(opticalData.coverageExpected);
             addHealthDomain(opticalComparablePorts - (opticalData.critical || 0),
-                opticalComparablePorts, opticalData);
+                opticalComparablePorts, opticalData, opticalHostCoverageComplete);
             addHealthDomain(berData.totalPorts - (berData.critical || 0), berData.totalPorts, berData);
             addHealthDomain(flapData.totalPorts - (flapData.critical || 0), flapData.totalPorts, flapData);
             addHealthDomain(hardwareData.totalDevices - (hardwareData.critical || 0), hardwareData.totalDevices, hardwareData);
@@ -2133,7 +2158,7 @@
             const criticalOnlyCount = Object.entries(criticalBreakdown)
                 .filter(([source]) => CRITICAL_SOURCES.has(source))
                 .reduce((sum, [, count]) => sum + (count || 0), 0);
-            let overallHealth = analysisCoverageProblems
+            let overallHealth = blockingAnalysisProblems
                 ? null
                 : (healthDomains.length
                     ? Math.floor(healthDomains.reduce((sum, value) => sum + value, 0) /

@@ -414,7 +414,10 @@
         if (path.endsWith('/duplicate-analysis.html')) return updateDuplicate();
         if (path.endsWith('/link-flap-analysis.html')) return updateFlap();
         if (path.endsWith('/optical-analysis.html')) {
-            return updateGradeReport('#optical-table', 'ports', ['excellent', 'good', 'warning', 'critical', 'down']);
+            return updateGradeReport(
+                '#optical-table', 'ports',
+                ['excellent', 'good', 'warning', 'critical', 'down', 'unplugged', 'unknown']
+            );
         }
         if (path.endsWith('/ber-analysis.html')) {
             return updateGradeReport('#ber-table', 'ports', ['excellent', 'good', 'warning', 'critical', 'unknown']);

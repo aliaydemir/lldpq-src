@@ -807,6 +807,7 @@ class OpticalAnalyzer:
         summary = self.get_optical_summary()
         anomalies = self.detect_optical_anomalies()
         expected_hosts = getattr(self, 'coverage_expected_hosts', None)
+        collected_hosts = getattr(self, 'coverage_collected_hosts', None)
         current_hosts = getattr(self, 'coverage_current_hosts', None)
         missing_hosts = sorted(set(getattr(self, 'coverage_missing_hosts', []) or []))
         coverage_failures = getattr(self, 'coverage_failures', {}) or {}
@@ -820,6 +821,10 @@ class OpticalAnalyzer:
                 f' data-coverage-expected="{expected_hosts}"'
                 f' data-coverage-current="{current_hosts}"'
             )
+            if isinstance(collected_hosts, int):
+                coverage_attrs += (
+                    f' data-coverage-collected="{collected_hosts}"'
+                )
         coverage_attrs += (
             f' data-coverage-missing-hosts="{len(missing_hosts)}"'
             f' data-coverage-failed-hosts="{len(coverage_failures)}"'
@@ -879,6 +884,8 @@ class OpticalAnalyzer:
         .card-warning {{ border-left-color: #ff9800; }}
         .card-critical {{ border-left-color: #f44336; }}
         .card-down {{ border-left-color: #ff9800; }}
+        .card-unplugged {{ border-left-color: #78909c; }}
+        .card-unknown {{ border-left-color: #9e9e9e; }}
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
         .metric-label {{ font-size: 12px; color: #888; margin-top: 4px; }}
@@ -892,6 +899,7 @@ class OpticalAnalyzer:
         .optical-warning {{ color: #ff9800; font-weight: bold; }}
         .optical-critical {{ color: #f44336; font-weight: bold; }}
         .optical-down {{ color: #ff9800; font-weight: bold; }}
+        .optical-unplugged {{ color: #90a4ae; font-weight: bold; }}
         .optical-unknown {{ color: #888; }}
         .optical-table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
         .optical-table th, .optical-table td {{ border: 1px solid #404040; padding: 10px 12px; text-align: left; }}
@@ -992,6 +1000,14 @@ class OpticalAnalyzer:
                 <div class="summary-card card-down" id="down-card">
                     <div class="metric optical-down" id="down-ports">{len(summary['down_ports'])}</div>
                     <div class="metric-label">Down</div>
+                </div>
+                <div class="summary-card card-unplugged" id="unplugged-card">
+                    <div class="metric optical-unplugged" id="unplugged-ports">{len(summary['unplugged_ports'])}</div>
+                    <div class="metric-label">Unplugged</div>
+                </div>
+                <div class="summary-card card-unknown" id="unknown-card">
+                    <div class="metric optical-unknown" id="unknown-ports">{len(summary['unknown_ports'])}</div>
+                    <div class="metric-label">Unknown</div>
                 </div>
             </div>
         </div>
@@ -1186,6 +1202,18 @@ class OpticalAnalyzer:
                     filterPorts('DOWN');
                 }
             });
+
+            document.getElementById('unplugged-card').addEventListener('click', function() {
+                if (parseInt(document.getElementById('unplugged-ports').textContent) > 0) {
+                    filterPorts('UNPLUGGED');
+                }
+            });
+
+            document.getElementById('unknown-card').addEventListener('click', function() {
+                if (parseInt(document.getElementById('unknown-ports').textContent) > 0) {
+                    filterPorts('UNKNOWN');
+                }
+            });
         }
 
         function filterPorts(filterType) {
@@ -1227,6 +1255,14 @@ class OpticalAnalyzer:
                 filteredRows = allRows.filter(row => row.dataset.health === 'down');
                 filterText = `Showing ${filteredRows.length} Down Ports`;
                 document.getElementById('down-card').classList.add('active');
+            } else if (filterType === 'UNPLUGGED') {
+                filteredRows = allRows.filter(row => row.dataset.health === 'unplugged');
+                filterText = `Showing ${filteredRows.length} Unplugged Ports`;
+                document.getElementById('unplugged-card').classList.add('active');
+            } else if (filterType === 'UNKNOWN') {
+                filteredRows = allRows.filter(row => row.dataset.health === 'unknown');
+                filterText = `Showing ${filteredRows.length} Unknown Ports`;
+                document.getElementById('unknown-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
                 filteredRows = allRows;
                 document.getElementById('total-ports-card').classList.add('active');
@@ -1580,6 +1616,8 @@ class OpticalAnalyzer:
                 csvContent += `# Warning: ${document.getElementById('warning-ports').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-ports').textContent}\\n`;
                 csvContent += `# Down: ${document.getElementById('down-ports').textContent}\\n`;
+                csvContent += `# Unplugged: ${document.getElementById('unplugged-ports').textContent}\\n`;
+                csvContent += `# Unknown: ${document.getElementById('unknown-ports').textContent}\\n`;
                 csvContent += `#\\n`;
 
                 // Process each visible row
