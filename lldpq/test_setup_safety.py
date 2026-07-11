@@ -733,7 +733,8 @@ class SetupEditorRecoveryContractTests(unittest.TestCase):
             'CONFIG_WRITE_JOURNAL_DIR="$PROVISION_STATE_DIR/config-write-journals"',
             entrypoint,
         )
-        self.assertIn('chmod 0700 "$CONFIG_WRITE_JOURNAL_DIR"', entrypoint)
+        self.assertIn('chmod 00700 "$CONFIG_WRITE_JOURNAL_DIR"', entrypoint)
+        self.assertNotIn('chmod 0700 "$CONFIG_WRITE_JOURNAL_DIR"', entrypoint)
         self.assertIn(
             '[ "$runtime_state" = "$PROVISION_STATE_DIR" ] && continue', entrypoint
         )
@@ -746,6 +747,20 @@ class SetupEditorRecoveryContractTests(unittest.TestCase):
             "single-file mount and return a migration hint",
             docker_doc,
         )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "requires GNU/Linux directory modes"
+    )
+    def test_fresh_journal_mode_clears_inherited_setgid_bit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Path(temporary) / "config-write-journals"
+            journal.mkdir()
+            journal.chmod(0o2700)
+            self.assertEqual(journal.stat().st_mode & 0o7777, 0o2700)
+
+            subprocess.run(["chmod", "00700", str(journal)], check=True)
+
+            self.assertEqual(journal.stat().st_mode & 0o7777, 0o700)
 
     def test_provision_state_trailing_slashes_normalize_before_chown_exclusion(self):
         normalizer = r'''

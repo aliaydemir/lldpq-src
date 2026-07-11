@@ -175,7 +175,10 @@ if [ -L "$CONFIG_WRITE_JOURNAL_DIR" ] || \
 fi
 mkdir -p "$CONFIG_WRITE_JOURNAL_DIR"
 chown lldpq:www-data "$CONFIG_WRITE_JOURNAL_DIR"
-chmod 0700 "$CONFIG_WRITE_JOURNAL_DIR"
+# GNU chmod preserves setgid on directories unless the numeric mode has an
+# extra leading zero. This child is created under a 2770 parent, so use 00700
+# to clear the inherited bit on a fresh Docker volume/writable layer.
+chmod 00700 "$CONFIG_WRITE_JOURNAL_DIR"
 if [ "$(stat -c '%U:%G:%a' -- "$CONFIG_WRITE_JOURNAL_DIR" 2>/dev/null || true)" != \
      "lldpq:www-data:700" ]; then
     echo "ERROR: could not secure persistent config-write journal directory" >&2
