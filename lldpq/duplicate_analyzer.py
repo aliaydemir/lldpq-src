@@ -498,6 +498,7 @@ class DuplicateAnalyzer:
                 "flagged": False, "local_hosts": set(), "vteps": set(),
                 "authoritative_hosts": set(),
                 "authoritative_macs": set(),
+                "arp_observed": False, "arp_hosts": set(),
                 "ports": set(), "apipa": False, "recency": None, "delta": None,
                 "events": 0, "latest": None, "mobility": False}
 
@@ -683,8 +684,10 @@ class DuplicateAnalyzer:
             if rec is None:
                 rec = self._blank_ip(vlan, vlan, ip)
                 self.ip_dups[(vlan, ip)] = rec
+            rec["arp_observed"] = True
             for mac, hosts in mac_hosts.items():
                 rec["macs"].add(mac)
+                rec["arp_hosts"].update(hosts)
 
     # --------------------------------------------------------------- finalize
     def _recency(self, latest):
@@ -1163,6 +1166,13 @@ class DuplicateAnalyzer:
         """Current authoritative FRR rows only; mobility/logs are context."""
         return bool(rec.get("authoritative_hosts", set()) & self.coverage["current"])
 
+    def _is_arp_observed_ip(self, rec):
+        """Cross-device ARP evidence (>=2 MACs for one IP) without a current
+        authoritative FRR DAD row: the documented non-EVPN duplicate-IP path.
+        Lower confidence than authoritative findings, so it is reported as a
+        distinct class and never merged into the confirmed counters."""
+        return bool(rec.get("arp_observed")) and not self._is_confirmed_ip(rec)
+
     @staticmethod
     def _is_confirmed_mac(rec):
         return bool(rec.get("confirmed_conflict"))
@@ -1182,6 +1192,9 @@ class DuplicateAnalyzer:
         confirmed_ips = [r for r in self.ip_dups.values() if self._is_confirmed_ip(r)]
         ip_active = sum(1 for r in confirmed_ips if r.get("severity") == "CRITICAL")
         ip_quiesced = sum(1 for r in confirmed_ips if r.get("severity") == "WARNING")
+        arp_observed_ips = [
+            r for r in self.ip_dups.values() if self._is_arp_observed_ip(r)
+        ]
         macs = list(self.mac_dups.values())
         confirmed_macs = [r for r in macs if self._is_confirmed_mac(r)]
         dad_macs = [r for r in macs if self._is_mac_dad(r)]
@@ -1192,12 +1205,17 @@ class DuplicateAnalyzer:
         mac_total = len(confirmed_macs)
         apipa_total = sum(a["total"] for a in self.apipa.values())
         vlans = set(r["vlan"] for r in confirmed_ips) | set(r["vlan"] for r in self.mac_dups.values())
+        vlans |= set(r["vlan"] for r in arp_observed_ips)
         for h, a in self.apipa.items():
             vlans |= set(a["per_vlan"].keys())
         disabled = [h for h, c in self.dup_config.items() if c.get("enabled") is False]
         return {
             "ip_active": ip_active, "ip_quiesced": ip_quiesced,
             "confirmed_ip_active": ip_active,
+            # Cross-device ARP evidence without an authoritative FRR row is a
+            # distinct, lower-confidence class; it never inflates ip_active/
+            # ip_quiesced/ip_total.
+            "ip_arp_observed": len(arp_observed_ips),
             # Backwards-compatible mac_total now means confirmed simultaneous
             # conflict; mobility and DAD evidence have their own counters.
             "mac_total": mac_total,
@@ -1289,8 +1307,10 @@ class DuplicateAnalyzer:
         sev_rank = {"CRITICAL": 0, "WARNING": 1, "OK": 2}
         all_devices = set()
 
-        # ---- IP duplicate rows
-        ip_rows = sorted((r for r in self.ip_dups.values() if self._is_confirmed_ip(r)),
+        # ---- IP duplicate rows (authoritative FRR findings + the distinct
+        # lower-confidence cross-device ARP observations)
+        ip_rows = sorted((r for r in self.ip_dups.values()
+                          if self._is_confirmed_ip(r) or self._is_arp_observed_ip(r)),
                          key=lambda r: (sev_rank.get(r["severity"], 3), -(r["seq"]), -(r["events"])))
         ip_html = []
         for r in ip_rows:
@@ -1312,7 +1332,12 @@ class DuplicateAnalyzer:
             vlanvni = "vlan %s<br><span class='dim'>VNI %s</span>" % (html.escape(r["vlan"]), html.escape(r["vni"]))
             devs = set(r["local_hosts"]) | set(p.split(":")[0] for p in r["ports"])
             all_devices |= devs
-            if len(r["macs"]) >= 2:
+            if self._is_arp_observed_ip(r):
+                # Cross-device ARP saw >=2 MACs for this IP, but no current FRR
+                # DAD row confirms it: report it distinctly, without claiming
+                # an authoritative finding.
+                note = "Observed &mdash; cross-device ARP (not FRR-confirmed)"
+            elif len(r["macs"]) >= 2:
                 note = "Confirmed &mdash; IP conflict"
                 if r["severity"] != "CRITICAL":
                     note += " <span class='dim'>(quiesced)</span>"
@@ -1473,7 +1498,8 @@ class DuplicateAnalyzer:
             for c, v, l, act in cards)
 
         stale_count = sum(1 for r in self.ip_dups.values()
-                          if self._is_confirmed_ip(r) and r.get("stale")) + \
+                          if (self._is_confirmed_ip(r) or self._is_arp_observed_ip(r))
+                          and r.get("stale")) + \
                       sum(1 for r in self.mac_dups.values() if r.get("stale"))
         aged_btn = ("" if not stale_count else
                     "<button id='agedBtn' class='btn btn-secondary' onclick='toggleAged()' "
@@ -1494,6 +1520,7 @@ class DuplicateAnalyzer:
             ' data-collection-status="%s"'
             ' data-confirmed-ip-active="%d"'
             ' data-ip-quiesced="%d"'
+            ' data-ip-arp-observed="%d"'
             ' data-confirmed-mac-total="%d"'
             ' data-mac-dad-total="%d"'
             ' data-mac-mobility-active="%d"'
@@ -1509,6 +1536,7 @@ class DuplicateAnalyzer:
         ) % (
             collection_status,
             s["confirmed_ip_active"], s["ip_quiesced"],
+            s["ip_arp_observed"],
             s["confirmed_mac_total"], s["mac_dad_total"],
             s["mac_mobility_active"], s["mac_mobility_total"],
             s["coverage_expected"], s["coverage_current"],

@@ -227,7 +227,7 @@ try:
                     current_group = None
                 continue
             
-            if current_group and line.startswith(hostname):
+            if current_group and line.split()[0] == hostname:
                 device_info['group'] = current_group
                 parts = line.split()
                 for part in parts[1:]:
@@ -625,6 +625,21 @@ host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml'
 if not os.path.exists(host_file):
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yml')
 
+# Load existing host_vars and check for duplicates BEFORE touching bgp_profiles.yaml
+host_data = {}
+if os.path.exists(host_file):
+    with open(host_file, 'r') as f:
+        host_data = yaml.load(f) or {}
+
+# Initialize vrfs if not exists
+if 'vrfs' not in host_data:
+    host_data['vrfs'] = {}
+
+# Check if VRF already exists
+if vrf_name in host_data['vrfs']:
+    print(json.dumps({'success': False, 'error': f'VRF {vrf_name} already exists on this device'}))
+    sys.exit(0)
+
 # If leaking is enabled, find the appropriate profiles
 tenant_profile = None
 shared_profile = None
@@ -680,21 +695,6 @@ if leaking_enabled and leak_from_vrf:
     except Exception as e:
         print(json.dumps({'success': False, 'error': f'Failed to configure leaking: {str(e)}'}))
         sys.exit(0)
-
-# Load existing host_vars
-host_data = {}
-if os.path.exists(host_file):
-    with open(host_file, 'r') as f:
-        host_data = yaml.load(f) or {}
-
-# Initialize vrfs if not exists
-if 'vrfs' not in host_data:
-    host_data['vrfs'] = {}
-
-# Check if VRF already exists
-if vrf_name in host_data['vrfs']:
-    print(json.dumps({'success': False, 'error': f'VRF {vrf_name} already exists on this device'}))
-    sys.exit(0)
 
 # Create VRF entry
 vrf_entry = {
@@ -925,6 +925,7 @@ import shutil
 import os
 import sys
 import glob
+import copy
 
 try:
     data = json.loads(os.environ.get('POST_DATA') or '{}')
@@ -970,12 +971,31 @@ for hf in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.j
     except:
         pass
 
+# Get this device's own BGP ASN (same derivation as create_vrf_bulk)
+device_asn = None
+bgp_config = host_data.get('bgp', {})
+if isinstance(bgp_config, dict):
+    device_asn = bgp_config.get('asn')
+
 # Add VRFs
 added = []
 for vrf_name in vrf_names:
     if vrf_name not in host_data['vrfs']:
         if vrf_name in all_vrf_configs:
-            host_data['vrfs'][vrf_name] = all_vrf_configs[vrf_name]
+            vrf_config = copy.deepcopy(all_vrf_configs[vrf_name])
+            # Don't copy the source device's ASN; use this device's own or omit
+            if 'bgp_asn' in vrf_config:
+                if device_asn:
+                    vrf_config['bgp_asn'] = device_asn
+                else:
+                    del vrf_config['bgp_asn']
+            vrf_bgp = vrf_config.get('bgp')
+            if isinstance(vrf_bgp, dict) and 'asn' in vrf_bgp:
+                if device_asn:
+                    vrf_bgp['asn'] = device_asn
+                else:
+                    del vrf_bgp['asn']
+            host_data['vrfs'][vrf_name] = vrf_config
             added.append(vrf_name)
         else:
             # Create minimal VRF entry
@@ -3670,6 +3690,11 @@ try:
     else:
         print(json.dumps({'success': False, 'error': 'Invalid interface format, expected swpX.VLAN'}))
         exit(0)
+
+    # Validate VLAN part up front - int(sub_id) is used after files are written
+    if not sub_id.isdigit():
+        print(json.dumps({'success': False, 'error': 'Invalid interface format, expected swpX.VLAN'}))
+        exit(0)
     
     # 1. Update host_vars - add subinterface
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
@@ -4343,24 +4368,30 @@ try:
                         local_ip = ''
                         interface_name = ''
                         
+                        # Non-IP peer keys (e.g. BGP unnumbered interface names) skip subnet matching
+                        try:
+                            peer_addr = ipaddress.ip_address(str(peer_ip))
+                        except ValueError:
+                            peer_addr = None
+
                         # 1) Check subinterfaces (swpX.VLAN)
-                        peer_addr = ipaddress.ip_address(str(peer_ip))
-                        for if_name, if_config in interfaces.items():
-                            subinterfaces = if_config.get('subinterfaces', {})
-                            for sub_id, sub_config in subinterfaces.items():
-                                sub_ip = sub_config.get('ip', '')
-                                sub_vrf = sub_config.get('vrf', '')
-                                
-                                if sub_vrf == vrf_name and sub_ip and '/' in sub_ip:
-                                    if peer_addr in ipaddress.ip_network(sub_ip, strict=False):
-                                        local_ip = sub_ip
-                                        interface_name = f"{if_name}.{sub_id}"
-                                        break
-                            if local_ip:
-                                break
-                        
+                        if peer_addr:
+                            for if_name, if_config in interfaces.items():
+                                subinterfaces = if_config.get('subinterfaces', {})
+                                for sub_id, sub_config in subinterfaces.items():
+                                    sub_ip = sub_config.get('ip', '')
+                                    sub_vrf = sub_config.get('vrf', '')
+
+                                    if sub_vrf == vrf_name and sub_ip and '/' in sub_ip:
+                                        if peer_addr in ipaddress.ip_network(sub_ip, strict=False):
+                                            local_ip = sub_ip
+                                            interface_name = f"{if_name}.{sub_id}"
+                                            break
+                                if local_ip:
+                                    break
+
                         # 2) Check direct interface IPs (subnet match)
-                        if not local_ip:
+                        if not local_ip and peer_addr:
                             for if_name, if_config in interfaces.items():
                                 if_ip = if_config.get('ip', '')
                                 if not if_ip or '/' not in if_ip:
@@ -7716,7 +7747,11 @@ PYTHON_END
     "ansible-status")
         # Check if Ansible is configured and available
         if [[ -n "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR" ]]; then
-            echo '{"success": true, "configured": true, "ansible_dir": "'"$ANSIBLE_DIR"'"}'
+            # json.dumps keeps the response valid even if the path contains quotes/backslashes
+            python3 - "$ANSIBLE_DIR" <<'PYTHON'
+import json, sys
+print(json.dumps({'success': True, 'configured': True, 'ansible_dir': sys.argv[1]}))
+PYTHON
         else
             echo '{"success": true, "configured": false}'
         fi
@@ -7734,7 +7769,7 @@ PYTHON_END
         fi
         if [[ "${CONTENT_LENGTH:-}" =~ ^[0-9]+$ ]] && (( CONTENT_LENGTH > 0 )); then
             POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) \
-                2>/dev/null | head -c "$CONTENT_LENGTH")
+                iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
         else
             POST_DATA=$(cat)
         fi
@@ -7775,6 +7810,11 @@ PYTHON_END
         fi
         ;;
     *)
-        echo '{"success": false, "error": "Unknown action: '"$ACTION"'"}'
+        # json.dumps keeps the response valid even if the action contains quotes/backslashes
+        python3 - "$ACTION" <<'PYTHON'
+import json, sys
+action = sys.argv[1] if len(sys.argv) > 1 else ''
+print(json.dumps({'success': False, 'error': f'Unknown action: {action}'}))
+PYTHON
         ;;
 esac
