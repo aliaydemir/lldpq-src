@@ -4,11 +4,15 @@
 from pathlib import Path
 import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from lldpq.process_pfc_ecn_data import _atomic_json
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from process_pfc_ecn_data import _atomic_json
 
 
 class PfcAtomicJsonTests(unittest.TestCase):
@@ -23,7 +27,7 @@ class PfcAtomicJsonTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "history.json"
             with mock.patch(
-                "lldpq.process_pfc_ecn_data.json.dumps",
+                "process_pfc_ecn_data.json.dumps",
                 side_effect=AssertionError("full JSON buffer must not be built"),
             ):
                 _atomic_json(path, value)
@@ -39,7 +43,7 @@ class PfcAtomicJsonTests(unittest.TestCase):
             path.write_text(original, encoding="utf-8")
             os.chmod(path, 0o640)
             with mock.patch(
-                "lldpq.process_pfc_ecn_data.os.replace",
+                "process_pfc_ecn_data.os.replace",
                 side_effect=OSError("simulated replace failure"),
             ):
                 with self.assertRaises(OSError):

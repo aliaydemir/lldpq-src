@@ -1001,16 +1001,21 @@
             // Check cache first
             const cached = localStorage.getItem('lldpq_update_check');
             if (cached) {
-                const data = JSON.parse(cached);
-                const age = Date.now() - data.timestamp;
-                // Cache valid only if: not expired AND local version hasn't changed
-                if (age < UPDATE_CHECK_INTERVAL && data.localVersion === localVersion) {
-                    // Use cached result - only show if remote is actually newer
-                    if (data.hasUpdate && data.remoteVersion && compareVersions(data.remoteVersion, localVersion) > 0) {
-                        remoteVersion = data.remoteVersion;
-                        showUpdateBadge(data.remoteVersion);
+                try {
+                    const data = JSON.parse(cached);
+                    const age = Date.now() - data.timestamp;
+                    // Cache valid only if: not expired AND local version hasn't changed
+                    if (age < UPDATE_CHECK_INTERVAL && data.localVersion === localVersion) {
+                        // Use cached result - only show if remote is actually newer
+                        if (data.hasUpdate && data.remoteVersion && compareVersions(data.remoteVersion, localVersion) > 0) {
+                            remoteVersion = data.remoteVersion;
+                            showUpdateBadge(data.remoteVersion);
+                        }
+                        return;
                     }
-                    return;
+                } catch (e) {
+                    // Corrupted cache - discard and re-check
+                    localStorage.removeItem('lldpq_update_check');
                 }
             }
             

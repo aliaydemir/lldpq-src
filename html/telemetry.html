@@ -1407,6 +1407,8 @@
         let allDevices = [];
         let prometheusUrl = '';
         let refreshInterval = null;
+        let dashboardUpdateGeneration = 0;
+        let dashboardUpdateChain = Promise.resolve();
         let totalThroughputChart = null;
         let topTalkersChart = null;
         let errorsChart = null;
@@ -1756,32 +1758,40 @@
             }, 10000);  // 10 second refresh
         }
         
-        async function updateDashboard() {
-            const device = document.getElementById('dashboardDevice').value;
-            const timeRange = document.getElementById('timeRange').value;
-            
-            try {
-                // Fetch stats
-                await Promise.all([
-                    updateStats(device, timeRange),
-                    updateTotalThroughputChart(device, timeRange),
-                    updateTopTalkersChart(device),
-                    updateErrorsChart(device, timeRange),
-                    updateDropsChart(device, timeRange),
-                    // Congestion & Link Health Stats
-                    updateTxWaitChart(device, timeRange),
-                    updateLinkFlapsChart(device, timeRange),
-                    updateBufferChart(device, timeRange),
-                    updatePauseChart(device, timeRange),
-                    updateArCongestionChart(device, timeRange),
-                    updateMarkedPacketsChart(device, timeRange),
-                    updateInterfaceTable(device),
-                    // Advanced charts (only update if visible)
-                    updateAdvancedCharts(device, timeRange)
-                ]);
-            } catch (error) {
-                console.error('Dashboard update error:', error);
-            }
+        function updateDashboard() {
+            // Serialize refreshes with a generation token so a slow in-flight
+            // batch cannot repaint charts with stale device/time-range data
+            dashboardUpdateGeneration += 1;
+            const generation = dashboardUpdateGeneration;
+            dashboardUpdateChain = dashboardUpdateChain.then(async () => {
+                if (generation !== dashboardUpdateGeneration) return;
+                const device = document.getElementById('dashboardDevice').value;
+                const timeRange = document.getElementById('timeRange').value;
+
+                try {
+                    // Fetch stats
+                    await Promise.all([
+                        updateStats(device, timeRange),
+                        updateTotalThroughputChart(device, timeRange),
+                        updateTopTalkersChart(device),
+                        updateErrorsChart(device, timeRange),
+                        updateDropsChart(device, timeRange),
+                        // Congestion & Link Health Stats
+                        updateTxWaitChart(device, timeRange),
+                        updateLinkFlapsChart(device, timeRange),
+                        updateBufferChart(device, timeRange),
+                        updatePauseChart(device, timeRange),
+                        updateArCongestionChart(device, timeRange),
+                        updateMarkedPacketsChart(device, timeRange),
+                        updateInterfaceTable(device),
+                        // Advanced charts (only update if visible)
+                        updateAdvancedCharts(device, timeRange)
+                    ]);
+                } catch (error) {
+                    console.error('Dashboard update error:', error);
+                }
+            });
+            return dashboardUpdateChain;
         }
         
         async function queryPrometheus(query, timeRange = '15m') {
@@ -2779,7 +2789,7 @@
                 }
             } catch (error) {
                 addLogEntry(`Error: ${error.message}`, 'error');
-                errorCount = allDevices.length;
+                errorCount = supportedDevices.length;
             }
             
             // Summary

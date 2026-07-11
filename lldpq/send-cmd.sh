@@ -159,7 +159,8 @@ execute_commands() {
     local out="$TMPDIR/${hostname}.out"
 
     for command in "${commands[@]}"; do
-        ssh_output=$(ssh -T -q -o StrictHostKeyChecking=no "$user@$device" "$command" 2>/dev/null)
+        ssh_output=$(ssh -T -q -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            -o ServerAliveInterval=10 -o ServerAliveCountMax=2 "$user@$device" "$command" 2>/dev/null)
         if [ -n "$ssh_output" ]; then
             {
                 echo ""

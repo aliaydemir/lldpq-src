@@ -8,19 +8,23 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from lldpq.collection_freshness import (
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from collection_freshness import (
     AssetStatusMap,
     _read_collection_outcomes_cached,
     is_current_collection,
     read_collection_outcomes,
 )
-from lldpq import process_hardware_data
-from lldpq import process_log_data
+import process_hardware_data
+import process_log_data
 
 
 ROOT = Path(__file__).resolve().parents[1]

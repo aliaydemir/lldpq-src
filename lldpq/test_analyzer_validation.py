@@ -6,11 +6,15 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from lldpq import validate_analysis_json
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import validate_analysis_json
 
 
 ROOT = Path(__file__).resolve().parents[1]

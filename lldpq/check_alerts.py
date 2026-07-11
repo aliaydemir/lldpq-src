@@ -1690,10 +1690,10 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
                 persisted = self.record_alert_delivery(
                     "network_summary", "last_summary", summary_signature
                 )
-                if include_schedule and self.is_summary_time():
-                    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                due_slot = self.due_summary_slot() if include_schedule else None
+                if due_slot is not None:
                     persisted = self.set_alert_state(
-                        "network_summary", "last_summary_time", current_time
+                        "network_summary", "last_summary_time", due_slot
                     ) and persisted
                 return delivered and persisted
             return False
@@ -1819,14 +1819,15 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
         if current_signature != last_signature:
             return True
             
-        # Send if it's scheduled time and hasn't been sent recently
-        if include_schedule and self.is_summary_time():
-            last_summary_time = self.get_alert_state("network_summary", "last_summary_time")
-            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-            
-            if current_time != last_summary_time:
-                return True
-                
+        # Send if a scheduled slot was reached and not yet sent for today
+        if include_schedule:
+            due_slot = self.due_summary_slot()
+            if due_slot is not None:
+                last_summary_time = self.get_alert_state("network_summary", "last_summary_time")
+
+                if due_slot != last_summary_time:
+                    return True
+
         return False
 
     def get_device_hardware_status(self, device):
@@ -2556,11 +2557,29 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
 
     def is_summary_time(self):
         """Check if it's time for scheduled summary"""
+        return self.due_summary_slot() is not None
+
+    def due_summary_slot(self):
+        """Return the newest summary slot already reached today, or None.
+
+        check_alerts runs at the end of the monitoring pipeline, minutes
+        after the cron minute, so an exact HH:MM match would never fire.
+        Comparing the reached slot against the last-sent slot marker lets a
+        scheduled summary fire exactly once per configured time per day.
+        """
         strategy = self.config.get('alert_strategy', {})
         summary_times = strategy.get('summary_times', ['09:00', '17:00'])
-        
-        current_time = datetime.datetime.now().strftime("%H:%M")
-        return current_time in summary_times
+
+        now = datetime.datetime.now()
+        current_time = now.strftime("%H:%M")
+        due_times = [
+            slot for slot in summary_times
+            if isinstance(slot, str) and re.fullmatch(r'\d{2}:\d{2}', slot)
+            and slot <= current_time
+        ]
+        if not due_times:
+            return None
+        return f"{now.strftime('%Y-%m-%d')} {max(due_times)}"
 
     def check_changes_only(self, devices):
         """Send the complete health summary only when its state changes."""

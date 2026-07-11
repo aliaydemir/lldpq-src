@@ -97,16 +97,16 @@ alert_strategy:
   # Example: "Network Health Summary: 70 devices, 14 excellent, 1 warning..."
   
   # 🚨 CRITICAL BYPASS (always immediate regardless of mode):
-  # These alerts are too important to wait for summary - sent immediately
+  # ⚠️ NOT IMPLEMENTED YET - critical issues are currently batched into the summary
   always_immediate:
     - "cpu_temp_critical"            # CPU over 85°C (hardware failure risk)
-    - "asic_temp_critical"           # ASIC over 90°C (switch could fail)  
+    - "asic_temp_critical"           # ASIC over 90°C (switch could fail)
     - "bgp_neighbors_down"           # BGP down (network connectivity lost)
     - "fan_critical_failure"         # Fan stopped (cooling failure)
-  # Note: These bypass summary mode and send individual device alerts
-  
+  # Note: These would bypass summary mode and send individual device alerts (not implemented yet)
+
   # 📈 CHANGE DETECTION (for change_only mode):
-  # Only alert when metrics change significantly from last check
+  # ⚠️ NOT IMPLEMENTED YET - change_only mode compares the full summary state instead
   change_threshold:
     temperature_change: 10          # Alert if temp jumps/drops by 10°C
     fan_change: 1000                # Alert if fan speed changes by 1000+ RPM
@@ -128,10 +128,12 @@ frequency:
   # Example: "✅ CPU Temperature Recovered: 72°C (back to normal)"
   
   # 📅 DAILY SUMMARY: Send health summary once per day
+  # ⚠️ NOT IMPLEMENTED YET - use alert_strategy.summary_times for scheduled summaries
   daily_summary: true
   # Sends comprehensive network health summary at 09:00 local time
-  
+
   # 📊 WEEKLY REPORT: Send weekly health trends (optional)
+  # ⚠️ NOT IMPLEMENTED YET
   weekly_report: false
   # Would send weekly statistics and trends every Monday at 09:00
 
@@ -170,7 +172,7 @@ templates:
 # 📊 WHAT YOU'LL GET:
 # • Summary mode: 1 clean dashboard-style message instead of 70+ spam alerts
 # • Smart scheduling: Morning (9 AM) and evening (5 PM) health summaries  
-# • Critical bypass: Immediate alerts for CPU/ASIC overheating, BGP down, fan failures
+# • Critical bypass: Immediate alerts for CPU/ASIC overheating, BGP down, fan failures (not implemented yet)
 # • Working links: Device links in alerts work from any machine (not just localhost)
 # • Rate limiting: Same alert won't spam - waits 30 minutes between repeats
 # • Recovery alerts: Get notified when problems are resolved

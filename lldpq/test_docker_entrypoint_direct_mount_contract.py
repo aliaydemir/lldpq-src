@@ -190,7 +190,7 @@ class DockerEntrypointDirectMountContractTests(unittest.TestCase):
 
     def test_defaults_and_initial_dhcp_follow_safe_source_order(self):
         defaults = self.source.index(
-            '# Default post-provision settings in lldpq.conf (if not present)'
+            '# Default display/post-provision settings in lldpq.conf (if not present)'
         )
         defaults_end = self.source.index("\n\n_docker_dhcp_is_managed", defaults)
         defaults_source = self.source[defaults:defaults_end]

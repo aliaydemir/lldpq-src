@@ -829,14 +829,14 @@ if leaking_enabled and leak_from_vrf:
 # Create VRF entry
 vrf_entry = {
     'l3vni': l3vni,
-    'lo': loopback_ip if loopback_ip else '{{ lo_ip }}',
-    'bgp_profile': bgp_profile
+    'lo': loopback_ip if loopback_ip else '{{ lo_ip }}'
 }
 
 if vxlan_int:
     vrf_entry['vxlan_int'] = vxlan_int
 
 devices_created = []
+device_errors = {}
 
 for device in devices:
     try:
@@ -862,11 +862,15 @@ for device in devices:
         if 'vrfs' not in host_data:
             host_data['vrfs'] = {}
         
-        # Create device-specific VRF entry with its own ASN
+        # Create device-specific VRF entry with its own ASN (nested bgp format, same as create_vrf)
         device_vrf_entry = vrf_entry.copy()
-        if device_asn:
-            device_vrf_entry['bgp_asn'] = device_asn
-        
+        if device_asn or bgp_profile:
+            device_vrf_entry['bgp'] = {}
+            if device_asn:
+                device_vrf_entry['bgp']['asn'] = device_asn
+            if bgp_profile:
+                device_vrf_entry['bgp']['bgp_profile'] = bgp_profile
+
         host_data['vrfs'][vrf_name] = device_vrf_entry
         
         # Write back
@@ -882,14 +886,19 @@ for device in devices:
         
         devices_created.append(device)
     except Exception as e:
-        pass  # Skip failed devices
+        device_errors[device] = str(e)  # Skip failed devices but report them
 
 result = {
-    'success': True,
+    'success': len(devices_created) > 0,
     'vrf_name': vrf_name,
     'devices_created': len(devices_created),
     'devices_list': devices_created
 }
+
+if device_errors:
+    result['device_errors'] = device_errors
+if not devices_created:
+    result['error'] = 'VRF was not created on any device: ' + '; '.join(f'{d}: {e}' for d, e in device_errors.items())
 
 if leaking_enabled:
     result['leaking_configured'] = leaking_configured
@@ -1371,10 +1380,16 @@ bgp_file = f"{ansible_dir}/inventory/group_vars/all/bgp_profiles.yaml"
 try:
     with open(bgp_file, 'r') as f:
         config = yaml.load(f) or {}
-    
+
+    bgp_profiles = config.get('bgp_profiles', {})
+    # Filtered name list for dropdowns (exclude underlay profiles)
+    profiles = [{'name': name} for name in sorted(bgp_profiles.keys())
+                if not name.startswith('VxLAN_UNDERLAY')]
+
     print(json.dumps({
         'success': True,
-        'bgp_profiles': config.get('bgp_profiles', {}),
+        'profiles': profiles,
+        'bgp_profiles': bgp_profiles,
         'infra_vrfs': config.get('infra_vrfs', [])
     }))
 
@@ -2309,95 +2324,105 @@ import shutil
 import os
 import sys
 
-# Parse POST data
-data = json.loads(os.environ.get('POST_DATA') or '{}')
-
-original_name = data.get('original_name', '')
-profile_name = data.get('profile_name', original_name)
-vlan_id = data.get('vlan_id')
-description = data.get('description', '')
-l2vni = data.get('l2vni')
-svi_enabled = data.get('svi_enabled', False)
-vrr_enabled = data.get('vrr_enabled', False)
-vrf = data.get('vrf', 'default')
-vrr_vip = data.get('vrr_vip', '')
-even_ip = data.get('even_ip', '')
-odd_ip = data.get('odd_ip', '')
-vrr_vmac = data.get('vrr_vmac', '')
-gateway_ip = data.get('gateway_ip', '')
-
-if not original_name:
-    print(json.dumps({'success': False, 'error': 'Original profile name is required'}))
-    sys.exit(0)
-
-# Paths
-ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
-inventory_base = os.path.join(ansible_dir, 'inventory')
-vlan_profiles_file = os.path.join(inventory_base, 'group_vars', 'all', 'vlan_profiles.yaml')
-
-# Load vlan_profiles
-vlan_config = {}
-if os.path.exists(vlan_profiles_file):
-    with open(vlan_profiles_file, 'r') as f:
-        vlan_config = yaml.load(f) or {}
-
-if 'vlan_profiles' not in vlan_config or original_name not in vlan_config['vlan_profiles']:
-    print(json.dumps({'success': False, 'error': f'VLAN profile {original_name} not found'}))
-    sys.exit(0)
-
-# Get existing profile data
-existing = vlan_config['vlan_profiles'][original_name]
-
-# Build updated VLAN entry
-vlan_entry = {
-    'description': description,
-    'l2vni': l2vni if l2vni else existing.get('vlans', {}).get(vlan_id, {}).get('l2vni', 100000 + vlan_id)
-}
-
-if svi_enabled:
-    vlan_entry['vrf'] = vrf
-    vlan_entry['ipv6'] = False
-    
-    if vrr_enabled:
-        if vrr_vip:
-            vlan_entry['vrr_vip'] = vrr_vip
-        if even_ip:
-            vlan_entry['even_ip'] = even_ip
-        if odd_ip:
-            vlan_entry['odd_ip'] = odd_ip
-        if vrr_vmac:
-            vlan_entry['vrr_vmac'] = vrr_vmac
-    else:
-        if gateway_ip:
-            vlan_entry['ip'] = gateway_ip
-
-# Update profile
-profile_entry = {
-    'vrr': {'state': vrr_enabled if svi_enabled else False},
-    'vlans': {vlan_id: vlan_entry}
-}
-
-# If profile name changed, remove old and add new
-if profile_name != original_name:
-    del vlan_config['vlan_profiles'][original_name]
-
-vlan_config['vlan_profiles'][profile_name] = profile_entry
-
-# Save
-_tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(vlan_profiles_file), suffix='.tmp')
 try:
-    with os.fdopen(_tmp_fd, 'w') as _tmp_f:
-        yaml.dump(vlan_config, _tmp_f)
-    shutil.move(_tmp_path, vlan_profiles_file)
-except:
-    if os.path.exists(_tmp_path): os.unlink(_tmp_path)
-    raise
+    # Parse POST data
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 
-print(json.dumps({
-    'success': True,
-    'profile_name': profile_name,
-    'renamed': profile_name != original_name
-}))
+    original_name = data.get('original_name', '')
+    profile_name = data.get('profile_name', original_name)
+    vlan_id = data.get('vlan_id')
+    description = data.get('description', '')
+    l2vni = data.get('l2vni')
+    svi_enabled = data.get('svi_enabled', False)
+    vrr_enabled = data.get('vrr_enabled', False)
+    vrf = data.get('vrf', 'default')
+    vrr_vip = data.get('vrr_vip', '')
+    even_ip = data.get('even_ip', '')
+    odd_ip = data.get('odd_ip', '')
+    vrr_vmac = data.get('vrr_vmac', '')
+    gateway_ip = data.get('gateway_ip', '')
+
+    if not original_name:
+        print(json.dumps({'success': False, 'error': 'Original profile name is required'}))
+        sys.exit(0)
+
+    # Paths
+    ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+    inventory_base = os.path.join(ansible_dir, 'inventory')
+    vlan_profiles_file = os.path.join(inventory_base, 'group_vars', 'all', 'vlan_profiles.yaml')
+
+    # Load vlan_profiles
+    vlan_config = {}
+    if os.path.exists(vlan_profiles_file):
+        with open(vlan_profiles_file, 'r') as f:
+            vlan_config = yaml.load(f) or {}
+
+    if 'vlan_profiles' not in vlan_config or original_name not in vlan_config['vlan_profiles']:
+        print(json.dumps({'success': False, 'error': f'VLAN profile {original_name} not found'}))
+        sys.exit(0)
+
+    # Get existing profile data
+    existing = vlan_config['vlan_profiles'][original_name]
+
+    # Build updated VLAN entry
+    vlan_entry = {
+        'description': description,
+        'l2vni': l2vni if l2vni else existing.get('vlans', {}).get(vlan_id, {}).get('l2vni', 100000 + vlan_id)
+    }
+
+    if svi_enabled:
+        vlan_entry['vrf'] = vrf
+        vlan_entry['ipv6'] = False
+
+        if vrr_enabled:
+            if vrr_vip:
+                vlan_entry['vrr_vip'] = vrr_vip
+            if even_ip:
+                vlan_entry['even_ip'] = even_ip
+            if odd_ip:
+                vlan_entry['odd_ip'] = odd_ip
+            if vrr_vmac:
+                vlan_entry['vrr_vmac'] = vrr_vmac
+        else:
+            if gateway_ip:
+                vlan_entry['ip'] = gateway_ip
+
+    # Update this VLAN in the profile's existing vlans (preserve other VLANs)
+    existing_vlans = existing.get('vlans', {}) or {}
+    if vlan_id not in existing_vlans and str(vlan_id) in existing_vlans:
+        existing_vlans[str(vlan_id)] = vlan_entry
+    else:
+        existing_vlans[vlan_id] = vlan_entry
+
+    profile_entry = {
+        'vrr': {'state': vrr_enabled if svi_enabled else False},
+        'vlans': existing_vlans
+    }
+
+    # If profile name changed, remove old and add new
+    if profile_name != original_name:
+        del vlan_config['vlan_profiles'][original_name]
+
+    vlan_config['vlan_profiles'][profile_name] = profile_entry
+
+    # Save
+    _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(vlan_profiles_file), suffix='.tmp')
+    try:
+        with os.fdopen(_tmp_fd, 'w') as _tmp_f:
+            yaml.dump(vlan_config, _tmp_f)
+        shutil.move(_tmp_path, vlan_profiles_file)
+    except:
+        if os.path.exists(_tmp_path): os.unlink(_tmp_path)
+        raise
+
+    print(json.dumps({
+        'success': True,
+        'profile_name': profile_name,
+        'renamed': profile_name != original_name
+    }))
+
+except Exception as e:
+    print(json.dumps({'success': False, 'error': str(e)}))
 PYTHON
 }
 
@@ -5476,6 +5501,8 @@ if not devices:
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
+max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
+max_workers = max(1, min(max_workers, 50))
 
 supported = []
 unsupported = []

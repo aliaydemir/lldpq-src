@@ -147,7 +147,9 @@ process_device() {
 
     # Step 2: Passwordless Sudo Setup
     if $DO_SUDO; then
-        local sudo_cmd="echo '$PASSWORD' | sudo -S bash -c 'echo \"$user ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/10_$user && chmod 440 /etc/sudoers.d/10_$user'"
+        local pw_quoted
+        pw_quoted=$(printf '%q' "$PASSWORD")
+        local sudo_cmd="echo $pw_quoted | sudo -S bash -c 'echo \"$user ALL=(ALL) NOPASSWD:ALL\" > /etc/sudoers.d/10_$user && chmod 440 /etc/sudoers.d/10_$user'"
         if sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -q "$user@$device" "$sudo_cmd" 2>/dev/null; then
             sudo_status="${GREEN}OK${NC}"
         else

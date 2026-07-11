@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import sys
 import time
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "html"))
 SCRIPT_TEXT = (ROOT / "html" / "ai-api.sh").read_text(encoding="utf-8")
 START = SCRIPT_TEXT.index("python3 << 'PYTHON_SCRIPT'") + len("python3 << 'PYTHON_SCRIPT'")
 END = SCRIPT_TEXT.rindex("\nPYTHON_SCRIPT")

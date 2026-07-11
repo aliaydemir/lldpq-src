@@ -9,3 +9,4 @@ IMPROVEMENT_PLAN.md
 .playwright-cli/
 tests/
 output/
+.pytest_cache/

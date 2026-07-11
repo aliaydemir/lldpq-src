@@ -5,14 +5,18 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import sys
 import unittest
 
-from lldpq.process_evpn_mh_data import (
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from process_evpn_mh_data import (
     correlate_snapshots,
     parse_snapshot,
     render_report,
 )
-from lldpq.collection_bundle import SECTIONS
+from collection_bundle import SECTIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]

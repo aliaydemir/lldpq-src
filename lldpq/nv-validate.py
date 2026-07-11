@@ -852,7 +852,8 @@ class NVUEValidator:
         has_untagged = 'untagged' in config
         
         # Required: either access or vlan must be defined
-        if not has_access and not has_vlan:
+        # Empty domain config (br_default: {}) is valid NVUE: port inherits all bridge VLANs
+        if config and not has_access and not has_vlan:
             self.add_error(path,
                          f"Interface '{iface_name}' has bridge domain but no VLAN configuration",
                          "access: <VLAN_ID> (access port) or vlan: <VLAN_ID>: {} (trunk port)")
@@ -3393,6 +3394,7 @@ Topology analysis checks for IP conflicts, MAC conflicts, VLAN-VNI consistency, 
         
         # Topology analysis (default enabled)
         topology_analyzer = TopologyAnalyzer()
+        topology_report = topology_analyzer.report  # empty report when --no-topology
         topology_errors = 0
         
         if not args.no_topology:

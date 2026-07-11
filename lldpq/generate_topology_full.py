@@ -555,10 +555,14 @@ def parse_lldp_results(
             all_lldp_links_found.add((neighbor_device, tgt_ifname, device_name_from_lldp, interface_name))
 
 
+    # Mark unreachable managed devices as "unknown" — but NOT hosts/servers/endpoints.
+    # A device is "unreachable" if it's in device_info (assets.ini) but has no LLDP file.
+    # Hosts/servers (e.g. RTX, DGX) are expected to not have LLDP files — they're not switches.
     for node in topology_data["nodes"]:
         if node["name"] in device_info and \
            node["name"] not in hosts_only_devices and \
-           node["name"] not in reachable_devices:
+           node["name"] not in reachable_devices and \
+           node["icon"] not in ("server", "host", "firewall"):
             node["icon"] = "unknown"
 
     return topology_data, device_nodes, link_id, all_lldp_links_found, all_port_status, all_port_speed

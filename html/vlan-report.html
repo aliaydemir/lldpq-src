@@ -1450,7 +1450,7 @@
                     let html = '';
                     for (const [group, devices] of Object.entries(data.devices)) {
                         const groupId = group.replace(/[^a-zA-Z0-9]/g, '_');
-                        html += `<div style="display: flex; align-items: center; gap: 6px; color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333; cursor: pointer;" onclick="toggleGroupDevices('${groupId}', 'create-vlan-devices')">
+                        html += `<div style="display: flex; align-items: center; gap: 6px; color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333; cursor: pointer;" onclick="toggleGroupDevices('${groupId}', 'create-vlan-devices', true)">
                             <input type="checkbox" id="group-${groupId}" style="width: 12px; height: 12px;" onclick="event.stopPropagation(); toggleGroupDevices('${groupId}', 'create-vlan-devices')">
                             <span>${group}</span>
                         </div>`;
@@ -1469,8 +1469,10 @@
             }
         }
         
-        function toggleGroupDevices(groupId, inputName) {
+        function toggleGroupDevices(groupId, inputName, flip) {
             const groupCb = document.getElementById('group-' + groupId);
+            // Header row click: flip the group checkbox first (checkbox clicks toggle natively)
+            if (flip) groupCb.checked = !groupCb.checked;
             const devices = document.querySelectorAll(`input[name="${inputName}"][data-group="${groupId}"]`);
             devices.forEach(cb => cb.checked = groupCb.checked);
         }

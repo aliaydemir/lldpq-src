@@ -6,11 +6,15 @@ from __future__ import annotations
 import collections
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from lldpq.link_flap_analyzer import LinkFlapAnalyzer
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from link_flap_analyzer import LinkFlapAnalyzer
 
 
 class LinkFlapOptimizationTests(unittest.TestCase):
@@ -36,7 +40,7 @@ class LinkFlapOptimizationTests(unittest.TestCase):
             batched = self.analyzer(second_root)
             self.seed(old_style, now)
             self.seed(batched, now)
-            with mock.patch("lldpq.link_flap_analyzer.time.time", return_value=now):
+            with mock.patch("link_flap_analyzer.time.time", return_value=now):
                 for analyzer in (old_style, batched):
                     analyzer.update_carrier_transitions("leaf:swp1", 16)
                     analyzer.update_carrier_transitions("leaf:swp2", 2)
@@ -66,7 +70,7 @@ class LinkFlapOptimizationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             analyzer = self.analyzer(root)
             self.seed(analyzer, now)
-            with mock.patch("lldpq.link_flap_analyzer.time.time", return_value=now):
+            with mock.patch("link_flap_analyzer.time.time", return_value=now):
                 analyzer.save_flap_history()
             path = Path(root) / "flap_history.json"
             text = path.read_text(encoding="utf-8")
@@ -83,7 +87,7 @@ class LinkFlapOptimizationTests(unittest.TestCase):
             path = Path(root) / "flap_history.json"
             path.write_text('{"old":true}\n', encoding="utf-8")
             with mock.patch(
-                "lldpq.link_flap_analyzer.os.replace",
+                "link_flap_analyzer.os.replace",
                 side_effect=OSError("simulated replace failure"),
             ):
                 with self.assertRaises(OSError):
