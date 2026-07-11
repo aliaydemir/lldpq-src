@@ -218,8 +218,18 @@ try:
 except:
     print("")
 ' 2>/dev/null)
-    
-    if [ -z "$content" ]; then
+
+    # Check content parameter is present (empty content is a valid save)
+    local has_content=$(echo "$post_data" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print("yes" if "content" in data else "no")
+except:
+    print("no")
+' 2>/dev/null)
+
+    if [ "$has_content" != "yes" ]; then
         json_response '{"success": false, "error": "No content provided"}'
         return
     fi
@@ -269,7 +279,7 @@ run_diff() {
     fi
     
     # Sanitize host name
-    host=$(echo "$host" | tr -cd '[:alnum:]-_,')
+    host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
     
     cd "$ANSIBLE_DIR" || {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
@@ -303,7 +313,7 @@ run_deploy() {
     fi
     
     # Sanitize host name
-    host=$(echo "$host" | tr -cd '[:alnum:]-_,')
+    host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
     
     cd "$ANSIBLE_DIR" || {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
@@ -339,7 +349,7 @@ run_generate() {
     local output
     if [ -n "$host" ] && [ "$host" != "all" ]; then
         # Sanitize host name (include localhost for summary play)
-        host=$(echo "$host" | tr -cd '[:alnum:]-_,')
+        host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
         output=$(ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/generate_switch_nvue_yaml_configs.yaml -l "$host,localhost" 2>&1)
     else
         output=$(ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/generate_switch_nvue_yaml_configs.yaml 2>&1)
@@ -544,7 +554,7 @@ case "$ACTION" in
         
         # Reset all changes (discard uncommitted changes)
         output=$(git checkout . 2>&1)
-        local reset_code=$?
+        reset_code=$?
         
         # Fix git permissions after reset
         fix_git_permissions

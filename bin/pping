@@ -341,7 +341,8 @@ last_call() {
     echo -e "Press \e[32m[P] \e[0mto do it again.\nPress \e[91m[Q] \e[0mto exit."
     read -rsn1 char
     if [[ $char == 'p' || $char == 'P' ]]; then
-        main_loop
+        # Return to main_loop so main re-runs with the original arguments
+        return 0
     elif [[ $char == 'q' || $char == 'Q' ]]; then
         exit 0
     else
@@ -374,7 +375,8 @@ main() {
     local role_filter=""
     local start_ip=""
     local end_ip=""
-    
+    local OPTIND=1
+
     while getopts ":v:f:r:h" opt; do
         case $opt in
             v) vrf_name="$OPTARG" ;;
@@ -408,7 +410,12 @@ main() {
     fi
     
     # Load from devices.yaml (with optional -f override)
-    load_from_devices_yaml "$role_filter" "$file_path"
+    # Plain-text custom files (hostname ip_address lines) fall back to load_ip_list
+    if [[ -n "$file_path" && -f "$file_path" ]] && ! grep -qE '^devices:' "$file_path"; then
+        load_ip_list "$file_path"
+    else
+        load_from_devices_yaml "$role_filter" "$file_path"
+    fi
     
     full_ping
 }

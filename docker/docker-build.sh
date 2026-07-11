@@ -50,6 +50,7 @@ cd "$REPO_ROOT"
 sudo docker build \
     -f docker/Dockerfile \
     --build-arg TARGETARCH="${ARCH_LABEL}" \
+    --build-arg LLDPQ_VERSION="${VERSION}" \
     --label "org.opencontainers.image.revision=${GIT_COMMIT}" \
     -t "${IMAGE_NAME}:${IMAGE_TAG}" \
     -t "${IMAGE_NAME}:${VERSION}" \

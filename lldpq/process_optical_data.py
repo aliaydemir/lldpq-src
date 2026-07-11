@@ -218,15 +218,34 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                     ("diagnostics-status          : N/A" in optical_data and
                      "temperature" not in optical_data and "voltage" not in optical_data and
                      "rx-power" not in optical_data and "tx-power" not in optical_data)):
+                    # ethtool reports an empty cage as a down interface with
+                    # no transceiver data.  A port with previous optical
+                    # readings that now reads empty is an unplugged module,
+                    # not a never-populated cage.
+                    if (NO_TRANSCEIVER_DATA_RE.search(optical_data) and
+                            port_name in optical_analyzer.optical_history and
+                            re.search(r'^\s*Interface\s+state\s*:\s*down\b',
+                                      optical_data,
+                                      re.IGNORECASE | re.MULTILINE)):
+                        record_optical_state(
+                            optical_analyzer, port_name, hostname,
+                            'unplugged', optical_data
+                        )
                     continue
 
                 # DAC/Copper cables do not provide optical diagnostics.  Keep
                 # this check before interface-state handling so a down DAC is
-                # not reclassified as a failed optical link.
-                if any(indicator in optical_data for indicator in [
-                    'Passive copper', 'Active copper', 'Copper cable',
-                    'Base-CR', 'DAC', 'Twinax', 'No separable connector'
-                ]):
+                # not reclassified as a failed optical link.  Vendor identity
+                # lines (SN/PN/date code) may coincidentally contain 'DAC', so
+                # classify from descriptor lines only.
+                if any(indicator in line
+                       for line in optical_data.split('\n')
+                       if not re.match(r'\s*(?:vendor|serial|date)',
+                                       line, re.IGNORECASE)
+                       for indicator in [
+                           'Passive copper', 'Active copper', 'Copper cable',
+                           'Base-CR', 'DAC', 'Twinax', 'No separable connector'
+                       ]):
                     continue
 
                 # Check for unplugged ports - add as "unplugged" status for troubleshooting

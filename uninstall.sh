@@ -2361,32 +2361,38 @@ if ! $DRY_RUN && [[ -f /etc/crontab ]]; then
     fi
 fi
 
+# Kill only processes anchored to the installed absolute paths; an unrelated
+# host process whose cmdline merely contains a generic script name is spared.
 for proc in lldpq-trigger lldpq-ai-analyze lldpq-provision-scheduler fabric-scan-cron.sh fabric-scan.sh collect-transceiver-fw.sh monitor.sh check-lldp.sh assets.sh; do
     if pgrep -f "/usr/local/bin/$proc" >/dev/null 2>&1 || \
        pgrep -f "$LLDPQ_INSTALL_DIR/$proc" >/dev/null 2>&1; then
-        run "sudo pkill -f '$proc' 2>/dev/null || true"
+        run "sudo pkill -f '/usr/local/bin/$proc' 2>/dev/null || true"
+        run "sudo pkill -f '$LLDPQ_INSTALL_DIR/$proc' 2>/dev/null || true"
         echo "  killed $proc"
     fi
 done
 
 quiesce_lldpq_writers() {
     local pattern pid remaining=false
+    # Generic script names are anchored to their installed absolute paths so an
+    # unrelated host process with a matching basename is neither killed nor able
+    # to keep this quiesce loop from converging.
     local -a patterns=(
         "lldpq-trigger"
         "lldpq-provision-scheduler"
-        "provision-api.sh --discovery-worker"
-        "provision-api.sh --discovery-schedule"
-        "provision-api.sh --upgrade-worker"
-        "provision-api.sh --upgrade-resume"
-        "fabric-scan-cron.sh"
-        "fabric-scan.sh"
+        "$WEB_ROOT/provision-api.sh --discovery-worker"
+        "$WEB_ROOT/provision-api.sh --discovery-schedule"
+        "$WEB_ROOT/provision-api.sh --upgrade-worker"
+        "$WEB_ROOT/provision-api.sh --upgrade-resume"
+        "$LLDPQ_INSTALL_DIR/fabric-scan-cron.sh"
+        "$LLDPQ_INSTALL_DIR/fabric-scan.sh"
         "lldpq-ai-analyze"
-        "ai-api.sh"
-        "collect-transceiver-fw.sh"
+        "$WEB_ROOT/ai-api.sh"
+        "$LLDPQ_INSTALL_DIR/collect-transceiver-fw.sh"
         "/usr/local/bin/lldpq([[:space:]]|$)"
-        "monitor.sh"
-        "check-lldp.sh"
-        "assets.sh"
+        "$LLDPQ_INSTALL_DIR/monitor.sh"
+        "$LLDPQ_INSTALL_DIR/check-lldp.sh"
+        "$LLDPQ_INSTALL_DIR/assets.sh"
     )
     terminate_process_tree() {
         local parent="$1" child
@@ -2452,11 +2458,9 @@ systemctl is-active --quiet fcgiwrap.socket 2>/dev/null && \
     FCGIWRAP_SOCKET_WAS_ACTIVE=true
 echo "  [i] fcgiwrap is shared: LLDPq CGI execution will be paused during cleanup."
 echo "      Previously active units will be restored after the LLDPq route and CGI files are removed."
-if ! run "sudo systemctl stop fcgiwrap.socket fcgiwrap.service 2>/dev/null"; then
-    echo "[!] fcgiwrap could not be stopped safely" >&2
-    if $KEEP_DATA && ! $DRY_RUN; then rollback_keep_data_quiesce || true; fi
-    exit 1
-fi
+# Tolerate absent/purged units so a retried uninstall is not dead-ended; the
+# is-active verification below still fails closed if a unit refused to stop.
+run "sudo systemctl stop fcgiwrap.socket fcgiwrap.service 2>/dev/null || true"
 if ! $DRY_RUN && \
    { systemctl is-active --quiet fcgiwrap.socket 2>/dev/null || \
      systemctl is-active --quiet fcgiwrap.service 2>/dev/null; }; then
@@ -2830,7 +2834,7 @@ verify_absent "Provision cron source" /etc/cron.d/lldpq || true
 
 # ─── 4. Bin scripts ───────────────────────────────────────────────────
 step "Removing CLI tools..."
-BIN_TOOLS=(lldpq lldpq-config lldpq-trigger lldpq-ai-analyze lldpq-provision-scheduler zzh pping send-cmd get-conf netprobe-ai)
+BIN_TOOLS=(lldpq lldpq-config lldpq-trigger lldpq-ai-analyze lldpq-provision-scheduler zzh pping send-cmd get-conf)
 for bin in "${BIN_TOOLS[@]}"; do
     if [[ -e "/usr/local/bin/$bin" || -L "/usr/local/bin/$bin" ]]; then
         run_required "CLI tool could not be removed: /usr/local/bin/$bin" \
@@ -2869,6 +2873,35 @@ for f in \
             "sudo rm -f '$f'" && echo "  removed $f"
     fi
 done
+# install.sh copies etc/* to /etc/, which installs /etc/tmux.conf host-wide.
+# Prefer the installer's pre-LLDPq backup; otherwise remove the file only when
+# it is byte-identical to the shipped copy so an operator-edited config stays.
+if [[ -f /etc/tmux.conf.pre-lldpq && ! -L /etc/tmux.conf.pre-lldpq ]]; then
+    run_required "Pre-LLDPq tmux configuration could not be restored" \
+        "sudo mv -f -- /etc/tmux.conf.pre-lldpq /etc/tmux.conf" && \
+        echo "  restored pre-LLDPq /etc/tmux.conf"
+elif [[ -e /etc/tmux.conf || -L /etc/tmux.conf ]]; then
+    _shipped_tmux_conf=""
+    _uninstall_self_dir=$(cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || \
+        _uninstall_self_dir=""
+    for _tmux_candidate in \
+        "${_uninstall_self_dir:+$_uninstall_self_dir/etc/tmux.conf}" \
+        "${LLDPQ_SOURCE_DIR:+$LLDPQ_SOURCE_DIR/etc/tmux.conf}"; do
+        if [[ -n "$_tmux_candidate" && -f "$_tmux_candidate" && \
+              "$_tmux_candidate" != /etc/tmux.conf ]]; then
+            _shipped_tmux_conf="$_tmux_candidate"
+            break
+        fi
+    done
+    if [[ -f /etc/tmux.conf && ! -L /etc/tmux.conf && -n "$_shipped_tmux_conf" ]] && \
+       cmp -s /etc/tmux.conf "$_shipped_tmux_conf"; then
+        run_required "LLDPq tmux configuration could not be removed" \
+            "sudo rm -f /etc/tmux.conf" && echo "  removed /etc/tmux.conf"
+    else
+        echo "  [i] kept /etc/tmux.conf (no pre-LLDPq backup; not verifiably the shipped LLDPq copy)"
+    fi
+fi
+unset _shipped_tmux_conf _uninstall_self_dir _tmux_candidate
 if $PARTIAL_INSTALL_TREE && ! $FORCE_PARTIAL; then
     echo "  kept /etc/lldpq.conf so a verified --force-partial rerun retains the custom paths"
 else
@@ -2918,6 +2951,15 @@ if [[ -e /etc/nginx/sites-available/lldpq || -L /etc/nginx/sites-available/lldpq
     run_required "Available nginx LLDPq site could not be removed" \
         "sudo rm -f /etc/nginx/sites-available/lldpq" && echo "  removed sites-available/lldpq"
 fi
+# install.sh unconditionally disabled the stock default site when it enabled
+# the LLDPq route. Re-enable it only when nginx is kept, the default vhost is
+# still available and no other site remains enabled, so port 80 serves again.
+if ! $REMOVE_NGINX_PKG && [[ -f /etc/nginx/sites-available/default ]] && \
+   [[ -d /etc/nginx/sites-enabled ]] && \
+   ! find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 ! -name lldpq -print -quit 2>/dev/null | grep -q .; then
+    run "sudo ln -s /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true"
+    echo "  re-enabled nginx default site"
+fi
 if command -v nginx >/dev/null 2>&1; then
     if ! run "sudo nginx -t >/dev/null 2>&1"; then
         record_cleanup_failure "nginx validation failed after removing the LLDPq site"
@@ -2952,6 +2994,7 @@ WEB_TARGETS=(
     "$WEB_ROOT/ai-api.sh" "$WEB_ROOT/ai.html" "$WEB_ROOT/ai_command_policy.py"
     "$WEB_ROOT/ai_insights.py" "$WEB_ROOT/ai_context.py"
     "$WEB_ROOT/assets-api.sh" "$WEB_ROOT/setup_safety.py"
+    "$WEB_ROOT/lldpq_config_write.py"
     "$WEB_ROOT/provision.html" "$WEB_ROOT/provision-api.sh" "$WEB_ROOT/admin-page.sh" \
     "$WEB_ROOT/lifecycle-scope.js"
     "$WEB_ROOT/handover.html" "$WEB_ROOT/tracking-api.sh"
@@ -3180,6 +3223,23 @@ if $REMOVE_DOCKER_PKG; then
     run_required "Docker engine/containerd data could not be removed" \
         "sudo rm -rf /var/lib/docker /var/lib/containerd" || true
     verify_absent "Requested Docker data" /var/lib/docker /var/lib/containerd || true
+    # install.sh writes this exact vfs marker only when no daemon.json existed,
+    # so any other content belongs to the operator and is left in place.
+    if [[ -f /etc/docker/daemon.json && ! -L /etc/docker/daemon.json ]] && \
+       [[ "$(cat /etc/docker/daemon.json 2>/dev/null)" == '{"storage-driver": "vfs"}' ]]; then
+        run_required "LLDPq Docker daemon config could not be removed" \
+            "sudo rm -f /etc/docker/daemon.json" && \
+            echo "  removed LLDPq-written /etc/docker/daemon.json"
+    elif [[ -e /etc/docker/daemon.json || -L /etc/docker/daemon.json ]]; then
+        echo "  [i] kept /etc/docker/daemon.json (not the LLDPq-written vfs marker)"
+    fi
+    # install.sh downloads this binary only when docker-compose was absent;
+    # without a marker its origin cannot be proven, so never delete it blindly.
+    if [[ -e /usr/local/bin/docker-compose || -L /usr/local/bin/docker-compose ]]; then
+        echo "  [i] kept /usr/local/bin/docker-compose (cannot prove install.sh downloaded it; remove manually if unwanted)"
+    fi
+    run "sudo gpasswd -d '$LLDPQ_USER' docker 2>/dev/null || true"
+    run "sudo gpasswd -d www-data docker 2>/dev/null || true"
     if ! $DRY_RUN; then
         for package in "${DOCKER_PACKAGE_CANDIDATES[@]}"; do
             package_is_installed "$package" && \

@@ -145,6 +145,17 @@ if [[ "$lock_is_inherited" != "true" ]]; then
     export LLDPQ_MONITOR_LOCK_HELD=1
 fi
 
+# bin/lldpq and lldpq-trigger export the pipeline identity before invoking
+# this script. Direct invocations generate the same-format fallback so
+# collection outcome manifests stay bound to this run; the current-run
+# manifest still records pipeline_complete=false for a fallback identity
+# because this run did not refresh the assets/LLDP sources.
+pipeline_id_is_fallback=false
+if [[ -z "${LLDPQ_PIPELINE_ID:-}" ]]; then
+    export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+    pipeline_id_is_fallback=true
+fi
+
 # Start timing
 START_TIME=$(date +%s)
 if [[ "$scoped_run" == "true" ]]; then
@@ -721,10 +732,18 @@ complete_report_state() {
 write_current_manifest() {
     local manifest="$SCRIPT_DIR/monitor-results/.lldpq-current.json"
     local completed_at
+    local pipeline_id="${LLDPQ_PIPELINE_ID:-}"
+    local pipeline_started_at="${LLDPQ_PIPELINE_STARTED_AT:-}"
+    if [[ "$pipeline_id_is_fallback" == "true" ]]; then
+        # A fallback identity has no wrapper-refreshed sources; keep the
+        # manifest on the pipeline_complete=false contract.
+        pipeline_id=""
+        pipeline_started_at=""
+    fi
     completed_at=$(date -Is) || return 1
     python3 - "$manifest" "$completed_at" "$device_count" \
-        "$SKIP_OPTICAL" "${LLDPQ_PIPELINE_ID:-}" \
-        "${LLDPQ_PIPELINE_STARTED_AT:-}" \
+        "$SKIP_OPTICAL" "$pipeline_id" \
+        "$pipeline_started_at" \
         "${LLDPQ_ASSETS_FILE:-$SCRIPT_DIR/assets.ini}" \
         "$SCRIPT_DIR/lldp-results/lldp_results.ini" \
         "${MONITOR_DATA_MAX_AGE_MINUTES:-30}" \
@@ -2519,14 +2538,13 @@ EOF
         cat "$_lldpq_snapshot_dir/vlan" | \
           awk '\''BEGIN{cp=""}
                NR==1||NF==0{next}
-               NF>=2{
+               /^[^ \t]/{
                  if(cp!="") print cp "|" p "|" v
                  cp=$1; p=""; v=$2
                  if($3=="PVID") p=$2
                  next
                }
-               NF==1{ v=v"," $1 }
-               NF>2&&$3=="PVID"{ p=$2; v=v"," $2 }
+               { v=(v=="" ? $1 : v"," $1); if($2=="PVID") p=$1 }
                END{ if(cp!="") print cp "|" p "|" v }'\'' | \
           awk -F"|" '\''{
                 if($1~/^vxlan/) { n="9999" } else { n="5000" }
@@ -3269,7 +3287,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status FRR OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -Ei "(error|warn|crit|fail|down|bgp)" || echo "No recent FRR routing issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -Ei "(error|warn|crit|fail|down|bgp)" || echo "No recent FRR routing issues"
             else
                 _lldpq_log_status FRR ERROR
             fi
@@ -3294,7 +3312,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status SWITCHD OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -Ei "(error|warn|crit|fail|except)" || echo "No recent switchd issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -Ei "(error|warn|crit|fail|except)" || echo "No recent switchd issues"
             else
                 _lldpq_log_status SWITCHD ERROR
             fi
@@ -3319,7 +3337,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status NVUE OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -E "(ERROR|WARN|FAIL|EXCEPT|config|commit|rollback)" || echo "No recent NVUE config issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(ERROR|WARN|FAIL|EXCEPT|config|commit|rollback)" || echo "No recent NVUE config issues"
             else
                 _lldpq_log_status NVUE ERROR
             fi
@@ -3344,7 +3362,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status MSTPD OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -E "(ERROR|WARN|TOPOLOGY|CHANGE|port|state|bridge)" || echo "No recent STP issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(ERROR|WARN|TOPOLOGY|CHANGE|port|state|bridge)" || echo "No recent STP issues"
             else
                 _lldpq_log_status MSTPD ERROR
             fi
@@ -3369,7 +3387,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status CLAGD OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -E "(ERROR|WARN|FAIL|CONFLICT|PEER|bond|backup|primary)" || echo "No recent MLAG issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(ERROR|WARN|FAIL|CONFLICT|PEER|bond|backup|primary)" || echo "No recent MLAG issues"
             else
                 _lldpq_log_status CLAGD ERROR
             fi
@@ -3394,7 +3412,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status AUTH OK
-                printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -30 | grep -E "(FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized)" | grep -v -E "(journalctl|monitor\.sh|--since|swp\|bond\|vlan\|carrier\|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized)" | grep -v -E "(journalctl|monitor\.sh|--since|swp\|bond\|vlan\|carrier\|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
             else
                 _lldpq_log_status AUTH ERROR
             fi
@@ -3413,7 +3431,7 @@ EOF
             _source_output=$(_lldpq_run_bounded sudo cat /var/log/syslog 2>/dev/null)
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
-                CRITICAL_LOGS=$(printf "%s\n" "$_source_output" | grep "$(date '\''+%b %d'\'')" | tail -50 | grep -E "(ERROR|CRIT|ALERT|EMERG|FAIL|kernel|oom|segfault)" || true)
+                CRITICAL_LOGS=$(printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -50 | grep -E "(ERROR|CRIT|ALERT|EMERG|FAIL|kernel|oom|segfault)" || true)
             fi
         else
             _source_status=2

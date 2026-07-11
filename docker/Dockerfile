@@ -2,7 +2,7 @@
 # Single container: nginx + fcgiwrap + python3 + ssh + cron
 FROM ubuntu:22.04
 
-ARG LLDPQ_VERSION=4.0.0
+ARG LLDPQ_VERSION=4.0.4
 LABEL maintainer="ali@lldpq.dev"
 LABEL description="LLDPq Network Monitoring"
 LABEL version="${LLDPQ_VERSION}"

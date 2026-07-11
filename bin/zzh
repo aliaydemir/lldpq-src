@@ -1660,7 +1660,7 @@ class Connections:
                             Role = None
                             if isinstance(DevInfo, str):
                                 # Parse "Hostname @role" format
-                                RoleMatch = re.match(r'^(.+?)\s+@(\w+)$', DevInfo.strip())
+                                RoleMatch = re.match(r'^(.+?)\s+@([A-Za-z0-9_.-]+)$', DevInfo.strip())
                                 if RoleMatch:
                                     Hostname = RoleMatch.group(1).strip()
                                     Role = RoleMatch.group(2).lower()
@@ -1684,6 +1684,9 @@ class Connections:
                                 'identity': '~/.ssh/id_rsa',
                                 'customargs': '-o StrictHostKeyChecking=no'
                             }
+                            if Role:
+                                # Populate roles key so the -r/--role filter works
+                                self.LoadedServersDict[Hostname]['roles'] = [Role]
                             DeviceCount += 1
                         LogWrite.debug('Loaded {} devices from devices.yaml'.format(DeviceCount))
             except Exception as Exc:
@@ -2918,7 +2921,7 @@ def MainCursesFunction(stdscr):
                 UserNum = int(ConnBox.Text)
                 if (UserNum >= 1
                     and UserNum <= len(ConnectionsList.FullServersList)):
-                        CommandInfo = ConnectionsList.GetCommandLine(str(UserNum - 1))
+                        CommandInfo = ConnectionsList.GetCommandLine(str(UserNum))
                         break
 
         # Enter key in FilterBox:

@@ -172,10 +172,15 @@ class OpticalAnalyzer:
             'No separable connector'  # DAC cables
         ]
         
-        for indicator in cable_type_indicators:
-            if indicator in optical_data:
-                # This is a copper/DAC cable, not optical - skip optical analysis
-                return None
+        # Vendor identity fields (SN/PN/date code) may coincidentally contain
+        # indicator substrings such as 'DAC'; classify from descriptor lines only.
+        for line in optical_data.split('\n'):
+            if re.match(r'\s*(?:vendor|serial|date)', line, re.IGNORECASE):
+                continue
+            for indicator in cable_type_indicators:
+                if indicator in line:
+                    # This is a copper/DAC cable, not optical - skip optical analysis
+                    return None
         
         optical_params = {
             'rx_power_dbm': None,
@@ -210,7 +215,7 @@ class OpticalAnalyzer:
         )
         bias_pattern = re.compile(
             rf'(?:ch-(?P<nvue_lane>\d+)-tx-bias-current|'
-            rf'Laser\s+tx\s+bias\s+current'
+            rf'Laser\s+(?:tx\s+)?bias\s+current'
             rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
             rf'\s*:\s*(?P<value>{number})\s*mA',
             re.IGNORECASE,

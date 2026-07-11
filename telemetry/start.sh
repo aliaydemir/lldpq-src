@@ -5,10 +5,17 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Prefer compose v2 plugin ('docker compose'), fall back to legacy v1 binary
+if docker compose version >/dev/null 2>&1; then
+    COMPOSE="docker compose"
+else
+    COMPOSE="docker-compose"
+fi
+
 case "${1:-start}" in
     start)
         echo "Starting LLDPq Telemetry Stack..."
-        docker-compose up -d
+        $COMPOSE up -d
         echo ""
         echo "Services started:"
         echo "  - OTEL Collector: http://localhost:4317 (gRPC), http://localhost:4318 (HTTP)"
@@ -19,17 +26,17 @@ case "${1:-start}" in
         ;;
     stop)
         echo "Stopping LLDPq Telemetry Stack..."
-        docker-compose down
+        $COMPOSE down
         ;;
     restart)
         echo "Restarting LLDPq Telemetry Stack..."
-        docker-compose restart
+        $COMPOSE restart
         ;;
     status)
-        docker-compose ps
+        $COMPOSE ps
         ;;
     logs)
-        docker-compose logs -f --tail=100
+        $COMPOSE logs -f --tail=100
         ;;
     *)
         echo "Usage: $0 [start|stop|restart|status|logs]"

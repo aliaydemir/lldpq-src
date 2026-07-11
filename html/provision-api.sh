@@ -54,6 +54,7 @@ BASE_CONFIG_DIR="${BASE_CONFIG_DIR:-${LLDPQ_DIR}/sw-base}"
 PROVISION_UPLOAD_DIR="${PROVISION_UPLOAD_DIR:-${WEB_ROOT}/provision-uploads}"
 
 POST_DATA=""
+POST_DATA_FILE=""
 LINES_PARAM=""
 PROVISION_UPLOAD_FD=""
 if [[ "$UPGRADE_WORKER_MODE" == true ]]; then
@@ -79,7 +80,19 @@ else
         # replaces stdin with the embedded source code.
         case "$CONTENT_TYPE" in
             multipart/form-data*) exec 3<&0; PROVISION_UPLOAD_FD=3 ;;
-            *) POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH") ;;
+            *)
+                if [ "$CONTENT_LENGTH" -gt 65536 ]; then
+                    # Bodies this large overflow the kernel per-string env limit
+                    # (MAX_ARG_STRLEN) on exec; spool them to a temp file instead.
+                    POST_DATA_FILE=$(mktemp /tmp/lldpq-provision-request.XXXXXX) || POST_DATA_FILE=""
+                    if [ -n "$POST_DATA_FILE" ]; then
+                        trap 'rm -f "$POST_DATA_FILE"' EXIT
+                        dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH" > "$POST_DATA_FILE"
+                    fi
+                else
+                    POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH")
+                fi
+                ;;
         esac
     fi
 fi
@@ -95,7 +108,7 @@ export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE DHCP_LOG_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
 export PROVISION_UPLOAD_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
-export POST_DATA ACTION LINES_PARAM UPGRADE_JOB_ID UPGRADE_WORKER_MODE
+export POST_DATA POST_DATA_FILE ACTION LINES_PARAM UPGRADE_JOB_ID UPGRADE_WORKER_MODE
 export DISCOVERY_JOB_ID DISCOVERY_WORKER_MODE DISCOVERY_SCHEDULE_MODE UPGRADE_RESUME_MODE
 export PROVISION_UPLOAD_FD
 export PROVISION_API_SCRIPT="${BASH_SOURCE[0]}"
@@ -127,6 +140,15 @@ import time
 
 ACTION = os.environ.get('ACTION', '')
 POST_DATA = os.environ.get('POST_DATA', '')
+POST_DATA_FILE = os.environ.get('POST_DATA_FILE', '')
+if not POST_DATA and POST_DATA_FILE:
+    # Large request bodies are spooled to a temp file by the shell wrapper
+    # because they exceed the kernel per-string environment limit on exec.
+    try:
+        with open(POST_DATA_FILE, 'r') as post_fh:
+            POST_DATA = post_fh.read()
+    except OSError:
+        POST_DATA = ''
 LLDPQ_DIR = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 LLDPQ_USER = os.environ.get('LLDPQ_USER', 'lldpq')
 WEB_ROOT = os.environ.get('WEB_ROOT', '/var/www/html')

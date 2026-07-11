@@ -732,7 +732,7 @@ render_lldpq_cron_file() {
         echo "* * * * * $user /usr/local/bin/lldpq-trigger"
         echo "* * * * * www-data /usr/local/bin/lldpq-provision-scheduler"
         echo "* * * * * $user cd $q_install && ./fabric-scan.sh >/dev/null 2>&1"
-        echo "0 0 * * * $user cd $q_install && cp $q_web/topology.dot topology.dot.bkp 2>/dev/null; cp $q_web/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m 'auto: \$(date +\\%Y-\\%m-\\%d)'"
+        echo "0 0 * * * $user cd $q_install && cp $q_web/topology.dot topology.dot.bkp 2>/dev/null; cp $q_web/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m \"auto: \$(date +\\%Y-\\%m-\\%d)\""
         echo "0 * * * * $user /usr/local/bin/lldpq-ai-analyze"
         if [[ "$include_fabric_cron" == "true" ]]; then
             echo "33 3 * * * $user $q_install/fabric-scan-cron.sh"
@@ -3174,6 +3174,7 @@ ping iputils-ping
 pgrep procps
 curl curl
 unzip unzip
+git git
 setfacl acl
 dhcpd isc-dhcp-server
 systemd-analyze systemd
@@ -3241,6 +3242,7 @@ ping iputils-ping
 pgrep procps
 curl curl
 unzip unzip
+git git
 setfacl acl
 dhcpd isc-dhcp-server
 systemd-analyze systemd
@@ -4437,6 +4439,10 @@ if [[ -f /etc/lldpq.conf ]] || [[ -f /etc/lldpq-users.conf ]] || [[ -d /var/lib/
             sudo rm -f /etc/lldpq.conf
             sudo rm -f /etc/lldpq-users.conf
             sudo rm -rf /var/lib/lldpq
+            # Remove the old telemetry tree: `cp -r telemetry` later would
+            # otherwise nest into the pre-existing directory and leave the
+            # stale docker-compose/config files authoritative.
+            sudo rm -rf "$LLDPQ_INSTALL_DIR/telemetry"
             echo "  Old installation files removed"
             INSTALL_MODE="fresh"
             if [[ "$_CALLER_SKIP_L1_WAS_SET" == "true" ]]; then
@@ -4501,7 +4507,7 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
     step "Installing required packages..."
     sudo apt update || { echo "[!] apt update failed"; exit 1; }
     sudo apt install -y nginx fcgiwrap python3 python3-pip python3-yaml python3-ruamel.yaml python3-requests util-linux bsdextrautils \
-        openssh-client sshpass iproute2 iputils-ping procps curl unzip acl isc-dhcp-server || {
+        openssh-client sshpass iproute2 iputils-ping procps curl unzip acl isc-dhcp-server git || {
         echo "[!] Package installation failed"
         echo "    Try running: sudo apt --fix-broken install"
         exit 1
@@ -4523,9 +4529,9 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
     if [[ ! -d "$MONACO_DIR" ]]; then
         echo "  Downloading Monaco Editor v${MONACO_VERSION}..."
         TMP_DIR=$(mktemp -d)
-        if curl -sL "https://registry.npmjs.org/monaco-editor/-/monaco-editor-${MONACO_VERSION}.tgz" -o "$TMP_DIR/monaco.tgz"; then
-            mkdir -p "$TMP_DIR/monaco"
-            tar -xzf "$TMP_DIR/monaco.tgz" -C "$TMP_DIR/monaco" --strip-components=1
+        if curl -sfL "https://registry.npmjs.org/monaco-editor/-/monaco-editor-${MONACO_VERSION}.tgz" -o "$TMP_DIR/monaco.tgz" && \
+           mkdir -p "$TMP_DIR/monaco" && \
+           tar -xzf "$TMP_DIR/monaco.tgz" -C "$TMP_DIR/monaco" --strip-components=1; then
             sudo mkdir -p "$MONACO_DIR"
             sudo cp -r "$TMP_DIR/monaco/min/vs" "$MONACO_DIR/"
             echo "  Monaco Editor installed to $MONACO_DIR"
@@ -4900,7 +4906,19 @@ fi
 step "Copying files to system directories..."
 
 echo "  - Copying etc/* to /etc/"
+# Preserve an operator-customized system tmux configuration before the copy
+# below overwrites it (uninstall restores this backup).
+if [[ -f /etc/tmux.conf ]] && [[ ! -f /etc/tmux.conf.pre-lldpq ]] && \
+   ! cmp -s etc/tmux.conf /etc/tmux.conf; then
+    sudo cp -p /etc/tmux.conf /etc/tmux.conf.pre-lldpq
+fi
 sudo cp -r etc/* /etc/
+
+# The packaged nginx site hardcodes the default web root; align it with the
+# configured WEB_ROOT (no-op for the default /var/www/html).
+if [[ "$WEB_ROOT" != "/var/www/html" ]]; then
+    sudo sed -i "s|/var/www/html|${WEB_ROOT}|g" /etc/nginx/sites-available/lldpq
+fi
 
 echo "  - Copying html/* to $WEB_ROOT/"
 sudo cp -r html/* "$WEB_ROOT/"
@@ -4916,9 +4934,9 @@ if [[ ! -d "$MONACO_DIR" ]]; then
     echo "  - Downloading Monaco Editor..."
     MONACO_VERSION="0.45.0"
     TMP_DIR=$(mktemp -d)
-    if curl -sL "https://registry.npmjs.org/monaco-editor/-/monaco-editor-${MONACO_VERSION}.tgz" -o "$TMP_DIR/monaco.tgz"; then
-        mkdir -p "$TMP_DIR/monaco"
-        tar -xzf "$TMP_DIR/monaco.tgz" -C "$TMP_DIR/monaco" --strip-components=1
+    if curl -sfL "https://registry.npmjs.org/monaco-editor/-/monaco-editor-${MONACO_VERSION}.tgz" -o "$TMP_DIR/monaco.tgz" && \
+       mkdir -p "$TMP_DIR/monaco" && \
+       tar -xzf "$TMP_DIR/monaco.tgz" -C "$TMP_DIR/monaco" --strip-components=1; then
         sudo mkdir -p "$MONACO_DIR"
         sudo cp -r "$TMP_DIR/monaco/min/vs" "$MONACO_DIR/"
         echo "    Monaco Editor installed"
@@ -4972,9 +4990,14 @@ sudo chown "$LLDPQ_USER:www-data" "$WEB_ROOT/serial-mapping.txt"
 sudo chmod 664 "$WEB_ROOT/serial-mapping.txt"
 
 echo "  - Copying bin/* to /usr/local/bin/"
-sudo cp bin/* /usr/local/bin/
-sudo chmod 755 /usr/local/bin/lldpq /usr/local/bin/lldpq-trigger 2>/dev/null || true
-sudo chmod 755 /usr/local/bin/*
+# Copy only regular files (a stray bin/__pycache__ directory must not abort
+# the install) and chmod only what this installer ships, never the whole dir.
+for _bin_file in bin/*; do
+    [[ -f "$_bin_file" ]] || continue
+    sudo cp "$_bin_file" /usr/local/bin/
+    sudo chmod 755 "/usr/local/bin/${_bin_file##*/}"
+done
+unset _bin_file
 if [[ ! -x /usr/local/bin/lldpq-config ]]; then
     echo "[!] Required runtime config helper was not installed: /usr/local/bin/lldpq-config" >&2
     exit 1
@@ -5243,7 +5266,7 @@ fi
 # Update git hooks if .git exists (update mode preserves .git from backup restore later)
 if [[ -d "$LLDPQ_INSTALL_DIR/.git" ]]; then
     echo "  - Updating git hooks..."
-    cat > "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" << 'HOOKEOF'
+    sudo tee "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" > /dev/null << 'HOOKEOF'
 #!/bin/bash
 # Fix permissions after git pull/merge (preserve group read access for www-data)
 chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
@@ -5253,9 +5276,11 @@ if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
     chmod -R 750 "$(git rev-parse --show-toplevel)/monitor-results" 2>/dev/null || true
 fi
 HOOKEOF
-    chmod +x "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge"
-    cp "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
-    git -C "$LLDPQ_INSTALL_DIR" config core.sharedRepository group 2>/dev/null || true
+    sudo chmod +x "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge"
+    sudo cp "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
+    sudo chown "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" \
+        "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
+    sudo -u "$LLDPQ_USER" git -C "$LLDPQ_INSTALL_DIR" config core.sharedRepository group 2>/dev/null || true
     echo "    Git hooks updated"
 fi
 
@@ -5269,7 +5294,7 @@ step "Setting up topology symlinks..."
 echo "  - topology.dot"
 if [[ -f "$WEB_ROOT/topology.dot" ]]; then
     echo "    Existing topology.dot preserved in web root"
-    rm -f "$LLDPQ_INSTALL_DIR/topology.dot" 2>/dev/null
+    sudo rm -f "$LLDPQ_INSTALL_DIR/topology.dot" 2>/dev/null
 elif [[ -f "$LLDPQ_INSTALL_DIR/topology.dot" ]]; then
     sudo mv "$LLDPQ_INSTALL_DIR/topology.dot" "$WEB_ROOT/topology.dot"
 else
@@ -5278,12 +5303,12 @@ else
 fi
 sudo chown "$LLDPQ_USER:www-data" "$WEB_ROOT/topology.dot"
 sudo chmod 664 "$WEB_ROOT/topology.dot"
-ln -sf "$WEB_ROOT/topology.dot" "$LLDPQ_INSTALL_DIR/topology.dot"
+sudo ln -sf "$WEB_ROOT/topology.dot" "$LLDPQ_INSTALL_DIR/topology.dot"
 
 echo "  - topology_config.yaml"
 if [[ -f "$WEB_ROOT/topology_config.yaml" ]]; then
     echo "    Existing topology_config.yaml preserved in web root"
-    rm -f "$LLDPQ_INSTALL_DIR/topology_config.yaml" 2>/dev/null
+    sudo rm -f "$LLDPQ_INSTALL_DIR/topology_config.yaml" 2>/dev/null
 elif [[ -f "$LLDPQ_INSTALL_DIR/topology_config.yaml" ]]; then
     sudo mv "$LLDPQ_INSTALL_DIR/topology_config.yaml" "$WEB_ROOT/topology_config.yaml"
 else
@@ -5292,7 +5317,7 @@ else
 fi
 sudo chown "$LLDPQ_USER:www-data" "$WEB_ROOT/topology_config.yaml"
 sudo chmod 664 "$WEB_ROOT/topology_config.yaml"
-ln -sf "$WEB_ROOT/topology_config.yaml" "$LLDPQ_INSTALL_DIR/topology_config.yaml"
+sudo ln -sf "$WEB_ROOT/topology_config.yaml" "$LLDPQ_INSTALL_DIR/topology_config.yaml"
 
 # ============================================================================
 # COMMON: Ansible directory
@@ -6442,6 +6467,12 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
     echo "    sudo visudo  # Add: username ALL=(ALL) NOPASSWD:ALL"
 
     step "Initializing git repository in $LLDPQ_INSTALL_DIR..."
+    # git normally arrives with the apt packages above, but a git-less host
+    # (e.g. offline tarball install) must degrade gracefully instead of
+    # aborting the whole install under set -e.
+    if ! command -v git >/dev/null 2>&1; then
+        echo "  [!] git not found — skipping git repository setup (config history disabled)"
+    else
     cd "$LLDPQ_INSTALL_DIR"
 
     # Create .gitignore
@@ -6494,6 +6525,7 @@ HOOKEOF
 
     echo "  Git repository initialized with initial commit"
     echo "  Git hooks created (permissions preserved after git operations)"
+    fi
 fi
 
 # Fresh telemetry choices use privileged in-place editors after the initial

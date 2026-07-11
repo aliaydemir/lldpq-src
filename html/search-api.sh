@@ -47,6 +47,20 @@ parse_query() {
     ACTION=$(echo "$query" | grep -oP 'action=\K[^&]*' | head -1)
     DEVICE=$(echo "$query" | grep -oP 'device=\K[^&]*' | head -1 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
     SEARCH=$(echo "$query" | grep -oP 'search=\K[^&]*' | head -1 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))" 2>/dev/null)
+    # Normalize dash (aa-bb-cc-dd-ee-ff) and dot (aabb.ccdd.eeff) MAC notations
+    # to the colon format used by bridge fdb / ip neigh output
+    if [[ -n "$SEARCH" ]]; then
+        SEARCH=$(echo "$SEARCH" | python3 -c '
+import re, sys
+term = sys.stdin.read().strip()
+if re.fullmatch(r"(?:[0-9a-fA-F]{2}-){5}[0-9a-fA-F]{2}", term):
+    term = term.replace("-", ":")
+elif re.fullmatch(r"(?:[0-9a-fA-F]{4}\.){2}[0-9a-fA-F]{4}", term):
+    digits = term.replace(".", "")
+    term = ":".join(digits[i:i+2] for i in range(0, 12, 2))
+print(term)
+' 2>/dev/null)
+    fi
 }
 
 # Search and the collectors must consume one inventory contract.  Calling the
@@ -407,7 +421,7 @@ def get_device_table(record):
             ]
             result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
         else:  # arp - get ARP with interface VRF mappings
-            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/vlan*/master /sys/class/net/eth*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
+            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
             cmd_parts = [
                 "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
@@ -441,7 +455,7 @@ def get_device_table(record):
                         "interface": iface,
                         "vlan": vlan,
                     }
-                    if not search or search in mac.lower() or search in iface.lower() or search in hostname.lower():
+                    if not search or search in mac.lower() or search in iface.lower() or search in vlan.lower() or search in hostname.lower():
                         entries.append(entry)
         elif table_type == "arp":
             # Parse ARP with VRF info from interface masters

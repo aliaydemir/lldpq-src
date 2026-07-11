@@ -362,6 +362,7 @@ PYTHON
 # Bulk create VLANs
 bulk_create_vlans() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -373,9 +374,9 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
-    data = json.loads(sys.stdin.read()) if sys.stdin.isatty() == False else {}
+    data = {}
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 vlan_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'vlan_profiles.yaml')
@@ -396,7 +397,8 @@ if count > 500:
     print(json.dumps({'success': False, 'error': 'Maximum 500 VLANs at once'}))
     exit(0)
 
-# Load existing vlan profiles
+# Load existing vlan profiles (keep full config to preserve other top-level keys like vxlan_int)
+existing = {}
 vlan_profiles = {}
 if os.path.exists(vlan_file):
     with open(vlan_file, 'r') as f:
@@ -407,6 +409,14 @@ if os.path.exists(vlan_file):
 if profile_name in vlan_profiles:
     print(json.dumps({'success': False, 'error': f'Profile {profile_name} already exists'}))
     exit(0)
+
+# Check if any VLAN ID in range already used in another profile
+for pname, pdata in vlan_profiles.items():
+    if pdata and 'vlans' in pdata:
+        for vid in range(start_id, end_id + 1):
+            if vid in pdata['vlans'] or str(vid) in pdata['vlans']:
+                print(json.dumps({'success': False, 'error': f'VLAN ID {vid} already exists in profile {pname}'}))
+                exit(0)
 
 # Create the VLAN profile with multiple VLANs inside
 vlans_dict = {}
@@ -421,12 +431,13 @@ new_profile = {
 }
 
 vlan_profiles[profile_name] = new_profile
+existing['vlan_profiles'] = vlan_profiles
 
-# Write back
+# Write back (full config, not just vlan_profiles)
 _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(vlan_file), suffix='.tmp')
 try:
     with os.fdopen(_tmp_fd, 'w') as _tmp_f:
-        yaml.dump({'vlan_profiles': vlan_profiles}, _tmp_f)
+        yaml.dump(existing, _tmp_f)
     shutil.move(_tmp_path, vlan_file)
 except:
     if os.path.exists(_tmp_path): os.unlink(_tmp_path)
@@ -573,6 +584,7 @@ PYTHON
 # Create VRF in device's host_vars
 create_vrf() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -584,7 +596,7 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -728,6 +740,7 @@ PYTHON
 # Create VRF on multiple devices (bulk)
 create_vrf_bulk() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -740,7 +753,7 @@ import sys
 import glob
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -892,6 +905,7 @@ PYTHON
 # Assign VRFs to device
 assign_vrfs() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -904,7 +918,7 @@ import sys
 import glob
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -976,6 +990,7 @@ PYTHON
 # Unassign VRF from device
 unassign_vrf() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -987,7 +1002,7 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1090,6 +1105,7 @@ PYTHON
 # Delete VRF globally (from all devices)
 delete_vrf_global() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -1102,7 +1118,7 @@ import sys
 import glob
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1373,17 +1389,20 @@ PYTHON
 # Create BGP Profile (using ruamel.yaml to preserve comments)
 create_bgp_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 import os
 import sys
+import tempfile
+import shutil
 from ruamel.yaml import YAML
 
 yaml = YAML()
 yaml.preserve_quotes = True
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1456,17 +1475,20 @@ PYTHON
 # Update BGP Profile (using ruamel.yaml to preserve comments)
 update_bgp_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 import os
 import sys
+import tempfile
+import shutil
 from ruamel.yaml import YAML
 
 yaml = YAML()
 yaml.preserve_quotes = True
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1541,17 +1563,20 @@ PYTHON
 # Delete BGP Profile (using ruamel.yaml to preserve comments)
 delete_bgp_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 import os
 import sys
+import tempfile
+import shutil
 from ruamel.yaml import YAML
 
 yaml = YAML()
 yaml.preserve_quotes = True
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1599,6 +1624,7 @@ PYTHON
 # Create Port Profile
 create_port_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -1610,7 +1636,7 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1685,6 +1711,7 @@ PYTHON
 # Update Port Profile
 update_port_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -1696,7 +1723,7 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1772,6 +1799,7 @@ PYTHON
 # Delete Port Profile
 delete_port_profile() {
     read -r POST_DATA
+    export POST_DATA
     python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -1783,7 +1811,7 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     data = {}
 
@@ -1823,8 +1851,8 @@ PYTHON
 # Create VLAN - adds to vlan_profiles.yaml and sw_port_profiles.yaml
 create_vlan() {
     # Read POST data
-    local post_data
-    read -r post_data
+    read -r POST_DATA
+    export POST_DATA
     
     python3 << PYTHON
 import json
@@ -1843,8 +1871,7 @@ port_profiles_file = f"{ansible_dir}/inventory/group_vars/all/sw_port_profiles.y
 
 try:
     # Parse POST data
-    post_data = '''$post_data'''
-    data = json.loads(post_data)
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
     
     vlan_id = int(data.get('vlan_id'))
     profile_name = data.get('profile_name', f'VLAN_{vlan_id}')
@@ -2022,8 +2049,8 @@ PYTHON
 
 delete_vlan() {
     # Read POST data
-    local post_data
-    read -r post_data
+    read -r POST_DATA
+    export POST_DATA
 
     python3 << PYTHON
 import json
@@ -2036,8 +2063,7 @@ import os
 import sys
 
 # Parse POST data
-post_data = '''$post_data'''
-data = json.loads(post_data)
+data = json.loads(os.environ.get('POST_DATA') or '{}')
 
 profile_name = data.get('profile_name', '')
 
@@ -2118,8 +2144,8 @@ PYTHON
 
 assign_vlans() {
     # Read POST data
-    local post_data
-    read -r post_data
+    read -r POST_DATA
+    export POST_DATA
 
     python3 << PYTHON
 import json
@@ -2132,8 +2158,7 @@ import os
 import sys
 
 # Parse POST data
-post_data = '''$post_data'''
-data = json.loads(post_data)
+data = json.loads(os.environ.get('POST_DATA') or '{}')
 
 device = data.get('device', '')
 vlans = data.get('vlans', [])
@@ -2196,8 +2221,8 @@ PYTHON
 
 unassign_vlan() {
     # Read POST data
-    local post_data
-    read -r post_data
+    read -r POST_DATA
+    export POST_DATA
 
     python3 << PYTHON
 import json
@@ -2210,8 +2235,7 @@ import os
 import sys
 
 # Parse POST data
-post_data = '''$post_data'''
-data = json.loads(post_data)
+data = json.loads(os.environ.get('POST_DATA') or '{}')
 
 device = data.get('device', '')
 vlan = data.get('vlan', '')
@@ -2272,8 +2296,8 @@ PYTHON
 
 update_vlan() {
     # Read POST data
-    local post_data
-    read -r post_data
+    read -r POST_DATA
+    export POST_DATA
 
     python3 << PYTHON
 import json
@@ -2286,8 +2310,7 @@ import os
 import sys
 
 # Parse POST data
-post_data = '''$post_data'''
-data = json.loads(post_data)
+data = json.loads(os.environ.get('POST_DATA') or '{}')
 
 original_name = data.get('original_name', '')
 profile_name = data.get('profile_name', original_name)
@@ -2538,6 +2561,7 @@ PYTHON
     "check-subnet-leak")
         # Check if a subnet is already leaked to any VRF
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 import yaml  # PyYAML - faster for read-only operations
@@ -2545,7 +2569,7 @@ import os
 import glob
 
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     params = {}
 
@@ -2695,6 +2719,7 @@ PYTHON
     "add-subnet-leak")
         # Add a subnet to prefix-list for leaking
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -2708,7 +2733,7 @@ import glob
 
 # Read POST data
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     params = {}
 
@@ -2790,6 +2815,7 @@ PYTHON
     "save-dhcp-relay")
         # Save (create or update) DHCP relay entry
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -2801,7 +2827,7 @@ import os
 import sys
 
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     params = {}
 
@@ -2874,6 +2900,7 @@ PYTHON
     "delete-dhcp-relay")
         # Delete DHCP relay entry
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -2885,7 +2912,7 @@ import os
 import sys
 
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     params = {}
 
@@ -2942,6 +2969,7 @@ PYTHON
     "save-evpn-mh")
         # Save EVPN Multihoming configuration
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -2953,7 +2981,7 @@ import os
 import sys
 
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
     device = params.get('device', '')
     evpn_mh = params.get('evpn_mh', {})
     
@@ -2999,6 +3027,7 @@ PYTHON
     "delete-evpn-mh")
         # Delete EVPN Multihoming configuration
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3010,7 +3039,7 @@ import os
 import sys
 
 try:
-    params = json.loads('''$POST_DATA''')
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
     device = params.get('device', '')
     
     if not device:
@@ -3052,6 +3081,7 @@ PYTHON
     create-bond)
         # Create a new bond interface
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3063,7 +3093,7 @@ import sys
 import os
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     try:
         data = json.loads(sys.stdin.read())
@@ -3141,6 +3171,7 @@ PYTHON
     delete-bond)
         # Delete a bond interface
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3152,7 +3183,7 @@ import sys
 import os
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     try:
         data = json.loads(sys.stdin.read())
@@ -3205,6 +3236,7 @@ PYTHON
     delete-subinterface)
         # Delete a subinterface
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3216,7 +3248,7 @@ import sys
 import os
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     try:
         data = json.loads(sys.stdin.read())
@@ -3291,6 +3323,7 @@ PYTHON
     update-interface)
         # Update interface or bond settings
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3303,7 +3336,7 @@ import os
 
 # Read POST data
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
     try:
         data = json.loads(sys.stdin.read())
@@ -3575,6 +3608,7 @@ PYTHON
         # Creates subinterface + adds peer to BGP profile
         # If create_border_profile=true, creates OVERLAY_BORDER_XX profile with External peer group
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3585,10 +3619,9 @@ import shutil
 import os
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
-    import sys
-    data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+    data = {}
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 
@@ -3778,6 +3811,7 @@ PYTHON
     delete-external-peer)
         # Delete an external BGP peer
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3789,9 +3823,9 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
-    data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+    data = {}
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 
@@ -3949,6 +3983,7 @@ PYTHON
     update-external-peer)
         # Update an existing external BGP peer
         read -r POST_DATA
+        export POST_DATA
         python3 << PYTHON
 import json
 from ruamel.yaml import YAML
@@ -3960,9 +3995,9 @@ import os
 import sys
 
 try:
-    data = json.loads('''$POST_DATA''')
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
 except:
-    data = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+    data = {}
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 

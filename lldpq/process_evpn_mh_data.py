@@ -856,7 +856,15 @@ def process_evpn_mh_data_files(
         except OSError as exc:
             coverage_failures[hostname] = f"snapshot read failed: {exc}"
             continue
-        if snapshot["errors"] and snapshot.get("local_count", 0) > 0:
+        # A failed ESI query always reports local_count 0, so it must be
+        # recorded as a coverage failure regardless of local_count.
+        esi_failed = any(
+            error == "EVPN_MH_ESI" or error.startswith("ESI_JSON:")
+            for error in snapshot["errors"]
+        )
+        if snapshot["errors"] and (
+            esi_failed or snapshot.get("local_count", 0) > 0
+        ):
             coverage_failures[hostname] = ", ".join(snapshot["errors"][:3])
         snapshots[hostname] = snapshot
 

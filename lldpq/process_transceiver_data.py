@@ -13,6 +13,7 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import json
+import tempfile
 from datetime import datetime
 
 
@@ -243,8 +244,23 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
     }
 
     output_path = os.path.join(output_dir, 'transceiver_inventory.json')
-    with open(output_path, 'w') as f:
-        json.dump(result, f, indent=2)
+    # Publish via tmp+fsync+rename so readers never observe partial JSON
+    fd, tmp_path = tempfile.mkstemp(
+        prefix='.transceiver_inventory.json.', dir=output_dir)
+    try:
+        mode = (os.stat(output_path).st_mode & 0o7777) if os.path.exists(output_path) else 0o664
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(result, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
     print(f"Transceiver inventory: {len(all_modules)} modules across "
           f"{len(devices_with_modules)} devices, {len(unique_models)} unique models"

@@ -1851,7 +1851,7 @@ def load_learnings():
 def save_learnings(items):
     clean, seen = [], set()
     for it in (items or [])[:500]:
-        t = (it.get('text') if isinstance(it, dict) else str(it)).strip()
+        t = (str(it.get('text') or '') if isinstance(it, dict) else str(it)).strip()
         if t and t.lower() not in seen and len(t) <= 400:
             seen.add(t.lower())
             ts = (it.get('ts') if isinstance(it, dict) else None) or int(time.time())

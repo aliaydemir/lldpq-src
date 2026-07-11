@@ -11,6 +11,7 @@ import os
 import re
 import json
 import html
+import tempfile
 from datetime import datetime, timezone
 from collections import defaultdict
 from collection_freshness import (
@@ -36,6 +37,27 @@ def json_for_inline_script(value):
         .replace('<', r'\u003c')
         .replace('>', r'\u003e')
     )
+
+def _atomic_write(path, content):
+    """Publish via tmp+fsync+rename so readers never observe partial files."""
+    directory = os.path.dirname(path) or "."
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", dir=directory
+    )
+    try:
+        mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else 0o664
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 class LogAnalyzer:
     def __init__(self, data_dir="monitor-results"):
@@ -1302,9 +1324,8 @@ class LogAnalyzer:
         
         # Write HTML file
         output_file = os.path.join(self.data_dir, "log-analysis.html")
-        with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        
+        _atomic_write(output_file, html_content)
+
         print(f"Log analysis HTML generated: {output_file}")
     
     def save_summary_data(self):
@@ -1344,9 +1365,8 @@ class LogAnalyzer:
         }
         
         summary_file = os.path.join(self.data_dir, "log_summary.json")
-        with open(summary_file, 'w') as f:
-            json.dump(summary_data, f, indent=2)
-        
+        _atomic_write(summary_file, json.dumps(summary_data, indent=2))
+
         print(f"Log summary data saved: {summary_file}")
     
     def run_analysis(self):
@@ -1427,13 +1447,17 @@ class LogAnalyzer:
                 failed_devices.append(device_name)
 
         if failed_devices:
+            # A host-local read failure is a coverage gap, not a fabric-wide
+            # analysis failure; publish partial coverage for the survivors.
             print(
                 "❌ Failed to process current logs for: "
                 + ", ".join(sorted(failed_devices))
             )
-            return False
-        
-        print(f"Processed {len(log_files)} devices")
+            self.current_devices -= set(failed_devices)
+            if len(failed_devices) == len(log_files):
+                return False
+
+        print(f"Processed {len(log_files) - len(failed_devices)} devices")
         
         # Generate outputs
         self.generate_html_report()
