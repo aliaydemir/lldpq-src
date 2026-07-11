@@ -29,7 +29,7 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
         cls.source = MONITOR.read_text(encoding="utf-8")
 
     def _interpolate_remote(self, root: Path, scope: str):
-        start = self.source.index("    timeout 300 ssh $SSH_OPTS")
+        start = self.source.index('    timeout "$ssh_umbrella_timeout" ssh $SSH_OPTS')
         end = self.source.index("\n    local ssh_status=$?", start)
         command = textwrap.dedent(self.source[start:end])
         capture = root / "remote.sh"
@@ -55,6 +55,7 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
                 'hostname="leaf1"',
                 'SKIP_OPTICAL="false"',
                 'SKIP_L1="false"',
+                'ssh_umbrella_timeout="300"',
                 'PFC_ECN_COLLECTION_BUDGET_SECONDS="60"',
                 'PFC_ECN_PORT_TIMEOUT_SECONDS="5"',
                 'PFC_ECN_MAX_PARALLEL="4"',

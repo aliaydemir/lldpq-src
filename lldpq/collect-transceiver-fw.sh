@@ -324,16 +324,28 @@ publish_inventory() {
         return 1
     fi
 
-    if mkdir -p "$WEB_MONITOR_DIR" 2>/dev/null && cp "$INVENTORY_JSON" "$WEB_MONITOR_DIR/" 2>/dev/null; then
-        chown "$(whoami):www-data" "$WEB_MONITOR_DIR/$(basename "$INVENTORY_JSON")" 2>/dev/null || true
-        chmod 664 "$WEB_MONITOR_DIR/$(basename "$INVENTORY_JSON")" 2>/dev/null || true
-        return 0
+    # Stage next to the target, then rename so web readers never see a
+    # partially written inventory.
+    local inv_name tmp_target
+    inv_name="$(basename "$INVENTORY_JSON")"
+    tmp_target="$WEB_MONITOR_DIR/.${inv_name}.tmp"
+
+    if mkdir -p "$WEB_MONITOR_DIR" 2>/dev/null && cp "$INVENTORY_JSON" "$tmp_target" 2>/dev/null; then
+        chown "$(whoami):www-data" "$tmp_target" 2>/dev/null || true
+        chmod 664 "$tmp_target" 2>/dev/null || true
+        if mv -f "$tmp_target" "$WEB_MONITOR_DIR/$inv_name" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$tmp_target" 2>/dev/null || true
     fi
 
-    if command -v sudo >/dev/null 2>&1 && sudo -n mkdir -p "$WEB_MONITOR_DIR" 2>/dev/null && sudo -n cp "$INVENTORY_JSON" "$WEB_MONITOR_DIR/" 2>/dev/null; then
-        sudo -n chown "${LLDPQ_USER:-$(whoami)}:www-data" "$WEB_MONITOR_DIR/$(basename "$INVENTORY_JSON")" 2>/dev/null || true
-        sudo -n chmod 664 "$WEB_MONITOR_DIR/$(basename "$INVENTORY_JSON")" 2>/dev/null || true
-        return 0
+    if command -v sudo >/dev/null 2>&1 && sudo -n mkdir -p "$WEB_MONITOR_DIR" 2>/dev/null && sudo -n cp "$INVENTORY_JSON" "$tmp_target" 2>/dev/null; then
+        sudo -n chown "${LLDPQ_USER:-$(whoami)}:www-data" "$tmp_target" 2>/dev/null || true
+        sudo -n chmod 664 "$tmp_target" 2>/dev/null || true
+        if sudo -n mv -f "$tmp_target" "$WEB_MONITOR_DIR/$inv_name" 2>/dev/null; then
+            return 0
+        fi
+        sudo -n rm -f "$tmp_target" 2>/dev/null || true
     fi
 
     echo "WARN: Could not publish inventory to $WEB_MONITOR_DIR" >&2

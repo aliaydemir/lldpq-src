@@ -2298,7 +2298,11 @@ EOF
     # Verbose output removed for performance
     local ssh_start=$(date +%s)
 
-    timeout 300 ssh $SSH_OPTS "$user@$device" '
+    # Umbrella must cover every per-section budget it forwards plus a fixed
+    # margin for the unbudgeted sections (defaults: 60 + 120 + 120 = 300).
+    local ssh_umbrella_timeout=$((PFC_ECN_COLLECTION_BUDGET_SECONDS + OPTICAL_COLLECTION_BUDGET_SECONDS + 120))
+
+    timeout "$ssh_umbrella_timeout" ssh $SSH_OPTS "$user@$device" '
         # Emit an immediate transport handshake before snapshots or analysis
         # commands run.  ICMP is only a hint; this marker is the authoritative
         # distinction between "SSH never established a remote shell" and

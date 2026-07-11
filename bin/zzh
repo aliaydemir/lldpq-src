@@ -1651,6 +1651,12 @@ class Connections:
                     DevicesConfig = yaml.safe_load(DevFile)
                     if DevicesConfig and 'devices' in DevicesConfig:
                         DefaultUser = DevicesConfig.get('defaults', {}).get('username', 'cumulus')
+                        # Prefer modern key types; first existing private key wins
+                        DefaultIdentity = None
+                        for KeyName in ('id_ed25519', 'id_ecdsa', 'id_rsa'):
+                            if pathlib.Path.home().joinpath('.ssh', KeyName).exists():
+                                DefaultIdentity = '~/.ssh/{}'.format(KeyName)
+                                break
                         DeviceCount = 0
                         for IpAddr, DevInfo in DevicesConfig['devices'].items():
                             # Handle formats:
@@ -1681,9 +1687,10 @@ class Connections:
                                 'address': str(IpAddr),
                                 'user': Username,
                                 'comment': Comment,
-                                'identity': '~/.ssh/id_rsa',
                                 'customargs': '-o StrictHostKeyChecking=no'
                             }
+                            if DefaultIdentity:
+                                self.LoadedServersDict[Hostname]['identity'] = DefaultIdentity
                             if Role:
                                 # Populate roles key so the -r/--role filter works
                                 self.LoadedServersDict[Hostname]['roles'] = [Role]

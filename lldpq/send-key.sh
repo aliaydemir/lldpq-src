@@ -18,7 +18,14 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/load_devices.sh"
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
-DEFAULT_SSH_KEY="$HOME/.ssh/id_rsa.pub"
+# Prefer modern key types; first existing public key wins
+DEFAULT_SSH_KEY="$HOME/.ssh/id_ed25519.pub"
+for _key in id_ed25519 id_ecdsa id_rsa; do
+    if [ -f "$HOME/.ssh/${_key}.pub" ]; then
+        DEFAULT_SSH_KEY="$HOME/.ssh/${_key}.pub"
+        break
+    fi
+done
 SSH_KEY=""
 PASSWORD=""
 DO_KEY=true
@@ -40,7 +47,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [-p password] [-k ssh_key_path] [--no-sudo] [--sudo-only]"
             echo ""
             echo "  -p, --password    SSH password for initial authentication"
-            echo "  -k, --key         Path to SSH public key (default: ~/.ssh/id_rsa.pub)"
+            echo "  -k, --key         Path to SSH public key (default: auto-detect ~/.ssh/id_{ed25519,ecdsa,rsa}.pub)"
             echo "  --no-sudo         Skip passwordless sudo setup (key distribution only)"
             echo "  --sudo-only       Skip key distribution (sudo setup only)"
             echo "  -h, --help        Show this help"
@@ -90,7 +97,7 @@ check_dependencies() {
                         echo -e "${RED}Key file not found: ${CUSTOM_KEY_PATH}${NC}"; exit 1
                     fi
                 else
-                    ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N "" -q
+                    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
                     if [ $? -eq 0 ]; then
                         SSH_KEY="$DEFAULT_SSH_KEY"
                         echo -e "${GREEN}SSH key generated: ${SSH_KEY}${NC}"
