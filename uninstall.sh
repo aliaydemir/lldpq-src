@@ -2386,6 +2386,11 @@ quiesce_lldpq_writers() {
         "$WEB_ROOT/provision-api.sh --upgrade-resume"
         "$LLDPQ_INSTALL_DIR/fabric-scan-cron.sh"
         "$LLDPQ_INSTALL_DIR/fabric-scan.sh"
+        # The installer's cron line spawns 'sh -c "cd $LLDPQ_INSTALL_DIR &&
+        # ./fabric-scan.sh ..."' whose cmdline never contains the absolute
+        # path; matching the wrapper kills its relative-path child with the
+        # tree and lets the recheck loop see an in-flight cron scan.
+        "cd $LLDPQ_INSTALL_DIR && \./fabric-scan\.sh"
         "lldpq-ai-analyze"
         "$WEB_ROOT/ai-api.sh"
         "$LLDPQ_INSTALL_DIR/collect-transceiver-fw.sh"
