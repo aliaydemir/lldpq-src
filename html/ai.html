@@ -185,7 +185,7 @@
         <button class="btn btn-secondary btn-sm" onclick="runAnalysis()" title="Run fabric health analysis" id="btnAnalyze">
             <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
             Analyze
-            <span class="analysis-badge" id="analysisBadge">!</span>
+            <span class="analysis-badge" id="analysisBadge" onclick="showPersistedAnalysis(event)">!</span>
         </button>
         <button class="btn btn-secondary btn-sm" onclick="exportChat()" title="Export chat as markdown" aria-label="Export chat as markdown">
             <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
@@ -265,7 +265,7 @@
             </div>
             <div style="margin-top: 10px;">
                 <label>Model</label>
-                <input type="text" id="cfgModelCloud" placeholder="gpt-4o / claude-sonnet-4-20250514">
+                <input type="text" id="cfgModelCloud" placeholder="gpt-5 / claude-sonnet-5">
             </div>
             <div style="margin-top: 10px;">
                 <label>Search model (optional) — enables [SEARCH:] web research</label>
@@ -464,6 +464,8 @@ function sanitizeStoredChatMessage(msg) {
         typeof msg.content !== 'string') return null;
     const clean = { role: msg.role, content: msg.content };
     if (msg.analysis === true) clean.analysis = true;
+    // Optional real send time (epoch ms). Older stored entries lack it.
+    if (Number.isFinite(msg.ts)) clean.ts = msg.ts;
     const limits = { tools: 20, fixes: 10, followups: 8, consoles: 20, evidence: 40 };
     Object.entries(limits).forEach(([key, limit]) => {
         if (Array.isArray(msg[key])) clean[key] = msg[key].slice(0, limit);
@@ -537,6 +539,7 @@ function loadChatFromStorage() {
                         evidence: msg.evidence,
                         confidence: msg.confidence,
                         timeline: msg.timeline,
+                        ts: msg.ts,
                     });
                 });
                 area.scrollTop = area.scrollHeight;
@@ -559,7 +562,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     }
     loadConfig();
-    loadContext();
+    // Await context so _knownDevices is populated before restored history is
+    // re-rendered — otherwise restored answers lose their device auto-links.
+    await loadContext();
     loadAnalysisBadge();
     const restored = loadChatFromStorage();
     if (!restored) {
@@ -699,16 +704,16 @@ function onProviderChange(userInitiated) {
     if (provider === 'gemini') {
         if (userInitiated || !apiUrl.value) apiUrl.value = 'https://generativelanguage.googleapis.com';
         apiUrl.disabled = true;
-        if (userInitiated || !cloudModel.value) cloudModel.value = 'gemini-2.0-flash';
-        cloudModel.placeholder = 'gemini-2.0-flash / gemini-1.5-pro';
+        if (userInitiated || !cloudModel.value) cloudModel.value = 'gemini-2.5-flash';
+        cloudModel.placeholder = 'gemini-2.5-flash / gemini-2.5-pro';
     } else if (provider === 'openai') {
         if (userInitiated || !apiUrl.value) apiUrl.value = 'https://api.openai.com/v1';
         apiUrl.disabled = false;
-        cloudModel.placeholder = 'gpt-4o / gpt-4o-mini';
+        cloudModel.placeholder = 'gpt-5 / gpt-5-mini';
     } else if (provider === 'claude') {
         if (userInitiated || !apiUrl.value) apiUrl.value = 'https://api.anthropic.com/v1';
         apiUrl.disabled = false;
-        cloudModel.placeholder = 'claude-sonnet-4-20250514 / claude-3-haiku-20240307';
+        cloudModel.placeholder = 'claude-sonnet-5 / claude-haiku-4-5';
     } else if (provider === 'custom') {
         apiUrl.disabled = false;
         apiUrl.placeholder = 'https://your-server/v1';
@@ -885,6 +890,9 @@ function addMessage(role, content, info) {
     div.className = `msg msg-${role}`;
     if (role === 'assistant') {
         div.innerHTML = renderMarkdown(content);
+        // Keep the pristine markdown source for the Copy action (innerText
+        // would mangle tables and drop code fencing).
+        wrapper._md = content;
         // Auto-link device names to Details page
         linkDeviceNames(div);
         colorizeStatus(div);   // color-code status cells in any tables (OK=green, Down/Fail=red, Warn=amber)
@@ -903,10 +911,12 @@ function addMessage(role, content, info) {
         if (info.timeline && typeof info.timeline === 'object') wrapper.appendChild(renderTimeline(info.timeline));
     }
     
-    // Meta row: timestamp + action buttons
+    // Meta row: timestamp + action buttons. Restored messages carry their
+    // original send time (info.ts); live messages are stamped with "now".
     const meta = document.createElement('div');
     meta.className = 'msg-meta';
-    meta.innerHTML = `<span class="msg-time">${formatTime(new Date())}</span>`;
+    const when = info && Number.isFinite(info.ts) ? new Date(info.ts) : new Date();
+    meta.innerHTML = `<span class="msg-time">${formatTime(when)}</span>`;
     
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
@@ -1267,7 +1277,15 @@ function renderFollowups(list) {
         const chip = document.createElement('button');
         chip.className = 'followup-chip';
         chip.textContent = q;
-        chip.onclick = () => { document.getElementById('chatInput').value = q; sendMessage(); };
+        chip.onclick = () => {
+            // Never overwrite the operator's draft while a request is running.
+            if (isStreaming || isAnalysisRunning) {
+                showToast('Wait for the current response to finish', 'info');
+                return;
+            }
+            document.getElementById('chatInput').value = q;
+            sendMessage();
+        };
         box.appendChild(chip);
     });
     return box;
@@ -1287,9 +1305,10 @@ function colorizeStatus(root) {
 }
 
 function copyMsgContent(btn) {
-    const msg = btn.closest('.msg-wrapper').querySelector('.msg-assistant');
+    const wrapper = btn.closest('.msg-wrapper');
+    const msg = wrapper.querySelector('.msg-assistant');
     if (!msg) return;
-    const text = msg.innerText;
+    const text = typeof wrapper._md === 'string' ? wrapper._md : msg.innerText;
     if (navigator.clipboard && navigator.clipboard.writeText) {
         navigator.clipboard.writeText(text).then(() => showToast('Copied', 'success')).catch(() => fallbackCopyText(text));
     } else {
@@ -1311,6 +1330,11 @@ function fallbackCopyText(text) {
 function reaskMessage(btn) {
     const msg = btn.closest('.msg-wrapper').querySelector('.msg-user');
     if (!msg) return;
+    // Never overwrite the operator's draft while a request is running.
+    if (isStreaming || isAnalysisRunning) {
+        showToast('Wait for the current response to finish', 'info');
+        return;
+    }
     document.getElementById('chatInput').value = msg.textContent;
     sendMessage();
 }
@@ -1430,7 +1454,7 @@ async function sendMessage() {
     const historyPayload = buildHistoryPayload(chatHistory);
     // Add user message (show original, send with logs)
     addMessage('user', message);
-    chatHistory.push({ role: 'user', content: message });
+    chatHistory.push({ role: 'user', content: message, ts: Date.now() });
     saveChatToStorage();
     input.value = '';
     autoResize(input);
@@ -1448,12 +1472,27 @@ async function sendMessage() {
                 evidence: data.evidence,
                 confidence: data.confidence,
                 timeline: data.timeline,
+                ts: Date.now(),
             };
             addMessage('assistant', data.response, _info);
             chatHistory.push(Object.assign({ role: 'assistant', content: data.response }, _info));
             saveChatToStorage();
         } else {
             addMessage('system', 'Error: ' + (data.error || 'No response from AI'));
+            // A failed run may still return the tool trace / evidence gathered
+            // before the failure — render them so that context is not lost.
+            const failTools = Array.isArray(data.tools_used) ? data.tools_used : [];
+            const failEvidence = Array.isArray(data.evidence) ? data.evidence : [];
+            if (failTools.length || failEvidence.length) {
+                const area = document.getElementById('chatArea');
+                const failWrap = document.createElement('div');
+                failWrap.className = 'msg-wrapper assistant';
+                if (failTools.length) failWrap.appendChild(renderToolTrace(failTools));
+                if (failEvidence.length) failWrap.appendChild(renderEvidencePanel(failEvidence, data.confidence));
+                if (data.timeline && typeof data.timeline === 'object') failWrap.appendChild(renderTimeline(data.timeline));
+                area.appendChild(failWrap);
+                area.scrollTop = area.scrollHeight;
+            }
         }
     } catch (e) {
         if (generation === requestGeneration && !controller.signal.aborted) {
@@ -1519,6 +1558,29 @@ async function loadAnalysisBadge() {
     }
 }
 
+// Badge click: show the cron-persisted analysis (get-analysis) in the chat
+// panel with zero LLM cost. The Analyze button itself still runs a fresh one.
+async function showPersistedAnalysis(event) {
+    if (event) event.stopPropagation();
+    if (isStreaming || isAnalysisRunning) return;
+    const data = await apiCall('get-analysis');
+    if (!data.success || !data.analysis) {
+        showToast('No saved analysis available', 'error');
+        return;
+    }
+    const suggestions = document.getElementById('suggestions');
+    if (suggestions) suggestions.remove();
+    const stamp = data.timestamp ? new Date(data.timestamp * 1000) : null;
+    addMessage('system', 'Last autonomous fabric health analysis' +
+        (stamp ? ` (${stamp.toLocaleString()})` : '') + ':');
+    addMessage('assistant', data.analysis, {
+        evidence: data.evidence,
+        confidence: data.confidence,
+        timeline: data.timeline,
+        ts: stamp ? stamp.getTime() : undefined,
+    });
+}
+
 async function runAnalysis() {
     if (isStreaming || isAnalysisRunning) return;
     isAnalysisRunning = true;
@@ -1548,6 +1610,7 @@ async function runAnalysis() {
                 evidence: data.evidence,
                 confidence: data.confidence,
                 timeline: data.timeline,
+                ts: Date.now(),
             };
             addMessage('assistant', data.analysis, _info);
             chatHistory.push(Object.assign({ role: 'assistant', content: data.analysis, analysis: true }, _info));
@@ -1649,7 +1712,7 @@ function getSuggestionsHTML() {
         html += '<tr>';
         html += `<td style="padding:8px 16px 8px 0; vertical-align:middle; white-space:nowrap; width:1%;"><span style="font-size:12px;color:#666;text-transform:uppercase;font-weight:700;letter-spacing:0.5px;">${cat.label}</span></td>`;
         html += '<td style="padding:8px 0;">';
-        html += '<div style="display:flex;flex-wrap:nowrap;gap:6px;">';
+        html += '<div style="display:flex;flex-wrap:wrap;gap:6px;">';
         cat.prompts.forEach(p => {
             const escaped = p.full.replace(/'/g, "\\'").replace(/"/g, '&quot;');
             html += `<div class="suggestion-chip" role="button" tabindex="0" onclick="sendPrompt('${escaped}')" onkeydown="handleSuggestionKey(event,this)">${p.chip}</div>`;
@@ -1692,6 +1755,12 @@ function renderMarkdown(markdown) {
         codeBlocks.push(`<pre><code class="lang-${escHtml(language)}">${escHtml(code)}</code></pre>`);
         return `\x00CB${codeBlocks.length - 1}\x00`;
     });
+    // An unterminated fence (answer cut off mid-code) still renders as an
+    // open code block instead of leaking raw backticks into the text.
+    text = text.replace(/```(\w*)\n?([\s\S]*)$/, (_match, language, code) => {
+        codeBlocks.push(`<pre><code class="lang-${escHtml(language)}">${escHtml(code)}</code></pre>`);
+        return `\x00CB${codeBlocks.length - 1}\x00`;
+    });
     const inlineCodes = [];
     text = text.replace(/`([^`\n]+)`/g, (_match, code) => {
         inlineCodes.push(`<code>${escHtml(code)}</code>`);
@@ -1708,21 +1777,27 @@ function renderMarkdown(markdown) {
     text = text.replace(/^# (.+)$/gm, '<h1>$1</h1>');
     // Bold
     text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    // Lists
+    // Lists (ordered items keep their numbering via a real <ol>)
     text = text.replace(/^\- (.+)$/gm, '<li>$1</li>');
     text = text.replace(/^\* (.+)$/gm, '<li>$1</li>');
-    text = text.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-    text = text.replace(/(<li>.*<\/li>)/s, '<ul>$1</ul>');
-    // Tables (pipe-delimited markdown)
-    text = text.replace(/((?:^\|.+\|$\n?)+)/gm, function(table) {
+    text = text.replace(/^\d+\. (.+)$/gm, '<oli>$1</oli>');
+    // Wrap each consecutive run of items separately so content between two
+    // lists (paragraphs, tables) is never swallowed into a single <ul>.
+    text = text.replace(/((?:<li>.*<\/li>\n)*<li>.*<\/li>)/g, '<ul>$1</ul>');
+    text = text.replace(/((?:<oli>.*<\/oli>\n)*<oli>.*<\/oli>)/g,
+        m => '<ol>' + m.replace(/<(\/?)oli>/g, '<$1li>') + '</ol>');
+    // Tables (pipe-delimited markdown; tolerate trailing whitespace and a
+    // missing trailing pipe — LLMs routinely emit both)
+    text = text.replace(/((?:^\|.+\|.*$\n?)+)/gm, function(table) {
         const rows = table.trim().split('\n').filter(r => r.trim());
         if (rows.length < 2) return table;
-        const isSep = r => /^\|[\s\-:|]+\|$/.test(r.trim());
+        const isSep = r => /^\|[\s\-:|]+$/.test(r.trim());
         let html = '<table class="md-table">';
         let headerDone = false;
         rows.forEach((row, i) => {
             if (isSep(row)) { headerDone = true; return; }
-            const cells = row.split('|').slice(1, -1).map(c => c.trim());
+            const inner = row.trim().replace(/^\|/, '').replace(/\|$/, '');
+            const cells = inner.split('|').map(c => c.trim());
             const tag = (!headerDone && i === 0) ? 'th' : 'td';
             html += '<tr>' + cells.map(c => `<${tag}>${c}</${tag}>`).join('') + '</tr>';
         });
@@ -1742,8 +1817,8 @@ function renderMarkdown(markdown) {
     text = text.replace(/(<\/h[123]>)<\/p>/g, '$1');
     text = text.replace(/<p>(<pre>)/g, '$1');
     text = text.replace(/(<\/pre>)<\/p>/g, '$1');
-    text = text.replace(/<p>(<ul>)/g, '$1');
-    text = text.replace(/(<\/ul>)<\/p>/g, '$1');
+    text = text.replace(/<p>(<[uo]l>)/g, '$1');
+    text = text.replace(/(<\/[uo]l>)<\/p>/g, '$1');
     text = text.replace(/<p>(<table)/g, '$1');
     text = text.replace(/(<\/table>)<\/p>/g, '$1');
     return text;

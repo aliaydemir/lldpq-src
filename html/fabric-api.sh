@@ -6926,15 +6926,20 @@ ALLOWED_PATTERNS = [
     r'^nv show\b',
     r'^nv sho\b',
     r'^nv sh\b',
+    r'^sudo nv show\b',
     # NVUE config (read-only show/find/diff)
     r'^nv config show\b',
     r'^nv config diff\b',
     r'^nv config find\b',
+    r'^sudo nv config show\b',
+    r'^sudo nv config diff\b',
+    r'^sudo nv config find\b',
     # FRR/vtysh commands
     r'^sudo vtysh -c ["\']show\b',
     r'^vtysh -c ["\']show\b',
     # Layer 1 diagnostics
     r'^sudo l1-show [A-Za-z0-9_.:-]+$',
+    r'^l1-show [A-Za-z0-9_.:-]+$',
     # ethtool variants
     r'^(sudo )?(/sbin/)?ethtool( -(m|S|i))? [A-Za-z0-9_.:-]+$',
     # IP/network commands
@@ -6942,14 +6947,21 @@ ALLOWED_PATTERNS = [
     r'^ip addr\b',
     r'^ip route\b',
     r'^ip neigh\b',
+    r'^sudo ip link\b',
+    r'^sudo ip addr\b',
+    r'^sudo ip route\b',
+    r'^sudo ip neigh\b',
     r'^/sbin/bridge fdb\b',
     r'^/sbin/bridge vlan\b',
     r'^bridge fdb\b',
     r'^bridge vlan\b',
+    r'^sudo (/sbin/)?bridge fdb\b',
+    r'^sudo (/sbin/)?bridge vlan\b',
     r'^lldpctl\b',
     r'^sudo lldpctl\b',
     # Bonding/LAG / MLAG (read-only status only)
     r'^cat /proc/net/bonding/[A-Za-z0-9_.:-]+$',
+    r'^sudo cat /proc/net/bonding/[A-Za-z0-9_.:-]+$',
     r'^clagctl$',
     r'^sudo clagctl$',
     r'^clagctl status$',
@@ -6979,8 +6991,11 @@ ALLOWED_PATTERNS = [
     r'^sudo dmesg\b',
     # System
     r'^uptime$',
+    r'^sudo uptime$',
     r'^free\b',
+    r'^sudo free\b',
     r'^df\b',
+    r'^sudo df\b',
     r'^ls -t /var/support/cl_support\*\.txz$',
     r'^pgrep\b',
     # Process cleanup is limited to a quoted LLDPq-owned temp path. A later
@@ -7223,9 +7238,22 @@ def validate_vtysh_command(tokens):
     if len(bare) != 3 or bare[:2] != ['vtysh', '-c']:
         return False
     inner = bare[2].strip()
+    if not re.match(r'^show(?:\s|$)', inner, re.IGNORECASE):
+        return False
+    if re.search(r'[<>;&`$\\\r\n]', inner):
+        return False
+    if '|' not in inner:
+        return True
+    # FRR output modifiers are interpreted by vtysh itself inside the quoted
+    # -c string, never by the shell. Permit exactly one safe filter tail.
+    _head, _sep, tail = inner.partition('|')
     return bool(
-        re.match(r'^show(?:\s|$)', inner, re.IGNORECASE)
-        and not re.search(r'[|<>;&`$\\\r\n]', inner)
+        '|' not in tail
+        and re.fullmatch(
+            r'\s*(?:include|exclude|begin|section)\s+[A-Za-z0-9_.:/,@%+= -]{1,160}',
+            tail,
+            re.IGNORECASE,
+        )
     )
 
 
@@ -7360,10 +7388,12 @@ def validate_base_argv(tokens):
             return True
         if path.startswith(('/tmp/capture_', '/tmp/live_', '/tmp/tail_')):
             return classify_scoped_cleanup(tokens) == 'remove'
+    # Read-only ip/bridge show commands are accepted with or without sudo,
+    # matching the Ask-AI read-only policy.
     if executable == 'ip':
-        return tokens == bare and validate_ip_command(bare)
+        return validate_ip_command(bare)
     if executable in {'bridge', '/sbin/bridge'}:
-        return tokens == bare and validate_bridge_command(bare)
+        return validate_bridge_command(bare)
     if executable == 'vtysh':
         return validate_vtysh_command(tokens)
     if executable == 'journalctl':

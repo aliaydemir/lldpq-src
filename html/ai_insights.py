@@ -16,6 +16,7 @@ import math
 import os
 import re
 import stat
+import sys
 import time
 import codecs
 from datetime import datetime
@@ -1602,7 +1603,11 @@ def _extract_config(path: Path, start: float, now: float, max_age: int) -> Tuple
     if stamp is None or stamp > now + 300 or not isinstance(pending, list):
         return [], _coverage("config", "invalid", 0, 0, None, start)
     events = _EventAccumulator(limit=500)
+    dropped = 0
     if stamp >= start:
+        # The cap keeps request CPU bounded; entries dropped by it must still
+        # be disclosed as truncation instead of silently vanishing.
+        dropped = max(0, len(pending) - 500)
         for raw_device in pending[:500]:
             device = _bounded_text(raw_device, 96)
             if not device:
@@ -1619,7 +1624,7 @@ def _extract_config(path: Path, start: float, now: float, max_age: int) -> Tuple
             ))
     result = _coverage(
         "config", load_status, 1, events.total, stamp, start,
-        truncated=events.truncated,
+        truncated=events.truncated or dropped > 0,
     )
     if result["status"] == "ok" and now - stamp > max_age:
         result["status"] = "stale"
@@ -1738,16 +1743,29 @@ def build_timeline(
     web = Path(os.fspath(web_root)) if web_root is not None else None
 
     jobs = [
-        (_extract_bgp, _source_path(monitor, web, "bgp_history.json")),
-        (_extract_optical, _source_path(monitor, web, "optical_history.json")),
-        (_extract_ber, _source_path(monitor, web, "ber_history.json")),
-        (_extract_flaps, _source_path(monitor, web, "flap_history.json")),
-        (_extract_congestion, _source_path(monitor, web, "pfc_ecn_history.json")),
+        ("bgp", _extract_bgp, _source_path(monitor, web, "bgp_history.json")),
+        ("optical", _extract_optical, _source_path(monitor, web, "optical_history.json")),
+        ("ber", _extract_ber, _source_path(monitor, web, "ber_history.json")),
+        ("flaps", _extract_flaps, _source_path(monitor, web, "flap_history.json")),
+        ("pfc_ecn", _extract_congestion, _source_path(monitor, web, "pfc_ecn_history.json")),
     ]
     all_events: List[Dict[str, Any]] = []
     coverage: List[Dict[str, Any]] = []
-    for extractor, path in jobs:
-        events, source_coverage = extractor(path, start, current, max_source_age_seconds)
+    for source_name, extractor, path in jobs:
+        try:
+            events, source_coverage = extractor(path, start, current, max_source_age_seconds)
+        except Exception as error:
+            # One misbehaving source must not blank the whole timeline; keep
+            # the healthy sources and disclose the failure in coverage.
+            print(
+                "ai_insights: %s extractor failed: %s" % (source_name, type(error).__name__),
+                file=sys.stderr,
+            )
+            events = []
+            source_coverage = _coverage(
+                source_name, "invalid", 0, 0, None, start,
+                detail="Source extractor failed unexpectedly",
+            )
         all_events.extend(events)
         coverage.append(source_coverage)
 

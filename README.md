@@ -271,6 +271,24 @@ configured. AI memory, analyses, and snapshots are stored under
 `/var/lib/lldpq/ai`; Docker deployments should persist the
 `lldpq-ai-state` volume.
 
+Additional AI settings are read from `/etc/lldpq.conf` (the settings UI does
+not expose them):
+
+| Key | Purpose |
+|-----|---------|
+| `AI_FALLBACK_MODEL` | Secondary model tried automatically when the primary model call fails |
+| `AI_CONTEXT_WINDOW_TOKENS` | Override the assumed context window (tokens) of the primary model |
+| `AI_FALLBACK_CONTEXT_WINDOW_TOKENS` | Same override for the fallback model |
+| `AI_SEARCH_URL` / `AI_SEARCH_KEY` | Separate endpoint and API key for the optional search model; they default to the main endpoint and its key when unset |
+
+`AI_SEARCH_MODEL` and `AI_PROXY_URL` are also stored in `/etc/lldpq.conf` and
+correspond to the search model and proxy fields in the settings UI.
+
+Local/air-gapped deployments can use the Ollama provider fully offline: run a
+current tool-capable local model and ensure its context length is large enough
+for the supplied fabric context (compact prompts are used automatically for
+local models).
+
 ## [02g] switch lifecycle and Analysis Scope
 
 Administrators classify switches from **Provision → Handover** as either
@@ -567,7 +585,7 @@ schedule is:
 | `* * * * *` | `lldpq-provision-scheduler` | discovery scheduling and upgrade resume |
 | `* * * * *` | `fabric-scan.sh` | cached topology/search data |
 | `0 0 * * *` | Git auto-commit | daily configuration-history commit |
-| `0 * * * *` | `lldpq-ai-analyze` | autonomous AI analysis when an AI provider/model is configured |
+| `7 * * * *` | `lldpq-ai-analyze` | autonomous AI analysis when an AI provider/model is configured (offset from collector starts) |
 | `33 3 * * *` | `fabric-scan-cron.sh` | optional Ansible diff check when Ansible is configured |
 
 `LLDPQ_CRON` and `GETCONF_CRON` can override the first two schedules. Docker

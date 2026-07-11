@@ -29,7 +29,14 @@ class ContextWindowTest(unittest.TestCase):
         cases = {
             "aws/bedrock-claude-opus-4-8": 1_000_000,
             "aws/bedrock-claude-opus-4-7": 1_000_000,
+            "claude/claude-opus-4-8": 1_000_000,
+            "claude/claude-opus-4-7": 1_000_000,
+            "claude/claude-opus-4-6": 1_000_000,
+            "claude/claude-sonnet-4-6": 1_000_000,
+            "claude/claude-fable-5": 1_000_000,
             "azure/anthropic/claude-sonnet-5": 1_000_000,
+            "claude/claude-haiku-4-5": 200_000,
+            "claude/claude-3-opus-unknown": 200_000,
             "gcp/google/gemini-2.5-pro": 1_000_000,
             "gcp/google/gemini-3.5-flash": 1_000_000,
             "openai/openai/gpt-4o": 128_000,
@@ -113,7 +120,7 @@ class ContextWindowTest(unittest.TestCase):
     def test_dense_unicode_estimate_is_more_conservative_than_ascii(self):
         dense = "界🙂é" * 113
         self.assertEqual(estimate_content_tokens(dense), len(dense) * 2)
-        self.assertEqual(estimate_content_tokens("a" * 113), math.ceil(113 / 2.4))
+        self.assertEqual(estimate_content_tokens("a" * 113), math.ceil(113 / 3.5))
         messages = [{"role": "user", "content": dense}]
         self.assertEqual(
             estimate_messages_tokens(messages),

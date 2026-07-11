@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 
-DENSE_CHARS_PER_TOKEN = 2.4
+DENSE_CHARS_PER_TOKEN = 3.5
 MESSAGE_OVERHEAD_TOKENS = 8
 DEFAULT_OUTPUT_RESERVE_TOKENS = 8_192
 DEFAULT_SAFETY_TOKENS = 8_192
@@ -103,9 +103,20 @@ def _catalog_context_window(model: str, provider: Optional[str]) -> int:
     if "ollama" in route or provider_name in {"local", "localhost"}:
         return OLLAMA_CONTEXT_WINDOW
 
-    if "bedrock-claude-opus-4-8" in route or "bedrock-claude-opus-4-7" in route:
-        return 1_000_000
-    if "claude-sonnet-5" in route:
+    # Current 1M-window Anthropic models, matched by substring so both direct
+    # names and bedrock-/vendor-prefixed routes resolve identically.  Unknown
+    # Claude aliases (including haiku-4-5) keep the conservative 200K rule.
+    if any(
+        name in route
+        for name in (
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-fable-5",
+        )
+    ):
         return 1_000_000
     if any(name in route for name in ("claude", "sonnet", "haiku", "opus")):
         return 200_000
@@ -240,10 +251,11 @@ def _content_text_for_estimate(content: Any) -> str:
 def estimate_content_tokens(content: Any) -> int:
     """Conservatively estimate tokens for ASCII and dense non-ASCII text.
 
-    Network output is normally ASCII, where 2.4 characters/token is already
-    conservative. CJK and emoji can consume one or multiple tokens per Unicode
-    code point, so count them at two tokens each instead of treating them like
-    English prose.
+    Network output is normally ASCII, where real BPE tokenizers average about
+    3.5-4 characters/token even for dense structured text; 3.5 keeps the
+    estimate on the conservative side. CJK and emoji can consume one or
+    multiple tokens per Unicode code point, so count them at two tokens each
+    instead of treating them like English prose.
     """
 
     text = _content_text_for_estimate(content)

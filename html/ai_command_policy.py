@@ -18,6 +18,13 @@ _MAX_COMMAND_CHARS = 512
 _SHELL_CONTROL_RE = re.compile(r"[;&|<>`$(){}\[\]\\\r\n\x00]")
 _SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9_.:/,@%+= -]{1,220}$")
 _SAFE_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# FRR "show" command with at most one output modifier. The pipe is interpreted
+# by vtysh itself inside the quoted -c string, never by the remote shell.
+_VTYSH_SHOW_RE = re.compile(
+    r"^show [A-Za-z0-9_.:/,@%+= -]{0,220}"
+    r"(?:\| *(?:include|exclude|begin|section) +[A-Za-z0-9_.:/,@%+= -]{1,160})?$",
+    re.IGNORECASE,
+)
 
 
 def _result(ok: bool, reason: str = "") -> Tuple[bool, str]:
@@ -48,10 +55,7 @@ def _allow_vtysh(tokens: List[str]) -> bool:
     _sudo, tokens = _strip_sudo(tokens)
     if len(tokens) != 3 or tokens[:2] != ["vtysh", "-c"]:
         return False
-    command = tokens[2].strip()
-    if not command.lower().startswith("show "):
-        return False
-    return _SAFE_ARG_RE.fullmatch(command) is not None
+    return _VTYSH_SHOW_RE.fullmatch(tokens[2].strip()) is not None
 
 
 def _allow_ethtool(tokens: List[str]) -> bool:
@@ -142,13 +146,27 @@ def _allow_journalctl(tokens: List[str]) -> bool:
     return True
 
 
+def _journalctl_is_bounded(tokens: List[str]) -> bool:
+    """Require --no-pager and a line cap; Ask-AI runs one-shot under ssh -tt."""
+    _sudo, tokens = _strip_sudo(tokens)
+    rest = tokens[1:]
+    has_no_pager = "--no-pager" in rest
+    has_line_cap = any(
+        token in {"-n", "--lines"} or token.startswith("--lines=")
+        for token in rest
+    )
+    return has_no_pager and has_line_cap
+
+
 def _allow_dmesg(tokens: List[str]) -> bool:
     _sudo, tokens = _strip_sudo(tokens)
     if not tokens or tokens[0] != "dmesg":
         return False
+    # Follow/pager flags (-w/--follow, -H/--human) never return on the forced
+    # pty used by the one-shot Ask-AI tool, so only one-shot-safe forms remain.
     safe_flags = {
         "-T", "--ctime", "--reltime", "--notime", "-x", "--decode",
-        "--nopager", "-H", "--human", "-w", "--follow",
+        "-P", "--nopager",
     }
     for token in tokens[1:]:
         if token in {"-c", "-C", "--clear", "--read-clear"}:
@@ -188,7 +206,14 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
     if len(command) > _MAX_COMMAND_CHARS:
         return _result(False, "command is too long")
     if _SHELL_CONTROL_RE.search(command):
-        return _result(False, "shell composition and redirection are not allowed")
+        # A pipe is tolerated only inside the quoted "vtysh -c" argument as an
+        # FRR output modifier ("| include <pattern>"), where vtysh interprets
+        # it; _allow_vtysh validates that tail. Any other control character,
+        # or a pipe on a non-vtysh command, is still rejected outright.
+        looks_like_vtysh = re.match(r"(?:sudo\s+)?vtysh\s", command) is not None
+        only_pipes = not _SHELL_CONTROL_RE.search(command.replace("|", ""))
+        if not (looks_like_vtysh and only_pipes):
+            return _result(False, "shell composition and redirection are not allowed")
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
@@ -201,29 +226,36 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
         return _result(False, "missing program")
 
     allowed = False
-    if bare[0] == "nv" and not _sudo:
+    if bare[0] == "nv":
         allowed = _allow_nv(bare)
     elif bare[0] == "vtysh":
         allowed = _allow_vtysh(tokens)
     elif bare[0] in {"ethtool", "/sbin/ethtool"}:
         allowed = _allow_ethtool(tokens)
-    elif bare[0] == "ip" and not _sudo:
+    elif bare[0] == "ip":
         allowed = _allow_ip(bare)
-    elif bare[0] in {"bridge", "/sbin/bridge"} and not _sudo:
+    elif bare[0] in {"bridge", "/sbin/bridge"}:
         allowed = _allow_bridge(bare)
     elif bare[0] == "lldpctl":
         allowed = _allow_lldpctl(tokens)
-    elif bare[0] == "cat" and not _sudo:
+    elif bare[0] == "cat":
         allowed = (
             len(bare) == 2
             and re.fullmatch(r"/proc/net/bonding/[A-Za-z0-9_.:-]{1,64}", bare[1]) is not None
         )
+    elif bare[0] == "l1-show":
+        allowed = len(bare) == 2 and _SAFE_INTERFACE_RE.fullmatch(bare[1]) is not None
     elif bare[0] == "clagctl":
         allowed = len(bare) == 1 or bare == ["clagctl", "status"]
     elif bare[0] in {"nvt", "/usr/local/bin/nvt"} and not _sudo:
         allowed = len(bare) == 1
     elif bare[0] == "journalctl":
         allowed = _allow_journalctl(tokens)
+        if allowed and not _journalctl_is_bounded(tokens):
+            return _result(
+                False,
+                "journalctl must include --no-pager and a line cap such as -n 200",
+            )
     elif bare[0] == "dmesg":
         allowed = _allow_dmesg(tokens)
     else:

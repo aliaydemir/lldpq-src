@@ -390,7 +390,7 @@ class AskAiApiContractTest(unittest.TestCase):
         })
         messages = [
             {"role": "system", "content": "trusted rules"},
-            {"role": "assistant", "content": "old " + ("x" * 20_000)},
+            {"role": "assistant", "content": "old " + ("x" * 30_000)},
             {"role": "user", "content": "current question"},
         ]
         fitted, info = ns["_fit_messages_for_model"](

@@ -24,12 +24,48 @@ if [[ "$AI_PROVIDER" == "ollama" ]]; then
     fi
 fi
 
+# Serialize runs: a cron run and a manual Analyze click race on the same
+# analysis snapshot, so overlapping runs must be skipped, not interleaved.
+AI_STATE_DIR="${AI_STATE_DIR:-/var/lib/lldpq/ai}"
+LOCK_FILE="$AI_STATE_DIR/lldpq-ai-analyze.lock"
+LOG_FILE="$AI_STATE_DIR/lldpq-ai-analyze.log"
+mkdir -p "$AI_STATE_DIR" 2>/dev/null || true
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    exit 0  # Another analyze run is already in progress
+fi
+
+# Keep only the most recent run in the log so it stays bounded.
+{
+    echo "=== lldpq-ai-analyze run $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+} > "$LOG_FILE"
+
 # Run the same CGI entry point with a process-local role.  This environment is
 # created by cron, not from HTTP request parameters; normal web requests still
 # pass through auth-guard.sh and require an administrator session.
-LLDPQ_AUTH_USER="lldpq-ai-cron" \
+RESPONSE=$(LLDPQ_AUTH_USER="lldpq-ai-cron" \
 LLDPQ_AUTH_ROLE="admin" \
 REQUEST_METHOD="GET" \
 QUERY_STRING="action=analyze" \
 CONTENT_LENGTH="0" \
-bash "$WEB_ROOT/ai-api.sh" > /dev/null
+bash "$WEB_ROOT/ai-api.sh" 2>>"$LOG_FILE")
+API_STATUS=$?
+printf '%s\n' "$RESPONSE" >> "$LOG_FILE"
+
+if [[ $API_STATUS -ne 0 ]]; then
+    echo "ERROR: lldpq-ai-analyze: ai-api.sh exited with status $API_STATUS; see $LOG_FILE" >&2
+    exit 1
+fi
+
+# The CGI output is headers, a blank line, then one JSON object.  Exit
+# non-zero on {"success": false, ...} so cron mail/monitoring can see it.
+if ! printf '%s\n' "$RESPONSE" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+body = raw.split("\n\n", 1)[1] if "\n\n" in raw else raw
+data = json.loads(body)
+sys.exit(0 if data.get("success") is True else 1)
+' 2>>"$LOG_FILE"; then
+    echo "ERROR: lldpq-ai-analyze: AI analysis reported failure; see $LOG_FILE" >&2
+    exit 1
+fi

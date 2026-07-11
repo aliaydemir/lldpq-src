@@ -44,8 +44,21 @@ echo ""
 
 # Read POST data
 POST_DATA=""
+POST_DATA_FILE=""
 if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-    POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH")
+    if [ "$CONTENT_LENGTH" -gt 65536 ]; then
+        # Bodies this large overflow the kernel per-string env limit
+        # (MAX_ARG_STRLEN) on exec; spool them to a temp file instead.
+        POST_DATA_FILE=$(mktemp /tmp/lldpq-ai-request.XXXXXX) || POST_DATA_FILE=""
+        if [ -n "$POST_DATA_FILE" ]; then
+            trap 'rm -f "$POST_DATA_FILE"' EXIT
+            dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) \
+                iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH" > "$POST_DATA_FILE"
+        fi
+    else
+        POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) \
+            iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
+    fi
 fi
 
 # Export for Python
@@ -54,7 +67,7 @@ export AI_PROVIDER AI_MODEL AI_API_KEY AI_API_URL OLLAMA_URL AI_PROXY_URL
 export AI_FALLBACK_MODEL AI_STATE_DIR
 export AI_CONTEXT_WINDOW_TOKENS AI_FALLBACK_CONTEXT_WINDOW_TOKENS
 export AI_SEARCH_MODEL AI_SEARCH_URL AI_SEARCH_KEY
-export POST_DATA ACTION
+export POST_DATA POST_DATA_FILE ACTION
 
 python3 << 'PYTHON_SCRIPT'
 import json
@@ -74,6 +87,15 @@ sys.dont_write_bytecode = True
 
 ACTION = os.environ.get('ACTION', '')
 POST_DATA = os.environ.get('POST_DATA', '')
+POST_DATA_FILE = os.environ.get('POST_DATA_FILE', '')
+if not POST_DATA and POST_DATA_FILE:
+    # Large request bodies are spooled to a temp file by the shell wrapper
+    # because they exceed the kernel per-string environment limit on exec.
+    try:
+        with open(POST_DATA_FILE, 'r') as post_fh:
+            POST_DATA = post_fh.read()
+    except OSError:
+        POST_DATA = ''
 LLDPQ_DIR = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 LLDPQ_USER = os.environ.get('LLDPQ_USER', 'lldpq')
 WEB_ROOT = os.environ.get('WEB_ROOT', '/var/www/html')
@@ -193,9 +215,21 @@ except Exception:
 if AI_PROXY_URL:
     os.environ['http_proxy'] = AI_PROXY_URL
     os.environ['https_proxy'] = AI_PROXY_URL
+    # Never route local endpoints (e.g. Ollama on localhost) through the proxy.
+    os.environ.setdefault('no_proxy', 'localhost,127.0.0.1,::1')
+    os.environ.setdefault('NO_PROXY', 'localhost,127.0.0.1,::1')
 
 ANALYSIS_FILE = os.path.join(AI_STATE_DIR, 'analysis.json')
 LEGACY_ANALYSIS_FILE = os.path.join(WEB_ROOT, 'ai-analysis.json')
+# The autonomous analysis refreshes hourly via cron. "Stale" therefore means
+# more than one missed cycle (2x interval plus scheduling margin) so the
+# freshness badge does not flap during a normally-timed refresh.
+ANALYSIS_STALE_AFTER_SECONDS = 2 * 3600 + 300
+# Steady-state reuse bounds for the hourly analysis: how recent the persisted
+# analysis must be to be carried forward without a new LLM call, and how old
+# its generated text may grow before a full regeneration is forced anyway.
+ANALYSIS_REUSE_MAX_AGE_SECONDS = ANALYSIS_STALE_AFTER_SECONDS
+ANALYSIS_REUSE_MAX_TEXT_AGE_SECONDS = 6 * 3600
 
 AI_FALLBACK_MODEL = os.environ.get('AI_FALLBACK_MODEL', '')
 # Cloud providers receive a redacted copy of every outbound message.  Redaction
@@ -375,12 +409,12 @@ def _history_context_messages(history, limit=10):
 
 
 def _context_override_for_model(model):
-    raw = (
-        AI_FALLBACK_CONTEXT_WINDOW_TOKENS
-        if AI_FALLBACK_MODEL and model == AI_FALLBACK_MODEL
-        and AI_FALLBACK_CONTEXT_WINDOW_TOKENS
-        else AI_CONTEXT_WINDOW_TOKENS
-    )
+    if AI_FALLBACK_MODEL and model == AI_FALLBACK_MODEL and model != AI_MODEL:
+        # The fallback model is budgeted against its own override, or its own
+        # catalog entry when unset — never the primary model's window.
+        raw = AI_FALLBACK_CONTEXT_WINDOW_TOKENS
+    else:
+        raw = AI_CONTEXT_WINDOW_TOKENS
     if not str(raw or '').strip():
         return None
     try:
@@ -567,14 +601,6 @@ def result_json(data):
 
 def error_json(msg):
     result_json({"success": False, "error": msg})
-
-def sse_event(data, event=None):
-    """Send a Server-Sent Event."""
-    if event:
-        sys.stdout.write(f"event: {event}\n")
-    sys.stdout.write(f"data: {json.dumps(data)}\n\n")
-    sys.stdout.flush()
-
 
 def _max_collection_age_seconds():
     try:
@@ -980,8 +1006,9 @@ def build_fabric_summary():
                         hostname = m.group(1).strip() if m else info.strip()
                         role = m.group(2).lower() if m else 'unknown'
                     elif isinstance(info, dict):
-                        hostname = info.get('hostname', str(ip))
-                        role = info.get('role', 'unknown').lower()
+                        # Coerce: unquoted YAML values may parse as int/None.
+                        hostname = str(info.get('hostname') or ip)
+                        role = str(info.get('role') or 'unknown').lower()
                     else:
                         hostname = str(ip)
                         role = 'unknown'
@@ -1051,7 +1078,7 @@ def build_fabric_summary():
     
     # 4. BGP history
     try:
-        bgp_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'bgp_history.json')
+        bgp_file = _mr_path('bgp_history.json')
         if os.path.exists(bgp_file):
             with open(bgp_file, 'r') as f:
                 bgp = json.load(f)
@@ -1079,7 +1106,7 @@ def build_fabric_summary():
     
     # 5. Log summary (totals + per-device critical breakdown)
     try:
-        log_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'log_summary.json')
+        log_file = _mr_path('log_summary.json')
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
                 logs = json.load(f)
@@ -1131,8 +1158,7 @@ def build_fabric_summary():
     
     # 7. Fabric tables summary
     try:
-        tables_dir = os.path.join(LLDPQ_DIR, 'monitor-results', 'fabric-tables')
-        summary_file = os.path.join(tables_dir, 'summary.json')
+        summary_file = _mr_path('fabric-tables', 'summary.json')
         if os.path.exists(summary_file):
             with open(summary_file, 'r') as f:
                 fsummary = json.load(f)
@@ -1189,7 +1215,7 @@ def build_device_detail(hostname, devices, device_health):
     
     # Fabric table for this device
     try:
-        table_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'fabric-tables', f'{hostname}.json')
+        table_file = _mr_path('fabric-tables', f'{hostname}.json')
         if os.path.exists(table_file):
             with open(table_file, 'r') as f:
                 table = json.load(f)
@@ -1212,7 +1238,7 @@ def build_device_detail(hostname, devices, device_health):
     
     # BGP for this device
     try:
-        bgp_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'bgp_history.json')
+        bgp_file = _mr_path('bgp_history.json')
         if os.path.exists(bgp_file):
             with open(bgp_file, 'r') as f:
                 bgp = json.load(f)
@@ -1859,16 +1885,35 @@ def save_learnings(items):
     _save_json_state(LEARNINGS_FILE, clean)
     return clean
 
+def _locked_learnings_update(mutate):
+    """Serialize learnings read-modify-write across concurrent CGI requests
+    with the same exclusive-flock discipline used by lldpq_config_write."""
+    import fcntl
+    _ensure_state_dir()
+    descriptor = os.open(LEARNINGS_FILE + '.lock', os.O_RDWR | os.O_CREAT, 0o660)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return mutate(load_learnings())
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(descriptor)
+
 def add_learning(text):
     text = (text or '').strip()
     if not text:
         return False
-    items = load_learnings()
-    if any(it.get('text', '').lower() == text.lower() for it in items):
+
+    def _mutate(items):
+        if any(it.get('text', '').lower() == text.lower() for it in items):
+            return True
+        items.append({'text': text[:400], 'ts': int(time.time())})
+        save_learnings(items)
         return True
-    items.append({'text': text[:400], 'ts': int(time.time())})
-    save_learnings(items)
-    return True
+
+    return _locked_learnings_update(_mutate)
 
 def relevant_learnings(question, cap=30):
     """All learnings if few; otherwise the ones sharing words with the question."""
@@ -1886,7 +1931,7 @@ def relevant_learnings(question, cap=30):
 
 
 # ======================== WEB RESEARCH ([SEARCH:]) ============================
-def run_search(query):
+def run_search(query, timeout=70):
     """Web research via a configured search-capable model (OpenAI-compatible)."""
     query = (query or '').strip()
     if not SEARCH_ENABLED:
@@ -1894,7 +1939,7 @@ def run_search(query):
     if not query:
         return "Empty search query."
     import urllib.request
-    url = f"{AI_SEARCH_URL}/chat/completions"
+    url = f"{AI_SEARCH_URL.rstrip('/')}/chat/completions"
     msgs = prepare_outbound_messages([
         {"role": "system", "content": "You are a network research assistant. Answer concisely "
          "using current web sources, focused on NVIDIA Cumulus Linux / networking known issues, "
@@ -1905,7 +1950,7 @@ def run_search(query):
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {AI_SEARCH_KEY}'}
     try:
         req = urllib.request.Request(url, data=payload, headers=headers)
-        resp = urllib.request.urlopen(req, timeout=70)
+        resp = urllib.request.urlopen(req, timeout=max(1, int(timeout)))
         result = json.loads(resp.read().decode())
         return (result.get('choices', [{}])[0].get('message', {}).get('content', '') or '(no result)')[:4000]
     except Exception as e:
@@ -1937,6 +1982,16 @@ def _diff_snapshots(prev, cur):
         if hn not in cur:
             changes.append("REMOVED device %s (was %s)" % (hn, p))
     return changes
+
+
+def _timeline_event_fingerprint(timeline):
+    """Stable hash of the timeline's event identity set for run-to-run reuse."""
+    events = timeline.get('events') if isinstance(timeline, dict) else None
+    ids = sorted(
+        str(event.get('id')) for event in (events or [])
+        if isinstance(event, dict) and event.get('id') is not None
+    )
+    return hashlib.sha256('\n'.join(ids).encode()).hexdigest()
 
 
 def build_transceiver_context(hosts=None, max_chars=9000):
@@ -2058,9 +2113,18 @@ def build_context_for_question(
         extra_context.append("OPERATOR-TAUGHT FACTS (site-specific; trust these):\n" + _lr)
         mark_source('operator_memory')
     
-    # Detect specific device mentions
+    # Detect specific device mentions. Word-boundary match so e.g. 'leaf1'
+    # does not also hit 'leaf10' and '10.0.0.1' does not hit '10.0.0.10'.
+    def _mentioned(name):
+        name = str(name or '').strip().lower()
+        if not name:
+            return False
+        return re.search(
+            r'(?<![\w.-])' + re.escape(name) + r'(?![\w-])(?!\.\d)', q_lower
+        ) is not None
+
     for ip, dev in devices.items():
-        if dev['hostname'].lower() in q_lower or ip in q_lower:
+        if _mentioned(dev['hostname']) or _mentioned(ip):
             mentioned_any = True
             mentioned_hosts.append(dev['hostname'])
             extra_context.append(build_device_detail(dev['hostname'], devices, device_health))
@@ -2074,7 +2138,7 @@ def build_context_for_question(
     if any(kw in q_lower for kw in ['flap', 'down', 'carrier', 'link down']):
         mark_source('flap_snapshot', False)
         try:
-            flap_dir = os.path.join(LLDPQ_DIR, 'monitor-results', 'flap-data')
+            flap_dir = _mr_path('flap-data')
             if os.path.isdir(flap_dir):
                 flaps = []
                 for f in sorted(glob.glob(os.path.join(flap_dir, '*.txt')))[-10:]:
@@ -2091,16 +2155,41 @@ def build_context_for_question(
     if any(kw in q_lower for kw in ['vlan', 'vxlan', 'evpn']):
         mark_source('ansible_config', False)
         try:
+            # Prefer the configured Ansible tree; the legacy roots stay as a
+            # bounded fallback (depth-limited, hidden dirs pruned) so a large
+            # home directory cannot burn the request deadline.
+            roots = [os.path.join(LLDPQ_DIR, '..'), '/var/www']
+            try:
+                with open('/etc/lldpq.conf', 'r') as f:
+                    for line in f:
+                        if line.startswith('ANSIBLE_DIR='):
+                            _ansible_dir = line.strip().split('=', 1)[1]
+                            if (_ansible_dir and _ansible_dir != 'NoNe'
+                                    and os.path.isdir(_ansible_dir)):
+                                roots.insert(0, _ansible_dir)
+                            break
+            except Exception:
+                pass
             for profile_name in ['vlan_profiles.yaml', 'sw_port_profiles.yaml']:
-                for root in [os.path.join(LLDPQ_DIR, '..'), '/var/www']:
+                found = False
+                for root in roots:
+                    base_depth = os.path.abspath(root).rstrip('/').count(os.sep)
                     for dirpath, dirnames, filenames in os.walk(root):
+                        dirnames[:] = [d for d in dirnames if not d.startswith('.')]
+                        if os.path.abspath(dirpath).count(os.sep) - base_depth >= 6:
+                            dirnames[:] = []
                         if profile_name in filenames:
                             filepath = os.path.join(dirpath, profile_name)
                             with open(filepath, 'r') as f:
                                 content = f.read()[:2000]
                             extra_context.append(f"{profile_name}:\n{content}")
                             mark_source('ansible_config')
+                            found = True
                             break
+                    if found:
+                        # One copy per profile: the same file often exists under
+                        # both roots and must not be appended twice.
+                        break
         except Exception:
             pass
     
@@ -2329,7 +2418,7 @@ def build_device_list(devices, device_health):
     
     # Check BGP issues
     try:
-        bgp_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'bgp_history.json')
+        bgp_file = _mr_path('bgp_history.json')
         if os.path.exists(bgp_file):
             with open(bgp_file, 'r') as f:
                 bgp = json.load(f)
@@ -2560,128 +2649,8 @@ def get_system_prompt():
 
 
 # ======================== LLM PROXY ========================
-
-def call_ollama_stream(messages):
-    """Call Ollama API with streaming."""
-    import urllib.request
-    url = f"{OLLAMA_URL}/api/chat"
-    messages = prepare_outbound_messages(messages, provider='ollama')
-    payload = json.dumps({
-        "model": AI_MODEL,
-        "messages": messages,
-        "stream": True
-    }).encode()
-    
-    req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
-    try:
-        resp = urllib.request.urlopen(req, timeout=120)
-        for line in resp:
-            try:
-                chunk = json.loads(line.decode())
-                content = chunk.get('message', {}).get('content', '')
-                if content:
-                    sse_event({"content": content})
-                if chunk.get('done'):
-                    break
-            except json.JSONDecodeError:
-                continue
-    except Exception as e:
-        sse_event({"error": str(e)}, event="error")
-
-
-def call_openai_stream(messages):
-    """Call OpenAI-compatible API with streaming (works for OpenAI, Claude via proxy, etc.)."""
-    import urllib.request
-    url = f"{AI_API_URL}/chat/completions"
-    messages = prepare_outbound_messages(messages, provider=AI_PROVIDER)
-    payload = json.dumps({
-        "model": AI_MODEL,
-        "messages": messages,
-        "stream": True
-    }).encode()
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {AI_API_KEY}'
-    }
-    
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        resp = urllib.request.urlopen(req, timeout=120)
-        for line in resp:
-            line = line.decode().strip()
-            if line.startswith('data: '):
-                data_str = line[6:]
-                if data_str == '[DONE]':
-                    break
-                try:
-                    chunk = json.loads(data_str)
-                    delta = chunk.get('choices', [{}])[0].get('delta', {})
-                    content = delta.get('content', '')
-                    if content:
-                        sse_event({"content": content})
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        sse_event({"error": str(e)}, event="error")
-
-
-def call_claude_stream(messages):
-    """Call Anthropic Claude API with streaming."""
-    import urllib.request
-    url = f"{AI_API_URL}/messages" if '/messages' not in AI_API_URL else AI_API_URL
-    
-    messages = prepare_outbound_messages(messages, provider='claude')
-    # Convert from OpenAI message format to Claude format
-    system_msg = ''
-    claude_messages = []
-    for m in messages:
-        if m['role'] == 'system':
-            system_msg = m['content']
-        else:
-            claude_messages.append({"role": m['role'], "content": m['content']})
-    
-    payload = json.dumps({
-        "model": AI_MODEL,
-        "max_tokens": 4096,
-        "system": system_msg,
-        "messages": claude_messages,
-        "stream": True
-    }).encode()
-    
-    headers = {
-        'Content-Type': 'application/json',
-        'x-api-key': AI_API_KEY,
-        'anthropic-version': '2023-06-01'
-    }
-    
-    req = urllib.request.Request(url, data=payload, headers=headers)
-    try:
-        resp = urllib.request.urlopen(req, timeout=120)
-        for line in resp:
-            line = line.decode().strip()
-            if line.startswith('data: '):
-                try:
-                    chunk = json.loads(line[6:])
-                    if chunk.get('type') == 'content_block_delta':
-                        content = chunk.get('delta', {}).get('text', '')
-                        if content:
-                            sse_event({"content": content})
-                except json.JSONDecodeError:
-                    continue
-    except Exception as e:
-        sse_event({"error": str(e)}, event="error")
-
-
-def call_llm_stream(messages):
-    """Route to the appropriate LLM provider."""
-    if AI_PROVIDER == 'ollama':
-        call_ollama_stream(messages)
-    elif AI_PROVIDER == 'claude':
-        call_claude_stream(messages)
-    else:  # openai or custom
-        call_openai_stream(messages)
-
+# fcgiwrap cannot stream SSE, so all live traffic goes through the synchronous
+# call_llm_sync/_provider_request_once path below.
 
 def _build_gemini_payload(messages, max_output_tokens=DEFAULT_LLM_MAX_OUTPUT_TOKENS):
     """Map normalized chat messages to Gemini's system/content contract."""
@@ -2733,6 +2702,10 @@ def _is_context_window_error(status, body):
         or 'prompt is too long' in text
         or 'request too large' in text
         or 'too many tokens' in text
+        # Gemini INVALID_ARGUMENT wording, e.g. "The input token count (N)
+        # exceeds the maximum number of tokens allowed (M)".
+        or 'exceeds the maximum number of tokens' in text
+        or ('input token count' in text and 'exceed' in text)
         or ('maximum' in text and 'token' in text and 'context' in text)
     )
 
@@ -2758,6 +2731,60 @@ def _reported_context_window(body):
     return None
 
 
+def _provider_error_detail(body, limit=300):
+    """Short, redacted provider explanation extracted from an error body."""
+    text = str(body or '').strip()
+    if not text:
+        return ''
+    try:
+        parsed = json.loads(text)
+        error_field = parsed.get('error') if isinstance(parsed, dict) else None
+        if isinstance(error_field, dict):
+            text = str(error_field.get('message') or text)
+        elif isinstance(error_field, str):
+            text = error_field
+    except Exception:
+        pass
+    return ' '.join(redact_secrets(text).split())[:limit]
+
+
+def _record_provider_usage(provider, model, result):
+    """Append one JSONL usage record per provider call (best-effort, no UI)."""
+    try:
+        if provider == 'gemini':
+            usage = result.get('usageMetadata')
+        elif provider == 'ollama':
+            usage = {
+                key: result[key]
+                for key in ('prompt_eval_count', 'eval_count')
+                if key in result
+            }
+        else:
+            # OpenAI-compatible and Anthropic both report a 'usage' object;
+            # Anthropic's includes cache_creation/read_input_tokens, which
+            # also verifies prompt-cache hits.
+            usage = result.get('usage')
+        if not isinstance(usage, dict) or not usage:
+            return
+        record = json.dumps({
+            'ts': round(time.time(), 3),
+            'provider': provider,
+            'model': model,
+            'usage': usage,
+        }, default=str)
+        descriptor = os.open(
+            os.path.join(AI_STATE_DIR, 'usage.jsonl'),
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o660,
+        )
+        try:
+            os.write(descriptor, (record + '\n').encode())
+        finally:
+            os.close(descriptor)
+    except Exception:
+        # Accounting must never affect the request path.
+        pass
+
+
 def _provider_request_once(
     messages, model, timeout, max_output_tokens=DEFAULT_LLM_MAX_OUTPUT_TOKENS
 ):
@@ -2768,21 +2795,52 @@ def _provider_request_once(
     safe_messages = prepare_outbound_messages(messages, provider=AI_PROVIDER)
     if AI_PROVIDER == 'ollama':
         url = f"{OLLAMA_URL}/api/chat"
+        options = {"num_predict": max(1, int(max_output_tokens))}
+        # Ollama's runtime default context is ~4K tokens; without num_ctx it
+        # silently truncates prompts fitted to the catalog window.
+        try:
+            if _context_model_window is not None:
+                options["num_ctx"] = int(_context_model_window(
+                    model, provider=AI_PROVIDER,
+                    override=_context_override_for_model(model), environ={},
+                ))
+        except Exception:
+            pass
         payload = json.dumps({
             "model": model, "messages": safe_messages, "stream": False,
-            "options": {"num_predict": max(1, int(max_output_tokens))},
+            "options": options,
         }).encode()
         headers = {'Content-Type': 'application/json'}
     elif AI_PROVIDER == 'claude':
-        url = f"{AI_API_URL}/messages" if '/messages' not in AI_API_URL else AI_API_URL
+        base_url = AI_API_URL.rstrip('/')
+        url = f"{base_url}/messages" if '/messages' not in base_url else base_url
         system_msg = '\n\n'.join(m['content'] for m in safe_messages if m['role'] == 'system')
-        claude_msgs = [m for m in safe_messages if m['role'] != 'system']
+        claude_msgs = [
+            {"role": m['role'], "content": m['content']}
+            for m in safe_messages if m['role'] != 'system'
+        ]
+        # Anthropic prompt caching is an explicit opt-in. The system prompt
+        # and the first user block (the large fabric-observation payload) are
+        # the stable prefix re-sent on every tool round and forced final
+        # answer; marking both ephemeral serves rounds 2+ from cache. It is
+        # harmless when the account or model ignores cache_control.
+        system_field = system_msg
+        if system_msg:
+            system_field = [{
+                "type": "text", "text": system_msg,
+                "cache_control": {"type": "ephemeral"},
+            }]
+        if claude_msgs and claude_msgs[0]['role'] == 'user':
+            claude_msgs[0]['content'] = [{
+                "type": "text", "text": claude_msgs[0]['content'],
+                "cache_control": {"type": "ephemeral"},
+            }]
         payload = json.dumps({"model": model, "max_tokens": max(1, int(max_output_tokens)),
-                              "system": system_msg, "messages": claude_msgs}).encode()
+                              "system": system_field, "messages": claude_msgs}).encode()
         headers = {'Content-Type': 'application/json', 'x-api-key': AI_API_KEY,
                    'anthropic-version': '2023-06-01'}
     elif AI_PROVIDER == 'gemini':
-        model = model or 'gemini-2.0-flash'
+        model = model or 'gemini-2.5-flash'
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}"
         payload = json.dumps(
             _build_gemini_payload(safe_messages, max_output_tokens)
@@ -2790,10 +2848,14 @@ def _provider_request_once(
         headers = {'Content-Type': 'application/json'}
     else:
         url = f"{AI_API_URL.rstrip('/')}/chat/completions"
-        payload = json.dumps({
-            "model": model, "messages": safe_messages,
-            "max_tokens": max(1, int(max_output_tokens)),
-        }).encode()
+        body = {"model": model, "messages": safe_messages}
+        # api.openai.com rejects the legacy max_tokens on current reasoning
+        # models; other OpenAI-compatible gateways still expect max_tokens.
+        if 'api.openai.com' in url:
+            body["max_completion_tokens"] = max(1, int(max_output_tokens))
+        else:
+            body["max_tokens"] = max(1, int(max_output_tokens))
+        payload = json.dumps(body).encode()
         headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {AI_API_KEY}'}
 
     request = urllib.request.Request(url, data=payload, headers=headers)
@@ -2808,8 +2870,38 @@ def _provider_request_once(
             raise _ProviderContextWindowError(
                 error.code, body, _reported_context_window(body)
             ) from error
+        # Surface the provider's own explanation (invalid model ID, billing,
+        # unsupported parameter) instead of a bare "HTTP Error 400".
+        detail = _provider_error_detail(body)
+        if detail:
+            error.msg = f"{error.msg or ''}: {detail}".lstrip(': ')
         raise
-    result = json.loads(response.read().decode())
+    # urllib's timeout is per socket operation, so a slow-dripping provider
+    # could hold the worker far past the deadline. Read the body in bounded
+    # chunks and enforce the same budget as a wall clock.
+    read_deadline = time.monotonic() + max(1, int(timeout))
+    body_chunks = []
+    while True:
+        if time.monotonic() > read_deadline:
+            raise TimeoutError(
+                f"{AI_PROVIDER} response read exceeded the request deadline"
+            )
+        try:
+            chunk = response.read(65536)
+        except TypeError:
+            # Non-socket file objects may not accept a size argument.
+            body_chunks.append(response.read())
+            break
+        if not chunk:
+            break
+        body_chunks.append(chunk)
+    result = json.loads(b''.join(body_chunks).decode())
+    try:
+        # Best-effort cost/usage accounting; also tolerates the contract test
+        # harness loading this function standalone.
+        _record_provider_usage(AI_PROVIDER, model, result)
+    except Exception:
+        pass
     truncated = False
     if AI_PROVIDER == 'ollama':
         text = result.get('message', {}).get('content', '')
@@ -2989,6 +3081,8 @@ def call_llm_sync(
                     continue
         context_retried = False
         transient_retried = False
+        output_limit_retried = False
+        active_max_output_tokens = int(max_output_tokens)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 1:
@@ -2997,7 +3091,7 @@ def call_llm_sync(
             timeout = max(1, min(LLM_REQUEST_TIMEOUT, int(remaining)))
             try:
                 text = _provider_request_once(
-                    fitted_messages, model, timeout, max_output_tokens
+                    fitted_messages, model, timeout, active_max_output_tokens
                 )
                 if fit_info is not None:
                     _apply_context_fit_state(
@@ -3054,7 +3148,7 @@ def call_llm_sync(
                     tighter_window = max(
                         8000,
                         int(rejected_tokens * 0.15)
-                        + int(max_output_tokens) + 8192,
+                        + int(active_max_output_tokens) + 8192,
                     )
                     configured = _context_override_for_model(model)
                     if configured is not None:
@@ -3064,7 +3158,7 @@ def call_llm_sync(
                 try:
                     try:
                         fitted_messages, fit_info = _fit_messages_for_model(
-                            context_messages, model, max_output_tokens,
+                            context_messages, model, active_max_output_tokens,
                             window_override=tighter_window,
                         )
                     except Exception:
@@ -3074,7 +3168,8 @@ def call_llm_sync(
                             'the provider rejected the larger request',
                         )
                         bounded = _hard_bound_pinned_untrusted(
-                            bounded_source, model, max_output_tokens, tighter_window
+                            bounded_source, model, active_max_output_tokens,
+                            tighter_window,
                         )
                         recovery_bounded = sum(
                             1 for original, replacement in zip(
@@ -3083,7 +3178,7 @@ def call_llm_sync(
                             if original.get('content') != replacement.get('content')
                         )
                         fitted_messages, fit_info = _fit_messages_for_model(
-                            bounded, model, max_output_tokens,
+                            bounded, model, active_max_output_tokens,
                             window_override=tighter_window,
                         )
                     continue
@@ -3096,6 +3191,27 @@ def call_llm_sync(
             except Exception as error:
                 safe_error = redact_secrets(str(error))
                 errors.append(f"{model}: {safe_error}")
+                if (
+                    'output-token limit' in safe_error
+                    and not output_limit_retried
+                    and deadline - time.monotonic() > 2
+                ):
+                    # One bounded retry with a doubled output budget: models
+                    # that spend the default budget on reasoning before the
+                    # final text otherwise fail the whole request. Refit the
+                    # prompt so the larger reserve still respects the window.
+                    output_limit_retried = True
+                    active_max_output_tokens = int(active_max_output_tokens) * 2
+                    if fit_context:
+                        try:
+                            fitted_messages, fit_info = _fit_messages_for_model(
+                                context_messages, model, active_max_output_tokens
+                            )
+                        except Exception:
+                            # Keep the already-fitted prompt; a provider-side
+                            # window rejection still has its own recovery.
+                            pass
+                    continue
                 if (
                     not transient_retried
                     and _provider_error_is_transient(error)
@@ -3177,11 +3293,19 @@ TUI like vtysh / top), suggest opening a live terminal:
 """
 
 
-def run_device_tool(device, command, cookie):
+def run_device_tool(device, command, cookie, deadline=None):
     """Run ONE read-only device command by invoking fabric-api.sh's run-device-command
     as a subprocess. This reuses its exact read-only whitelist, admin auth (via the
     forwarded session cookie) and ssh exec — nothing is duplicated. Never raises."""
     import subprocess
+    timeout = 60
+    if deadline is not None:
+        # Fit the subprocess inside the remaining request budget so a hung
+        # device cannot push the request past nginx's fastcgi_read_timeout.
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            return False, 'tool skipped: request time budget exhausted'
+        timeout = max(1, min(60, int(remaining)))
     try:
         body = json.dumps({'device': device, 'command': command, 'policy': 'ai-readonly'})
         env = dict(os.environ)
@@ -3193,7 +3317,7 @@ def run_device_tool(device, command, cookie):
             env['HTTP_COOKIE'] = cookie
         proc = subprocess.run(
             ['bash', os.path.join(WEB_ROOT, 'fabric-api.sh')],
-            input=body, env=env, capture_output=True, text=True, timeout=60
+            input=body, env=env, capture_output=True, text=True, timeout=timeout
         )
         raw = proc.stdout or ''
         for sep in ('\r\n\r\n', '\n\n'):
@@ -3210,10 +3334,12 @@ def run_device_tool(device, command, cookie):
         return False, f'tool error: {e}'
 
 
-def run_dispatch(target, command, devices, cookie, max_devices=60, pool=8, per_out=1200):
+def run_dispatch(target, command, devices, cookie, max_devices=60, pool=8, per_out=1200,
+                 deadline=None):
     """Phase 3: run ONE read-only command on many devices in PARALLEL (fan-out).
     target = 'all'/'*' or a role/hostname substring (e.g. 'leaf', 'spine', 'border').
-    Returns (hostnames, {hostname: (ok, output)}). Reuses run_device_tool per device."""
+    Returns (hostnames, {hostname: (ok, output)}). Reuses run_device_tool per device;
+    each per-device subprocess is clamped to the remaining request deadline."""
     from concurrent.futures import ThreadPoolExecutor
     t = (target or '').strip().lstrip('@').lower()
     targets = []
@@ -3230,7 +3356,7 @@ def run_dispatch(target, command, devices, cookie, max_devices=60, pool=8, per_o
         return targets, results
 
     def _one(h):
-        ok, out = run_device_tool(h, command, cookie)
+        ok, out = run_device_tool(h, command, cookie, deadline=deadline)
         return h, ok, (out or '')[:per_out]
 
     try:
@@ -3851,7 +3977,9 @@ def action_chat():
         data = json.loads(POST_DATA)
     except Exception:
         error_json("Invalid JSON")
-    
+    if not isinstance(data, dict):
+        error_json("Request must be an object")
+
     raw_question = data.get('message', '')
     if not isinstance(raw_question, str):
         error_json("Message must be text")
@@ -3977,6 +4105,9 @@ def action_chat():
     # (its read-only whitelist + admin auth + ssh exec are reused, not duplicated).
     cookie = os.environ.get('HTTP_COOKIE', '')
     valid_hostnames = {d.get('hostname', '') for d in devices.values() if d.get('hostname')}
+    # Models often re-case hostnames quoted from prose; resolve [RUN:] targets
+    # case-insensitively back to the canonical inventory hostname.
+    hostname_by_lower = {name.lower(): name for name in valid_hostnames}
     MAX_ROUNDS = 4
     MAX_TOOLS_PER_ROUND = 3
     MAX_TOTAL_TOOLS = 10
@@ -4041,11 +4172,13 @@ def action_chat():
             cmd = cmd.strip()
             total_tools += 1
             round_tools += 1
-            if dev_name not in valid_hostnames:
+            canonical_name = hostname_by_lower.get(dev_name.lower())
+            if canonical_name is None:
                 tools_used.append({'device': dev_name, 'command': cmd, 'ok': False})
                 results.append(f"[{dev_name}] error: unknown device (not in fabric)")
                 continue
-            ok, out = run_device_tool(dev_name, cmd, cookie)
+            dev_name = canonical_name
+            ok, out = run_device_tool(dev_name, cmd, cookie, deadline=deadline)
             tools_used.append({'device': dev_name, 'command': cmd, 'ok': ok})
             results.append(f"[RUN {dev_name}: {cmd}]\n{(out or '')[:6000]}")
         # Parallel multi-device fan-out (Phase 3): at most one dispatch per round
@@ -4060,7 +4193,8 @@ def action_chat():
             total_tools += 1
             round_tools += 1
             hosts, dres = run_dispatch(tgt, cmd, devices, cookie,
-                                       max_devices=min(60, DISPATCH_DEVICE_CAP - dispatch_dev_total))
+                                       max_devices=min(60, DISPATCH_DEVICE_CAP - dispatch_dev_total),
+                                       deadline=deadline)
             dispatches_used += 1
             dispatch_dev_total += len(hosts)
             dispatch_ok = bool(hosts) and all(
@@ -4374,13 +4508,48 @@ def action_save_config():
     result_json({"success": True, "message": "AI configuration saved"})
 
 
+def _probe_configured_secondary_models(provider):
+    """Probe AI_FALLBACK_MODEL and AI_SEARCH_MODEL with the saved credentials.
+
+    Catches a mistyped fallback/search model at configuration time instead of
+    during a primary outage. Returns OPTIONAL response fields only; the
+    existing test-connection fields stay untouched.
+    """
+    extras = {}
+    if AI_FALLBACK_MODEL and provider == AI_PROVIDER.strip().lower():
+        # The fallback always runs against the saved provider config, so the
+        # probe reuses the production request path directly.
+        try:
+            _provider_request_once(
+                [{"role": "user", "content": "Test connection. Reply with: OK"}],
+                AI_FALLBACK_MODEL, 20, max_output_tokens=1024,
+            )
+            extras['fallback'] = {"model": AI_FALLBACK_MODEL, "ok": True}
+        except Exception as error:
+            extras['fallback'] = {
+                "model": AI_FALLBACK_MODEL, "ok": False,
+                "error": redact_secrets(str(error))[:300],
+            }
+    if SEARCH_ENABLED:
+        out = run_search('Reply with exactly: OK', timeout=20)
+        search_ok = not str(out).startswith(
+            ('Search error:', 'Web search is not configured', 'Empty search query')
+        )
+        extras['search'] = {"model": AI_SEARCH_MODEL, "ok": search_ok}
+        if not search_ok:
+            extras['search']['error'] = str(out)[:300]
+    return extras
+
+
 def action_test_connection():
     """Test LLM connection."""
     try:
         data = json.loads(POST_DATA) if POST_DATA else {}
     except Exception:
         data = {}
-    
+    if not isinstance(data, dict):
+        error_json("Request must be an object")
+
     provider = data.get('provider') or AI_PROVIDER
     model = data.get('model') or AI_MODEL
     if not isinstance(provider, str) or not isinstance(model, str):
@@ -4413,7 +4582,11 @@ def action_test_connection():
     elif AI_PROXY_URL:
         os.environ['http_proxy'] = AI_PROXY_URL
         os.environ['https_proxy'] = AI_PROXY_URL
-    
+    if proxy_url or AI_PROXY_URL:
+        # Never route local endpoints (e.g. Ollama on localhost) through the proxy.
+        os.environ.setdefault('no_proxy', 'localhost,127.0.0.1,::1')
+        os.environ.setdefault('NO_PROXY', 'localhost,127.0.0.1,::1')
+
     messages = [
         {"role": "system", "content": "You are a helpful assistant. Reply with exactly: OK"},
         {"role": "user", "content": "Test connection. Reply with: OK"}
@@ -4430,7 +4603,8 @@ def action_test_connection():
             result = json.loads(resp.read().decode())
             reply = result.get('message', {}).get('content', '')
             elapsed = round(time.time() - start, 1)
-            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed, "model": model})
+            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed,
+                         "model": model, **_probe_configured_secondary_models(provider)})
         elif provider == 'gemini':
             import urllib.request
             # Set proxy if provided in test payload
@@ -4447,14 +4621,18 @@ def action_test_connection():
             candidates = result.get('candidates', [])
             reply = candidates[0]['content']['parts'][0]['text'] if candidates else 'No response'
             elapsed = round(time.time() - start, 1)
-            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed, "model": model})
+            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed,
+                         "model": model, **_probe_configured_secondary_models(provider)})
         else:
             # OpenAI-compatible
             import urllib.request
             api_url = requested_api_url
             if provider == 'claude':
+                api_url = api_url.rstrip('/')
                 url = f"{api_url}/messages" if '/messages' not in api_url else api_url
-                payload = json.dumps({"model": model, "max_tokens": 100, "messages": [{"role": "user", "content": "Test. Reply: OK"}]}).encode()
+                # 1024 tokens: models with thinking enabled spend budget on
+                # thinking blocks before emitting the text block.
+                payload = json.dumps({"model": model, "max_tokens": 1024, "messages": [{"role": "user", "content": "Test. Reply: OK"}]}).encode()
                 headers = {'Content-Type': 'application/json', 'x-api-key': api_key, 'anthropic-version': '2023-06-01'}
             else:
                 url = f"{api_url.rstrip('/')}/chat/completions"
@@ -4464,11 +4642,26 @@ def action_test_connection():
             resp = urllib.request.urlopen(req, timeout=30)
             result = json.loads(resp.read().decode())
             if provider == 'claude':
-                reply = result.get('content', [{}])[0].get('text', '')
+                # The first block may be a thinking block (or the list may be
+                # empty on refusal); pick the first text block explicitly.
+                reply = next(
+                    (str(part.get('text') or '')
+                     for part in (result.get('content') or [])
+                     if isinstance(part, dict)
+                     and part.get('type', 'text') == 'text' and part.get('text')),
+                    '',
+                )
+                if not reply:
+                    result_json({
+                        "success": False,
+                        "error": "Connected, but the model returned no text content",
+                        "elapsed": round(time.time() - start, 1),
+                    })
             else:
                 reply = result.get('choices', [{}])[0].get('message', {}).get('content', '')
             elapsed = round(time.time() - start, 1)
-            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed, "model": model})
+            result_json({"success": True, "reply": reply.strip(), "elapsed": elapsed,
+                         "model": model, **_probe_configured_secondary_models(provider)})
     except Exception as e:
         elapsed = round(time.time() - start, 1)
         error_msg = redact_secrets(str(e))
@@ -4511,12 +4704,23 @@ def action_analyze():
     legacy_snap_file = os.path.join(WEB_ROOT, 'ai-analysis-snapshot.json')
     cur_snap = _health_snapshot(devices, device_health)
     collection_complete = bool(collection_metadata.get('complete'))
+    baseline_established = False
     if collection_complete:
         previous_file = snap_file if os.path.exists(snap_file) else legacy_snap_file
-        prev_snap = (_load_json_file(previous_file) or {}).get('statuses', {})
-        changes = _diff_snapshots(prev_snap, cur_snap)
-        changes_text = ("CHANGES SINCE LAST RUN:\n" + "\n".join("  - " + c for c in changes)) \
-            if changes else "CHANGES SINCE LAST RUN: none — device status unchanged."
+        if not os.path.exists(previous_file):
+            # First-ever run: there is no baseline to diff against, so every
+            # device would surface as a spurious "NEW device" finding.
+            baseline_established = True
+            changes = []
+            changes_text = (
+                "BASELINE ESTABLISHED: first analysis run — change detection "
+                "starts on the next cycle."
+            )
+        else:
+            prev_snap = (_load_json_file(previous_file) or {}).get('statuses', {})
+            changes = _diff_snapshots(prev_snap, cur_snap)
+            changes_text = ("CHANGES SINCE LAST RUN:\n" + "\n".join("  - " + c for c in changes)) \
+                if changes else "CHANGES SINCE LAST RUN: none — device status unchanged."
     else:
         changes = []
         changes_text = (
@@ -4524,6 +4728,70 @@ def action_analyze():
             "The last trusted snapshot is being retained; do not infer additions, removals, "
             "or status changes from this run."
         )
+
+    # Steady-state reuse: with complete coverage, an unchanged device-status
+    # diff, an unchanged 24h timeline event set, and a fresh persisted
+    # analysis, refresh the persisted metadata/snapshot instead of paying a
+    # new LLM call. A bounded text age forces periodic full regeneration.
+    if collection_complete and not changes and not baseline_established:
+        reused_prior = None
+        try:
+            prior = _load_json_file(ANALYSIS_FILE)
+            if isinstance(prior, dict) and str(prior.get('analysis') or '').strip():
+                prior_ts = float(prior.get('timestamp') or 0)
+                prior_generated = float(prior.get('generated_at') or prior_ts)
+                if (
+                    0 <= time.time() - prior_ts < ANALYSIS_REUSE_MAX_AGE_SECONDS
+                    and 0 <= time.time() - prior_generated
+                    < ANALYSIS_REUSE_MAX_TEXT_AGE_SECONDS
+                    and _timeline_event_fingerprint(prior.get('timeline'))
+                    == _timeline_event_fingerprint(timeline)
+                ):
+                    reused_prior = prior
+        except Exception:
+            reused_prior = None
+        if reused_prior is not None:
+            evidence_bundle = _build_evidence(
+                evidence_collection_metadata, [], timeline,
+                context_info=context_state,
+            )
+            analysis = {
+                "timestamp": time.time(),
+                "generated_at": float(
+                    reused_prior.get('generated_at')
+                    or reused_prior.get('timestamp') or time.time()
+                ),
+                "analysis": reused_prior.get('analysis'),
+                "device_count": len(devices),
+                "provider": reused_prior.get('provider') or AI_PROVIDER,
+                "model": reused_prior.get('model') or AI_MODEL,
+                "fallback_used": bool(reused_prior.get('fallback_used')),
+                "changes": changes,
+                "collection": collection_metadata,
+                "timeline": timeline,
+                "evidence": evidence_bundle['records'],
+                "confidence": evidence_bundle['confidence'],
+                "reused": True,
+            }
+            try:
+                _save_json_state(ANALYSIS_FILE, analysis)
+                _save_json_state(
+                    snap_file, {"timestamp": time.time(), "statuses": cur_snap}
+                )
+            except Exception as error:
+                error_json(
+                    "AI analysis refresh could not be saved: "
+                    + redact_secrets(str(error))
+                )
+            result_json({"success": True, "analysis": analysis['analysis'],
+                         "timestamp": analysis['timestamp'],
+                         "changes": changes, "collection": collection_metadata,
+                         "timeline": timeline, "evidence": evidence_bundle['records'],
+                         "confidence": evidence_bundle['confidence'],
+                         "persisted": True, "snapshot_updated": True,
+                         "model": analysis['model'],
+                         "fallback_used": analysis['fallback_used'],
+                         "reused": True})
 
     analysis_observations = neutralize_untrusted_observation_text(f"""
 {changes_text}
@@ -4602,6 +4870,9 @@ Correlations show temporal coincidence only and do not prove causation.""")
     
     analysis = {
         "timestamp": time.time(),
+        # generated_at marks when the analysis text itself was produced by the
+        # LLM; steady-state reuse refreshes timestamp but carries this forward.
+        "generated_at": time.time(),
         "analysis": response,
         "device_count": len(devices),
         "provider": llm_result['provider'],
@@ -4612,6 +4883,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
         "timeline": timeline,
         "evidence": evidence_bundle['records'],
         "confidence": evidence_bundle['confidence'],
+        "baseline": baseline_established,
     }
     
     # Persist only a successful analysis based on complete/current collection.
@@ -4631,6 +4903,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
                  "timeline": timeline, "evidence": evidence_bundle['records'],
                  "confidence": evidence_bundle['confidence'],
                  "persisted": persisted, "snapshot_updated": persisted,
+                 "baseline": baseline_established,
                  "model": llm_result['model'], "fallback_used": llm_result['fallback_used']})
 
 
@@ -4652,7 +4925,13 @@ def action_get_analysis():
             data['timeline'] = _safe_public_metadata(data['timeline'])
         age = time.time() - data.get('timestamp', 0)
         data['success'] = True
-        data['stale'] = age > 3600 or not (data.get('collection') or {}).get('complete', False)
+        # Wider than the hourly refresh interval so the freshness badge does
+        # not flap while the on-time cron run is still in flight, and a single
+        # missed run degrades gracefully.
+        data['stale'] = (
+            age > ANALYSIS_STALE_AFTER_SECONDS
+            or not (data.get('collection') or {}).get('complete', False)
+        )
         data['age_seconds'] = int(age)
         result_json(data)
     except Exception:
@@ -4681,7 +4960,7 @@ elif ACTION == 'get-analysis':
     action_get_analysis()
 elif ACTION == 'get-log-messages':
     try:
-        log_file = os.path.join(LLDPQ_DIR, 'monitor-results', 'log_summary.json')
+        log_file = _mr_path('log_summary.json')
         if os.path.exists(log_file):
             with open(log_file, 'r') as f:
                 data = json.load(f)
@@ -4697,7 +4976,12 @@ elif ACTION == 'save-learnings':
         _d = json.loads(POST_DATA)
     except Exception:
         error_json("Invalid JSON")
-    _items = save_learnings(_d.get('learnings', []))
+    if not isinstance(_d, dict):
+        error_json("Request must be an object")
+    _learnings = _d.get('learnings', [])
+    if not isinstance(_learnings, list):
+        error_json("learnings must be a list")
+    _items = _locked_learnings_update(lambda _existing: save_learnings(_learnings))
     result_json({"success": True, "count": len(_items)})
 else:
     error_json(f"Unknown action: {ACTION}")
