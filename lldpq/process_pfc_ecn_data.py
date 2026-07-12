@@ -1452,7 +1452,12 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             histories[key] = []
             continue
         histories[key] = [
-            value for value in values
+            # Migrate pre-slim records (recognizable by their embedded absolute
+            # counters) on the fly, so the file-size win applies on the first
+            # run instead of phasing in over the 24h retention window.
+            _history_record(value) if "counters" in value or "rates" in value
+            else value
+            for value in values
             if isinstance(value, Mapping)
             and isinstance(value.get("timestamp"), (int, float))
             and value["timestamp"] >= cutoff
