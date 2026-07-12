@@ -13,6 +13,7 @@ import re
 import json
 import time
 import html
+import tempfile
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
@@ -41,11 +42,40 @@ class BGPState(Enum):
 
 class BGPHealth(Enum):
     """BGP neighbor health levels"""
-    EXCELLENT = "excellent"
-    GOOD = "good"
+    HEALTHY = "healthy"
     WARNING = "warning"
     CRITICAL = "critical"
     UNKNOWN = "unknown"
+
+
+def _atomic_write(path: str, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (tempfile + fsync + replace).
+
+    A concurrent web reader or a mid-write kill never sees a truncated file;
+    the previous complete version is kept until the replace succeeds.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def coerce_bgp_state(value: Any) -> BGPState:
@@ -211,8 +241,13 @@ class BGPAnalyzer:
                 "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
             }
-            with open(f"{self.data_dir}/bgp_history.json", "w") as f:
-                json.dump(data, f, indent=2)
+            # Atomic write: a mid-write kill must never truncate the history
+            # file, or per-neighbor down_since is lost and a long-down neighbor
+            # gets re-stamped down_since=now (CRITICAL downgraded to WARNING).
+            _atomic_write(
+                f"{self.data_dir}/bgp_history.json",
+                json.dumps(data, indent=2),
+            )
         except Exception as e:
             print(f"Error saving BGP history: {e}")
     
@@ -421,7 +456,7 @@ class BGPAnalyzer:
         return (
             BGPHealth.WARNING
             if self.established_neighbor_issues(neighbor)
-            else BGPHealth.EXCELLENT
+            else BGPHealth.HEALTHY
         )
 
     def established_neighbor_issues(self, neighbor: BGPNeighbor) -> List[str]:
@@ -850,7 +885,7 @@ class BGPAnalyzer:
                 
                 neighbor = BGPNeighbor(**neighbor_dict)
                 health = self.assess_neighbor_health(neighbor)
-                if health in [BGPHealth.EXCELLENT, BGPHealth.GOOD]:
+                if health == BGPHealth.HEALTHY:
                     healthy_neighbors += 1
                 if health in [BGPHealth.CRITICAL, BGPHealth.WARNING, BGPHealth.UNKNOWN]:
                     problem_neighbors.append({
@@ -1029,6 +1064,34 @@ class BGPAnalyzer:
             coverage_status = "partial"
         else:
             coverage_status = "current"
+
+        # Visible stale/partial-coverage banner so a broken or partial
+        # collection can never read as a fully-healthy fabric.
+        coverage_banner = ""
+        if coverage_status == "unavailable":
+            coverage_banner = (
+                '<div class="coverage-banner coverage-banner-critical">'
+                "BGP collection unavailable: no current device data was returned. "
+                "The counts below do not reflect live fabric state.</div>"
+            )
+        elif coverage_status == "partial":
+            missing = sorted(
+                set(coverage.get("unavailable_bgp_devices", []) or [])
+                | set(coverage.get("unavailable_evpn_devices", []) or [])
+            )
+            missing_detail = ", ".join(missing[:20])
+            if len(missing) > 20:
+                missing_detail += f" (+{len(missing) - 20} more)"
+            coverage_banner = (
+                '<div class="coverage-banner">Partial collection: '
+                f"{current_bgp_devices}/{expected_devices} BGP and "
+                f"{current_evpn_devices}/{expected_devices} EVPN devices reported."
+                + (
+                    " Not current: " + html.escape(missing_detail)
+                    if missing_detail else ""
+                )
+                + "</div>"
+            )
         route_coverage = (
             "partial" if evpn_summary.get("route_counts_partial") else "complete"
         )
@@ -1318,6 +1381,35 @@ class BGPAnalyzer:
         ::-webkit-scrollbar-thumb {{ background: #404040; border-radius: 4px; }}
         ::-webkit-scrollbar-thumb:hover {{ background: #555; }}
         
+        /* Coverage / stale-data banner */
+        .coverage-banner {{
+            margin: 0 0 20px;
+            padding: 10px 14px;
+            background: #35270f;
+            color: #ffb74d;
+            border: 1px solid #6d511d;
+            border-radius: 6px;
+            font-size: 13px;
+        }}
+        .coverage-banner-critical {{
+            background: #3a1c1c;
+            color: #ff8a80;
+            border-color: #7d2f2f;
+        }}
+
+        /* Empty-state row */
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; }}
+
+        /* Expandable per-row detail panel */
+        tbody tr[data-row-id] {{ cursor: pointer; }}
+        .detail-row td {{ padding: 0; border-top: 0; }}
+        .detail-panel {{ padding: 14px 20px 18px; background: #202020; border-left: 3px solid #76b900; }}
+        .detail-title {{ color: #76b900; font-weight: 700; margin-bottom: 12px; font-size: 14px; }}
+        .detail-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 6px 24px; }}
+        .detail-grid .kv {{ display: grid; grid-template-columns: 150px 1fr; gap: 8px; padding: 5px 0; border-bottom: 1px solid #333; }}
+        .detail-grid .kv span:first-child {{ color: #999; }}
+        .detail-grid .kv code {{ color: #6fc7df; }}
+
         @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
     </style>
 </head>
@@ -1364,7 +1456,7 @@ class BGPAnalyzer:
             </button>
         </div>
     </div>
-    
+    {coverage_banner}
     <!-- BGP Summary Section -->
     <div class="dashboard-section">
         <div class="section-header">
@@ -1538,11 +1630,14 @@ class BGPAnalyzer:
             0 if x['health'] == BGPHealth.CRITICAL else
             1 if x['health'] == BGPHealth.WARNING else
             2 if x['health'] == BGPHealth.UNKNOWN else
-            3 if x['health'] == BGPHealth.GOOD else
-            4
+            3
         ))
-        
-        for neighbor_info in sorted_neighbors:
+
+        # Per-row evidence surfaced through an expandable detail panel
+        # (description / table_version / down_since / VRF / AF / raw counters).
+        row_details = {}
+
+        for row_id, neighbor_info in enumerate(sorted_neighbors):
             neighbor = neighbor_info['neighbor']
             health = neighbor_info['health']
             hostname = neighbor_info['hostname']
@@ -1559,9 +1654,7 @@ class BGPAnalyzer:
                 state_badge_class = 'badge badge-orange'
             
             # Badge class based on health
-            if health_val == 'excellent':
-                health_badge_class = 'badge badge-green'
-            elif health_val == 'good':
+            if health_val == 'healthy':
                 health_badge_class = 'badge badge-green'
             elif health_val == 'warning':
                 health_badge_class = 'badge badge-orange'
@@ -1587,9 +1680,40 @@ class BGPAnalyzer:
             display_vrf = html.escape(str(vrf), quote=True)
             display_address_family = html.escape(str(address_family), quote=True)
             display_uptime = html.escape(str(neighbor.uptime))
-            
+
+            down_since_display = "—"
+            if neighbor.down_since:
+                try:
+                    down_since_display = datetime.fromtimestamp(
+                        float(neighbor.down_since)
+                    ).strftime("%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError, OSError, OverflowError):
+                    down_since_display = "—"
+            row_details[row_id] = {
+                "device": str(canonical(hostname)),
+                "neighbor": neighbor_display,
+                "neighbor_ip": neighbor.neighbor_ip,
+                "vrf": vrf,
+                "address_family": address_family,
+                "state": state_val.upper(),
+                "health": health_val.upper(),
+                "description": neighbor.description or "N/A",
+                "version": neighbor.version,
+                "asn": neighbor.asn,
+                "table_version": neighbor.table_version,
+                "uptime": neighbor.uptime,
+                "down_since": down_since_display,
+                "interface": neighbor.interface or "N/A",
+                "prefixes_received": neighbor.prefixes_received,
+                "prefixes_sent": neighbor.prefixes_sent,
+                "messages_received": neighbor.messages_received,
+                "messages_sent": neighbor.messages_sent,
+                "in_queue": neighbor.in_queue,
+                "out_queue": neighbor.out_queue,
+            }
+
             html_content += f"""
-        <tr data-device-key="{device_key}" data-health="{health_val}" data-state="{dashboard_state}" data-bgp-state="{state_val}" data-vrf="{display_vrf}" data-address-family="{display_address_family}">
+        <tr data-device-key="{device_key}" data-row-id="{row_id}" onclick="toggleBgpDetails(this, event)" data-health="{health_val}" data-state="{dashboard_state}" data-bgp-state="{state_val}" data-vrf="{display_vrf}" data-address-family="{display_address_family}">
             <td>{display_hostname}</td>
             <td>{display_neighbor}</td>
             <td>{display_interface}</td>
@@ -1602,13 +1726,30 @@ class BGPAnalyzer:
             <td><span class="{health_badge_class}">{health_val.upper()}</span></td>
         </tr>
 """
-        
+
+        if not sorted_neighbors:
+            if coverage_status == "unavailable":
+                empty_msg = (
+                    "BGP collection is unavailable — no current neighbor "
+                    "data was returned."
+                )
+            elif coverage_status == "partial":
+                empty_msg = "No BGP neighbors in the current (partial) collection."
+            else:
+                empty_msg = (
+                    "No BGP neighbors found — every reporting device returned "
+                    "an empty neighbor set."
+                )
+            html_content += (
+                f'        <tr class="empty-row"><td colspan="10">{empty_msg}</td></tr>\n'
+            )
+
         html_content += """
                 </tbody>
             </table>
         </div>
     </div>
-    
+
     <!-- Thresholds Section -->
     <div class="dashboard-section">
         <div class="section-header">
@@ -1653,6 +1794,65 @@ class BGPAnalyzer:
         // EVPN per-device data
         const evpnPerDevice = __EVPN_DATA_PLACEHOLDER__;
         const evpnUniqueVnis = __EVPN_UNIQUE_VNI_PLACEHOLDER__;
+        // Per-neighbor evidence for the expandable detail rows
+        const bgpRowDetails = __BGP_ROW_DETAILS_PLACEHOLDER__;
+
+        function escBgp(value) {
+            return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            }[c]));
+        }
+
+        function kvRow(label, value, mono) {
+            const rendered = mono
+                ? '<code>' + escBgp(value) + '</code>'
+                : escBgp(value);
+            return '<div class="kv"><span>' + escBgp(label) + '</span><span>' +
+                rendered + '</span></div>';
+        }
+
+        function buildBgpDetailPanel(d) {
+            return '<div class="detail-panel">' +
+                '<div class="detail-title">' + escBgp(d.device) + ' &#8596; ' +
+                escBgp(d.neighbor) + '</div>' +
+                '<div class="detail-grid">' +
+                kvRow('Neighbor IP', d.neighbor_ip, true) +
+                kvRow('Interface', d.interface) +
+                kvRow('VRF', d.vrf) +
+                kvRow('Address Family', d.address_family) +
+                kvRow('State', d.state) +
+                kvRow('Health', d.health) +
+                kvRow('ASN', d.asn) +
+                kvRow('Version', d.version) +
+                kvRow('Table Version', d.table_version) +
+                kvRow('Uptime', d.uptime) +
+                kvRow('Down Since', d.down_since) +
+                kvRow('Prefixes RX / TX', d.prefixes_received + ' / ' + d.prefixes_sent) +
+                kvRow('Messages RX / TX', d.messages_received + ' / ' + d.messages_sent) +
+                kvRow('Queue In / Out', d.in_queue + ' / ' + d.out_queue) +
+                kvRow('Description', d.description) +
+                '</div></div>';
+        }
+
+        function clearBgpDetailRows() {
+            document.querySelectorAll('#bgp-table tr.detail-row').forEach(r => r.remove());
+        }
+
+        function toggleBgpDetails(row, event) {
+            if (event && event.target && event.target.closest('a')) return;
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('detail-row')) {
+                next.remove();
+                return;
+            }
+            clearBgpDetailRows();
+            const detail = bgpRowDetails[row.dataset.rowId];
+            if (!detail) return;
+            const tr = document.createElement('tr');
+            tr.className = 'detail-row';
+            tr.innerHTML = '<td colspan="10">' + buildBgpDetailPanel(detail) + '</td>';
+            row.parentNode.insertBefore(tr, row.nextSibling);
+        }
 
         function evpnSortableHeader(label, column, type) {
             return '<th class="sortable evpn-sortable" data-column="' + column +
@@ -1892,7 +2092,8 @@ class BGPAnalyzer:
         
         function filterNeighbors(filterType) {
             currentFilter = filterType;
-            
+            clearBgpDetailRows();
+
             // Clear device search when using card filters
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -1943,6 +2144,7 @@ class BGPAnalyzer:
         
         function clearFilter() {
             currentFilter = 'ALL';
+            clearBgpDetailRows();
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
             });
@@ -2009,7 +2211,8 @@ class BGPAnalyzer:
         
         function filterByDevice(deviceName) {
             if (!deviceName) return;
-            
+            clearBgpDetailRows();
+
             selectedDevice = deviceName;
             deviceSearchActive = true;
             
@@ -2036,6 +2239,7 @@ class BGPAnalyzer:
         }
         
         function clearDeviceSearch() {
+            clearBgpDetailRows();
             selectedDevice = '';
             deviceSearchActive = false;
             $('#deviceSearch').val('').trigger('change');
@@ -2075,7 +2279,10 @@ class BGPAnalyzer:
         function sortBGPTable(columnIndex, direction, type) {
             const table = document.getElementById('bgp-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows);
+            clearBgpDetailRows();
+            const rows = Array.from(tbody.rows).filter(
+                row => !row.classList.contains('empty-row')
+            );
             
             rows.sort((a, b) => {
                 let aVal = a.cells[columnIndex].textContent.trim();
@@ -2191,8 +2398,7 @@ class BGPAnalyzer:
                 'CRITICAL': 0,
                 'WARNING': 1,
                 'UNKNOWN': 2,
-                'GOOD': 3,
-                'EXCELLENT': 4
+                'HEALTHY': 3
             };
             
             const aPriority = Object.prototype.hasOwnProperty.call(priority, a) ? priority[a] : 99;
@@ -2333,8 +2539,13 @@ class BGPAnalyzer:
                 csvContent += `# Stale Collections: ${document.getElementById('stale-devices').textContent}\\n`;
                 csvContent += `# Unknown Collections: ${document.getElementById('unknown-devices').textContent}\\n`;
                 csvContent += `# Health Ratio: ${document.getElementById('health-ratio').textContent}\\n`;
+                // The summary totals above are full-fabric; the rows below reflect
+                // only what is currently visible, so annotate when a filter is on.
+                const filterActive =
+                    document.getElementById('filter-info').style.display === 'block';
+                csvContent += `# Rows exported: ${filterActive ? 'filtered/visible subset only' : 'all neighbors'}\\n`;
                 csvContent += `#\\n`;
-                
+
                 // Process each visible row
                 rows.forEach(row => {
                     if (row.style.display !== 'none') {
@@ -2442,6 +2653,10 @@ class BGPAnalyzer:
         html_content = html_content.replace(
             '__EVPN_UNIQUE_VNI_PLACEHOLDER__', evpn_unique_vnis_json
         )
+        bgp_row_details_json = json.dumps(row_details).replace("<", "\\u003c")
+        html_content = html_content.replace(
+            '__BGP_ROW_DETAILS_PLACEHOLDER__', bgp_row_details_json
+        )
         prefix_threshold = self.thresholds["low_prefix_threshold"]
         ratio_threshold = self.thresholds["message_ratio_threshold"]
         replacements = {
@@ -2456,9 +2671,9 @@ class BGPAnalyzer:
         }
         for marker, value in replacements.items():
             html_content = html_content.replace(marker, value)
-        
-        with open(output_file, "w") as f:
-            f.write(html_content)
+
+        # Atomic write so a concurrent web reader never sees a half-written page.
+        _atomic_write(output_file, html_content)
 
 if __name__ == "__main__":
     analyzer = BGPAnalyzer()

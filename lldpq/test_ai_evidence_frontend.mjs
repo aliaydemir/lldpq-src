@@ -43,7 +43,7 @@ function createRendererHarness() {
     },
   };
   vm.runInNewContext(
-    `${match[0]}\nglobalThis.renderEvidence = renderEvidencePanel; globalThis.renderEvents = renderTimeline;`,
+    `${match[0]}\nglobalThis.renderEvidence = renderEvidencePanel; globalThis.renderEvents = renderTimeline; globalThis.renderFindings = renderFindingsPanel;`,
     context,
   );
   return context;
@@ -119,6 +119,68 @@ test('timeline renderer shows correlations, events, coverage, and truncation', (
   assert.match(panel.textContent, /BGP: current/);
   assert.ok(panel.children[1].children.some(row => row.className.includes('fail')));
   assert.ok(panel.children[1].children.some(row => row.className.includes('warn')));
+});
+
+test('findings renderer stamps trend badges and keeps suppressed rows dimmed and inert', () => {
+  const renderer = createRendererHarness();
+  const attack = '<img src=x onerror="globalThis.pwned=true">';
+
+  const panel = renderer.renderFindings([
+    {
+      severity: 'CRITICAL', category: 'BGP', device: 'leaf01',
+      description: attack, status: 'NEW',
+    },
+    {
+      severity: 'WARNING', category: 'BER', device: 'leaf03',
+      description: 'BER rising on swp12', status: 'ONGOING',
+      ongoing_seconds: 50_400, worsened: true, previous_severity: 'INFO',
+    },
+    {
+      severity: 'INFO', category: 'LLDP', device: 'leaf02',
+      description: 'neighbor restored', status: 'RESOLVED',
+    },
+    {
+      severity: 'INFO', category: 'CONFIG', device: 'lab-leaf09',
+      description: 'port intentionally down', status: 'ONGOING',
+      _suppressed: true, suppression_reason: '<b>lab port</b> is expected down',
+    },
+  ], { new: 1, ongoing: 1, worsened: 1, resolved: 1, suppressed: 1 });
+
+  assert.equal(panel.tagName, 'details');
+  assert.equal(panel.className, 'tool-trace');
+  assert.match(panel.textContent,
+    /Findings — 4 findings · 1 new · 1 ongoing · 1 worsened · 1 resolved · 1 suppressed/);
+  assert.match(panel.textContent, /NEW/);
+  assert.match(panel.textContent, /ONGOING 14h/);
+  assert.match(panel.textContent, /WORSENED INFO→WARNING/);
+  assert.match(panel.textContent, /RESOLVED/);
+  assert.match(panel.textContent, /1 suppressed \(acknowledged, hidden from badge counts\)/);
+  assert.match(panel.textContent, /<img src=x onerror=/);
+  assert.equal(renderer.pwned, undefined);
+
+  const body = panel.children[1];
+  assert.ok(body.children.some(row => row.className.includes('fail')));
+  assert.ok(body.children.some(row => row.className.includes('warn')));
+  const nested = body.children.find(child => child.tagName === 'details');
+  assert.ok(nested, 'suppressed findings collapse into a nested details block');
+  const suppressedRow = nested.children[1].children[0];
+  assert.ok(suppressedRow.className.includes('suppressed'));
+  assert.match(suppressedRow.title, /<b>lab port<\/b> is expected down/);
+
+  // Absent field renders exactly as today: nothing is appended for it.
+  const empty = renderer.renderFindings(undefined, undefined);
+  assert.match(empty.textContent, /Findings — 0 findings/);
+});
+
+test('async chat submit/poll/stop path keeps the sync fallback intact', () => {
+  assert.match(aiHtml, /apiCall\('chat-submit', \{ message: finalMessage, history: historyPayload \}/);
+  assert.match(aiHtml, /apiCall\('chat', \{ message: finalMessage, history: historyPayload \}/);
+  assert.match(aiHtml, /apiCall\('chat-poll', \{ job_id: jobId, cursor \}/);
+  assert.match(aiHtml, /apiCall\('chat-stop', \{ job_id: activeChatJobId \}/);
+  assert.match(aiHtml, /await sleepWithAbort\(1500, controller\.signal\)/);
+  assert.match(aiHtml, /id="btnStop"/);
+  assert.match(aiHtml, /findings: data\.findings/);
+  assert.match(aiHtml, /findings_summary: data\.findings_summary/);
 });
 
 test('chat persistence and prompt chips include evidence and timeline fields', () => {

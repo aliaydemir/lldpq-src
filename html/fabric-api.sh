@@ -7759,6 +7759,217 @@ except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}))
 PYTHON_END
         ;;
+    run-audit-pack)
+        # Run one named read-only audit pack on a device in a single SSH
+        # session. Only a server-side pack NAME is accepted; the compound
+        # command is composed locally from ai_audit_packs.py, whose commands
+        # are individually validated against the Ask-AI read-only policy at
+        # module import, so the policy surface does not widen.
+        read -r POST_DATA
+        export POST_DATA
+
+        python3 << 'PYTHON_END'
+import json
+import subprocess
+import re
+import os
+import sys
+import fcntl
+import hashlib
+import stat
+
+# Parse input
+post_data = os.environ.get('POST_DATA', '{}')
+try:
+    params = json.loads(post_data)
+except:
+    params = {}
+
+device = params.get('device', '')
+pack = params.get('pack', '')
+
+if not isinstance(device, str) or not isinstance(pack, str):
+    print(json.dumps({'success': False, 'error': 'Device and pack must be text'}))
+    exit()
+
+device = device.strip()
+pack = pack.strip()
+
+if not device or not pack:
+    print(json.dumps({'success': False, 'error': 'Missing device or pack'}))
+    exit()
+
+# No raw shell is accepted here: the pack name only selects a server-side
+# command list and the sentinel-wrapped compound is built below.
+module_dir = os.path.dirname(os.environ.get('SCRIPT_FILENAME', ''))
+if not module_dir:
+    module_dir = os.environ.get('WEB_ROOT', '/var/www/html')
+if module_dir not in sys.path:
+    sys.path.insert(0, module_dir)
+try:
+    from ai_audit_packs import PACKS, build_compound
+except Exception:
+    print(json.dumps({'success': False, 'error': 'Audit pack module is unavailable'}))
+    exit()
+
+if pack not in PACKS:
+    print(json.dumps({'success': False, 'error': 'Unknown audit pack'}))
+    exit()
+
+command = build_compound(pack)
+
+# Validate device name (must be a valid hostname pattern)
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    print(json.dumps({'success': False, 'error': 'Invalid device name format'}))
+    exit()
+
+
+def lock_device_key(value):
+    component = re.sub(r'[^A-Za-z0-9-]', '_', value)
+    digest = hashlib.sha256(value.encode('utf-8')).hexdigest()[:16]
+    return f'{component[:48]}_{digest}'
+
+
+def open_owned_lock(path):
+    if not hasattr(os, 'O_NOFOLLOW'):
+        raise RuntimeError('Secure lock files are not supported on this host')
+    flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+    if hasattr(os, 'O_CLOEXEC'):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(path, flags, 0o600)
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        os.close(descriptor)
+        raise PermissionError('Unsafe command lock file')
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, 'w')
+
+
+# Read config from lldpq.conf (same method as run-device-command)
+def read_lldpq_conf():
+    conf = {}
+    conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
+    for conf_path in conf_paths:
+        if os.path.exists(conf_path):
+            with open(conf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        conf[key.strip()] = val.strip()
+            break
+    return conf
+
+lldpq_conf = read_lldpq_conf()
+ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
+
+# Get device management IP and username
+# Priority: devices.yaml (always available) -> Ansible inventory (optional)
+device_ip = None
+ssh_user = 'cumulus'
+
+# Try devices.yaml first
+lldpq_dir = lldpq_conf.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
+import yaml
+for devices_path in [f"{lldpq_dir}/devices.yaml"]:
+    if os.path.exists(devices_path):
+        try:
+            with open(devices_path, 'r') as f:
+                ddata = yaml.safe_load(f)
+            defaults = ddata.get('defaults', {})
+            default_user = defaults.get('username', 'cumulus')
+            for ip, info in ddata.get('devices', {}).items():
+                if isinstance(info, dict):
+                    hname = info.get('hostname', '')
+                    uname = info.get('username', default_user)
+                else:
+                    hname = str(info).split()[0] if info else ''
+                    uname = default_user
+                if hname == device:
+                    device_ip = str(ip)
+                    ssh_user = uname
+                    break
+        except:
+            pass
+
+# Fallback to Ansible inventory
+if not device_ip:
+    for inv_file in [f"{ansible_dir}/inventory/inventory.ini", f"{ansible_dir}/inventory/hosts"]:
+        if os.path.exists(inv_file):
+            try:
+                with open(inv_file, 'r') as f:
+                    for line in f:
+                        if line.strip().startswith(device + ' ') or line.strip().startswith(device + '\t'):
+                            match = re.search(r'ansible_host=(\S+)', line)
+                            if match:
+                                device_ip = match.group(1)
+                                break
+            except:
+                pass
+        if device_ip:
+            break
+
+if not device_ip:
+    print(json.dumps({'success': False, 'error': f'Device {device} not found in inventory or devices.yaml'}))
+    exit()
+
+# Execute the compound command via SSH using management IP
+try:
+    lock_path = f"/tmp/lldpq-run-device-command-{lock_device_key(device)}.lock"
+    lock_fd = open_owned_lock(lock_path)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(json.dumps({'success': False, 'error': 'Another command is already running on this device'}))
+        exit()
+
+    # A pack chains several short read-only commands in one session, so it
+    # gets double the single-command budget while staying bounded.
+    cmd_timeout = 60
+
+    ssh_command = [
+        'sudo', '-u', lldpq_user,
+        'ssh', '-tt',  # Force pseudo-tty for unbuffered output
+        '-o', 'StrictHostKeyChecking=no',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'BatchMode=yes',
+        '-o', 'LogLevel=ERROR',  # Suppress warnings
+        f'{ssh_user}@{device_ip}',  # Use username@IP from devices.yaml/inventory
+        command
+    ]
+
+    result = subprocess.run(
+        ssh_command,
+        capture_output=True,
+        text=True,
+        timeout=cmd_timeout
+    )
+
+    command_ok = result.returncode == 0
+    response = {
+        'success': command_ok,
+        'device': device,
+        'pack': pack,
+        'command': command,
+        'output': result.stdout,
+        'error_output': result.stderr,
+        'exit_code': result.returncode
+    }
+    if not command_ok:
+        response['error'] = (result.stderr or result.stdout or
+                             f'Command exited with status {result.returncode}').strip()[:1000]
+    print(json.dumps(response))
+
+except subprocess.TimeoutExpired:
+    print(json.dumps({'success': False, 'error': f'Command timed out ({cmd_timeout}s)'}))
+except Exception as e:
+    print(json.dumps({'success': False, 'error': str(e)}))
+PYTHON_END
+        ;;
     refresh-assets)
         # Trigger assets.sh to refresh device inventory using trigger file mechanism
         # A cron job running as lldpq user watches this file and runs assets.sh

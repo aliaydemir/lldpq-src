@@ -252,10 +252,15 @@ coverage, confidence, partial-result warnings, a time-bounded event timeline,
 correlations, and the checks performed by the agent.
 
 - **Analyze** performs an autonomous review of the previous 24 hours. A saved baseline is replaced only when collection is complete and current.
+- Chat runs as a background job with live progress lines and a **Stop** button; long multi-round investigations are no longer bound by the request timeout.
 - Suggested fixes open **Commands** prefilled for administrator review; Ask-AI never executes them automatically.
 - Console suggestions can open the interactive Console for the selected device.
+- `[AUDIT: <pack> <device|@role>]` runs a named read-only audit pack (`bgp`, `evpn`, `optical`, `mtu-path`, `pfc`, `hardware`) in one SSH session per device and prepends a deterministic verdict block to the evidence.
+- Analysis findings carry **NEW** / **ONGOING** / **RESOLVED** badges (plus worsened/reopened) tracked across runs; a device missing from the current collection is never marked resolved.
+- Known-benign findings can be acknowledged with `suppress: <device|*|@role> [CATEGORY] <regex> [ttl=7d] [because ...]` and removed with `unsuppress: <id or fragment>`. Suppressions expire on TTL and auto-reopen when the finding's severity worsens past the acknowledged level.
+- Recent fabric changes (24h git log of the Ansible directory plus running-config drift) are correlated into analysis and change-related chat questions.
 - Optional critical/error logs can be attached to the request.
-- Persistent site facts can be saved in **Memory**, including with `remember: ...` or `hatırla: ...`.
+- Persistent site facts can be saved in **Memory**, including with `remember: ...` or `hatırla: ...`; a fact can be removed with `forget: <fragment>`.
 - Chats can be exported for later review.
 - Supported providers include Ollama, Gemini, OpenAI, Claude/Anthropic, NVIDIA inference, and custom OpenAI-compatible endpoints. Provider settings include endpoint URL, API key, model, optional search model, and proxy.
 
@@ -267,7 +272,12 @@ correlations, and the checks performed by the agent.
 > request calls for web research.
 
 The hourly autonomous analyzer runs only when an AI provider and model are
-configured. AI memory, analyses, and snapshots are stored under
+configured. It is tiered: a cheap findings-only scan gates the full synthesis
+call (skipped entirely when the fabric is clean), and critical findings
+trigger a targeted per-device drill-down. The scan stage uses
+`AI_FALLBACK_MODEL` automatically when configured; single-model setups use
+the same `AI_MODEL` for the scan — savings come from skipping calls, not from
+requiring a second model. AI memory, analyses, and snapshots are stored under
 `/var/lib/lldpq/ai`; Docker deployments should persist the
 `lldpq-ai-state` volume.
 
@@ -276,7 +286,7 @@ not expose them):
 
 | Key | Purpose |
 |-----|---------|
-| `AI_FALLBACK_MODEL` | Secondary model tried automatically when the primary model call fails |
+| `AI_FALLBACK_MODEL` | Secondary model tried automatically when the primary model call fails; also preferred for the hourly scan stage when set |
 | `AI_CONTEXT_WINDOW_TOKENS` | Override the assumed context window (tokens) of the primary model |
 | `AI_FALLBACK_CONTEXT_WINDOW_TOKENS` | Same override for the fallback model |
 | `AI_SEARCH_URL` / `AI_SEARCH_KEY` | Separate endpoint and API key for the optional search model; they default to the main endpoint and its key when unset |

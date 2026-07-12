@@ -57,18 +57,30 @@ class AskAiApiContractTest(unittest.TestCase):
         self.assertTrue(search_requested("İnternette bu CVE'yi araştır"))
         self.assertFalse(search_requested("Why is BGP down?"))
         self.assertFalse(search_requested("Check BGP on leaf01"))
+        # A question that IMPLIES external research is now permitted even without
+        # an explicit "search the web" phrase.
+        self.assertTrue(search_requested("Is this a known issue in Cumulus 5.9?"))
+        self.assertTrue(search_requested("Any CVE or advisory for this optic?"))
+        self.assertTrue(search_requested("Bu bilinen bir sorun mu?"))
+        self.assertTrue(search_requested("When is the EOL date for this release?"))
 
-    def test_external_search_uses_redacted_operator_text_not_model_text(self):
-        ns = load_symbols("_public_search_query")
+    def test_external_search_forwards_scrubbed_operator_and_model_text(self):
+        ns = load_symbols("_public_search_query", "_scrub_public_query_text")
         ns["redact_secrets"] = lambda value: value
         query = ns["_public_search_query"](
             "Search the web for leaf01 at 10.20.30.40 with aa:bb:cc:dd:ee:ff",
             {"10.20.30.40": {"hostname": "leaf01"}},
+            # Model-authored query terms are now forwarded, but still scrubbed.
+            "leaf01 Cumulus 5.9 EVPN symmetric routing known issue",
         )
+        # Fabric identifiers never leave the boundary, from either source.
         self.assertNotIn("leaf01", query)
         self.assertNotIn("10.20.30.40", query)
         self.assertNotIn("aa:bb:cc:dd:ee:ff", query)
         self.assertIn("[fabric-device]", query)
+        # Model-authored product/version signal is forwarded.
+        self.assertIn("Cumulus 5.9", query)
+        self.assertIn("known issue", query)
 
     def test_observation_text_cannot_forge_boundaries_or_tools(self):
         ns = load_symbols(

@@ -15,6 +15,8 @@ import json
 import os
 import re
 import html
+import statistics
+import tempfile
 from datetime import datetime, timezone
 from collection_freshness import (
     is_current_collection,
@@ -255,8 +257,19 @@ def threshold_reference_rows():
             f"<td>&ge; {b}{unit} and &lt; {c}{unit}</td>"
             f"<td>&ge; {c}{unit}</td></tr>"
         )
+    # Fan speed is graded relative to each fan's own cohort (same fan type on
+    # the same device) because absolute RPM bands are meaningless across chassis
+    # and PSU fans and vary with inlet temperature.
+    critical_ratio, warning_ratio, good_ratio = FAN_COHORT_RATIO_THRESHOLDS
+    cr, wr, gr = (int(round(value * 100)) for value in (critical_ratio, warning_ratio, good_ratio))
+    rows.append(
+        "<tr><td>Fan Speed (vs. cohort baseline)</td>"
+        f"<td>&ge; {gr}% of peer median</td>"
+        f"<td>&ge; {wr}% and &lt; {gr}%</td>"
+        f"<td>&ge; {cr}% and &lt; {wr}%</td>"
+        f"<td>&lt; {cr}% of peer median, or stopped</td></tr>"
+    )
     for label, key, unit in (
-        ("Fan Speed", "fan_rpm", " RPM"),
         ("PSU Efficiency", "psu_efficiency_percent", "%"),
     ):
         critical_min, warning_min, excellent_min = HARDWARE_THRESHOLDS[key]
@@ -691,6 +704,121 @@ def grade_load_per_core(cpu_load, cpu_cores):
     return grade_high_is_bad(load_per_core, "load_per_core")
 
 
+# Absolute fan RPM thresholds cannot be trusted across platforms: chassis fans
+# idle far below PSU fans and both swing with inlet temperature, so a single
+# fleet-wide band both false-flags a cool chassis fan as CRITICAL and always
+# grades a fast PSU fan EXCELLENT even as it slows. Grade each fan against the
+# median of its own cohort (same fan type, same device); a fan that lags its
+# peers - or has stopped while peers spin - is the reliable fault signal. Values
+# are CRITICAL/WARNING/GOOD ratio boundaries relative to that cohort baseline.
+FAN_COHORT_RATIO_THRESHOLDS = (0.5, 0.7, 0.85)
+
+
+def _classify_fan(name):
+    """Return a coarse cohort key ('psu' or 'system') for a fan by its label."""
+    return "psu" if "psu" in str(name).lower() else "system"
+
+
+def grade_fans_relative(fans):
+    """Grade fans by deviation from their own cohort baseline.
+
+    Returns ``(overall_grade, per_fan_details)`` where ``per_fan_details`` is a
+    list of dicts (name/rpm/type/grade/baseline/ratio) that feeds the expandable
+    detail panel. ``overall_grade`` is the worst per-fan grade, or ``None`` when
+    no fan can be graded (the caller treats that as missing telemetry).
+    """
+    numeric_fans = []
+    for name, rpm in (fans or {}).items():
+        if isinstance(rpm, bool) or not isinstance(rpm, (int, float)):
+            continue
+        if rpm != rpm or abs(rpm) == float("inf"):
+            continue
+        numeric_fans.append((str(name), float(rpm)))
+
+    cohorts = {}
+    for name, rpm in numeric_fans:
+        if rpm > 0:
+            cohorts.setdefault(_classify_fan(name), []).append(rpm)
+    baselines = {
+        cohort: statistics.median(values)
+        for cohort, values in cohorts.items() if values
+    }
+    any_spinning = bool(baselines)
+
+    critical_ratio, warning_ratio, good_ratio = FAN_COHORT_RATIO_THRESHOLDS
+    details = []
+    grades = []
+    for name, rpm in numeric_fans:
+        cohort = _classify_fan(name)
+        baseline = baselines.get(cohort)
+        ratio = None
+        if rpm <= 0:
+            # A stopped fan only matters while other fans still spin; an
+            # all-zero reading is usually an empty slot, not a live failure.
+            grade = "CRITICAL" if any_spinning else None
+        elif baseline and baseline > 0:
+            ratio = rpm / baseline
+            if ratio < critical_ratio:
+                grade = "CRITICAL"
+            elif ratio < warning_ratio:
+                grade = "WARNING"
+            elif ratio < good_ratio:
+                grade = "GOOD"
+            else:
+                grade = "EXCELLENT"
+        else:
+            grade = None
+        details.append({
+            "name": name,
+            "rpm": int(rpm) if float(rpm).is_integer() else round(rpm, 1),
+            "type": cohort,
+            "grade": grade,
+            "baseline": (
+                int(baseline) if baseline and float(baseline).is_integer()
+                else (round(baseline, 1) if baseline else None)
+            ),
+            "ratio": round(ratio, 2) if ratio is not None else None,
+        })
+        if grade:
+            grades.append(grade)
+
+    overall = (
+        max(grades, key=lambda g: GRADE_PRIORITY.get(g, 0)) if grades else None
+    )
+    return overall, details
+
+
+def _atomic_write(path, content):
+    """Write ``content`` to ``path`` atomically (tempfile + fsync + replace).
+
+    A concurrent web reader or a mid-write crash then never observes a
+    truncated or empty analysis page.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o664)
+        os.replace(temporary_name, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
@@ -757,21 +885,13 @@ def calculate_device_health_grade(device_name, device_data):
     else:
         required_telemetry_missing = True
     
-    # Fan status grade
+    # Fan status grade (relative to each fan's own cohort baseline)
     fans = device_data.get("fans", {})
     if not fans:
         fans = parse_fans_from_hardware_file(device_name)
-    if fans:
-        fan_grades = [
-            grade_low_is_bad(fan_speed, "fan_rpm")
-            for fan_speed in fans.values()
-            if isinstance(fan_speed, (int, float))
-        ]
-        if fan_grades:
-            fan_status = max(fan_grades, key=lambda x: GRADE_PRIORITY.get(x, 0))
-            health_grades.append(fan_status)
-        else:
-            required_telemetry_missing = True
+    fan_status, _fan_details = grade_fans_relative(fans)
+    if fan_status:
+        health_grades.append(fan_status)
     else:
         required_telemetry_missing = True
     
@@ -891,7 +1011,61 @@ def generate_hardware_html():
         current_device_count < expected_devices or unknown_device_count > 0
     )
     coverage_status = "partial" if coverage_partial else "current"
-    
+
+    # Identify the specific hosts that were expected but did not report a
+    # current sample, so a partial run is never silently read as all-healthy.
+    collected_hosts = {
+        filename.removesuffix('_hardware.txt')
+        for filename in current_device_files
+    }
+    if collection_outcomes is not None:
+        all_expected_hosts = set(collection_outcomes.keys())
+    elif asset_statuses:
+        all_expected_hosts = set(asset_statuses.keys())
+    else:
+        all_expected_hosts = set(collected_hosts)
+    missing_hosts = sorted(all_expected_hosts - collected_hosts)
+
+    # Data age reflects the newest raw sample on disk, not the moment this
+    # report happens to be regenerated, so a stale collection reads as stale.
+    data_mtime = None
+    for filename in current_device_files:
+        try:
+            sample_mtime = os.path.getmtime(
+                os.path.join(hardware_data_dir, filename)
+            )
+        except OSError:
+            continue
+        data_mtime = (
+            sample_mtime if data_mtime is None else max(data_mtime, sample_mtime)
+        )
+    if data_mtime is not None:
+        last_updated = datetime.fromtimestamp(data_mtime).strftime(
+            '%Y-%m-%d %H:%M:%S'
+        )
+    else:
+        last_updated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    coverage_banner = ""
+    if coverage_partial:
+        parts = [
+            f"Partial collection: {current_device_count} of {expected_devices} "
+            "devices reported a current hardware sample."
+        ]
+        if missing_hosts:
+            shown = ", ".join(html.escape(host) for host in missing_hosts[:20])
+            if len(missing_hosts) > 20:
+                shown += f", +{len(missing_hosts) - 20} more"
+            parts.append(f"Not reporting: {shown}.")
+        if unknown_device_count:
+            parts.append(
+                f"{unknown_device_count} device(s) returned incomplete telemetry "
+                "(shown as Unknown)."
+            )
+        coverage_banner = (
+            '<div class="coverage-banner">' + " ".join(parts) + "</div>"
+        )
+
     # Generate dark theme HTML
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -953,6 +1127,24 @@ def generate_hardware_html():
         .status-dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 6px; vertical-align: middle; }}
         .status-dot.warning {{ background-color: #ff9800; }}
         .status-dot.critical {{ background-color: #f44336; }}
+        .coverage-banner {{ margin: 0 0 20px; padding: 10px 14px; background: #35270f; color: #ffb74d; border: 1px solid #6d511d; border-radius: 6px; font-size: 13px; }}
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; }}
+        .empty-row.stale td {{ color: #ffb74d; }}
+        .hardware-table tbody tr.hw-row {{ cursor: pointer; }}
+        .detail-row td {{ padding: 0; border: 1px solid #404040; }}
+        .detail-panel {{ padding: 14px 18px 18px; background: #202020; border-left: 3px solid #76b900; }}
+        .detail-title {{ color: #76b900; font-weight: 700; margin-bottom: 12px; font-size: 14px; }}
+        .detail-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }}
+        .detail-card {{ background: #292929; border: 1px solid #3a3a3a; border-radius: 4px; padding: 12px; }}
+        .detail-card h4 {{ color: #76b900; font-size: 12px; text-transform: uppercase; margin-bottom: 8px; }}
+        .kv {{ display: grid; grid-template-columns: 140px 1fr; gap: 8px; padding: 3px 0; border-bottom: 1px solid #333; font-size: 12px; }}
+        .kv span:first-child {{ color: #999; }}
+        .fan-list {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+        .fan-list th, .fan-list td {{ border: 1px solid #3a3a3a; padding: 4px 8px; text-align: left; }}
+        .fan-list th {{ background: #333; color: #76b900; }}
+        .g-excellent {{ color: #76b900; }} .g-good {{ color: #8bc34a; }}
+        .g-warning {{ color: #ff9800; }} .g-critical {{ color: #f44336; }}
+        .g-unknown {{ color: #9e9e9e; }}
         .btn {{ padding: 8px 14px; border: none; border-radius: 4px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 6px; }}
         .btn-primary {{ background: linear-gradient(0deg, #76b900 0%, #5a8c00 100%); color: white; }}
         .btn-primary:hover {{ background: linear-gradient(0deg, #8bd400 0%, #6ba000 100%); }}
@@ -990,7 +1182,7 @@ def generate_hardware_html():
     <div class="page-header">
         <div>
             <div class="page-title">Hardware Health Analysis</div>
-            <div class="last-updated">Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <div class="last-updated">Last Updated: {last_updated}</div>
         </div>
         <div class="action-buttons">
             <div class="device-search-container">
@@ -1011,7 +1203,7 @@ def generate_hardware_html():
             </button>
         </div>
     </div>
-    
+    {coverage_banner}
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
@@ -1079,7 +1271,11 @@ def generate_hardware_html():
     all_devices = (summary['critical_devices'] + summary['warning_devices'] +
                   summary['good_devices'] + summary['excellent_devices'] +
                   summary['unknown_devices'])
-    
+
+    # Per-device evidence for the expandable detail panel (already computed
+    # below); surfaced client-side instead of collecting anything new.
+    device_details = {}
+
     for device_info in all_devices:
         device_name = device_info['device']
         device_data = device_info['data']
@@ -1111,28 +1307,15 @@ def generate_hardware_html():
         psu_efficiency_parsed = parse_psu_efficiency_from_hardware_file(device_name)
         psu_efficiency = psu_efficiency_parsed if psu_efficiency_parsed is not None else 0.0
         
-        # Calculate fan status for display (use JSON fans or parse from file if missing)
+        # Calculate fan status for display (use JSON fans or parse from file if
+        # missing). Fans are graded relative to their own cohort baseline.
         fans = device_data.get("fans", {})
         if not fans:
             fans = parse_fans_from_hardware_file(device_name)
-        if fans:
-            fan_grades_calculated = [
-                grade_low_is_bad(fan_speed, "fan_rpm")
-                for fan_speed in fans.values()
-                if isinstance(fan_speed, (int, float))
-            ]
-            
-            # Get overall fan status (worst case from all fans)
-            fan_status = (
-                max(
-                    fan_grades_calculated,
-                    key=lambda x: GRADE_PRIORITY.get(x, 0),
-                )
-                if fan_grades_calculated else "N/A"
-            )
-        else:
+        fan_status, fan_details = grade_fans_relative(fans)
+        if fan_status is None:
             fan_status = "N/A"
-        
+
         # Badge class for health
         if health_grade == "EXCELLENT":
             health_badge_class = "badge badge-green"
@@ -1146,7 +1329,7 @@ def generate_hardware_html():
             health_badge_class = "badge badge-gray"
         
         # Badge class for fan
-        if fan_status == "HEALTHY" or fan_status == "EXCELLENT" or fan_status == "GOOD":
+        if fan_status == "EXCELLENT" or fan_status == "GOOD":
             fan_badge_class = "badge badge-green"
         elif fan_status == "WARNING":
             fan_badge_class = "badge badge-orange"
@@ -1227,15 +1410,40 @@ def generate_hardware_html():
         )
         memory_usage_str = (f"{memory_usage:.1f}%"
                             if isinstance(memory_usage, (int, float)) else "N/A")
-        cpu_load_str = (f"{cpu_load:.2f}"
-                        if isinstance(cpu_load, (int, float)) else "N/A")
+        # Display the raw 5-minute load alongside the per-core value that health
+        # is actually graded against, so the figure can be read directly against
+        # the per-core threshold reference instead of appearing falsely CRITICAL.
+        if isinstance(cpu_load, (int, float)):
+            if normalized_load is not None:
+                cpu_load_str = f"{cpu_load:.2f} ({normalized_load:.2f}/core)"
+            else:
+                cpu_load_str = f"{cpu_load:.2f}"
+        else:
+            cpu_load_str = "N/A"
         psu_efficiency_str = (
             f"{psu_efficiency:.1f}%"
             if psu_efficiency_parsed is not None else "N/A"
         )
-        
+
+        device_details[str(device_name)] = {
+            "device": str(canonical(device_name)),
+            "health": health_grade,
+            "cpu_temp": cpu_temp,
+            "asic_temp": asic_temp,
+            "memory": memory_usage if isinstance(memory_usage, (int, float)) else None,
+            "load_raw": cpu_load if isinstance(cpu_load, (int, float)) else None,
+            "load_per_core": round(normalized_load, 2) if normalized_load is not None else None,
+            "cores": cpu_cores if isinstance(cpu_cores, (int, float)) else None,
+            "psu_efficiency": (
+                round(psu_efficiency, 1) if psu_efficiency_parsed is not None else None
+            ),
+            "psu_in": round(psu_in_w, 1) if psu_in_w is not None else None,
+            "psu_out": round(psu_out_w, 1) if psu_out_w is not None else None,
+            "fans": fan_details,
+        }
+
         html_content += f"""
-                <tr data-device-key="{device_key}" data-status="{health_grade.lower()}">
+                <tr class="hw-row" data-device-key="{device_key}" data-status="{health_grade.lower()}" onclick="toggleHwDetails(this)">
                     <td>{device_label}</td>
                     <td><span class="{health_badge_class}">{health_grade.upper()}</span></td>
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
@@ -1248,8 +1456,26 @@ def generate_hardware_html():
                     <td>{device_model}</td>
                 </tr>
 """
-    
+
+    if not all_devices:
+        if coverage_status != "current" or current_device_count == 0:
+            empty_message = (
+                "No current hardware telemetry available - the collection may be "
+                "incomplete or unavailable."
+            )
+            empty_class = "empty-row stale"
+        else:
+            empty_message = "All monitored devices are healthy - nothing to flag."
+            empty_class = "empty-row"
+        html_content += (
+            f'                <tr class="{empty_class}"><td colspan="10">'
+            f'{empty_message}</td></tr>\n'
+        )
+
     threshold_rows = threshold_reference_rows()
+    hw_details_json = json.dumps(
+        device_details, separators=(",", ":"), ensure_ascii=True
+    ).replace("</", "<\\/")
     html_content += f"""
                 </tbody>
             </table>
@@ -1275,11 +1501,15 @@ def generate_hardware_html():
 
 """
     
+    html_content += f"""
+    <script>window.HW_DETAILS = {hw_details_json};</script>
+"""
+
     html_content += """
     <!-- jQuery and Select2 for device search -->
     <script src="/css/jquery-3.5.1.min.js"></script>
     <script src="/css/select2.min.js"></script>
-    
+
     <script>
         // Filter functionality
         let currentFilter = 'ALL';
@@ -1288,8 +1518,9 @@ def generate_hardware_html():
         let selectedDevice = '';
         
         document.addEventListener('DOMContentLoaded', function() {
-            // Store all table rows for filtering
-            allRows = Array.from(document.querySelectorAll('#hardware-data tr'));
+            // Store device rows for filtering (excludes dynamic detail rows and
+            // the empty-state placeholder).
+            allRows = Array.from(document.querySelectorAll('#hardware-data tr.hw-row'));
             
             // Add click events to summary cards
             setupCardEvents();
@@ -1301,7 +1532,96 @@ def generate_hardware_html():
             populateDeviceList();
             initDeviceSearch();
         });
-        
+
+        // ===== Expandable per-device detail panels =====
+        function hwEsc(v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, function(c) {
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
+        }
+
+        function removeDetailRows() {
+            document.querySelectorAll('#hardware-data tr.detail-row').forEach(function(r) {
+                r.remove();
+            });
+        }
+
+        function gradeClass(grade) {
+            switch (grade) {
+                case 'EXCELLENT': return 'g-excellent';
+                case 'GOOD': return 'g-good';
+                case 'WARNING': return 'g-warning';
+                case 'CRITICAL': return 'g-critical';
+                default: return 'g-unknown';
+            }
+        }
+
+        function fmtNum(value, suffix) {
+            if (value === null || value === undefined || value === '') return '—';
+            return hwEsc(value) + (suffix || '');
+        }
+
+        function buildDetailPanel(d) {
+            const rows = [
+                ['CPU Temperature', fmtNum(d.cpu_temp, '°C')],
+                ['ASIC Temperature', fmtNum(d.asic_temp, '°C')],
+                ['Memory Usage', fmtNum(d.memory, '%')],
+                ['CPU Load (raw)', fmtNum(d.load_raw)],
+                ['CPU Load (per core)', d.load_per_core === null || d.load_per_core === undefined
+                    ? '—' : hwEsc(d.load_per_core) + '/core' + (d.cores ? ' (' + hwEsc(d.cores) + ' cores)' : '')],
+                ['PSU Efficiency', fmtNum(d.psu_efficiency, '%')],
+                ['PSU Power In / Out', (d.psu_in === null || d.psu_in === undefined)
+                    ? '—' : hwEsc(d.psu_in) + 'W / ' + fmtNum(d.psu_out, 'W')],
+            ];
+            const sensorRows = rows.map(function(r) {
+                return '<div class="kv"><span>' + r[0] + '</span><span>' + r[1] + '</span></div>';
+            }).join('');
+
+            let fanCard = '<div class="detail-card"><h4>Fans</h4>';
+            const fans = d.fans || [];
+            if (fans.length) {
+                let body = '';
+                fans.forEach(function(f) {
+                    const grade = f.grade || 'UNKNOWN';
+                    const ratio = (f.ratio === null || f.ratio === undefined) ? '—' : f.ratio + '×';
+                    const baseline = (f.baseline === null || f.baseline === undefined) ? '—' : f.baseline;
+                    body += '<tr><td>' + hwEsc(f.name) + '</td><td>' + hwEsc(f.rpm)
+                        + ' RPM</td><td>' + hwEsc(f.type) + '</td><td>' + hwEsc(baseline)
+                        + '</td><td>' + hwEsc(ratio) + '</td><td class="' + gradeClass(grade)
+                        + '">' + hwEsc(grade) + '</td></tr>';
+                });
+                fanCard += '<table class="fan-list"><thead><tr><th>Fan</th><th>RPM</th>'
+                    + '<th>Cohort</th><th>Baseline</th><th>vs&nbsp;peers</th><th>Grade</th></tr></thead>'
+                    + '<tbody>' + body + '</tbody></table>';
+            } else {
+                fanCard += '<div class="kv"><span>Status</span><span>No fan telemetry</span></div>';
+            }
+            fanCard += '</div>';
+
+            return '<td colspan="10"><div class="detail-panel">'
+                + '<div class="detail-title">' + hwEsc(d.device) + ' — ' + hwEsc(d.health) + '</div>'
+                + '<div class="detail-grid">'
+                + '<div class="detail-card"><h4>Sensors &amp; Resources</h4>' + sensorRows + '</div>'
+                + fanCard
+                + '</div></div></td>';
+        }
+
+        function toggleHwDetails(row) {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('detail-row')) {
+                next.remove();
+                return;
+            }
+            removeDetailRows();
+            const key = row.dataset.deviceKey;
+            const details = (window.HW_DETAILS || {})[key];
+            if (!details) return;
+            const detail = document.createElement('tr');
+            detail.className = 'detail-row';
+            detail.innerHTML = buildDetailPanel(details);
+            row.after(detail);
+        }
+
         function setupCardEvents() {
             console.log('Hardware: Setting up card events...');
             
@@ -1347,7 +1667,8 @@ def generate_hardware_html():
         
         function filterDevices(filterType) {
             currentFilter = filterType;
-            
+            removeDetailRows();
+
             // Clear device search when using card filters
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -1406,6 +1727,7 @@ def generate_hardware_html():
         
         function clearFilter() {
             currentFilter = 'ALL';
+            removeDetailRows();
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
             });
@@ -1471,7 +1793,8 @@ def generate_hardware_html():
         
         function filterByDevice(deviceName) {
             if (!deviceName) return;
-            
+            removeDetailRows();
+
             selectedDevice = deviceName;
             deviceSearchActive = true;
             
@@ -1500,6 +1823,7 @@ def generate_hardware_html():
         function clearDeviceSearch() {
             selectedDevice = '';
             deviceSearchActive = false;
+            removeDetailRows();
             $('#deviceSearch').val('').trigger('change');
             document.getElementById('clearSearchBtn').style.display = 'none';
             document.getElementById('filter-info').style.display = 'none';
@@ -1537,8 +1861,10 @@ def generate_hardware_html():
         function sortHardwareTable(columnIndex, direction, type) {
             const table = document.getElementById('hardware-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows);
-            
+            // Collapse any open detail rows so they never sort as data.
+            removeDetailRows();
+            const rows = Array.from(tbody.querySelectorAll('tr.hw-row'));
+
             rows.sort((a, b) => {
                 let aVal = a.cells[columnIndex].textContent.trim();
                 let bVal = b.cells[columnIndex].textContent.trim();
@@ -1579,9 +1905,9 @@ def generate_hardware_html():
                 
                 return direction === 'desc' ? -result : result;
             });
-            
-            // Clear tbody and add sorted rows back
-            tbody.innerHTML = '';
+
+            // Re-append sorted rows (keeps any empty-state placeholder intact).
+            if (!rows.length) return;
             rows.forEach(row => tbody.appendChild(row));
         }
         
@@ -1706,14 +2032,16 @@ def generate_hardware_html():
                     'Model'
                 ];
                 
-                let csvContent = headers.join(',') + '\\n';
-                
-                // Get table data (only visible rows)
+                // Get table data (data rows only; detail/empty rows are skipped)
                 const table = document.getElementById('hardware-table');
                 const tbody = table.querySelector('tbody');
-                const rows = tbody.querySelectorAll('tr');
-                
-                // Add summary stats as comments
+                const rows = tbody.querySelectorAll('tr.hw-row');
+                const visibleCount = Array.from(rows).filter(r => r.style.display !== 'none').length;
+                const filtered = visibleCount !== rows.length;
+
+                // Comment header first so parsers that honor a leading '#' never
+                // mistake a summary line for the column header row.
+                let csvContent = '';
                 csvContent += `# Hardware Health Summary Report\\n`;
                 csvContent += `# Generated: ${now.toLocaleString()}\\n`;
                 csvContent += `# Total Devices: ${document.getElementById('total-devices').textContent}\\n`;
@@ -1722,8 +2050,12 @@ def generate_hardware_html():
                 csvContent += `# Warning: ${document.getElementById('warning-devices').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-devices').textContent}\\n`;
                 csvContent += `# Unknown: ${document.getElementById('unknown-devices').textContent}\\n`;
+                csvContent += `# Rows exported: ${visibleCount} of ${rows.length}${filtered ? ' (a filter is active)' : ''}\\n`;
                 csvContent += `#\\n`;
-                
+
+                // Column header follows the comment block.
+                csvContent += headers.join(',') + '\\n';
+
                 // Process each visible row
                 rows.forEach(row => {
                     if (row.style.display !== 'none') {
@@ -1822,9 +2154,9 @@ def generate_hardware_html():
 </body>
 </html>"""
     
-    # Write HTML file
-    with open("monitor-results/hardware-analysis.html", 'w') as f:
-        f.write(html_content)
+    # Write HTML file atomically so a concurrent web reader or a crash mid-write
+    # never observes a truncated or empty analysis page.
+    _atomic_write("monitor-results/hardware-analysis.html", html_content)
     
     print(f"Hardware analysis HTML generated with {total_devices} devices!")
     print(f"   - Excellent: {len(summary['excellent_devices'])}")

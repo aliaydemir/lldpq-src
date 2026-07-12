@@ -31,6 +31,18 @@ except Exception:
     def canonical(_n):
         return _n
 
+def _short_window_cell(value: int) -> str:
+    """Render a short-window (30s/1m/5m) flap count.
+
+    At the multi-minute monitor cadence the whole poll interval is longer than
+    these windows, so calculate_flapping_rate can never attribute an event to
+    them -- a literal 0 there means "not measurable at this cadence", not "no
+    recent flapping". Render an em-dash for that unmeasurable zero so operators
+    do not read it as a positive all-clear; a genuine non-zero (fast cadence)
+    still shows the real count."""
+    return str(value) if value else "&mdash;"
+
+
 class FlapStatus(Enum):
     """flap status"""
     OK = "ok"
@@ -155,6 +167,18 @@ class LinkFlapAnalyzer:
                     self.carrier_transitions_lookback[port] = collections.deque(lookback, maxlen=100)
                 self.prev_cumulative = dict(data.get("prev_cumulative", {}))
                 self.prev_sample_time = dict(data.get("prev_sample_time", {}))
+                # Restore the per-port cumulative counter. Every report surface
+                # (total_ports, table, summary, anomalies) is keyed off it, so a
+                # port that fails collection this cycle -- exactly what a hard
+                # flap does -- must keep its last-known value and its persisted
+                # flapping_hist rather than silently vanishing from the report.
+                saved_stats = data.get("carrier_transitions_stats")
+                if isinstance(saved_stats, dict):
+                    for port, value in saved_stats.items():
+                        try:
+                            self.carrier_transitions_stats[port] = int(value)
+                        except (TypeError, ValueError):
+                            continue
                 saved_coverage = data.get("collection_coverage")
                 if isinstance(saved_coverage, dict):
                     self.collection_coverage.update(saved_coverage)
@@ -173,6 +197,7 @@ class LinkFlapAnalyzer:
                 "carrier_transitions_lookback": {port: list(deq) for port, deq in self.carrier_transitions_lookback.items()},
                 "prev_cumulative": self.prev_cumulative,
                 "prev_sample_time": self.prev_sample_time,
+                "carrier_transitions_stats": self.carrier_transitions_stats,
                 "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
             }
@@ -221,6 +246,50 @@ class LinkFlapAnalyzer:
                 except FileNotFoundError:
                     pass
     
+    @staticmethod
+    def _atomic_text_write(path: str, content: str) -> None:
+        """Write the HTML report durably so a concurrent web reader (or a
+        mid-write kill) never sees a truncated or empty Analysis page."""
+        target = os.path.abspath(path)
+        directory = os.path.dirname(target)
+        os.makedirs(directory, exist_ok=True)
+        metadata = None
+        if os.path.lexists(target):
+            if os.path.islink(target) or not stat.S_ISREG(os.lstat(target).st_mode):
+                raise OSError(f"unsafe flap report target: {target}")
+            metadata = os.stat(target, follow_symlinks=False)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=directory
+        )
+        try:
+            mode = stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o664
+            os.fchmod(descriptor, mode)
+            if metadata is not None:
+                try:
+                    os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+                except PermissionError:
+                    pass
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            temporary = ""
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
     def update_carrier_transitions(self, port_name: str, current_transitions: int):
         """Update carrier transition count for a port, and record any NEW flaps since the previous
         cycle.
@@ -470,7 +539,33 @@ class LinkFlapAnalyzer:
             coverage_status = "partial"
         else:
             coverage_status = "current"
-        
+
+        # Visible stale/partial-coverage banner so a broken or partial
+        # collection cannot read as a fully-healthy fabric.
+        coverage_banner = ""
+        if coverage_status != "current":
+            unavailable_devices = coverage.get("unavailable_devices") or []
+            if coverage_status == "unavailable":
+                banner_msg = (
+                    "Collection unavailable: no current carrier-transition data was "
+                    "collected this cycle. The counts below are the last known values "
+                    "and may be stale."
+                )
+            else:
+                banner_msg = (
+                    f"Partial collection: {current_devices} of {expected_devices} "
+                    "expected devices reported this cycle."
+                )
+                if unavailable_devices:
+                    shown = ", ".join(
+                        html.escape(str(d)) for d in unavailable_devices[:20]
+                    )
+                    extra = len(unavailable_devices) - 20
+                    if extra > 0:
+                        shown += f" (+{extra} more)"
+                    banner_msg += f" Missing: {shown}."
+            coverage_banner = f'<div class="coverage-banner">{banner_msg}</div>'
+
         html_content = f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -581,6 +676,17 @@ class LinkFlapAnalyzer:
             opacity: 1;
             visibility: visible;
         }}
+        .coverage-banner {{ margin: 0 0 16px; padding: 10px 14px; background: #35270f; color: #ffb74d; border: 1px solid #6d511d; border-radius: 6px; font-size: 13px; }}
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; }}
+        .flap-table tbody tr.flap-row {{ cursor: pointer; }}
+        .detail-row td {{ padding: 0; border: 1px solid #404040; }}
+        .detail-panel {{ padding: 14px 20px 18px; background: #202020; border-left: 3px solid #ff9800; }}
+        .detail-title {{ color: #ffb300; font-weight: 700; margin-bottom: 10px; font-size: 13px; }}
+        .detail-note {{ margin: 0 0 10px; padding: 10px 12px; background: #362b10; border: 1px solid #8b6700; color: #ffc107; border-radius: 4px; font-size: 12px; }}
+        .event-table {{ width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }}
+        .event-table th, .event-table td {{ border: 1px solid #3a3a3a; padding: 6px 8px; text-align: left; }}
+        .event-table th {{ background: #2a2a2a; color: #9ccc65; font-weight: 600; }}
+        .event-empty {{ color: #888; font-size: 12px; padding: 4px 0; }}
     </style>
 </head>
 <body>
@@ -613,7 +719,7 @@ class LinkFlapAnalyzer:
             </button>
         </div>
     </div>
-    
+    {coverage_banner}
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
@@ -685,7 +791,45 @@ class LinkFlapAnalyzer:
                 'total_transitions': self.carrier_transitions_stats.get(port_name, 0)
             }
             all_ports.append(port_info)
-        
+
+        # Per-row detail evidence (recent flap timeline) surfaced through an
+        # expandable panel, mirroring the EVPN-MH gold standard. This reuses the
+        # already-persisted flapping_hist events rather than collecting anything
+        # new. Each event is (time, cumulative, count[, interval_start, seconds]).
+        flap_details = {}
+        for port_name in self._port_cache.keys():
+            events = []
+            for event in reversed(self.flapping_hist.get(port_name, [])):
+                if len(event) < 3:
+                    continue
+                try:
+                    event_time = float(event[0])
+                    event_count = int(event[2])
+                    event_cumulative = int(event[1])
+                except (TypeError, ValueError):
+                    continue
+                event_seconds = None
+                if len(event) >= 5:
+                    try:
+                        event_seconds = round(float(event[4]))
+                    except (TypeError, ValueError):
+                        event_seconds = None
+                events.append({
+                    "t": round(event_time),
+                    "n": event_count,
+                    "cum": event_cumulative,
+                    "dur": event_seconds,
+                })
+                if len(events) >= 25:
+                    break
+            flap_details[port_name] = {
+                "status": self._port_cache[port_name]['status'].value,
+                "events": events,
+            }
+        details_json = json.dumps(
+            flap_details, separators=(",", ":"), ensure_ascii=True
+        ).replace("</", "<\\/")
+
         # Interface flapping table (sorted by problems first, like BGP)
         html_content += f"""
     <div class="dashboard-section">
@@ -704,9 +848,9 @@ class LinkFlapAnalyzer:
                     <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
                     <th class="sortable" data-column="1" data-type="port">Interface <span class="sort-arrow">▲▼</span></th>
                     <th class="sortable" data-column="2" data-type="flap-status">Status <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="3" data-type="number">30s <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="4" data-type="number">1m <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="5" data-type="number">5m <span class="sort-arrow">▲▼</span></th>
+                    <th class="sortable" data-column="3" data-type="number">30s <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
+                    <th class="sortable" data-column="4" data-type="number">1m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
+                    <th class="sortable" data-column="5" data-type="number">5m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
                     <th class="sortable" data-column="6" data-type="number">1h <span class="sort-arrow">▲▼</span></th>
                     <th class="sortable" data-column="7" data-type="number">12h <span class="sort-arrow">▲▼</span></th>
                     <th class="sortable" data-column="8" data-type="number">24h <span class="sort-arrow">▲▼</span></th>
@@ -737,37 +881,61 @@ class LinkFlapAnalyzer:
             
             # The cumulative counter can be large on a healthy old device; its
             # colour follows the current threshold grade, not lifetime total.
+            # Reuse the existing .flap-* palette (transition-* were never defined
+            # in the <style> block and rendered as inert grey text).
             if status_val == "critical":
-                transition_class = "transition-critical"
+                transition_class = "flap-critical"
             elif status_val == "warning":
-                transition_class = "transition-warning"
+                transition_class = "flap-warning"
             else:
-                transition_class = "transition-good"
+                transition_class = "flap-excellent"
 
             dashboard_status = "ok" if status_val == "ok" else "problematic"
             device_key = html.escape(str(port['device']), quote=True)
+            port_key = html.escape(f"{port['device']}:{port['interface']}", quote=True)
             table_rows.append(f"""
-        <tr data-device-key="{device_key}" data-status="{dashboard_status}" data-flap-status="{status_val}">
+        <tr class="flap-row" data-device-key="{device_key}" data-status="{dashboard_status}" data-flap-status="{status_val}" data-port-key="{port_key}" onclick="toggleFlapDetails(this)">
             <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
             <td><span class="{badge_class}">{status_val.upper()}</span></td>
-            <td>{counters['flap_30_sec']}</td>
-            <td>{counters['flap_1_min']}</td>
-            <td>{counters['flap_5_min']}</td>
-            <td>{counters['flap_1_hr']}</td>
-            <td>{counters['flap_12_hrs']}</td>
-            <td>{counters['flap_24_hrs']}</td>
-            <td><span class="{transition_class}">{port['total_transitions']}</span></td>
+            <td data-value="{counters['flap_30_sec']}">{_short_window_cell(counters['flap_30_sec'])}</td>
+            <td data-value="{counters['flap_1_min']}">{_short_window_cell(counters['flap_1_min'])}</td>
+            <td data-value="{counters['flap_5_min']}">{_short_window_cell(counters['flap_5_min'])}</td>
+            <td data-value="{counters['flap_1_hr']}">{counters['flap_1_hr']}</td>
+            <td data-value="{counters['flap_12_hrs']}">{counters['flap_12_hrs']}</td>
+            <td data-value="{counters['flap_24_hrs']}">{counters['flap_24_hrs']}</td>
+            <td data-value="{port['total_transitions']}"><span class="{transition_class}">{port['total_transitions']}</span></td>
         </tr>""")
         
+        # Empty-state placeholder that distinguishes healthy-empty from a
+        # broken/partial collection, instead of bare headers over a blank body.
+        if not table_rows:
+            if coverage_status == "unavailable":
+                empty_message = (
+                    "No current carrier-transition data was collected. Device "
+                    "collection appears unavailable this cycle."
+                )
+            elif coverage_status == "partial":
+                empty_message = (
+                    "No link flapping among the devices that reported. Some "
+                    "expected devices did not report this cycle."
+                )
+            else:
+                empty_message = (
+                    "No link flapping detected. All monitored interfaces are stable."
+                )
+            table_rows.append(
+                f'<tr class="empty-row"><td colspan="10">{empty_message}</td></tr>'
+            )
+
         html_content += ''.join(table_rows)
-        
+
         html_content += """
                 </tbody>
             </table>
         </div>
     </div>
-    
+
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
@@ -795,14 +963,93 @@ class LinkFlapAnalyzer:
     
     <script>
         // Filter functionality
+        const FLAP_DETAILS = __FLAP_DETAILS_JSON__;
         let currentFilter = 'ALL';
         let allRows = [];
         let deviceSearchActive = false;
         let selectedDevice = '';
-        
+
+        function removeFlapDetailRows() {
+            document.querySelectorAll('#flap-data tr.detail-row').forEach(function(r) {
+                r.remove();
+            });
+        }
+
+        function escapeFlapHtml(value) {
+            return String(value == null ? '' : value).replace(/[&<>"']/g, function(c) {
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
+        }
+
+        function formatFlapAge(seconds) {
+            seconds = Math.max(0, Math.round(seconds));
+            if (seconds < 60) return seconds + 's ago';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return minutes + 'm ago';
+            const hours = Math.floor(minutes / 60);
+            if (hours < 24) return hours + 'h ' + (minutes % 60) + 'm ago';
+            const days = Math.floor(hours / 24);
+            return days + 'd ' + (hours % 24) + 'h ago';
+        }
+
+        function flapRemediation(status) {
+            if (status === 'critical') {
+                return 'Critical: inspect physical cabling, optics/DAC seating and hardware health; consider isolating the link.';
+            }
+            if (status === 'warning') {
+                return 'Warning: monitor closely and investigate if the flapping pattern continues.';
+            }
+            return 'Stable: no action required. Recent transitions (if any) are within threshold.';
+        }
+
+        function toggleFlapDetails(row) {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('detail-row')) { next.remove(); return; }
+            removeFlapDetailRows();
+            const key = row.dataset.portKey || '';
+            const info = FLAP_DETAILS[key] || {};
+            const events = info.events || [];
+            const parts = row.dataset.portKey ? row.dataset.portKey.split(':') : [];
+            const device = parts.length ? parts[0] : (row.cells[0] ? row.cells[0].textContent.trim() : '');
+            const iface = parts.length > 1 ? parts.slice(1).join(':') : '';
+            let body;
+            if (events.length) {
+                const nowMs = Date.now() / 1000;
+                let rowsHtml = '';
+                events.forEach(function(ev) {
+                    const age = formatFlapAge(nowMs - ev.t);
+                    const window = (ev.dur == null) ? '—' : formatFlapDuration(ev.dur);
+                    rowsHtml += '<tr><td>' + escapeFlapHtml(age) + '</td><td>' + escapeFlapHtml(ev.n)
+                        + '</td><td>' + escapeFlapHtml(ev.cum) + '</td><td>' + escapeFlapHtml(window) + '</td></tr>';
+                });
+                body = '<table class="event-table"><thead><tr><th>Observed</th><th>Flaps</th>'
+                    + '<th>Cumulative</th><th>Sample Window</th></tr></thead><tbody>' + rowsHtml + '</tbody></table>';
+            } else {
+                body = '<div class="event-empty">No carrier-transition events recorded in the last 24 hours.</div>';
+            }
+            const detail = document.createElement('tr');
+            detail.className = 'detail-row';
+            detail.innerHTML = '<td colspan="10"><div class="detail-panel">'
+                + '<div class="detail-title">' + escapeFlapHtml(device)
+                + (iface ? ' &middot; ' + escapeFlapHtml(iface) : '') + '</div>'
+                + '<div class="detail-note">' + escapeFlapHtml(flapRemediation(info.status || row.dataset.flapStatus)) + '</div>'
+                + body + '</div></td>';
+            row.after(detail);
+        }
+
+        function formatFlapDuration(seconds) {
+            seconds = Math.max(0, Math.round(seconds));
+            if (seconds < 60) return seconds + 's';
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return minutes + 'm ' + (seconds % 60) + 's';
+            const hours = Math.floor(minutes / 60);
+            return hours + 'h ' + (minutes % 60) + 'm';
+        }
+
         document.addEventListener('DOMContentLoaded', function() {
-            // Store all table rows for filtering
-            allRows = Array.from(document.querySelectorAll('#flap-data tr'));
+            // Store all data table rows for filtering (exclude the empty-state
+            // placeholder and any dynamically-added detail rows).
+            allRows = Array.from(document.querySelectorAll('#flap-data tr.flap-row'));
             
             // Add click events to summary cards
             setupCardEvents();
@@ -854,7 +1101,8 @@ class LinkFlapAnalyzer:
         
         function filterPorts(filterType) {
             currentFilter = filterType;
-            
+            removeFlapDetailRows();
+
             // Clear device search when using card filters
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -901,6 +1149,7 @@ class LinkFlapAnalyzer:
         
         function clearFilter() {
             currentFilter = 'ALL';
+            removeFlapDetailRows();
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
             });
@@ -975,7 +1224,8 @@ class LinkFlapAnalyzer:
         
         function filterByDevice(deviceName) {
             if (!deviceName) return;
-            
+            removeFlapDetailRows();
+
             selectedDevice = deviceName;
             deviceSearchActive = true;
             
@@ -1004,6 +1254,7 @@ class LinkFlapAnalyzer:
         function clearDeviceSearch() {
             selectedDevice = '';
             deviceSearchActive = false;
+            removeFlapDetailRows();
             $('#deviceSearch').val('').trigger('change');
             document.getElementById('clearSearchBtn').style.display = 'none';
             document.getElementById('filter-info').style.display = 'none';
@@ -1041,23 +1292,28 @@ class LinkFlapAnalyzer:
         function sortFlapTable(columnIndex, direction, type) {
             const table = document.getElementById('flap-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows);
-            
+            // Detail rows are transient evidence panels; drop them so they never
+            // get folded into the sort or separated from their parent row.
+            removeFlapDetailRows();
+            const rows = Array.from(tbody.querySelectorAll('tr.flap-row'));
+
             rows.sort((a, b) => {
                 let aVal = a.cells[columnIndex].textContent.trim();
                 let bVal = b.cells[columnIndex].textContent.trim();
-                
+
                 // Extract actual text for status columns (remove HTML)
                 if (type === 'flap-status') {
                     aVal = a.cells[columnIndex].querySelector('span')?.textContent || aVal;
                     bVal = b.cells[columnIndex].querySelector('span')?.textContent || bVal;
                 }
-                
+
                 let result = 0;
-                
+
                 switch(type) {
                     case 'number':
-                        result = parseInt(aVal) - parseInt(bVal);
+                        // Sort on the numeric data-value (em-dash cells expose 0)
+                        // instead of scraping the rendered "—" glyph.
+                        result = flapCellNumber(a, columnIndex) - flapCellNumber(b, columnIndex);
                         break;
                     case 'port':
                         result = comparePort(aVal, bVal);
@@ -1070,13 +1326,20 @@ class LinkFlapAnalyzer:
                         result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
                         break;
                 }
-                
+
                 return direction === 'desc' ? -result : result;
             });
-            
-            // Clear tbody and add sorted rows back
-            tbody.innerHTML = '';
+
+            // Re-append only the sorted data rows (detail rows already removed).
             rows.forEach(row => tbody.appendChild(row));
+        }
+
+        function flapCellNumber(row, columnIndex) {
+            const cell = row.cells[columnIndex];
+            if (!cell) return 0;
+            const raw = cell.dataset.value != null ? cell.dataset.value : cell.textContent;
+            const value = parseFloat(raw);
+            return Number.isFinite(value) ? value : 0;
         }
         
         function comparePort(a, b) {
@@ -1213,14 +1476,43 @@ class LinkFlapAnalyzer:
                     'Total'
                 ];
                 
-                let csvContent = headers.join(',') + '\\n';
-                
-                // Get table data (only visible rows)
+                // Get table data (only visible data rows)
                 const table = document.getElementById('flap-table');
                 const tbody = table.querySelector('tbody');
-                const rows = tbody.querySelectorAll('tr');
-                
-                // Add summary stats as comments
+                const rows = tbody.querySelectorAll('tr.flap-row');
+
+                // Collect the visible data rows first so the summary comment can
+                // annotate exactly how many rows the export contains.
+                const dataLines = [];
+                rows.forEach(row => {
+                    if (row.style.display === 'none') return;
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length < 10) return;
+                    const rowData = [
+                        cells[0].textContent.trim(), // Device
+                        cells[1].textContent.trim(), // Port
+                        cells[2].querySelector('span') ? cells[2].querySelector('span').textContent.trim() : cells[2].textContent.trim(), // Status
+                        cells[3].dataset.value != null ? cells[3].dataset.value : cells[3].textContent.trim(), // 30 sec
+                        cells[4].dataset.value != null ? cells[4].dataset.value : cells[4].textContent.trim(), // 1 min
+                        cells[5].dataset.value != null ? cells[5].dataset.value : cells[5].textContent.trim(), // 5 min
+                        cells[6].textContent.trim(), // 1 hour
+                        cells[7].textContent.trim(), // 12 hours
+                        cells[8].textContent.trim(), // 24 hours
+                        cells[9].textContent.trim()  // Total
+                    ];
+                    // Escape commas and quotes in data
+                    const escapedData = rowData.map(field => {
+                        if (field.includes(',') || field.includes('"') || field.includes('\\n')) {
+                            return '"' + field.replace(/"/g, '""') + '"';
+                        }
+                        return field;
+                    });
+                    dataLines.push(escapedData.join(','));
+                });
+
+                // Comment header FIRST (before the column header) so spreadsheet
+                // parsers that ignore leading '#' lines still see a clean header.
+                let csvContent = '';
                 csvContent += `# Link Flap Analysis Summary Report\\n`;
                 csvContent += `# Generated: ${now.toLocaleString()}\\n`;
                 csvContent += `# Total Devices: ${document.getElementById('total-devices').textContent}\\n`;
@@ -1228,39 +1520,11 @@ class LinkFlapAnalyzer:
                 csvContent += `# Stable Ports: ${document.getElementById('stable-ports').textContent}\\n`;
                 csvContent += `# Problematic Ports: ${document.getElementById('problematic-ports').textContent}\\n`;
                 csvContent += `# Stability Ratio: ${document.getElementById('stability-ratio').textContent}\\n`;
+                csvContent += `# Rows Exported: ${dataLines.length}${dataLines.length !== allRows.length ? ' (filtered view)' : ''}\\n`;
                 csvContent += `#\\n`;
-                
-                // Process each visible row
-                rows.forEach(row => {
-                    if (row.style.display !== 'none') {
-                        const cells = row.querySelectorAll('td');
-                        if (cells.length >= 10) {
-                            const rowData = [
-                                cells[0].textContent.trim(), // Device
-                                cells[1].textContent.trim(), // Port
-                                cells[2].querySelector('span') ? cells[2].querySelector('span').textContent.trim() : cells[2].textContent.trim(), // Status
-                                cells[3].textContent.trim(), // 30 sec
-                                cells[4].textContent.trim(), // 1 min
-                                cells[5].textContent.trim(), // 5 min
-                                cells[6].textContent.trim(), // 1 hour
-                                cells[7].textContent.trim(), // 12 hours
-                                cells[8].textContent.trim(), // 24 hours
-                                cells[9].textContent.trim()  // Total
-                            ];
-                            
-                            // Escape commas and quotes in data
-                            const escapedData = rowData.map(field => {
-                                if (field.includes(',') || field.includes('"') || field.includes('\\n')) {
-                                    return '"' + field.replace(/"/g, '""') + '"';
-                                }
-                                return field;
-                            });
-                            
-                            csvContent += escapedData.join(',') + '\\n';
-                        }
-                    }
-                });
-                
+                csvContent += headers.join(',') + '\\n';
+                csvContent += dataLines.length ? dataLines.join('\\n') + '\\n' : '';
+
                 // Create and trigger download
                 const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
                 const link = document.createElement('a');
@@ -1334,10 +1598,12 @@ class LinkFlapAnalyzer:
         ).replace(
             "__FLAP_CRITICAL_THRESHOLD__",
             f'{self.thresholds["critical_flaps_per_hour"]}+ flaps/hour',
+        ).replace(
+            "__FLAP_DETAILS_JSON__",
+            details_json,
         )
         
-        with open(output_file, "w") as f:
-            f.write(html_content)
+        self._atomic_text_write(output_file, html_content)
 
 if __name__ == "__main__":
     analyzer = LinkFlapAnalyzer()

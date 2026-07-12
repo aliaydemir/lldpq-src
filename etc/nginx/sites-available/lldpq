@@ -341,6 +341,22 @@ server {
             client_max_body_size 2048m;
         }
 
+        # Inventory / Bootstrap API endpoint (P2P + IPAM design upload + artifact generation)
+        location = /inventory-api.sh {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/inventory-api.sh;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+            fastcgi_param CONTENT_TYPE $content_type;
+            fastcgi_param CONTENT_LENGTH $content_length;
+            fastcgi_param HTTP_COOKIE $http_cookie;
+
+            # Timeout for xlsx parsing + artifact generation
+            fastcgi_read_timeout 120;
+            # Allow uploading design workbooks (xlsx/xlsm)
+            client_max_body_size 128m;
+        }
+
         # Authenticated read-only switch lifecycle/tracking endpoint
         location = /tracking-api.sh {
             fastcgi_pass unix:/var/run/fcgiwrap.socket;

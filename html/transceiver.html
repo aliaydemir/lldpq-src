@@ -215,6 +215,41 @@
 
         .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.5; }
         .sort-arrow.active { opacity: 1; color: #76b900; }
+
+        .coverage-banner {
+            margin: 0 0 18px;
+            padding: 10px 14px;
+            border-radius: 6px;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .coverage-banner.hidden { display: none; }
+        .coverage-banner.warn { background: #35270f; color: #ffb74d; border: 1px solid #6d511d; }
+        .coverage-banner.info { background: #10222e; color: #4fc3f7; border: 1px solid #244a5c; }
+        .coverage-banner .cov-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .data-table tr.module-row { cursor: pointer; }
+        .detail-row td { padding: 0; border-bottom: 1px solid #404040; }
+        .detail-panel { padding: 14px 18px; background: #202020; border-left: 3px solid #4fc3f7; }
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 8px 24px;
+        }
+        .detail-kv { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px solid #2d2d2d; }
+        .detail-kv .k { color: #888; min-width: 130px; }
+        .detail-kv .v { color: #d4d4d4; word-break: break-all; }
+        .detail-kv .v.mono { font-family: monospace; font-size: 12px; }
     </style>
 </head>
 <body>
@@ -243,6 +278,8 @@
             </button>
         </div>
     </div>
+
+    <div id="coverage-banner" class="coverage-banner hidden"></div>
 
     <div class="summary-grid">
         <div class="summary-card card-total">
@@ -288,8 +325,9 @@
                 <option value="">All Versions</option>
             </select>
         </div>
-        <div class="filter-group" style="display:none;">
-            <input type="hidden" id="filter-search" value="">
+        <div class="filter-group">
+            <label>Search</label>
+            <input type="text" id="filter-search" value="" placeholder="vendor, serial, port..." oninput="renderTable()">
         </div>
     </div>
 
@@ -321,6 +359,24 @@
     let sortAsc = true;
     let mixedFwModels = [];
     let fwByModel = {};
+    let currentFiltered = [];
+
+    // Data older than this is flagged as stale in the coverage banner.
+    const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+    function esc(v) {
+        return String(v == null ? '' : v).replace(/[&<>"']/g, c => (
+            {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+        ));
+    }
+
+    // Sort key for interface names so breakout subports order correctly:
+    // swp1 < swp1s0 < swp1s1 < swp2 < swp10. Non-swp names sort last, by name.
+    function portSortKey(port) {
+        const m = /^swp(\d+)(?:s(\d+))?/i.exec(port || '');
+        if (!m) return [Number.MAX_SAFE_INTEGER, 0, (port || '').toLowerCase()];
+        return [parseInt(m[1], 10), m[2] != null ? parseInt(m[2], 10) : -1, ''];
+    }
 
     document.addEventListener('DOMContentLoaded', loadData);
 
@@ -339,12 +395,73 @@
                 : '';
 
             updateSummary();
+            renderBanner(data.last_update);
             populateFilters();
             renderTable();
         } catch (e) {
+            showBanner('warn', 'Collection unavailable — could not load the transceiver inventory. '
+                + 'The data shown may be missing or out of date.');
             document.getElementById('module-table').innerHTML =
                 '<tr><td colspan="9"><div class="no-data"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg><h3>No Data Yet</h3><p>Transceiver inventory will be available after the next monitor run.</p></div></td></tr>';
         }
+    }
+
+    function showBanner(kind, html) {
+        const el = document.getElementById('coverage-banner');
+        el.className = 'coverage-banner ' + kind;
+        el.innerHTML = html;
+    }
+
+    function hideBanner() {
+        const el = document.getElementById('coverage-banner');
+        el.className = 'coverage-banner hidden';
+        el.innerHTML = '';
+    }
+
+    // Surface summary.status_counts (skipped/failed/unreachable/no_data are
+    // otherwise invisible) and flag hours-old data as stale so a partial or
+    // stale collection can never read as a fully-healthy fabric.
+    function renderBanner(lastUpdate) {
+        const counts = summary.status_counts || {};
+        const problem = (counts.failed || 0) + (counts.unreachable || 0);
+        const skipped = (counts.skipped_model || 0) + (counts.skipped_unknown || 0);
+        const noData = counts.no_data || 0;
+
+        let stale = false;
+        if (lastUpdate) {
+            const age = Date.now() - new Date(lastUpdate).getTime();
+            stale = isFinite(age) && age > STALE_AFTER_MS;
+        }
+
+        const parts = [];
+        if (stale) {
+            const when = lastUpdate
+                ? new Date(lastUpdate).toLocaleString('sv-SE').replace('T', ' ')
+                : 'unknown';
+            parts.push('<strong>Data may be stale</strong> — last collected ' + esc(when) + '.');
+        }
+        if (problem) {
+            const bits = [];
+            if (counts.failed) bits.push(counts.failed + ' failed');
+            if (counts.unreachable) bits.push(counts.unreachable + ' unreachable');
+            parts.push('<strong>Partial coverage</strong> — ' + esc(bits.join(', '))
+                + ' (these modules have no firmware data).');
+        }
+
+        if (!parts.length && !skipped && !noData) {
+            hideBanner();
+            return;
+        }
+
+        const badges = [];
+        if (counts.ok) badges.push('<span class="cov-badge">' + counts.ok + ' ok</span>');
+        if (skipped) badges.push('<span class="cov-badge">' + skipped + ' skipped</span>');
+        if (noData) badges.push('<span class="cov-badge">' + noData + ' no-data</span>');
+        if (problem) badges.push('<span class="cov-badge">' + problem + ' failed/unreachable</span>');
+
+        const kind = (stale || problem) ? 'warn' : 'info';
+        const msg = parts.length ? parts.join(' ') : 'Firmware scan coverage:';
+        showBanner(kind, '<span>' + msg + '</span>' + badges.join(' '));
     }
 
     function updateSummary() {
@@ -367,14 +484,14 @@
 
         const devSearch = document.getElementById('deviceSearch');
         devSearch.innerHTML = '<option value="">Search Device...</option>' +
-            devices.map(d => `<option value="${d}">${d}</option>`).join('');
+            devices.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join('');
     }
 
     function fillSelect(id, values) {
         const sel = document.getElementById(id);
         const current = sel.value;
         const first = sel.options[0].outerHTML;
-        sel.innerHTML = first + values.map(v => `<option value="${v}" ${v === current ? 'selected' : ''}>${v}</option>`).join('');
+        sel.innerHTML = first + values.map(v => `<option value="${esc(v)}" ${v === current ? 'selected' : ''}>${esc(v)}</option>`).join('');
     }
 
     function getFilteredModules() {
@@ -434,22 +551,28 @@
         let filtered = getFilteredModules();
 
         filtered.sort((a, b) => {
+            if (sortField === 'port') {
+                const ka = portSortKey(a.port), kb = portSortKey(b.port);
+                let cmp = ka[0] - kb[0] || ka[1] - kb[1] || ka[2].localeCompare(kb[2]);
+                return sortAsc ? cmp : -cmp;
+            }
             let va = (a[sortField] || '').toString().toLowerCase();
             let vb = (b[sortField] || '').toString().toLowerCase();
-            if (sortField === 'port') {
-                const na = parseInt(va.replace(/\D/g, '')) || 0;
-                const nb = parseInt(vb.replace(/\D/g, '')) || 0;
-                return sortAsc ? na - nb : nb - na;
-            }
             return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
         });
 
+        currentFiltered = filtered;
+
         if (filtered.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="9"><div class="no-data"><h3>No Modules Found</h3><p>No transceivers match your filters.</p></div></td></tr>';
+            const hasData = allModules.length > 0;
+            const msg = hasData
+                ? 'No transceivers match your filters.'
+                : 'No transceiver modules were found in the current collection.';
+            tbody.innerHTML = `<tr><td colspan="9"><div class="no-data"><h3>No Modules Found</h3><p>${esc(msg)}</p></div></td></tr>`;
             return;
         }
 
-        tbody.innerHTML = filtered.map(m => {
+        tbody.innerHTML = filtered.map((m, i) => {
             const isMixed = mixedFwModels.includes(m.part_number);
             const majorityFw = isMixed ? getMajorityFw(m.part_number) : null;
             const isMinority = isMixed && m.fw_version && m.fw_version !== majorityFw;
@@ -457,24 +580,62 @@
             const fwClass = isMinority ? 'fw-mixed' : '';
             let fwDisplay;
             if (m.fw_version) {
-                fwDisplay = m.fw_version;
+                fwDisplay = esc(m.fw_version);
                 if (isMinority) fwDisplay += ' <span class="badge badge-yellow">mixed</span>';
             } else {
                 fwDisplay = renderStatusBadge(m.fw_status, m.fw_status_detail);
             }
 
-            return `<tr>
-                <td>${m.device}</td>
-                <td><span class="badge badge-gray">${m.port}</span></td>
-                <td><span class="badge badge-blue">${m.identifier || '-'}</span></td>
-                <td>${m.vendor || '-'}</td>
-                <td><strong>${m.part_number || '-'}</strong></td>
-                <td style="font-family: monospace; font-size: 12px; color: #999;">${m.serial || '-'}</td>
-                <td>${m.vendor_rev || '-'}</td>
+            return `<tr class="module-row" data-idx="${i}" onclick="toggleModuleDetails(this)">
+                <td>${esc(m.device)}</td>
+                <td><span class="badge badge-gray">${esc(m.port)}</span></td>
+                <td><span class="badge badge-blue">${esc(m.identifier || '-')}</span></td>
+                <td>${esc(m.vendor || '-')}</td>
+                <td><strong>${esc(m.part_number || '-')}</strong></td>
+                <td style="font-family: monospace; font-size: 12px; color: #999;">${esc(m.serial || '-')}</td>
+                <td>${esc(m.vendor_rev || '-')}</td>
                 <td class="${fwClass}">${fwDisplay}</td>
-                <td style="font-family: monospace; font-size: 12px;">${m.cable_byte130 || '-'}</td>
+                <td style="font-family: monospace; font-size: 12px;">${esc(m.cable_byte130 || '-')}</td>
             </tr>`;
         }).join('');
+    }
+
+    // Expandable per-row detail (EVPN-MH pattern): surfaces connector and
+    // firmware status detail that are collected but have no dedicated column.
+    function toggleModuleDetails(row) {
+        const next = row.nextElementSibling;
+        if (next && next.classList.contains('detail-row')) { next.remove(); return; }
+        document.querySelectorAll('#module-table tr.detail-row').forEach(r => r.remove());
+
+        const m = currentFiltered[parseInt(row.dataset.idx, 10)];
+        if (!m) return;
+
+        const kv = (k, v, mono) =>
+            `<div class="detail-kv"><span class="k">${esc(k)}</span>` +
+            `<span class="v${mono ? ' mono' : ''}">${esc(v || '-')}</span></div>`;
+
+        let fwStatus = m.fw_status || 'ok';
+        if (m.fw_status_detail) fwStatus += ' (' + m.fw_status_detail + ')';
+
+        const panel =
+            '<div class="detail-panel"><div class="detail-grid">' +
+            kv('Device', m.device) +
+            kv('Port', m.port) +
+            kv('Identifier', m.identifier) +
+            kv('Connector', m.connector) +
+            kv('Vendor', m.vendor) +
+            kv('Part Number', m.part_number) +
+            kv('Serial', m.serial, true) +
+            kv('Vendor Rev', m.vendor_rev) +
+            kv('FW Version', m.fw_version) +
+            kv('FW Status', fwStatus) +
+            kv('Cable-Byte130', m.cable_byte130, true) +
+            '</div></div>';
+
+        const tr = document.createElement('tr');
+        tr.className = 'detail-row';
+        tr.innerHTML = `<td colspan="9">${panel}</td>`;
+        row.after(tr);
     }
 
     function renderStatusBadge(status, detail) {
@@ -482,9 +643,9 @@
             case 'unreachable':
                 return '<span class="badge badge-red">unreachable</span>';
             case 'failed':
-                return `<span class="badge badge-red" title="${detail || 'failed'}">failed</span>`;
+                return `<span class="badge badge-red" title="${esc(detail || 'failed')}">failed</span>`;
             case 'skipped_model':
-                return `<span class="badge badge-gray" title="Skipped due to model: ${detail || 'unknown'}">skipped (${detail || 'model'})</span>`;
+                return `<span class="badge badge-gray" title="Skipped due to model: ${esc(detail || 'unknown')}">skipped (${esc(detail || 'model')})</span>`;
             case 'skipped_unknown':
                 return '<span class="badge badge-gray" title="Skipped: unknown model">skipped (unknown)</span>';
             case 'no_data':
@@ -502,9 +663,50 @@
 
     function downloadCSV() {
         const filtered = getFilteredModules();
+
+        // Describe any active filter so a filtered export is never mistaken
+        // for the full fabric (the summary counts below are always full-fabric).
+        const filterBits = [];
+        const dev = document.getElementById('filter-device').value;
+        const pn = document.getElementById('filter-pn').value;
+        const idType = document.getElementById('filter-id').value;
+        const fw = document.getElementById('filter-fw').value;
+        const search = document.getElementById('filter-search').value.trim();
+        if (dev) filterBits.push('device=' + dev);
+        if (pn) filterBits.push('part_number=' + pn);
+        if (idType) filterBits.push('identifier=' + idType);
+        if (fw) filterBits.push('fw_version=' + fw);
+        if (search) filterBits.push('search=' + search);
+
+        const now = new Date();
+        const counts = summary.status_counts || {};
+        const skipped = (counts.skipped_model || 0) + (counts.skipped_unknown || 0);
         const headers = ['Device','Port','Identifier','Vendor','Part Number','Serial Number','Rev','FW Version','Cable-Byte130'];
-        const rows = filtered.map(m => [m.device, m.port, m.identifier, m.vendor, m.part_number, m.serial, m.vendor_rev, m.fw_version, m.cable_byte130].map(v => `"${(v||'').replace(/"/g,'""')}"`).join(','));
-        const csv = [headers.join(','), ...rows].join('\n');
+        const csvField = v => `"${String(v == null ? '' : v).replace(/"/g,'""')}"`;
+        const rows = filtered.map(m => [m.device, m.port, m.identifier, m.vendor, m.part_number, m.serial, m.vendor_rev, m.fw_version, m.cable_byte130].map(csvField).join(','));
+
+        // Summary comments go BEFORE the header row (leading '#' lines) so a
+        // spreadsheet or parser that skips them still reads a clean header.
+        const meta = [
+            '# Transceiver Inventory Report',
+            '# Generated: ' + now.toLocaleString(),
+            '# Total Modules: ' + (summary.total_modules != null ? summary.total_modules : allModules.length),
+            '# Unique Models: ' + (summary.unique_models || 0),
+            '# Devices: ' + (summary.devices_with_modules || 0),
+            '# Mixed FW Models: ' + mixedFwModels.length,
+            '# Status ok: ' + (counts.ok || 0),
+            '# Status failed: ' + (counts.failed || 0),
+            '# Status unreachable: ' + (counts.unreachable || 0),
+            '# Status skipped: ' + skipped,
+            '# Status no-data: ' + (counts.no_data || 0)
+        ];
+        if (filterBits.length) {
+            meta.push('# NOTE: Rows below reflect the active filter ('
+                + filterBits.join('; ') + '); summary counts above are for the full fabric.');
+        }
+        meta.push('#');
+
+        const csv = [...meta, headers.join(','), ...rows].join('\n');
         const blob = new Blob([csv], {type: 'text/csv'});
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);

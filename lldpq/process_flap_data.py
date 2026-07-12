@@ -61,7 +61,7 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
         active_hosts = set(statuses)
         for attribute in (
             "flapping_hist", "carrier_transitions_lookback", "prev_cumulative",
-            "prev_sample_time",
+            "prev_sample_time", "carrier_transitions_stats",
         ):
             values = getattr(flap_analyzer, attribute, {})
             for port_name in list(values):

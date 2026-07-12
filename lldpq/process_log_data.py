@@ -70,6 +70,9 @@ class LogAnalyzer:
         self.expected_devices = set()
         self.current_devices = set()
         self.collection_status = "current"
+        # Modification time of the newest processed log sample, so the report
+        # can show data age rather than report-generation time.
+        self.newest_sample_mtime = None
         
         # Patterns that should NOT be critical (demoted to warning)
         # These are transient issues, not real critical problems
@@ -452,7 +455,34 @@ class LogAnalyzer:
             json.dumps(coverage['partial_devices'], separators=(',', ':')),
             quote=True,
         )
-        
+
+        # Visible partial/stale banner so a broken or partial collection is
+        # never mistaken for a fully-healthy fabric.
+        coverage_banner = ""
+        if self.collection_status != "current":
+            coverage_banner = (
+                '<div class="coverage-banner">Log collection is currently '
+                'unavailable for this fabric — the counts below do not reflect '
+                'live device state.</div>'
+            )
+        elif coverage['partial']:
+            missing = coverage['partial_devices']
+            coverage_banner = (
+                '<div class="coverage-banner">Partial collection: '
+                + html.escape(
+                    f"{len(missing)} device(s) missing or errored"
+                    + (" (" + ", ".join(missing) + ")" if missing else "")
+                )
+                + '. Counts below cover only successfully collected devices.'
+                '</div>'
+            )
+
+        # Show data age (newest sample), not report-generation time.
+        data_timestamp = (
+            datetime.fromtimestamp(self.newest_sample_mtime)
+            if self.newest_sample_mtime else datetime.now()
+        ).strftime('%Y-%m-%d %H:%M:%S')
+
         # Calculate totals
         total_devices = len(self.log_counts)
         totals = {"critical": 0, "warning": 0, "error": 0, "info": 0}
@@ -547,6 +577,10 @@ class LogAnalyzer:
         ::-webkit-scrollbar-thumb {{ background: #404040; border-radius: 4px; }}
         ::-webkit-scrollbar-thumb:hover {{ background: #555; }}
         @keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
+        .coverage-banner {{ margin: 0 0 20px 0; padding: 9px 12px; background: #35270f; color: #ffb74d; border: 1px solid #6d511d; border-radius: 6px; font-size: 13px; }}
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; font-style: italic; }}
+        .message-search {{ height: 34px; padding: 0 10px; background: #3c3c3c; border: 1px solid #555; border-radius: 4px; color: #d4d4d4; font-size: 13px; min-width: 200px; }}
+        .message-search::placeholder {{ color: #888; }}
     </style>
 </head>
 <body data-analysis-summary="log"
@@ -558,9 +592,10 @@ class LogAnalyzer:
     <div class="page-header">
         <div>
             <div class="page-title">Log Analysis Results</div>
-            <div class="last-updated">Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <div class="last-updated">Last Updated: {data_timestamp}</div>
         </div>
         <div class="action-buttons">
+            <input id="messageSearch" class="message-search" type="text" placeholder="Search log text..." oninput="filterByMessage(this.value)">
             <div class="device-search-container">
                 <select id="deviceSearch" style="width: 200px;"><option value="">Search Device...</option></select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
@@ -575,7 +610,7 @@ class LogAnalyzer:
             </button>
         </div>
     </div>
-    
+    {coverage_banner}
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
@@ -703,7 +738,24 @@ class LogAnalyzer:
                             <div id="content-{device_attr}-info"></div>
                         </td>
                     </tr>"""
-        
+
+        if not sorted_devices:
+            if self.collection_status != "current" or coverage['partial']:
+                empty_text = (
+                    "No log data collected — collection is unavailable or "
+                    "partial, not necessarily a healthy fabric."
+                )
+            else:
+                empty_text = (
+                    "No log entries were collected from any device in the "
+                    "current run."
+                )
+            html_content += (
+                '<tr class="empty-row"><td colspan="6">'
+                + html.escape(empty_text)
+                + '</td></tr>'
+            )
+
         html_content += """
                 </tbody>
             </table>
@@ -721,6 +773,13 @@ class LogAnalyzer:
         // Initialize page functionality
         let deviceSearchActive = false;
         let selectedDevice = '';
+        let messageSearchActive = false;
+
+        function resetMessageSearch() {
+            const input = document.getElementById('messageSearch');
+            if (input) input.value = '';
+            messageSearchActive = false;
+        }
         
         document.addEventListener('DOMContentLoaded', function() {
             initSummaryCardFilters();
@@ -760,7 +819,8 @@ class LogAnalyzer:
             const rows = table.querySelectorAll('tbody tr');
             const filterInfo = document.getElementById('filter-info');
             const filterText = document.getElementById('filter-text');
-            
+
+            resetMessageSearch();
             // Clear device search when using card filters
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -830,7 +890,8 @@ class LogAnalyzer:
             const table = document.querySelector('.log-table');
             const allRows = table.querySelectorAll('tbody tr');
             const filterInfo = document.getElementById('filter-info');
-            
+
+            resetMessageSearch();
             // Also clear device search
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -889,7 +950,7 @@ class LogAnalyzer:
             const deviceSet = new Set();
             
             rows.forEach(row => {
-                if (!row.classList.contains('log-details')) {
+                if (!row.classList.contains('log-details') && !row.classList.contains('empty-row')) {
                     const deviceName = row.cells[0]?.textContent?.trim();
                     if (deviceName) deviceSet.add(deviceName);
                 }
@@ -914,7 +975,8 @@ class LogAnalyzer:
             
             selectedDevice = deviceName;
             deviceSearchActive = true;
-            
+
+            resetMessageSearch();
             // Clear card-based filter
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
             
@@ -965,7 +1027,66 @@ class LogAnalyzer:
                 }
             });
         }
-        
+
+        // Free-text grep over collected log messages (all severities) — the
+        // field operators most want to search across the fabric.
+        function filterByMessage(rawText) {
+            const text = (rawText || '').trim().toLowerCase();
+            const table = document.querySelector('.log-table');
+            const rows = table.querySelectorAll('tbody tr');
+            const filterInfo = document.getElementById('filter-info');
+            const filterText = document.getElementById('filter-text');
+
+            if (!text) {
+                messageSearchActive = false;
+                // Nothing to search: restore the full table (unless a device
+                // search is active, which owns the view).
+                if (!deviceSearchActive) {
+                    document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
+                    document.getElementById('total-devices-card').classList.add('active');
+                    filterInfo.style.display = 'none';
+                    rows.forEach(row => {
+                        row.style.display = row.classList.contains('log-details') ? 'none' : '';
+                    });
+                }
+                return;
+            }
+
+            messageSearchActive = true;
+
+            // Clear conflicting device/card filters.
+            if (deviceSearchActive) {
+                selectedDevice = '';
+                deviceSearchActive = false;
+                $('#deviceSearch').val('').trigger('change');
+                document.getElementById('clearSearchBtn').style.display = 'none';
+            }
+            document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
+
+            let matchCount = 0;
+            rows.forEach(row => {
+                if (row.classList.contains('log-details')) {
+                    row.style.display = 'none';
+                    return;
+                }
+                const deviceKey = row.dataset.deviceKey;
+                const severities = (deviceKey && logData[deviceKey]) || {};
+                let matched = false;
+                for (const severity in severities) {
+                    const entries = severities[severity] || [];
+                    if (entries.some(entry => String(entry.message || '').toLowerCase().indexOf(text) > -1)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                row.style.display = matched ? '' : 'none';
+                if (matched) matchCount++;
+            });
+
+            filterText.textContent = `Showing ${matchCount} device(s) with log text matching "${rawText.trim()}"`;
+            filterInfo.style.display = 'block';
+        }
+
         function toggleLogDetails(deviceName, severity) {
             const detailsRow = document.getElementById(`details-${deviceName}-${severity}`);
             const contentDiv = document.getElementById(`content-${deviceName}-${severity}`);
@@ -974,14 +1095,9 @@ class LogAnalyzer:
             if (!detailsRow || !contentDiv) {
                 return;
             }
-            
-            // Hide all other details first
-            document.querySelectorAll('.log-details').forEach(row => {
-                if (row.id !== `details-${deviceName}-${severity}`) {
-                    row.style.display = 'none';
-                }
-            });
-            
+
+            // Panels toggle independently so two severities (or two devices)
+            // can be expanded side by side for comparison.
             if (detailsRow.style.display === 'table-row') {
                 detailsRow.style.display = 'none';
                 return;
@@ -1065,7 +1181,7 @@ class LogAnalyzer:
         function sortLogTable(columnIndex, direction, type) {
             const table = document.getElementById('log-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows).filter(row => !row.classList.contains('log-details'));
+            const rows = Array.from(tbody.rows).filter(row => !row.classList.contains('log-details') && !row.classList.contains('empty-row'));
             
             rows.sort((a, b) => {
                 let aVal, bVal;
@@ -1433,18 +1549,25 @@ class LogAnalyzer:
         if all_devices_unavailable:
             self.collection_status = "unavailable"
         
+        sample_mtimes = []
         failed_devices = []
         for log_file in log_files:
             device_name = log_file.replace('_logs.txt', '')
             log_file_path = os.path.join(self.log_data_dir, log_file)
-            
+            try:
+                sample_mtimes.append(os.path.getmtime(log_file_path))
+            except OSError:
+                pass
+
             # Ensure device is initialized in counts (even if no logs)
             if device_name not in self.log_counts:
                 self.log_counts[device_name] = {"critical": 0, "warning": 0, "error": 0, "info": 0}
                 self.log_analysis[device_name] = {"critical": [], "warning": [], "error": [], "info": []}
-            
+
             if not self.process_device_logs(device_name, log_file_path):
                 failed_devices.append(device_name)
+
+        self.newest_sample_mtime = max(sample_mtimes) if sample_mtimes else None
 
         if failed_devices:
             # A host-local read failure is a coverage gap, not a fabric-wide
@@ -1454,6 +1577,12 @@ class LogAnalyzer:
                 + ", ".join(sorted(failed_devices))
             )
             self.current_devices -= set(failed_devices)
+            # Drop failed devices from the counts so they are surfaced as a
+            # coverage gap (partial banner) instead of rendering as healthy
+            # all-zero rows that inflate Total Devices.
+            for device_name in failed_devices:
+                self.log_counts.pop(device_name, None)
+                self.log_analysis.pop(device_name, None)
             if len(failed_devices) == len(log_files):
                 return False
 

@@ -2998,6 +2998,10 @@ WEB_TARGETS=(
     "$WEB_ROOT/auth-api.sh" "$WEB_ROOT/auth-guard.sh" "$WEB_ROOT/ansible-api.sh"
     "$WEB_ROOT/ai-api.sh" "$WEB_ROOT/ai.html" "$WEB_ROOT/ai_command_policy.py"
     "$WEB_ROOT/ai_insights.py" "$WEB_ROOT/ai_context.py"
+    "$WEB_ROOT/ai_kb.py" "$WEB_ROOT/ai_audit_packs.py"
+    "$WEB_ROOT/inventory.html" "$WEB_ROOT/inventory-api.sh"
+    "$WEB_ROOT/ai_generate.py" "$WEB_ROOT/ai_correlate.py"
+    "$WEB_ROOT/ai_p2p.py" "$WEB_ROOT/ai_ipam.py"
     "$WEB_ROOT/assets-api.sh" "$WEB_ROOT/setup_safety.py"
     "$WEB_ROOT/lldpq_config_write.py"
     "$WEB_ROOT/provision.html" "$WEB_ROOT/provision-api.sh" "$WEB_ROOT/admin-page.sh" \

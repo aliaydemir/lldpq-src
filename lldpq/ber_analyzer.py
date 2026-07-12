@@ -205,6 +205,44 @@ class BERAnalyzer:
                 pass
             raise
 
+    @staticmethod
+    def _atomic_text_write(path: str, text: str) -> None:
+        """Write a text report atomically so a reader never sees a partial file."""
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+        except FileNotFoundError:
+            mode = 0o644
+
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{os.path.basename(path)}.", dir=directory
+        )
+        try:
+            os.fchmod(descriptor, mode)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+
+            directory_fd = os.open(
+                directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
     def _parse_raw_phy_ber_for_device(self, hostname: str) -> Dict[str, float]:
         """Parse RAW PHY BER per interface for given device.
 
@@ -1083,16 +1121,26 @@ class BERAnalyzer:
         expected_hosts = getattr(self, 'coverage_expected_hosts', None)
         current_hosts = getattr(self, 'coverage_current_hosts', None)
         coverage_attrs = ''
+        coverage_banner = ''
+        coverage_partial = False
         if isinstance(expected_hosts, int) and isinstance(current_hosts, int):
-            coverage_status = (
-                'complete' if current_hosts >= expected_hosts else 'partial'
-            )
+            coverage_partial = current_hosts < expected_hosts
+            coverage_status = 'partial' if coverage_partial else 'complete'
             coverage_attrs = (
                 f' data-coverage-status="{coverage_status}"'
                 f' data-coverage-expected="{expected_hosts}"'
                 f' data-coverage-current="{current_hosts}"'
             )
-        
+            if coverage_partial:
+                missing = max(0, expected_hosts - current_hosts)
+                coverage_banner = (
+                    '<div class="coverage-banner">Partial collection: '
+                    f'interface counters returned for {current_hosts} of '
+                    f'{expected_hosts} expected devices ({missing} missing or '
+                    'stale). Ports for uncollected devices are not shown; the '
+                    'status below may be incomplete.</div>'
+                )
+
         # Determine overall health status
         total_problematic = len(summary['warning_ports']) + len(summary['critical_ports'])
         
@@ -1171,6 +1219,20 @@ class BERAnalyzer:
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
         .filter-info {{ text-align: center; padding: 10px 15px; margin: 15px 16px; background: rgba(118, 185, 0, 0.1); border: 1px solid rgba(118, 185, 0, 0.3); border-radius: 6px; color: #76b900; display: none; font-size: 13px; }}
         .filter-info button {{ margin-left: 10px; padding: 4px 10px; background: #76b900; color: #000; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }}
+        .coverage-banner {{ margin: 0 0 20px 0; padding: 9px 12px; background: #35270f; color: #ffb74d; border: 1px solid #6d511d; border-radius: 6px; font-size: 13px; }}
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; font-style: italic; }}
+        .anomaly-more {{ padding: 8px 4px 2px; color: #888; font-size: 12px; }}
+        .ber-table tbody tr.ber-row {{ cursor: pointer; }}
+        .ber-table tbody tr.detail-row {{ background: #202020; }}
+        .ber-table tbody tr.detail-row:hover {{ background: #202020; }}
+        .detail-row td {{ padding: 0; }}
+        .detail-panel {{ padding: 14px 20px 18px; background: #202020; border-left: 3px solid #76b900; }}
+        .detail-title {{ color: #76b900; font-weight: 700; margin-bottom: 12px; font-size: 14px; }}
+        .detail-kv {{ display: grid; grid-template-columns: 180px 1fr; gap: 6px 14px; margin-bottom: 12px; }}
+        .detail-kv span:nth-child(odd) {{ color: #999; }}
+        .detail-reasons {{ margin: 6px 0 0 18px; line-height: 1.7; }}
+        .detail-reasons li {{ color: #ffb74d; }}
+        .detail-none {{ color: #76b900; }}
         .anomaly-card {{ margin: 10px 0; padding: 12px 15px; background: #252526; border-radius: 6px; border-left: 3px solid #f44336; }}
         .anomaly-card.warning {{ border-left-color: #ff9800; }}
         .anomaly-card h4 {{ color: #d4d4d4; margin-bottom: 8px; font-size: 14px; }}
@@ -1226,7 +1288,7 @@ class BERAnalyzer:
             </button>
         </div>
     </div>
-    
+    {coverage_banner}
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
@@ -1283,6 +1345,10 @@ class BERAnalyzer:
                 <p><strong>Action:</strong> {anomaly['action']}</p>
             </div>
 """
+            if len(anomalies) > 10:
+                html_content += f"""
+            <div class="anomaly-more">Showing the 10 highest-severity of {len(anomalies)} anomalies. All affected ports are listed in the Interface Error Status table below.</div>
+"""
             html_content += """
         </div>
     </div>
@@ -1335,7 +1401,11 @@ class BERAnalyzer:
             }.get(port_info.get('status'), 4)
         
         sorted_ports = sorted(all_ports, key=get_ber_priority)
-        
+
+        # Per-port evidence surfaced in the expandable detail panel.  These are
+        # values the analyzer already computed; nothing new is collected.
+        port_details: Dict[str, Any] = {}
+
         for port_info in sorted_ports:
             port_name = port_info['port']
             device = port_name.split(':')[0] if ':' in port_name else "unknown"
@@ -1398,29 +1468,67 @@ class BERAnalyzer:
                 port_info.get('sample_duration_seconds', 0)
             )
             device_key = html.escape(str(device), quote=True)
-            
+            port_key = html.escape(str(port_name), quote=True)
+
+            # Numeric sort keys so composite/text cells sort correctly.
+            sym_sort = str(sym_delta) if isinstance(sym_delta, int) else ''
+            try:
+                ts_sort = float(port_info['timestamp'])
+            except (TypeError, ValueError):
+                ts_sort = 0.0
+
+            port_details[port_name] = {
+                'status': status,
+                'severity_reasons': port_info.get('severity_reasons') or [],
+                'sample_status': port_info.get('sample_status'),
+                'frame_error_density': port_info.get('frame_error_density'),
+                'raw_ber': port_info.get('raw_ber'),
+                'effective_ber': port_info.get('effective_ber'),
+                'symbol_errors': port_info.get('symbol_errors'),
+                'symbol_error_delta': port_info.get('symbol_error_delta'),
+                'delta_packets': port_info.get('delta_packets', 0),
+                'delta_rx_errors': port_info.get('delta_rx_errors', 0),
+                'delta_tx_errors': port_info.get('delta_tx_errors', 0),
+                'sample_window': sample_window,
+            }
+
             html_content += f"""
-                <tr data-device-key="{device_key}" data-status="{status.lower()}">
+                <tr class="ber-row" data-device-key="{device_key}" data-status="{status.lower()}" data-port="{port_key}" onclick="toggleBerDetails(this)">
                     <td>{canonical(device)}</td>
                     <td>{interface}</td>
                     <td><span class="{badge_class}">{status}</span></td>
                     <td>{ber_display}</td>
                     <td>{raw_phy_display}</td>
                     <td>{eff_display}</td>
-                    <td>{sym_display}</td>
+                    <td data-sort="{sym_sort}">{sym_display}</td>
                     <td>{port_info['delta_packets']:,}</td>
                     <td>{port_info['delta_rx_errors']:,}</td>
                     <td>{port_info['delta_tx_errors']:,}</td>
-                    <td>{timestamp} / {sample_window}</td>
+                    <td data-sort="{ts_sort}">{timestamp} / {sample_window}</td>
                 </tr>
 """
         
+        if not sorted_ports:
+            if coverage_partial:
+                empty_message = (
+                    "No interface counters were collected in this run. See the "
+                    "partial collection notice above."
+                )
+            else:
+                empty_message = (
+                    "No physical interfaces reported link errors in the current "
+                    "collection."
+                )
+            html_content += f"""
+                <tr class="empty-row"><td colspan="11">{empty_message}</td></tr>
+"""
+
         html_content += f"""
                 </tbody>
             </table>
         </div>
     </div>
-        
+
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
@@ -1461,6 +1569,13 @@ class BERAnalyzer:
 
 """
         
+        details_json = json.dumps(
+            port_details, separators=(",", ":"), ensure_ascii=True
+        ).replace("</", "<\\/")
+        html_content += f"""
+    <script>window.__berPortDetails = {details_json};</script>
+"""
+
         html_content += """
     <!-- jQuery and Select2 for device search -->
     <script src="/css/jquery-3.5.1.min.js"></script>
@@ -1474,8 +1589,8 @@ class BERAnalyzer:
         let selectedDevice = '';
         
         document.addEventListener('DOMContentLoaded', function() {
-            // Store all table rows for filtering
-            allRows = Array.from(document.querySelectorAll('#ber-data tr'));
+            // Store all real data rows for filtering (excludes empty-state / detail rows)
+            allRows = Array.from(document.querySelectorAll('#ber-data tr.ber-row'));
             
             // Add click events to summary cards
             setupCardEvents();
@@ -1529,11 +1644,22 @@ class BERAnalyzer:
                     filterPorts('CRITICAL');
                 }
             });
+
+            document.getElementById('unknown-card').addEventListener('click', function() {
+                if (parseInt(document.getElementById('unknown-ports').textContent) > 0) {
+                    filterPorts('UNKNOWN');
+                }
+            });
         }
         
+        function removeBerDetailRows() {
+            document.querySelectorAll('#ber-data tr.detail-row').forEach(r => r.remove());
+        }
+
         function filterPorts(filterType) {
             currentFilter = filterType;
-            
+            removeBerDetailRows();
+
             // Clear device search when using card filters
             if (deviceSearchActive) {
                 selectedDevice = '';
@@ -1566,6 +1692,10 @@ class BERAnalyzer:
                 filteredRows = allRows.filter(row => row.dataset.status === 'critical');
                 filterText = 'Showing ' + filteredRows.length + ' Critical Ports';
                 document.getElementById('critical-card').classList.add('active');
+            } else if (filterType === 'UNKNOWN') {
+                filteredRows = allRows.filter(row => row.dataset.status === 'unknown');
+                filterText = 'Showing ' + filteredRows.length + ' Ports Awaiting Sample';
+                document.getElementById('unknown-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
                 filteredRows = allRows;
                 document.getElementById('total-ports-card').classList.add('active');
@@ -1588,6 +1718,7 @@ class BERAnalyzer:
         
         function clearFilter() {
             currentFilter = 'ALL';
+            removeBerDetailRows();
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
             });
@@ -1657,7 +1788,8 @@ class BERAnalyzer:
             
             selectedDevice = deviceName;
             deviceSearchActive = true;
-            
+            removeBerDetailRows();
+
             // Clear card-based filter
             currentFilter = 'ALL';
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
@@ -1683,6 +1815,7 @@ class BERAnalyzer:
         function clearDeviceSearch() {
             selectedDevice = '';
             deviceSearchActive = false;
+            removeBerDetailRows();
             $('#deviceSearch').val('').trigger('change');
             document.getElementById('clearSearchBtn').style.display = 'none';
             document.getElementById('filter-info').style.display = 'none';
@@ -1720,20 +1853,31 @@ class BERAnalyzer:
         function sortBERTable(columnIndex, direction, type) {
             const table = document.getElementById('ber-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows);
-            
+            removeBerDetailRows();
+            // Only reorder real data rows; any empty-state placeholder stays put.
+            const rows = Array.from(tbody.querySelectorAll('tr.ber-row'));
+            if (!rows.length) return;
+
+            // Prefer an explicit numeric/time data-sort key over the formatted
+            // cell text so composite cells (e.g. "+1,234 / 5,000") sort correctly.
+            const sortRaw = (row) => {
+                const cell = row.cells[columnIndex];
+                if (!cell) return '';
+                return cell.dataset.sort !== undefined ? cell.dataset.sort : cell.textContent.trim();
+            };
+
             rows.sort((a, b) => {
-                let aVal = a.cells[columnIndex].textContent.trim();
-                let bVal = b.cells[columnIndex].textContent.trim();
-                
+                let aVal = (a.cells[columnIndex]?.textContent || '').trim();
+                let bVal = (b.cells[columnIndex]?.textContent || '').trim();
+
                 // Extract actual text for status columns (remove HTML)
                 if (type === 'ber-status') {
-                    aVal = a.cells[columnIndex].querySelector('span')?.textContent || aVal;
-                    bVal = b.cells[columnIndex].querySelector('span')?.textContent || bVal;
+                    aVal = a.cells[columnIndex]?.querySelector('span')?.textContent || aVal;
+                    bVal = b.cells[columnIndex]?.querySelector('span')?.textContent || bVal;
                 }
-                
+
                 let result = 0;
-                
+
                 switch(type) {
                     case 'port':
                         result = comparePort(aVal, bVal);
@@ -1744,32 +1888,42 @@ class BERAnalyzer:
                     case 'ber-value':
                         result = compareBERValue(aVal, bVal);
                         break;
-                    case 'number':
-                        const numA = parseInt(aVal.replace(/,/g, ''));
-                        const numB = parseInt(bVal.replace(/,/g, ''));
-                        result = numA - numB;
+                    case 'number': {
+                        const numA = parseFloat(String(sortRaw(a)).replace(/,/g, ''));
+                        const numB = parseFloat(String(sortRaw(b)).replace(/,/g, ''));
+                        if (isNaN(numA) && isNaN(numB)) result = 0;
+                        else if (isNaN(numA)) result = 1;
+                        else if (isNaN(numB)) result = -1;
+                        else result = numA - numB;
                         break;
-                    case 'time':
-                        result = aVal.localeCompare(bVal);
+                    }
+                    case 'time': {
+                        const rawA = a.cells[columnIndex]?.dataset.sort;
+                        const rawB = b.cells[columnIndex]?.dataset.sort;
+                        if (rawA !== undefined && rawB !== undefined) {
+                            result = parseFloat(rawA) - parseFloat(rawB);
+                        } else {
+                            result = aVal.localeCompare(bVal);
+                        }
                         break;
+                    }
                     case 'string':
                     default:
                         result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
                         break;
                 }
-                
+
                 return direction === 'desc' ? -result : result;
             });
-            
-            // Clear tbody and add sorted rows back
-            tbody.innerHTML = '';
+
+            // Re-append in sorted order (appendChild moves the existing nodes).
             rows.forEach(row => tbody.appendChild(row));
         }
         
         function comparePort(a, b) {
             if (a === 'N/A') return 1;
             if (b === 'N/A') return -1;
-            
+
             // Handle port sorting (swp1, swp10, swp1s0, etc.)
             const extractPortNumber = (port) => {
                 const match = port.match(/swp(\\d+)(?:s(\\d+))?/);
@@ -1778,10 +1932,18 @@ class BERAnalyzer:
                     const subPort = match[2] ? parseInt(match[2]) : 0;
                     return mainPort * 1000 + subPort;
                 }
-                return port.localeCompare(b, undefined, { numeric: true });
+                return null;
             };
-            
-            return extractPortNumber(a) - extractPortNumber(b);
+
+            const na = extractPortNumber(a);
+            const nb = extractPortNumber(b);
+            // Both are swp interfaces: compare on the derived numeric key.
+            if (na !== null && nb !== null) return na - nb;
+            // Keep swp interfaces grouped before non-swp names (eth1, eno1, ...).
+            if (na !== null) return -1;
+            if (nb !== null) return 1;
+            // Neither matches swp: stable numeric-aware string compare of a vs b.
+            return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
         }
         
         function compareBERStatus(a, b) {
@@ -1804,8 +1966,64 @@ class BERAnalyzer:
             if (isNaN(numA) && isNaN(numB)) return 0;
             if (isNaN(numA)) return 1;
             if (isNaN(numB)) return -1;
-            
+
             return numA - numB;
+        }
+
+        // ===== Expandable per-row detail panels =====
+        function berEsc(v) {
+            return String(v === null || v === undefined ? '' : v).replace(/[&<>"]/g, function(c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+            });
+        }
+
+        function berFmtBer(v) {
+            if (v === null || v === undefined || v === '') return 'N/A';
+            const n = Number(v);
+            if (isNaN(n)) return berEsc(String(v));
+            if (n === 0) return '0';
+            return n.toExponential(2);
+        }
+
+        function berFmtInt(v) {
+            if (v === null || v === undefined || v === '') return 'N/A';
+            const n = Number(v);
+            return isNaN(n) ? berEsc(String(v)) : n.toLocaleString();
+        }
+
+        function toggleBerDetails(row) {
+            const next = row.nextElementSibling;
+            if (next && next.classList.contains('detail-row')) { next.remove(); return; }
+            removeBerDetailRows();
+            const details = (window.__berPortDetails || {})[row.dataset.port];
+            if (!details) return;
+            const device = row.cells[0] ? row.cells[0].textContent.trim() : '';
+            const iface = row.cells[1] ? row.cells[1].textContent.trim() : '';
+            const reasons = Array.isArray(details.severity_reasons) ? details.severity_reasons : [];
+            const reasonsHtml = reasons.length
+                ? '<ul class="detail-reasons">' + reasons.map(function(r) { return '<li>' + berEsc(r) + '</li>'; }).join('') + '</ul>'
+                : '<div class="detail-none">No warning/critical evidence — link is within thresholds.</div>';
+            const symText = (details.symbol_error_delta !== null && details.symbol_error_delta !== undefined)
+                ? ('+' + berFmtInt(details.symbol_error_delta) + ' since last sample (total ' + berFmtInt(details.symbol_errors) + ')')
+                : berFmtInt(details.symbol_errors);
+            const detail = document.createElement('tr');
+            detail.className = 'detail-row';
+            detail.innerHTML = '<td colspan="11"><div class="detail-panel">'
+                + '<div class="detail-title">' + berEsc(device) + ' : ' + berEsc(iface) + '</div>'
+                + '<div class="detail-kv">'
+                + '<span>Status</span><span>' + berEsc(String(details.status || '').toUpperCase()) + '</span>'
+                + '<span>Sample State</span><span>' + berEsc(String(details.sample_status || 'analyzed')) + '</span>'
+                + '<span>Frame Error Density</span><span>' + berFmtBer(details.frame_error_density) + '</span>'
+                + '<span>Physical BER (pre-FEC)</span><span>' + berFmtBer(details.raw_ber) + '</span>'
+                + '<span>Effective BER (post-FEC)</span><span>' + berFmtBer(details.effective_ber) + '</span>'
+                + '<span>PHY Symbol Errors</span><span>' + berEsc(symText) + '</span>'
+                + '<span>&Delta; Packets / RX Err / TX Err</span><span>' + berFmtInt(details.delta_packets) + ' / ' + berFmtInt(details.delta_rx_errors) + ' / ' + berFmtInt(details.delta_tx_errors) + '</span>'
+                + '<span>Sample Window</span><span>' + berEsc(String(details.sample_window || 'N/A')) + '</span>'
+                + '</div>'
+                + '<div><strong style="color:#d4d4d4;">Severity evidence:</strong></div>'
+                + reasonsHtml
+                + '</div></td>';
+            row.after(detail);
         }
 
         // Run Analysis Function
@@ -1893,21 +2111,29 @@ class BERAnalyzer:
                 const headers = Array.from(table.querySelectorAll('thead th')).map(function(th){
                     return th.textContent.replace('▲▼', '').trim();
                 });
-                let csvContent = headers.join(',') + '\\n';
                 const tbody = table.querySelector('tbody');
-                const rows = tbody.querySelectorAll('tr');
-                
-                // Add summary stats as comments
-                csvContent += `# Link Error / BER Analysis Summary Report\\n`;
+                const rows = tbody.querySelectorAll('tr.ber-row');
+
+                // Detect an active filter so the exported subset is clearly labelled.
+                const filterActive = deviceSearchActive || (currentFilter !== 'ALL' && currentFilter !== 'TOTAL');
+
+                // Comment/summary block goes BEFORE the header row so standard CSV
+                // parsers (which only skip leading comment lines) read it correctly.
+                let csvContent = `# Link Error / BER Analysis Summary Report\\n`;
                 csvContent += `# Generated: ${now.toLocaleString()}\\n`;
                 csvContent += `# Total Ports: ${document.getElementById('total-ports').textContent}\\n`;
                 csvContent += `# Excellent: ${document.getElementById('excellent-ports').textContent}\\n`;
                 csvContent += `# Good: ${document.getElementById('good-ports').textContent}\\n`;
                 csvContent += `# Warning: ${document.getElementById('warning-ports').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-ports').textContent}\\n`;
+                csvContent += `# Awaiting Sample: ${document.getElementById('unknown-ports').textContent}\\n`;
+                if (filterActive) {
+                    csvContent += `# NOTE: a filter is active - only the currently visible rows are exported; the counts above reflect the full fabric.\\n`;
+                }
                 csvContent += `#\\n`;
-                
-                // Process each visible row (all columns, dynamically)
+                csvContent += headers.join(',') + '\\n';
+
+                // Process each visible data row (all columns, dynamically)
                 rows.forEach(row => {
                     if (row.style.display === 'none') return;
                     const cells = row.querySelectorAll('td');
@@ -1993,8 +2219,7 @@ class BERAnalyzer:
 </html>"""
         
         try:
-            with open(output_file, 'w') as f:
-                f.write(html_content)
+            self._atomic_text_write(output_file, html_content)
             print(f"BER analysis report generated: {output_file}")
         except Exception as e:
             print(f"Error writing BER analysis report: {e}")

@@ -118,6 +118,15 @@
         .tool-status { font-size: 9px; font-weight: 700; color: #6bbf59; white-space: nowrap; }
         .tool-row.fail .tool-status { color: #ef5350; }
         .tool-row.warn .tool-status { color: #ffca28; }
+        /* Operator-acknowledged (suppressed) findings render dimmed */
+        .tool-row.suppressed { opacity: .45; }
+        /* Finding trend badges (NEW / ONGOING / RESOLVED / WORSENED) */
+        .finding-badge { font-size: 9px; font-weight: 700; letter-spacing: .5px; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+        .finding-badge.new { background: #4d2a00; color: #ffa726; }
+        .finding-badge.ongoing { background: #332b0a; color: #ffca28; }
+        .finding-badge.resolved { background: #1b3320; color: #6bbf59; }
+        .finding-badge.worsened { background: #3a1515; color: #ef5350; }
+        .finding-badge.suppressed { background: #2d2d2d; color: #888; }
 
         /* Suggested remediation (one-click → Commands, prefilled) */
         /* follow-up question chips */
@@ -221,6 +230,10 @@
     <button id="btnAttachLogs" onclick="toggleAttachLogs()" title="Attach critical/error logs to next message" aria-label="Attach critical or error logs to next message" aria-pressed="false" style="height: 42px; width: 42px; padding: 0; flex-shrink: 0; background: #333; border: 1px solid #555; border-radius: 6px; color: #888; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">
         <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-6-6zm-1 9h-2v3c0 1.1-.9 2-2 2s-2-.9-2-2v-4c0-1.66 1.34-3 3-3s3 1.34 3 3v1zm-3-7V3.5L18.5 9H14c-.55 0-1-.45-1-1V4z"/></svg>
     </button>
+    <button class="btn btn-secondary" onclick="stopChatJob()" id="btnStop" aria-label="Stop the running investigation" style="height: 42px; padding: 0 16px; flex-shrink: 0; display: none;">
+        <svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>
+        Stop
+    </button>
     <button class="btn btn-primary" onclick="sendMessage()" id="btnSend" aria-label="Send message" style="height: 42px; padding: 0 16px; flex-shrink: 0;">
         <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
     </button>
@@ -266,6 +279,10 @@
             <div style="margin-top: 10px;">
                 <label>Model</label>
                 <input type="text" id="cfgModelCloud" placeholder="gpt-5 / claude-sonnet-5">
+            </div>
+            <div style="margin-top: 10px;">
+                <label>Fallback Model</label>
+                <input type="text" id="cfgFallbackModel" placeholder="optional — scan/fallback model" autocomplete="off">
             </div>
             <div style="margin-top: 10px;">
                 <label>Search model (optional) — enables [SEARCH:] web research</label>
@@ -477,6 +494,18 @@ function sanitizeStoredChatMessage(msg) {
             complete: msg.confidence.complete,
         };
     }
+    // Classified findings (trend badges) survive a reload like evidence does.
+    if (Array.isArray(msg.findings)) clean.findings = msg.findings.slice(0, 40);
+    if (msg.findings_summary && typeof msg.findings_summary === 'object' &&
+        !Array.isArray(msg.findings_summary)) {
+        clean.findings_summary = {};
+        ['critical', 'warning', 'info', 'new', 'ongoing', 'resolved', 'worsened', 'suppressed']
+            .forEach(key => {
+                if (Number.isFinite(msg.findings_summary[key])) {
+                    clean.findings_summary[key] = msg.findings_summary[key];
+                }
+            });
+    }
     if (msg.timeline && typeof msg.timeline === 'object' && !Array.isArray(msg.timeline)) {
         const timeline = msg.timeline;
         clean.timeline = {
@@ -539,6 +568,8 @@ function loadChatFromStorage() {
                         evidence: msg.evidence,
                         confidence: msg.confidence,
                         timeline: msg.timeline,
+                        findings: msg.findings,
+                        findings_summary: msg.findings_summary,
                         ts: msg.ts,
                     });
                 });
@@ -674,6 +705,7 @@ async function loadConfig() {
         document.getElementById('cfgApiUrl').value = data.api_url || '';
         document.getElementById('cfgModel').value = data.model || 'llama3.2';
         document.getElementById('cfgModelCloud').value = data.model || '';
+        document.getElementById('cfgFallbackModel').value = data.fallback_model || '';
         document.getElementById('cfgSearchModel').value = data.search_model || '';
         document.getElementById('cfgProxyUrl').value = data.proxy_url || '';
         const keyInput = document.getElementById('cfgApiKey');
@@ -726,7 +758,9 @@ function onProviderChange(userInitiated) {
         // Sensible Nvidia-inference defaults: fill on an explicit switch, or when empty.
         const _m = cloudModel;
         const _s = document.getElementById('cfgSearchModel');
+        const _f = document.getElementById('cfgFallbackModel');
         if (userInitiated || !_m.value) _m.value = 'aws/anthropic/bedrock-claude-opus-4-8';
+        if (userInitiated || !_f.value) _f.value = 'aws/anthropic/bedrock-claude-opus-4-8';
         if (userInitiated || !_s.value) _s.value = 'perplexity/perplexity/sonar-pro';
     }
 }
@@ -744,6 +778,7 @@ async function saveSettings() {
         config.model = document.getElementById('cfgModelCloud').value.trim();
     }
     config.proxy_url = document.getElementById('cfgProxyUrl').value.trim();
+    config.fallback_model = document.getElementById('cfgFallbackModel').value.trim();
     config.search_model = document.getElementById('cfgSearchModel').value.trim();
     const data = await apiCall('save-config', config);
     if (data.success) {
@@ -907,6 +942,7 @@ function addMessage(role, content, info) {
         if (info.consoles && info.consoles.length) wrapper.appendChild(renderConsoleBtns(info.consoles));
         if (info.followups && info.followups.length) wrapper.appendChild(renderFollowups(info.followups));
         if (info.tools && info.tools.length) wrapper.appendChild(renderToolTrace(info.tools));
+        if (Array.isArray(info.findings) && info.findings.length) wrapper.appendChild(renderFindingsPanel(info.findings, info.findings_summary));
         if (info.evidence && info.evidence.length) wrapper.appendChild(renderEvidencePanel(info.evidence, info.confidence));
         if (info.timeline && typeof info.timeline === 'object') wrapper.appendChild(renderTimeline(info.timeline));
     }
@@ -1204,6 +1240,111 @@ function renderTimeline(timeline) {
     return det;
 }
 
+// Classified findings panel: NEW / ONGOING (with duration) / RESOLVED trend
+// badges plus dimmed operator-suppressed findings. Only rendered when the
+// backend supplies classified findings — older analyses render exactly as
+// before. All backend fields pass through textContent and stay inert.
+function formatFindingDuration(value) {
+    const seconds = Number(value);
+    if (!Number.isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 3600) return `${Math.max(1, Math.round(seconds / 60))}m`;
+    if (seconds < 86400) return `${Math.round(seconds / 3600)}h`;
+    return `${Math.round(seconds / 86400)}d`;
+}
+
+function appendFindingBadge(row, text, variant) {
+    const badge = document.createElement('span');
+    badge.className = `finding-badge ${variant}`;
+    badge.textContent = text;
+    row.appendChild(badge);
+}
+
+function createFindingRow(rawFinding) {
+    const finding = rawFinding && typeof rawFinding === 'object' ? rawFinding : {};
+    const severity = compactDisplay(finding.severity || 'INFO', 12).toUpperCase();
+    const suppressed = finding._suppressed === true;
+    const resolved = finding.status === 'RESOLVED';
+    let state = '';
+    if (!suppressed && !resolved) {
+        if (severity === 'CRITICAL') state = 'fail';
+        else if (severity === 'WARNING') state = 'warn';
+    }
+    const row = document.createElement('div');
+    row.className = 'tool-row' + (state ? ` ${state}` : '') + (suppressed ? ' suppressed' : '');
+    const kindEl = document.createElement('span');
+    kindEl.className = 'tool-kind';
+    kindEl.textContent = severity;
+    row.appendChild(kindEl);
+    const parts = [];
+    const device = compactDisplay(finding.device, 100);
+    const category = compactDisplay(finding.category, 40);
+    const description = compactDisplay(finding.description, 500);
+    if (device) parts.push(device);
+    if (category) parts.push(category);
+    if (description) parts.push(description);
+    const code = document.createElement('code');
+    code.textContent = parts.join(' · ') || 'No details available';
+    row.appendChild(code);
+    if (resolved) {
+        appendFindingBadge(row, 'RESOLVED', 'resolved');
+    } else if (finding.status === 'NEW') {
+        appendFindingBadge(row, 'NEW', 'new');
+    } else if (finding.status === 'ONGOING') {
+        const duration = formatFindingDuration(finding.ongoing_seconds);
+        appendFindingBadge(row, duration ? `ONGOING ${duration}` : 'ONGOING', 'ongoing');
+    }
+    if (finding.worsened === true) {
+        const previous = compactDisplay(finding.previous_severity, 12).toUpperCase();
+        appendFindingBadge(row, previous ? `WORSENED ${previous}→${severity}` : 'WORSENED', 'worsened');
+    }
+    if (finding.reopened === true) appendFindingBadge(row, 'REOPENED', 'worsened');
+    if (suppressed) {
+        appendFindingBadge(row, 'SUPPRESSED', 'suppressed');
+        const reason = compactDisplay(finding.suppression_reason, 300);
+        row.title = 'Acknowledged by an operator' + (reason ? `: ${reason}` : '')
+            + ' — hidden from badge counts, still tracked for trends.';
+    }
+    return row;
+}
+
+function renderFindingsPanel(findings, summary) {
+    const list = (Array.isArray(findings) ? findings : [])
+        .filter(item => item && typeof item === 'object');
+    const counts = summary && typeof summary === 'object' && !Array.isArray(summary) ? summary : {};
+    const det = document.createElement('details');
+    det.className = 'tool-trace';
+    const sum = document.createElement('summary');
+    const chunks = [];
+    ['new', 'ongoing', 'worsened', 'resolved', 'suppressed'].forEach(key => {
+        const count = Number(counts[key]);
+        if (Number.isFinite(count) && count > 0) chunks.push(`${count} ${key}`);
+    });
+    sum.textContent = `Findings — ${list.length} ${list.length === 1 ? 'finding' : 'findings'}`
+        + (chunks.length ? ` · ${chunks.join(' · ')}` : '');
+    det.appendChild(sum);
+    const body = document.createElement('div');
+    body.className = 'tool-trace-body';
+    list.filter(finding => finding._suppressed !== true)
+        .forEach(finding => body.appendChild(createFindingRow(finding)));
+    const suppressed = list.filter(finding => finding._suppressed === true);
+    if (suppressed.length) {
+        // Acknowledged findings stay collapsed and dimmed inside the same
+        // panel; the row tooltip carries the operator's suppression reason.
+        const supDet = document.createElement('details');
+        supDet.className = 'tool-trace';
+        const supSum = document.createElement('summary');
+        supSum.textContent = `${suppressed.length} suppressed (acknowledged, hidden from badge counts)`;
+        supDet.appendChild(supSum);
+        const supBody = document.createElement('div');
+        supBody.className = 'tool-trace-body';
+        suppressed.forEach(finding => supBody.appendChild(createFindingRow(finding)));
+        supDet.appendChild(supBody);
+        body.appendChild(supDet);
+    }
+    det.appendChild(body);
+    return det;
+}
+
 // One-click remediation buttons → open the Commands page prefilled (NOT auto-run)
 function renderFixes(fixes) {
     const box = document.createElement('div');
@@ -1390,6 +1531,150 @@ function toggleAttachLogs() {
     btn.setAttribute('aria-pressed', attachLogsActive ? 'true' : 'false');
 }
 
+// ===================== ASYNC CHAT JOBS =====================
+// chat-submit + chat-poll background jobs remove the sync request ceiling and
+// make live progress + Stop possible. Everything here degrades gracefully: a
+// failed submit (older backend, unavailable job store) transparently falls
+// back to the original synchronous action=chat path in sendMessage.
+let activeChatJobId = null;
+let _progressBody = null;
+let _progressRows = {};
+
+function showChatProgress() {
+    removeChatProgress();
+    const area = document.getElementById('chatArea');
+    const det = document.createElement('details');
+    det.className = 'tool-trace';
+    det.id = 'chatProgress';
+    det.open = true;
+    const sum = document.createElement('summary');
+    sum.textContent = 'Investigating — live progress';
+    det.appendChild(sum);
+    const body = document.createElement('div');
+    body.className = 'tool-trace-body';
+    det.appendChild(body);
+    area.appendChild(det);
+    _progressBody = body;
+    _progressRows = {};
+    area.scrollTop = area.scrollHeight;
+}
+
+function removeChatProgress() {
+    const el = document.getElementById('chatProgress');
+    if (el) el.remove();
+    _progressBody = null;
+    _progressRows = {};
+}
+
+function addProgressRow(key, kind, label, status, state) {
+    if (!_progressBody) return;
+    const row = createTraceRow(kind, label, status, state);
+    if (key) _progressRows[key] = row;
+    _progressBody.appendChild(row);
+    while (_progressBody.children.length > 40) _progressBody.removeChild(_progressBody.firstChild);
+    const area = document.getElementById('chatArea');
+    area.scrollTop = area.scrollHeight;
+}
+
+function finishProgressRow(key, ok) {
+    const row = _progressRows[key];
+    if (!row) return;
+    delete _progressRows[key];
+    const status = row.querySelector('.tool-status');
+    if (status) status.textContent = ok ? 'OK' : 'FAIL';
+    if (!ok) row.className = 'tool-row fail';
+}
+
+// Deterministic phase lines from worker events — no LLM narrator involved.
+// All values render through textContent so backend text stays inert.
+function renderChatProgressEvent(rawEvent) {
+    const event = rawEvent && typeof rawEvent === 'object' ? rawEvent : {};
+    const name = event.event;
+    if (name === 'queued') {
+        addProgressRow('', 'JOB', 'Queued — starting the background worker...', 'RUN', '');
+    } else if (name === 'start') {
+        const deadline = Number(event.deadline_seconds);
+        addProgressRow('', 'JOB', 'Investigation started'
+            + (Number.isFinite(deadline) ? ` (up to ${Math.round(deadline)}s)` : ''), 'RUN', '');
+    } else if (name === 'round') {
+        addProgressRow('', 'ROUND', `Round ${event.round}/${event.rounds_max} — asking the model...`, 'RUN', '');
+    } else if (name === 'tool') {
+        const target = event.device || event.dispatch || 'fabric';
+        const key = `${target}\x00${event.command || ''}`;
+        if (event.status === 'started') {
+            addProgressRow(key, event.dispatch ? 'RUNALL' : 'RUN',
+                `Running ${event.command || 'command'} on ${target}...`, '...', '');
+        } else {
+            finishProgressRow(key, event.ok !== false);
+        }
+    } else if (name === 'finalize') {
+        addProgressRow('', 'FINAL', 'Composing the final answer (no more tools)...', 'RUN', '');
+    } else if (name === 'cancelled') {
+        addProgressRow('', 'STOP', 'Stop requested — finalizing from the evidence collected so far...', 'STOPPING', 'warn');
+    }
+    // 'heartbeat', 'model-reply' and unknown events are intentionally silent.
+}
+
+function sleepWithAbort(ms, signal) {
+    return new Promise(resolve => {
+        const timer = setTimeout(done, ms);
+        function done() {
+            clearTimeout(timer);
+            if (signal) signal.removeEventListener('abort', done);
+            resolve();
+        }
+        if (signal) signal.addEventListener('abort', done, { once: true });
+    });
+}
+
+// Poll every ~1.5s until the worker publishes its terminal event; the return
+// value has the exact shape the synchronous action=chat response has today.
+async function pollChatJob(jobId, generation, controller) {
+    let cursor = 0;
+    let failures = 0;
+    while (true) {
+        if (generation !== requestGeneration || controller.signal.aborted) return { aborted: true };
+        const data = await apiCall('chat-poll', { job_id: jobId, cursor }, { signal: controller.signal });
+        if (data.aborted || generation !== requestGeneration || controller.signal.aborted) return { aborted: true };
+        if (!data.success) {
+            // Tolerate brief poll hiccups — the worker keeps running server-side.
+            failures += 1;
+            if (failures >= 4) {
+                return { success: false, error: data.error || 'Lost contact with the background chat job' };
+            }
+        } else {
+            failures = 0;
+            if (Number.isFinite(data.cursor)) cursor = data.cursor;
+            (Array.isArray(data.events) ? data.events : []).forEach(renderChatProgressEvent);
+            if (data.done) {
+                return (data.result && typeof data.result === 'object') ? data.result
+                    : { success: false, error: 'The chat job finished without a result.' };
+            }
+        }
+        await sleepWithAbort(1500, controller.signal);
+    }
+}
+
+function setStopButtonVisible(visible) {
+    const btn = document.getElementById('btnStop');
+    if (!btn) return;
+    btn.style.display = visible ? '' : 'none';
+    btn.disabled = false;
+}
+
+async function stopChatJob() {
+    if (!activeChatJobId) return;
+    const btn = document.getElementById('btnStop');
+    if (btn) btn.disabled = true;
+    const data = await apiCall('chat-stop', { job_id: activeChatJobId });
+    if (data && data.success) {
+        showToast('Stop requested — the answer will use the evidence collected so far', 'info');
+    } else {
+        if (btn) btn.disabled = false;
+        showToast('Stop failed: ' + ((data && data.error) || 'unknown error'), 'error');
+    }
+}
+
 async function sendMessage() {
     const input = document.getElementById('chatInput');
     const message = input.value.trim();
@@ -1460,7 +1745,20 @@ async function sendMessage() {
     autoResize(input);
     
     try {
-        const data = await apiCall('chat', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
+        // Async-first: submit as a background job and poll for progress.
+        // Any submit failure (older backend without chat-submit, unavailable
+        // job store) falls back to the synchronous action=chat path unchanged.
+        let data;
+        const submitted = await apiCall('chat-submit', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
+        if (generation !== requestGeneration || controller.signal.aborted || submitted.aborted) return;
+        if (submitted.success && submitted.job_id) {
+            activeChatJobId = String(submitted.job_id);
+            setStopButtonVisible(true);
+            showChatProgress();
+            data = await pollChatJob(activeChatJobId, generation, controller);
+        } else {
+            data = await apiCall('chat', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
+        }
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
         
         if (data.success && data.response) {
@@ -1501,6 +1799,9 @@ async function sendMessage() {
     } finally {
         if (generation === requestGeneration && chatRequestController === controller) {
             removeTypingIndicator();
+            removeChatProgress();
+            activeChatJobId = null;
+            setStopButtonVisible(false);
             chatRequestController = null;
             isStreaming = false;
             btn.disabled = false;
@@ -1523,6 +1824,15 @@ function clearChat() {
     analysisRequestController = null;
     isStreaming = false;
     isAnalysisRunning = false;
+    // Best-effort stop for an in-flight background job; the chat area rewrite
+    // below removes the progress panel node itself.
+    if (activeChatJobId) {
+        apiCall('chat-stop', { job_id: activeChatJobId });
+        activeChatJobId = null;
+    }
+    _progressBody = null;
+    _progressRows = {};
+    setStopButtonVisible(false);
     removeTypingIndicator();
     const sendButton = document.getElementById('btnSend');
     sendButton.disabled = false;
@@ -1577,6 +1887,8 @@ async function showPersistedAnalysis(event) {
         evidence: data.evidence,
         confidence: data.confidence,
         timeline: data.timeline,
+        findings: data.findings,
+        findings_summary: data.findings_summary,
         ts: stamp ? stamp.getTime() : undefined,
     });
 }
@@ -1610,6 +1922,8 @@ async function runAnalysis() {
                 evidence: data.evidence,
                 confidence: data.confidence,
                 timeline: data.timeline,
+                findings: data.findings,
+                findings_summary: data.findings_summary,
                 ts: Date.now(),
             };
             addMessage('assistant', data.analysis, _info);

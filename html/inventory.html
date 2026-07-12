@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="shortcut icon" href="/png/favicon.ico">
+    <title>..::LLDPQ:: Inventory</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <script src="/css/auth.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+        body { background:#1e1e1e; color:#d4d4d4; font-family:'Segoe UI',Roboto,sans-serif; font-size:14px; }
+
+        .su-header { padding:18px 24px; border-bottom:1px solid #333; background:#252526; }
+        .su-title { font-size:20px; font-weight:600; color:#fff; display:flex; align-items:center; gap:10px; }
+        .su-title svg { width:22px; height:22px; fill:#76b900; }
+        .su-sub { color:#9a9a9a; font-size:13px; margin-top:4px; }
+
+        .inv-wrap { height:calc(100vh - 75px); overflow:auto; padding:22px 26px; }
+        .inv-inner { width:100%; }
+
+        .inv-panel { background:#252526; border:1px solid #333; border-radius:8px; padding:18px 20px; margin-bottom:18px; }
+        .inv-panel h2 { margin:0 0 4px; font-size:17px; color:#fff; }
+        .inv-panel .p-desc { color:#9a9a9a; font-size:13px; line-height:1.6; margin:0 0 14px; }
+        .inv-panel code { background:#111; color:#dcdcaa; padding:1px 6px; border-radius:4px; font-size:12px; }
+        .p-file { color:#76b900; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; }
+
+        .grid-2 { display:flex; gap:16px; flex-wrap:wrap; }
+        .grid-2 > .kind-card { flex:1; min-width:340px; }
+        .kind-card { background:#202020; border:1px solid #333; border-radius:8px; padding:14px 16px; }
+        .kind-card h3 { margin:0 0 8px; font-size:14px; color:#e0e0e0; }
+
+        .p-toolbar { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+        .p-toolbar .spacer { flex:1; }
+
+        .btn { border:0; border-radius:5px; padding:9px 14px; cursor:pointer; font-size:13px; font-weight:600; display:inline-flex; align-items:center; gap:7px; }
+        .btn svg { width:14px; height:14px; fill:currentColor; }
+        .btn.primary { background:#76b900; color:#1a1a1a; }
+        .btn.primary:hover { background:#8ad400; }
+        .btn.secondary { background:#3c3c3c; color:#e0e0e0; }
+        .btn.secondary:hover { background:#4a4a4a; }
+        .btn.danger { background:#c9362d; color:#fff; }
+        .btn.danger:hover { background:#e0443a; }
+        .btn.sm { padding:5px 10px; font-size:12px; }
+        .btn:disabled { opacity:.5; cursor:not-allowed; }
+
+        .status { font-size:12.5px; margin-top:10px; min-height:18px; }
+        .status.ok { color:#76b900; }
+        .status.err { color:#f44336; }
+        .status.info { color:#9a9a9a; }
+
+        .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+        .badge.green { background:rgba(118,185,0,.2); color:#76b900; }
+        .badge.gray { background:rgba(255,255,255,.1); color:#999; }
+        .badge.blue { background:rgba(97,175,239,.16); color:#9cdcfe; }
+        .badge.red { background:rgba(244,67,54,.18); color:#ef7770; }
+        .badge.amber { background:rgba(255,152,0,.16); color:#e0b060; }
+
+        /* version list — same visual language as the provision OS-Image list */
+        .ver-list { margin-top:4px; }
+        .ver-empty { color:#888; font-size:12.5px; }
+        .ver-row { display:flex; align-items:center; gap:10px; padding:7px 10px; background:#252526; border:1px solid #2d2d2d; border-radius:5px; margin-bottom:5px; }
+        .ver-row.active { background:#1a2e00; border-color:#76b900; }
+        .ver-row svg { width:18px; height:18px; fill:#76b900; flex-shrink:0; }
+        .ver-name { font-family:'Cascadia Code',Consolas,monospace; font-size:12px; color:#cfcfcf; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:180px; }
+        .ver-sum { flex:1; font-size:11px; color:#8f8f8f; display:flex; gap:6px; flex-wrap:wrap; }
+        .ver-ts { color:#777; font-size:11px; }
+
+        .note { background:#2a2a1a; border:1px solid #4a4424; border-radius:6px; padding:9px 13px; color:#d6ca8a; font-size:12px; line-height:1.5; margin:6px 0 12px; }
+
+        textarea.inv-ta, pre.inv-pre { width:100%; min-height:280px; max-height:520px; background:#111; color:#d4d4d4; border:1px solid #333; border-radius:6px;
+            padding:14px; font-family:'Cascadia Code',Consolas,monospace; font-size:12.5px; line-height:1.55; resize:vertical; overflow:auto; white-space:pre; margin:0; }
+        textarea.inv-ta:focus { outline:none; border-color:#76b900; }
+
+        .rep-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+        .rep-table th { text-align:left; color:#9a9a9a; font-weight:600; padding:7px 10px; border-bottom:1px solid #333; }
+        .rep-table td { padding:7px 10px; border-bottom:1px solid #2a2a2a; vertical-align:top; }
+        .rep-counts { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+
+        .diff-cols { display:flex; gap:14px; flex-wrap:wrap; margin-top:10px; }
+        .diff-col { flex:1; min-width:200px; }
+        .diff-col h4 { margin:0 0 6px; font-size:12.5px; color:#9a9a9a; font-weight:600; }
+        .diff-item { font-family:'Cascadia Code',Consolas,monospace; font-size:11.5px; padding:2px 0; }
+        .diff-add { color:#76b900; }
+        .diff-rem { color:#ef7770; }
+        .diff-chg { color:#e0b060; }
+        .diff-skip { color:#888; }
+
+        .kind-sel { background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:5px; padding:6px 10px; font-size:13px; }
+        .kind-sel:focus { outline:none; border-color:#76b900; }
+
+        .preview-wrap { display:none; margin-top:12px; }
+        .preview-wrap.show { display:block; }
+
+        /* Bootstrap advisor (hidden unless the backend exposes the action) */
+        .advisor { display:none; }
+        .advisor.show { display:block; }
+        .adv-log { background:#0d0d0d; border:1px solid #333; border-radius:6px; padding:12px; height:260px; overflow:auto; margin-bottom:10px; display:flex; flex-direction:column; gap:12px; }
+        .adv-msg { font-size:13px; line-height:1.55; padding:9px 12px; border-radius:8px; max-width:88%; white-space:pre-wrap; word-break:break-word; }
+        .adv-msg.user { align-self:flex-end; background:#2c3a12; color:#e8f0d8; }
+        .adv-msg.assistant { align-self:flex-start; background:#202020; border:1px solid #333; color:#d4d4d4; }
+        .adv-msg.system { align-self:center; color:#8f8f8f; font-size:12px; }
+        .adv-input { display:flex; gap:8px; align-items:flex-end; }
+        .adv-input textarea { flex:1; min-height:42px; max-height:140px; background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:6px; padding:10px 12px; font-size:13px; resize:vertical; }
+        .adv-input textarea:focus { outline:none; border-color:#76b900; }
+    </style>
+</head>
+<body>
+    <div class="su-header">
+        <div class="su-title">
+            <svg viewBox="0 0 24 24"><path d="M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z"/></svg>
+            Inventory &amp; Bootstrap
+        </div>
+        <div class="su-sub">Upload the fabric design (P2P cabling + IP allocation), validate it, then generate the LLDPq install files. Every generated file is previewed and confirmed before it is written &mdash; nothing is applied silently.</div>
+    </div>
+
+    <div class="inv-wrap">
+      <div class="inv-inner">
+
+        <!-- 1. Design sources -->
+        <div class="inv-panel">
+            <h2>1. Design Sources</h2>
+            <p class="p-desc">Upload the P2P cabling workbook and the IPAM (IP allocation) workbook &mdash; <code>.xlsx</code>, <code>.xlsm</code> or a parsed <code>connections.json</code>. The newest uploads are kept as recoverable versions; pick one and click <strong>Use as Design</strong> to make it active. The active design is what the generators and Ask-AI use.</p>
+            <div class="note">A wrong upload stays recoverable: the previous versions are retained automatically (up to the keep limit) as a single silent backup &mdash; there is no version-diff UI by design.</div>
+            <div class="grid-2">
+                <div class="kind-card">
+                    <h3>P2P cabling <span class="p-file">connections</span></h3>
+                    <div class="p-toolbar">
+                        <button class="btn secondary sm" onclick="document.getElementById('up-p2p').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload P2P</button>
+                        <input type="file" id="up-p2p" accept=".xlsx,.xlsm,.json" style="display:none" onchange="uploadDesign('p2p', this)">
+                    </div>
+                    <div class="ver-list" id="list-p2p"><span class="ver-empty">Loading&hellip;</span></div>
+                    <div class="status info" id="st-p2p"></div>
+                </div>
+                <div class="kind-card">
+                    <h3>IP allocation <span class="p-file">ipam</span></h3>
+                    <div class="p-toolbar">
+                        <button class="btn secondary sm" onclick="document.getElementById('up-ipam').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload IPAM</button>
+                        <input type="file" id="up-ipam" accept=".xlsx,.xlsm,.json" style="display:none" onchange="uploadDesign('ipam', this)">
+                    </div>
+                    <div class="ver-list" id="list-ipam"><span class="ver-empty">Loading&hellip;</span></div>
+                    <div class="status info" id="st-ipam"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 2. Validation -->
+        <div class="inv-panel">
+            <h2>2. Validation Report</h2>
+            <p class="p-desc">Deterministic design checks &mdash; duplicate ports, breakout mismatches, tbd/blank endpoints, duplicate cable/records. Runs against the active design; no AI required.</p>
+            <div class="p-toolbar">
+                <select class="kind-sel" id="val-kind">
+                    <option value="p2p">P2P cabling</option>
+                    <option value="ipam">IP allocation</option>
+                </select>
+                <button class="btn secondary" onclick="runValidate()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Validate</button>
+            </div>
+            <div class="status info" id="st-val"></div>
+            <div id="val-report"></div>
+        </div>
+
+        <!-- 3. topology.dot -->
+        <div class="inv-panel">
+            <h2>3. Generate <span class="p-file">topology.dot</span></h2>
+            <p class="p-desc">Render the resolved P2P links as the expected topology. Preview first, then <strong>Set as expected topology</strong> writes <code>topology.dot</code> (the previous file is backed up to <code>.bak</code>).</p>
+            <div class="p-toolbar">
+                <button class="btn secondary" onclick="preview('topology')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <span class="status info" id="stat-topology" style="margin:0"></span>
+            </div>
+            <div class="status info" id="st-topology"></div>
+            <div class="preview-wrap" id="pw-topology">
+                <textarea class="inv-ta" id="ta-topology" readonly></textarea>
+                <div class="p-toolbar" style="margin-top:10px">
+                    <div class="spacer"></div>
+                    <button class="btn primary" onclick="applyArtifact('topology')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Set as expected topology</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 4. devices.yaml -->
+        <div class="inv-panel">
+            <h2>4. Generate <span class="p-file">devices.yaml</span></h2>
+            <p class="p-desc">Draft <code>devices.yaml</code> from the IPAM design &mdash; switch roles only (DGX/PDU/power/host filtered), SSH defaults preserved. Preview shows a diff against the current file before applying.</p>
+            <div class="p-toolbar">
+                <button class="btn secondary" onclick="preview('devices')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <span class="status info" id="stat-devices" style="margin:0"></span>
+            </div>
+            <div class="status info" id="st-devices"></div>
+            <div class="preview-wrap" id="pw-devices">
+                <div id="diff-devices"></div>
+                <textarea class="inv-ta" id="ta-devices" readonly></textarea>
+                <div class="p-toolbar" style="margin-top:10px">
+                    <div class="spacer"></div>
+                    <button class="btn primary" onclick="applyArtifact('devices')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply devices.yaml</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 5. topology_config.yaml -->
+        <div class="inv-panel">
+            <h2>5. Generate <span class="p-file">topology_config.yaml</span></h2>
+            <p class="p-desc">Draft <code>topology_config.yaml</code> (device_categories / layers / icons) from the roles present in the design. Preview, then confirm to write.</p>
+            <div class="p-toolbar">
+                <button class="btn secondary" onclick="preview('topology-config')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <span class="status info" id="stat-topology-config" style="margin:0"></span>
+            </div>
+            <div class="status info" id="st-topology-config"></div>
+            <div class="preview-wrap" id="pw-topology-config">
+                <textarea class="inv-ta" id="ta-topology-config" readonly></textarea>
+                <div class="p-toolbar" style="margin-top:10px">
+                    <div class="spacer"></div>
+                    <button class="btn primary" onclick="applyArtifact('topology-config')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply topology_config.yaml</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 6. Bootstrap advisor (only shown if the backend exposes the action) -->
+        <div class="inv-panel advisor" id="advisor-panel">
+            <h2>Bootstrap Advisor <span class="badge blue">AI</span></h2>
+            <p class="p-desc">Ask the advisor to propose or adjust artifacts &mdash; e.g. &ldquo;propose topology.dot&rdquo;, &ldquo;remove leaf07 and add leaf09&rdquo;, &ldquo;generate devices.yaml&rdquo;. Every suggestion still goes through the preview + confirm gate above; the advisor never writes install files.</p>
+            <div class="adv-log" id="adv-log"></div>
+            <div class="adv-input">
+                <textarea id="adv-text" placeholder="Ask the bootstrap advisor..." rows="1" onkeydown="advisorKeydown(event)"></textarea>
+                <button class="btn primary" id="adv-send" onclick="advisorSend()">Send</button>
+            </div>
+        </div>
+
+      </div>
+    </div>
+
+<script>
+const API = '/inventory-api.sh';
+const TOKENS = {};        // artifact -> confirm token from the last preview
+const ART = {             // artifact key -> ui ids
+    'topology':        { ta:'ta-topology',        pw:'pw-topology',        st:'st-topology',        stat:'stat-topology',        file:'topology.dot' },
+    'devices':         { ta:'ta-devices',         pw:'pw-devices',         st:'st-devices',         stat:'stat-devices',         file:'devices.yaml' },
+    'topology-config': { ta:'ta-topology-config', pw:'pw-topology-config', st:'st-topology-config', stat:'stat-topology-config', file:'topology_config.yaml' },
+};
+
+function escHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+        ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function setStatus(id, msg, cls) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = msg || '';
+    el.className = 'status ' + (cls || 'info');
+}
+function fmtTs(ts) {
+    if (!ts) return '';
+    try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return ''; }
+}
+
+async function apiGet(action, params) {
+    const qs = new URLSearchParams(Object.assign({ action }, params || {})).toString();
+    const r = await fetch(API + '?' + qs, { cache: 'no-store' });
+    return r.json();
+}
+async function apiPost(action, body, params) {
+    const qs = new URLSearchParams(Object.assign({ action }, params || {})).toString();
+    const r = await fetch(API + '?' + qs, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+    });
+    return r.json();
+}
+
+// ---- Design versions ---------------------------------------------------
+async function uploadDesign(kind, input) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    setStatus('st-' + kind, 'Uploading ' + file.name + '…', 'info');
+    const fd = new FormData();
+    fd.append('kind', kind);
+    fd.append('file', file);
+    try {
+        const r = await fetch(API + '?action=upload&kind=' + encodeURIComponent(kind), { method: 'POST', body: fd });
+        const data = await r.json();
+        if (data.success) {
+            const w = (data.warnings && data.warnings.length) ? ' (' + data.warnings.length + ' warning(s))' : '';
+            setStatus('st-' + kind, 'Uploaded ' + (data.filename || file.name) + w + '. Click "Use as Design" to activate.', 'ok');
+            loadVersions();
+        } else {
+            setStatus('st-' + kind, data.error || 'Upload failed', 'err');
+        }
+    } catch (e) {
+        setStatus('st-' + kind, 'Upload failed: ' + e.message, 'err');
+    }
+}
+
+function summaryChips(kind, sum) {
+    sum = sum || {};
+    const chips = [];
+    if (kind === 'p2p') {
+        chips.push('<span class="badge gray">' + (sum.total_connections || 0) + ' conns</span>');
+        chips.push('<span class="badge green">' + (sum.resolved_links || 0) + ' links</span>');
+        if (sum.unresolved) chips.push('<span class="badge amber">' + sum.unresolved + ' unresolved</span>');
+    } else {
+        chips.push('<span class="badge gray">' + (sum.total_records || 0) + ' records</span>');
+        chips.push('<span class="badge green">' + (sum.fabric || 0) + ' fabric</span>');
+        if (sum.hosts) chips.push('<span class="badge blue">' + sum.hosts + ' hosts</span>');
+        if (sum.subnets) chips.push('<span class="badge gray">' + sum.subnets + ' subnets</span>');
+    }
+    return chips.join('');
+}
+
+function renderVersions(kind, versions) {
+    const box = document.getElementById('list-' + kind);
+    if (!versions || !versions.length) {
+        box.innerHTML = '<span class="ver-empty">No ' + kind.toUpperCase() + ' design uploaded yet.</span>';
+        return;
+    }
+    box.innerHTML = versions.map(v => {
+        const active = !!v.active;
+        const name = v.filename || v.version;
+        const action = active
+            ? '<span class="badge green">Active</span>'
+            : '<button class="btn secondary sm" onclick="activate(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Use as Design</button>';
+        return '<div class="ver-row' + (active ? ' active' : '') + '">' +
+            '<svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>' +
+            '<span class="ver-name" title="' + escHtml(name) + '">' + escHtml(name) + '</span>' +
+            '<span class="ver-sum">' + summaryChips(kind, v.summary) + '</span>' +
+            '<span class="ver-ts">' + escHtml(fmtTs(v.ts)) + '</span>' +
+            action + '</div>';
+    }).join('');
+}
+
+async function loadVersions() {
+    try {
+        const data = await apiGet('list');
+        if (data.success) {
+            renderVersions('p2p', (data.versions || {}).p2p || []);
+            renderVersions('ipam', (data.versions || {}).ipam || []);
+        }
+    } catch (e) { /* offline / no backend: leave placeholders */ }
+}
+
+async function activate(kind, version) {
+    setStatus('st-' + kind, 'Activating…', 'info');
+    const data = await apiPost('activate', { kind, version });
+    if (data.success) {
+        let msg = 'Active design set.';
+        if (data.publish_error) msg += ' (publish warning: ' + data.publish_error + ')';
+        setStatus('st-' + kind, msg, 'ok');
+        loadVersions();
+    } else {
+        setStatus('st-' + kind, data.error || 'Activate failed', 'err');
+    }
+}
+
+// ---- Validation --------------------------------------------------------
+function sevBadge(sev) {
+    const map = { error: 'red', warning: 'amber', info: 'blue' };
+    return '<span class="badge ' + (map[sev] || 'gray') + '">' + escHtml(sev || '') + '</span>';
+}
+async function runValidate() {
+    const kind = document.getElementById('val-kind').value;
+    setStatus('st-val', 'Validating ' + kind + '…', 'info');
+    document.getElementById('val-report').innerHTML = '';
+    const data = await apiGet('validate', { kind });
+    if (!data.success) { setStatus('st-val', data.error || 'Validation failed', 'err'); return; }
+    const rep = data.report || {};
+    const issues = rep.issues || [];
+    const counts = rep.counts || {};
+    const warns = rep.warnings || [];
+    const chips = Object.keys(counts).map(k =>
+        '<span class="badge gray">' + escHtml(k.replace(/_/g, ' ')) + ': ' + escHtml(counts[k]) + '</span>').join('');
+    let html = '<div class="rep-counts">' + chips + '</div>';
+    if (!issues.length) {
+        html += '<div class="status ok">No structural issues found.</div>';
+    } else {
+        html += '<table class="rep-table"><thead><tr><th style="width:90px">Severity</th><th style="width:140px">Kind</th><th>Message</th></tr></thead><tbody>';
+        html += issues.map(i => '<tr><td>' + sevBadge(i.severity) + '</td><td>' + escHtml(i.kind || '') +
+            '</td><td>' + escHtml(i.message || '') + '</td></tr>').join('');
+        html += '</tbody></table>';
+    }
+    if (warns.length) {
+        html += '<h4 style="color:#9a9a9a;font-size:12.5px;margin:12px 0 4px">Parser warnings (' + warns.length + ')</h4>';
+        html += '<div class="diff-item diff-skip">' + warns.slice(0, 40).map(escHtml).join('<br>') + '</div>';
+    }
+    document.getElementById('val-report').innerHTML = html;
+    const errs = issues.filter(i => i.severity === 'error').length;
+    setStatus('st-val', errs ? (errs + ' error(s) found') : (issues.length + ' issue(s)'), errs ? 'err' : 'ok');
+}
+
+// ---- Artifact preview / apply -----------------------------------------
+function renderDevicesDiff(diff, skipped) {
+    diff = diff || {}; skipped = skipped || [];
+    const col = (title, cls, items, fmt) =>
+        '<div class="diff-col"><h4>' + title + ' (' + items.length + ')</h4>' +
+        (items.length ? items.map(x => '<div class="diff-item ' + cls + '">' + fmt(x) + '</div>').join('')
+                      : '<div class="diff-item diff-skip">&mdash;</div>') + '</div>';
+    const dev = x => escHtml(x.hostname + '  ' + (x.ip || '') + (x.role ? ' @' + x.role : ''));
+    const chg = x => escHtml(x.hostname + ': ' + (x.from ? (x.from.ip + '@' + x.from.role) : '') + ' → ' +
+        (x.to ? (x.to.ip + '@' + x.to.role) : ''));
+    let html = '<div class="diff-cols">' +
+        col('Added', 'diff-add', diff.added || [], dev) +
+        col('Removed', 'diff-rem', diff.removed || [], dev) +
+        col('Changed', 'diff-chg', diff.changed || [], chg) +
+        '</div>';
+    if (skipped.length) {
+        html += '<h4 style="color:#9a9a9a;font-size:12.5px;margin:10px 0 4px">Skipped (non-switch / no mgmt IP): ' + skipped.length + '</h4>' +
+            '<div class="diff-item diff-skip">' + skipped.slice(0, 60).map(escHtml).join(', ') + '</div>';
+    }
+    return html;
+}
+
+async function preview(artifact) {
+    const ui = ART[artifact];
+    setStatus(ui.st, 'Generating preview…', 'info');
+    document.getElementById(ui.stat).textContent = '';
+    document.getElementById(ui.pw).classList.remove('show');
+    let data;
+    try {
+        data = await apiGet('generate-' + artifact, { mode: 'preview' });
+    } catch (e) { setStatus(ui.st, 'Preview failed: ' + e.message, 'err'); return; }
+    if (!data.success) { setStatus(ui.st, data.error || 'Preview failed', 'err'); TOKENS[artifact] = null; return; }
+    TOKENS[artifact] = data.token || null;
+    document.getElementById(ui.ta).value = data.preview || '';
+    if (artifact === 'devices') {
+        document.getElementById('diff-devices').innerHTML = renderDevicesDiff(data.diff, data.skipped);
+    }
+    let stat = '';
+    if (data.stats && typeof data.stats.edges === 'number') stat = data.stats.edges + ' edge(s)';
+    if (data.source_version) stat += (stat ? ' · ' : '') + 'from ' + data.source_version;
+    document.getElementById(ui.stat).textContent = stat;
+    document.getElementById(ui.pw).classList.add('show');
+    setStatus(ui.st, 'Preview ready. Review, then confirm to write ' + ui.file + '.', 'ok');
+}
+
+async function applyArtifact(artifact) {
+    const ui = ART[artifact];
+    const token = TOKENS[artifact];
+    if (!token) { setStatus(ui.st, 'Re-preview before applying.', 'err'); return; }
+    const msg = artifact === 'topology'
+        ? 'Set this as the expected topology?\n\n' + ui.file + ' will be overwritten (the current file is backed up to .bak).'
+        : 'Write ' + ui.file + '?\n\nThe current file is backed up to .bak.';
+    if (!window.confirm(msg)) return;
+    setStatus(ui.st, 'Applying…', 'info');
+    let data;
+    try {
+        data = await apiPost('generate-' + artifact, { confirm: token }, { mode: 'apply' });
+    } catch (e) { setStatus(ui.st, 'Apply failed: ' + e.message, 'err'); return; }
+    if (data.success) {
+        setStatus(ui.st, data.message || (ui.file + ' saved.'), 'ok');
+        TOKENS[artifact] = null;
+        document.getElementById(ui.pw).classList.remove('show');
+    } else {
+        setStatus(ui.st, data.error || 'Apply failed', 'err');
+        if (data.token) TOKENS[artifact] = data.token;
+    }
+}
+
+// ---- Bootstrap advisor (feature-detected; hidden if unavailable) -------
+let advisorHistory = [];
+function advisorAppend(role, text) {
+    const log = document.getElementById('adv-log');
+    const el = document.createElement('div');
+    el.className = 'adv-msg ' + role;
+    el.textContent = text;
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+}
+function advisorKeydown(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); advisorSend(); }
+}
+async function advisorSend() {
+    const input = document.getElementById('adv-text');
+    const message = (input.value || '').trim();
+    if (!message) return;
+    input.value = '';
+    advisorAppend('user', message);
+    advisorHistory.push({ role: 'user', content: message });
+    document.getElementById('adv-send').disabled = true;
+    try {
+        const data = await apiPost('bootstrap', { message, history: advisorHistory });
+        if (data && data.success) {
+            const reply = data.reply || data.message || '(no reply)';
+            advisorAppend('assistant', reply);
+            advisorHistory.push({ role: 'assistant', content: reply });
+            // If the advisor proposes an artifact, route it through the preview gate.
+            if (data.artifact && ART[data.artifact] && data.preview) {
+                const ui = ART[data.artifact];
+                TOKENS[data.artifact] = data.token || null;
+                document.getElementById(ui.ta).value = data.preview;
+                if (data.artifact === 'devices' && data.diff) {
+                    document.getElementById('diff-devices').innerHTML = renderDevicesDiff(data.diff, data.skipped);
+                }
+                document.getElementById(ui.pw).classList.add('show');
+                setStatus(ui.st, 'Advisor proposed ' + ui.file + '. Review, then confirm to write.', 'info');
+            }
+        } else {
+            advisorAppend('system', (data && data.error) || 'Advisor request failed.');
+        }
+    } catch (e) {
+        advisorAppend('system', 'Advisor request failed: ' + e.message);
+    }
+    document.getElementById('adv-send').disabled = false;
+}
+
+async function probeAdvisor() {
+    // The advisor is optional: only reveal it if the backend exposes a
+    // bootstrap action. An appliance on local Ollama with no AI stays offline
+    // and this panel simply never appears.
+    try {
+        const data = await apiGet('bootstrap', { probe: '1' });
+        if (data && data.success && data.advisor_available) {
+            document.getElementById('advisor-panel').classList.add('show');
+            advisorAppend('system', 'Bootstrap advisor ready. Suggestions go through the preview + confirm gate above.');
+        }
+    } catch (e) { /* keep hidden */ }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    loadVersions();
+    probeAdvisor();
+});
+</script>
+</body>
+</html>

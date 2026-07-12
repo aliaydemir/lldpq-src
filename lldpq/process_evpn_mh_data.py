@@ -469,6 +469,7 @@ def _row_html(row: Mapping[str, Any]) -> str:
     return f"""
 <tr class="mh-row status-{_h(status)}" data-devices="{_h(devices)}"
     data-esi="{_h(row['esi'])}" data-status="{_h(status)}"
+    data-reason="{_h(row.get('reason', ''))}"
     data-bypass-active="{'1' if row['bypass_active'] else '0'}"
     data-inconsistent="{'1' if row['inconsistent'] else '0'}"
     data-orphan="{'1' if row['orphan'] else '0'}" {data_attrs}
@@ -546,9 +547,19 @@ def render_report(
     )
     table_rows = "\n".join(_row_html(row) for row in rows)
     if not table_rows:
+        if coverage_failures:
+            empty_text = (
+                "No Ethernet Segments were correlated, but this collection is "
+                "partial (see the banner above) — the fabric may not be fully "
+                "covered rather than free of multihoming issues."
+            )
+        else:
+            empty_text = (
+                "No local EVPN multihoming Ethernet Segments were found in the "
+                "current collection."
+            )
         table_rows = (
-            '<tr class="empty-row"><td colspan="10">No local EVPN multihoming '
-            "Ethernet Segments were found in the current collection.</td></tr>"
+            f'<tr class="empty-row"><td colspan="10">{_h(empty_text)}</td></tr>'
         )
     coverage_message = ""
     if coverage_failures:
@@ -580,10 +591,12 @@ select {{ width:210px; padding:7px 28px 7px 10px; background:#333; border:1px so
 .btn {{ display:inline-flex; align-items:center; gap:6px; border:0; border-radius:3px; padding:7px 12px; color:white; cursor:pointer; font-size:12px; }}
 .btn-secondary {{ background:#149fc7; }} .btn-secondary:hover {{ background:#19b6e2; }}
 .btn-primary {{ background:#76b900; }} .btn-primary:hover {{ background:#89d000; }}
-.summary-grid {{ display:grid; grid-template-columns:repeat(6,minmax(120px,1fr)); gap:10px; margin:14px 0; }}
+.summary-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:10px; margin:14px 0; }}
 .summary-card {{ background:#292929; border:1px solid #383838; border-left:3px solid #76b900; padding:12px; cursor:pointer; min-height:74px; }}
-.summary-card:nth-child(3) {{ border-left-color:#888; }} .summary-card:nth-child(4) {{ border-left-color:#ff9800; }}
-.summary-card:nth-child(5) {{ border-left-color:#f44336; }} .summary-card:nth-child(6) {{ border-left-color:#ba68c8; }}
+.summary-card.sev-healthy {{ border-left-color:#76b900; }} .summary-card.sev-warning {{ border-left-color:#ffc107; }}
+.summary-card.sev-critical,.summary-card.sev-inconsistent {{ border-left-color:#f44336; }}
+.summary-card.sev-bypass {{ border-left-color:#ff9800; }} .summary-card.sev-inactive {{ border-left-color:#777; }}
+.summary-card.sev-orphan {{ border-left-color:#ba68c8; }}
 .metric {{ font-size:24px; font-weight:700; color:#76b900; }} .metric-label {{ color:#999; font-size:10px; text-transform:uppercase; margin-top:5px; }}
 .dashboard-section {{ background:#292929; border:1px solid #383838; border-radius:8px; margin:12px 0 20px; overflow:hidden; }}
 .section-header {{ padding:12px 16px; background:#333; color:#76b900; font-weight:600; font-size:14px; display:flex; align-items:center; gap:8px; }}
@@ -608,13 +621,17 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
 .badge-healthy {{ color:#76b900; }} .badge-bypass {{ color:#ff9800; }} .badge-warning {{ color:#ffc107; }}
 .badge-inactive {{ color:#999; }} .badge-critical {{ color:#f44336; }}
 .detail-row td {{ padding:0; white-space:normal; max-width:none; }}
-.detail-panel {{ padding:14px 20px 18px; background:#202020; border:1px solid #ff9800; }}
+.detail-panel {{ padding:14px 20px 18px; background:#202020; border:1px solid #ff9800; box-sizing:border-box; }}
 .detail-title {{ color:#ffb300; font-weight:700; margin-bottom:12px; }}
-.compare-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
+.compare-grid {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:18px; }}
 .peer-card {{ background:#292929; border:1px solid #444; border-radius:4px; padding:12px; }}
 .peer-title {{ color:#76b900; font-size:15px; font-weight:700; border-bottom:1px solid #444; padding-bottom:7px; margin-bottom:7px; }}
 .kv {{ display:grid; grid-template-columns:145px 1fr; gap:8px; padding:4px 0; border-bottom:1px solid #333; }}
-.kv span:first-child {{ color:#999; }} .good {{ color:#76b900; }} .warn {{ color:#ff9800; }}
+.kv span:first-child {{ color:#999; }} .good {{ color:#76b900; }} .warn {{ color:#ff9800; }} .bad {{ color:#f44336; }}
+.member-table {{ width:100%; min-width:0; border-collapse:collapse; margin-top:10px; font-size:11px; table-layout:fixed; }}
+.member-table th,.member-table td {{ border:1px solid #3a3a3a; padding:3px 7px; text-align:left; word-break:break-word; overflow-wrap:anywhere; }}
+.member-table th {{ background:#2f2f2f; color:#9ccc3f; font-weight:600; }}
+.member-table code {{ color:#6fc7df; }}
 .detail-note {{ margin-top:12px; padding:10px 12px; background:#362b10; border:1px solid #8b6700; color:#ffc107; }}
 .coverage-banner {{ margin:12px 0; padding:9px 12px; background:#35270f; color:#ffb74d; border:1px solid #6d511d; }}
 .empty-row td {{ text-align:center; color:#888; padding:30px; }}
@@ -637,7 +654,7 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
 <div class="page-header">
   <div><div class="page-title">EVPN Multi-Homing Analysis</div><div class="last-updated">Last Updated: {_h(updated)}</div></div>
   <div class="action-buttons">
-    <div class="device-search-container"><select id="deviceSearch" onchange="filterRows()"><option value="">Search Device...</option>{options}</select></div>
+    <div class="device-search-container"><select id="deviceSearch" onchange="onDeviceChange()"><option value="">Search Device...</option>{options}</select></div>
     <button id="thresholds-btn" class="btn btn-secondary" onclick="openThresholdsModal()">⚙ Thresholds</button>
     <button id="run-analysis" class="btn btn-secondary" onclick="runAnalysis()">↻ Run Analysis</button>
     <button id="download-csv" class="btn btn-primary" onclick="downloadCSV()">⇩ Download CSV</button>
@@ -646,11 +663,13 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
 {coverage_message}
 <div class="summary-grid">
   <div class="summary-card" onclick="setStatus('')"><div class="metric" id="total-es">{counts['total']}</div><div class="metric-label">Local Ethernet Segments</div></div>
-  <div class="summary-card" onclick="setStatus('healthy')"><div class="metric" id="healthy-es">{counts['healthy']}</div><div class="metric-label">Healthy</div></div>
-  <div class="summary-card" onclick="setStatus('inactive')"><div class="metric" id="inactive-es">{counts['inactive']}</div><div class="metric-label">Inactive / Down</div></div>
-  <div class="summary-card" onclick="setStatus('bypass')"><div class="metric" id="bypass-es">{counts['bypass']}</div><div class="metric-label">LACP Bypass Active</div></div>
-  <div class="summary-card" onclick="setStatus('critical')"><div class="metric" id="inconsistent-es">{counts['inconsistent']}</div><div class="metric-label">BGP Inconsistent</div></div>
-  <div class="summary-card" onclick="setOrphan()"><div class="metric" id="orphan-es">{counts['orphan']}</div><div class="metric-label">Orphan ESI</div></div>
+  <div class="summary-card sev-healthy" onclick="setStatus('healthy')"><div class="metric" id="healthy-es">{counts['healthy']}</div><div class="metric-label">Healthy</div></div>
+  <div class="summary-card sev-warning" onclick="setStatus('warning')"><div class="metric" id="warning-es">{counts['warning']}</div><div class="metric-label">Warning</div></div>
+  <div class="summary-card sev-critical" onclick="setStatus('critical')"><div class="metric" id="critical-es">{counts['critical']}</div><div class="metric-label">Critical</div></div>
+  <div class="summary-card sev-bypass" onclick="setFlag('bypassActive')"><div class="metric" id="bypass-es">{counts['bypass']}</div><div class="metric-label">LACP Bypass Active</div></div>
+  <div class="summary-card sev-inactive" onclick="setStatus('inactive')"><div class="metric" id="inactive-es">{counts['inactive']}</div><div class="metric-label">Inactive / Down</div></div>
+  <div class="summary-card sev-inconsistent" onclick="setFlag('inconsistent')"><div class="metric" id="inconsistent-es">{counts['inconsistent']}</div><div class="metric-label">BGP Inconsistent</div></div>
+  <div class="summary-card sev-orphan" onclick="setFlag('orphan')"><div class="metric" id="orphan-es">{counts['orphan']}</div><div class="metric-label">Orphan ESI</div></div>
 </div>
 <div class="dashboard-section">
   <div class="section-header">
@@ -687,10 +706,24 @@ tr.status-inactive {{ border-left-color:#777; }} tr.status-critical {{ border-le
 </div>
 <script>
 const MH_DETAILS={details_json};
+const SEV_RANK={{critical:5,warning:4,bypass:3,inactive:2,healthy:1}};
 let statusFilter='';
-let orphanOnly=false;
+let flagFilter='';
 let sortState={{column:-1,ascending:true}};
 function esc(v){{return String(v??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));}}
+function memberTable(item){{
+  const list=item.member_details||[];
+  if(!list.length)return '';
+  const rows=list.map(m=>{{
+    const up=String(m.mii||'').toUpperCase()==='UP';
+    return `<tr>
+      <td><code>${{esc(m.name||'—')}}</code></td>
+      <td class="${{up?'good':'bad'}}">${{esc(m.mii||'—')}}</td>
+      <td class="${{m.synced?'good':'bad'}}">${{m.synced?'in-sync':'unsynced'}}</td>
+      <td class="${{m.bypass?'warn':''}}">${{m.bypass?'yes':'no'}}</td></tr>`;
+  }}).join('');
+  return `<table class="member-table"><thead><tr><th>Member</th><th>MII</th><th>Actor/Partner Sync</th><th>Bypass</th></tr></thead><tbody>${{rows}}</tbody></table>`;
+}}
 function side(item,role){{
   item=item||{{}};
   const members=(item.members||[]).join(', ')||'—';
@@ -704,7 +737,8 @@ function side(item,role){{
     <div class="kv"><span>LACP</span><span class="${{item.lacp==='Synced'?'good':'warn'}}">${{esc(state)}}</span></div>
     <div class="kv"><span>Actor / Partner Key</span><span>${{esc(item.actor_key||'—')}} / ${{esc(item.partner_key||'—')}}</span></div>
     <div class="kv"><span>Partner MAC</span><code>${{esc(item.partner_mac||'—')}}</code></div>
-    <div class="kv"><span>ES MAC / Local ID</span><span>${{esc(item.segment_mac||'—')}} / ${{esc(item.local_id??'—')}}</span></div></div>`;
+    <div class="kv"><span>ES MAC / Local ID</span><span>${{esc(item.segment_mac||'—')}} / ${{esc(item.local_id??'—')}}</span></div>
+    ${{memberTable(item)}}</div>`;
 }}
 function selectedSides(row){{
   const list=MH_DETAILS[row.dataset.esi]||[];
@@ -732,12 +766,31 @@ function filterRows(){{
   document.querySelectorAll('tr.mh-row').forEach(row=>{{
     orientRow(row);
     const devices=(row.dataset.devices||'').split(/\\s+/);
-    const show=(!device||devices.includes(device))&&(!statusFilter||row.dataset.status===statusFilter)&&(!orphanOnly||row.dataset.orphan==='1');
+    const flagOk=!flagFilter||row.dataset[flagFilter]==='1';
+    const show=(!device||devices.includes(device))&&(!statusFilter||row.dataset.status===statusFilter)&&flagOk;
     row.style.display=show?'':'none';
   }});
 }}
-function setStatus(value){{statusFilter=value;orphanOnly=false;filterRows();}}
-function setOrphan(){{statusFilter='';orphanOnly=true;filterRows();}}
+function syncQuery(){{
+  const p=new URLSearchParams(location.search);
+  const device=document.getElementById('deviceSearch').value;
+  statusFilter?p.set('status',statusFilter):p.delete('status');
+  flagFilter?p.set('flag',flagFilter):p.delete('flag');
+  device?p.set('device',device):p.delete('device');
+  const q=p.toString();
+  history.replaceState(null,'',location.pathname+(q?'?'+q:'')+location.hash);
+}}
+function applyQuery(){{
+  const p=new URLSearchParams(location.search);
+  statusFilter=p.get('status')||'';
+  flagFilter=p.get('flag')||'';
+  const device=p.get('device')||'';
+  const sel=document.getElementById('deviceSearch');
+  if(device&&Array.from(sel.options).some(o=>o.value===device))sel.value=device;
+}}
+function onDeviceChange(){{filterRows();syncQuery();}}
+function setStatus(value){{statusFilter=value;flagFilter='';filterRows();syncQuery();}}
+function setFlag(name){{statusFilter='';flagFilter=name;filterRows();syncQuery();}}
 function sortTable(column,header){{
   document.querySelectorAll('tr.detail-row').forEach(r=>r.remove());
   const body=document.getElementById('evpn-mh-body');
@@ -745,9 +798,14 @@ function sortTable(column,header){{
   const ascending=sortState.column===column?!sortState.ascending:true;
   sortState={{column,ascending}};
   rows.sort((a,b)=>{{
-    const av=(a.cells[column]?.textContent||'').trim();
-    const bv=(b.cells[column]?.textContent||'').trim();
-    const result=av.localeCompare(bv,undefined,{{numeric:true,sensitivity:'base'}});
+    let result;
+    if(column===9){{
+      result=(SEV_RANK[a.dataset.status]||0)-(SEV_RANK[b.dataset.status]||0);
+    }}else{{
+      const av=(a.cells[column]?.textContent||'').trim();
+      const bv=(b.cells[column]?.textContent||'').trim();
+      result=av.localeCompare(bv,undefined,{{numeric:true,sensitivity:'base'}});
+    }}
     return ascending?result:-result;
   }});
   rows.forEach(row=>body.appendChild(row));
@@ -766,9 +824,23 @@ function toggleDetails(row){{
   const detail=document.createElement('tr');detail.className='detail-row';
   detail.innerHTML=`<td colspan="10"><div class="detail-panel"><div class="detail-title">${{esc(a.hostname||'Device')}} ↔ ${{esc(b.hostname||'Peer')}} — ESI ${{esc(row.dataset.esi)}}</div>
     <div class="compare-grid">${{side(a,'DEVICE')}}${{side(b,'PEER')}}</div>
-    <div class="detail-note">${{bypass?'LACP bypass is active. Type-1/Type-4 advertisements and DF filtering are intentionally withdrawn — dual DF is expected, not a conflict.':esc(row.title||row.dataset.status)}}</div></div></td>`;
+    <div class="detail-note">${{bypass?'LACP bypass is active. Type-1/Type-4 advertisements and DF filtering are intentionally withdrawn — dual DF is expected, not a conflict.':esc(row.dataset.reason||row.dataset.status)}}</div></div></td>`;
   row.after(detail);
+  sizeDetailPanel();
 }}
+function sizeDetailPanel(){{
+  const panel=document.querySelector('tr.detail-row .detail-panel');
+  if(!panel)return;
+  const wrap=panel.closest('.table-wrap');
+  if(!wrap)return;
+  panel.style.width=wrap.clientWidth+'px';
+  panel.style.transform='translateX('+wrap.scrollLeft+'px)';
+  if(!wrap.dataset.detailSync){{
+    wrap.dataset.detailSync='1';
+    wrap.addEventListener('scroll',sizeDetailPanel,{{passive:true}});
+  }}
+}}
+window.addEventListener('resize',sizeDetailPanel);
 function openThresholdsModal(){{document.getElementById('thresholdModal').classList.add('show');}}
 function closeThresholdsModal(){{document.getElementById('thresholdModal').classList.remove('show');}}
 document.getElementById('thresholdModal').addEventListener('click',e=>{{if(e.target.id==='thresholdModal')closeThresholdsModal();}});
@@ -791,10 +863,28 @@ async function runAnalysis(){{
     const data=await response.json();
     if(!response.ok||data.status!=='success')throw new Error(data.message||'Trigger failed');
     if(window.waitForLldpqAnalysisCompletion)await window.waitForLldpqAnalysisCompletion(null,{{scope:'evpn-mh',pipelineId:data.trigger_id}});
-    location.replace(location.pathname+'?_analysis_refresh='+Date.now());
+    const p=new URLSearchParams(location.search);p.set('_analysis_refresh',Date.now());
+    location.replace(location.pathname+'?'+p.toString());
   }}catch(error){{alert('Analysis did not complete: '+(error.message||error));button.disabled=false;button.innerHTML=original;}}
 }}
+function recountSeverityCards(){{
+  // The homepage lifecycle scoper (lifecycle-scope.js) only refreshes the six
+  // canonical cards; keep the Critical/Warning cards in sync using the same
+  // lifecycle visibility rule so a scoped view is not left with stale counts.
+  const all=Array.from(document.querySelectorAll('#evpn-mh-body tr.mh-row'));
+  const scoped=all.some(r=>r.getAttribute('data-lifecycle-scoped-row')==='1');
+  const rows=scoped?all.filter(r=>r.getAttribute('data-lifecycle-scoped-row')==='1'&&!r.classList.contains('lldpq-lifecycle-hidden')):all;
+  const set=(id,n)=>{{const el=document.getElementById(id);if(el)el.textContent=n;}};
+  set('critical-es',rows.filter(r=>r.dataset.status==='critical').length);
+  set('warning-es',rows.filter(r=>r.dataset.status==='warning').length);
+}}
+const mhBody=document.getElementById('evpn-mh-body');
+if(mhBody&&window.MutationObserver){{
+  new MutationObserver(recountSeverityCards).observe(mhBody,{{subtree:true,childList:true,attributes:true,attributeFilter:['class','data-lifecycle-scoped-row']}});
+}}
+applyQuery();
 filterRows();
+recountSeverityCards();
 </script>
 <script src="/p2p-alias.js"></script>
 <script src="/css/analysis-guard.js?v=20260710-evpn-mh"></script>

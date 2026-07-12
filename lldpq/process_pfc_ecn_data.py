@@ -62,11 +62,16 @@ COUNTER_PATHS = {
     "rx_pause_frames": ("pfc-stats", "rx-pause-frames"),
     "tx_pause_frames": ("pfc-stats", "tx-pause-frames"),
 }
-REQUIRED_COUNTERS = (
-    "ecn_marked_frames",
+# Counter families are located and required independently.  A port that only
+# exposes one group (ECN egress stats without PFC pause stats, or vice versa)
+# is still analyzable for the signals the present group can prove; the absent
+# group's columns render as unavailable rather than forcing "missing".
+ECN_COUNTERS = ("ecn_marked_frames",)
+PFC_COUNTERS = (
     "rx_pause_frames",
     "tx_pause_frames",
 )
+REQUIRED_COUNTERS = ECN_COUNTERS + PFC_COUNTERS
 HISTORY_SECONDS = 24 * 60 * 60
 HISTORY_MAX_RECORDS_PER_PORT = 288
 
@@ -279,18 +284,24 @@ def validate_inventory_contract(
     return True, None
 
 
-def _find_qos_object(value: Any) -> Optional[Mapping[str, Any]]:
-    """Recursively locate the NVUE object containing both exact QoS groups."""
+def _find_group(value: Any, key: str) -> Optional[Any]:
+    """Recursively locate the first NVUE object holding ``key`` and return it.
+
+    Counter groups are located independently so a port that exposes only one
+    group (for example ECN/WRED egress stats without PFC pause stats when PFC is
+    not configured) still surfaces its collected counters instead of being
+    treated as entirely missing.
+    """
     if isinstance(value, Mapping):
-        if "egress-queue-stats" in value and "pfc-stats" in value:
-            return value
+        if key in value:
+            return value.get(key)
         for child in value.values():
-            found = _find_qos_object(child)
+            found = _find_group(child, key)
             if found is not None:
                 return found
     elif isinstance(value, list):
         for child in value:
-            found = _find_qos_object(child)
+            found = _find_group(child, key)
             if found is not None:
                 return found
     return None
@@ -332,13 +343,12 @@ def _counter_number(value: Any) -> Optional[int]:
 
 
 def extract_counters(payload: Mapping[str, Any]) -> Dict[str, Optional[int]]:
-    qos = _find_qos_object(payload)
     result: Dict[str, Optional[int]] = {name: None for name in COUNTER_PATHS}
-    if qos is None:
-        return result
     groups = {
-        "egress-queue-stats": _priority_three(qos.get("egress-queue-stats")),
-        "pfc-stats": _priority_three(qos.get("pfc-stats")),
+        "egress-queue-stats": _priority_three(
+            _find_group(payload, "egress-queue-stats")
+        ),
+        "pfc-stats": _priority_three(_find_group(payload, "pfc-stats")),
     }
     for name, (group_name, field) in COUNTER_PATHS.items():
         group = groups[group_name]
@@ -389,7 +399,11 @@ def build_port_record(
         deltas[name] = delta
         rates[name] = delta / duration
 
-    exact = all(counters.get(name) is not None for name in REQUIRED_COUNTERS)
+    ecn_present = all(counters.get(name) is not None for name in ECN_COUNTERS)
+    pfc_present = all(counters.get(name) is not None for name in PFC_COUNTERS)
+    # A port is analyzable when at least one counter family is fully present;
+    # the missing family stays unavailable instead of hiding the collected one.
+    exact = ecn_present or pfc_present
     if collection_status != "ok":
         sample_status = "collection_error"
     elif not exact:
@@ -555,9 +569,48 @@ def _fmt_sample_time(timestamp: float) -> str:
     return f"{value.day} {value:%b %Y, %H:%M:%S} UTC"
 
 
+HISTORY_DETAIL_SAMPLES = 24
+
+
+def _detail_history(
+    history: Mapping[str, Any], records: Iterable[Mapping[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Build a compact per-port sample trail for the expandable detail panels.
+
+    Only the fields the panel renders are kept, and each port is bounded to the
+    most recent ``HISTORY_DETAIL_SAMPLES`` entries so the embedded JSON stays
+    small regardless of the persisted 24h retention.
+    """
+    detail: Dict[str, List[Dict[str, Any]]] = {}
+    if not isinstance(history, Mapping):
+        return detail
+    for row in records:
+        key = str(row.get("port_key") or f"{row.get('hostname')}:{row.get('interface')}")
+        samples = history.get(key)
+        trail: List[Dict[str, Any]] = []
+        if isinstance(samples, list):
+            for entry in samples[-HISTORY_DETAIL_SAMPLES:]:
+                if not isinstance(entry, Mapping):
+                    continue
+                deltas = entry.get("deltas") if isinstance(entry.get("deltas"), Mapping) else {}
+                trail.append({
+                    "t": entry.get("timestamp_iso"),
+                    "status": entry.get("sample_status"),
+                    "signal": entry.get("signal"),
+                    "ecn": deltas.get("ecn_marked_frames"),
+                    "rx": deltas.get("rx_pause_frames"),
+                    "tx": deltas.get("tx_pause_frames"),
+                    "loss": entry.get("loss_delta"),
+                    "share": entry.get("ecn_share_percent"),
+                    "dur": entry.get("sample_duration_seconds"),
+                })
+        detail[key] = trail
+    return detail
+
+
 def render_report(
     records: List[Mapping[str, Any]],
-    _history: Mapping[str, Any],
+    history: Mapping[str, Any],
     expected_hosts: Optional[int] = None,
     current_hosts: Optional[int] = None,
     collection_unavailable: bool = False,
@@ -698,7 +751,8 @@ def render_report(
             f'data-{name.replace("_", "-")}="{int(value)}"'
             for name, value in row_flags.items()
         )
-        rows.append(f'''<tr data-search="{search}" data-status="{html.escape(status_key, quote=True)}" data-device="{html.escape(hostname, quote=True)}" {flag_attrs}>
+        port_key = html.escape(str(row.get("port_key") or f"{hostname}:{interface}"), quote=True)
+        rows.append(f'''<tr class="port-row" data-search="{search}" data-status="{html.escape(status_key, quote=True)}" data-device="{html.escape(hostname, quote=True)}" data-port-key="{port_key}" {flag_attrs} onclick="togglePfcDetails(this)">
 <td data-sort="{html.escape(hostname, quote=True)}" data-csv-value="{html.escape(hostname, quote=True)}" data-p2p-namespace="devices"><span data-p2p-key="{html.escape(hostname, quote=True)}" data-p2p-namespace="devices">{html.escape(hostname)}</span></td>
 <td data-sort="{html.escape(interface, quote=True)}" data-csv-value="{html.escape(interface, quote=True)}" data-p2p-namespace="interfaces"><code data-p2p-key="{html.escape(interface, quote=True)}" data-p2p-namespace="interfaces">{html.escape(interface)}</code></td>
 <td data-sort="{html.escape(status_label, quote=True)}"><span class="badge {status_class}">{html.escape(status_label)}</span></td>
@@ -714,13 +768,15 @@ def render_report(
 <td data-sort="{row['timestamp']}" data-csv-value="{html.escape(sample_time, quote=True)} / {html.escape(sample_window, quote=True)} window" title="{html.escape(str(row['timestamp_iso']), quote=True)}">{html.escape(sample_time)}<small>{html.escape(sample_window)} window</small></td>
 </tr>''')
 
-    latest_timestamp = max(
-        (float(row["timestamp"]) for row in records),
-        default=time.time(),
-    )
-    last_updated = datetime.fromtimestamp(
-        latest_timestamp, timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    # Data age reflects the newest collected sample, never the report-generation
+    # time; with no current samples we must not imply a fresh "now" update.
+    sample_timestamps = [float(row["timestamp"]) for row in records]
+    if sample_timestamps:
+        last_updated = datetime.fromtimestamp(
+            max(sample_timestamps), timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        last_updated = "no current samples"
     unavailable_banner = (
         '<div class="notice">No current switch collection is available; '
         'the table intentionally shows no current counters.</div>'
@@ -736,6 +792,27 @@ def render_report(
             + html.escape(failure_text)
             + '</div>'
         )
+    if collection_unavailable:
+        empty_message = (
+            "No current switch collection is available; no PFC/ECN counters "
+            "could be sampled."
+        )
+    elif coverage_failures:
+        empty_message = (
+            "No PFC/ECN counters were collected in the current window; see the "
+            "coverage notice above for affected devices."
+        )
+    else:
+        empty_message = "No PFC/ECN counter records in the current collection."
+    empty_row = (
+        '<tr class="empty-row"><td colspan="13">'
+        + html.escape(empty_message)
+        + '</td></tr>'
+    )
+    table_body = "".join(rows) if rows else empty_row
+    detail_json = json.dumps(
+        _detail_history(history, records), separators=(",", ":"), ensure_ascii=True
+    ).replace("</", "<\\/")
     return f'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>PFC/ECN Analysis</title>
@@ -764,6 +841,9 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
 .table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:1200px;font-size:13px}}th,td{{border:1px solid #404040;padding:9px 10px;text-align:left;white-space:nowrap}}th{{background:#333;color:#76b900;font-weight:600;font-size:12px;position:sticky;top:0;z-index:1}}tbody tr{{background:#252526}}tbody tr:hover{{background:#2d2d2d}}td:nth-child(n+4){{text-align:right}}td small{{display:block;color:#888;margin-top:2px}}code{{color:#9cdcfe}}
 .sortable{{cursor:pointer;user-select:none;padding-right:16px}}.sortable:hover{{background:#3c3c3c}}.sort-arrow{{font-size:10px;color:#666;margin-left:3px;opacity:.65}}.sortable.asc .sort-arrow,.sortable.desc .sort-arrow{{color:#76b900;opacity:1}}
 .badge{{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase}}.badge.ok{{background:rgba(118,185,0,.2);color:#76b900}}.badge.info{{background:rgba(79,195,247,.2);color:#4fc3f7}}.badge.warn{{background:rgba(255,152,0,.2);color:#ffb74d}}.badge.danger{{background:rgba(244,67,54,.2);color:#ff6b6b}}.badge.muted{{background:rgba(158,158,158,.2);color:#aaa}}
+tr.port-row{{cursor:pointer}}tr.empty-row td{{text-align:center;color:#888;padding:18px;white-space:normal}}
+tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#202020}}.detail-panel{{padding:14px 20px 18px;background:#202020;border-left:3px solid #4fc3f7}}.detail-title{{color:#4fc3f7;font-weight:700;margin-bottom:10px;font-size:13px}}
+.detail-empty{{color:#888}}.detail-table{{width:100%;min-width:0;font-size:12px;border-collapse:collapse}}.detail-table th,.detail-table td{{border:1px solid #383838;padding:5px 8px;white-space:nowrap;text-align:right;position:static}}.detail-table th{{background:#2a2a2a;color:#9ccc65;text-align:right}}.detail-table th:first-child,.detail-table td:first-child{{text-align:left}}.detail-table tbody tr{{background:#242424}}
 .guide-modal{{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.68);padding:40px 16px}}.guide-modal.open{{display:flex;align-items:flex-start;justify-content:center}}.guide-modal-box{{background:#1e1e1e;border:1px solid #3c3c3c;border-radius:8px;width:92%;max-width:960px;max-height:85vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,.55)}}
 .guide-modal-head{{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid #3c3c3c}}.guide-modal-head h2{{font-size:17px;color:#e0e0e0}}.guide-modal-close{{background:none;border:none;color:#aaa;font-size:26px;line-height:1;cursor:pointer;padding:0 6px}}.guide-modal-close:hover{{color:#fff}}.guide-modal-body{{padding:18px;overflow:auto;color:#aaa;font-size:13px;line-height:1.65}}
 .guide-intro{{padding:12px 14px;background:#252526;border-left:3px solid #76b900;color:#d4d4d4;margin-bottom:16px}}.guide-grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}}.guide-card{{background:#252526;border-left:3px solid #4fc3f7;padding:12px}}.guide-card:first-child{{border-left-color:#76b900}}.guide-card:last-child{{border-left-color:#ff9800}}.guide-card h3,.guide-section h3{{font-size:14px;color:#d4d4d4;margin-bottom:5px}}
@@ -809,7 +889,8 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
 <th class="sortable" data-type="number" aria-sort="none" title="TC3 transmitted frames since the previous sample">TC3 TX Δ <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="number" aria-sort="none" title="Combined TC3 unicast-buffer and WRED discard change">Discard Δ <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="number" aria-sort="none" title="Latest sample time and elapsed comparison window">Sample / Window <span class="sort-arrow">▲▼</span></th>
-</tr></thead><tbody>{''.join(rows)}</tbody></table></div></div></section>
+</tr></thead><tbody>{table_body}</tbody></table></div></div></section>
+<script id="pfc-history-data" type="application/json">{detail_json}</script>
 <div id="metricGuideModal" class="guide-modal" role="dialog" aria-modal="true" aria-labelledby="metricGuideTitle" aria-hidden="true">
   <div class="guide-modal-box"><div class="guide-modal-head"><h2 id="metricGuideTitle">PFC/ECN Metric Guide</h2><button type="button" class="guide-modal-close" onclick="closeMetricGuide()" title="Close" aria-label="Close metric guide">&times;</button></div>
   <div class="guide-modal-body"><div class="guide-intro">This report compares the latest switch counters with the previous successful collection. It monitors traffic class 3 (TC3) and switch priority 3 (SP3). Totals are cumulative hardware counters; “since last sample” values show what changed during the comparison window.</div>
@@ -850,11 +931,20 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
     return Boolean(dataKey && row.dataset[dataKey] === '1');
   }}
 
+  function dataRows() {{
+    return [...body.rows].filter(row => row.classList.contains('port-row'));
+  }}
+
+  function removeDetailRows() {{
+    body.querySelectorAll('tr.detail-row').forEach(row => row.remove());
+  }}
+
   function applyFilters() {{
     const query = search.value.trim().toLowerCase();
     const status = statusFilter.value;
     const device = deviceSearch.value;
-    [...body.rows].forEach(row => {{
+    removeDetailRows();
+    dataRows().forEach(row => {{
       const searchable = (row.dataset.search + ' ' + row.textContent).toLowerCase();
       row.hidden = Boolean(
         (query && !searchable.includes(query)) ||
@@ -907,7 +997,7 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
 
   function populateDevices() {{
     const devices = [...new Set(
-      [...body.rows].map(row => row.dataset.device).filter(Boolean)
+      dataRows().map(row => row.dataset.device).filter(Boolean)
     )].sort((a, b) => a.localeCompare(b, undefined, {{numeric: true, sensitivity: 'base'}}));
     devices.forEach(device => {{
       const option = document.createElement('option');
@@ -984,7 +1074,8 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
     const arrow = header.querySelector('.sort-arrow');
     if (arrow) arrow.textContent = direction === 1 ? '▲' : '▼';
     const numeric = header.dataset.type === 'number';
-    [...body.rows].sort((a, b) => {{
+    removeDetailRows();
+    dataRows().sort((a, b) => {{
       let first = a.cells[index].dataset.sort ?? '';
       let second = b.cells[index].dataset.sort ?? '';
       if (first === '' && second === '') return 0;
@@ -1004,7 +1095,7 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
       }}
       return cell.textContent.trim().replace(/\\s+/g, ' ');
     }};
-    const visibleRows = [...body.rows].filter(row => !row.hidden);
+    const visibleRows = dataRows().filter(row => !row.hidden);
     const lines = [
       headers.map(cleanHeader),
       ...visibleRows.map(row => [...row.cells].map(canonicalCell))
@@ -1024,6 +1115,62 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
   initDeviceSearch();
   applyRequestedCardFilter();
 }})();
+
+const PFC_HISTORY = (function() {{
+  try {{
+    const el = document.getElementById('pfc-history-data');
+    return el ? JSON.parse(el.textContent) : {{}};
+  }} catch (error) {{
+    return {{}};
+  }}
+}})();
+function pfcEsc(value) {{
+  return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({{
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }}[ch]));
+}}
+function pfcNum(value) {{
+  if (value === null || value === undefined || value === '') return '—';
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toLocaleString() : pfcEsc(value);
+}}
+function pfcPct(value) {{
+  if (value === null || value === undefined || value === '') return '—';
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(4) + '%' : '—';
+}}
+function pfcTime(value) {{
+  if (!value) return '—';
+  const d = new Date(value);
+  return Number.isNaN(d.getTime())
+    ? pfcEsc(value)
+    : d.toISOString().replace('T', ' ').replace(/\\.\\d+Z$/, ' UTC').replace('Z', ' UTC');
+}}
+function togglePfcDetails(row) {{
+  const next = row.nextElementSibling;
+  if (next && next.classList.contains('detail-row')) {{ next.remove(); return; }}
+  document.querySelectorAll('tr.detail-row').forEach(r => r.remove());
+  const key = row.dataset.portKey || '';
+  const samples = (PFC_HISTORY[key] || []).slice().reverse();
+  let panel;
+  if (!samples.length) {{
+    panel = '<div class="detail-empty">No retained 24-hour sample history for this port yet.</div>';
+  }} else {{
+    const rowsHtml = samples.map(s =>
+      `<tr><td>${{pfcTime(s.t)}}</td><td>${{pfcEsc(String(s.signal || s.status || '').replace(/_/g, ' '))}}</td>`
+      + `<td>${{pfcNum(s.ecn)}}</td><td>${{pfcPct(s.share)}}</td><td>${{pfcNum(s.rx)}}</td>`
+      + `<td>${{pfcNum(s.tx)}}</td><td>${{pfcNum(s.loss)}}</td></tr>`
+    ).join('');
+    panel = `<table class="detail-table"><thead><tr><th>Sample (UTC)</th><th>Signal</th>`
+      + `<th>ECN Δ</th><th>ECN %</th><th>PFC RX Δ</th><th>PFC TX Δ</th><th>Discard Δ</th></tr></thead>`
+      + `<tbody>${{rowsHtml}}</tbody></table>`;
+  }}
+  const detail = document.createElement('tr');
+  detail.className = 'detail-row';
+  detail.innerHTML = `<td colspan="13"><div class="detail-panel">`
+    + `<div class="detail-title">Recent 24-hour samples — ${{pfcEsc(key)}}</div>${{panel}}</div></td>`;
+  row.after(detail);
+}}
 
 let metricGuideReturnFocus = null;
 function openMetricGuide() {{
@@ -1135,7 +1282,6 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             str(path), path.name.removesuffix("_pfc_ecn.txt"), asset_snapshot
         )
     ]
-    inventory_hosts = set(statuses) if snapshot_valid else set()
     expected_hosts = (
         {host for host, status in statuses.items() if status == "OK"}
         if snapshot_valid else set()
@@ -1282,7 +1428,11 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     report = render_report(
         records,
         histories,
-        len(inventory_hosts) if snapshot_valid else None,
+        # Coverage is measured against the hosts we actually expect a current
+        # collection from (asset status OK), not the whole inventory.  Down or
+        # excluded devices are reported as coverage failures instead of
+        # permanently degrading a fully-collected fabric to "partial".
+        len(expected_hosts) if snapshot_valid else None,
         len(hosts_with_ports) if snapshot_valid else None,
         collection_unavailable=all_devices_unavailable,
         coverage_failures=coverage_failures,

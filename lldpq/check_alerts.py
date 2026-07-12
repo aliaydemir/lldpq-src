@@ -148,6 +148,10 @@ class LLDPqAlerts:
         self.notifications_disabled = False
         self.had_error = False
         self.run_manifest = None
+        # Parsed log_summary.json is cached for the run so per-device alert
+        # checks do not re-read and re-parse the whole file for every host.
+        self._log_summary_loaded = False
+        self._log_summary_data = None
         
         # Create state directory if it doesn't exist (like `mkdir -p`)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -1854,29 +1858,64 @@ Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']} 
             self.had_error = True
             return "unknown"
 
-    def get_device_log_counts(self, device):
-        """Get log severity counts for a device from processed summary"""
+    def _load_log_summary(self):
+        """Read and validate log_summary.json once per run; cache the result.
+
+        A corrupt or structurally invalid summary must fail loudly (had_error)
+        rather than silently disabling log alerting fabric-wide.  A summary that
+        is simply not 'current' (collection unavailable) is a legitimate skip.
+        """
+        if self._log_summary_loaded:
+            return self._log_summary_data
+        self._log_summary_loaded = True
+        self._log_summary_data = None
+
+        summary_file = self.monitor_results / "log_summary.json"
+        if not summary_file.exists():
+            return None
         try:
-            # Read from processed log_summary.json instead of raw files
-            summary_file = self.monitor_results / "log_summary.json"
-            if not summary_file.exists():
-                return None
-                
             with open(summary_file, 'r') as f:
                 summary_data = json.load(f)
-            
-            device_counts = summary_data.get("device_counts", {}).get(device)
-            if device_counts:
-                # Map to expected format
-                return {
-                    "critical": device_counts.get("critical", 0),
-                    "warnings": device_counts.get("warning", 0), 
-                    "errors": device_counts.get("error", 0),
-                    "info": device_counts.get("info", 0)
-                }
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"    ❌ Error reading log summary: {exc}")
+            self.had_error = True
             return None
-        except:
+
+        if not isinstance(summary_data, dict):
+            print("    ❌ log_summary.json is not an object")
+            self.had_error = True
             return None
+
+        # Only 'current' telemetry reflects live device state; an unavailable
+        # collection is a legitimate skip, not a corrupt-file error.
+        if summary_data.get("collection_status") != "current":
+            print("    ⚠️ log_summary.json has no current device telemetry")
+            return None
+
+        device_counts = summary_data.get("device_counts")
+        if not isinstance(device_counts, dict):
+            print("    ❌ log_summary.json has invalid device_counts")
+            self.had_error = True
+            return None
+
+        self._log_summary_data = summary_data
+        return summary_data
+
+    def get_device_log_counts(self, device):
+        """Get log severity counts for a device from the validated summary"""
+        summary_data = self._load_log_summary()
+        if not summary_data:
+            return None
+
+        device_counts = summary_data.get("device_counts", {}).get(device)
+        if not isinstance(device_counts, dict):
+            return None
+        return {
+            "critical": device_counts.get("critical", 0),
+            "warnings": device_counts.get("warning", 0),
+            "errors": device_counts.get("error", 0),
+            "info": device_counts.get("info", 0),
+        }
 
     def get_device_bgp_status(self, device):
         """Get BGP status for a device from processed summary"""

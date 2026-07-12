@@ -27,21 +27,42 @@ def parse_bgp_report(csv_path):
     down_active = []
     device_neighbors = defaultdict(set)
     
+    # Resolve columns by header name.  The exported BGP CSV injects VRF and
+    # Address Family columns (Device,VRF,Address Family,Neighbor,Interface,
+    # State,...), so a fixed positional read of State (old row[3]) silently
+    # picked up the Neighbor column and never matched IDLE/ACTIVE/ESTABLISHED.
+    # Fall back to the legacy positional layout when no header row is present.
+    col = {'device': 0, 'neighbor': 1, 'state': 3}
+
     with open(csv_path, 'r') as f:
         reader = csv.reader(f)
-        header_skipped = False
+        header_seen = False
         for row in reader:
-            if len(row) < 4 or row[0].startswith('#'):
+            if not row or row[0].startswith('#'):
                 continue
-            
-            # Skip header row
-            if not header_skipped:
-                if row[0].lower() == 'device' or row[0].lower() == 'hostname':
-                    header_skipped = True
+
+            # Detect and consume the header row, mapping columns by name.
+            if not header_seen:
+                header_seen = True
+                first = row[0].strip().lower()
+                if first in ('device', 'hostname'):
+                    lookup = {
+                        name.strip().lower(): idx for idx, name in enumerate(row)
+                    }
+                    col['device'] = lookup.get(
+                        'device', lookup.get('hostname', col['device'])
+                    )
+                    col['neighbor'] = lookup.get('neighbor', col['neighbor'])
+                    col['state'] = lookup.get('state', col['state'])
                     continue
-                header_skipped = True
-            
-            device, neighbor_raw, interface, state = row[0], row[1], row[2], row[3]
+                # No header: fall through and parse this first row positionally.
+
+            if len(row) <= max(col.values()):
+                continue
+
+            device = row[col['device']]
+            neighbor_raw = row[col['neighbor']]
+            state = row[col['state']].strip().upper()
             devices.add(device)
             
             # Skip firewall links

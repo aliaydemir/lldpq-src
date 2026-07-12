@@ -25,6 +25,7 @@ import re
 import json
 import html
 import time
+import tempfile
 from datetime import datetime, timezone
 
 try:
@@ -63,6 +64,37 @@ MAC_OBSERVER_STATE_TTL_SEC = 7 * 86400
 LOOP_MIN_MACS = 10             # >= this many MACs flapping between the SAME endpoint pair (no dup IP) = likely L2 loop
 STALE_AGE_SEC = 7 * 86400      # a quiesced dup whose EVPN sequence has not moved for this long = aged/stale
                                # (collapsed out of the main list; still available via the "aged" toggle)
+
+
+def _atomic_write(path, content):
+    """Write text to *path* atomically (tempfile + fsync + os.replace).
+
+    A concurrent web reader (or a mid-write kill) never observes a truncated
+    or empty file. Local copy of the repo-wide pattern; a per-file helper is
+    used deliberately so parallel fixers do not collide on a shared module.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _parse_ts(s):
@@ -136,13 +168,11 @@ class DuplicateAnalyzer:
 
     def _save_state(self):
         try:
-            with open(self.state_file, "w") as f:
-                json.dump(self.new_state, f)
+            _atomic_write(self.state_file, json.dumps(self.new_state))
         except Exception:
             pass
         try:
-            with open(self.ip_state_file, "w") as f:
-                json.dump(self.new_ip_state, f)
+            _atomic_write(self.ip_state_file, json.dumps(self.new_ip_state))
         except Exception:
             pass
 
@@ -1259,8 +1289,11 @@ class DuplicateAnalyzer:
 
     @staticmethod
     def _sev_badge(sev):
+        # Internal severity keeps "OK"; the badge renders the unified HEALTHY
+        # label so the vocabulary matches the other analysis pages.
         cls = {"CRITICAL": "badge-red", "WARNING": "badge-orange", "OK": "badge-green"}.get(sev, "badge-gray")
-        return '<span class="badge %s">%s</span>' % (cls, sev)
+        label = "HEALTHY" if sev == "OK" else sev
+        return '<span class="badge %s">%s</span>' % (cls, label)
 
     @staticmethod
     def _seq_cell(seq, delta, active=True):
@@ -1306,6 +1339,31 @@ class DuplicateAnalyzer:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sev_rank = {"CRITICAL": 0, "WARNING": 1, "OK": 2}
         all_devices = set()
+
+        # Freshness/coverage gate.  Computed up front so the empty-state rows can
+        # avoid reading as a healthy fabric when the sample is missing or partial
+        # (a no-data collection must not render green "no duplicates" rows).
+        if (not s["coverage_expected"]
+                or (not s["coverage_ip_current"]
+                    and not s["coverage_mac_evidence_current"])):
+            collection_status = "unavailable"
+        elif s["coverage_partial"]:
+            collection_status = "partial"
+        else:
+            collection_status = "current"
+
+        def _empty_row(colspan, healthy_text):
+            # Green check only when coverage is trustworthy; otherwise a neutral
+            # amber notice so an empty table is not misread as "all good".
+            if collection_status == "current":
+                return ("<tr><td colspan='%d' class='empty'>%s &#10003;</td></tr>"
+                        % (colspan, healthy_text))
+            reason = ("collection unavailable / stale"
+                      if collection_status == "unavailable"
+                      else "coverage partial")
+            return ("<tr><td colspan='%d' class='empty empty-stale'>"
+                    "No findings in the available sample &mdash; %s</td></tr>"
+                    % (colspan, reason))
 
         # ---- IP duplicate rows (authoritative FRR findings + the distinct
         # lower-confidence cross-device ARP observations)
@@ -1358,13 +1416,16 @@ class DuplicateAnalyzer:
                 note += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
             rowcls = " class='stale-row'" if r.get("stale") else ""
             ip_html.append(
-                "<tr data-sev='%d' data-devices='%s'%s><td>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
-                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono'>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-                    sev_rank.get(r["severity"], 3), html.escape(" ".join(sorted(devs))), rowcls, self._sev_badge(r["severity"]), vlanvni,
+                "<tr data-sev='%d' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td>%s</td><td data-sort='%d'>%s</td><td>%s</td></tr>" % (
+                    sev_rank.get(r["severity"], 3), html.escape(" ".join(sorted(devs))), rowcls,
+                    sev_rank.get(r["severity"], 3), self._sev_badge(r["severity"]), vlanvni,
                     html.escape(r["ip"]), macs, owner, vteps,
-                    self._seq_cell(r["seq"], r["delta"]), self._ago(r["recency"]), r["events"] or "&mdash;", note))
+                    r["seq"] or 0, self._seq_cell(r["seq"], r["delta"]),
+                    self._ago(r["recency"]),
+                    r["events"] or 0, r["events"] or "&mdash;", note))
         if not ip_html:
-            ip_html.append("<tr><td colspan='10' class='empty'>No duplicate IPs detected &#10003;</td></tr>")
+            ip_html.append(_empty_row(10, "No duplicate IPs detected"))
 
         # ---- MAC duplicate rows
         # Port map from related duplicate IPs: for a duplicate MAC the "other end" is often a
@@ -1432,16 +1493,16 @@ class DuplicateAnalyzer:
             else:
                 kind = "context"
             mac_html.append(
-                "<tr data-sev='%d' data-kind='%s' data-mobility-active='%s' data-devices='%s'%s><td>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
-                "<td class='mono'>%s</td><td class='mono'>%s</td><td>%s</td></tr>" % (
+                "<tr data-sev='%d' data-kind='%s' data-mobility-active='%s' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td>%s</td></tr>" % (
                     sev_rank.get(r["severity"], 3), kind,
                     str(bool(r.get("sequence_active"))).lower(),
                     html.escape(" ".join(sorted(devs))), rowcls,
-                    self._sev_badge(r["severity"]), vlanvni,
+                    sev_rank.get(r["severity"], 3), self._sev_badge(r["severity"]), vlanvni,
                     html.escape(r["mac"]), local, vteps,
-                    self._seq_cell(r["seq"], r.get("delta"), r.get("sequence_active", False)), note_html))
+                    r["seq"] or 0, self._seq_cell(r["seq"], r.get("delta"), r.get("sequence_active", False)), note_html))
         if not mac_html:
-            mac_html.append("<tr><td colspan='7' class='empty'>No MAC conflict, DAD, or mobility findings &#10003;</td></tr>")
+            mac_html.append(_empty_row(7, "No MAC conflict, DAD, or mobility findings"))
 
         # ---- APIPA rows (real access VLANs only; baseline link-local filtered out)
         apipa_rows = []
@@ -1453,12 +1514,12 @@ class DuplicateAnalyzer:
                 apipa_rows.append((sev_rank[sev], sev, host, vlan, cnt))
         apipa_rows.sort()
         apipa_html = []
-        for _, sev, host, vlan, cnt in apipa_rows:
+        for rank, sev, host, vlan, cnt in apipa_rows:
             all_devices.add(host)
-            apipa_html.append("<tr data-devices='%s'><td>%s</td><td class='mono'>%s</td><td>vlan %s</td><td class='mono'>%d</td></tr>" % (
-                html.escape(host), self._sev_badge(sev), html.escape(host), html.escape(vlan), cnt))
+            apipa_html.append("<tr data-devices='%s'><td data-sort='%d'>%s</td><td class='mono'>%s</td><td>vlan %s</td><td class='mono'>%d</td></tr>" % (
+                html.escape(host), rank, self._sev_badge(sev), html.escape(host), html.escape(vlan), cnt))
         if not apipa_html:
-            apipa_html.append("<tr><td colspan='4' class='empty'>No APIPA (169.254/16) addresses &#10003;</td></tr>")
+            apipa_html.append(_empty_row(4, "No APIPA (169.254/16) addresses"))
 
         # ---- DAD / multihoming note (shown in the Thresholds modal, not as a banner)
         dad_note = ""
@@ -1507,14 +1568,8 @@ class DuplicateAnalyzer:
                     % (STALE_AGE_SEC // 86400, stale_count))
 
         html_doc = _PAGE_TEMPLATE
-        if (not s["coverage_expected"]
-                or (not s["coverage_ip_current"]
-                    and not s["coverage_mac_evidence_current"])):
-            collection_status = "unavailable"
-        elif s["coverage_partial"]:
-            collection_status = "partial"
-        else:
-            collection_status = "current"
+        # collection_status was computed up front (used for the empty-state
+        # gate); the visible banner and the machine-summary div reuse it.
         machine_summary = (
             '<div data-analysis-summary="duplicate"'
             ' data-collection-status="%s"'
@@ -1546,7 +1601,32 @@ class DuplicateAnalyzer:
             s["coverage_failures"], str(s["coverage_partial"]).lower(),
             html.escape(json.dumps(self.coverage["failures"]), quote=True),
         )
+        # Visible coverage/freshness banner (gold-standard EVPN-MH parity): make
+        # a stale or partial collection impossible to mistake for a clean fabric.
+        coverage_banner = ""
+        if collection_status != "current":
+            failures = self.coverage.get("failures", [])
+            fail_txt = ""
+            if failures:
+                shown = ", ".join(failures[:6])
+                if len(failures) > 6:
+                    shown += " (+%d more)" % (len(failures) - 6)
+                fail_txt = " <span class='banner-detail'>[%s]</span>" % html.escape(shown)
+            if collection_status == "unavailable":
+                coverage_banner = (
+                    "<div class='coverage-banner banner-critical'>"
+                    "Collection unavailable or stale &mdash; this page cannot confirm a "
+                    "healthy fabric. %d/%d devices reporting complete evidence. Empty tables "
+                    "below do <b>not</b> mean there are no duplicates.%s</div>"
+                ) % (s["coverage_current"], s["coverage_expected"], fail_txt)
+            else:
+                coverage_banner = (
+                    "<div class='coverage-banner'>"
+                    "Partial collection &mdash; %d/%d devices with complete evidence; results "
+                    "may be incomplete.%s</div>"
+                ) % (s["coverage_current"], s["coverage_expected"], fail_txt)
         html_doc = html_doc.replace("__MACHINE_SUMMARY__", machine_summary)
+        html_doc = html_doc.replace("__COVERAGE_BANNER__", coverage_banner)
         html_doc = html_doc.replace("__NOW__", html.escape(now))
         html_doc = html_doc.replace("__AGED_BTN__", aged_btn)
         html_doc = html_doc.replace("__STALE_COUNT__", str(stale_count))
@@ -1562,8 +1642,7 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__MAC_ROWS__", "\n".join(mac_html))
         html_doc = html_doc.replace("__APIPA_ROWS__", "\n".join(apipa_html))
         html_doc = html_doc.replace("__DEVICES__", json.dumps(sorted(all_devices)))
-        with open(output_file, "w") as f:
-            f.write(html_doc)
+        _atomic_write(output_file, html_doc)
 
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -1606,6 +1685,11 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
 tr.stale-row { opacity:0.55; }
 body:not(.show-aged) tr.stale-row { display:none !important; }
 .empty { text-align:center; color:#76b900; padding:18px; }
+.empty.empty-stale { color:#ffb74d; }
+.coverage-banner { margin:0 0 16px; padding:9px 12px; background:#35270f; color:#ffb74d; border:1px solid #6d511d; border-radius:6px; font-size:13px; }
+.coverage-banner.banner-critical { background:#3a1e1e; color:#ff6b6b; border-color:#6d2020; }
+.coverage-banner b { color:inherit; }
+.coverage-banner .banner-detail { color:#c8964a; font-size:11px; }
 .delta-up { color:#ff6b6b; font-weight:bold; }
 .delta-muted { color:#aaa; font-weight:bold; }
 .badge { display:inline-block; padding:3px 9px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; }
@@ -1672,6 +1756,7 @@ __MACHINE_SUMMARY__
       Download CSV</button>
   </div>
 </div>
+__COVERAGE_BANNER__
 <div class="filter-info" id="filterInfo">Filtered &mdash; <span id="filterLabel"></span> <button onclick="showAllDup()">Show All</button></div>
 <div class="dashboard-section">
   <div class="section-header">Summary</div>
@@ -1770,6 +1855,7 @@ __MACHINE_SUMMARY__
 var DUP_DEVICES = __DEVICES__;
 var AGED_COUNT = __STALE_COUNT__;
 function toggleAged(){ var on=document.body.classList.toggle('show-aged'); var b=document.getElementById('agedBtn'); if(b){ b.textContent = on ? 'Hide aged' : ('Show aged ('+AGED_COUNT+')'); } }
+function sortKey(cell){ if(!cell) return ''; var v=cell.getAttribute('data-sort'); return v!==null ? v : (cell.innerText||'').trim(); }
 function sortTable(tid, col, numeric) {
   var t = document.getElementById(tid), tb = t.tBodies[0];
   var rows = Array.prototype.slice.call(tb.rows).filter(function(r){return !r.querySelector('.empty');});
@@ -1777,16 +1863,16 @@ function sortTable(tid, col, numeric) {
   var asc = t.getAttribute('data-sc') != (col+(numeric?'n':''));
   t.setAttribute('data-sc', asc ? (col+(numeric?'n':'')) : '');
   rows.sort(function(a,b){
-    var x=a.cells[col].innerText.trim(), y=b.cells[col].innerText.trim();
-    if (numeric){ x=parseFloat(x.replace(/[^0-9.\\-]/g,''))||0; y=parseFloat(y.replace(/[^0-9.\\-]/g,''))||0; return asc?x-y:y-x; }
-    return asc ? x.localeCompare(y) : y.localeCompare(x);
+    var x=sortKey(a.cells[col]), y=sortKey(b.cells[col]);
+    if (numeric){ x=parseFloat(String(x).replace(/[^0-9.\\-]/g,''))||0; y=parseFloat(String(y).replace(/[^0-9.\\-]/g,''))||0; return asc?x-y:y-x; }
+    return asc ? String(x).localeCompare(String(y)) : String(y).localeCompare(String(x));
   });
   rows.forEach(function(r){ tb.appendChild(r); });
 }
 ['ipt','mact','apt'].forEach(function(tid){
   var t=document.getElementById(tid); if(!t) return;
   Array.prototype.forEach.call(t.tHead.rows[0].cells, function(th, i){
-    var num = /Count|Seq|Events/i.test(th.innerText);
+    var num = /Count|Seq|Events|Severity/i.test(th.innerText);
     th.addEventListener('click', function(){ sortTable(tid, i, num); });
   });
 });
@@ -1872,12 +1958,26 @@ async function runAnalysis(){
   }
 }
 function csvEsc(v){ v=(v==null?'':String(v)); return '"'+v.replace(/"/g,'""')+'"'; }
-function downloadCSV(){
-  var out=[['Severity','VLAN/VNI','IP','MAC(s)','Owner','Conflict VTEP(s)','EVPN Seq','Last Dup Event','Events','Note']];
-  Array.prototype.slice.call(document.querySelectorAll('#ipt tbody tr')).forEach(function(r){
+function tableCSV(tid){
+  var t=document.getElementById(tid); if(!t||!t.tHead||!t.tBodies.length) return [];
+  var rows=[Array.prototype.slice.call(t.tHead.rows[0].cells).map(function(c){ return (c.innerText||'').trim().replace(/\\s+/g,' '); })];
+  Array.prototype.slice.call(t.tBodies[0].rows).forEach(function(r){
     if(r.style.display==='none' || r.querySelector('.empty')) return;
     if(r.classList.contains('stale-row') && !document.body.classList.contains('show-aged')) return;
-    out.push(Array.prototype.slice.call(r.cells).map(function(c){ return (c.innerText||'').trim().replace(/\\s+/g,' '); }));
+    rows.push(Array.prototype.slice.call(r.cells).map(function(c){ return (c.innerText||'').trim().replace(/\\s+/g,' '); }));
+  });
+  return rows;
+}
+function downloadCSV(){
+  var out=[];
+  [['Duplicate IPs (per VLAN / VNI)','ipt'],
+   ['MAC Findings (Confirmed / DAD / Mobility)','mact'],
+   ['APIPA / DHCP-failed (169.254.0.0/16)','apt']].forEach(function(sec){
+    var body=tableCSV(sec[1]);
+    out.push([sec[0]]);
+    if(body.length<=1){ out.push(['(no rows)']); }
+    else { body.forEach(function(r){ out.push(r); }); }
+    out.push([]);
   });
   var csv=out.map(function(r){ return r.map(csvEsc).join(','); }).join('\\n');
   var ts=new Date().toISOString().slice(0,16).replace('T','_').replace(/:/g,'-');

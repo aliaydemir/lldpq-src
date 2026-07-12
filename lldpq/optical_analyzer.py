@@ -13,6 +13,7 @@ import re
 import os
 import math
 import html
+import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
@@ -51,6 +52,38 @@ def coerce_optical_health(value: Any) -> OpticalHealth:
         except ValueError:
             pass
     return OpticalHealth.UNKNOWN
+
+
+def _atomic_write(path: str, content: str) -> None:
+    """Write ``content`` to ``path`` atomically (tempfile + fsync + replace).
+
+    A concurrent web reader or a mid-write termination never sees a truncated
+    or empty Analysis page/state file.  A small local copy is used here on
+    purpose so parallel analyzers do not share a cross-file module.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
 
 class OpticalAnalyzer:
     # Industry standard optical power thresholds (dBm)
@@ -151,8 +184,10 @@ class OpticalAnalyzer:
                 "current_optical_stats": self.current_optical_stats,
                 "last_update": time.time()
             }
-            with open(f"{self.data_dir}/optical_history.json", "w") as f:
-                json.dump(data, f, indent=2)
+            _atomic_write(
+                f"{self.data_dir}/optical_history.json",
+                json.dumps(data, indent=2),
+            )
         except Exception as e:
             print(f"Error saving optical history: {e}")
 
@@ -811,6 +846,29 @@ class OpticalAnalyzer:
         """Export optical data for web display - EXACT same styling as BGP/Link Flap"""
         summary = self.get_optical_summary()
         anomalies = self.detect_optical_anomalies()
+
+        # Group the already-computed anomalies (exact measured values and the
+        # specific remediation string) by port so they can be surfaced in the
+        # expandable per-row detail panel instead of being discarded.
+        anomalies_by_port: Dict[str, List[Dict[str, Any]]] = {}
+        for anomaly in anomalies:
+            anomalies_by_port.setdefault(anomaly.get('port', ''), []).append(anomaly)
+
+        # True data age: the newest sample timestamp actually collected, not the
+        # report-generation time.  This prevents a stale collection reading as
+        # freshly healthy.  Fall back to now() when no sample carries a time.
+        sample_times = [
+            stats.get('last_updated')
+            for stats in self.current_optical_stats.values()
+            if isinstance(stats.get('last_updated'), (int, float))
+        ]
+        if sample_times:
+            last_updated_text = datetime.fromtimestamp(
+                max(sample_times)
+            ).strftime('%Y-%m-%d %H:%M:%S')
+        else:
+            last_updated_text = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
         expected_hosts = getattr(self, 'coverage_expected_hosts', None)
         collected_hosts = getattr(self, 'coverage_collected_hosts', None)
         current_hosts = getattr(self, 'coverage_current_hosts', None)
@@ -888,7 +946,7 @@ class OpticalAnalyzer:
         .card-good {{ border-left-color: #8bc34a; }}
         .card-warning {{ border-left-color: #ff9800; }}
         .card-critical {{ border-left-color: #f44336; }}
-        .card-down {{ border-left-color: #ff9800; }}
+        .card-down {{ border-left-color: #ba68c8; }}
         .card-unplugged {{ border-left-color: #78909c; }}
         .card-unknown {{ border-left-color: #9e9e9e; }}
         .card-info {{ border-left-color: #4fc3f7; }}
@@ -898,12 +956,13 @@ class OpticalAnalyzer:
         .badge-green {{ background: rgba(118, 185, 0, 0.2); color: #76b900; }}
         .badge-red {{ background: rgba(244, 67, 54, 0.2); color: #ff6b6b; }}
         .badge-orange {{ background: rgba(255, 152, 0, 0.2); color: #ffb74d; }}
+        .badge-purple {{ background: rgba(186, 104, 200, 0.2); color: #ce93d8; }}
         .badge-gray {{ background: rgba(158, 158, 158, 0.2); color: #999; }}
         .optical-excellent {{ color: #76b900; font-weight: bold; }}
         .optical-good {{ color: #8bc34a; font-weight: bold; }}
         .optical-warning {{ color: #ff9800; font-weight: bold; }}
         .optical-critical {{ color: #f44336; font-weight: bold; }}
-        .optical-down {{ color: #ff9800; font-weight: bold; }}
+        .optical-down {{ color: #ba68c8; font-weight: bold; }}
         .optical-unplugged {{ color: #90a4ae; font-weight: bold; }}
         .optical-unknown {{ color: #888; }}
         .optical-table {{ width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }}
@@ -942,6 +1001,24 @@ class OpticalAnalyzer:
         .coverage-warning {{ background: rgba(255, 152, 0, 0.12); border: 1px solid #ff9800; border-radius: 6px; margin-bottom: 20px; padding: 14px 16px; color: #ffd180; }}
         .coverage-warning-title {{ color: #ffb74d; font-weight: 700; margin-bottom: 6px; }}
         .coverage-warning ul {{ margin: 8px 0 0 22px; }}
+        .optical-table tbody tr.detail-parent {{ cursor: pointer; }}
+        .detail-row td {{ padding: 0; border: 1px solid #404040; }}
+        .detail-panel {{ padding: 14px 18px 16px; background: #202020; border-left: 3px solid #ff9800; }}
+        .detail-title {{ color: #ffb300; font-weight: 700; margin-bottom: 10px; font-size: 13px; }}
+        .detail-anomaly {{ margin: 6px 0; padding: 8px 10px; border-radius: 4px; background: #2a2118; border: 1px solid #6d511d; }}
+        .detail-anomaly.critical {{ background: rgba(244, 67, 54, 0.1); border-color: #7a2a24; }}
+        .detail-anomaly-msg {{ color: #ffd180; font-weight: 600; }}
+        .detail-anomaly.critical .detail-anomaly-msg {{ color: #ff8a80; }}
+        .detail-anomaly-action {{ color: #9ccc65; margin-top: 3px; }}
+        .detail-lanes {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin: 10px 0; }}
+        .detail-lane-card {{ background: #262626; border: 1px solid #3c3c3c; border-radius: 4px; padding: 8px 10px; }}
+        .detail-lane-title {{ color: #76b900; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; }}
+        .detail-lane-values {{ color: #d4d4d4; font-family: monospace; font-size: 12px; }}
+        .detail-raw {{ margin-top: 8px; }}
+        .detail-raw summary {{ cursor: pointer; color: #4fc3f7; font-size: 12px; }}
+        .detail-raw pre {{ margin-top: 6px; padding: 10px; background: #161616; border: 1px solid #333; border-radius: 4px; color: #b0b0b0; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto; }}
+        .detail-empty {{ color: #888; font-size: 12px; }}
+        .empty-row td {{ text-align: center; color: #888; padding: 30px; }}
         ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
         ::-webkit-scrollbar-track {{ background: #1e1e1e; }}
         ::-webkit-scrollbar-thumb {{ background: #404040; border-radius: 4px; }}
@@ -953,7 +1030,7 @@ class OpticalAnalyzer:
     <div class="page-header">
         <div>
             <div class="page-title">Optical Diagnostics Analysis</div>
-            <div class="last-updated">Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+            <div class="last-updated">Last Updated: {last_updated_text}</div>
         </div>
         <div class="action-buttons">
             <div class="device-search-container">
@@ -1027,6 +1104,36 @@ class OpticalAnalyzer:
                      summary['unknown_ports'] + summary['good_ports'] +
                      summary['excellent_ports'])
 
+        # Per-row evidence for the expandable detail panel.  Surfaces the
+        # already-computed anomaly messages/actions and the raw per-lane arrays
+        # that the collapsed table row cannot show.  Emitted once as a single
+        # JSON blob (EVPN-MH pattern) and consumed by toggleDetails().
+        port_details: Dict[str, Any] = {}
+        for port in all_ports:
+            port_name = port['port']
+            stats = self.current_optical_stats.get(port_name, {})
+            port_details[port_name] = {
+                'health': port.get('health'),
+                'rx_lanes': stats.get('rx_power_lanes_dbm') or [],
+                'tx_lanes': stats.get('tx_power_lanes_dbm') or [],
+                'bias_lanes': stats.get('bias_current_lanes_ma') or [],
+                'rx_lane': port.get('rx_power_lane'),
+                'tx_lane': port.get('tx_power_lane'),
+                'bias_lane': port.get('bias_current_lane'),
+                'anomalies': [
+                    {
+                        'severity': item.get('severity', ''),
+                        'message': item.get('message', ''),
+                        'action': item.get('action', ''),
+                    }
+                    for item in anomalies_by_port.get(port_name, [])
+                ],
+                'raw': stats.get('raw_data', ''),
+            }
+        port_details_json = json.dumps(
+            port_details, separators=(',', ':'), ensure_ascii=True
+        ).replace('</', '<\\/')
+
         html_content += f"""
     <div class="dashboard-section">
         <div class="section-header">
@@ -1093,14 +1200,15 @@ class OpticalAnalyzer:
             elif health == 'critical':
                 badge_class = 'badge badge-red'
             elif health == 'down':
-                badge_class = 'badge badge-orange'
+                badge_class = 'badge badge-purple'
             elif health == 'unplugged':
                 badge_class = 'badge badge-gray'
             else:
                 badge_class = 'badge badge-gray'
 
+            port_key = html.escape(str(port['port']), quote=True)
             html_content += f"""
-                <tr data-device-key="{device_key}" data-health="{port['health']}">
+                <tr class="detail-parent" data-device-key="{device_key}" data-health="{port['health']}" data-port="{port_key}" onclick="toggleDetails(this)">
                     <td>{canonical(device_name)}</td>
                     <td>{interface_name}</td>
                     <td><span class="{badge_class}">{port['health'].upper()}</span></td>
@@ -1112,6 +1220,19 @@ class OpticalAnalyzer:
                     <td>{bias_current}</td>
                     <td>{recommended_action}</td>
                 </tr>"""
+
+        if not all_ports:
+            # Distinguish healthy-empty from stale/unavailable: a partial or
+            # failed collection is already announced by the coverage banner
+            # above, so this row states the empty table is not an error.
+            if missing_hosts:
+                empty_message = ('No optical diagnostics were collected. See the '
+                                 'partial-collection notice above.')
+            else:
+                empty_message = ('No optical modules with diagnostics were found '
+                                 '(all links are DAC/copper or no optics present).')
+            html_content += f"""
+                <tr class="empty-row"><td colspan="10">{html.escape(empty_message)}</td></tr>"""
 
         html_content += """
         </tbody>
@@ -1144,6 +1265,10 @@ class OpticalAnalyzer:
     </div>
 """
 
+        html_content += f"""
+    <script id="optical-details-data" type="application/json">{port_details_json}</script>
+"""
+
         html_content += """
     <!-- jQuery and Select2 for device search -->
     <script src="/css/jquery-3.5.1.min.js"></script>
@@ -1156,9 +1281,87 @@ class OpticalAnalyzer:
         let deviceSearchActive = false;
         let selectedDevice = '';
 
+        // Per-row detail evidence (anomaly messages/actions + per-lane arrays).
+        let opticalDetails = {};
+        try {
+            const detailNode = document.getElementById('optical-details-data');
+            if (detailNode) opticalDetails = JSON.parse(detailNode.textContent || '{}');
+        } catch (e) {
+            console.error('Could not parse optical detail data:', e);
+        }
+
+        function esc(value) {
+            return String(value === null || value === undefined ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function removeDetailRows() {
+            document.querySelectorAll('#optical-data tr.detail-row').forEach(r => r.remove());
+            document.querySelectorAll('#optical-data tr.detail-parent').forEach(
+                r => r.classList.remove('expanded')
+            );
+        }
+
+        function laneText(values, unit) {
+            if (!values || !values.length) return 'N/A';
+            return values.map((v, i) => 'L' + (i + 1) + ': ' +
+                (typeof v === 'number' ? v.toFixed(2) : esc(v)) + unit).join('  ');
+        }
+
+        function toggleDetails(row) {
+            if (!row.classList.contains('detail-parent')) return;
+            const next = row.nextElementSibling;
+            const wasOpen = next && next.classList.contains('detail-row');
+            removeDetailRows();
+            if (wasOpen) return;
+
+            const port = row.dataset.port || '';
+            const data = opticalDetails[port] || {};
+            let inner = '<div class="detail-panel">';
+            inner += '<div class="detail-title">' + esc(port) + ' — ' +
+                esc(String(data.health || 'unknown').toUpperCase()) + '</div>';
+
+            const anomalies = data.anomalies || [];
+            if (anomalies.length) {
+                anomalies.forEach(a => {
+                    const crit = a.severity === 'critical' ? ' critical' : '';
+                    inner += '<div class="detail-anomaly' + crit + '">' +
+                        '<div class="detail-anomaly-msg">' + esc(a.message) + '</div>' +
+                        (a.action ? '<div class="detail-anomaly-action">Action: ' +
+                            esc(a.action) + '</div>' : '') + '</div>';
+                });
+            } else {
+                inner += '<div class="detail-empty">No anomalies recorded for this port.</div>';
+            }
+
+            inner += '<div class="detail-lanes">';
+            inner += '<div class="detail-lane-card"><div class="detail-lane-title">RX Power (worst L' +
+                esc(data.rx_lane ?? '-') + ')</div><div class="detail-lane-values">' +
+                esc(laneText(data.rx_lanes, ' dBm')) + '</div></div>';
+            inner += '<div class="detail-lane-card"><div class="detail-lane-title">TX Power (worst L' +
+                esc(data.tx_lane ?? '-') + ')</div><div class="detail-lane-values">' +
+                esc(laneText(data.tx_lanes, ' dBm')) + '</div></div>';
+            inner += '<div class="detail-lane-card"><div class="detail-lane-title">Bias Current (worst L' +
+                esc(data.bias_lane ?? '-') + ')</div><div class="detail-lane-values">' +
+                esc(laneText(data.bias_lanes, ' mA')) + '</div></div>';
+            inner += '</div>';
+
+            if (data.raw) {
+                inner += '<details class="detail-raw"><summary>Raw diagnostics (truncated)</summary>' +
+                    '<pre>' + esc(data.raw) + '</pre></details>';
+            }
+            inner += '</div>';
+
+            const detail = document.createElement('tr');
+            detail.className = 'detail-row';
+            detail.innerHTML = '<td colspan="10">' + inner + '</td>';
+            row.after(detail);
+            row.classList.add('expanded');
+        }
+
         document.addEventListener('DOMContentLoaded', function() {
-            // Store all table rows for filtering
-            allRows = Array.from(document.querySelectorAll('#optical-data tr'));
+            // Store all data table rows for filtering (skip placeholder rows)
+            allRows = Array.from(document.querySelectorAll('#optical-data tr.detail-parent'));
 
             // Add click events to summary cards
             setupCardEvents();
@@ -1223,6 +1426,7 @@ class OpticalAnalyzer:
 
         function filterPorts(filterType) {
             currentFilter = filterType;
+            removeDetailRows();
 
             // Clear device search when using card filters
             if (deviceSearchActive) {
@@ -1290,6 +1494,7 @@ class OpticalAnalyzer:
 
         function clearFilter() {
             currentFilter = 'ALL';
+            removeDetailRows();
             document.querySelectorAll('.summary-card').forEach(card => {
                 card.classList.remove('active');
             });
@@ -1334,7 +1539,7 @@ class OpticalAnalyzer:
         
         function populateDeviceList() {
             const deviceSet = new Set();
-            allRows.forEach(row => {
+            document.querySelectorAll('#optical-data tr.detail-parent').forEach(row => {
                 // Device column (cells[0]) contains just the hostname
                 const deviceName = row.cells[0]?.textContent?.trim();
                 if (deviceName) {
@@ -1361,7 +1566,8 @@ class OpticalAnalyzer:
             
             selectedDevice = deviceName;
             deviceSearchActive = true;
-            
+            removeDetailRows();
+
             // Clear card-based filter
             currentFilter = 'ALL';
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
@@ -1388,6 +1594,7 @@ class OpticalAnalyzer:
         function clearDeviceSearch() {
             selectedDevice = '';
             deviceSearchActive = false;
+            removeDetailRows();
             $('#deviceSearch').val('').trigger('change');
             document.getElementById('clearSearchBtn').style.display = 'none';
             document.getElementById('filter-info').style.display = 'none';
@@ -1425,7 +1632,10 @@ class OpticalAnalyzer:
         function sortOpticalTable(columnIndex, direction, type) {
             const table = document.getElementById('optical-table');
             const tbody = table.querySelector('tbody');
-            const rows = Array.from(tbody.rows);
+            removeDetailRows();
+            const rows = Array.from(tbody.rows).filter(
+                row => !row.classList.contains('empty-row')
+            );
 
             rows.sort((a, b) => {
                 let aVal = a.cells[columnIndex].textContent.trim();
@@ -1606,13 +1816,14 @@ class OpticalAnalyzer:
                 const headers = Array.from(table.querySelectorAll('thead th')).map(th =>
                     th.textContent.replace('▲▼', '').trim()
                 );
-                let csvContent = headers.join(',') + '\\n';
 
-                // Get table data (only visible rows)
+                // Get table data (only visible data rows)
                 const tbody = table.querySelector('tbody');
                 const rows = tbody.querySelectorAll('tr');
 
-                // Add summary stats as comments
+                // Summary comments come BEFORE the header row so a spreadsheet or
+                // parser that skips leading '#' lines reads a clean header.
+                let csvContent = '';
                 csvContent += `# Optical Diagnostics Summary Report\\n`;
                 csvContent += `# Generated: ${now.toLocaleString()}\\n`;
                 csvContent += `# Total Ports: ${document.getElementById('total-ports').textContent}\\n`;
@@ -1623,10 +1834,24 @@ class OpticalAnalyzer:
                 csvContent += `# Down: ${document.getElementById('down-ports').textContent}\\n`;
                 csvContent += `# Unplugged: ${document.getElementById('unplugged-ports').textContent}\\n`;
                 csvContent += `# Unknown: ${document.getElementById('unknown-ports').textContent}\\n`;
-                csvContent += `#\\n`;
 
-                // Process each visible row
+                // Note when the export reflects an active filter so the totals
+                // above cannot be mistaken for the exported (filtered) rows.
+                const filterInfo = document.getElementById('filter-info');
+                const filtered = filterInfo && filterInfo.style.display !== 'none';
+                if (filtered) {
+                    const filterText = document.getElementById('filter-text').textContent.trim();
+                    csvContent += `# NOTE: Rows below reflect the active filter (${filterText}); summary counts above are for the full fabric.\\n`;
+                }
+                csvContent += `#\\n`;
+                csvContent += headers.join(',') + '\\n';
+
+                // Process each visible data row (skip detail/empty placeholder rows)
                 rows.forEach(row => {
+                    if (row.classList.contains('detail-row') ||
+                        row.classList.contains('empty-row')) {
+                        return;
+                    }
                     if (row.style.display !== 'none') {
                         const cells = row.querySelectorAll('td');
                         if (cells.length) {
@@ -1714,8 +1939,7 @@ class OpticalAnalyzer:
 </body>
 </html>"""
 
-        with open(output_file, "w") as f:
-            f.write(html_content)
+        _atomic_write(output_file, html_content)
 
 if __name__ == "__main__":
     analyzer = OpticalAnalyzer()
