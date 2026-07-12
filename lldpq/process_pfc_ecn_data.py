@@ -472,6 +472,38 @@ def build_port_record(
     }
 
 
+def _history_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    """Slim per-sample projection persisted in the 24h history file.
+
+    The history file is rewritten (and re-read, and re-validated) every run,
+    so its size directly drives the analyzer's load/write wall time on large
+    fabrics. Only the fields the downstream consumers actually read are kept
+    — the detail panels (_detail_history), ai_correlate and ai_insights —
+    while absolute counters live in the baseline file, rates are recomputable
+    as delta/duration, and hostname/interface repeat the series key.
+    """
+    deltas = record.get("deltas")
+    slim_deltas = (
+        {name: value for name, value in deltas.items() if value is not None}
+        if isinstance(deltas, Mapping) else {}
+    )
+    duration = record.get("sample_duration_seconds")
+    share = record.get("ecn_share_percent")
+    return {
+        "timestamp": record.get("timestamp"),
+        "sample_duration_seconds": (
+            round(duration, 3) if isinstance(duration, float) else duration
+        ),
+        "sample_status": record.get("sample_status"),
+        "signal": record.get("signal"),
+        "deltas": slim_deltas,
+        "ecn_share_percent": (
+            round(share, 4) if isinstance(share, float) else share
+        ),
+        "loss_delta": record.get("loss_delta"),
+    }
+
+
 def _read_state(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -593,8 +625,13 @@ def _detail_history(
                 if not isinstance(entry, Mapping):
                     continue
                 deltas = entry.get("deltas") if isinstance(entry.get("deltas"), Mapping) else {}
+                stamp = entry.get("timestamp")
                 trail.append({
-                    "t": entry.get("timestamp_iso"),
+                    # Slim history records store only the epoch timestamp; the
+                    # ISO form survives here for records persisted before that.
+                    "t": entry.get("timestamp_iso") or (
+                        _iso(stamp) if isinstance(stamp, (int, float)) else None
+                    ),
                     "status": entry.get("sample_status"),
                     "signal": entry.get("signal"),
                     "ecn": deltas.get("ecn_marked_frames"),
@@ -1392,7 +1429,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             port_history = histories.setdefault(key, [])
             if not isinstance(port_history, list):
                 port_history = histories[key] = []
-            port_history.append(record)
+            port_history.append(_history_record(record))
 
     hosts_without_ports = expected_hosts - hosts_with_ports
     if hosts_without_ports:

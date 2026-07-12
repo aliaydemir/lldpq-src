@@ -1864,7 +1864,9 @@ function autoResize(el) {
 async function loadAnalysisBadge() {
     const data = await apiCall('get-analysis');
     if (data.success && data.analysis && !data.stale) {
-        document.getElementById('analysisBadge').style.display = '';
+        // 'inline-block' explicitly: the stylesheet default is display:none, so
+        // clearing the inline style ('') would leave the badge hidden forever.
+        document.getElementById('analysisBadge').style.display = 'inline-block';
     }
 }
 
