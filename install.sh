@@ -731,10 +731,10 @@ render_lldpq_cron_file() {
         echo "$getconf_schedule $user /usr/local/bin/get-conf"
         echo "* * * * * $user /usr/local/bin/lldpq-trigger"
         echo "* * * * * www-data /usr/local/bin/lldpq-provision-scheduler"
-        echo "* * * * * $user cd $q_install && ./fabric-scan.sh >/dev/null 2>&1"
+        # Give a full collector scheduled on the same minute enough time to
+        # acquire the shared pipeline lock before this best-effort cache scan.
+        echo "* * * * * $user /bin/sleep 30 && cd $q_install && ./fabric-scan.sh >/dev/null 2>&1"
         echo "0 0 * * * $user cd $q_install && cp $q_web/topology.dot topology.dot.bkp 2>/dev/null; cp $q_web/topology_config.yaml topology_config.yaml.bkp 2>/dev/null; git add -A; git diff --cached --quiet || git commit -m \"auto: \$(date +\\%Y-\\%m-\\%d)\""
-        # Offset from the */10 collector starts so analyze sees a settled dataset.
-        echo "7 * * * * $user /usr/local/bin/lldpq-ai-analyze"
         if [[ "$include_fabric_cron" == "true" ]]; then
             echo "33 3 * * * $user $q_install/fabric-scan-cron.sh"
         fi

@@ -1,11 +1,26 @@
 #!/bin/bash
 # lldpq-ai-analyze - Autonomous fabric health analysis via AI
-# Called by cron hourly (or as configured)
+# Triggered after a successful full pipeline (hourly-throttled with --if-due)
 # Invokes ai-api.sh directly.  Loopback HTTP cannot authenticate a cron job and
 # must not be given a reusable browser session or an nginx auth bypass.
 
-if [[ -x /usr/local/bin/lldpq-config ]]; then
-    eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+RUN_IF_DUE=false
+case "${1:-}" in
+    "") ;;
+    --if-due) RUN_IF_DUE=true ;;
+    *)
+        echo "Usage: lldpq-ai-analyze [--if-due]" >&2
+        exit 2
+        ;;
+esac
+[[ $# -le 1 ]] || {
+    echo "Usage: lldpq-ai-analyze [--if-due]" >&2
+    exit 2
+}
+
+LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
+if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
+    eval "$("$LLDPQ_CONFIG_HELPER" 2>/dev/null)" || true
 fi
 
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
@@ -13,15 +28,6 @@ WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 # Only run if AI is configured (provider + model set)
 if [[ -z "$AI_PROVIDER" ]] || [[ -z "$AI_MODEL" ]]; then
     exit 0
-fi
-
-# Check if provider is reachable before wasting time
-if [[ "$AI_PROVIDER" == "ollama" ]]; then
-    OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
-    if ! curl --silent --fail --connect-timeout 3 --max-time 10 \
-        "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
-        exit 0  # Ollama not running, skip silently
-    fi
 fi
 
 # Serialize runs: a cron run and a manual Analyze click race on the same
@@ -35,10 +41,71 @@ if ! flock -n 9; then
     exit 0  # Another analyze run is already in progress
 fi
 
+# Full collections can finish every few minutes, but autonomous AI should run
+# at most once per hour. Record attempts (including provider/API failures) so a
+# persistent outage cannot create a request storm after every pipeline.
+AI_ANALYSIS_MIN_INTERVAL_SECONDS="${AI_ANALYSIS_MIN_INTERVAL_SECONDS:-3600}"
+if [[ "$AI_ANALYSIS_MIN_INTERVAL_SECONDS" =~ ^[0-9]{1,9}$ ]] && \
+   (( 10#$AI_ANALYSIS_MIN_INTERVAL_SECONDS > 0 )); then
+    AI_ANALYSIS_MIN_INTERVAL_SECONDS=$((10#$AI_ANALYSIS_MIN_INTERVAL_SECONDS))
+else
+    AI_ANALYSIS_MIN_INTERVAL_SECONDS=3600
+fi
+LAST_ATTEMPT_FILE="$AI_STATE_DIR/last-autonomous-attempt"
+NOW_EPOCH=$(date +%s)
+LAST_ACTIVITY=0
+if [[ -f "$LAST_ATTEMPT_FILE" && ! -L "$LAST_ATTEMPT_FILE" ]]; then
+    IFS= read -r LAST_ATTEMPT < "$LAST_ATTEMPT_FILE" || LAST_ATTEMPT=0
+    if [[ "$LAST_ATTEMPT" =~ ^[0-9]{1,12}$ ]]; then
+        LAST_ATTEMPT=$((10#$LAST_ATTEMPT))
+        (( LAST_ATTEMPT > LAST_ACTIVITY )) && LAST_ACTIVITY=$LAST_ATTEMPT
+    fi
+fi
+# A recent manual Analyze call writes the same private report but does not pass
+# through this wrapper. Honor that mtime so the next full pipeline does not pay
+# for an immediate duplicate autonomous call. The seeded "{}" file is ignored.
+ANALYSIS_FILE="$AI_STATE_DIR/analysis.json"
+if [[ -f "$ANALYSIS_FILE" && ! -L "$ANALYSIS_FILE" ]] && \
+   (( $(stat -c '%s' "$ANALYSIS_FILE" 2>/dev/null || printf '0') > 3 )); then
+    ANALYSIS_MTIME=$(stat -c '%Y' "$ANALYSIS_FILE" 2>/dev/null || printf '0')
+    if [[ "$ANALYSIS_MTIME" =~ ^[0-9]{1,12}$ ]]; then
+        ANALYSIS_MTIME=$((10#$ANALYSIS_MTIME))
+        (( ANALYSIS_MTIME > LAST_ACTIVITY )) && LAST_ACTIVITY=$ANALYSIS_MTIME
+    fi
+fi
+if [[ "$RUN_IF_DUE" == "true" ]] && \
+   (( NOW_EPOCH >= LAST_ACTIVITY )) && \
+   (( NOW_EPOCH - LAST_ACTIVITY < AI_ANALYSIS_MIN_INTERVAL_SECONDS )); then
+    exit 0
+fi
+if [[ -e "$LAST_ATTEMPT_FILE" && \
+      ( -L "$LAST_ATTEMPT_FILE" || ! -f "$LAST_ATTEMPT_FILE" ) ]]; then
+    echo "ERROR: unsafe autonomous analysis throttle state" >&2
+    exit 1
+fi
+ATTEMPT_TEMP=$(mktemp "$AI_STATE_DIR/.last-autonomous-attempt.XXXXXXXX") || exit 1
+if ! printf '%s\n' "$NOW_EPOCH" > "$ATTEMPT_TEMP" ||
+   ! chmod 0660 "$ATTEMPT_TEMP" ||
+   ! mv -fT "$ATTEMPT_TEMP" "$LAST_ATTEMPT_FILE"; then
+    rm -f "$ATTEMPT_TEMP"
+    exit 1
+fi
+
 # Keep only the most recent run in the log so it stays bounded.
 {
     echo "=== lldpq-ai-analyze run $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
 } > "$LOG_FILE"
+
+# Check if a local provider is reachable only after the hourly attempt has been
+# claimed; otherwise every successful full pipeline would retry the outage.
+if [[ "$AI_PROVIDER" == "ollama" ]]; then
+    OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+    if ! curl --silent --fail --connect-timeout 3 --max-time 10 \
+        "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
+        echo "Ollama is unavailable; autonomous analysis skipped" >> "$LOG_FILE"
+        exit 0
+    fi
+fi
 
 # Run the same CGI entry point with a process-local role.  This environment is
 # created by cron, not from HTTP request parameters; normal web requests still
@@ -57,14 +124,15 @@ if [[ $API_STATUS -ne 0 ]]; then
     exit 1
 fi
 
-# The CGI output is headers, a blank line, then one JSON object.  Exit
-# non-zero on {"success": false, ...} so cron mail/monitoring can see it.
+# The CGI output is headers, a blank line, then one JSON object. A detached
+# autonomous run is successful only when its current-generation report was
+# actually persisted for the Last Report UI.
 if ! printf '%s\n' "$RESPONSE" | python3 -c '
 import json, sys
 raw = sys.stdin.read()
 body = raw.split("\n\n", 1)[1] if "\n\n" in raw else raw
 data = json.loads(body)
-sys.exit(0 if data.get("success") is True else 1)
+sys.exit(0 if data.get("success") is True and data.get("persisted") is True else 1)
 ' 2>>"$LOG_FILE"; then
     echo "ERROR: lldpq-ai-analyze: AI analysis reported failure; see $LOG_FILE" >&2
     exit 1

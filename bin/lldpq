@@ -223,4 +223,13 @@ if [[ -d "monitor-results" ]] && [[ -f "notifications.yaml" ]]; then
     run_command python3 ./check_alerts.py || echo "⚠️  Alert check failed (non-critical)"
 fi
 
+# A trusted autonomous AI report must be based on the generation that just
+# finished, not on a fixed clock minute that can land inside a long collector.
+# The analyzer applies its own one-hour throttle and runs detached so it neither
+# extends this command nor inherits descriptor 9 and keeps the pipeline locked.
+AI_ANALYZER="${LLDPQ_AI_ANALYZER:-/usr/local/bin/lldpq-ai-analyze}"
+if [[ $fabric_status -eq 0 && -x "$AI_ANALYZER" ]]; then
+    nohup "$AI_ANALYZER" --if-due >/dev/null 2>&1 9>&- &
+fi
+
 exit "$fabric_status"

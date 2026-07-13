@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import ast
+from datetime import datetime, timezone
 import json
+import math
+import os
 import re
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -40,6 +44,163 @@ def load_symbols(*names):
 
 
 class AskAiApiContractTest(unittest.TestCase):
+    def test_markdown_tables_become_cross_channel_bullet_records(self):
+        formatter = load_symbols("_slack_safe_markdown_tables")[
+            "_slack_safe_markdown_tables"
+        ]
+        source = """*EW-tier — NEW/confirmed*
+| Device | Port(s) down | Peer | Down for |
+|---|---|---|---|
+| leaf01 | swp54s0/s1 | spine01 | 4d05h |
+| leaf02 | — | — | PSU3 fault |
+
+```text
+| literal | code |
+|---|---|
+```
+"""
+        formatted = formatter(source)
+        self.assertNotIn("| Device |", formatted)
+        self.assertIn("EW-tier — NEW/confirmed", formatted)
+        self.assertNotIn("*EW-tier", formatted)
+        self.assertIn("• leaf01", formatted)
+        self.assertIn(
+            "Port(s) down: swp54s0/s1 · Peer: spine01 · Down for: 4d05h",
+            formatted,
+        )
+        self.assertIn("• leaf02\n  ↳ Down for: PSU3 fault", formatted)
+        self.assertIn("| literal | code |", formatted)
+
+    def test_ai_prompts_forbid_pipe_tables_and_nested_emphasis(self):
+        values = {}
+        for node in TREE.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in {
+                        "SYSTEM_PROMPT_COMPACT", "SYSTEM_PROMPT_FULL"
+                    }:
+                        values[target.id] = ast.literal_eval(node.value)
+        self.assertEqual(set(values), {"SYSTEM_PROMPT_COMPACT", "SYSTEM_PROMPT_FULL"})
+        for prompt in values.values():
+            self.assertIn("NEVER emit pipe-delimited Markdown tables", prompt)
+            self.assertIn("nested", prompt)
+
+    def test_current_pipeline_with_unavailable_devices_is_reportable(self):
+        ns = load_symbols(
+            "_max_collection_age_seconds",
+            "_load_json_file",
+            "_mr_path",
+            "_pipeline_generation_state",
+        )
+        ns.update({
+            "os": os,
+            "math": math,
+            "datetime": datetime,
+            "timezone": timezone,
+        })
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            monitor = root / "lldpq/monitor-results"
+            inputs = monitor / ".pipeline-inputs"
+            web = root / "web"
+            inputs.mkdir(parents=True)
+            web.mkdir()
+            ns["LLDPQ_DIR"] = str(root / "lldpq")
+            ns["WEB_ROOT"] = str(web)
+            pipeline_id = "pipeline-test"
+            (monitor / ".lldpq-current.json").write_text(json.dumps({
+                "status": "current",
+                "pipeline_complete": True,
+                "pipeline_id": pipeline_id,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "max_age_seconds": 1800,
+                "device_count": 2,
+            }), encoding="utf-8")
+            outcomes = {
+                "pipeline_id": pipeline_id,
+                "expected_devices": 2,
+                "counts": {"current": 1, "unavailable": 1, "failed": 0},
+                "devices": {
+                    "leaf1": {"status": "current"},
+                    "leaf2": {"status": "unavailable"},
+                },
+            }
+            status_path = inputs / "collection_status.json"
+            status_path.write_text(json.dumps(outcomes), encoding="utf-8")
+
+            state = ns["_pipeline_generation_state"]({"leaf1", "leaf2"})
+
+            self.assertTrue(state["current"])
+            self.assertEqual(state["current_devices"], 1)
+            self.assertEqual(state["unavailable_devices"], 1)
+
+            outcomes["counts"] = {"current": 1, "unavailable": 0, "failed": 1}
+            outcomes["devices"]["leaf2"]["status"] = "failed"
+            status_path.write_text(json.dumps(outcomes), encoding="utf-8")
+            self.assertFalse(
+                ns["_pipeline_generation_state"]({"leaf1", "leaf2"})["current"]
+            )
+
+    def test_partial_coverage_persists_report_but_not_trusted_snapshot(self):
+        self.assertIn("if report_persistable:", PYTHON_TEXT)
+        self.assertIn("if collection_complete:", PYTHON_TEXT)
+        self.assertIn(
+            "if not isinstance(prev_snap, dict) or not prev_snap:", PYTHON_TEXT
+        )
+        self.assertIn(
+            "if scan_findings == [] and collection_complete:", PYTHON_TEXT
+        )
+        final_persistence = PYTHON_TEXT.split(
+            "# Persist a report from every transactionally current generation", 1
+        )[1].split("result_json(", 1)[0]
+        self.assertLess(
+            final_persistence.index("_save_json_state(ANALYSIS_FILE, analysis)"),
+            final_persistence.index("if collection_complete:"),
+        )
+        self.assertIn("snapshot_updated = True", final_persistence)
+
+    def test_current_partial_report_is_returned_as_fresh_last_analysis(self):
+        ns = load_symbols("_slack_safe_markdown_tables", "action_get_analysis")
+        captured = {}
+
+        def capture(payload):
+            captured.update(payload)
+            raise SystemExit(0)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            analysis = Path(temporary) / "analysis.json"
+            analysis.write_text(json.dumps({
+                "timestamp": time.time(),
+                "analysis": "517 current; 130 devices unavailable.",
+                "collection": {
+                    "complete": False,
+                    "generation": {
+                        "current": True,
+                        "current_devices": 517,
+                        "unavailable_devices": 130,
+                    },
+                },
+            }), encoding="utf-8")
+            ns.update({
+                "os": os,
+                "json": json,
+                "time": time,
+                "ANALYSIS_FILE": str(analysis),
+                "LEGACY_ANALYSIS_FILE": str(Path(temporary) / "legacy.json"),
+                "ANALYSIS_STALE_AFTER_SECONDS": 7500,
+                "_safe_public_metadata": lambda value: value,
+                "load_suppressions": lambda: [],
+                "_suppression_is_active": lambda _entry, _now: False,
+                "result_json": capture,
+            })
+
+            with self.assertRaises(SystemExit):
+                ns["action_get_analysis"]()
+
+        self.assertFalse(captured["stale"])
+        self.assertTrue(captured["coverage_partial"])
+        self.assertIn("130 devices unavailable", captured["analysis"])
+
     def test_common_comparison_phrases_choose_the_expected_window(self):
         ns = load_symbols("_requested_duration_hours", "_timeline_window_for_question")
         window = ns["_timeline_window_for_question"]

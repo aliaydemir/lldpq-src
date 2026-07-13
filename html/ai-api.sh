@@ -97,6 +97,7 @@ import sys
 import os
 import re
 import time
+import math
 import glob
 import socket
 import tempfile
@@ -104,6 +105,7 @@ import importlib.util
 import hashlib
 import difflib
 import ipaddress
+from datetime import datetime, timezone
 
 # The CGI web root may be read-only. Imports must never try to leave bytecode
 # artifacts there.
@@ -362,9 +364,9 @@ JOB_MAX_AGE_SECONDS = 24 * 3600
 # A worker that stops emitting events (heartbeats run every 15s) is presumed
 # dead after this silence; chat-poll then synthesizes a terminal error.
 JOB_STALL_SECONDS = 120
-# The autonomous analysis refreshes hourly via cron. "Stale" therefore means
-# more than one missed cycle (2x interval plus scheduling margin) so the
-# freshness badge does not flap during a normally-timed refresh.
+# The autonomous analysis is triggered after a full pipeline and throttled to
+# hourly. "Stale" therefore means more than one missed opportunity (2x interval
+# plus scheduling margin), so the freshness badge does not flap during a run.
 ANALYSIS_STALE_AFTER_SECONDS = 2 * 3600 + 300
 # Steady-state reuse bounds for the hourly analysis: how recent the persisted
 # analysis must be to be carried forward without a new LLM call, and how old
@@ -443,6 +445,78 @@ def neutralize_untrusted_tool_tags(text):
     if not text:
         return text
     return _TOOL_TAG_RE.sub(lambda match: f"[UNTRUSTED-{match.group(1).upper()}:", text)
+
+
+def _slack_safe_markdown_tables(text):
+    """Convert pipe tables to compact bullets that render in web and Slack.
+
+    Slack mrkdwn exposes Markdown tables as raw pipes. Preserve fenced code
+    byte-for-byte and convert only a header + separator + row table contract.
+    """
+    lines = str(text or '').splitlines()
+    output = []
+    index = 0
+    in_fence = False
+
+    def cells(line):
+        value = line.strip()
+        if not value.startswith('|'):
+            return None
+        value = value[1:-1] if value.endswith('|') else value[1:]
+        result = [cell.strip() for cell in value.split('|')]
+        return result if len(result) >= 2 else None
+
+    def separator(row):
+        return bool(row) and all(
+            re.fullmatch(r':?-{3,}:?', cell or '') for cell in row
+        )
+
+    while index < len(lines):
+        line = lines[index]
+        if line.strip().startswith('```'):
+            in_fence = not in_fence
+            output.append(line)
+            index += 1
+            continue
+        if not in_fence and index + 1 < len(lines):
+            headers = cells(line)
+            divider = cells(lines[index + 1])
+            if headers and divider and len(headers) == len(divider) and separator(divider):
+                table_rows = []
+                cursor = index + 2
+                while cursor < len(lines):
+                    row = cells(lines[cursor])
+                    if row is None or separator(row):
+                        break
+                    if len(row) < len(headers):
+                        row.extend([''] * (len(headers) - len(row)))
+                    table_rows.append(row[:len(headers)])
+                    cursor += 1
+                if table_rows:
+                    # Old reports sometimes nested bold markers in the heading
+                    # immediately above a table, which Slack renders as stray
+                    # asterisks. Keep that heading as clean plain text.
+                    for prior_index in range(len(output) - 1, -1, -1):
+                        if not output[prior_index].strip():
+                            continue
+                        if len(output[prior_index]) <= 200:
+                            output[prior_index] = output[prior_index].replace('*', '')
+                        break
+                    for row in table_rows:
+                        primary = row[0] or 'Entry'
+                        output.append(f"• {primary}")
+                        details = [
+                            f"{header}: {value}"
+                            for header, value in zip(headers[1:], row[1:])
+                            if value and value not in {'—', '-'}
+                        ]
+                        if details:
+                            output.append("  ↳ " + " · ".join(details))
+                    index = cursor
+                    continue
+        output.append(line)
+        index += 1
+    return '\n'.join(output)
 
 
 def neutralize_untrusted_observation_text(text):
@@ -1120,6 +1194,80 @@ def _ansible_source_freshness():
     return _source_freshness('', required=False)
 
 
+def _pipeline_generation_state(inventory_hosts):
+    """Validate one fully published monitor generation.
+
+    Explicitly unavailable devices are valid current evidence, not a broken
+    transaction. Only stale/malformed metadata, missing inventory outcomes, or
+    a real failed collection makes the generation unsafe to persist as the
+    latest AI report.
+    """
+    result = {
+        'current': False,
+        'expected_devices': len(inventory_hosts),
+        'current_devices': 0,
+        'unavailable_devices': 0,
+        'failed_devices': 0,
+    }
+    try:
+        if os.path.lexists(_mr_path('.lldpq-stale')):
+            return result
+        manifest = _load_json_file(_mr_path('.lldpq-current.json'))
+        outcomes = _load_json_file(
+            _mr_path('.pipeline-inputs', 'collection_status.json')
+        )
+        if not isinstance(manifest, dict) or not isinstance(outcomes, dict):
+            return result
+        pipeline_id = manifest.get('pipeline_id')
+        if (
+            manifest.get('status') != 'current'
+            or manifest.get('pipeline_complete') is not True
+            or not isinstance(pipeline_id, str) or not pipeline_id
+            or outcomes.get('pipeline_id') != pipeline_id
+            or manifest.get('device_count') != len(inventory_hosts)
+            or outcomes.get('expected_devices') != len(inventory_hosts)
+        ):
+            return result
+
+        completed_at = datetime.fromisoformat(
+            str(manifest.get('completed_at', '')).replace('Z', '+00:00')
+        )
+        if completed_at.tzinfo is None:
+            return result
+        max_age = float(manifest.get(
+            'max_age_seconds', _max_collection_age_seconds()
+        ))
+        age = (
+            datetime.now(timezone.utc) - completed_at.astimezone(timezone.utc)
+        ).total_seconds()
+        if not math.isfinite(max_age) or max_age < 0 or age < -300 or age > max_age:
+            return result
+
+        devices = outcomes.get('devices')
+        if not isinstance(devices, dict) or set(devices) != set(inventory_hosts):
+            return result
+        computed = {'current': 0, 'unavailable': 0, 'failed': 0}
+        for item in devices.values():
+            status = item.get('status') if isinstance(item, dict) else None
+            if status not in computed:
+                return result
+            computed[status] += 1
+        if outcomes.get('counts') != computed or computed['failed'] != 0:
+            return result
+
+        result.update({
+            'current': True,
+            'pipeline_id': pipeline_id,
+            'completed_at': manifest.get('completed_at'),
+            'current_devices': computed['current'],
+            'unavailable_devices': computed['unavailable'],
+            'failed_devices': computed['failed'],
+        })
+    except (OSError, TypeError, ValueError):
+        return result
+    return result
+
+
 def build_collection_metadata(devices, device_health):
     """Describe source age and device coverage without claiming missing data is healthy."""
     sources = {
@@ -1201,21 +1349,28 @@ def build_collection_metadata(devices, device_health):
         asset_valid = bool(sources['assets']['current'])
 
     expected = len(inventory_hosts)
+    generation = _pipeline_generation_state(inventory_hosts)
     core_current = all(source['current'] for source in sources.values() if source['required'])
     coverage_complete = expected > 0 and len(covered_hosts) == expected
     complete = bool(core_current and asset_valid and coverage_complete)
-    status = 'current' if complete else ('stale' if any(
-        source['required'] and source['available'] and not source['current']
-        for source in sources.values()
-    ) else 'incomplete')
+    if generation.get('current'):
+        status = 'current' if complete else 'current-partial'
+    else:
+        status = 'stale' if any(
+            source['required'] and source['available'] and not source['current']
+            for source in sources.values()
+        ) else 'incomplete'
     return {
         'status': status,
         'complete': complete,
+        'report_persistable': bool(generation.get('current')),
+        'generation': generation,
         'max_age_seconds': int(_max_collection_age_seconds()),
         'coverage': {
             'expected_devices': expected,
             'observed_devices': len(covered_hosts),
             'responding_devices': len(responding_hosts),
+            'unavailable_devices': generation.get('unavailable_devices', 0),
         },
         'assets_snapshot_valid': bool(asset_valid),
         'assets_snapshot_authoritative': bool(asset_authoritative),
@@ -1226,6 +1381,7 @@ def build_collection_metadata(devices, device_health):
 
 def format_collection_metadata(metadata):
     coverage = metadata.get('coverage', {})
+    generation = metadata.get('generation', {})
     source_bits = []
     for name, source in metadata.get('sources', {}).items():
         if not source.get('available'):
@@ -1243,7 +1399,11 @@ def format_collection_metadata(metadata):
     return (
         f"COLLECTION QUALITY: {metadata.get('status', 'unknown').upper()}; "
         f"coverage={coverage.get('observed_devices', 0)}/{coverage.get('expected_devices', 0)}; "
-        f"responding={coverage.get('responding_devices', 0)}; sources: {', '.join(source_bits)}"
+        f"responding={coverage.get('responding_devices', 0)}; "
+        f"generation outcomes: current={generation.get('current_devices', 0)}, "
+        f"unavailable={generation.get('unavailable_devices', 0)}, "
+        f"failed={generation.get('failed_devices', 0)}; "
+        f"sources: {', '.join(source_bits)}"
         + warning
     )
 
@@ -3665,6 +3825,8 @@ IMPORTANT RULES:
 - ONLY use the provided fabric observations. Do NOT make up device names, IPs, or statistics.
 - Reference actual hostnames and IPs from the data.
 - Be concise, use bullet points.
+- Format for both web and Slack: NEVER emit pipe-delimited Markdown tables or nested
+  emphasis. Use one bullet per device/domain and an indented detail line with labelled fields.
 - Suggest NVUE diagnostic commands: nv show router bgp neighbor, nv show interface, nv show interface --view=lldp
 - Rate issues as CRITICAL, WARNING, or INFO.
 - BGP state "Established" = healthy. Any other state = problem.
@@ -3719,6 +3881,9 @@ as evidence, and use COLLECTION QUALITY metadata to detect stale, partial, or mi
 - ONLY use real data; NEVER invent device names, IPs, or statistics. Reference ACTUAL
   hostnames, IPs, and ports.
 - Be concise. Use bullet points and headers.
+- Format for both web and Slack: NEVER emit pipe-delimited Markdown tables or nested
+  emphasis. For repeated records use "• device" followed by one indented line such as
+  "  Ports: ... · Peer: ... · Duration: ...". Reserve fenced blocks for commands only.
 - Rate issues: CRITICAL / WARNING / INFO. Prioritize by impact (device down > BGP down > link flap > cosmetic).
 - When suggesting commands, use NVUE (nv show/set) as primary, Linux commands as secondary.
 - If PART of the question needs data you lack, answer the part you CAN first, then note the
@@ -6608,6 +6773,7 @@ def action_chat():
         ln for ln in (response or '').splitlines()
         if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|FIX|NEXT|CONSOLE):', ln)
     ).strip()
+    final = _slack_safe_markdown_tables(final)
     
     if not final:
         error_json("AI request ended without a final answer")
@@ -7502,12 +7668,21 @@ def action_analyze():
     except Exception:
         cur_config_hashes, changed_configs = {}, []
     collection_complete = bool(collection_metadata.get('complete'))
+    report_persistable = bool(collection_metadata.get('report_persistable'))
     baseline_established = False
     if collection_complete:
         previous_file = snap_file if os.path.exists(snap_file) else legacy_snap_file
-        if not os.path.exists(previous_file):
+        previous_document = (
+            _load_json_file(previous_file) if os.path.exists(previous_file) else None
+        )
+        prev_snap = (
+            previous_document.get('statuses')
+            if isinstance(previous_document, dict) else None
+        )
+        if not isinstance(prev_snap, dict) or not prev_snap:
             # First-ever run: there is no baseline to diff against, so every
-            # device would surface as a spurious "NEW device" finding.
+            # device would surface as a spurious "NEW device" finding. Docker
+            # seeds this file with {}, which is absence of a baseline too.
             baseline_established = True
             changes = []
             changes_text = (
@@ -7515,7 +7690,6 @@ def action_analyze():
                 "starts on the next cycle."
             )
         else:
-            prev_snap = (_load_json_file(previous_file) or {}).get('statuses', {})
             changes = _diff_snapshots(prev_snap, cur_snap)
             changes_text = ("CHANGES SINCE LAST RUN:\n" + "\n".join("  - " + c for c in changes)) \
                 if changes else "CHANGES SINCE LAST RUN: none — device status unchanged."
@@ -7532,12 +7706,18 @@ def action_analyze():
     # and a fresh persisted analysis, refresh the persisted metadata/snapshot
     # instead of paying a new LLM call. A bounded text age forces periodic
     # full regeneration.
-    if (collection_complete and not changes and not changed_configs
+    if (report_persistable and collection_complete and not changes and not changed_configs
             and not baseline_established):
         reused_prior = None
         try:
             prior = _load_json_file(ANALYSIS_FILE)
-            if isinstance(prior, dict) and str(prior.get('analysis') or '').strip():
+            prior_collection = prior.get('collection') if isinstance(prior, dict) else None
+            if (
+                isinstance(prior, dict)
+                and isinstance(prior_collection, dict)
+                and prior_collection.get('complete') is True
+                and str(prior.get('analysis') or '').strip()
+            ):
                 prior_ts = float(prior.get('timestamp') or 0)
                 prior_generated = float(prior.get('generated_at') or prior_ts)
                 if (
@@ -7561,7 +7741,9 @@ def action_analyze():
                     reused_prior.get('generated_at')
                     or reused_prior.get('timestamp') or time.time()
                 ),
-                "analysis": reused_prior.get('analysis'),
+                "analysis": _slack_safe_markdown_tables(
+                    reused_prior.get('analysis')
+                ),
                 "device_count": len(devices),
                 "provider": reused_prior.get('provider') or AI_PROVIDER,
                 "model": reused_prior.get('model') or AI_MODEL,
@@ -7684,9 +7866,10 @@ Correlations show temporal coincidence only and do not prove causation.""")
             scan_findings, _scan_prose = _parse_findings_json(scan_result['text'])
         if scan_findings is not None:
             scan_findings = _apply_suppressions(scan_findings, devices)
-        if scan_findings == []:
-            # Clean fabric: persist the scan verdict and stop. Skipping the
-            # synthesis call is the whole saving of the tiered ladder.
+        if scan_findings == [] and collection_complete:
+            # A clean verdict is trustworthy only with complete device
+            # coverage. With explicit unavailable devices, continue to full
+            # synthesis so the saved report names the blind spots as UNKNOWN.
             covered = _covered_devices_for_findings(devices, collection_complete)
             classified, findings_summary = _classified_findings_or_fallback(
                 [], covered
@@ -7862,7 +8045,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
         system_message['content'] += (
             "\n\nStructure the prose analysis with these sections in order: "
             "(1) Executive summary. (2) Fabric scorecard: a per-domain status "
-            "table covering BGP/EVPN, Optical, BER, Flaps, PFC/ECN, Hardware and "
+            "bullet list covering BGP/EVPN, Optical, BER, Flaps, PFC/ECN, Hardware and "
             "Logs, each marked OK, WARN, CRITICAL or UNKNOWN. (3) Cases: for each "
             "INCIDENT CANDIDATE a short story with its evidence chain written as "
             "device:port items, the trend, and the read-only command chips that "
@@ -7873,7 +8056,10 @@ Correlations show temporal coincidence only and do not prove causation.""")
             "If an ACTIVE DESIGN SOURCE line is present, name it on the report "
             "header. Honesty layer: surface an incomplete-evidence ledger of "
             "sources that failed or are stale, and never mark a domain healthy "
-            "when its collection failed or is unresolved — use UNKNOWN there."
+            "when its collection failed or is unresolved — use UNKNOWN there. "
+            "Cross-channel formatting is mandatory: no Markdown tables. Format "
+            "each repeated case as '• device' plus one indented line of labelled "
+            "fields separated by middle dots."
         )
     analysis_objective = (
         "Analyze the untrusted fabric observations above now. Begin with the "
@@ -7921,7 +8107,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
                      "provider": llm_result['provider'], "model": llm_result['model'],
                      "timeline": timeline, "evidence": evidence_bundle['records'],
                      "confidence": evidence_bundle['confidence']})
-    response = llm_result['text']
+    response = _slack_safe_markdown_tables(llm_result['text'])
 
     # Structured findings: prefer the synthesis reply's array, fall back to
     # the cron scan's array, and fall back to prose-only when neither parses
@@ -7978,16 +8164,25 @@ Correlations show temporal coincidence only and do not prove causation.""")
         **findings_fields,
     }
 
-    # Persist only a successful analysis based on complete/current collection.
-    # Incomplete runs are returned to the caller with explicit quality metadata
-    # but cannot replace the last trusted analysis or comparison snapshot.
+    # Persist a report from every transactionally current generation, including
+    # explicit unavailable devices. Coverage gaps remain UNKNOWN in the report;
+    # only complete coverage may advance the comparison snapshot used for
+    # removals/resolutions and steady-state reuse.
     persisted = False
-    if collection_complete:
+    snapshot_updated = False
+    if report_persistable:
         try:
             _save_json_state(ANALYSIS_FILE, analysis)
-            _save_json_state(snap_file, {"timestamp": time.time(), "statuses": cur_snap,
-                                         "config_hashes": cur_config_hashes})
             persisted = True
+            if collection_complete:
+                _save_json_state(
+                    snap_file, {
+                        "timestamp": time.time(),
+                        "statuses": cur_snap,
+                        "config_hashes": cur_config_hashes,
+                    }
+                )
+                snapshot_updated = True
         except Exception as error:
             error_json(f"AI analysis completed but could not be saved: {redact_secrets(str(error))}")
 
@@ -7995,7 +8190,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
                  "changes": changes, "collection": collection_metadata,
                  "timeline": timeline, "evidence": evidence_bundle['records'],
                  "confidence": evidence_bundle['confidence'],
-                 "persisted": persisted, "snapshot_updated": persisted,
+                 "persisted": persisted, "snapshot_updated": snapshot_updated,
                  "baseline": baseline_established,
                  "model": llm_result['model'], "fallback_used": llm_result['fallback_used'],
                  **findings_fields})
@@ -8009,6 +8204,10 @@ def action_get_analysis():
     try:
         with open(source, 'r') as f:
             data = json.load(f)
+        if isinstance(data.get('analysis'), str):
+            # Upgrade-safe readback: old saved reports are Slack-friendly
+            # immediately, without waiting for the next hourly regeneration.
+            data['analysis'] = _slack_safe_markdown_tables(data['analysis'])
         # Older persisted analyses may contain source filesystem paths from a
         # pre-provenance schema. Scrub structured metadata during readback.
         if isinstance(data.get('collection'), dict):
@@ -8018,13 +8217,23 @@ def action_get_analysis():
         if isinstance(data.get('timeline'), dict):
             data['timeline'] = _safe_public_metadata(data['timeline'])
         age = time.time() - data.get('timestamp', 0)
+        collection = data.get('collection') if isinstance(data.get('collection'), dict) else {}
+        generation = (
+            collection.get('generation')
+            if isinstance(collection.get('generation'), dict) else {}
+        )
+        generation_was_current = generation.get('current')
+        if generation_was_current is None:
+            # Backward compatibility for reports saved before generation
+            # metadata was introduced: complete coverage was the old trust gate.
+            generation_was_current = collection.get('complete') is True
         data['success'] = True
-        # Wider than the hourly refresh interval so the freshness badge does
-        # not flap while the on-time cron run is still in flight, and a single
-        # missed run degrades gracefully.
+        data['coverage_partial'] = collection.get('complete') is not True
+        # Explicit unavailable devices do not make a current report stale.
+        # Age or a legacy/non-current generation does.
         data['stale'] = (
             age > ANALYSIS_STALE_AFTER_SECONDS
-            or not (data.get('collection') or {}).get('complete', False)
+            or generation_was_current is not True
         )
         data['age_seconds'] = int(age)
         # Additive: active operator suppressions ride along so the UI can

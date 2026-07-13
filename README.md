@@ -271,10 +271,11 @@ correlations, and the checks performed by the agent.
 > Optional web search is used only when a search model is configured and the
 > request calls for web research.
 
-The hourly autonomous analyzer runs only when an AI provider and model are
-configured. It is tiered: a cheap findings-only scan gates the full synthesis
-call (skipped entirely when the fabric is clean), and critical findings
-trigger a targeted per-device drill-down. The scan stage uses
+The autonomous analyzer is triggered after a successful full collection and
+throttled to at most once per hour; it runs only when an AI provider and model
+are configured. It is tiered: a cheap findings-only scan gates the full
+synthesis call (skipped entirely when complete coverage is clean), and critical
+findings trigger a targeted per-device drill-down. The scan stage uses
 `AI_FALLBACK_MODEL` automatically when configured; single-model setups use
 the same `AI_MODEL` for the scan — savings come from skipping calls, not from
 requiring a second model. AI memory, analyses, and snapshots are stored under
@@ -593,9 +594,9 @@ schedule is:
 | `0 */12 * * *` | `get-conf` | configuration backup |
 | `* * * * *` | `lldpq-trigger` | singleton daemon for web refresh requests |
 | `* * * * *` | `lldpq-provision-scheduler` | discovery scheduling and upgrade resume |
-| `* * * * *` | `fabric-scan.sh` | cached topology/search data |
+| `* * * * *` + 30s | `fabric-scan.sh` | cached topology/search data; delayed so the full collector has lock priority |
 | `0 0 * * *` | Git auto-commit | daily configuration-history commit |
-| `7 * * * *` | `lldpq-ai-analyze` | autonomous AI analysis when an AI provider/model is configured (offset from collector starts) |
+| Post full collection, max hourly | `lldpq-ai-analyze --if-due` | autonomous AI analysis of the generation that just published |
 | `33 3 * * *` | `fabric-scan-cron.sh` | optional Ansible diff check when Ansible is configured |
 
 `LLDPQ_CRON` and `GETCONF_CRON` can override the first two schedules. Docker
