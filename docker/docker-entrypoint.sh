@@ -931,7 +931,7 @@ if ! /usr/local/bin/lldpq-config --validate-cron "$GETCONF_CRON"; then
 fi
 cat > /etc/cron.d/lldpq << CRON
 # LLDPq full run (assets + lldp + monitor + alerts)
-$LLDPQ_CRON lldpq /usr/local/bin/lldpq > /dev/null 2>&1
+$LLDPQ_CRON lldpq LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq > /dev/null 2>&1
 # Web trigger daemon (handles Refresh buttons from UI) - every minute
 * * * * * lldpq /usr/local/bin/lldpq-trigger > /dev/null 2>&1
 * * * * * www-data /usr/local/bin/lldpq-provision-scheduler > /dev/null 2>&1

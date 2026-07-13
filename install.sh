@@ -727,7 +727,7 @@ render_lldpq_cron_file() {
         echo "# Managed by LLDPq. Local changes may be replaced by install.sh."
         echo "SHELL=/bin/sh"
         echo "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        echo "$lldpq_schedule $user /usr/local/bin/lldpq"
+        echo "$lldpq_schedule $user LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq"
         echo "$getconf_schedule $user /usr/local/bin/get-conf"
         echo "* * * * * $user /usr/local/bin/lldpq-trigger"
         echo "* * * * * www-data /usr/local/bin/lldpq-provision-scheduler"

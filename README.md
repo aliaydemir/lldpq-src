@@ -605,6 +605,11 @@ Ansible maintenance jobs. During an upgrade, only legacy entries that invoke
 recognized LLDPq command paths or backup patterns are removed from
 `/etc/crontab`.
 
+Scheduled full collectors wait up to five minutes for an active cache-only
+Fabric Scan, while manual duplicate invocations remain non-blocking. If an
+older full collector publishes during that wait, the queued schedule is
+discarded instead of starting a back-to-back duplicate generation.
+
 The `lldpq-trigger` daemon processes token-specific LLDP validation and Assets
 refresh jobs, full or page-scoped monitoring analysis, configuration
 collection requests, and the separate on-demand transceiver firmware scan.

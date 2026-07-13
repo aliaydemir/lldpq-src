@@ -19,6 +19,24 @@ AI_ANALYZER_TEXT = AI_ANALYZER.read_text(encoding="utf-8")
 
 
 class PostPipelineSchedulingTests(unittest.TestCase):
+    def test_scheduled_full_pipeline_waits_for_cache_scan_without_duplicating_full_run(self):
+        self.assertIn(
+            'echo "$lldpq_schedule $user LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 '
+            '/usr/local/bin/lldpq"',
+            INSTALL,
+        )
+        self.assertIn(
+            "$LLDPQ_CRON lldpq LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 "
+            "/usr/local/bin/lldpq",
+            ENTRYPOINT,
+        )
+        self.assertIn('flock -w "$LOCK_WAIT_SECONDS" 9', LLDPQ)
+        self.assertIn(
+            "A newer full monitoring generation completed while this scheduled "
+            "run waited",
+            LLDPQ,
+        )
+
     def test_scheduled_fabric_scan_yields_lock_priority_for_thirty_seconds(self):
         native = (
             'echo "* * * * * $user /bin/sleep 30 && cd $q_install '
