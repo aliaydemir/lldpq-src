@@ -939,8 +939,9 @@ $LLDPQ_CRON lldpq /usr/local/bin/lldpq > /dev/null 2>&1
 * * * * * lldpq cd /home/lldpq/lldpq && ./fabric-scan.sh > /dev/null 2>&1
 # Config backup
 $GETCONF_CRON lldpq /usr/local/bin/get-conf > /dev/null 2>&1
-# Autonomous Ask-AI health analysis
-0 * * * * lldpq /usr/local/bin/lldpq-ai-analyze > /dev/null 2>&1
+# Autonomous Ask-AI health analysis (minute 7: offset from the */10 full run
+# so analyze never reads collection files mid-write; matches install.sh)
+7 * * * * lldpq /usr/local/bin/lldpq-ai-analyze > /dev/null 2>&1
 CRON
 chmod 644 /etc/cron.d/lldpq
 

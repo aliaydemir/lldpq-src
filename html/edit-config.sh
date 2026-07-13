@@ -163,34 +163,49 @@ if [ "$ACTION" = "validate" ]; then
         exit 0
     fi
     
+    STDERR_FILE=$(mktemp)
     # If specific devices requested, create temp dir with symlinks
     if [ -n "$DEVICES" ]; then
         TEMP_DIR=$(mktemp -d)
         IFS=',' read -ra DEVICE_ARRAY <<< "$DEVICES"
+        LINKED=0
         for device in "${DEVICE_ARRAY[@]}"; do
             device=$(echo "$device" | xargs)  # trim whitespace
             if [ -f "$CONFIG_DIR/${device}.yaml" ]; then
                 ln -s "$CONFIG_DIR/${device}.yaml" "$TEMP_DIR/${device}.yaml"
+                LINKED=$((LINKED + 1))
             elif [ -f "$CONFIG_DIR/${device}.yml" ]; then
                 ln -s "$CONFIG_DIR/${device}.yml" "$TEMP_DIR/${device}.yml"
+                LINKED=$((LINKED + 1))
             fi
         done
-        RESULT=$(python3 "$VALIDATE_SCRIPT" --dir "$TEMP_DIR" --json --no-topology 2>&1)
+        if [ "$LINKED" -eq 0 ]; then
+            rm -rf "$TEMP_DIR"
+            rm -f "$STDERR_FILE"
+            ERROR=$(printf '%s' "No generated config for $DEVICES" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+            echo '{"success": false, "error": '"$ERROR"'}'
+            exit 0
+        fi
+        RESULT=$(python3 "$VALIDATE_SCRIPT" --dir "$TEMP_DIR" --json --no-topology 2>"$STDERR_FILE")
+        rc=$?
         rm -rf "$TEMP_DIR"
     else
         # Run validator on all configs
-        RESULT=$(python3 "$VALIDATE_SCRIPT" --dir "$CONFIG_DIR" --json 2>&1)
+        RESULT=$(python3 "$VALIDATE_SCRIPT" --dir "$CONFIG_DIR" --json 2>"$STDERR_FILE")
+        rc=$?
     fi
-    
-    if [ $? -eq 0 ]; then
+    ERR_OUTPUT=$(cat "$STDERR_FILE")
+    rm -f "$STDERR_FILE"
+
+    if [ "$rc" -eq 0 ]; then
         echo '{"success": true, "valid": true, "result": '"$RESULT"'}'
     else
         # Check if it's JSON output (validation found errors)
         if echo "$RESULT" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then
             echo '{"success": true, "valid": false, "result": '"$RESULT"'}'
         else
-            # Script error
-            ERROR=$(echo "$RESULT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+            # Script error - report stderr, not the JSON stdout stream
+            ERROR=$(printf '%s' "$ERR_OUTPUT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
             echo '{"success": false, "error": '"$ERROR"'}'
         fi
     fi

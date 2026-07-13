@@ -71,6 +71,8 @@
         .cr-custom button { padding:9px 22px; background:#76b900; color:#1a1a1a; font-weight:700; border:0; border-radius:6px; cursor:pointer; }
         .cr-custom button:hover { background:#8fd400; }
         .cr-custom button:disabled { background:#555; color:#999; cursor:not-allowed; }
+        .cr-custom button.stop { background:#ef5350; color:#fff; }
+        .cr-custom button.stop:hover { background:#f4675f; }
 
         .cr-results { flex:1; overflow-y:auto; padding:14px 16px; }
         .cr-empty { color:#777; text-align:center; padding:50px 0; }
@@ -121,6 +123,7 @@
             <div class="cr-custom">
                 <input type="text" id="customCmd" autocomplete="off" placeholder="Enter command (nv show ..., ip ..., sudo ...)  — runs on the selected devices">
                 <button id="runBtn" onclick="runCustomCommand()">Run</button>
+                <button id="stopBtn" class="stop" onclick="stopRun()" style="display:none;">Stop</button>
             </div>
 
             <div class="cr-results" id="results">
@@ -142,14 +145,29 @@ const CMD_GROUPS = [
     { title:'Logs', color:'#ef5350', cmds:['sudo journalctl -p err -n 100 --no-pager','sudo journalctl -n 100 --no-pager'] },
 ];
 
-const POOL = 6;             // max parallel device sessions
+const POOL = 4;             // max parallel device sessions (single-worker fcgiwrap — keep low)
 const CMD_TIMEOUT_MS = 45000;
+const NGINX_CAP_MS = 60000; // nginx caps fabric-api.sh at 60s; run-device-command has no background path
+const MAX_TRIES = 3;        // retries on backend device_busy (flock contention)
 
 let devicesByGroup = {};
 let groupOrder = [];
 let allHostnames = [];
 const selected = new Set();  // selected hostnames (multi-select)
 let running = false;
+let cancelled = false;
+let controllers = new Set(); // in-flight AbortControllers, so Stop can abort them
+
+// Mirror the server rule: default 45s, but if the command carries `timeout <N>`,
+// wait N+15s — capped at the nginx 60s ceiling (no background path for commands).
+function cmdTimeoutMs(cmd) {
+    const m = String(cmd).match(/\btimeout\s+(\d+)/);
+    if (m) {
+        const secs = parseInt(m[1], 10);
+        if (secs > 0) return Math.min((secs + 15) * 1000, NGINX_CAP_MS);
+    }
+    return CMD_TIMEOUT_MS;
+}
 
 document.addEventListener('DOMContentLoaded', async () => {
     // Command Runner is admin-only (backend run-device-command requires admin)
@@ -171,6 +189,16 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (btn && btn.dataset.cmd) runOnTarget(btn.dataset.cmd);
     });
     document.getElementById('customCmd').addEventListener('keypress', e => { if (e.key === 'Enter') runCustomCommand(); });
+    // target-list selection via event delegation + data-* attrs (safe for hostnames/groups with quotes)
+    document.getElementById('targetList').addEventListener('click', e => {
+        const grpCb = e.target.closest('.grp-cb');
+        if (grpCb) { e.stopPropagation(); toggleGroupSelect(grpCb.dataset.group, grpCb.checked); return; }
+        if (e.target.closest('.cr-all')) { toggleAll(); return; }
+        const header = e.target.closest('.group-header');
+        if (header) { toggleDeviceGroup(header); return; }
+        const item = e.target.closest('.device-item');
+        if (item) { toggleDevice(item.dataset.host); return; }
+    });
 });
 
 // ---------------- left: targets ----------------
@@ -200,7 +228,7 @@ function renderTargetList(filter = '') {
     const f = filter.toLowerCase();
     const cont = document.getElementById('targetList');
     let html = `
-        <div class="cr-all" onclick="toggleAll(selected.size < allHostnames.length)">
+        <div class="cr-all">
             <input type="checkbox" id="cb-all" style="pointer-events:none;">
             <span class="cr-all-icon">&#9733;</span>
             <span class="cr-all-label">All devices</span>
@@ -212,13 +240,13 @@ function renderTargetList(filter = '') {
         if (!names.length) return;
         html += `
             <div class="device-group">
-                <div class="group-header collapsed" onclick="toggleDeviceGroup(this)">
-                    <input type="checkbox" class="grp-cb" data-group="${esc(group)}" onclick="event.stopPropagation(); toggleGroupSelect('${esc(group)}', this.checked)">
+                <div class="group-header collapsed">
+                    <input type="checkbox" class="grp-cb" data-group="${esc(group)}">
                     <span class="arrow">&#9654;</span> ${esc(group)} (${names.length})
                 </div>
                 <div class="group-devices collapsed">
                     ${names.map(n => `
-                        <div class="device-item" data-host="${esc(n)}" onclick="toggleDevice('${esc(n)}')">
+                        <div class="device-item" data-host="${esc(n)}">
                             <input type="checkbox" class="dev-cb" data-host="${esc(n)}" style="pointer-events:none;">
                             <span class="device-icon"></span><span>${esc(n)}</span>
                         </div>`).join('')}
@@ -230,6 +258,11 @@ function renderTargetList(filter = '') {
 }
 
 function filterDevices() { renderTargetList(document.getElementById('deviceSearch').value); }
+
+// Current search term + the device lists that are actually SHOWN (so bulk toggles match the display).
+function searchTerm() { const el = document.getElementById('deviceSearch'); return (el ? el.value : '').toLowerCase(); }
+function groupFilteredNames(group) { const f = searchTerm(); return (devicesByGroup[group] || []).filter(n => n.toLowerCase().includes(f)); }
+function allFilteredNames() { const f = searchTerm(); return f ? allHostnames.filter(n => n.toLowerCase().includes(f)) : allHostnames.slice(); }
 
 // Prefill from Ask AI's "Run in Commands" button: ?devices=a,b&cmd=...  (selects + fills,
 // but NEVER auto-runs — the operator must review and click Run).
@@ -277,14 +310,15 @@ function toggleDeviceGroup(header) {
     if (gd) gd.classList.toggle('collapsed');
 }
 
-function toggleAll(check) {
-    selected.clear();
-    if (check) allHostnames.forEach(h => selected.add(h));
+function toggleAll() {
+    const names = allFilteredNames();
+    const allSel = names.length > 0 && names.every(h => selected.has(h));
+    names.forEach(h => { if (allSel) selected.delete(h); else selected.add(h); });
     updateSelectionUI();
 }
 
 function toggleGroupSelect(group, check) {
-    (devicesByGroup[group] || []).forEach(h => { if (check) selected.add(h); else selected.delete(h); });
+    groupFilteredNames(group).forEach(h => { if (check) selected.add(h); else selected.delete(h); });
     updateSelectionUI();
 }
 
@@ -299,12 +333,15 @@ function updateSelectionUI() {
     const total = allHostnames.length;
     const n = selected.size;
 
+    // "All" + group checkboxes reflect only the CURRENTLY FILTERED (shown) devices.
+    const fAll = allFilteredNames();
+    const fSel = fAll.filter(h => selected.has(h)).length;
     const cbAll = document.getElementById('cb-all');
-    if (cbAll) { cbAll.checked = n > 0 && n === total; cbAll.indeterminate = n > 0 && n < total; }
-    document.querySelector('.cr-all')?.classList.toggle('selected', n > 0 && n === total);
+    if (cbAll) { cbAll.checked = fSel > 0 && fSel === fAll.length; cbAll.indeterminate = fSel > 0 && fSel < fAll.length; }
+    document.querySelector('.cr-all')?.classList.toggle('selected', fSel > 0 && fSel === fAll.length);
 
     document.querySelectorAll('.grp-cb').forEach(cb => {
-        const names = devicesByGroup[cb.getAttribute('data-group')] || [];
+        const names = groupFilteredNames(cb.getAttribute('data-group'));
         const sel = names.filter(x => selected.has(x)).length;
         cb.checked = sel > 0 && sel === names.length;
         cb.indeterminate = sel > 0 && sel < names.length;
@@ -353,7 +390,10 @@ function runCustomCommand() {
 }
 
 // ---------------- execution (fan-out) ----------------
-function cardId(host) { return 'res-' + host.replace(/[^a-zA-Z0-9_-]/g, '_'); }
+// Index-based ids: sanitizing hostnames (e.g. leaf.1 / leaf:1) would collide, so map each
+// host of the current run to a unique index instead.
+let cardIndex = {};
+function cardId(host) { return 'res-' + (host in cardIndex ? cardIndex[host] : 0); }
 
 async function runOnTarget(cmd) {
     if (running) return;
@@ -366,7 +406,11 @@ async function runOnTarget(cmd) {
 
     // No confirmation prompt — run directly on the selected targets.
     running = true;
+    cancelled = false;
+    controllers = new Set();
     document.getElementById('runBtn').disabled = true;
+    const stopBtn = document.getElementById('stopBtn');
+    if (stopBtn) stopBtn.style.display = '';
     const single = hosts.length === 1;
     const state = {}; hosts.forEach(h => state[h] = {status:'running', output:'Running…'});
     renderResults(cmd, hosts, state, single);
@@ -374,31 +418,85 @@ async function runOnTarget(cmd) {
     let idx = 0;
     const worker = async () => {
         while (idx < hosts.length) {
-            const h = hosts[idx++];
-            try {
-                const ctrl = new AbortController();
-                const to = setTimeout(() => ctrl.abort(), CMD_TIMEOUT_MS);
-                const r = await fetch('/fabric-api.sh?action=run-device-command', {
-                    method:'POST', headers:{'Content-Type':'application/json'},
-                    body: JSON.stringify({device:h, command:cmd}), signal: ctrl.signal,
-                });
-                clearTimeout(to);
-                const d = await r.json();
-                state[h] = d.success ? {status:'ok', output:(d.output||'(no output)')} : {status:'fail', output:('Error: ' + (d.error||'unknown'))};
-            } catch (e) {
-                state[h] = {status:'fail', output: e.name === 'AbortError' ? 'Timed out (45s)' : ('Request failed: ' + e.message)};
-            }
-            updateCard(h, state[h], single);
-            updateSummary(hosts, state, cmd);
+            if (cancelled) return;
+            await runOne(hosts[idx++], cmd, hosts, state, single);
         }
     };
     await Promise.all(Array.from({length: Math.min(POOL, hosts.length)}, worker));
+
+    if (cancelled) {
+        hosts.forEach(h => { if (state[h].status === 'running') { state[h] = {status:'fail', output:'Cancelled'}; updateCard(h, state[h], single); } });
+        updateSummary(hosts, state, cmd);
+    }
     running = false;
+    controllers.clear();
     document.getElementById('runBtn').disabled = false;
+    if (stopBtn) stopBtn.style.display = 'none';
+}
+
+// Run one device, retrying with backoff when the backend reports device_busy (flock contention).
+async function runOne(h, cmd, hosts, state, single) {
+    const toMs = cmdTimeoutMs(cmd);
+    const secs = Math.round(toMs / 1000);
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+        if (cancelled) { state[h] = {status:'fail', output:'Cancelled'}; break; }
+        const ctrl = new AbortController();
+        controllers.add(ctrl);
+        const to = setTimeout(() => ctrl.abort(), toMs);
+        let retry = false;
+        try {
+            const r = await fetch('/fabric-api.sh?action=run-device-command', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({device:h, command:cmd}), signal: ctrl.signal,
+            });
+            const d = await r.json();
+            if (d.success) {
+                state[h] = {status:'ok', output:(d.output || '(no output)')};
+            } else if (d.error_code === 'device_busy' && attempt < MAX_TRIES && !cancelled) {
+                retry = true;
+                state[h] = {status:'running', output:`Device busy — retrying (${attempt}/${MAX_TRIES - 1})…`};
+                updateCard(h, state[h], single);
+            } else {
+                state[h] = {status:'fail', output: failOutput(d)};
+            }
+        } catch (e) {
+            state[h] = {status:'fail', output: (cancelled || e.name === 'AbortError')
+                ? (cancelled ? 'Cancelled' : `Timed out (${secs}s)`)
+                : ('Request failed: ' + e.message)};
+        } finally {
+            clearTimeout(to);
+            controllers.delete(ctrl);
+        }
+        if (retry) { await backoff(attempt); continue; }
+        break;
+    }
+    updateCard(h, state[h], single);
+    updateSummary(hosts, state, cmd);
+}
+
+function backoff(attempt) { return new Promise(r => setTimeout(r, 400 * attempt)); }
+
+// Abort all pending/in-flight requests; remaining devices are marked cancelled by runOnTarget.
+function stopRun() {
+    if (!running) return;
+    cancelled = true;
+    controllers.forEach(c => { try { c.abort(); } catch (e) {} });
+    controllers.clear();
+}
+
+// On failure show the FULL captured output (stdout + stderr) with the error as the first line,
+// instead of dropping everything but the truncated error string.
+function failOutput(d) {
+    let body = '';
+    if (d.output) body += d.output;
+    if (d.error_output) body += (body ? '\n' : '') + d.error_output;
+    const err = d.error || 'unknown error';
+    return body ? (err + '\n\n' + body) : ('Error: ' + err);
 }
 
 function renderResults(cmd, hosts, state, single) {
     const res = document.getElementById('results');
+    cardIndex = {}; hosts.forEach((h, i) => cardIndex[h] = i);
     let html = `<div class="cr-summary" id="resSummary"></div>`;
     html += hosts.map(h => {
         const st = state[h];

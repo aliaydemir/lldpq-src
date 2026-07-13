@@ -6581,7 +6581,15 @@ remote_capture = (
     'child_pid=$!; wait "$child_pid"; status=$?; '
     'trap - TERM INT; exit "$status"'
 )
+# Sweep leftover live/tail/pcap temp files older than 60 min before launching.
+# A closed browser tab otherwise leaks these on the switch tmpfs (RAM) forever.
+sweep_cmd = (
+    "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-mmin +60 -delete >/dev/null 2>&1; "
+)
 remote_cmd = (
+    sweep_cmd +
     f'nohup sh -c {shlex.quote(remote_capture)} '
     f'{shlex.quote(output_file)} > /dev/null 2>&1 & echo $!'
 )
@@ -6607,7 +6615,7 @@ if result.returncode != 0:
              f'SSH exited with status {result.returncode}').strip()
     fail(error[:200], exit_code=result.returncode)
 
-pid = result.stdout.strip()
+pid = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
 if re.fullmatch(r'[1-9][0-9]{0,19}', pid) is None:
     fail('Remote launch did not return a valid PID')
 print(json.dumps({
@@ -6799,7 +6807,15 @@ remote_tail = (
     'child_pid=$!; wait "$child_pid"; status=$?; '
     'trap - TERM INT; exit "$status"'
 )
+# Sweep leftover live/tail/pcap temp files older than 60 min before launching.
+# A closed browser tab otherwise leaks these on the switch tmpfs (RAM) forever.
+sweep_cmd = (
+    "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-mmin +60 -delete >/dev/null 2>&1; "
+)
 remote_cmd = (
+    sweep_cmd +
     f'nohup sh -c {shlex.quote(remote_tail)} '
     f'{shlex.quote(output_file)} > /dev/null 2>&1 & echo $!'
 )
@@ -6825,7 +6841,7 @@ if result.returncode != 0:
              f'SSH exited with status {result.returncode}').strip()
     fail(error[:200], exit_code=result.returncode)
 
-pid = result.stdout.strip()
+pid = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
 if re.fullmatch(r'[1-9][0-9]{0,19}', pid) is None:
     fail('Remote launch did not return a valid PID')
 print(json.dumps({
@@ -6837,6 +6853,412 @@ print(json.dumps({
 }))
 
 PYTHON_TAIL
+        exit 0
+        ;;
+    start-pcap)
+        # Start a background tcpdump PCAP capture and return immediately with the
+        # pcap path + poll token. This mirrors start-live-capture so a capture of
+        # any duration survives the 60s fastcgi_read_timeout (the synchronous
+        # run-device-command path orphaned tcpdump for Duration >= 1 min).
+        read -r POST_DATA
+        export POST_DATA
+
+        python3 << 'PYTHON_PCAP'
+import json
+import subprocess
+import re
+import os
+import time
+import hashlib
+import secrets
+import shlex
+
+def read_lldpq_conf():
+    conf = {}
+    conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
+    for conf_path in conf_paths:
+        if os.path.exists(conf_path):
+            with open(conf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        conf[key.strip()] = val.strip()
+            break
+    return conf
+
+def fail(message, **extra):
+    response = {'success': False, 'error': message}
+    response.update(extra)
+    print(json.dumps(response))
+    raise SystemExit(0)
+
+
+def parse_bounded_integer(value, field, minimum, maximum):
+    if isinstance(value, bool):
+        fail(f'{field} must be an integer')
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        if (
+            len(value) > len(str(maximum))
+            or re.fullmatch(r'(?:0|[1-9][0-9]*)', value) is None
+        ):
+            fail(f'{field} must be an integer')
+        parsed = int(value)
+    else:
+        fail(f'{field} must be an integer')
+    if not minimum <= parsed <= maximum:
+        fail(f'{field} must be between {minimum} and {maximum}')
+    return parsed
+
+
+try:
+    data = json.loads(os.environ.get('POST_DATA', '{}'))
+except (TypeError, ValueError, json.JSONDecodeError):
+    fail('Invalid JSON body')
+if not isinstance(data, dict):
+    fail('JSON body must be an object')
+
+device = data.get('device', '')
+iface = data.get('interface', 'any')
+filter_expr = data.get('filter', '')
+
+if not isinstance(device, str):
+    fail('Device must be text')
+device = device.strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
+
+# Interface charset stays strict so the pcap path stays cleanup-whitelist safe.
+if not isinstance(iface, str) or not re.fullmatch(
+    r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}', iface
+):
+    fail('Invalid interface name')
+
+duration = parse_bounded_integer(data.get('duration', 30), 'Duration', 1, 300)
+count = parse_bounded_integer(data.get('count', 0), 'Count', 0, 999999)
+
+if not isinstance(filter_expr, str):
+    fail('Filter must be text')
+if any(ord(char) < 32 or ord(char) == 127 for char in filter_expr):
+    fail('Invalid filter expression')
+filter_expr = filter_expr.strip()
+filter_tokens = []
+if filter_expr:
+    if (
+        len(filter_expr) > 256
+        or not re.fullmatch(r'[A-Za-z0-9_.:/()\[\] -]+', filter_expr)
+    ):
+        fail('Invalid filter expression')
+    filter_tokens = re.findall(r'[()]|[^() ]+', filter_expr)
+    if len(filter_tokens) > 64:
+        fail('Filter expression is too complex')
+    depth = 0
+    for token in filter_tokens:
+        if token == '(':
+            depth += 1
+        elif token == ')':
+            depth -= 1
+            if depth < 0:
+                fail('Invalid filter expression')
+        elif token.startswith('-') or not re.fullmatch(
+            r'[A-Za-z0-9_.:/\[\]-]+', token
+        ):
+            fail('Invalid filter expression')
+    if depth != 0:
+        fail('Invalid filter expression')
+
+lldpq_conf = read_lldpq_conf()
+ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
+
+device_ip = None
+ssh_user = 'cumulus'
+
+lldpq_dir = lldpq_conf.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
+import yaml
+for devices_path in [f"{lldpq_dir}/devices.yaml"]:
+    if os.path.exists(devices_path):
+        try:
+            with open(devices_path, 'r') as f:
+                ddata = yaml.safe_load(f)
+            defaults = ddata.get('defaults', {})
+            default_user = defaults.get('username', 'cumulus')
+            for ip, info in ddata.get('devices', {}).items():
+                if isinstance(info, dict):
+                    hname = info.get('hostname', '')
+                    uname = info.get('username', default_user)
+                else:
+                    hname = str(info).split()[0] if info else ''
+                    uname = default_user
+                if hname == device:
+                    device_ip = str(ip)
+                    ssh_user = uname
+                    break
+        except:
+            pass
+
+if not device_ip:
+    for inv_file in [f"{ansible_dir}/inventory/inventory.ini", f"{ansible_dir}/inventory/hosts"]:
+        if os.path.exists(inv_file):
+            try:
+                with open(inv_file, 'r') as f:
+                    for line in f:
+                        if line.strip().startswith(device + ' ') or line.strip().startswith(device + '\t'):
+                            match = re.search(r'ansible_host=(\S+)', line)
+                            if match:
+                                device_ip = match.group(1)
+                                break
+            except:
+                pass
+        if device_ip:
+            break
+
+if not device_ip:
+    print(json.dumps({'success': False, 'error': f'Device {device} not found in devices.yaml or inventory'}))
+    exit()
+
+# The pcap name uses the full sanitized hostname so the existing device-bound
+# Stop (pkill/rm) and download-file whitelist recognize it unchanged.
+timestamp = time.strftime('%Y%m%d-%H%M%S')
+capture_device = re.sub(r'[^A-Za-z0-9-]', '_', device)
+pcap_file = f'/tmp/capture_{capture_device}_{timestamp}_{secrets.token_hex(6)}.pcap'
+
+cmd_parts = ['sudo', 'timeout', str(duration), 'tcpdump', '-U', '-i', iface,
+             '-nnnn', '-w', pcap_file]
+if count:
+    cmd_parts.extend(['-c', str(count)])
+cmd_parts.extend(filter_tokens)
+
+tcpdump_cmd = shlex.join(cmd_parts)
+capture_worker = shlex.join(['setsid', 'sh', '-c', tcpdump_cmd])
+# tcpdump writes the pcap through -w; keep its own stdout/stderr off that file.
+remote_capture = (
+    'child_pid=; '
+    'terminate_child() { '
+    'if [ -n "$child_pid" ]; then '
+    'kill -TERM -- "-${child_pid}" 2>/dev/null; '
+    'fi; exit 143; }; '
+    'trap terminate_child TERM INT; '
+    f'{capture_worker} > /dev/null 2>&1 & '
+    'child_pid=$!; wait "$child_pid"; status=$?; '
+    'trap - TERM INT; exit "$status"'
+)
+# Sweep leftover live/tail/pcap temp files older than 60 min before launching.
+sweep_cmd = (
+    "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-mmin +60 -delete >/dev/null 2>&1; "
+)
+remote_cmd = (
+    sweep_cmd +
+    f'nohup sh -c {shlex.quote(remote_capture)} '
+    f'{shlex.quote(pcap_file)} > /dev/null 2>&1 & echo $!'
+)
+
+ssh_command = [
+    'sudo', '-u', lldpq_user,
+    'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
+    f'{ssh_user}@{device_ip}',
+    remote_cmd
+]
+
+try:
+    result = subprocess.run(
+        ssh_command, capture_output=True, text=True, timeout=15
+    )
+except subprocess.TimeoutExpired:
+    fail('SSH launch timed out')
+except Exception as exc:
+    fail(str(exc))
+
+if result.returncode != 0:
+    error = (result.stderr or result.stdout or
+             f'SSH exited with status {result.returncode}').strip()
+    fail(error[:200], exit_code=result.returncode)
+
+pid = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ''
+if re.fullmatch(r'[1-9][0-9]{0,19}', pid) is None:
+    fail('Remote launch did not return a valid PID')
+print(json.dumps({
+    'success': True,
+    'pcap_file': pcap_file,
+    'pid': pid,
+    'device': device,
+    'duration': duration
+}))
+
+PYTHON_PCAP
+        exit 0
+        ;;
+    pcap-status)
+        # Poll a background PCAP capture: report running/finished and file size
+        # so the client can enable Download once tcpdump has exited.
+        read -r POST_DATA
+        export POST_DATA
+
+        python3 << 'PYTHON_PCAP_STATUS'
+import json
+import subprocess
+import re
+import os
+import shlex
+
+def read_lldpq_conf():
+    conf = {}
+    conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
+    for conf_path in conf_paths:
+        if os.path.exists(conf_path):
+            with open(conf_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, val = line.split('=', 1)
+                        conf[key.strip()] = val.strip()
+            break
+    return conf
+
+def fail(message, **extra):
+    response = {'success': False, 'error': message}
+    response.update(extra)
+    print(json.dumps(response))
+    raise SystemExit(0)
+
+
+try:
+    data = json.loads(os.environ.get('POST_DATA', '{}'))
+except (TypeError, ValueError, json.JSONDecodeError):
+    fail('Invalid JSON body')
+if not isinstance(data, dict):
+    fail('JSON body must be an object')
+
+device = data.get('device', '')
+pcap_file = data.get('pcap_file', '')
+
+if not isinstance(device, str):
+    fail('Device must be text')
+device = device.strip()
+if (
+    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}', device)
+    or '..' in device
+):
+    fail('Invalid device name format')
+
+if not isinstance(pcap_file, str):
+    fail('PCAP path must be text')
+pcap_file = pcap_file.strip()
+if (
+    '..' in pcap_file
+    or re.fullmatch(r'/tmp/capture_[A-Za-z0-9_.:-]{1,220}\.pcap', pcap_file) is None
+):
+    fail('Invalid PCAP path')
+
+lldpq_conf = read_lldpq_conf()
+ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
+lldpq_dir = lldpq_conf.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
+
+device_ip = None
+ssh_user = 'cumulus'
+
+import yaml
+for devices_path in [f"{lldpq_dir}/devices.yaml"]:
+    if os.path.exists(devices_path):
+        try:
+            with open(devices_path, 'r') as f:
+                ddata = yaml.safe_load(f)
+            defaults = ddata.get('defaults', {})
+            default_user = defaults.get('username', 'cumulus')
+            for ip, info in ddata.get('devices', {}).items():
+                if isinstance(info, dict):
+                    hname = info.get('hostname', '')
+                    uname = info.get('username', default_user)
+                else:
+                    hname = str(info).split()[0] if info else ''
+                    uname = default_user
+                if hname == device:
+                    device_ip = str(ip)
+                    ssh_user = uname
+                    break
+        except:
+            pass
+
+if not device_ip:
+    for inv_file in [f"{ansible_dir}/inventory/inventory.ini", f"{ansible_dir}/inventory/hosts"]:
+        if os.path.exists(inv_file):
+            try:
+                with open(inv_file, 'r') as f:
+                    for line in f:
+                        if line.strip().startswith(device + ' ') or line.strip().startswith(device + '\t'):
+                            match = re.search(r'ansible_host=(\S+)', line)
+                            if match:
+                                device_ip = match.group(1)
+                                break
+            except:
+                pass
+        if device_ip:
+            break
+
+if not device_ip:
+    print(json.dumps({'success': False, 'error': f'Device {device} not found'}))
+    exit()
+
+# Bracket the leading '/' and the dots so pgrep -f does not match its own
+# argument text, matching only the live tcpdump/worker processes.
+process_pattern = '[/]' + pcap_file[1:].replace('.', '[.]')
+remote_status = (
+    'st=DONE; '
+    f'if sudo pgrep -f {shlex.quote(process_pattern)} >/dev/null 2>&1; '
+    'then st=RUNNING; fi; '
+    f'sz=$(stat -c %s {shlex.quote(pcap_file)} 2>/dev/null || echo 0); '
+    "printf '%s %s\\n' \"$st\" \"$sz\""
+)
+
+ssh_command = [
+    'sudo', '-u', lldpq_user,
+    'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes',
+    f'{ssh_user}@{device_ip}',
+    remote_status
+]
+
+try:
+    result = subprocess.run(
+        ssh_command, capture_output=True, text=True, timeout=15
+    )
+except subprocess.TimeoutExpired:
+    fail('SSH status poll timed out')
+except Exception as exc:
+    fail(str(exc))
+
+if result.returncode != 0:
+    error = (result.stderr or result.stdout or
+             f'SSH exited with status {result.returncode}').strip()
+    fail(error[:200], exit_code=result.returncode)
+
+lines = [ln.rstrip('\r') for ln in result.stdout.splitlines() if ln.strip()]
+parsed = lines[-1].split() if lines else []
+if len(parsed) != 2 or parsed[0] not in ('RUNNING', 'DONE'):
+    fail('Could not parse capture status')
+running = parsed[0] == 'RUNNING'
+try:
+    size = int(parsed[1])
+except ValueError:
+    size = 0
+
+print(json.dumps({
+    'success': True,
+    'device': device,
+    'pcap_file': pcap_file,
+    'running': running,
+    'finished': not running,
+    'size': size
+}))
+
+PYTHON_PCAP_STATUS
         exit 0
         ;;
     run-device-command)
@@ -6943,14 +7365,14 @@ ALLOWED_PATTERNS = [
     # ethtool variants
     r'^(sudo )?(/sbin/)?ethtool( -(m|S|i))? [A-Za-z0-9_.:-]+$',
     # IP/network commands
-    r'^ip link\b',
-    r'^ip addr\b',
-    r'^ip route\b',
-    r'^ip neigh\b',
-    r'^sudo ip link\b',
-    r'^sudo ip addr\b',
-    r'^sudo ip route\b',
-    r'^sudo ip neigh\b',
+    r'^ip (?:-br |--brief )?link\b',
+    r'^ip (?:-br |--brief )?addr\b',
+    r'^ip (?:-br |--brief )?route\b',
+    r'^ip (?:-br |--brief )?neigh\b',
+    r'^sudo ip (?:-br |--brief )?link\b',
+    r'^sudo ip (?:-br |--brief )?addr\b',
+    r'^sudo ip (?:-br |--brief )?route\b',
+    r'^sudo ip (?:-br |--brief )?neigh\b',
     r'^/sbin/bridge fdb\b',
     r'^/sbin/bridge vlan\b',
     r'^bridge fdb\b',
@@ -7001,7 +7423,7 @@ ALLOWED_PATTERNS = [
     # Process cleanup is limited to a quoted LLDPq-owned temp path. A later
     # device-bound validator ensures the path belongs to the selected device.
     r'^sudo pkill -f "/tmp/(?:capture_[A-Za-z0-9_.:-]+\.pcap|(?:live|tail)_[A-Za-z0-9_.:-]+)"$',
-    r'^find /tmp -name "capture_\*\.pcap"(?: -mmin \+[0-9]+ -delete)?$',
+    r'^find /tmp -name "(?:capture_\*\.pcap|live_\*\.txt|tail_\*\.txt)"(?: -mmin \+[0-9]+ -delete)?$',
     # Packet capture
     r'^sudo timeout ([1-9]|[1-9][0-9]|[12][0-9]{2}|300) tcpdump -U -i [A-Za-z0-9_.:-]+ -nnnn -w /tmp/capture_[A-Za-z0-9_.:-]+\.pcap( -c [1-9][0-9]{0,5})?( [A-Za-z0-9_.:/ -]+)?$',
     # Diagnostic bundle
@@ -7213,7 +7635,13 @@ def classify_scoped_cleanup(tokens):
 def validate_ip_command(tokens):
     if len(tokens) < 2 or tokens[0] != 'ip':
         return False
-    family = tokens[1]
+    index = 1
+    # An optional brief flag may precede the subcommand (e.g. ip -br addr show).
+    if tokens[index] in {'-br', '--brief'}:
+        index += 1
+    if len(tokens) <= index:
+        return False
+    family = tokens[index]
     allowed_actions = {
         'link': {'show', 'list'},
         'addr': {'show', 'list'},
@@ -7222,7 +7650,7 @@ def validate_ip_command(tokens):
     }
     if family not in allowed_actions:
         return False
-    return len(tokens) == 2 or tokens[2] in allowed_actions[family]
+    return len(tokens) == index + 1 or tokens[index + 1] in allowed_actions[family]
 
 
 def validate_bridge_command(tokens):
@@ -7696,7 +8124,7 @@ try:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(json.dumps({'success': False, 'error': 'Another command is already running on this device'}))
+            print(json.dumps({'success': False, 'error_code': 'device_busy', 'error': 'Another command is already running on this device'}))
             exit()
 
     # Determine timeout based on command - longer for tcpdump, cl-support
@@ -7739,17 +8167,35 @@ try:
         timeout=cmd_timeout
     )
     
+    # ssh -tt delivers a pty, so every line arrives CRLF-terminated. Strip the
+    # trailing '\r' per line so JS line parsers (cl-support ls paths, VRF/port
+    # lists, single-value lookups) see clean values.
+    def strip_cr(text):
+        if not text:
+            return text
+        return '\n'.join(line[:-1] if line.endswith('\r') else line
+                         for line in text.split('\n'))
+
+    stdout = strip_cr(result.stdout)
+    stderr = strip_cr(result.stderr)
+
+    # journalctl/cat over many devices can push tens of MB; cap stdout so the
+    # JSON payload stays bounded and the browser does not freeze.
+    STDOUT_CAP = 512 * 1024
+    if len(stdout) > STDOUT_CAP:
+        stdout = stdout[:STDOUT_CAP] + '\n[output truncated at 512 KB]'
+
     command_ok = result.returncode == 0
     response = {
         'success': command_ok,
         'device': device,
         'command': command,
-        'output': result.stdout,
-        'error_output': result.stderr,
+        'output': stdout,
+        'error_output': stderr,
         'exit_code': result.returncode
     }
     if not command_ok:
-        response['error'] = (result.stderr or result.stdout or
+        response['error'] = (stderr or stdout or
                              f'Command exited with status {result.returncode}').strip()[:1000]
     print(json.dumps(response))
 
@@ -7924,7 +8370,7 @@ try:
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print(json.dumps({'success': False, 'error': 'Another command is already running on this device'}))
+        print(json.dumps({'success': False, 'error_code': 'device_busy', 'error': 'Another command is already running on this device'}))
         exit()
 
     # A pack chains several short read-only commands in one session, so it
@@ -7949,18 +8395,33 @@ try:
         timeout=cmd_timeout
     )
 
+    # ssh -tt delivers a pty, so lines arrive CRLF-terminated; strip the
+    # trailing '\r' per line so downstream JS parsers see clean values.
+    def strip_cr(text):
+        if not text:
+            return text
+        return '\n'.join(line[:-1] if line.endswith('\r') else line
+                         for line in text.split('\n'))
+
+    stdout = strip_cr(result.stdout)
+    stderr = strip_cr(result.stderr)
+
+    STDOUT_CAP = 512 * 1024
+    if len(stdout) > STDOUT_CAP:
+        stdout = stdout[:STDOUT_CAP] + '\n[output truncated at 512 KB]'
+
     command_ok = result.returncode == 0
     response = {
         'success': command_ok,
         'device': device,
         'pack': pack,
         'command': command,
-        'output': result.stdout,
-        'error_output': result.stderr,
+        'output': stdout,
+        'error_output': stderr,
         'exit_code': result.returncode
     }
     if not command_ok:
-        response['error'] = (result.stderr or result.stdout or
+        response['error'] = (stderr or stdout or
                              f'Command exited with status {result.returncode}').strip()[:1000]
     print(json.dumps(response))
 

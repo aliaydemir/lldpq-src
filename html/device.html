@@ -1467,6 +1467,7 @@
         let clsupportOperationId = 0;
         let opticalDetailRequestId = 0;
         let logRequestId = 0;
+        let commandRequestId = 0;
         let tailStopTimeout = null;
         
         // Track which tabs have been loaded (for lazy loading)
@@ -1841,6 +1842,14 @@
             if (!nextDevice) return;
             const previousDevice = deviceName;
 
+            // Re-clicking the already-selected device would tear down any running
+            // capture/tail/cl-support work below; bail out to leave it running.
+            if (nextDevice === deviceName &&
+                (activeCaptureContext || activeTailContext || tailPollingInterval ||
+                 clsupportPollingInterval)) {
+                return;
+            }
+
             if (updateHistory) {
                 const url = new URL(window.location.href);
                 if (url.searchParams.get('device') !== nextDevice) {
@@ -1857,6 +1866,7 @@
             clsupportOperationId += 1;
             opticalDetailRequestId += 1;
             logRequestId += 1;
+            commandRequestId += 1;
             captureFileOperationId += 1;
             if (deviceDataAbortController) {
                 deviceDataAbortController.abort();
@@ -1957,6 +1967,8 @@
             if (cmdHeader) cmdHeader.textContent = '';
             if (cmdResult) { cmdResult.textContent = ''; cmdResult.style.color = ''; }
             if (customCmd) customCmd.value = '';
+            document.querySelectorAll('#tab-commands .cmd-btn, #tab-commands .custom-command button')
+                .forEach(btn => { btn.disabled = false; });
 
             const tailOutputContainer = document.getElementById('tailOutputContainer');
             const tailOutput = document.getElementById('tailOutput');
@@ -1990,9 +2002,14 @@
             const captureMode = document.getElementById('captureMode');
             if (captureInterface) captureInterface.value = '';
             if (captureFilter) captureFilter.value = '';
-            if (captureDuration) captureDuration.selectedIndex = 0;
-            if (captureCount) captureCount.selectedIndex = 0;
-            if (captureMode) captureMode.selectedIndex = 0;
+            const resetSelectToDefault = (el) => {
+                if (!el) return;
+                const idx = Array.from(el.options).findIndex(o => o.defaultSelected);
+                el.selectedIndex = idx >= 0 ? idx : 0;
+            };
+            resetSelectToDefault(captureDuration);
+            resetSelectToDefault(captureCount);
+            resetSelectToDefault(captureMode);
             if (captureOutput) { captureOutput.textContent = ''; captureOutput.style.display = 'none'; }
             if (capturePcapResult) capturePcapResult.style.display = 'none';
             if (captureStatus) captureStatus.textContent = '';
@@ -2297,6 +2314,7 @@
             clsupportOperationId += 1;
             opticalDetailRequestId += 1;
             logRequestId += 1;
+            commandRequestId += 1;
             captureFileOperationId += 1;
             if (deviceDataAbortController) {
                 deviceDataAbortController.abort();
@@ -2950,6 +2968,10 @@
                 showNotification('Please select an interface', 'error');
                 return false;
             }
+            if (!/^[A-Za-z0-9_.:-]+$/.test(iface)) {
+                showNotification('Invalid interface name', 'error');
+                return false;
+            }
 
             if (activeCaptureContext) {
                 const cancelled = await cancelActiveCapture({ updateUi: false });
@@ -3022,61 +3044,33 @@
             };
             
             if (mode === 'pcap') {
-                // PCAP mode - save to file for Wireshark
-                statusEl.textContent = 'Cleaning old captures...';
+                // PCAP mode - background capture on the switch, then poll for completion.
+                // A single blocking request would exceed the fcgiwrap/nginx read timeout
+                // for durations >= 1 minute, so we start-pcap and poll pcap-status.
+                statusEl.textContent = 'Starting capture...';
                 statusEl.style.color = '#ff9800';
                 outputEl.style.display = 'block';
-                outputEl.textContent = 'Preparing capture...';
-                
-                // Clean up old PCAP files for this device (older than 1 hour)
+                outputEl.textContent = 'Starting PCAP capture on ' + iface + '...\nThis will run for up to ' + duration + ' seconds.';
+
                 try {
-                    await fetch('/fabric-api.sh?action=run-device-command', {
+                    const startResp = await fetch('/fabric-api.sh?action=start-pcap', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({device: captureContext.device, command: 'find /tmp -name "capture_*.pcap" -mmin +60 -delete'}),
+                        body: JSON.stringify({
+                            device: captureContext.device,
+                            interface: iface,
+                            duration: duration,
+                            count: count,
+                            filter: filter
+                        }),
                         signal: captureContext.controller.signal
                     });
-                } catch (e) {
-                    if (!isCurrentCapture(captureContext)) {
-                        if (activeCaptureContext === captureContext) {
-                            await cancelActiveCapture({ updateUi: false });
-                        }
-                        return false;
+                    const startData = await startResp.json();
+                    // Record the remote pcap path as soon as we know it so any
+                    // cleanup path (stale/cancel) can pkill+rm the started capture.
+                    if (startData && startData.pcap_file) {
+                        captureContext.pcapFile = startData.pcap_file;
                     }
-                }
-                if (!isCurrentCapture(captureContext)) {
-                    if (activeCaptureContext === captureContext) {
-                        await cancelActiveCapture({ updateUi: false });
-                    }
-                    return false;
-                }
-                
-                statusEl.textContent = 'Capturing to PCAP file...';
-                outputEl.textContent = 'Running tcpdump with PCAP output on ' + iface + '...\nThis will take ' + duration + ' seconds.';
-                
-                // Generate unique filename
-                const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-                const safeDeviceFilePart = safeTempDevicePart(captureContext.device);
-                const pcapFile = `/tmp/capture_${safeDeviceFilePart}_${iface}_${timestamp}.pcap`;
-                captureContext.pcapFile = pcapFile;
-                
-                // Build command with -w for PCAP output, -U (packet-buffered) for immediate write
-                let cmd = `sudo timeout ${duration} tcpdump -U -i ${iface} -nnnn -w ${pcapFile}`;
-                if (count !== '0') {
-                    cmd += ` -c ${count}`;
-                }
-                if (filter) {
-                    cmd += ` ${filter}`;
-                }
-                
-                try {
-                    const response = await fetch('/fabric-api.sh?action=run-device-command', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({device: captureContext.device, command: cmd}),
-                        signal: captureContext.controller.signal
-                    });
-                    const data = await response.json();
                     if (!isCurrentCapture(captureContext)) {
                         if (activeCaptureContext === captureContext) {
                             await cancelActiveCapture({ updateUi: false });
@@ -3085,44 +3079,92 @@
                         }
                         return false;
                     }
-                    
-                    if (data.success) {
+                    if (!startData.success) {
+                        throw new Error(startData.error || 'Failed to start capture');
+                    }
+
+                    const pcapFile = captureContext.pcapFile;
+
+                    statusEl.textContent = 'Capturing to PCAP file...';
+                    statusEl.style.color = '#ff9800';
+                    outputEl.textContent = 'Running tcpdump with PCAP output on ' + iface + '...\nCapturing for up to ' + duration + ' seconds.';
+
+                    const revealPcapReady = (message, color) => {
+                        releaseCaptureContext(captureContext);
                         capturePcapPath = pcapFile;
                         capturePcapSourceDevice = captureContext.device;
                         document.getElementById('capturePcapPath').textContent = pcapFile;
                         document.getElementById('btnDownloadPcap').disabled = false;
                         pcapResultEl.style.display = 'block';
-                        outputEl.textContent = data.output || '';
-                        statusEl.textContent = 'Capture complete - PCAP ready for download';
-                        statusEl.style.color = '#76b900';
-                        return true;
-                    } else {
-                        outputEl.textContent = 'Error: ' + (data.error || 'Unknown error');
-                        statusEl.textContent = 'Capture failed';
-                        statusEl.style.color = '#f44336';
-                        capturePcapPath = null;
-                        capturePcapSourceDevice = null;
-                        return false;
-                    }
+                        statusEl.textContent = message;
+                        statusEl.style.color = color;
+                        restoreButtons();
+                    };
+
+                    // Poll pcap-status until the capture finishes, then reveal Download.
+                    let pollCount = 0;
+                    const maxPolls = parseInt(duration, 10) + 30;
+                    captureContext.pollInterval = setInterval(async () => {
+                        if (!isCurrentCapture(captureContext)) {
+                            if (activeCaptureContext === captureContext) {
+                                void cancelActiveCapture({ updateUi: false });
+                            }
+                            return;
+                        }
+                        pollCount++;
+                        try {
+                            const statusResp = await fetch('/fabric-api.sh?action=pcap-status', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({device: captureContext.device, pcap_file: pcapFile}),
+                                signal: captureContext.controller.signal
+                            });
+                            const statusData = await statusResp.json();
+                            if (!isCurrentCapture(captureContext)) return;
+
+                            if (statusData.success && statusData.finished) {
+                                const sizeKb = statusData.size
+                                    ? ' (' + (statusData.size / 1024).toFixed(1) + ' KB)'
+                                    : '';
+                                outputEl.textContent = 'Capture complete. PCAP ready for download' + sizeKb + '.';
+                                revealPcapReady('Capture complete - PCAP ready for download', '#76b900');
+                                return;
+                            }
+                            if (statusData.success) {
+                                const sizeKb = statusData.size
+                                    ? '\nCaptured so far: ' + (statusData.size / 1024).toFixed(1) + ' KB'
+                                    : '';
+                                outputEl.textContent = 'Capturing on ' + iface + '...' + sizeKb;
+                            }
+                        } catch (e) {
+                            // Ignore transient poll errors and keep polling until the ceiling.
+                        }
+                        if (isCurrentCapture(captureContext) && pollCount >= maxPolls) {
+                            outputEl.textContent = 'Capture status polling timed out; the PCAP file may still be available for download.';
+                            revealPcapReady('Capture status unknown - try downloading', '#ff9800');
+                        }
+                    }, 1000);
+                    return true;
                 } catch (e) {
                     if (!isCurrentCapture(captureContext)) {
                         if (activeCaptureContext === captureContext) {
                             await cancelActiveCapture({ updateUi: false });
+                        } else {
+                            await cleanupStaleCapture(captureContext, { removePcap: true });
                         }
                         return false;
                     }
+                    releaseCaptureContext(captureContext);
                     capturePcapPath = null;
                     capturePcapSourceDevice = null;
                     pcapResultEl.style.display = 'none';
                     outputEl.textContent = e.name === 'AbortError'
                         ? 'Capture cancelled'
                         : 'Capture stopped or error: ' + e.message;
-                    statusEl.textContent = e.name === 'AbortError' ? 'Capture cancelled' : 'Capture ended';
-                    statusEl.style.color = '#888';
-                    return false;
-                } finally {
-                    if (activeCaptureContext === captureContext) releaseCaptureContext(captureContext);
+                    statusEl.textContent = e.name === 'AbortError' ? 'Capture cancelled' : 'Capture failed';
+                    statusEl.style.color = e.name === 'AbortError' ? '#888' : '#f44336';
                     restoreButtons();
+                    return false;
                 }
             } else {
                 // Live mode - real-time streaming via dedicated API
@@ -3722,6 +3764,19 @@
         let clsupportSourceDevice = null;
         let clsupportPollingInterval = null;
         let clsupportPollContext = null;
+        const CLSUPPORT_MAX_POLL_ERRORS = 20;
+
+        // Classify a `pgrep -f cl-support` run-device-command result. A non-zero
+        // exit is NOT automatically "finished": pgrep exits 1 only when nothing
+        // matched (genuinely idle), while a lock (device_busy) or an SSH blip is a
+        // transient failure we must keep polling through instead of declaring done.
+        function classifyClSupportPgrep(data) {
+            if (data.success && data.output && data.output.trim().length > 0) return 'running';
+            if (data.error_code === 'device_busy') return 'busy';
+            if (data.success === true) return 'idle';
+            if (data.exit_code === 1) return 'idle';
+            return 'error';
+        }
 
         function isCurrentClSupportRequest(requestContext, requestId = null) {
             return isCurrentDeviceRequest(requestContext?.device, requestContext?.generation) &&
@@ -3764,9 +3819,9 @@
                 });
                 const psData = await psResponse.json();
                 if (!isCurrentClSupportRequest(requestContext, requestId)) return false;
-                const isRunning = psData.success && psData.output && psData.output.trim().length > 0;
-                
-                if (isRunning) {
+                const psState = classifyClSupportPgrep(psData);
+
+                if (psState === 'running') {
                     // cl-support is running
                     clsupportFilePath = null;
                     clsupportSourceDevice = null;
@@ -3776,12 +3831,29 @@
                     btnEl.style.opacity = '0.5';
                     statusEl.textContent = 'Generating...';
                     statusEl.style.color = '#ff9800';
-                    
+
                     // Start polling
                     startClSupportPolling(requestContext);
                     return true;
                 }
-                
+
+                if (psState === 'busy' || psState === 'error') {
+                    // Transient failure (device busy / unreachable) - do NOT claim
+                    // "No bundle found"; let the user retry with Refresh.
+                    progressEl.style.display = 'none';
+                    resultEl.style.display = 'none';
+                    btnEl.disabled = false;
+                    btnEl.style.opacity = '1';
+                    document.getElementById('clsupportDownloadBtn').disabled = false;
+                    statusEl.textContent = psState === 'busy'
+                        ? 'Device busy - another command running, click Refresh to retry'
+                        : 'Device unreachable - click Refresh to retry';
+                    statusEl.style.color = '#ff9800';
+                    clsupportFilePath = null;
+                    clsupportSourceDevice = null;
+                    return false;
+                }
+
                 // Check for existing bundle
                 const lsResponse = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
@@ -3790,10 +3862,17 @@
                 });
                 const lsData = await lsResponse.json();
                 if (!isCurrentClSupportRequest(requestContext, requestId)) return false;
-                
-                if (lsData.success && lsData.output && lsData.output.trim()) {
+
+                // Defensively de-CR each line and take the newest non-empty path.
+                const bundleLines = (lsData.output || '')
+                    .split('\n')
+                    .map(line => line.replace(/\r+$/, '').trim())
+                    .filter(Boolean);
+                const lsTransient = lsData.error_code === 'device_busy' || lsData.exit_code === 255;
+
+                if (bundleLines.length) {
                     // Bundle exists - show it
-                    clsupportFilePath = lsData.output.trim().split('\n')[0]; // Get latest
+                    clsupportFilePath = bundleLines[0]; // Get latest
                     clsupportSourceDevice = requestContext.device;
                     document.getElementById('clsupportFilePath').textContent = clsupportFilePath;
                     progressEl.style.display = 'none';
@@ -3803,6 +3882,19 @@
                     document.getElementById('clsupportDownloadBtn').disabled = false;
                     statusEl.textContent = 'Bundle ready';
                     statusEl.style.color = '#76b900';
+                } else if (lsTransient) {
+                    // Transient failure while listing - keep the door open for retry.
+                    progressEl.style.display = 'none';
+                    resultEl.style.display = 'none';
+                    btnEl.disabled = false;
+                    btnEl.style.opacity = '1';
+                    document.getElementById('clsupportDownloadBtn').disabled = false;
+                    statusEl.textContent = lsData.error_code === 'device_busy'
+                        ? 'Device busy - another command running, click Refresh to retry'
+                        : 'Device unreachable - click Refresh to retry';
+                    statusEl.style.color = '#ff9800';
+                    clsupportFilePath = null;
+                    clsupportSourceDevice = null;
                 } else {
                     // No bundle exists
                     progressEl.style.display = 'none';
@@ -3842,13 +3934,42 @@
             const pollContext = {
                 device: requestContext.device,
                 generation: requestContext.generation,
-                interval: null
+                interval: null,
+                errorCount: 0,
+                skipTicks: 0
             };
             clsupportPollContext = pollContext;
+
+            const giveUpPolling = (message) => {
+                stopClSupportPolling(pollContext);
+                const statusEl = document.getElementById('clsupportStatus');
+                statusEl.textContent = message;
+                statusEl.style.color = '#f44336';
+                const btnEl = document.getElementById('btnGenerateClsupport');
+                btnEl.disabled = false;
+                btnEl.style.opacity = '1';
+            };
+
+            const noteTransient = (message) => {
+                pollContext.errorCount++;
+                if (pollContext.errorCount >= CLSUPPORT_MAX_POLL_ERRORS) {
+                    giveUpPolling(message + ' - stopped checking, click Refresh to retry');
+                    return;
+                }
+                const statusEl = document.getElementById('clsupportStatus');
+                statusEl.textContent = message + ' - still generating...';
+                statusEl.style.color = '#ff9800';
+                // Back off: skip a growing number of ticks before the next poll.
+                pollContext.skipTicks = Math.min(pollContext.errorCount, 4);
+            };
 
             pollContext.interval = setInterval(async () => {
                 if (clsupportPollContext !== pollContext || !isCurrentClSupportRequest(pollContext)) {
                     stopClSupportPolling(pollContext);
+                    return;
+                }
+                if (pollContext.skipTicks > 0) {
+                    pollContext.skipTicks--;
                     return;
                 }
                 try {
@@ -3862,15 +3983,32 @@
                         stopClSupportPolling(pollContext);
                         return;
                     }
-                    const isRunning = psData.success && psData.output && psData.output.trim().length > 0;
-                    if (!isRunning) {
-                        stopClSupportPolling(pollContext);
-                        await loadClSupportStatus(pollContext);
+                    const psState = classifyClSupportPgrep(psData);
+                    if (psState === 'running') {
+                        pollContext.errorCount = 0;
+                        const statusEl = document.getElementById('clsupportStatus');
+                        statusEl.textContent = 'Generating... (2-5 minutes)';
+                        statusEl.style.color = '#ff9800';
+                        return; // keep polling
                     }
+                    if (psState === 'busy') {
+                        noteTransient('Device busy');
+                        return;
+                    }
+                    if (psState === 'error') {
+                        noteTransient('Device unreachable');
+                        return;
+                    }
+                    // psState === 'idle': cl-support genuinely finished.
+                    pollContext.errorCount = 0;
+                    stopClSupportPolling(pollContext);
+                    await loadClSupportStatus(pollContext);
                 } catch (e) {
                     if (clsupportPollContext !== pollContext || !isCurrentClSupportRequest(pollContext)) {
                         stopClSupportPolling(pollContext);
+                        return;
                     }
+                    noteTransient('Device unreachable');
                 }
             }, 3000);
             clsupportPollingInterval = pollContext.interval;
@@ -4434,25 +4572,34 @@
         async function runCommand(cmd) {
             const requestContext = getDeviceRequestContext();
             if (!requestContext.device) return false;
+            const requestId = ++commandRequestId;
             const outputDiv = document.getElementById('commandOutput');
             const cmdHeader = document.getElementById('cmdHeader');
             const cmdResult = document.getElementById('cmdResult');
-            
+            const commandButtons = document.querySelectorAll(
+                '#tab-commands .cmd-btn, #tab-commands .custom-command button'
+            );
+            const isCurrentCommand = () => (
+                requestId === commandRequestId &&
+                isCurrentDeviceRequest(requestContext.device, requestContext.generation)
+            );
+
             outputDiv.style.display = 'block';
             cmdHeader.textContent = `$ ${cmd}`;
             cmdResult.style.color = '';
             cmdResult.textContent = 'Running...';
-            
+            commandButtons.forEach(btn => { btn.disabled = true; });
+
             try {
                 const response = await fetch('/fabric-api.sh?action=run-device-command', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({device: requestContext.device, command: cmd})
                 });
-                
+
                 const data = await response.json();
-                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
-                
+                if (!isCurrentCommand()) return false;
+
                 if (data.success) {
                     cmdResult.textContent = data.output || '(no output)';
                 } else {
@@ -4463,11 +4610,15 @@
                 outputDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 return data.success;
             } catch (e) {
-                if (!isCurrentDeviceRequest(requestContext.device, requestContext.generation)) return false;
+                if (!isCurrentCommand()) return false;
                 cmdResult.style.color = '#f44336';
                 cmdResult.textContent = `Request failed: ${e.message}`;
                 outputDiv.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 return false;
+            } finally {
+                if (isCurrentCommand()) {
+                    commandButtons.forEach(btn => { btn.disabled = false; });
+                }
             }
         }
         

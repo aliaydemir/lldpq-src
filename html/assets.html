@@ -611,7 +611,11 @@
                 last_seen: assetText(row.last_seen),
             };
         });
-        return { createdAt: assetText(payload.created_at), rows };
+        const ageSeconds = typeof payload.age_seconds === 'number' &&
+            Number.isFinite(payload.age_seconds) && payload.age_seconds >= 0
+            ? payload.age_seconds
+            : null;
+        return { createdAt: assetText(payload.created_at), ageSeconds, rows };
     }
 
     async function fetchAndDisplayAssetResults() {
@@ -635,7 +639,7 @@
                     `Assets request failed (${response.status})`));
             }
             const report = normalizeAssetReport(payload);
-            if (!setLastUpdated(report.createdAt)) {
+            if (!setLastUpdated(report.createdAt, report.ageSeconds)) {
                 throw new Error('Assets response contained an invalid collection timestamp');
             }
             generateAssetTable(report.rows);
@@ -650,7 +654,7 @@
         }
     }
     
-    function setLastUpdated(createdAt) {
+    function setLastUpdated(createdAt, ageSeconds = null) {
         const target = document.getElementById('last-updated');
         const match = typeof createdAt === 'string'
             ? createdAt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/)
@@ -667,7 +671,13 @@
             target.textContent = 'Unavailable';
             return false;
         }
-        target.textContent = dateToUse.toLocaleString('en-US', {
+        // created_at carries no timezone; parsing it as browser-local can mislabel
+        // the instant. When the API reports age_seconds, derive the moment from it
+        // so the rendered wall-clock time is correct in the viewer's timezone.
+        const displayDate = typeof ageSeconds === 'number' && Number.isFinite(ageSeconds)
+            ? new Date(Date.now() - ageSeconds * 1000)
+            : dateToUse;
+        target.textContent = displayDate.toLocaleString('en-US', {
             year: 'numeric',
             month: '2-digit',
             day: '2-digit',
@@ -780,6 +790,17 @@
         document.getElementById('fail-count').textContent = failCount;
         document.getElementById('warning-count').textContent = warningCount;
         document.getElementById('no-info-count').textContent = noInfoCount;
+
+        // The Assets API only emits OK/UNREACHABLE/SSH-FAILED/NO-INFO, so the
+        // Warnings category is normally empty. Hide the card when it has no rows
+        // so clicking it can never filter the table down to nothing.
+        const warningCard = document.querySelector('.card-warning');
+        if (warningCard) {
+            warningCard.style.display = warningCount > 0 ? '' : 'none';
+            if (warningCount === 0 && currentFilter === 'warning') {
+                filterTable('all');
+            }
+        }
         
         // Add click handlers to cards for filtering
         if (!assetCardHandlersAdded) {
@@ -912,12 +933,14 @@
         const getUptimeMinutes = uptime => {
             let minutes = 0;
             let matched = false;
-            const matcher = /(\d+)[\s_-]*(weeks?|days?|hours?|minutes?)/gi;
+            const matcher = /(\d+)[\s_-]*(decades?|years?|weeks?|days?|hours?|minutes?)/gi;
             for (const match of String(uptime).matchAll(matcher)) {
                 matched = true;
                 const amount = Number(match[1]);
                 const unit = match[2].toLowerCase();
-                if (unit.startsWith('week')) minutes += amount * 7 * 24 * 60;
+                if (unit.startsWith('decade')) minutes += amount * 10 * 365 * 24 * 60;
+                else if (unit.startsWith('year')) minutes += amount * 365 * 24 * 60;
+                else if (unit.startsWith('week')) minutes += amount * 7 * 24 * 60;
                 else if (unit.startsWith('day')) minutes += amount * 24 * 60;
                 else if (unit.startsWith('hour')) minutes += amount * 60;
                 else minutes += amount;
@@ -1037,6 +1060,39 @@
         }
     }
 
+    function dismissAssetsTracking() {
+        assetsPollGeneration += 1;
+        activeAssetsJobToken = null;
+        if (assetsPollTimer) {
+            clearTimeout(assetsPollTimer);
+            assetsPollTimer = null;
+        }
+        setStoredAssetsToken('');
+        setAssetsButton('idle', true);
+        updateAssetsNotification('queued', 'Assets Tracking Dismissed',
+            'Stopped tracking the previous refresh request.',
+            'You can start a new refresh whenever you are ready.');
+    }
+
+    function showAssetsDismissAction() {
+        if (!assetsStatusNotification) return;
+        const action = document.createElement('button');
+        action.type = 'button';
+        action.textContent = 'Dismiss tracking';
+        action.style.cssText = `
+            margin-top: 10px;
+            background: #404040;
+            color: #d4d4d4;
+            border: none;
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        `;
+        action.addEventListener('click', dismissAssetsTracking);
+        assetsStatusNotification.append(document.createElement('br'), action);
+    }
+
     function scheduleAssetsStatusPoll(token, generation, delayMs) {
         if (token !== activeAssetsJobToken || generation !== assetsPollGeneration) return;
         if (assetsPollTimer) clearTimeout(assetsPollTimer);
@@ -1086,8 +1142,10 @@
             const statusAge = data.updated_at ? nowSeconds - data.updated_at : 0;
             const retryOverdue = data.status === 'failure' && data.retry_scheduled &&
                 data.next_retry_at && nowSeconds - data.next_retry_at > 300;
-            const queueDelayed = data.status === 'queued' && statusAge > 120;
-            const workerStalled = (data.status === 'running' && statusAge > 3600) || retryOverdue;
+            const queueStalled = data.status === 'queued' && statusAge > 1800;
+            const queueDelayed = data.status === 'queued' && statusAge > 120 && !queueStalled;
+            const workerStalled = (data.status === 'running' && statusAge > 3600) ||
+                queueStalled || retryOverdue;
             if (queueDelayed) {
                 // lldpq-trigger serializes LLDP and Assets work.  A large LLDP
                 // request may therefore keep a healthy Assets token queued for
@@ -1095,13 +1153,18 @@
                 setAssetsButton('queued', false);
                 updateAssetsNotification('queued', 'Assets Refresh Still Queued', reason,
                     'The worker may be completing an earlier analysis. This request remains tracked.');
+                showAssetsDismissAction();
                 scheduleAssetsStatusPoll(token, generation, 15000);
                 return;
             }
             if (workerStalled) {
+                // A dead worker can leave a token queued/running indefinitely.
+                // Enable retry and offer an explicit escape from tracking so the
+                // Refresh button can never be disabled permanently.
                 setAssetsButton('failure', true);
                 updateAssetsNotification('failure', 'Assets Worker Appears Stalled', reason,
                     'No timely lifecycle update was received. The report was not treated as complete.');
+                showAssetsDismissAction();
                 scheduleAssetsStatusPoll(token, generation, 15000);
                 return;
             }
@@ -1116,6 +1179,7 @@
                 setAssetsButton('queued', false);
                 updateAssetsNotification('queued', 'Assets Refresh Queued', reason,
                     'Waiting for the matching request to start.');
+                showAssetsDismissAction();
                 const queuedDelay = data.next_retry_at
                     ? Math.max(2000, Math.min(10000, data.next_retry_at * 1000 - Date.now() + 500))
                     : 2000;
@@ -1160,6 +1224,7 @@
         updateAssetsNotification('queued', 'Assets Refresh Queued',
             'The request was accepted and is waiting for the Assets worker.',
             'This page refreshes only after confirmed success.');
+        showAssetsDismissAction();
         scheduleAssetsStatusPoll(token, generation, 250);
         return true;
     }
@@ -1475,7 +1540,9 @@
         devicesEditorRevision = '';
         setDevicesEditorActionsEnabled(false);
         document.getElementById('devicesEditorModal').style.display = 'flex';
-        document.getElementById('devicesEditorStatus').textContent = 'Loading...';
+        const editorStatus = document.getElementById('devicesEditorStatus');
+        editorStatus.style.color = '#888';
+        editorStatus.textContent = 'Loading...';
         try {
             const response = await fetch('/edit-devices', { cache: 'no-store' });
             const data = await response.json();
@@ -1530,8 +1597,9 @@
         const expectedRevision = devicesEditorRevision;
         devicesEditorSaving = true;
         setDevicesEditorActionsEnabled(false);
-        document.getElementById('devicesEditorStatus').textContent = 'Saving...';
         const status = document.getElementById('devicesEditorStatus');
+        status.style.color = '#888';
+        status.textContent = 'Saving...';
         try {
             const response = await fetch('/edit-devices', {
                 method: 'POST',
@@ -1618,7 +1686,7 @@
             <div style="margin-bottom: 15px;">
                 <label style="color: #ccc; font-size: 13px; display: block; margin-bottom: 5px;">Device Password</label>
                 <div style="position: relative;">
-                    <input type="password" id="sshPassword" placeholder="Enter device password" oninput="checkPasswordInput()" autocomplete="off"
+                    <input type="password" id="sshPassword" placeholder="Enter device password" oninput="checkPasswordInput()" onkeydown="handleSSHPasswordEnter(event)" autocomplete="off"
                         style="width: 100%; padding: 10px 40px 10px 12px; background: #1a1a1a; border: 1px solid #555; border-radius: 4px; color: #fff; font-size: 14px; box-sizing: border-box;">
                     <button id="sshPasswordToggle" onclick="togglePasswordVisibility('sshPassword', this)" style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #888; cursor: pointer; padding: 4px;" title="Show/Hide"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
                 </div>
@@ -1666,6 +1734,13 @@ function resetSSHPasswordState() {
     input.value = '';
     input.type = 'password';
     if (toggle) toggle.style.color = '#888';
+}
+
+function handleSSHPasswordEnter(event) {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    const btn = document.getElementById('sshRunBtn');
+    if (btn && !btn.disabled) runSSHSetup();
 }
 
 function checkPasswordInput() {
@@ -1826,7 +1901,6 @@ function renderSSHSetupResults(data, retryDevices = null) {
             if (retrySet.has(row.dataset.ip || '')) row.remove();
         });
     }
-    sshSetupFailedDevices = [];
     const results = Array.isArray(data.results) ? data.results : [];
     results.forEach(result => {
         const hostname = assetText(result?.hostname);
@@ -1835,9 +1909,10 @@ function renderSSHSetupResults(data, retryDevices = null) {
         const sudoFix = assetText(result?.sudo_fix);
         const row = document.createElement('tr');
         row.dataset.ip = ip;
-        const isFailed = sendKey === 'fail' || sudoFix === 'fail';
-        if (isFailed) {
-            sshSetupFailedDevices.push(ip);
+        row.dataset.hostname = hostname;
+        row.dataset.sendKey = sendKey;
+        row.dataset.sudoFix = sudoFix;
+        if (sendKey === 'fail' || sudoFix === 'fail') {
             row.style.background = 'rgba(244, 67, 54, 0.08)';
         }
         appendSSHResultCell(row, hostname,
@@ -1848,17 +1923,47 @@ function renderSSHSetupResults(data, retryDevices = null) {
         appendSSHStatusCell(row, sudoFix, result?.sudo_fix_msg);
         tbody.appendChild(row);
     });
+    if (retryDevices) {
+        // Retried rows were removed then re-appended; restore hostname order so
+        // the table is not left with the retry subset dumped at the bottom.
+        Array.from(tbody.rows)
+            .sort((a, b) => (a.dataset.hostname || '').localeCompare(
+                b.dataset.hostname || '', undefined, { numeric: true, sensitivity: 'base' }))
+            .forEach(row => tbody.appendChild(row));
+    }
     document.getElementById('sshResultsArea').style.display = 'block';
+    renderSSHSetupSummary();
+}
+
+function renderSSHSetupSummary() {
+    // Derive the fleet summary from the current table rows so a retry of a
+    // failed subset never overwrites the whole-fleet counts with subset totals.
+    const tbody = document.getElementById('sshResultsBody');
+    const rows = Array.from(tbody.rows);
+    const isOk = status => status === 'ok' || status === 'already';
+    let sendOk = 0;
+    let sudoOk = 0;
+    sshSetupFailedDevices = [];
+    rows.forEach(row => {
+        const sendKey = row.dataset.sendKey || '';
+        const sudoFix = row.dataset.sudoFix || '';
+        if (isOk(sendKey)) sendOk++;
+        if (isOk(sudoFix)) sudoOk++;
+        if (sendKey === 'fail' || sudoFix === 'fail') {
+            sshSetupFailedDevices.push(row.dataset.ip || '');
+        }
+    });
+    const total = rows.length;
 
     const summary = document.getElementById('sshSummary');
     const label = document.createElement('strong');
     label.textContent = 'Results:';
     const sendCount = document.createElement('span');
     sendCount.style.color = '#4caf50';
-    sendCount.textContent = `${assetText(data.send_key_ok, '0')}/${assetText(data.total, '0')}`;
+    sendCount.textContent = `${sendOk}/${total}`;
     const sudoCount = document.createElement('span');
     sudoCount.style.color = '#4caf50';
-    sudoCount.textContent = `${assetText(data.sudo_fix_ok, '0')}/${assetText(data.total, '0')}`;
+    sudoCount.textContent = `${sudoOk}/${total}`;
     summary.replaceChildren(label, document.createTextNode(' Send Key: '), sendCount,
         document.createTextNode(' | Sudo Fix: '), sudoCount);
     if (sshSetupFailedDevices.length > 0) {
@@ -1867,6 +1972,8 @@ function renderSSHSetupResults(data, retryDevices = null) {
         failed.textContent = `${sshSetupFailedDevices.length} failed`;
         summary.append(document.createTextNode(' | '), failed);
         document.getElementById('sshRetryBtn').style.display = 'inline-block';
+    } else {
+        document.getElementById('sshRetryBtn').style.display = 'none';
     }
     summary.style.display = 'block';
 }
@@ -1970,7 +2077,7 @@ function retrySSHSetup() {
                 <div>
                     <button onclick="closeDevicesEditorModal()" style="background: #555; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">Cancel</button>
                     <button id="devicesSaveBtn" onclick="saveDevices()" disabled style="background: #607d8b; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; margin-right: 10px;">Save</button>
-                    <button id="devicesSaveRunBtn" onclick="saveDevicesAndRun()" disabled style="background: #76b900; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;">Save & Run LLDPq</button>
+                    <button id="devicesSaveRunBtn" onclick="saveDevicesAndRun()" disabled style="background: #76b900; color: #000; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: bold;">Save & Refresh Assets</button>
                 </div>
             </div>
         </div>

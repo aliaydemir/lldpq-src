@@ -2217,9 +2217,9 @@ async function loadDHCPHosts() {
         return;
     }
     tbody.innerHTML = bindings.map(b => `<tr style="${b.commented ? 'opacity:0.4;' : ''}">
-        <td>${b.hostname}</td>
-        <td style="font-family:monospace;font-size:12px;">${b.mac}</td>
-        <td style="font-family:monospace;">${b.ip}</td>
+        <td>${escHtml(b.hostname)}</td>
+        <td style="font-family:monospace;font-size:12px;">${escHtml(b.mac)}</td>
+        <td style="font-family:monospace;">${escHtml(b.ip)}</td>
         <td>${b.commented ? '<span style="color:#888;">Disabled</span>' : '<span style="color:#76b900;">Active</span>'}</td>
     </tr>`).join('');
 }
@@ -2360,6 +2360,10 @@ let _cachedDhcpConfig = null;
 
 // ===================== DOWNLOAD CSV =====================
 async function rebuildDevicesYaml() {
+    if (!inventoryLoaded) {
+        showToast('Inventory has not loaded yet; reload before rebuilding.', 'error');
+        return;
+    }
     // Count what will be written (must match server-side logic: inv_status == 'planned' is the sole criterion)
     const withRole = allBindings.filter(b => b.hostname && b.ip && b.role);
     const active = withRole.filter(b => b.inv_status !== 'planned');
@@ -2505,6 +2509,10 @@ function parseBulkText(text) {
 }
 
 function applyBulkImport() {
+    if (!inventoryLoaded) {
+        showToast('Inventory has not loaded yet; reload before importing.', 'error');
+        return;
+    }
     const text = document.getElementById('bulkImportText').value;
     if (!text.trim()) {
         showToast('Paste binding data first', 'error');
@@ -2803,7 +2811,10 @@ function toggleDhcp(hostname, checked) {
 }
 
 function toggleAllDhcp(checked) {
-    allBindings.forEach(b => { b.dhcp = checked; });
+    allBindings.forEach(b => {
+        const hasValidMac = b.mac && b.mac !== '-' && !b.mac.includes('x');
+        if (hasValidMac) b.dhcp = checked;
+    });
     bindingsModified = true;
     document.getElementById('btnSaveBindings').style.display = '';
     document.getElementById('btnDiscardBindings').style.display = '';
@@ -3174,6 +3185,10 @@ function deleteBinding(hostname) {
 }
 
 async function saveBindings() {
+    if (!inventoryLoaded) {
+        showToast('Inventory has not loaded yet; reload before saving.', 'error');
+        return;
+    }
     const btn = document.getElementById('btnSaveBindings');
     btn.disabled = true;
     btn.textContent = 'Saving...';
@@ -4247,6 +4262,10 @@ function isValidZtpPublicKey(value) {
 }
 
 function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
+    if (!ztpLoaded) {
+        showToast('ZTP tab has not loaded; reload before applying (avoids overwriting the saved script with defaults).', 'error');
+        return false;
+    }
     let content = document.getElementById('ztpEditor').value;
     const os = document.getElementById('ztpTargetOS').value.trim() || '5.14.0';
     const pwRaw = document.getElementById('ztpPassword').value.trim() || 'Nvidia@123';
@@ -4701,6 +4720,11 @@ async function saveZTPScript() {
 
 // ===================== TAB 5: UPGRADE =====================
 let upgradeDevices = [];
+let upgradeSelected = new Set();
+function upgradeSetSel(ip, checked) {
+    if (!ip) return;
+    if (checked) upgradeSelected.add(ip); else upgradeSelected.delete(ip);
+}
 let upgradeImages = [];
 let upgradeJobId = null;
 let upgradePollTimer = null;
@@ -4813,7 +4837,7 @@ function selectedUpgradeDevices() {
 
 function upgradeSelectAll(checked) {
     document.querySelectorAll('.upgrade-dev-cb').forEach(cb => {
-        if (!cb.disabled) cb.checked = checked;
+        if (!cb.disabled) { cb.checked = checked; upgradeSetSel(cb.dataset.ip, checked); }
     });
     const all = document.getElementById('upgradeSelectAllBox');
     if (all) all.checked = checked;
@@ -4823,6 +4847,7 @@ function toggleUpgradeRow(index) {
     const cb = document.querySelector(`.upgrade-dev-cb[data-index="${index}"]`);
     if (!cb || cb.disabled) return;
     cb.checked = !cb.checked;
+    upgradeSetSel(cb.dataset.ip, cb.checked);
 }
 
 let upgradeSortCol = 'hostname';
@@ -4911,7 +4936,7 @@ function renderUpgradeTable(job = null) {
         const badgeClass = displayStatus === 'done' ? 'badge-success' : displayStatus === 'failed' ? 'badge-error' : displayStatus === 'already' ? 'badge-info' : displayStatus === 'queued' ? 'badge-pending' : displayStatus === 'upgrading' || displayStatus === 'waiting_reboot' ? 'badge-warning' : candidate ? 'badge-match' : 'badge-unreachable';
         const detail = merged.error || merged.message || (merged.checks ? merged.checks.join('; ') : '') || (merged.already ? 'Already at selected target version' : '');
         return `<tr id="upgrade-${rowIdFromIp(merged.ip)}" onclick="toggleUpgradeRow(${i})" style="${candidate ? 'cursor:pointer;' : 'opacity:0.75;'}">
-            <td><input type="checkbox" class="upgrade-dev-cb" data-index="${i}" ${candidate ? '' : 'disabled'} onclick="event.stopPropagation();" style="accent-color:#76b900;"></td>
+            <td><input type="checkbox" class="upgrade-dev-cb" data-index="${i}" data-ip="${escHtml(merged.ip)}" ${candidate ? '' : 'disabled'} ${candidate && upgradeSelected.has(merged.ip) ? 'checked' : ''} onclick="event.stopPropagation();" onchange="upgradeSetSel(this.dataset.ip, this.checked)" style="accent-color:#76b900;"></td>
             <td><strong>${escHtml(merged.hostname)}</strong></td>
             <td style="font-family:monospace;font-size:12px;">${escHtml(merged.ip)}</td>
             <td>${escHtml(merged.role || '')}</td>
@@ -5034,6 +5059,11 @@ async function cancelUpgradeJob() {
 
 // ===================== TAB 6: BASE CONFIG =====================
 let bcDeviceGroups = {};
+let bcSelected = new Set();
+function bcSetSel(ip, checked) {
+    if (!ip) return;
+    if (checked) bcSelected.add(ip); else bcSelected.delete(ip);
+}
 
 async function loadDeviceList() {
     const data = await apiCall('list-devices');
@@ -5074,7 +5104,7 @@ function renderBCDeviceList() {
                 <div id="bcd-${groupId}" style="display:none;">
                     ${filtered.map(d => `
                         <label style="display:flex; align-items:center; gap:8px; padding:4px 10px 4px 28px; cursor:pointer; font-size:12px; transition:background 0.1s;" onmouseover="this.style.background='#2a2a2a'" onmouseout="this.style.background=''">
-                            <input type="checkbox" class="bc-dev-cb" data-ip="${d.ip}" data-hostname="${d.hostname}" data-username="${d.username || 'cumulus'}" data-group="${groupId}" style="accent-color:#76b900; width:13px; height:13px;" onchange="bcUpdateCounts()">
+                            <input type="checkbox" class="bc-dev-cb" data-ip="${escHtml(d.ip)}" data-hostname="${escHtml(d.hostname)}" data-username="${escHtml(d.username || 'cumulus')}" data-group="${groupId}" ${bcSelected.has(d.ip) ? 'checked' : ''} style="accent-color:#76b900; width:13px; height:13px;" onchange="bcSetSel(this.dataset.ip, this.checked); bcUpdateCounts()">
                             <span style="flex:1; color:#d4d4d4;">${escHtml(d.hostname)}</span>
                             <span style="color:#666; font-family:monospace; font-size:11px;">${escHtml(d.ip)}</span>
                         </label>
@@ -5096,12 +5126,12 @@ function bcToggleGroup(groupId) {
 
 function bcToggleGroupDevices(groupId) {
     const groupCb = document.getElementById('bcg-' + groupId);
-    document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]`).forEach(cb => cb.checked = groupCb.checked);
+    document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]`).forEach(cb => { cb.checked = groupCb.checked; bcSetSel(cb.dataset.ip, cb.checked); });
     bcUpdateCounts();
 }
 
 function bcSelectAll(checked) {
-    document.querySelectorAll('.bc-dev-cb').forEach(cb => cb.checked = checked);
+    document.querySelectorAll('.bc-dev-cb').forEach(cb => { cb.checked = checked; bcSetSel(cb.dataset.ip, checked); });
     document.querySelectorAll('[id^="bcg-"]').forEach(cb => cb.checked = checked);
     bcUpdateCounts();
 }
@@ -5199,7 +5229,7 @@ function escHtml(s) {
 }
 function escAttr(s) {
     if (!s) return '';
-    return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/`/g, '\\`').replace(/\n/g, '').replace(/\r/g, '');
+    return s.replace(/&/g, '&amp;').replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/`/g, '\\`').replace(/\n/g, '').replace(/\r/g, '');
 }
 
 // ===================== CUSTOM CONFIRM MODAL =====================

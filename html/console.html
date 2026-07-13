@@ -205,7 +205,9 @@
             document.fonts.ready.then(() => {
                 for (const id in sessions) {
                     const t = sessions[id];
-                    try { t.term.options.fontSize = t.term.options.fontSize; } catch(e){}
+                    // A no-op setter never fires onOptionChange, so nudge the value to force
+                    // xterm to re-measure glyph metrics now that the webfont is active.
+                    try { const fs = t.term.options.fontSize; t.term.options.fontSize = fs + 0.0001; t.term.options.fontSize = fs; } catch(e){}
                     snug(t);
                 }
             });
@@ -451,6 +453,8 @@
                 sess.log = '';
             }
             sess.connected = true;
+            sess.reconnectAttempts = 0;
+            if (sess.reconnectTimer) { clearTimeout(sess.reconnectTimer); sess.reconnectTimer = null; }
             sess.tabEl.classList.add('connected'); sess.tabEl.classList.remove('closed');
             snug(sess);
             // FitAddon only emits onResize when dimensions changed. Explicitly send the
@@ -473,9 +477,29 @@
             sess.tabEl.classList.remove('connected'); sess.tabEl.classList.add('closed');
             const detail = closeDescription(event);
             sess.term.write(`\r\n\x1b[90m• ${detail}\x1b[0m\r\n`);
-            showReconnect(sess, detail);
+            if (shouldAutoReconnect(event && Number(event.code))) scheduleReconnect(sess, detail);
+            else showReconnect(sess, detail);
         };
         ws.onerror = () => { try { ws.close(); } catch(e){} };
+    }
+
+    // Auto-reconnect only on transient/unexpected closes, never on policy rejections
+    // (1008) or application close codes (4xxx) that mean "do not retry".
+    function shouldAutoReconnect(code) {
+        return code === 1006 || code === 1012 || code === 1013;
+    }
+    function scheduleReconnect(sess, detail) {
+        if (sess.closing) return;
+        sess.reconnectAttempts = (sess.reconnectAttempts || 0) + 1;
+        if (sess.reconnectAttempts > 6) { showReconnect(sess, detail); return; }
+        const delay = Math.min(15000, 500 * Math.pow(2, sess.reconnectAttempts - 1));
+        showReconnect(sess, `${detail} — reconnecting…`);
+        if (sess.reconnectTimer) clearTimeout(sess.reconnectTimer);
+        sess.reconnectTimer = setTimeout(() => {
+            sess.reconnectTimer = null;
+            if (sess.closing) return;
+            connect(sess, { resetOnOpen: true });
+        }, delay);
     }
 
     function closeDescription(event) {
@@ -506,6 +530,8 @@
             button.textContent = 'Reconnect';
             button.addEventListener('click', () => {
                 button.disabled = true;
+                sess.reconnectAttempts = 0;
+                if (sess.reconnectTimer) { clearTimeout(sess.reconnectTimer); sess.reconnectTimer = null; }
                 connect(sess, { resetOnOpen: true });
             });
             box.appendChild(message);
@@ -524,13 +550,29 @@
     }
     function clearReconnect(sess) { const b = sess.paneEl.querySelector('.reconnect'); if (b) b.remove(); }
 
+    // Deliver {t:'end'} over a brand-new short-lived socket with the same sid. Used when the
+    // tab's own socket is already down, so reattach-then-kill still terminates the live PTY.
+    function terminateRemote(sess) {
+        try {
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            const ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`);
+            ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'end' })); } catch (e) {} try { ws.close(); } catch (e) {} };
+            ws.onerror = () => { try { ws.close(); } catch (e) {} };
+        } catch (e) {}
+    }
+
     function closeSession(id) {
         const s = sessions[id];
         if (!s) return;
         s.closing = true;
+        if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
         // Explicit close → tell the bridge to kill the PTY (navigation-away does NOT send this,
-        // so those sessions stay alive for reattach).
-        try { if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'end' })); } catch(e){}
+        // so those sessions stay alive for reattach). If our socket is already down, reattach
+        // with the same sid solely to deliver {t:'end'} so the session is not orphaned.
+        try {
+            if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'end' }));
+            else terminateRemote(s);
+        } catch(e){}
         try { if (s.ws) s.ws.close(); } catch(e){}
         try { s.term.dispose(); } catch(e){}
         s.paneEl.remove(); s.tabEl.remove();
@@ -640,7 +682,13 @@
     }
     function downloadLog() {
         const s = sessions[activeId]; if (!s) return;
-        const blob = new Blob([s.log.replace(/\0/g, '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')], { type: 'text/plain' });
+        const cleaned = s.log
+            .replace(/\0/g, '')
+            .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')   // OSC (e.g. window title \x1b]0;…\x07)
+            .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')          // CSI
+            .replace(/\x1b[()][0-9A-Za-z]/g, '')             // 2-byte charset designation
+            .replace(/\x1b[=>]/g, '');                       // keypad application mode
+        const blob = new Blob([cleaned], { type: 'text/plain' });
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = `console-${s.label.replace(/[^a-z0-9]+/gi, '_')}-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'')}.log`;
@@ -729,6 +777,10 @@
     function broadcastSend() {
         const inp = document.getElementById('bcastInput');
         const cmd = inp.value;
+        if (!cmd) {
+            showToast('Broadcast skipped because the command is empty.', 'warning');
+            return;
+        }
         const all = Object.values(sessions);
         const connected = all.filter(s => s.ws && s.ws.readyState === WebSocket.OPEN);
         if (!connected.length) {
@@ -746,6 +798,7 @@
                 }
             });
             const nowSkipped = all.length - sent;
+            if (sent) showToast(`Broadcast sent to ${sent} tab${sent === 1 ? '' : 's'}.`, 'info');
             if (nowSkipped) showToast(`Broadcast skipped ${nowSkipped} disconnected target${nowSkipped === 1 ? '' : 's'}.`, 'warning');
             if (sent) inp.value = '';   // placeholder stays "send commands to all tabs"
         };

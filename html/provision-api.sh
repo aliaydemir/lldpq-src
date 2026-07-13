@@ -87,10 +87,10 @@ else
                     POST_DATA_FILE=$(mktemp /tmp/lldpq-provision-request.XXXXXX) || POST_DATA_FILE=""
                     if [ -n "$POST_DATA_FILE" ]; then
                         trap 'rm -f "$POST_DATA_FILE"' EXIT
-                        dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH" > "$POST_DATA_FILE"
+                        head -c "$CONTENT_LENGTH" > "$POST_DATA_FILE"
                     fi
                 else
-                    POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) 2>/dev/null | head -c "$CONTENT_LENGTH")
+                    POST_DATA=$(head -c "$CONTENT_LENGTH")
                 fi
                 ;;
         esac
@@ -1616,6 +1616,7 @@ def _action_save_bindings_locked():
     remove_devices = data.get('remove_devices', [])  # hostnames to remove from devices.yaml
     do_restart = data.get('restart_dhcp', True)  # default True for backward compat
     client_revision = str(data.get('revision', '')).strip()
+    first_run = bool(data.get('first_run', False))
 
     # Hold the canonical inventory lock before reading dhcpd.hosts or
     # devices.yaml to build candidates.  This prevents DHCP Save from changing
@@ -1671,7 +1672,7 @@ def _action_save_bindings_locked():
     try:
         current_revision = inventory_revision()
         if current_revision != initial_revision or (
-            client_revision and client_revision != current_revision
+            (not first_run) and client_revision != current_revision
         ):
             result_json({
                 'success': False,
@@ -7573,8 +7574,9 @@ def action_rebuild_devices_yaml():
     except ValueError as exc:
         error_json(str(exc))
     client_revision = str(data.get('revision', '')).strip()
+    first_run = bool(data.get('first_run', False))
     initial_revision = inventory_revision()
-    if client_revision and client_revision != initial_revision:
+    if (not first_run) and client_revision != initial_revision:
         result_json({'success': False, 'error_code': 'inventory_conflict',
                      'error': 'Inventory changed on the server. Reload before rebuilding.',
                      'revision': initial_revision})

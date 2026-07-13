@@ -64,6 +64,7 @@ HOST_TARGET = "__lldpq_host__"
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _TOKEN_RE = re.compile(r"^[A-Fa-f0-9]{64}$")
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 SESSIONS = {}          # sid -> session dict
 CLEANUP_TASKS = set()  # process cleanup tasks, including sessions already removed
@@ -125,6 +126,21 @@ def _current_user():
         return pwd.getpwuid(os.geteuid()).pw_name
     except Exception:
         return "www-data"
+
+
+def _sanitize_log(value, limit=256):
+    """Strip CR/LF/control chars and cap length so audit/journald lines can't be forged."""
+    text = _CONTROL_RE.sub("", str(value or ""))
+    return text[:limit]
+
+
+def _client_ip(headers, fallback):
+    """Trust the loopback nginx proxy's forwarded client IP over the TCP peername."""
+    for name in ("x-real-ip", "x-forwarded-for"):
+        candidate = _sanitize_log((headers.get(name, "") or "").split(",")[0], 64).strip()
+        if candidate:
+            return candidate
+    return fallback
 
 
 def _extract_session_token(cookie_header):
@@ -298,7 +314,7 @@ def resolve_target(target):
         return (None, None)
     ip, duser = dev
     ssh = ["ssh", "-tt",
-           "-o", "StrictHostKeyChecking=no",
+           "-o", "StrictHostKeyChecking=accept-new",
            "-o", "ConnectTimeout=10",
            "-o", "BatchMode=yes",
            "-o", "LogLevel=ERROR",
@@ -764,6 +780,19 @@ async def _watchdog(sess):
         if sess.get("attached") and sess.get("writer"):
             _send_session_frame(sess, 0x2, b"\x00", sess.get("attachment_id"))
         idle = time.time() - sess["last_activity"]
+        warn_at = IDLE_TIMEOUT - 60
+        if warn_at > 0:
+            if idle >= warn_at and idle <= IDLE_TIMEOUT and not sess.get("idle_warned"):
+                if sess.get("attached") and sess.get("writer"):
+                    sess["idle_warned"] = True
+                    _send_session_frame(
+                        sess, 0x1,
+                        b"\r\n\x1b[33m\xe2\x80\xa2 session closes in 60s \xe2\x80\x94 "
+                        b"press any key to stay\x1b[0m\r\n",
+                        sess.get("attachment_id"),
+                    )
+            elif idle < warn_at:
+                sess.pop("idle_warned", None)
         if idle > IDLE_TIMEOUT or (time.time() - sess["started"]) > MAX_SESSION:
             reason = "idle" if idle > IDLE_TIMEOUT else "max-session"
             _send_session_frame(
@@ -864,9 +893,12 @@ async def handle(reader, writer):
                 return
             headers[name] = value.strip()
 
+        peer_ip = _client_ip(headers, peer_ip)
+
         request_url = urlsplit(request_parts[1])
         query = parse_qs(request_url.query, keep_blank_values=True)
         target = (query.get("target") or [""])[0]
+        log_target = _sanitize_log(target, 128)
         sid = (query.get("sid") or [""])[0]
         if not _SID_RE.fullmatch(sid):
             await http_reject("400 Bad Request", "invalid session id")
@@ -874,7 +906,7 @@ async def handle(reader, writer):
 
         ok, user, role, token = _authenticate_admin(headers.get("cookie", ""))
         if not ok:
-            audit("DENY ip=%s target=%s (not admin)" % (peer_ip, target))
+            audit("DENY ip=%s target=%s (not admin)" % (peer_ip, log_target))
             await http_reject("403 Forbidden", "Admin session required")
             return
 
@@ -910,12 +942,12 @@ async def handle(reader, writer):
         else:
             label, argv = resolve_target(target)
             if not argv:
-                audit("DENY ip=%s user=%s target=%s (unknown target)" % (peer_ip, user, target))
+                audit("DENY ip=%s user=%s target=%s (unknown target)" % (peer_ip, user, log_target))
                 await http_reject("404 Not Found", "Unknown target")
                 return
             limit_status = _session_limit_status(token)
             if limit_status:
-                audit("DENY ip=%s user=%s target=%s (session limit)" % (peer_ip, user, target))
+                audit("DENY ip=%s user=%s target=%s (session limit)" % (peer_ip, user, log_target))
                 await http_reject(*limit_status)
                 return
 

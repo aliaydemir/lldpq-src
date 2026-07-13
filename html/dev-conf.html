@@ -554,7 +554,10 @@
         let selectedDevice = null;
         let selectedFormat = 'txt';
         let currentConfigContent = '';
-        
+        let configRequestId = 0;
+        let isAdminUser = false;
+        let preSearchCollapsed = null;
+
         function showLoading(text = 'Loading...') {
             document.getElementById('loadingOverlay').classList.add('visible');
             document.getElementById('loadingText').textContent = text;
@@ -657,7 +660,7 @@
                 header.className = 'group-header collapsed';
                 header.innerHTML = `
                     <span class="arrow">▼</span>
-                    ${group} (${deviceGroups[group].length})
+                    ${escapeHtml(group)} (${deviceGroups[group].length})
                 `;
                 header.onclick = () => toggleGroup(header);
                 
@@ -670,7 +673,7 @@
                     item.dataset.device = device;
                     item.innerHTML = `
                         <div class="device-icon"></div>
-                        <span class="device-name">${device}</span>
+                        <span class="device-name">${escapeHtml(device)}</span>
                     `;
                     item.onclick = () => selectDevice(device);
                     devicesDiv.appendChild(item);
@@ -697,13 +700,37 @@
                 const device = item.dataset.device.toLowerCase();
                 item.style.display = device.includes(search) ? '' : 'none';
             });
-            
-            // Show/hide groups based on visible items
-            document.querySelectorAll('.device-group').forEach(group => {
-                const visibleItems = group.querySelectorAll('.device-item[style=""]').length + 
-                                    group.querySelectorAll('.device-item:not([style])').length;
-                group.style.display = visibleItems > 0 ? '' : 'none';
-            });
+
+            if (search) {
+                // Remember collapse state the first time a search begins
+                if (preSearchCollapsed === null) {
+                    preSearchCollapsed = {};
+                    document.querySelectorAll('.device-group').forEach(group => {
+                        const header = group.querySelector('.group-header');
+                        preSearchCollapsed[group.dataset.group] = header.classList.contains('collapsed');
+                    });
+                }
+                // Reveal matching groups (expanded) and hide the rest
+                document.querySelectorAll('.device-group').forEach(group => {
+                    const hasMatch = group.querySelector('.device-item[style=""], .device-item:not([style])');
+                    group.style.display = hasMatch ? '' : 'none';
+                    if (hasMatch) {
+                        group.querySelector('.group-header').classList.remove('collapsed');
+                        group.querySelector('.group-devices').classList.remove('collapsed');
+                    }
+                });
+            } else {
+                // Query cleared: restore visibility and the pre-search collapse state
+                document.querySelectorAll('.device-group').forEach(group => {
+                    group.style.display = '';
+                    if (preSearchCollapsed) {
+                        const wasCollapsed = !!preSearchCollapsed[group.dataset.group];
+                        group.querySelector('.group-header').classList.toggle('collapsed', wasCollapsed);
+                        group.querySelector('.group-devices').classList.toggle('collapsed', wasCollapsed);
+                    }
+                });
+                preSearchCollapsed = null;
+            }
         }
         
         function selectDevice(device) {
@@ -753,7 +780,7 @@
                 hideLoading();
                 
                 if (!data.success) {
-                    showValidateModal('Validation Error', `<div style="color: #f44336;">${data.error || 'Unknown error'}</div>`, 'error');
+                    showValidateModal('Validation Error', `<div style="color: #f44336;">${escapeHtml(data.error || 'Unknown error')}</div>`, 'error');
                     return;
                 }
                 
@@ -772,7 +799,7 @@
                 if (all) {
                     html += `<div>Files: <span style="color: #fff;">${summary.total_files ?? '?'}</span> (${summary.valid_files ?? 0} valid, ${summary.invalid_files ?? 0} invalid)</div>`;
                 } else {
-                    html += `<div>Device: <span style="color: #4fc3f7; font-weight: bold;">${selectedDevice}</span></div>`;
+                    html += `<div>Device: <span style="color: #4fc3f7; font-weight: bold;">${escapeHtml(selectedDevice)}</span></div>`;
                 }
                 html += `<div>Issues: <span style="color: #f44336;">${summary.total_errors ?? 0} errors</span>, <span style="color: #ff9800;">${summary.total_warnings ?? 0} warnings</span></div>`;
                 html += '</div></div>';
@@ -781,21 +808,43 @@
                 const filesWithIssues = (result.files || []).filter(f => f.issues && f.issues.length > 0);
                 filesWithIssues.forEach(file => {
                     if (all) {
-                        html += `<div style="margin: 12px 0 4px; color: #4fc3f7; font-weight: bold;">${file.device || file.file || ''}</div>`;
+                        html += `<div style="margin: 12px 0 4px; color: #4fc3f7; font-weight: bold;">${escapeHtml(file.filename || file.device || file.file || '')}</div>`;
                     }
                     file.issues.forEach(issue => {
                         const sevColor = issue.severity === 'ERROR' ? '#f44336' : '#ff9800';
                         html += `<div style="margin-bottom: 8px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
-                        html += `<span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> `;
-                        html += `<span style="color: #888;">${issue.path}:</span> `;
-                        html += `<span style="color: #ddd;">${issue.message}</span>`;
+                        html += `<span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> `;
+                        html += `<span style="color: #888;">${escapeHtml(issue.path)}:</span> `;
+                        html += `<span style="color: #ddd;">${escapeHtml(issue.message)}</span>`;
                         if (issue.suggestion) {
-                            html += `<div style="color: #999; font-style: italic;">→ ${issue.suggestion}</div>`;
+                            html += `<div style="color: #999; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
                         }
                         html += '</div>';
                     });
                 });
-                
+
+                // Topology-level issues (fabric-wide view) live outside files[]
+                const topoIssues = (result.topology && result.topology.issues) || [];
+                if (topoIssues.length > 0) {
+                    html += `<div style="margin: 12px 0 4px; color: #4fc3f7; font-weight: bold;">Topology</div>`;
+                    topoIssues.forEach(issue => {
+                        const sevColor = issue.severity === 'ERROR' ? '#f44336' : '#ff9800';
+                        html += `<div style="margin-bottom: 8px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
+                        html += `<span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> `;
+                        if (issue.category) {
+                            html += `<span style="color: #888;">${escapeHtml(issue.category)}:</span> `;
+                        }
+                        html += `<span style="color: #ddd;">${escapeHtml(issue.message)}</span>`;
+                        if (issue.devices && issue.devices.length) {
+                            html += `<div style="color: #888;">Devices: ${escapeHtml((issue.devices || []).join(', '))}</div>`;
+                        }
+                        if (issue.suggestion) {
+                            html += `<div style="color: #999; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
+                        }
+                        html += '</div>';
+                    });
+                }
+
                 html += '</div>';
                 
                 showValidateModal(
@@ -806,7 +855,7 @@
                 
             } catch (e) {
                 hideLoading();
-                showValidateModal('Error', `<div style="color: #f44336;">Failed to validate: ${e.message}</div>`, 'error');
+                showValidateModal('Error', `<div style="color: #f44336;">Failed to validate: ${escapeHtml(e.message)}</div>`, 'error');
             }
         }
         
@@ -818,32 +867,44 @@
             loadConfig();
         }
         
+        function resetConfigView() {
+            currentConfigContent = '';
+            document.getElementById('configTitle').textContent = 'Configuration';
+            document.getElementById('configSize').textContent = 'Size: 0 bytes';
+        }
+
         function loadConfig() {
             if (!selectedDevice) return;
-            
+
             const fileName = `${selectedDevice}.${selectedFormat}`;
-            
+            const reqId = ++configRequestId;
+            resetConfigView();
+
             if (!files.includes(fileName)) {
                 document.getElementById('welcomeScreen').style.display = 'none';
                 document.getElementById('configDisplay').style.display = 'block';
-                document.getElementById('configContent').innerHTML = `<span style="color: #f44336;">Configuration file not found: ${fileName}</span>`;
+                document.getElementById('configContent').innerHTML = `<span style="color: #f44336;">Configuration file not found: ${escapeHtml(fileName)}</span>`;
                 return;
             }
-            
+
             showLoading(`Loading ${fileName}...`);
-            
+
             fetch(`/configs/${fileName}`)
                 .then(response => {
                     if (!response.ok) throw new Error(`HTTP ${response.status}`);
                     return response.text();
                 })
                 .then(data => {
+                    if (reqId !== configRequestId) return;
                     hideLoading();
                     displayConfig(data, fileName);
                 })
                 .catch(error => {
+                    if (reqId !== configRequestId) return;
                     hideLoading();
-                    document.getElementById('configContent').innerHTML = `<span style="color: #f44336;">Error loading config: ${error.message}</span>`;
+                    document.getElementById('welcomeScreen').style.display = 'none';
+                    document.getElementById('configDisplay').style.display = 'block';
+                    document.getElementById('configContent').innerHTML = `<span style="color: #f44336;">Error loading config: ${escapeHtml(error.message)}</span>`;
                 });
         }
         
@@ -964,33 +1025,45 @@
             
             const zip = new JSZip();
             let completed = 0;
-            
+            let dropped = 0;
+
+            const finalize = () => {
+                if (completed !== formatFiles.length) return;
+                zip.generateAsync({type: 'blob'}).then(blob => {
+                    const now = new Date();
+                    const dateStr = now.toISOString().slice(0, 10);
+                    const link = document.createElement('a');
+                    link.href = URL.createObjectURL(blob);
+                    link.download = `Configs_${format.toUpperCase()}_${dateStr}.zip`;
+                    link.click();
+
+                    button.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" style="width:14px;height:14px;"><path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z"/></svg> Downloaded!`;
+                    setTimeout(() => {
+                        button.disabled = false;
+                        button.innerHTML = originalHtml;
+                    }, 2000);
+
+                    if (dropped > 0) {
+                        alert(`${dropped} of ${formatFiles.length} ${format.toUpperCase()} file(s) could not be fetched and were left out of the ZIP.`);
+                    }
+                });
+            };
+
             formatFiles.forEach(filename => {
                 fetch(`/configs/${filename}`)
-                    .then(r => r.text())
+                    .then(r => {
+                        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                        return r.text();
+                    })
                     .then(content => {
                         zip.file(filename, content);
                         completed++;
-                        
-                        if (completed === formatFiles.length) {
-                            zip.generateAsync({type: 'blob'}).then(blob => {
-                                const now = new Date();
-                                const dateStr = now.toISOString().slice(0, 10);
-                                const link = document.createElement('a');
-                                link.href = URL.createObjectURL(blob);
-                                link.download = `Configs_${format.toUpperCase()}_${dateStr}.zip`;
-                                link.click();
-                                
-                                button.innerHTML = `<svg viewBox="0 0 24 24" fill="currentColor" style="width:14px;height:14px;"><path d="M21,7L9,19L3.5,13.5L4.91,12.09L9,16.17L19.59,5.59L21,7Z"/></svg> Downloaded!`;
-                                setTimeout(() => {
-                                    button.disabled = false;
-                                    button.innerHTML = originalHtml;
-                                }, 2000);
-                            });
-                        }
+                        finalize();
                     })
                     .catch(() => {
+                        dropped++;
                         completed++;
+                        finalize();
                     });
             });
         }
@@ -1031,6 +1104,14 @@
                             }
                         } catch (e) { /* keep polling */ }
                     }, 10000);
+                } else {
+                    // Not started: 403 (non-admin) or trigger error -> re-enable and report
+                    text.textContent = 'Collect Configs';
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    const msg = data.error || data.message ||
+                        (response.status === 403 ? 'Not authorized (admin only)' : 'Failed to start config collection');
+                    alert(msg);
                 }
             } catch (e) {
                 text.textContent = 'Collect Configs';
@@ -1040,8 +1121,31 @@
             }
         }
 
+        async function applyRoleAwareControls() {
+            try {
+                const r = await fetch('/auth-api?action=check');
+                const d = await r.json();
+                isAdminUser = !!(d && d.authenticated && d.role === 'admin');
+            } catch (e) {
+                isAdminUser = false;
+            }
+            if (!isAdminUser) {
+                ['btn-collect', 'btn-validate'].forEach(id => {
+                    const b = document.getElementById(id);
+                    if (!b) return;
+                    b.disabled = true;
+                    b.style.opacity = '0.5';
+                    b.style.cursor = 'not-allowed';
+                    b.title = 'Admin only';
+                });
+            }
+        }
+
         // Initialize
-        window.onload = listFiles;
+        window.onload = () => {
+            listFiles();
+            applyRoleAwareControls();
+        };
     </script>
 </body>
 </html>

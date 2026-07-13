@@ -70,6 +70,12 @@ class BERAnalyzer:
         "raw_phy_ber_critical_threshold": 1.0E-5,
         "effective_phy_ber_warning_threshold": 1.0E-12,
         "effective_phy_ber_critical_threshold": 1.0E-11,
+        # A physically operational link cannot sustain a pre/post-FEC BER at or
+        # above this floor (that is 100% or more corrupted symbols). l1-show on
+        # an admin-down / link-down port reports the degenerate coef=1,
+        # magnitude=0 => 1.0e+00 "no measurement" sentinel; readings at or above
+        # this floor are discarded instead of being graded as a real fault.
+        "phy_ber_invalid_floor": 1.0,
         # Compatibility aliases used by the processing summary and older
         # callers; these always mirror the effective/post-FEC limits.
         "phy_ber_warning_threshold": 1.0E-12,
@@ -909,37 +915,69 @@ class BERAnalyzer:
         else:
             frame_grade = BERGrade.UNKNOWN.value
 
+        # The PHY BER ratios (raw/effective) and the symbol counter describe the
+        # physical link, not the traffic on it. A live PHY keeps advancing its
+        # FEC symbol counter even with no L2 traffic (idle/control symbols still
+        # cross the wire); an admin-down or link-down port does not, and its
+        # l1-show snapshot freezes at the last reading -- frequently the
+        # degenerate coef=1 / magnitude=0 => 1.0e+00 "no measurement" sentinel.
+        # That stale snapshot must never be graded as a real bit-error fault.
+        # Guard 1: discard physically impossible readings (a real link cannot
+        # run at a pre/post-FEC BER at or above the invalid floor).
+        if (isinstance(raw_ber, (int, float))
+                and raw_ber >= self.config['phy_ber_invalid_floor']):
+            raw_ber = None
+        if (isinstance(effective_ber, (int, float))
+                and effective_ber >= self.config['phy_ber_invalid_floor']):
+            effective_ber = None
+
+        previous_symbols = self._previous_symbol_errors(port_name, stats)
+        symbol_delta = None
+        if isinstance(symbol_errors, int) and isinstance(previous_symbols, int):
+            # A reset/wrap establishes a new baseline instead of inventing a
+            # negative or enormous delta.
+            if symbol_errors >= previous_symbols:
+                symbol_delta = symbol_errors - previous_symbols
+
+        # Guard 2: only let the L1 metrics drive health when this sample proves
+        # the link was actually receiving -- traffic flowed, new interface
+        # errors appeared, or the FEC symbol counter advanced. An idle/down port
+        # (no traffic, no errors, no symbol advance) keeps its stale snapshot
+        # for display but stays ungraded.
+        error_delta = (stats.get('delta_rx_errors', 0)
+                       + stats.get('delta_tx_errors', 0))
+        link_active = (
+            sample_status == 'analyzed'
+            or stats.get('delta_packets', 0) > 0
+            or error_delta > 0
+            or (isinstance(symbol_delta, int) and symbol_delta > 0)
+        )
+
         raw_grade = BERGrade.UNKNOWN.value
-        if isinstance(raw_ber, (int, float)):
+        if link_active and isinstance(raw_ber, (int, float)):
             raw_grade = self.get_raw_phy_ber_grade(raw_ber).value
             grades.append(raw_grade)
             if self._grade_priority(raw_grade) >= self._grade_priority(BERGrade.WARNING.value):
                 reasons.append(f"raw PHY BER {raw_ber:.2e}")
 
         effective_grade = BERGrade.UNKNOWN.value
-        if isinstance(effective_ber, (int, float)):
+        if link_active and isinstance(effective_ber, (int, float)):
             effective_grade = self.get_effective_phy_ber_grade(effective_ber).value
             grades.append(effective_grade)
             if self._grade_priority(effective_grade) >= self._grade_priority(BERGrade.WARNING.value):
                 reasons.append(f"effective PHY BER {effective_ber:.2e}")
 
-        previous_symbols = self._previous_symbol_errors(port_name, stats)
-        symbol_delta = None
         symbol_grade = BERGrade.UNKNOWN.value
-        if isinstance(symbol_errors, int) and isinstance(previous_symbols, int):
-            # A reset/wrap establishes a new baseline instead of inventing a
-            # negative or enormous delta.
-            if symbol_errors >= previous_symbols:
-                symbol_delta = symbol_errors - previous_symbols
-                if symbol_delta >= self.config['symbol_error_critical_delta']:
-                    symbol_grade = BERGrade.CRITICAL.value
-                elif symbol_delta >= self.config['symbol_error_warning_delta']:
-                    symbol_grade = BERGrade.WARNING.value
-                else:
-                    symbol_grade = BERGrade.EXCELLENT.value
-                grades.append(symbol_grade)
-                if self._grade_priority(symbol_grade) >= self._grade_priority(BERGrade.WARNING.value):
-                    reasons.append(f"PHY symbol errors +{symbol_delta}")
+        if link_active and isinstance(symbol_delta, int):
+            if symbol_delta >= self.config['symbol_error_critical_delta']:
+                symbol_grade = BERGrade.CRITICAL.value
+            elif symbol_delta >= self.config['symbol_error_warning_delta']:
+                symbol_grade = BERGrade.WARNING.value
+            else:
+                symbol_grade = BERGrade.EXCELLENT.value
+            grades.append(symbol_grade)
+            if self._grade_priority(symbol_grade) >= self._grade_priority(BERGrade.WARNING.value):
+                reasons.append(f"PHY symbol errors +{symbol_delta}")
 
         status = (max(grades, key=self._grade_priority)
                   if grades else BERGrade.UNKNOWN.value)
