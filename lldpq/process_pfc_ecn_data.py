@@ -645,6 +645,64 @@ def _detail_history(
     return detail
 
 
+def summarize_records(
+    records: List[Mapping[str, Any]],
+    expected_hosts: Optional[int] = None,
+    current_hosts: Optional[int] = None,
+    collection_unavailable: bool = False,
+) -> Dict[str, Any]:
+    """Headline port/status metrics shared by the report and the summary JSON."""
+    total = len(records)
+    analyzed_records = [
+        row for row in records if row.get("sample_status") == "analyzed"
+    ]
+    ready = len(analyzed_records)
+    collection_status = "partial"
+    coverage_status = "partial"
+    if collection_unavailable:
+        collection_status = "unavailable"
+        coverage_status = "unavailable"
+    elif expected_hosts is not None and current_hosts is not None:
+        coverage_status = (
+            "complete" if current_hosts >= expected_hosts else "partial"
+        )
+        collection_status = (
+            "current" if coverage_status == "complete" else "partial"
+        )
+    interval_status = (
+        "unavailable"
+        if collection_unavailable or total == 0 or ready == 0
+        else "complete"
+        if ready == total and coverage_status == "complete"
+        else "partial"
+    )
+    return {
+        "total_ports": total,
+        "ready_ports": ready,
+        "ecn_active_ports": sum(
+            (row["deltas"].get("ecn_marked_frames") or 0) > 0
+            for row in analyzed_records
+        ),
+        "pfc_rx_active_ports": sum(
+            (row["deltas"].get("rx_pause_frames") or 0) > 0
+            for row in analyzed_records
+        ),
+        "pfc_tx_active_ports": sum(
+            (row["deltas"].get("tx_pause_frames") or 0) > 0
+            for row in analyzed_records
+        ),
+        "discard_ready_ports": sum(
+            row.get("loss_delta") is not None for row in analyzed_records
+        ),
+        "discard_active_ports": sum(
+            (row.get("loss_delta") or 0) > 0 for row in analyzed_records
+        ),
+        "collection_status": collection_status,
+        "coverage_status": coverage_status,
+        "interval_status": interval_status,
+    }
+
+
 def render_report(
     records: List[Mapping[str, Any]],
     history: Mapping[str, Any],
@@ -654,59 +712,34 @@ def render_report(
     coverage_failures: Optional[Mapping[str, str]] = None,
 ) -> str:
     records = sorted(records, key=lambda row: (row["hostname"], row["interface"]))
-    total = len(records)
+    metrics = summarize_records(
+        records, expected_hosts, current_hosts, collection_unavailable
+    )
+    total = metrics["total_ports"]
     exact = sum(bool(row.get("exact")) for row in records)
-    analyzed_records = [
-        row for row in records if row.get("sample_status") == "analyzed"
-    ]
-    ready = len(analyzed_records)
-    ecn_active = sum(
-        (row["deltas"].get("ecn_marked_frames") or 0) > 0
-        for row in analyzed_records
-    )
-    rx_active = sum(
-        (row["deltas"].get("rx_pause_frames") or 0) > 0
-        for row in analyzed_records
-    )
-    tx_active = sum(
-        (row["deltas"].get("tx_pause_frames") or 0) > 0
-        for row in analyzed_records
-    )
-    discard_ready = sum(
-        row.get("loss_delta") is not None for row in analyzed_records
-    )
-    loss_active = sum(
-        (row.get("loss_delta") or 0) > 0 for row in analyzed_records
-    )
+    ready = metrics["ready_ports"]
+    ecn_active = metrics["ecn_active_ports"]
+    rx_active = metrics["pfc_rx_active_ports"]
+    tx_active = metrics["pfc_tx_active_ports"]
+    discard_ready = metrics["discard_ready_ports"]
+    loss_active = metrics["discard_active_ports"]
     incomplete = total - ready
     device_coverage = (
         f"{current_hosts}/{expected_hosts}"
         if expected_hosts is not None and current_hosts is not None
         else "&mdash;"
     )
+    collection_status = metrics["collection_status"]
+    coverage_status = metrics["coverage_status"]
+    interval_status = metrics["interval_status"]
     coverage_attrs = ""
-    collection_status = "partial"
-    coverage_status = "partial"
     if collection_unavailable:
         coverage_attrs = ' data-collection-status="unavailable" data-coverage-status="unavailable"'
-        collection_status = "unavailable"
-        coverage_status = "unavailable"
     elif expected_hosts is not None and current_hosts is not None:
-        coverage = "complete" if current_hosts >= expected_hosts else "partial"
         coverage_attrs = (
-            f' data-coverage-status="{coverage}" data-coverage-expected="{expected_hosts}"'
+            f' data-coverage-status="{coverage_status}" data-coverage-expected="{expected_hosts}"'
             f' data-coverage-current="{current_hosts}"'
         )
-        coverage_status = coverage
-        collection_status = "current" if coverage == "complete" else "partial"
-
-    interval_status = (
-        "unavailable"
-        if collection_unavailable or total == 0 or ready == 0
-        else "complete"
-        if ready == total and coverage_status == "complete"
-        else "partial"
-    )
     coverage_metadata_attrs = ""
     if current_hosts is not None:
         coverage_metadata_attrs += f' data-coverage-current="{current_hosts}"'
@@ -1483,6 +1516,33 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     _atomic_json(baseline_path, baseline_output)
     _atomic_json(history_path, history_output)
     _atomic_write(report_path, report)
+    # Machine-readable dashboard summary. Additive to the HTML report and
+    # carrying the same headline numbers/collection status the report embeds.
+    metrics = summarize_records(
+        records,
+        len(expected_hosts) if snapshot_valid else None,
+        len(hosts_with_ports) if snapshot_valid else None,
+        collection_unavailable=all_devices_unavailable,
+    )
+    _atomic_json(
+        result_dir / "summary" / "pfc-ecn-summary.json",
+        {
+            "domain": "pfc-ecn",
+            "generated_at": int(now),
+            "collection_status": metrics["collection_status"],
+            "coverage_status": metrics["coverage_status"],
+            "interval_status": metrics["interval_status"],
+            "coverage_expected": len(expected_hosts) if snapshot_valid else None,
+            "coverage_current": len(hosts_with_ports) if snapshot_valid else None,
+            "total_ports": metrics["total_ports"],
+            "ready_ports": metrics["ready_ports"],
+            "ecn_active_ports": metrics["ecn_active_ports"],
+            "pfc_rx_active_ports": metrics["pfc_rx_active_ports"],
+            "pfc_tx_active_ports": metrics["pfc_tx_active_ports"],
+            "discard_ready_ports": metrics["discard_ready_ports"],
+            "discard_active_ports": metrics["discard_active_ports"],
+        },
+    )
     finish_phase("write_state")
     print(f"PFC/ECN analysis report generated: {report_path}")
     return True

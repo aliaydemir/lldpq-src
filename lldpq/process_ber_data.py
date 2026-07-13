@@ -451,6 +451,35 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
         print("❌ BER analysis report was not generated")
         return False
     print(f"BER analysis report generated: {output_file}")
+
+    # Machine-readable dashboard summary. Additive to the HTML report and
+    # carrying the same headline numbers/collection status the report embeds.
+    coverage_expected = getattr(ber_analyzer, 'coverage_expected_hosts', None)
+    coverage_current = getattr(ber_analyzer, 'coverage_current_hosts', None)
+    if all_devices_unavailable:
+        collection_status = "unavailable"
+    elif isinstance(coverage_expected, int) and isinstance(coverage_current, int):
+        collection_status = (
+            "partial" if coverage_current < coverage_expected else "complete"
+        )
+    else:
+        collection_status = None
+    ber_analyzer._atomic_json_write(
+        os.path.join(result_dir, "summary", "ber-summary.json"),
+        {
+            "domain": "ber",
+            "generated_at": int(time.time()),
+            "collection_status": collection_status,
+            "coverage_expected": coverage_expected,
+            "coverage_current": coverage_current,
+            "total_ports": summary["total_ports"],
+            "excellent": len(summary["excellent_ports"]),
+            "good": len(summary["good_ports"]),
+            "warning": len(summary["warning_ports"]),
+            "critical": len(summary["critical_ports"]),
+            "unknown": len(summary["unknown_ports"]),
+        },
+    )
     
     # Final summary
     total_ports = summary['total_ports']

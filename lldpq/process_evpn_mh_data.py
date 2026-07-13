@@ -513,14 +513,9 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
-def render_report(
-    rows: Sequence[Mapping[str, Any]],
-    *,
-    coverage_status: str,
-    coverage_failures: Mapping[str, str],
-    generated_at: datetime,
-) -> str:
-    counts = {
+def summary_counts(rows: Sequence[Mapping[str, Any]]) -> Dict[str, int]:
+    """Headline ES counts shared by the HTML report and the summary JSON."""
+    return {
         "total": len(rows),
         "healthy": sum(row["status"] == "healthy" for row in rows),
         "inactive": sum(row["status"] == "inactive" for row in rows),
@@ -531,6 +526,16 @@ def render_report(
         "inconsistent": sum(bool(row["inconsistent"]) for row in rows),
         "orphan": sum(bool(row["orphan"]) for row in rows),
     }
+
+
+def render_report(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    coverage_status: str,
+    coverage_failures: Mapping[str, str],
+    generated_at: datetime,
+) -> str:
+    counts = summary_counts(rows)
     device_names = sorted({
         str(item["hostname"]) for row in rows for item in row["attachments"]
     }, key=str.lower)
@@ -960,14 +965,35 @@ def process_evpn_mh_data_files(
 
     rows = correlate_snapshots(snapshots)
     coverage_status = "partial" if coverage_failures else "current"
+    generated_at = datetime.now(timezone.utc)
     report = render_report(
         rows,
         coverage_status=coverage_status,
         coverage_failures=coverage_failures,
-        generated_at=datetime.now(timezone.utc),
+        generated_at=generated_at,
     )
+    counts = summary_counts(rows)
+    summary_payload = {
+        "domain": "evpn-mh",
+        "generated_at": int(generated_at.timestamp()),
+        "collection_status": coverage_status,
+        "coverage_partial": coverage_status != "current",
+        "total_es": counts["total"],
+        "healthy_es": counts["healthy"],
+        "inactive_es": counts["inactive"],
+        "bypass_es": counts["bypass"],
+        "bypass_issue_es": counts["bypass_status"],
+        "critical_es": counts["critical"],
+        "warning_es": counts["warning"],
+        "inconsistent_es": counts["inconsistent"],
+        "orphan_es": counts["orphan"],
+    }
     try:
         _atomic_write(result_dir / "evpn-mh-analysis.html", report)
+        _atomic_write(
+            result_dir / "summary" / "evpn-mh-summary.json",
+            json.dumps(summary_payload) + "\n",
+        )
     except OSError as exc:
         print(f"Could not write EVPN-MH report: {exc}", file=sys.stderr)
         return False

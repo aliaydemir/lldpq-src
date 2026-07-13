@@ -349,7 +349,7 @@
         </div>
 
         <!-- Quick Tools -->
-        <div class="dashboard-section">
+        <div class="analysis-section">
             <div class="section-header">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="opacity:0.7;"><path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>
                 <span class="section-title">Quick Tools</span>
@@ -380,11 +380,11 @@
                     </div>
                     <div class="card-label">Tracepath</div>
                 </div>
-                <div class="summary-card" style="border-left-color: #76b900;" onclick="window.location.href='telemetry.html'">
+                <div class="summary-card" style="border-left-color: #76b900;" onclick="window.location.href='inventory.html'">
                     <div class="card-value" style="color: #76b900;">
-                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M3.5 18.5l6-6 4 4L22 6.92 20.59 5.5l-7.09 8-4-4L2 17l1.5 1.5z"/></svg>
+                        <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor"><path d="M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z"/></svg>
                     </div>
-                    <div class="card-label">Telemetry</div>
+                    <div class="card-label">Inventory</div>
                 </div>
                 <div class="summary-card" style="border-left-color: #26a69a;" onclick="window.location.href='topology/main.html'">
                     <div class="card-value" style="color: #4db6ac;">
@@ -982,7 +982,12 @@
             let manifestReadSuccessful = false;
             try {
                 const response = await fetch(noCacheUrl('monitor-results/.lldpq-current.json'), { cache: 'no-store' });
-                if (response.ok) {
+                if (response.status === 404) {
+                    // A missing manifest is a valid state on a fresh install:
+                    // no report has been published yet. renderLastUpdated
+                    // shows N/A (and any marker note) for this state.
+                    manifestReadSuccessful = true;
+                } else if (response.ok) {
                     manifest = await response.json();
                     manifestReadSuccessful = true;
                 }
@@ -1403,6 +1408,345 @@
                 : null;
         }
 
+        // A rounded 100.0% must never display while problematic ports remain
+        // (same guard the overall-health metric applies): cap at 99.9 instead.
+        function formatFlapStabilityPercent(percent, problematicPorts) {
+            if (percent === null || percent === undefined) return null;
+            const value = Number(percent);
+            if (!Number.isFinite(value)) return null;
+            const capped = (Number(problematicPorts) || 0) > 0
+                ? Math.min(value, 99.9)
+                : value;
+            return capped.toFixed(1);
+        }
+
+        // JSON-first dashboard reads. Each analyzer additionally publishes
+        // monitor-results/summary/<domain>-summary.json carrying the exact
+        // headline numbers/collection status its HTML report embeds. The
+        // dashboard prefers these small files; when one is missing (older
+        // server) or fails validation, the HTML scraping path below remains
+        // the authoritative fallback with unchanged semantics.
+        const DASHBOARD_SUMMARY_JSON_DOMAINS = {
+            'bgp': 'bgp',
+            'evpn': 'evpn',
+            'evpn-mh': 'evpn-mh',
+            'optical': 'optical',
+            'ber': 'ber',
+            'pfc': 'pfc-ecn',
+            'flap': 'flap',
+            'hardware': 'hardware',
+            'duplicate': 'duplicate'
+        };
+
+        const DASHBOARD_SUMMARY_JSON_FIELDS = {
+            'bgp': ['collection_status', 'coverage_expected', 'coverage_current',
+                'total_devices', 'total_neighbors', 'established_neighbors',
+                'problem_neighbors', 'warning_neighbors', 'critical_neighbors',
+                'stale_devices', 'unknown_devices', 'health_percent'],
+            'evpn': ['collection_status', 'coverage_expected', 'coverage_current',
+                'route_coverage', 'total_vnis', 'l2_vnis', 'l3_vnis',
+                'type2_routes', 'type5_routes'],
+            'evpn-mh': ['collection_status', 'coverage_partial', 'total_es',
+                'healthy_es', 'inactive_es', 'bypass_es', 'bypass_issue_es',
+                'critical_es', 'warning_es', 'inconsistent_es', 'orphan_es'],
+            'optical': ['collection_status', 'coverage_expected',
+                'coverage_current', 'coverage_collected', 'total_ports',
+                'excellent', 'good', 'warning', 'critical', 'down',
+                'unplugged', 'unknown'],
+            'ber': ['collection_status', 'coverage_expected', 'coverage_current',
+                'total_ports', 'excellent', 'good', 'warning', 'critical',
+                'unknown'],
+            'pfc': ['collection_status', 'coverage_status', 'interval_status',
+                'coverage_expected', 'coverage_current', 'total_ports',
+                'ready_ports', 'ecn_active_ports', 'pfc_rx_active_ports',
+                'pfc_tx_active_ports', 'discard_ready_ports',
+                'discard_active_ports'],
+            'flap': ['collection_status', 'coverage_expected', 'coverage_current',
+                'total_devices', 'total_ports', 'stable_ports',
+                'problematic_ports', 'critical_ports', 'warning_ports',
+                'stability_percent'],
+            'hardware': ['collection_status', 'coverage_expected',
+                'coverage_current', 'coverage_partial', 'total_devices',
+                'excellent', 'good', 'warning', 'critical', 'unknown'],
+            'duplicate': ['collection_status', 'coverage_partial',
+                'confirmed_ip_active', 'ip_quiesced', 'confirmed_mac_total',
+                'coverage_expected', 'coverage_current', 'coverage_failures']
+        };
+
+        function summaryJsonNumber(value) {
+            return typeof value === 'number' && Number.isFinite(value)
+                ? value
+                : null;
+        }
+
+        // Mirror of copyReportState for JSON payloads: identical
+        // unavailable/partial semantics, sourced from collection_status and
+        // the coverage_* fields instead of report data-* attributes.
+        function summaryJsonBaseState(payload) {
+            const status = String(payload.collection_status || '').toLowerCase();
+            const summaryData = {
+                unavailable: status === 'unavailable',
+                coveragePartial: status === 'unavailable' || status === 'partial'
+            };
+            const expected = summaryJsonNumber(payload.coverage_expected);
+            const current = summaryJsonNumber(payload.coverage_current);
+            if (expected !== null) summaryData.coverageExpected = expected;
+            if (current !== null) summaryData.coverageCurrent = current;
+            if (expected !== null && current !== null && current < expected) {
+                summaryData.coveragePartial = true;
+            }
+            if (payload.coverage_partial === true) summaryData.coveragePartial = true;
+            return summaryData;
+        }
+
+        // Map a validated summary JSON payload onto the same summaryData shape
+        // the HTML scraping path produces. Returns null when the payload fails
+        // the same sanity contract the scraper enforces (caller falls back).
+        function summaryDataFromDomainJson(dataType, payload) {
+            const number = summaryJsonNumber;
+
+            if (dataType === 'duplicate') {
+                const status = String(payload.collection_status || '').toLowerCase();
+                const confirmedIpActive = number(payload.confirmed_ip_active);
+                const quiescedIp = number(payload.ip_quiesced);
+                const confirmedMacConflicts = number(payload.confirmed_mac_total);
+                const coverageExpected = number(payload.coverage_expected);
+                const coverageCurrent = number(payload.coverage_current);
+                const coverageFailures = number(payload.coverage_failures);
+                let coveragePartial = status === 'unavailable' ||
+                    status === 'partial' || payload.coverage_partial === true;
+                if (coverageExpected !== null && coverageCurrent !== null &&
+                    coverageCurrent < coverageExpected) {
+                    coveragePartial = true;
+                }
+                if ((coverageFailures || 0) > 0) coveragePartial = true;
+                const coverageText = coverageExpected !== null && coverageCurrent !== null
+                    ? `${coverageCurrent}/${coverageExpected}`
+                    : 'N/A';
+                const metricsAvailable = confirmedIpActive !== null;
+                const coverageContractComplete = coverageExpected !== null &&
+                    coverageCurrent !== null && coverageFailures !== null &&
+                    typeof payload.coverage_partial === 'boolean';
+                return {
+                    confirmedIpActive,
+                    quiescedIp,
+                    confirmedMacConflicts,
+                    coverageExpected,
+                    coverageCurrent,
+                    coverageFailures,
+                    coveragePartial: coveragePartial === true,
+                    coverageText,
+                    semanticComplete: metricsAvailable && coverageContractComplete,
+                    unavailable: status === 'unavailable' || !metricsAvailable
+                };
+            }
+
+            const summaryData = summaryJsonBaseState(payload);
+
+            if (dataType === 'evpn') {
+                if (String(payload.route_coverage || '').toLowerCase() === 'partial') {
+                    summaryData.coveragePartial = true;
+                }
+                summaryData.totalVnis = number(payload.total_vnis);
+                summaryData.l2Vnis = number(payload.l2_vnis);
+                summaryData.l3Vnis = number(payload.l3_vnis);
+                summaryData.type2Routes = number(payload.type2_routes);
+                summaryData.type5Routes = number(payload.type5_routes);
+                if ([summaryData.totalVnis, summaryData.l2Vnis, summaryData.l3Vnis,
+                     summaryData.type2Routes, summaryData.type5Routes].some(value => value === null)) {
+                    summaryData.unavailable = true;
+                    summaryData.coveragePartial = true;
+                }
+                return summaryData;
+            }
+
+            // The remaining domains render N/A cards for an unavailable
+            // collection without consuming per-domain counts, exactly like
+            // the scraping path's early return after copyReportState.
+            if (summaryData.unavailable) return summaryData;
+
+            if (dataType === 'bgp') {
+                summaryData.totalDevices = number(payload.total_devices);
+                summaryData.totalNeighbors = number(payload.total_neighbors);
+                summaryData.established = number(payload.established_neighbors);
+                summaryData.down = number(payload.problem_neighbors) || 0;
+                summaryData.stale = number(payload.stale_devices) || 0;
+                summaryData.unknown = number(payload.unknown_devices) || 0;
+                summaryData.warning = number(payload.warning_neighbors) || 0;
+                summaryData.critical = number(payload.critical_neighbors) || 0;
+                summaryData.problematic = summaryData.warning + summaryData.critical;
+                summaryData.failed = summaryData.critical;
+                summaryData.healthPercent = number(payload.health_percent);
+                summaryData.coveragePartial = summaryData.coveragePartial ||
+                    summaryData.stale > 0 || summaryData.unknown > 0;
+                if (summaryData.totalNeighbors === null) {
+                    summaryData.unavailable = true;
+                    summaryData.coveragePartial = true;
+                }
+            } else if (dataType === 'evpn-mh') {
+                const requiredMetrics = {
+                    totalEs: number(payload.total_es),
+                    healthyEs: number(payload.healthy_es),
+                    inactiveEs: number(payload.inactive_es),
+                    bypassEs: number(payload.bypass_es),
+                    bypassIssueEs: number(payload.bypass_issue_es),
+                    criticalEs: number(payload.critical_es),
+                    warningEs: number(payload.warning_es),
+                    inconsistentEs: number(payload.inconsistent_es),
+                    orphanEs: number(payload.orphan_es)
+                };
+                const partitionTotal = requiredMetrics.healthyEs +
+                    requiredMetrics.inactiveEs + requiredMetrics.bypassIssueEs +
+                    requiredMetrics.criticalEs + requiredMetrics.warningEs;
+                const metricsValid =
+                    Object.values(requiredMetrics).every(value =>
+                        Number.isInteger(value) && value >= 0
+                    ) &&
+                    partitionTotal === requiredMetrics.totalEs &&
+                    requiredMetrics.bypassIssueEs <= requiredMetrics.bypassEs &&
+                    requiredMetrics.bypassEs <= requiredMetrics.totalEs &&
+                    requiredMetrics.inconsistentEs <= requiredMetrics.totalEs &&
+                    requiredMetrics.orphanEs <= requiredMetrics.totalEs;
+                if (!metricsValid) return null;
+                Object.assign(summaryData, requiredMetrics);
+                summaryData.total = summaryData.totalEs;
+                summaryData.healthy = summaryData.healthyEs;
+                summaryData.inactive = summaryData.inactiveEs;
+                summaryData.bypass = summaryData.bypassEs;
+                summaryData.bypassIssues = summaryData.bypassIssueEs;
+                summaryData.critical = summaryData.criticalEs;
+                summaryData.warning = summaryData.warningEs;
+                summaryData.inconsistent = summaryData.inconsistentEs;
+                summaryData.orphan = summaryData.orphanEs;
+            } else if (dataType === 'optical') {
+                summaryData.totalPorts = number(payload.total_ports);
+                summaryData.excellent = number(payload.excellent);
+                summaryData.good = number(payload.good);
+                summaryData.warning = number(payload.warning);
+                summaryData.critical = number(payload.critical);
+                summaryData.down = number(payload.down);
+                summaryData.unplugged = number(payload.unplugged);
+                summaryData.unknown = number(payload.unknown);
+                summaryData.coverageCollected = number(payload.coverage_collected);
+                const categories = [
+                    summaryData.excellent, summaryData.good, summaryData.warning,
+                    summaryData.critical, summaryData.down, summaryData.unplugged,
+                    summaryData.unknown
+                ];
+                if (summaryData.totalPorts === null ||
+                    categories.some(value => value === null) ||
+                    categories.reduce((total, value) => total + value, 0) !== summaryData.totalPorts) {
+                    return null;
+                }
+                if (summaryData.unknown > 0) summaryData.coveragePartial = true;
+                summaryData.totalDevices = number(payload.total_devices);
+            } else if (dataType === 'ber') {
+                summaryData.totalPorts = number(payload.total_ports);
+                summaryData.excellent = number(payload.excellent) || 0;
+                summaryData.good = number(payload.good) || 0;
+                summaryData.warning = number(payload.warning) || 0;
+                summaryData.critical = number(payload.critical) || 0;
+                summaryData.unknown = number(payload.unknown) || 0;
+                summaryData.coveragePartial = summaryData.coveragePartial ||
+                    summaryData.unknown > 0;
+                if (summaryData.totalPorts === null) {
+                    summaryData.unavailable = true;
+                    summaryData.coveragePartial = true;
+                }
+            } else if (dataType === 'pfc') {
+                const requiredMetrics = {
+                    totalPorts: number(payload.total_ports),
+                    readyPorts: number(payload.ready_ports),
+                    ecnActivePorts: number(payload.ecn_active_ports),
+                    pfcRxActivePorts: number(payload.pfc_rx_active_ports),
+                    pfcTxActivePorts: number(payload.pfc_tx_active_ports),
+                    discardReadyPorts: number(payload.discard_ready_ports),
+                    discardActivePorts: number(payload.discard_active_ports)
+                };
+                const intervalStatus = String(payload.interval_status || '').toLowerCase();
+                const coverageStatus = String(payload.coverage_status || '').toLowerCase();
+                const metricValues = Object.values(requiredMetrics);
+                const intervalConsistent =
+                    (intervalStatus === 'complete' &&
+                     requiredMetrics.readyPorts === requiredMetrics.totalPorts &&
+                     requiredMetrics.totalPorts > 0 && coverageStatus === 'complete') ||
+                    (intervalStatus === 'partial' && requiredMetrics.readyPorts > 0 &&
+                     (requiredMetrics.readyPorts < requiredMetrics.totalPorts ||
+                      coverageStatus === 'partial')) ||
+                    (intervalStatus === 'unavailable' &&
+                     requiredMetrics.readyPorts === 0);
+                const metricsValid =
+                    metricValues.every(value => Number.isInteger(value) && value >= 0) &&
+                    requiredMetrics.readyPorts <= requiredMetrics.totalPorts &&
+                    requiredMetrics.discardReadyPorts <= requiredMetrics.readyPorts &&
+                    requiredMetrics.discardActivePorts <=
+                        requiredMetrics.discardReadyPorts &&
+                    [requiredMetrics.ecnActivePorts, requiredMetrics.pfcRxActivePorts,
+                     requiredMetrics.pfcTxActivePorts]
+                        .every(value => value <= requiredMetrics.readyPorts) &&
+                    intervalConsistent;
+                if (!metricsValid) return null;
+                Object.assign(summaryData, requiredMetrics);
+                summaryData.notReady = summaryData.totalPorts - summaryData.readyPorts;
+                summaryData.intervalStatus = intervalStatus;
+                summaryData.intervalUnavailable = intervalStatus === 'unavailable';
+                summaryData.signalPartial = summaryData.coveragePartial ||
+                    intervalStatus !== 'complete';
+                summaryData.discardPartial =
+                    summaryData.discardReadyPorts < summaryData.readyPorts;
+                summaryData.coveragePartial = summaryData.signalPartial ||
+                    summaryData.discardPartial;
+            } else if (dataType === 'flap') {
+                summaryData.totalDevices = number(payload.total_devices);
+                summaryData.totalPorts = number(payload.total_ports);
+                summaryData.stable = number(payload.stable_ports) || 0;
+                summaryData.critical = number(payload.critical_ports) || 0;
+                summaryData.warning = number(payload.warning_ports) || 0;
+                summaryData.problematic = summaryData.critical + summaryData.warning;
+                summaryData.stabilityPercent = formatFlapStabilityPercent(
+                    payload.stability_percent, summaryData.problematic
+                );
+                if (summaryData.totalPorts === null) {
+                    summaryData.unavailable = true;
+                    summaryData.coveragePartial = true;
+                }
+            } else if (dataType === 'hardware') {
+                summaryData.totalDevices = number(payload.total_devices) || 0;
+                summaryData.excellent = number(payload.excellent) || 0;
+                summaryData.good = number(payload.good) || 0;
+                summaryData.warning = number(payload.warning) || 0;
+                summaryData.critical = number(payload.critical) || 0;
+                summaryData.unknown = number(payload.unknown) || 0;
+                if (summaryData.unknown > 0) summaryData.coveragePartial = true;
+            } else {
+                return null;
+            }
+
+            return summaryData;
+        }
+
+        async function fetchDashboardSummaryJson(dataType) {
+            const domain = DASHBOARD_SUMMARY_JSON_DOMAINS[dataType];
+            if (!domain) return null;
+            try {
+                const response = await fetch(
+                    noCacheUrl(`monitor-results/summary/${domain}-summary.json`),
+                    { cache: 'no-store' }
+                );
+                if (!response.ok) return null;
+                const payload = await response.json();
+                if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+                    payload.domain !== domain ||
+                    !Number.isInteger(payload.generated_at) ||
+                    DASHBOARD_SUMMARY_JSON_FIELDS[dataType].some(field => !(field in payload))) {
+                    return null;
+                }
+                return summaryDataFromDomainJson(dataType, payload);
+            } catch (error) {
+                return null;
+            }
+        }
+
         // Fetch summary data directly from data files
         async function fetchRawDataSummary(dataType, pipelineState = dashboardPipelineState) {
             try {
@@ -1421,7 +1765,9 @@
                         unavailableLldpSummary();
                     
                 } else if (dataType === 'evpn') {
-                    // Parse EVPN data from bgp-analysis.html summary cards
+                    const jsonSummary = await fetchDashboardSummaryJson(dataType);
+                    if (jsonSummary) return jsonSummary;
+                    // Fallback: parse EVPN data from bgp-analysis.html summary cards
                     const response = await fetch(
                         noCacheUrl('monitor-results/bgp-analysis.html'),
                         { cache: 'no-store' }
@@ -1452,7 +1798,9 @@
                     if (pipelineState.manifest.skipped.includes('optical')) {
                         return { skipped: true, unavailable: false, coveragePartial: false };
                     }
-                    // Special case for optical: use summary cards because they have correct total ports count
+                    const jsonSummary = await fetchDashboardSummaryJson(dataType);
+                    if (jsonSummary) return jsonSummary;
+                    // Fallback: use summary cards because they have correct total ports count
                     const response = await fetch(
                         noCacheUrl('monitor-results/optical-analysis.html'),
                         { cache: 'no-store' }
@@ -1510,7 +1858,9 @@
                     summaryData.totalDevices = new Set(rows.map(row => row.cells[0]?.textContent.trim())).size;
                     
                 } else if (dataType === 'hardware') {
-                    // Parse hardware-analysis.html summary cards
+                    const jsonSummary = await fetchDashboardSummaryJson(dataType);
+                    if (jsonSummary) return jsonSummary;
+                    // Fallback: parse hardware-analysis.html summary cards
                     const response = await fetch(
                         noCacheUrl('monitor-results/hardware-analysis.html'),
                         { cache: 'no-store' }
@@ -1586,6 +1936,8 @@
                 } else if (dataType === 'duplicate') {
                     // Duplicate exposes only the two IP states needed by the dashboard.
                     // MAC/APIPA diagnostics remain available on the analysis page.
+                    const jsonSummary = await fetchDashboardSummaryJson(dataType);
+                    if (jsonSummary) return jsonSummary;
                     const response = await fetch(
                         noCacheUrl('monitor-results/duplicate-analysis.html'),
                         { cache: 'no-store' }
@@ -1601,9 +1953,11 @@
                     summaryData = parseDuplicateSummary(doc);
                     
                 } else {
-                    // BGP, BER, PFC/ECN and Link Flap expose report-level summary
-                    // contracts. Re-counting rendered rows loses unavailable,
+                    // BGP, EVPN-MH, BER, PFC/ECN and Link Flap expose report-level
+                    // summary contracts. Re-counting rendered rows loses unavailable,
                     // baseline, reset and status-precedence semantics.
+                    const jsonSummary = await fetchDashboardSummaryJson(dataType);
+                    if (jsonSummary) return jsonSummary;
                     const pageMap = {
                         'bgp': 'monitor-results/bgp-analysis.html',
                         'evpn-mh': 'monitor-results/evpn-mh-analysis.html',
@@ -1777,7 +2131,9 @@
                                 summaryData.problematic = summaryData.critical + summaryData.warning;
                             }
                             summaryData.stabilityPercent = summaryData.totalPorts > 0
-                                ? ((summaryData.stable / summaryData.totalPorts) * 100).toFixed(1)
+                                ? formatFlapStabilityPercent(
+                                    (summaryData.stable / summaryData.totalPorts) * 100,
+                                    summaryData.problematic)
                                 : null;
                         }
                         const requiredTotal = dataType === 'bgp'

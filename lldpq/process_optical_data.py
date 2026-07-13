@@ -6,12 +6,13 @@ Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
 
+import json
 import os
 import re
 import sys
 import time
 from datetime import datetime
-from optical_analyzer import OpticalAnalyzer
+from optical_analyzer import OpticalAnalyzer, _atomic_write
 from collection_freshness import (
     asset_snapshot_is_valid,
     is_current_collection,
@@ -366,6 +367,43 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     # Generate summary for dashboard
     summary = optical_analyzer.get_optical_summary()
     anomalies = optical_analyzer.detect_optical_anomalies()
+
+    # Machine-readable dashboard summary. Additive to the HTML report and
+    # carrying the same headline numbers/collection status the report embeds.
+    coverage_expected = getattr(optical_analyzer, 'coverage_expected_hosts', None)
+    coverage_collected = getattr(optical_analyzer, 'coverage_collected_hosts', None)
+    coverage_current = getattr(optical_analyzer, 'coverage_current_hosts', None)
+    if all_devices_unavailable:
+        collection_status = "unavailable"
+    elif isinstance(coverage_expected, int) and isinstance(coverage_current, int):
+        collection_status = (
+            "complete" if coverage_current >= coverage_expected else "partial"
+        )
+    else:
+        collection_status = None
+    _atomic_write(
+        os.path.join(result_dir, "summary", "optical-summary.json"),
+        json.dumps({
+            "domain": "optical",
+            "generated_at": int(time.time()),
+            "collection_status": collection_status,
+            "coverage_expected": coverage_expected,
+            "coverage_current": coverage_current,
+            "coverage_collected": coverage_collected,
+            "total_devices": len({
+                port.split(':', 1)[0]
+                for port in optical_analyzer.current_optical_stats
+            }),
+            "total_ports": summary["total_ports"],
+            "excellent": len(summary["excellent_ports"]),
+            "good": len(summary["good_ports"]),
+            "warning": len(summary["warning_ports"]),
+            "critical": len(summary["critical_ports"]),
+            "down": len(summary["down_ports"]),
+            "unplugged": len(summary["unplugged_ports"]),
+            "unknown": len(summary["unknown_ports"]),
+        }) + "\n",
+    )
     print(f"Summary stats: {len(optical_analyzer.current_optical_stats)} total ports analyzed")
 
     print(f"\nOptical Analysis Summary:")

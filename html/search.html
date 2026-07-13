@@ -633,6 +633,12 @@
                     Search All
                 </button>
                 <button type="button" class="btn-clear" onclick="clearGlobalSearch()">Clear</button>
+                <button type="button" id="runScanBtn" class="btn-scan" onclick="runFabricScan()" title="Refresh the cached MAC/ARP/route tables from all devices">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>
+                    </svg>
+                    Run Fabric Scan
+                </button>
             </div>
         </div>
         <div id="globalSearchResults" class="global-search-results" aria-live="polite" style="display: none;"></div>
@@ -2022,7 +2028,7 @@
             
             // Single VRF or search mode - show single table
             if (selectedVrf !== 'all' || search) {
-                html = '<table class="data-table" id="routeTable0"><thead><tr>';
+                html += '<table class="data-table" id="routeTable0"><thead><tr>';
                 html += '<th>Prefix<span class="sort-icon"></span></th>';
                 html += '<th>Next Hop<span class="sort-icon"></span></th>';
                 html += '<th>Interface<span class="sort-icon"></span></th>';
@@ -2207,6 +2213,47 @@
         document.getElementById('vtepSearchInput').addEventListener('keypress', e => { if (e.key === 'Enter') loadVtepTable(); });
         document.getElementById('routeSearchInput').addEventListener('keypress', e => { if (e.key === 'Enter') loadRouteTable(); });
         document.getElementById('lldpSearchInput').addEventListener('keypress', e => { if (e.key === 'Enter') loadLldpNeighbors(); });
+
+        // ============ LIVE CLIENT-SIDE FILTER ============
+        // Typing in a tab's filter box instantly narrows the rows that are
+        // already rendered; Load still performs the fresh (server-side) fetch.
+        function applyLiveFilter(tab) {
+            const cfg = tabResultConfigs[tab];
+            if (!cfg) return;
+            const term = document.getElementById(cfg.search).value.trim().toLowerCase();
+            const tables = document.getElementById(cfg.results).querySelectorAll('table.data-table');
+            if (tables.length === 0) return;
+
+            const countEl = document.getElementById(cfg.count);
+            const stateTable = tables[0];
+            let shown = 0;
+            let total = 0;
+            tables.forEach(table => {
+                table.querySelectorAll('tbody tr').forEach(row => {
+                    total += 1;
+                    const match = !term || row.textContent.toLowerCase().includes(term);
+                    row.style.display = match ? '' : 'none';
+                    if (match) shown += 1;
+                });
+            });
+
+            if (term) {
+                // Keep the unfiltered count text on the rendered table itself
+                // so the saved value dies with the table on the next Load.
+                if (stateTable.dataset.baseCountText === undefined) {
+                    stateTable.dataset.baseCountText = countEl.textContent;
+                }
+                countEl.textContent = shown + ' of ' + total + ' loaded rows match filter';
+            } else if (stateTable.dataset.baseCountText !== undefined) {
+                countEl.textContent = stateTable.dataset.baseCountText;
+                delete stateTable.dataset.baseCountText;
+            }
+        }
+
+        Object.keys(tabResultConfigs).forEach(tab => {
+            document.getElementById(tabResultConfigs[tab].search)
+                .addEventListener('input', () => applyLiveFilter(tab));
+        });
         
         // Check scan status
         async function checkScanStatus() {
@@ -2250,11 +2297,64 @@
                     setLastUpdated(null);
                     statusSpan.innerHTML = '<span style="color:#f59e0b;">No cached data</span>';
                 }
+                return data;
             } catch (e) {
                 if (!e.isAuthError) {
                     setLastUpdated(null);
                     document.getElementById('scanStatus').textContent = 'Status unavailable';
                 }
+                return null;
+            }
+        }
+
+        // ============ FABRIC SCAN ============
+        const RUN_SCAN_BUTTON_HTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">' +
+            '<path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/>' +
+            '</svg> Run Fabric Scan';
+        const SCAN_POLL_INTERVAL_MS = 5000;
+        const SCAN_POLL_MAX_MS = 10 * 60 * 1000;
+        let scanPollTimer = null;
+
+        function stopScanPolling() {
+            if (scanPollTimer !== null) {
+                clearInterval(scanPollTimer);
+                scanPollTimer = null;
+            }
+            const btn = document.getElementById('runScanBtn');
+            btn.disabled = false;
+            btn.innerHTML = RUN_SCAN_BUTTON_HTML;
+        }
+
+        async function runFabricScan() {
+            const btn = document.getElementById('runScanBtn');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" class="spin">' +
+                '<path d="M12 4V2A10 10 0 0 0 2 12h2a8 8 0 0 1 8-8z"/></svg> Scanning...';
+            clearPageError();
+
+            try {
+                // Capture the baseline timestamp; a new one means the scan finished.
+                const baseline = await checkScanStatus();
+                const baselineTimestamp = baseline && baseline.timestamp ? baseline.timestamp : null;
+
+                const data = await apiFetchJson('search-api.sh?action=run-scan');
+                if (!data.success) {
+                    throw new Error(data.error || 'Fabric scan could not be started');
+                }
+
+                const startedAt = Date.now();
+                scanPollTimer = setInterval(async () => {
+                    const latest = await checkScanStatus();
+                    const finished = latest && latest.timestamp && latest.timestamp !== baselineTimestamp;
+                    if (finished || Date.now() - startedAt > SCAN_POLL_MAX_MS) {
+                        stopScanPolling();
+                    }
+                }, SCAN_POLL_INTERVAL_MS);
+            } catch (e) {
+                if (e.isAuthError) return;
+                stopScanPolling();
+                showPageError('Fabric scan could not be started: ' + e.message);
             }
         }
         

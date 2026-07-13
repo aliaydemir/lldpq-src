@@ -125,7 +125,7 @@
                 <div class="kind-card">
                     <h3>P2P cabling <span class="p-file">connections</span></h3>
                     <div class="p-toolbar">
-                        <button class="btn secondary sm" onclick="document.getElementById('up-p2p').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload P2P</button>
+                        <button class="btn secondary sm" id="btn-up-p2p" onclick="document.getElementById('up-p2p').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload P2P</button>
                         <input type="file" id="up-p2p" accept=".xlsx,.xlsm,.json" style="display:none" onchange="uploadDesign('p2p', this)">
                     </div>
                     <div class="ver-list" id="list-p2p"><span class="ver-empty">Loading&hellip;</span></div>
@@ -134,7 +134,7 @@
                 <div class="kind-card">
                     <h3>IP allocation <span class="p-file">ipam</span></h3>
                     <div class="p-toolbar">
-                        <button class="btn secondary sm" onclick="document.getElementById('up-ipam').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload IPAM</button>
+                        <button class="btn secondary sm" id="btn-up-ipam" onclick="document.getElementById('up-ipam').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload IPAM</button>
                         <input type="file" id="up-ipam" accept=".xlsx,.xlsm,.json" style="display:none" onchange="uploadDesign('ipam', this)">
                     </div>
                     <div class="ver-list" id="list-ipam"><span class="ver-empty">Loading&hellip;</span></div>
@@ -152,7 +152,7 @@
                     <option value="p2p">P2P cabling</option>
                     <option value="ipam">IP allocation</option>
                 </select>
-                <button class="btn secondary" onclick="runValidate()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Validate</button>
+                <button class="btn secondary" id="btn-validate" onclick="runValidate()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Validate</button>
             </div>
             <div class="status info" id="st-val"></div>
             <div id="val-report"></div>
@@ -161,9 +161,18 @@
         <!-- 3. topology.dot -->
         <div class="inv-panel">
             <h2>3. Generate <span class="p-file">topology.dot</span></h2>
-            <p class="p-desc">Render the resolved P2P links as the expected topology. Preview first, then <strong>Set as expected topology</strong> writes <code>topology.dot</code> (the previous file is backed up to <code>.bak</code>).</p>
+            <p class="p-desc">Render the resolved P2P links as the expected topology. Pick the link scope (p2p-parser semantics), preview, then <strong>Set as expected topology</strong> writes <code>topology.dot</code> (the previous file is backed up to <code>.bak</code>).</p>
             <div class="p-toolbar">
-                <button class="btn secondary" onclick="preview('topology')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <select class="kind-sel" id="topo-scope" onchange="onTopoScopeChange()" title="Which planes of the design go into topology.dot">
+                    <option value="sw-to-sw" selected>Switch-to-switch</option>
+                    <option value="full">Full fabric</option>
+                    <option value="eth-only">ETH only</option>
+                    <option value="ib-only">IB only</option>
+                </select>
+                <label style="display:flex;align-items:center;gap:6px;color:#bbb;font-size:12.5px;cursor:pointer" title="Also include the OOB / MGMT / CTRL plane in a scoped topology">
+                    <input type="checkbox" id="topo-mgmt"> add mgmt
+                </label>
+                <button class="btn secondary" id="btn-prev-topology" onclick="preview('topology')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-topology" style="margin:0"></span>
             </div>
             <div class="status info" id="st-topology"></div>
@@ -171,7 +180,7 @@
                 <textarea class="inv-ta" id="ta-topology" readonly></textarea>
                 <div class="p-toolbar" style="margin-top:10px">
                     <div class="spacer"></div>
-                    <button class="btn primary" onclick="applyArtifact('topology')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Set as expected topology</button>
+                    <button class="btn primary" id="btn-apply-topology" onclick="applyArtifact('topology')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Set as expected topology</button>
                 </div>
             </div>
         </div>
@@ -181,7 +190,7 @@
             <h2>4. Generate <span class="p-file">devices.yaml</span></h2>
             <p class="p-desc">Draft <code>devices.yaml</code> from the IPAM design &mdash; switch roles only (DGX/PDU/power/host filtered), SSH defaults preserved. Preview shows a diff against the current file before applying.</p>
             <div class="p-toolbar">
-                <button class="btn secondary" onclick="preview('devices')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <button class="btn secondary" id="btn-prev-devices" onclick="preview('devices')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-devices" style="margin:0"></span>
             </div>
             <div class="status info" id="st-devices"></div>
@@ -190,7 +199,7 @@
                 <textarea class="inv-ta" id="ta-devices" readonly></textarea>
                 <div class="p-toolbar" style="margin-top:10px">
                     <div class="spacer"></div>
-                    <button class="btn primary" onclick="applyArtifact('devices')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply devices.yaml</button>
+                    <button class="btn primary" id="btn-apply-devices" onclick="applyArtifact('devices')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply devices.yaml</button>
                 </div>
             </div>
         </div>
@@ -200,7 +209,7 @@
             <h2>5. Generate <span class="p-file">topology_config.yaml</span></h2>
             <p class="p-desc">Draft <code>topology_config.yaml</code> (device_categories / layers / icons) from the roles present in the design. Preview, then confirm to write.</p>
             <div class="p-toolbar">
-                <button class="btn secondary" onclick="preview('topology-config')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
+                <button class="btn secondary" id="btn-prev-topology-config" onclick="preview('topology-config')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-topology-config" style="margin:0"></span>
             </div>
             <div class="status info" id="st-topology-config"></div>
@@ -208,7 +217,7 @@
                 <textarea class="inv-ta" id="ta-topology-config" readonly></textarea>
                 <div class="p-toolbar" style="margin-top:10px">
                     <div class="spacer"></div>
-                    <button class="btn primary" onclick="applyArtifact('topology-config')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply topology_config.yaml</button>
+                    <button class="btn primary" id="btn-apply-topology-config" onclick="applyArtifact('topology-config')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Apply topology_config.yaml</button>
                 </div>
             </div>
         </div>
@@ -231,10 +240,21 @@
 const API = '/inventory-api.sh';
 const TOKENS = {};        // artifact -> confirm token from the last preview
 const ART = {             // artifact key -> ui ids
-    'topology':        { ta:'ta-topology',        pw:'pw-topology',        st:'st-topology',        stat:'stat-topology',        file:'topology.dot' },
-    'devices':         { ta:'ta-devices',         pw:'pw-devices',         st:'st-devices',         stat:'stat-devices',         file:'devices.yaml' },
-    'topology-config': { ta:'ta-topology-config', pw:'pw-topology-config', st:'st-topology-config', stat:'stat-topology-config', file:'topology_config.yaml' },
+    'topology':        { ta:'ta-topology',        pw:'pw-topology',        st:'st-topology',        stat:'stat-topology',        prev:'btn-prev-topology',        apply:'btn-apply-topology',        file:'topology.dot' },
+    'devices':         { ta:'ta-devices',         pw:'pw-devices',         st:'st-devices',         stat:'stat-devices',         prev:'btn-prev-devices',         apply:'btn-apply-devices',         file:'devices.yaml' },
+    'topology-config': { ta:'ta-topology-config', pw:'pw-topology-config', st:'st-topology-config', stat:'stat-topology-config', prev:'btn-prev-topology-config', apply:'btn-apply-topology-config', file:'topology_config.yaml' },
 };
+
+function setBusy(ids, busy) {
+    // Disable a panel's buttons while its request is in flight (no double-Apply).
+    (ids || []).forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.disabled = !!busy;
+    });
+}
+function setListBusy(kind, busy) {
+    document.querySelectorAll('#list-' + kind + ' button').forEach(b => { b.disabled = !!busy; });
+}
 
 function escHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
@@ -275,6 +295,7 @@ async function uploadDesign(kind, input) {
     const fd = new FormData();
     fd.append('kind', kind);
     fd.append('file', file);
+    setBusy(['btn-up-' + kind], true);
     try {
         const r = await fetch(API + '?action=upload&kind=' + encodeURIComponent(kind), { method: 'POST', body: fd });
         const data = await r.json();
@@ -287,6 +308,8 @@ async function uploadDesign(kind, input) {
         }
     } catch (e) {
         setStatus('st-' + kind, 'Upload failed: ' + e.message, 'err');
+    } finally {
+        setBusy(['btn-up-' + kind], false);
     }
 }
 
@@ -317,7 +340,8 @@ function renderVersions(kind, versions) {
         const name = v.filename || v.version;
         const action = active
             ? '<span class="badge green">Active</span>'
-            : '<button class="btn secondary sm" onclick="activate(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Use as Design</button>';
+            : '<button class="btn secondary sm" onclick="activate(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Use as Design</button>' +
+              '<button class="btn danger sm" title="Delete this stored version" onclick="deleteVersion(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Del</button>';
         return '<div class="ver-row' + (active ? ' active' : '') + '">' +
             '<svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>' +
             '<span class="ver-name" title="' + escHtml(name) + '">' + escHtml(name) + '</span>' +
@@ -339,14 +363,40 @@ async function loadVersions() {
 
 async function activate(kind, version) {
     setStatus('st-' + kind, 'Activating…', 'info');
-    const data = await apiPost('activate', { kind, version });
-    if (data.success) {
-        let msg = 'Active design set.';
-        if (data.publish_error) msg += ' (publish warning: ' + data.publish_error + ')';
-        setStatus('st-' + kind, msg, 'ok');
-        loadVersions();
-    } else {
-        setStatus('st-' + kind, data.error || 'Activate failed', 'err');
+    setListBusy(kind, true);
+    try {
+        const data = await apiPost('activate', { kind, version });
+        if (data.success) {
+            let msg = 'Active design set.';
+            if (data.publish_error) msg += ' (publish warning: ' + data.publish_error + ')';
+            setStatus('st-' + kind, msg, 'ok');
+            loadVersions();
+        } else {
+            setStatus('st-' + kind, data.error || 'Activate failed', 'err');
+        }
+    } catch (e) {
+        setStatus('st-' + kind, 'Activate failed: ' + e.message, 'err');
+    } finally {
+        setListBusy(kind, false);
+    }
+}
+
+async function deleteVersion(kind, version) {
+    if (!window.confirm('Delete stored version ' + version + '?\n\nThe design copy is removed permanently. The active version cannot be deleted.')) return;
+    setStatus('st-' + kind, 'Deleting…', 'info');
+    setListBusy(kind, true);
+    try {
+        const data = await apiPost('delete', { kind, version });
+        if (data.success) {
+            setStatus('st-' + kind, 'Version deleted.', 'ok');
+            loadVersions();
+        } else {
+            setStatus('st-' + kind, data.error || 'Delete failed', 'err');
+        }
+    } catch (e) {
+        setStatus('st-' + kind, 'Delete failed: ' + e.message, 'err');
+    } finally {
+        setListBusy(kind, false);
     }
 }
 
@@ -359,7 +409,16 @@ async function runValidate() {
     const kind = document.getElementById('val-kind').value;
     setStatus('st-val', 'Validating ' + kind + '…', 'info');
     document.getElementById('val-report').innerHTML = '';
-    const data = await apiGet('validate', { kind });
+    let data;
+    setBusy(['btn-validate'], true);
+    try {
+        data = await apiGet('validate', { kind });
+    } catch (e) {
+        setStatus('st-val', 'Validation failed: ' + e.message, 'err');
+        return;
+    } finally {
+        setBusy(['btn-validate'], false);
+    }
     if (!data.success) { setStatus('st-val', data.error || 'Validation failed', 'err'); return; }
     const rep = data.report || {};
     const issues = rep.issues || [];
@@ -407,15 +466,40 @@ function renderDevicesDiff(diff, skipped) {
     return html;
 }
 
+function topologyScopeParams() {
+    const scope = document.getElementById('topo-scope');
+    const mgmt = document.getElementById('topo-mgmt');
+    return {
+        scope: scope ? scope.value : 'sw-to-sw',
+        mgmt: (mgmt && mgmt.checked) ? '1' : '0',
+    };
+}
+function onTopoScopeChange() {
+    // 'full' already contains the management plane; the modifier only makes
+    // sense for a narrowed scope.
+    const scope = document.getElementById('topo-scope').value;
+    const mgmt = document.getElementById('topo-mgmt');
+    mgmt.disabled = (scope === 'full');
+    if (scope === 'full') mgmt.checked = false;
+    // A different scope invalidates the previewed content/token.
+    TOKENS['topology'] = null;
+    document.getElementById(ART['topology'].pw).classList.remove('show');
+    setStatus(ART['topology'].st, '', 'info');
+}
+
 async function preview(artifact) {
     const ui = ART[artifact];
     setStatus(ui.st, 'Generating preview…', 'info');
     document.getElementById(ui.stat).textContent = '';
     document.getElementById(ui.pw).classList.remove('show');
+    const params = { mode: 'preview' };
+    if (artifact === 'topology') Object.assign(params, topologyScopeParams());
     let data;
+    setBusy([ui.prev, ui.apply], true);
     try {
-        data = await apiGet('generate-' + artifact, { mode: 'preview' });
+        data = await apiGet('generate-' + artifact, params);
     } catch (e) { setStatus(ui.st, 'Preview failed: ' + e.message, 'err'); return; }
+    finally { setBusy([ui.prev, ui.apply], false); }
     if (!data.success) { setStatus(ui.st, data.error || 'Preview failed', 'err'); TOKENS[artifact] = null; return; }
     TOKENS[artifact] = data.token || null;
     document.getElementById(ui.ta).value = data.preview || '';
@@ -424,6 +508,12 @@ async function preview(artifact) {
     }
     let stat = '';
     if (data.stats && typeof data.stats.edges === 'number') stat = data.stats.edges + ' edge(s)';
+    if (data.stats && data.stats.scope) {
+        stat += (stat ? ' · ' : '') + data.stats.scope + (data.stats.include_mgmt ? ' +mgmt' : '');
+    }
+    if (data.stats && data.stats.switch_source) {
+        stat += ' · switches: ' + data.stats.switch_source;
+    }
     if (data.source_version) stat += (stat ? ' · ' : '') + 'from ' + data.source_version;
     document.getElementById(ui.stat).textContent = stat;
     document.getElementById(ui.pw).classList.add('show');
@@ -439,17 +529,26 @@ async function applyArtifact(artifact) {
         : 'Write ' + ui.file + '?\n\nThe current file is backed up to .bak.';
     if (!window.confirm(msg)) return;
     setStatus(ui.st, 'Applying…', 'info');
+    const params = { mode: 'apply' };
+    if (artifact === 'topology') Object.assign(params, topologyScopeParams());
     let data;
+    setBusy([ui.prev, ui.apply], true);
     try {
-        data = await apiPost('generate-' + artifact, { confirm: token }, { mode: 'apply' });
+        data = await apiPost('generate-' + artifact, { confirm: token }, params);
     } catch (e) { setStatus(ui.st, 'Apply failed: ' + e.message, 'err'); return; }
+    finally { setBusy([ui.prev, ui.apply], false); }
     if (data.success) {
         setStatus(ui.st, data.message || (ui.file + ' saved.'), 'ok');
         TOKENS[artifact] = null;
         document.getElementById(ui.pw).classList.remove('show');
+    } else if (data.token) {
+        // Stale confirm token: never re-arm from the server value — the
+        // previewed content no longer matches what would be written.
+        TOKENS[artifact] = null;
+        document.getElementById(ui.pw).classList.remove('show');
+        setStatus(ui.st, (data.error || 'Apply failed') + ' Click Preview again.', 'err');
     } else {
         setStatus(ui.st, data.error || 'Apply failed', 'err');
-        if (data.token) TOKENS[artifact] = data.token;
     }
 }
 
@@ -501,12 +600,12 @@ async function advisorSend() {
 }
 
 async function probeAdvisor() {
-    // The advisor is optional: only reveal it if the backend exposes a
-    // bootstrap action. An appliance on local Ollama with no AI stays offline
-    // and this panel simply never appears.
+    // The advisor is optional: only reveal it if the backend reports it
+    // available via bootstrap-status. An appliance on local Ollama with no AI
+    // stays offline and this panel simply never appears.
     try {
-        const data = await apiGet('bootstrap', { probe: '1' });
-        if (data && data.success && data.advisor_available) {
+        const data = await apiGet('bootstrap-status');
+        if (data && data.success && (data.available || data.advisor_available)) {
             document.getElementById('advisor-panel').classList.add('show');
             advisorAppend('system', 'Bootstrap advisor ready. Suggestions go through the preview + confirm gate above.');
         }

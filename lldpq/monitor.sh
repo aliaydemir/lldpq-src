@@ -287,6 +287,11 @@ analysis_artifacts=(
     hardware-analysis.html
     log-analysis.html log_summary.json
     duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+    summary/bgp-summary.json summary/evpn-summary.json
+    summary/evpn-mh-summary.json summary/flap-summary.json
+    summary/optical-summary.json summary/ber-summary.json
+    summary/pfc-ecn-summary.json summary/hardware-summary.json
+    summary/duplicate-summary.json
 )
 
 # A retained analyzer rollback snapshot can predate the PFC/ECN feature.  Keep
@@ -309,6 +314,22 @@ analysis_artifacts_legacy_v2=(
     .lldpq-current.json
     .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
     bgp-analysis.html bgp_history.json
+    link-flap-analysis.html flap_history.json
+    optical-analysis.html optical_history.json
+    ber-analysis.html ber_history.json ber_baseline.json
+    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+    hardware-analysis.html
+    log-analysis.html log_summary.json
+    duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+)
+
+# Snapshot schema used before the per-domain dashboard summary JSON files.
+analysis_artifacts_legacy_v3=(
+    .lldpq-current.json
+    .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    .pipeline-inputs/collection_status.json
+    bgp-analysis.html bgp_history.json
+    evpn-mh-analysis.html
     link-flap-analysis.html flap_history.json
     optical-analysis.html optical_history.json
     ber-analysis.html ber_history.json ber_baseline.json
@@ -494,6 +515,7 @@ validate_analysis_backup_manifest() {
     local manifest="$analysis_backup_dir/manifest"
     local status relative extra expected expected_artifact backup count=0 valid=true
     local current_schema=true legacy_schema_v1=true legacy_schema_v2=true
+    local legacy_schema_v3=true
     local -A seen=()
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
 
@@ -536,8 +558,12 @@ validate_analysis_backup_manifest() {
     for expected_artifact in "${analysis_artifacts_legacy_v2[@]}"; do
         [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v2=false
     done
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v3[@]}" ]] || legacy_schema_v3=false
+    for expected_artifact in "${analysis_artifacts_legacy_v3[@]}"; do
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v3=false
+    done
     [[ "$current_schema" == "true" || "$legacy_schema_v1" == "true" ||
-       "$legacy_schema_v2" == "true" ]]
+       "$legacy_schema_v2" == "true" || "$legacy_schema_v3" == "true" ]]
 }
 
 commit_analysis_state() {
@@ -1013,7 +1039,8 @@ publish_full_monitor_results() {
         # Keep the private history for a future enabled run, but never republish
         # an old aggregate/history as though it belonged to this skipped run.
         if ! sudo rm -f "$stage_dir/optical_history.json" \
-                "$stage_dir/optical-analysis.html" ||
+                "$stage_dir/optical-analysis.html" \
+                "$stage_dir/summary/optical-summary.json" ||
            ! sudo tee "$stage_dir/optical-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Optical Analysis - Skipped</title>
@@ -1041,37 +1068,51 @@ select_scope_web_overlays() {
         bgp)
             SCOPE_WEB_OVERLAYS=(
                 bgp-analysis.html bgp_history.json bgp-data evpn-data
+                summary/bgp-summary.json summary/evpn-summary.json
             )
             ;;
         evpn-mh)
-            SCOPE_WEB_OVERLAYS=(evpn-mh-analysis.html evpn-mh-data)
+            SCOPE_WEB_OVERLAYS=(
+                evpn-mh-analysis.html evpn-mh-data
+                summary/evpn-mh-summary.json
+            )
             ;;
         duplicate)
-            SCOPE_WEB_OVERLAYS=(duplicate-analysis.html dup-data)
+            SCOPE_WEB_OVERLAYS=(
+                duplicate-analysis.html dup-data
+                summary/duplicate-summary.json
+            )
             ;;
         flap)
             SCOPE_WEB_OVERLAYS=(
                 link-flap-analysis.html flap_history.json flap-data
+                summary/flap-summary.json
             )
             ;;
         optical)
             SCOPE_WEB_OVERLAYS=(
                 optical-analysis.html optical_history.json optical-data
+                summary/optical-summary.json
             )
             ;;
         ber)
             SCOPE_WEB_OVERLAYS=(
                 ber-analysis.html ber_history.json ber_baseline.json ber-data
+                summary/ber-summary.json
             )
             ;;
         pfc-ecn)
             SCOPE_WEB_OVERLAYS=(
                 pfc-ecn-analysis.html pfc_ecn_baseline.json
                 pfc_ecn_history.json pfc-ecn-data
+                summary/pfc-ecn-summary.json
             )
             ;;
         hardware)
-            SCOPE_WEB_OVERLAYS=(hardware-analysis.html hardware-data)
+            SCOPE_WEB_OVERLAYS=(
+                hardware-analysis.html hardware-data
+                summary/hardware-summary.json
+            )
             ;;
         logs)
             SCOPE_WEB_OVERLAYS=(log-analysis.html log_summary.json log-data)
@@ -1173,6 +1214,7 @@ PYTHON
             return 1
         fi
         if ! sudo rm -rf -- "$stage_path" ||
+           ! sudo mkdir -p -- "$(dirname "$stage_path")" ||
            ! sudo cp -a "${CP_REFLINK_ARGS[@]}" -- \
                 "$source_path" "$stage_path"; then
             sudo rm -rf "$stage_dir" 2>/dev/null || true
@@ -3963,51 +4005,89 @@ validate_analysis_outputs() {
                 hardware-analysis.html
                 log-analysis.html log_summary.json
                 duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                summary/bgp-summary.json summary/evpn-summary.json
+                summary/evpn-mh-summary.json summary/flap-summary.json
+                summary/ber-summary.json summary/pfc-ecn-summary.json
+                summary/hardware-summary.json summary/duplicate-summary.json
             )
             json_files=(
                 bgp_history.json flap_history.json ber_history.json ber_baseline.json
                 pfc_ecn_baseline.json pfc_ecn_history.json
                 log_summary.json dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                summary/bgp-summary.json summary/evpn-summary.json
+                summary/evpn-mh-summary.json summary/flap-summary.json
+                summary/ber-summary.json summary/pfc-ecn-summary.json
+                summary/hardware-summary.json summary/duplicate-summary.json
             )
             if [[ "$SKIP_OPTICAL" != "true" ]]; then
-                required+=(optical-analysis.html optical_history.json)
-                json_files+=(optical_history.json)
+                required+=(
+                    optical-analysis.html optical_history.json
+                    summary/optical-summary.json
+                )
+                json_files+=(optical_history.json summary/optical-summary.json)
             fi
             ;;
         bgp)
-            required=(bgp-analysis.html bgp_history.json)
-            json_files=(bgp_history.json)
+            required=(
+                bgp-analysis.html bgp_history.json
+                summary/bgp-summary.json summary/evpn-summary.json
+            )
+            json_files=(
+                bgp_history.json
+                summary/bgp-summary.json summary/evpn-summary.json
+            )
             ;;
         evpn-mh)
-            required=(evpn-mh-analysis.html)
+            required=(evpn-mh-analysis.html summary/evpn-mh-summary.json)
+            json_files=(summary/evpn-mh-summary.json)
             ;;
         duplicate)
             required=(
                 duplicate-analysis.html
                 dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                summary/duplicate-summary.json
             )
-            json_files=(dup-data/dup_seq_state.json dup-data/dup_ip_state.json)
+            json_files=(
+                dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                summary/duplicate-summary.json
+            )
             ;;
         flap)
-            required=(link-flap-analysis.html flap_history.json)
-            json_files=(flap_history.json)
+            required=(
+                link-flap-analysis.html flap_history.json
+                summary/flap-summary.json
+            )
+            json_files=(flap_history.json summary/flap-summary.json)
             ;;
         optical)
-            required=(optical-analysis.html optical_history.json)
-            json_files=(optical_history.json)
+            required=(
+                optical-analysis.html optical_history.json
+                summary/optical-summary.json
+            )
+            json_files=(optical_history.json summary/optical-summary.json)
             ;;
         ber)
-            required=(ber-analysis.html ber_history.json ber_baseline.json)
-            json_files=(ber_history.json ber_baseline.json)
+            required=(
+                ber-analysis.html ber_history.json ber_baseline.json
+                summary/ber-summary.json
+            )
+            json_files=(
+                ber_history.json ber_baseline.json summary/ber-summary.json
+            )
             ;;
         pfc-ecn)
             required=(
                 pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+                summary/pfc-ecn-summary.json
             )
-            json_files=(pfc_ecn_baseline.json pfc_ecn_history.json)
+            json_files=(
+                pfc_ecn_baseline.json pfc_ecn_history.json
+                summary/pfc-ecn-summary.json
+            )
             ;;
         hardware)
-            required=(hardware-analysis.html)
+            required=(hardware-analysis.html summary/hardware-summary.json)
+            json_files=(summary/hardware-summary.json)
             ;;
         logs)
             required=(log-analysis.html log_summary.json)

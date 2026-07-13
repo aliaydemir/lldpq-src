@@ -2675,6 +2675,50 @@ class BGPAnalyzer:
         # Atomic write so a concurrent web reader never sees a half-written page.
         _atomic_write(output_file, html_content)
 
+        # Machine-readable dashboard summaries. Additive to the HTML report and
+        # carrying the exact same headline numbers/collection status it embeds.
+        summary_dir = os.path.join(os.path.dirname(os.path.abspath(output_file)), "summary")
+        generated_at = int(time.time())
+        health_percent = (
+            round(summary["health_ratio"], 1)
+            if summary["health_ratio"] is not None else None
+        )
+        _atomic_write(
+            os.path.join(summary_dir, "bgp-summary.json"),
+            json.dumps({
+                "domain": "bgp",
+                "generated_at": generated_at,
+                "collection_status": coverage_status,
+                "coverage_expected": expected_devices,
+                "coverage_current": current_bgp_devices,
+                "total_devices": summary["total_devices"],
+                "total_neighbors": summary["total_neighbors"],
+                "established_neighbors": summary["established_neighbors"],
+                "problem_neighbors": problem_neighbors,
+                "warning_neighbors": summary["warning_neighbors"],
+                "critical_neighbors": summary["critical_neighbors"],
+                "stale_devices": summary["stale_devices"],
+                "unknown_devices": summary["unknown_devices"],
+                "health_percent": health_percent,
+            }) + "\n",
+        )
+        _atomic_write(
+            os.path.join(summary_dir, "evpn-summary.json"),
+            json.dumps({
+                "domain": "evpn",
+                "generated_at": generated_at,
+                "collection_status": coverage_status,
+                "coverage_expected": expected_devices,
+                "coverage_current": current_evpn_devices,
+                "total_vnis": evpn_summary["total_vnis"],
+                "l2_vnis": evpn_summary["l2_vnis"],
+                "l3_vnis": evpn_summary["l3_vnis"],
+                "type2_routes": evpn_summary["type2_routes"],
+                "type5_routes": evpn_summary["type5_routes"],
+                "route_coverage": route_coverage,
+            }) + "\n",
+        )
+
 if __name__ == "__main__":
     analyzer = BGPAnalyzer()
     print("BGP analyzer initialized")

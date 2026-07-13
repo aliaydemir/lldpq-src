@@ -51,8 +51,14 @@
         .msg-assistant h3 { font-size: 13px; }
         .msg-assistant strong { color: #e0e0e0; }
         .msg-assistant code { background: #1a1a1a; padding: 1px 5px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; font-size: 12px; color: #76b900; }
-        .msg-assistant pre { background: #1a1a1a; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; }
+        .msg-assistant pre { background: #1a1a1a; padding: 10px; border-radius: 4px; overflow-x: auto; margin: 8px 0; position: relative; }
         .msg-assistant pre code { padding: 0; background: none; }
+        /* Per-code-block copy button (same language as .msg-action-btn) */
+        .code-copy-btn { position: absolute; top: 4px; right: 4px; background: #2d2d2d; border: none; border-radius: 3px; color: #666; cursor: pointer; padding: 2px 6px; font-size: 10px; display: inline-flex; align-items: center; gap: 3px; opacity: 0; transition: opacity 0.2s; }
+        .msg-assistant pre:hover .code-copy-btn, .code-copy-btn:focus, .code-copy-btn.copied { opacity: 1; }
+        .code-copy-btn:hover { color: #76b900; background: #3c3c3c; }
+        .code-copy-btn.copied { color: #76b900; }
+        .code-copy-btn svg { width: 12px; height: 12px; fill: currentColor; }
         .msg-assistant ul, .msg-assistant ol { margin: 6px 0 6px 20px; }
         .msg-assistant li { margin: 3px 0; }
         .msg-assistant table { border-collapse: collapse; margin: 8px 0; font-size: 12px; }
@@ -95,7 +101,6 @@
         .settings-footer { padding: 15px 20px; border-top: 1px solid #3c3c3c; display: flex; gap: 10px; justify-content: flex-end; }
 
         /* Analysis badge */
-        .analysis-badge { background: #e65100; color: white; font-size: 10px; padding: 1px 6px; border-radius: 8px; font-weight: bold; display: none; }
 
         /* Provider indicator */
         .provider-badge { font-size: 11px; padding: 3px 8px; border-radius: 4px; background: #2d2d2d; color: #888; font-family: 'Cascadia Code', Consolas, monospace; }
@@ -191,10 +196,14 @@
     </div>
     <div class="header-right">
         <span class="provider-badge" id="providerBadge">--</span>
-        <button class="btn btn-secondary btn-sm" onclick="runAnalysis()" title="Run fabric health analysis" id="btnAnalyze">
+        <button class="btn btn-secondary btn-sm" onclick="runAnalysis()" title="Run a fresh fabric health analysis" id="btnAnalyze">
             <svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0012 4C9.11 4 6.6 5.64 5.35 8.04A5.994 5.994 0 000 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
             Analyze
-            <span class="analysis-badge" id="analysisBadge" onclick="showPersistedAnalysis(event)">!</span>
+        </button>
+        <button class="btn btn-secondary btn-sm" onclick="showPersistedAnalysis()" style="display:none;"
+                title="Show the last saved hourly analysis (no new run, no cost)" id="btnLastAnalysis">
+            <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M13 3a9 9 0 00-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 117 7c-1.93 0-3.68-.79-4.94-2.06l-1.42 1.42A8.954 8.954 0 0013 21a9 9 0 000-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg>
+            <span id="lastAnalysisLabel">Last Analysis</span>
         </button>
         <button class="btn btn-secondary btn-sm" onclick="exportChat()" title="Export chat as markdown" aria-label="Export chat as markdown">
             <svg viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
@@ -603,6 +612,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     document.getElementById('chatInput').focus();
 
+    // A background chat job that was still running when the page reloaded is
+    // resumed against the restored history (fire-and-forget, self-cleaning).
+    const savedJob = loadSavedChatJob();
+    if (savedJob) resumeChatJob(savedJob);
+
     // "Ask AI about this" deep-link: ?ask=<prompt> (or sessionStorage lldpq_ai_ask)
     // preloads the input and auto-sends — lets other pages hand context to Ask AI.
     try {
@@ -931,6 +945,7 @@ function addMessage(role, content, info) {
         // Auto-link device names to Details page
         linkDeviceNames(div);
         colorizeStatus(div);   // color-code status cells in any tables (OK=green, Down/Fail=red, Warn=amber)
+        addCodeCopyButtons(div);   // per-block copy buttons (live + restored history)
     } else {
         div.textContent = content;
     }
@@ -1457,6 +1472,43 @@ function copyMsgContent(btn) {
     }
 }
 
+// Small copy button on the top-right of every code block in an assistant
+// answer. Runs after markdown rendering, so it covers live responses and
+// blocks re-rendered from restored history alike.
+function addCodeCopyButtons(root) {
+    if (!root) return;
+    root.querySelectorAll('pre').forEach(pre => {
+        const code = pre.querySelector('code');
+        if (!code || pre.querySelector('.code-copy-btn')) return;
+        const btn = document.createElement('button');
+        btn.className = 'code-copy-btn';
+        btn.type = 'button';
+        btn.title = 'Copy code';
+        btn.setAttribute('aria-label', 'Copy code block');
+        btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>';
+        const label = document.createElement('span');
+        label.textContent = 'Copy';
+        btn.appendChild(label);
+        btn.onclick = () => {
+            const text = code.textContent;
+            const done = () => {
+                btn.classList.add('copied');
+                label.textContent = 'Copied';
+                setTimeout(() => {
+                    btn.classList.remove('copied');
+                    label.textContent = 'Copy';
+                }, 1400);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopyText(text));
+            } else {
+                fallbackCopyText(text);
+            }
+        };
+        pre.appendChild(btn);
+    });
+}
+
 function fallbackCopyText(text) {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -1484,19 +1536,24 @@ function linkDeviceNames(el) {
     // Find device hostnames in text and make them clickable links to Details page
     // Uses the devices from context (loaded on init)
     if (!_knownDevices || _knownDevices.length === 0) return;
+    // Word-boundary-safe, longest-first matching: leaf1 must never link inside
+    // leaf10, and a hostname that is a prefix of another prefers the longer one.
+    const escapeRegExp = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const alternation = _knownDevices.slice()
+        .sort((a, b) => String(b).length - String(a).length)
+        .map(escapeRegExp).join('|');
+    const devicePattern = new RegExp(
+        `(^|[^A-Za-z0-9_-])(${alternation})(?![A-Za-z0-9_-])`, 'g');
     // Only process text nodes to avoid breaking HTML
     const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, null, false);
     const textNodes = [];
     while (walker.nextNode()) textNodes.push(walker.currentNode);
-    
+
     textNodes.forEach(node => {
-        let text = node.textContent;
         let changed = false;
-        _knownDevices.forEach(name => {
-            if (text.includes(name)) {
-                text = text.split(name).join(`\x00${name}\x00`);
-                changed = true;
-            }
+        const text = node.textContent.replace(devicePattern, (_match, prefix, name) => {
+            changed = true;
+            return `${prefix}\x00${name}\x00`;
         });
         if (changed) {
             const span = document.createElement('span');
@@ -1523,6 +1580,12 @@ let attachLogsActive = false;
 
 function toggleAttachLogs() {
     attachLogsActive = !attachLogsActive;
+    updateAttachLogsButton();
+}
+
+// Single source of truth for the attach-logs button visuals — used by the
+// manual toggle and by the auto-clear after a message is sent.
+function updateAttachLogsButton() {
     const btn = document.getElementById('btnAttachLogs');
     btn.style.background = attachLogsActive ? '#76b900' : '#333';
     btn.style.color = attachLogsActive ? '#000' : '#888';
@@ -1629,8 +1692,8 @@ function sleepWithAbort(ms, signal) {
 
 // Poll every ~1.5s until the worker publishes its terminal event; the return
 // value has the exact shape the synchronous action=chat response has today.
-async function pollChatJob(jobId, generation, controller) {
-    let cursor = 0;
+async function pollChatJob(jobId, generation, controller, startCursor = 0) {
+    let cursor = startCursor;
     let failures = 0;
     while (true) {
         if (generation !== requestGeneration || controller.signal.aborted) return { aborted: true };
@@ -1675,6 +1738,130 @@ async function stopChatJob() {
     }
 }
 
+// Render a terminal chat result (success or failure) into the chat area and
+// history. Shared by the live send path and the reload-resume path.
+function renderChatOutcome(data) {
+    if (data.success && data.response) {
+        const _info = {
+            tools: data.tools_used,
+            fixes: data.fixes,
+            followups: data.followups,
+            consoles: data.consoles,
+            evidence: data.evidence,
+            confidence: data.confidence,
+            timeline: data.timeline,
+            ts: Date.now(),
+        };
+        addMessage('assistant', data.response, _info);
+        chatHistory.push(Object.assign({ role: 'assistant', content: data.response }, _info));
+        saveChatToStorage();
+    } else {
+        addMessage('system', 'Error: ' + (data.error || 'No response from AI'));
+        // A failed run may still return the tool trace / evidence gathered
+        // before the failure — render them so that context is not lost.
+        const failTools = Array.isArray(data.tools_used) ? data.tools_used : [];
+        const failEvidence = Array.isArray(data.evidence) ? data.evidence : [];
+        if (failTools.length || failEvidence.length) {
+            const area = document.getElementById('chatArea');
+            const failWrap = document.createElement('div');
+            failWrap.className = 'msg-wrapper assistant';
+            if (failTools.length) failWrap.appendChild(renderToolTrace(failTools));
+            if (failEvidence.length) failWrap.appendChild(renderEvidencePanel(failEvidence, data.confidence));
+            if (data.timeline && typeof data.timeline === 'object') failWrap.appendChild(renderTimeline(data.timeline));
+            area.appendChild(failWrap);
+            area.scrollTop = area.scrollHeight;
+        }
+    }
+}
+
+// The active background job survives a page reload: its id + question are kept
+// in localStorage while the job runs and removed on every terminal outcome.
+const CHAT_JOB_KEY = 'lldpq_ai_chat_job';
+
+function saveActiveChatJob(jobId, question) {
+    try {
+        localStorage.setItem(CHAT_JOB_KEY, JSON.stringify({
+            job_id: String(jobId), question: String(question ?? ''), ts: Date.now(),
+        }));
+    } catch (e) {}
+}
+
+function clearSavedChatJob() {
+    try { localStorage.removeItem(CHAT_JOB_KEY); } catch (e) {}
+}
+
+function loadSavedChatJob() {
+    try {
+        const raw = localStorage.getItem(CHAT_JOB_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' &&
+            typeof parsed.job_id === 'string' && parsed.job_id) return parsed;
+        clearSavedChatJob();
+    } catch (e) {
+        clearSavedChatJob();
+    }
+    return null;
+}
+
+// Reattach to a background job that was still running when the page reloaded:
+// resume polling via chat-poll and render the outcome into the restored
+// history. A job the backend no longer knows clears silently.
+async function resumeChatJob(saved) {
+    const jobId = String(saved.job_id);
+    if (isStreaming || isAnalysisRunning) return;
+    isStreaming = true;
+    const generation = ++requestGeneration;
+    const controller = new AbortController();
+    chatRequestController = controller;
+    const btn = document.getElementById('btnSend');
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+    try {
+        // Probe first (no UI yet): unknown/expired jobs must clear silently.
+        const probe = await apiCall('chat-poll', { job_id: jobId, cursor: 0 }, { signal: controller.signal });
+        if (generation !== requestGeneration || controller.signal.aborted || probe.aborted) return;
+        if (!probe.success) {
+            clearSavedChatJob();
+            return;
+        }
+        activeChatJobId = jobId;
+        const question = String(saved.question || '').trim();
+        addMessage('system', 'Resumed the background investigation from before the reload'
+            + (question ? ` — "${truncateContextText(question, 120)}"` : '') + '...');
+        let data;
+        if (probe.done) {
+            data = (probe.result && typeof probe.result === 'object') ? probe.result
+                : { success: false, error: 'The chat job finished without a result.' };
+        } else {
+            setStopButtonVisible(true);
+            showChatProgress();
+            (Array.isArray(probe.events) ? probe.events : []).forEach(renderChatProgressEvent);
+            showTypingIndicator();
+            data = await pollChatJob(jobId, generation, controller,
+                Number.isFinite(probe.cursor) ? probe.cursor : 0);
+        }
+        if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
+        clearSavedChatJob();
+        renderChatOutcome(data);
+    } catch (e) {
+        if (generation === requestGeneration && !controller.signal.aborted) {
+            addMessage('system', 'Connection error: ' + e.message);
+        }
+    } finally {
+        if (generation === requestGeneration && chatRequestController === controller) {
+            removeTypingIndicator();
+            removeChatProgress();
+            activeChatJobId = null;
+            setStopButtonVisible(false);
+            chatRequestController = null;
+            isStreaming = false;
+            btn.disabled = false;
+            btn.removeAttribute('aria-busy');
+        }
+    }
+}
+
 async function sendMessage() {
     const input = document.getElementById('chatInput');
     const message = input.value.trim();
@@ -1699,8 +1886,7 @@ async function sendMessage() {
     const btn = document.getElementById('btnSend');
     btn.disabled = true;
     btn.setAttribute('aria-busy', 'true');
-    showTypingIndicator();
-    
+
     // Remove suggestions on first message
     const suggestions = document.getElementById('suggestions');
     if (suggestions) suggestions.remove();
@@ -1724,12 +1910,10 @@ async function sendMessage() {
                 }
             }
         } catch (e) {}
+        // Auto-clear the one-shot flag and fully reset the button (colors,
+        // tooltip and aria-pressed) through the shared helper.
         attachLogsActive = false;
-        const abtn = document.getElementById('btnAttachLogs');
-        abtn.style.background = '#333';
-        abtn.style.color = '#888';
-        abtn.style.borderColor = '#555';
-        abtn.setAttribute('aria-pressed', 'false');
+        updateAttachLogsButton();
     }
 
     if (generation !== requestGeneration || controller.signal.aborted) return;
@@ -1743,7 +1927,10 @@ async function sendMessage() {
     saveChatToStorage();
     input.value = '';
     autoResize(input);
-    
+    // Only now that the user's bubble is in the DOM: the indicator must always
+    // render directly below the just-sent message, never above it.
+    showTypingIndicator();
+
     try {
         // Async-first: submit as a background job and poll for progress.
         // Any submit failure (older backend without chat-submit, unavailable
@@ -1753,6 +1940,8 @@ async function sendMessage() {
         if (generation !== requestGeneration || controller.signal.aborted || submitted.aborted) return;
         if (submitted.success && submitted.job_id) {
             activeChatJobId = String(submitted.job_id);
+            // Persist the in-flight job so a page reload can resume polling.
+            saveActiveChatJob(activeChatJobId, message);
             setStopButtonVisible(true);
             showChatProgress();
             data = await pollChatJob(activeChatJobId, generation, controller);
@@ -1760,38 +1949,8 @@ async function sendMessage() {
             data = await apiCall('chat', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
         }
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
-        
-        if (data.success && data.response) {
-            const _info = {
-                tools: data.tools_used,
-                fixes: data.fixes,
-                followups: data.followups,
-                consoles: data.consoles,
-                evidence: data.evidence,
-                confidence: data.confidence,
-                timeline: data.timeline,
-                ts: Date.now(),
-            };
-            addMessage('assistant', data.response, _info);
-            chatHistory.push(Object.assign({ role: 'assistant', content: data.response }, _info));
-            saveChatToStorage();
-        } else {
-            addMessage('system', 'Error: ' + (data.error || 'No response from AI'));
-            // A failed run may still return the tool trace / evidence gathered
-            // before the failure — render them so that context is not lost.
-            const failTools = Array.isArray(data.tools_used) ? data.tools_used : [];
-            const failEvidence = Array.isArray(data.evidence) ? data.evidence : [];
-            if (failTools.length || failEvidence.length) {
-                const area = document.getElementById('chatArea');
-                const failWrap = document.createElement('div');
-                failWrap.className = 'msg-wrapper assistant';
-                if (failTools.length) failWrap.appendChild(renderToolTrace(failTools));
-                if (failEvidence.length) failWrap.appendChild(renderEvidencePanel(failEvidence, data.confidence));
-                if (data.timeline && typeof data.timeline === 'object') failWrap.appendChild(renderTimeline(data.timeline));
-                area.appendChild(failWrap);
-                area.scrollTop = area.scrollHeight;
-            }
-        }
+
+        renderChatOutcome(data);
     } catch (e) {
         if (generation === requestGeneration && !controller.signal.aborted) {
             addMessage('system', 'Connection error: ' + e.message);
@@ -1801,6 +1960,7 @@ async function sendMessage() {
             removeTypingIndicator();
             removeChatProgress();
             activeChatJobId = null;
+            clearSavedChatJob();
             setStopButtonVisible(false);
             chatRequestController = null;
             isStreaming = false;
@@ -1830,6 +1990,7 @@ function clearChat() {
         apiCall('chat-stop', { job_id: activeChatJobId });
         activeChatJobId = null;
     }
+    clearSavedChatJob();
     _progressBody = null;
     _progressRows = {};
     setStopButtonVisible(false);
@@ -1862,15 +2023,27 @@ function autoResize(el) {
 
 // ===================== ANALYSIS =====================
 async function loadAnalysisBadge() {
+    // Own "Last Analysis" button (hidden via its inline style until a fresh
+    // persisted analysis exists) — a separate control, so a click can never
+    // fall through to the Analyze button and start a costly new run.
+    const btn = document.getElementById('btnLastAnalysis');
+    if (!btn) return;
     const data = await apiCall('get-analysis');
     if (data.success && data.analysis && !data.stale) {
-        // 'inline-block' explicitly: the stylesheet default is display:none, so
-        // clearing the inline style ('') would leave the badge hidden forever.
-        document.getElementById('analysisBadge').style.display = 'inline-block';
+        const label = document.getElementById('lastAnalysisLabel');
+        if (label) {
+            const stamp = data.timestamp ? new Date(data.timestamp * 1000) : null;
+            label.textContent = stamp
+                ? 'Last ' + stamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : 'Last Analysis';
+        }
+        btn.style.display = '';
+    } else {
+        btn.style.display = 'none';
     }
 }
 
-// Badge click: show the cron-persisted analysis (get-analysis) in the chat
+// Button click: show the cron-persisted analysis (get-analysis) in the chat
 // panel with zero LLM cost. The Analyze button itself still runs a fresh one.
 async function showPersistedAnalysis(event) {
     if (event) event.stopPropagation();
@@ -1916,11 +2089,9 @@ async function runAnalysis() {
             if (suggestions) suggestions.remove();
 
             addMessage('system', 'Autonomous fabric health analysis:');
+            // action=analyze returns analysis/evidence/confidence/timeline/
+            // findings only — it never emits tools_used/fixes/followups/consoles.
             const _info = {
-                tools: data.tools_used,
-                fixes: data.fixes,
-                followups: data.followups,
-                consoles: data.consoles,
                 evidence: data.evidence,
                 confidence: data.confidence,
                 timeline: data.timeline,
@@ -1931,7 +2102,9 @@ async function runAnalysis() {
             addMessage('assistant', data.analysis, _info);
             chatHistory.push(Object.assign({ role: 'assistant', content: data.analysis, analysis: true }, _info));
             saveChatToStorage();
-            document.getElementById('analysisBadge').style.display = 'none';
+            // The fresh run replaced the persisted analysis: refresh the
+            // "Last Analysis" button timestamp instead of hiding anything.
+            loadAnalysisBadge();
             showToast('Analysis complete', 'success');
         } else {
             showToast('Analysis failed: ' + (data.error || ''), 'error');

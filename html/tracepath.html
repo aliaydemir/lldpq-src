@@ -571,6 +571,9 @@
         let srcDetectTimeout = null;
         let srcVrfRequestController = null;
         let srcVrfRequestId = 0;
+        let dstDetectTimeout = null;
+        let dstVrfRequestController = null;
+        let dstVrfRequestId = 0;
         let traceController = null;
         let traceRequestId = 0;
 
@@ -676,6 +679,19 @@
             document.getElementById('srcVrfSelect').setAttribute('aria-busy', 'false');
         }
 
+        function cancelDstVrfDetection() {
+            if (dstDetectTimeout !== null) {
+                clearTimeout(dstDetectTimeout);
+                dstDetectTimeout = null;
+            }
+            dstVrfRequestId += 1;
+            if (dstVrfRequestController) {
+                dstVrfRequestController.abort();
+                dstVrfRequestController = null;
+            }
+            document.getElementById('dstVrfSelect').setAttribute('aria-busy', 'false');
+        }
+
         // Swap source and destination (IP + VRF)
         function swapSrcDst() {
             if (traceController) {
@@ -694,6 +710,7 @@
             const oldDestinationVrf = dstVrf.value || oldSourceVrf;
 
             cancelSrcVrfDetection();
+            cancelDstVrfDetection();
             srcIp.value = oldDestinationIp;
             dstIp.value = oldSourceIp;
 
@@ -853,6 +870,67 @@
             }
         }
         
+        // Auto-detect VRFs for destination IP (same flow as the source field;
+        // a manual destination VRF choice always wins over the detection).
+        async function detectDstVrfs() {
+            if (dstDetectTimeout !== null) {
+                clearTimeout(dstDetectTimeout);
+                dstDetectTimeout = null;
+            }
+            if (dstVrfRequestController) {
+                dstVrfRequestController.abort();
+                dstVrfRequestController = null;
+            }
+
+            const ip = document.getElementById('destinationIp').value.trim();
+            const sel = document.getElementById('dstVrfSelect');
+            sel.setAttribute('aria-busy', 'false');
+            const selectionAtStart = sel.value;
+            const requestId = ++dstVrfRequestId;
+
+            if (!ip || !isValidIpv4(ip)) {
+                return;
+            }
+
+            const controller = new AbortController();
+            dstVrfRequestController = controller;
+            sel.setAttribute('aria-busy', 'true');
+            let didTimeout = false;
+            const timeoutId = setTimeout(() => {
+                didTimeout = true;
+                controller.abort();
+            }, LOOKUP_TIMEOUT_MS);
+
+            try {
+                const response = await fetch(
+                    `/search-api.sh?action=find-ip-vrf&ip=${encodeURIComponent(ip)}`,
+                    { signal: controller.signal }
+                );
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const data = await response.json();
+
+                if (requestId !== dstVrfRequestId || controller.signal.aborted ||
+                    document.getElementById('destinationIp').value.trim() !== ip) return;
+
+                // A manual change made while the lookup was running wins.
+                if (sel.value !== selectionAtStart) return;
+
+                const vrfs = normalizeVrfList(data.vrfs);
+                if (vrfs.length > 0) {
+                    syncDstVrf({ preferredVrf: vrfs[0], preservePrevious: false });
+                }
+            } catch(e) {
+                if (requestId !== dstVrfRequestId || (controller.signal.aborted && !didTimeout)) return;
+                if (didTimeout) console.error('Destination VRF lookup timed out');
+            } finally {
+                clearTimeout(timeoutId);
+                if (requestId === dstVrfRequestId) {
+                    dstVrfRequestController = null;
+                    sel.setAttribute('aria-busy', 'false');
+                }
+            }
+        }
+
         // Debounced auto-detect for source IP
         document.getElementById('sourceIp').addEventListener('input', function() {
             cancelActiveTraceForChangedInput();
@@ -874,10 +952,40 @@
             cancelSrcVrfDetection();
             syncDstVrf();
         });
-        document.getElementById('dstVrfSelect').addEventListener('change', cancelActiveTraceForChangedInput);
+        // Destination VRF changed manually → a pending detection must not
+        // override the explicit choice.
+        document.getElementById('dstVrfSelect').addEventListener('change', function() {
+            cancelActiveTraceForChangedInput();
+            cancelDstVrfDetection();
+        });
         
         // Load all VRFs on page load
         document.addEventListener('DOMContentLoaded', loadAllVrfs);
+
+        // Prefill the form from URL query parameters (source_ip, dest_ip,
+        // vrf, dst_vrf) and auto-run the trace when both endpoints are given.
+        function applyUrlParams() {
+            const params = new URLSearchParams(window.location.search);
+            const sourceIp = (params.get('source_ip') || '').trim();
+            const destIp = (params.get('dest_ip') || '').trim();
+            const vrf = (params.get('vrf') || '').trim();
+            const dstVrf = (params.get('dst_vrf') || '').trim();
+            if (!sourceIp && !destIp && !vrf && !dstVrf) return;
+
+            if (sourceIp) document.getElementById('sourceIp').value = sourceIp;
+            if (destIp) document.getElementById('destinationIp').value = destIp;
+            if (vrf) setVrfOptions(document.getElementById('srcVrfSelect'), [vrf], vrf, true);
+            if (dstVrf) syncDstVrf({ preferredVrf: dstVrf, preservePrevious: false });
+
+            if (sourceIp && destIp && isValidIpv4(sourceIp) && isValidIpv4(destIp)) {
+                tracePath();
+                return;
+            }
+            // Partial prefill: run the same detections typing would trigger.
+            if (sourceIp) detectSrcVrfs(vrf, Boolean(vrf));
+            if (destIp && !dstVrf) detectDstVrfs();
+        }
+        document.addEventListener('DOMContentLoaded', applyUrlParams);
 
         function setTraceButtonLoading(isLoading) {
             const button = document.getElementById('traceBtn');
@@ -964,6 +1072,7 @@
             if (traceController || btn.disabled) return;
             // Freeze the VRF selection used by this request.
             cancelSrcVrfDetection();
+            cancelDstVrfDetection();
             
             if (!sourceIp) {
                 showAlertModal('Please enter a source IP address');
@@ -1320,13 +1429,27 @@
 
         function clearResults() {
             cancelTraceRequest();
+            cancelDstVrfDetection();
             document.getElementById('destinationIp').value = '';
             syncDstVrf({ preferredVrf: '', preservePrevious: false });
             resetResultsDisplay();
         }
         
+        // Debounced auto-detect for destination IP (mirrors the source field)
+        document.getElementById('destinationIp').addEventListener('input', function() {
+            cancelActiveTraceForChangedInput();
+            cancelDstVrfDetection();
+            // Never carry a detected VRF from the previous destination address.
+            syncDstVrf({ preferredVrf: '', preservePrevious: false });
+            dstDetectTimeout = setTimeout(detectDstVrfs, 500);
+        });
+        document.getElementById('destinationIp').addEventListener('blur', function() {
+            if (dstDetectTimeout !== null) clearTimeout(dstDetectTimeout);
+            dstDetectTimeout = null;
+            detectDstVrfs();
+        });
+
         // Allow Enter key to trigger trace
-        document.getElementById('destinationIp').addEventListener('input', cancelActiveTraceForChangedInput);
         document.getElementById('destinationIp').addEventListener('keydown', function(e) {
             if (e.key === 'Enter') {
                 e.preventDefault();

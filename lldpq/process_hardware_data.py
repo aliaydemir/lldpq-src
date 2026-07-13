@@ -7,6 +7,7 @@ Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
 
+import json
 import os
 import sys
 import subprocess
@@ -18,6 +19,15 @@ from collection_freshness import (
     read_asset_snapshot,
     read_collection_outcomes,
 )
+
+
+def mark_summary_collection_unavailable(summary_path):
+    """Keep the summary JSON status equal to the HTML unavailable banner."""
+    from generate_hardware_html import _atomic_write
+    with open(summary_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["collection_status"] = "unavailable"
+    _atomic_write(summary_path, json.dumps(payload) + "\n")
 
 
 def main():
@@ -101,6 +111,9 @@ def main():
             if all_devices_unavailable:
                 mark_html_collection_unavailable(
                     os.path.join(data_dir, "hardware-analysis.html")
+                )
+                mark_summary_collection_unavailable(
+                    os.path.join(data_dir, "summary", "hardware-summary.json")
                 )
         else:
             print(f"❌ Error generating HTML: {result.stderr}")

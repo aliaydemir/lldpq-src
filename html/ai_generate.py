@@ -97,10 +97,78 @@ _CTYPE_LABELS = (
 )
 # Connection planes that are not LLDP-validated network links.
 _EXCLUDED_CTYPES = {"power"}
+# The management plane a scoped topology can opt back in (include_mgmt).
+_MGMT_CTYPES = {"oob", "mgmt", "ctrl"}
+# OS spelling of a switch front-panel port — the sw-to-sw fallback heuristic
+# keeps a link only when BOTH normalized endpoints look like this (host ends
+# are HCA/BMC/mgmt/enP* names and rarely normalize to swpN[sM]).
+_SWITCH_PORT_RE = re.compile(r"^swp\d+(?:s\d+)?$")
+# Storage appliances name their NICs swp-style in some designs (VAST cbox/dbox),
+# which fools the port-form heuristic; p2p-parser solves this with device roles.
+# This name filter is only the no-IPAM fallback — the IPAM fabric sheet is the
+# authoritative switch list when a design is active.
+_STORAGE_APPLIANCE_RE = re.compile(
+    r"\bvast\b|[-_]vast[-_]|\bcbox\b|\bdbox\b|\bjbo[df]\b|\bfiler\b|\bnas\b|"
+    r"storage[-_ ]?(?:node|srv|server|array)",
+    re.IGNORECASE,
+)
+TOPOLOGY_SCOPES = ("full", "sw-to-sw", "eth-only", "ib-only")
+
+
+def switch_names_from_ipam(ipam):
+    """Authoritative switch-name set from the IPAM fabric sheet.
+
+    Returns the lowercase device keys (both the design 'Device' label and the
+    live 'Hostname', FQDN-shortened) of every fabric record that maps to a
+    managed-switch role — p2p-parser's role-driven switch classification, with
+    the roles coming from the design itself instead of an interactive config.
+    Empty set when the design has no usable fabric records.
+    """
+    names = set()
+    for record in (ipam.get("fabric") if isinstance(ipam, dict) else []) or []:
+        role = record.get("role")
+        hostname = record.get("hostname") or ""
+        device = record.get("device") or ""
+        if _map_switch_role(role, hostname or device) is None:
+            continue
+        for name in (hostname, device):
+            for key in ai_p2p._device_keys(name):
+                names.add(key)
+    return names
+
+
+def _is_switch_endpoint(dev, os_port, switch_names):
+    if switch_names:
+        return bool(ai_p2p._device_keys(dev) & switch_names)
+    return (bool(_SWITCH_PORT_RE.match(os_port))
+            and not _NONSWITCH_RE.search(dev)
+            and not _STORAGE_APPLIANCE_RE.search(dev))
+
+
+def _link_in_scope(ctype, ntype, a_dev, a_port, b_dev, b_port, scope,
+                   include_mgmt, switch_names):
+    """Scope filter mirroring p2p-parser's output modes (--full/--switch-only/
+    --eth/--ib-only) plus the include-mgmt modifier. Power never passes."""
+    if ctype in _EXCLUDED_CTYPES:
+        return False
+    if scope == "full":
+        return True
+    if include_mgmt and ctype in _MGMT_CTYPES:
+        return True
+    if scope == "eth-only":
+        return ntype == "eth"
+    if scope == "ib-only":
+        return ntype == "ib"
+    if scope == "sw-to-sw":
+        return (ntype == "eth"
+                and _is_switch_endpoint(a_dev, a_port, switch_names)
+                and _is_switch_endpoint(b_dev, b_port, switch_names))
+    return True
 
 
 def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
-                        port_aliases=None):
+                        port_aliases=None, scope="full", include_mgmt=False,
+                        switch_names=None):
     """Render resolved physical P2P links as a topology.dot GraphViz graph.
 
     Only resolved links are emitted (ai_p2p already drops tbd/blank/customer
@@ -114,10 +182,21 @@ def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
     ({lower(designLabel): liveName}, from display-aliases.json reversed) —
     topology.dot must name what LLDP actually reports, and P2P workbooks often
     label devices/ports differently. Absent or empty maps are a no-op.
+
+    scope selects the emitted planes (p2p-parser semantics): 'full' = every
+    non-power link, 'sw-to-sw' = ETH links where both endpoints are switches,
+    'eth-only' / 'ib-only' = by network type. include_mgmt additionally keeps
+    the OOB/MGMT/CTRL plane inside a non-full scope.
+
+    switch_names (from switch_names_from_ipam) is the authoritative switch set
+    for sw-to-sw; without it a port-form + name heuristic decides, which can be
+    fooled by storage appliances whose NICs are named swp-style.
     """
     name = re.sub(r'["\\\x00-\x1f]', "", str(graph_name or "FABRIC")).strip() or "FABRIC"
     device_aliases = device_aliases or {}
     port_aliases = port_aliases or {}
+    if scope not in TOPOLOGY_SCOPES:
+        raise ValueError("unknown topology scope: %r" % (scope,))
 
     def live_device(dev):
         return device_aliases.get(dev.lower(), dev)
@@ -132,14 +211,20 @@ def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
     # whole design for context); _os_port stays as the per-port fallback.
     resolved = ai_p2p.resolve_port_map(connections)
     for link in ai_p2p.expected_links(connections):
-        ctype = str((link.get("meta") or {}).get("connection_type") or "general").lower()
-        if ctype in _EXCLUDED_CTYPES:
-            continue
+        meta = link.get("meta") or {}
+        ctype = str(meta.get("connection_type") or "general").lower()
+        ntype = str(meta.get("network_type") or "").lower()
         a_dev, b_dev = _clean(link.get("a_dev")), _clean(link.get("b_dev"))
         a_port = (ai_p2p.resolved_os_port(resolved, a_dev, link.get("a_port"))
                   or _os_port(link.get("a_port")))
         b_port = (ai_p2p.resolved_os_port(resolved, b_dev, link.get("b_port"))
                   or _os_port(link.get("b_port")))
+        # Scope is judged on the design-side names/OS spelling, before display-
+        # alias translation (which only renames, never changes what a port is).
+        if not _link_in_scope(ctype, ntype, a_dev, a_port.lower(),
+                              b_dev, b_port.lower(), scope, include_mgmt,
+                              switch_names):
+            continue
         a_dev, b_dev = live_device(a_dev), live_device(b_dev)
         a_port, b_port = live_port(a_port), live_port(b_port)
         if _bad_token(a_dev) or _bad_token(a_port) or _bad_token(b_dev) or _bad_token(b_port):
@@ -296,6 +381,23 @@ _NONSWITCH_RE = re.compile(
 )
 
 
+def _switch_role(role, hostname):
+    """Role tag for devices.yaml: the design's own Role column wins verbatim.
+
+    _map_switch_role still makes the switch-vs-host decision (None filters the
+    record out), but its canonical vocabulary is only the fallback for designs
+    without a Role column. Operators key their dashboards and analysis scopes
+    to their own role names (tan_leaf, oob_tor, ...) — collapsing those to
+    generic 'leaf' would rewrite a working devices.yaml on apply.
+    """
+    canon = _map_switch_role(role, hostname)
+    if canon is None:
+        return None
+    verbatim = re.sub(r"\s+", "_", str(role or "").strip())
+    verbatim = re.sub(r"[^A-Za-z0-9_-]", "", verbatim)
+    return verbatim or canon
+
+
 def _map_switch_role(role, hostname):
     """Map an IPAM role/hostname onto the LLDPq role vocabulary, or None.
 
@@ -419,7 +521,7 @@ def ipam_to_devices_yaml(ipam, existing_yaml=None):
         if not hostname:
             continue
         mgmt_ip = str(record.get("mgmt_ip") or "").strip()
-        role = _map_switch_role(record.get("role"), hostname)
+        role = _switch_role(record.get("role"), hostname)
         if role is None:
             skipped.append(hostname)
             continue
@@ -513,48 +615,167 @@ _ROLE_TOPO = {
 _TOPO_ORDER = ("firewall", "border", "spine", "leaf", "core", "access")
 
 
-def ipam_to_topology_config_yaml(ipam, p2p=None):
-    """Draft a topology_config.yaml matching the shipped shape.
+def _family_pattern(hostnames, role):
+    """Anchored hostname-family regex for one role group.
 
-    device_categories are emitted only for the roles actually present in the
-    design (from IPAM fabric roles/hostnames, with P2P device names as a
-    fallback source of names), each mapped to the layer/icon LLDPq expects.
+    'tan-spine-01..04' -> '^tan-spine'. Falls back to the sanitized role text
+    when the hostnames share no usable prefix.
     """
-    roles_present = set()
+    names = sorted({str(h).strip() for h in hostnames if str(h).strip()})
+    if names:
+        prefix = names[0]
+        for name in names[1:]:
+            while prefix and not name.lower().startswith(prefix.lower()):
+                prefix = prefix[:-1]
+        # Trim dangling numbering ('tan-spine-0' / 'oob-tor-1-' -> family name).
+        prefix = re.sub(r"[\d_-]+$", "", prefix)
+        if len(prefix) >= 3:
+            # Escape only real regex metacharacters: re.escape would emit
+            # '\-' which is an invalid escape inside YAML double quotes.
+            return "^" + re.sub(r"([.^$*+?{}\[\]|()\\])", r"\\\1", prefix)
+    fallback = re.sub(r"[^A-Za-z0-9_-]+", "-", str(role or "").strip()).strip("-")
+    return fallback.lower().replace("_", "-") or "switch"
+
+
+def _family_rank(role, sample_host):
+    """(plane, tier) ordering key: OOB plane on top, then firewalls, then the
+    inband fabric — mirroring how operators lay these out by hand."""
+    text = ("%s %s" % (role or "", sample_host or "")).lower()
+    plane = 0 if re.search(r"oob|mgmt|ipmi", text) else 2
+    if re.search(r"fw|firewall", text):
+        return (1, 0)
+    if "tor" in text:
+        tier = 0 if plane == 0 else 4
+    elif re.search(r"border|brdr|edge|\bbdr\b", text):
+        tier = 1 if plane == 0 else 0
+    elif re.search(r"core|sspine|super", text):
+        tier = 1
+    elif re.search(r"spine|\bsp\b", text):
+        tier = 2
+    elif re.search(r"leaf|\blf\b", text):
+        tier = 3
+    else:
+        tier = 5
+    return (plane, tier)
+
+
+def _family_icon(role, sample_host):
+    text = ("%s %s" % (role or "", sample_host or "")).lower()
+    if re.search(r"fw|firewall", text):
+        return "firewall"
+    if re.search(r"border|brdr|edge|\bbdr\b", text):
+        return "router"
+    return "switch"
+
+
+_TOPO_HEADER = """# topology_config.yaml draft generated by LLDPq Inventory from the IPAM design.
+# Review layers/icons before applying.
+#
+# Topology Generation Mode:
+# - minimal: uses generate_topology.py (faster, basic topology)
+# - full:    uses generate_topology_full.py (comprehensive, detailed topology)
+
+topology: minimal  # [full] or [minimal]
+
+# Pattern matching supports REGEX against the device hostname:
+#   - "spine"           matches any device containing "spine"
+#   - "^spine-"         matches devices starting with "spine-"
+#   - "leaf-[0-9]+$"    matches devices ending with "leaf-" + numbers
+#   - "border|edge"     matches devices containing "border" OR "edge"
+#
+# Icons: switch, router, firewall [EndPoint], server [EndPoint],
+#        host [EndPoint], unknown [EndPoint]
+"""
+
+
+def ipam_to_topology_config_yaml(ipam, p2p=None):
+    """Draft a topology_config.yaml from the design's own device families.
+
+    Every switch role in the IPAM fabric sheet becomes a device_categories
+    entry whose pattern is the anchored common hostname prefix of that family
+    ('^tan-spine'), ordered OOB plane -> firewalls -> inband (border, spine,
+    leaf), with layer gaps left for manual tweaking. Large host families from
+    the P2P design (DGX trays etc.) become a stagger special_rule when their
+    names carry a usable row number.
+    """
+    families = {}
     for record in (ipam.get("fabric") if isinstance(ipam, dict) else []) or []:
-        role = _map_switch_role(record.get("role"), record.get("hostname") or record.get("device"))
-        if role:
-            roles_present.add(role)
+        hostname = str(record.get("hostname") or record.get("device") or "").strip()
+        role = _switch_role(record.get("role"), hostname)
+        if not role or not hostname:
+            continue
+        families.setdefault(role, []).append(hostname)
+
+    lines = [_TOPO_HEADER, "device_categories:", ""]
+    ordered = sorted(
+        families.items(),
+        key=lambda kv: (_family_rank(kv[0], kv[1][0]), kv[0].lower()),
+    )
+    layer = 1
+    seen_patterns = set()
+    if not ordered:
+        # Nothing recognized: still emit a valid, minimal skeleton.
+        for pattern, icon in (("spine", "switch"), ("leaf", "switch")):
+            lines += ['  - pattern: "%s"' % pattern,
+                      "    layer: %d" % layer, '    icon: "%s"' % icon, ""]
+            layer += 2
+    for role, hosts in ordered:
+        pattern = _family_pattern(hosts, role)
+        if pattern in seen_patterns:
+            continue
+        seen_patterns.add(pattern)
+        lines += ["  # %s (%d device%s)" % (role, len(hosts),
+                                            "" if len(hosts) == 1 else "s"),
+                  '  - pattern: "%s"' % pattern,
+                  "    layer: %d" % layer,
+                  '    icon: "%s"' % _family_icon(role, hosts[0]),
+                  ""]
+        layer += 2
+
+    # Host families (DGX trays, servers) from the P2P design: emit a stagger
+    # rule when the names carry a row number the visualizer can alternate on.
+    host_families = {}
     if p2p is not None:
         for link in ai_p2p.expected_links(p2p):
             for dev in (link.get("a_dev"), link.get("b_dev")):
-                role = _map_switch_role("", dev)
-                if role:
-                    roles_present.add(role)
+                dev = str(dev or "").strip()
+                # Whitespace names can never appear in topology.dot/LLDP, so a
+                # rule for them would be dead weight in the config.
+                if not dev or _WS_RE.search(dev):
+                    continue
+                if _map_switch_role("", dev) is not None:
+                    continue
+                fam = re.split(r"[-_]", dev, 1)[0].lower()
+                if len(fam) >= 3:
+                    host_families.setdefault(fam, []).append(dev)
+    stagger = []
+    for fam, members in sorted(host_families.items(),
+                               key=lambda kv: -len(kv[1])):
+        if len(members) < 4:
+            continue
+        two_num = re.compile(r"^%s-\d+-(\d+)" % re.escape(fam), re.IGNORECASE)
+        one_num = re.compile(r"^%s-(\d+)" % re.escape(fam), re.IGNORECASE)
+        for candidate in (two_num, one_num):
+            hits = sum(1 for m in members if candidate.match(m))
+            if hits >= max(4, int(0.8 * len(members))):
+                stagger.append((fam, candidate.pattern))
+                break
+    if stagger:
+        lines += ["# Host rows (staggered bricks in the visualization)",
+                  "special_rules:"]
+        for fam, number_regex in stagger:
+            lines += ['  - pattern: "%s"' % fam,
+                      '    type: "stagger"',
+                      '    number_regex: "%s"' % number_regex.replace("\\", "\\\\"),
+                      "    layer: %d" % layer,
+                      '    icon: "server"',
+                      ""]
+            layer += 2
 
-    lines = [
-        "# topology_config.yaml draft generated by LLDPq Inventory.",
-        "# Review layers/icons before applying.",
-        "",
-        "topology: minimal  # [full] or [minimal]",
-        "",
-        "device_categories:",
-        "",
-    ]
-    ordered = [r for r in _TOPO_ORDER if r in roles_present]
-    if not ordered:
-        # Nothing recognized: still emit a valid, minimal skeleton.
-        ordered = ["spine", "leaf"]
-    for role in ordered:
-        layer, icon = _ROLE_TOPO.get(role, (7, "switch"))
-        lines.append('  - pattern: "%s"' % role)
-        lines.append("    layer: %d" % layer)
-        lines.append('    icon: "%s"' % icon)
-        lines.append("")
-    lines.append("# Default category for unmatched devices")
-    lines.append("default:")
-    lines.append("  layer: 9")
-    lines.append('  icon: "server"')
+    lines += ["# Default category for unmatched devices",
+              "default:",
+              "  layer: %d" % (layer + 2),
+              '  icon: "host"']
     return "\n".join(lines) + "\n"
 
 

@@ -63,6 +63,19 @@ print(term)
     fi
 }
 
+# Exact-key query parameter lookup.  grep substring extraction lets keys
+# overlap (vrf= also matches inside dst_vrf=), so parse the query string with
+# a real parser and keep blank values ("vrf=") distinct from missing keys.
+get_query_param() {
+    printf '%s' "$QUERY_STRING" | python3 -c '
+import sys
+import urllib.parse
+
+params = urllib.parse.parse_qs(sys.stdin.read(), keep_blank_values=True)
+print(params.get(sys.argv[1], [""])[0])
+' "$1" 2>/dev/null
+}
+
 # Search and the collectors must consume one inventory contract.  Calling the
 # canonical parser here keeps type normalization, legacy usernames (for
 # example DOMAIN\user and user+tag), validation and error handling identical.
@@ -143,22 +156,44 @@ get_mac_table() {
     local ssh_output
     ssh_output=$(sudo -u "$LLDPQ_USER" timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o BatchMode=yes "$ssh_target" '
         # Get bridge FDB (MAC table)
-        /usr/sbin/bridge fdb show 2>/dev/null
+        if ! /usr/sbin/bridge fdb show 2>/dev/null; then
+            exit 41
+        fi
+        echo "---BOND_MAP---"
+        # Bond member ports (same "bond:swp1 swp2" format the fabric scan uses)
+        # so live results carry the same Physical Ports data as cached results.
+        for b in /sys/class/net/*/bonding/slaves; do
+            [ -f "$b" ] && echo "$(basename $(dirname $(dirname $b))):$(cat $b)"
+        done 2>/dev/null
+        exit 0
     ' 2>/dev/null)
-    
+
     if [[ $? -ne 0 ]]; then
         echo '{"success": false, "error": "Failed to connect to device"}'
         return
     fi
-    
+
     # Keep SSH output on stdin so device-controlled text is never Python source.
     printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
 import re
 import sys
 
-output = sys.stdin.read()
+raw = sys.stdin.read()
 search = sys.argv[1].lower()
+
+# Split FDB output from the bond membership map appended by the remote script.
+sections = raw.split('---BOND_MAP---', 1)
+output = sections[0]
+bond_members = {}
+if len(sections) > 1:
+    for bond_line in sections[1].strip().split('\n'):
+        if ':' not in bond_line:
+            continue
+        bond_name, members = bond_line.split(':', 1)
+        bond_name = bond_name.strip()
+        if bond_name and members.strip():
+            bond_members[bond_name] = members.strip().split()
 
 entries = []
 parse_candidates = 0
@@ -194,7 +229,9 @@ for line in output.strip().split('\n'):
             "vlan": vlan,
             "type": "dynamic"
         }
-        
+        if iface in bond_members:
+            entry["bond_ports"] = bond_members[iface]
+
         # Apply search filter
         if search:
             if search in mac.lower() or search in iface.lower() or search in vlan.lower():
@@ -256,6 +293,9 @@ get_arp_table() {
             m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null)
             [ -n "$m" ] && echo "$n $m"
         done
+        # The loop above legitimately ends with a failed test when the last
+        # interface has no master; that must not look like an SSH failure.
+        exit 0
     ' 2>/dev/null)
     
     if [[ $? -ne 0 ]]; then
@@ -827,8 +867,11 @@ for line in output.strip().split('\n'):
     
     protocol = route_codes.get(code, code)
     
-    # Skip kernel routes (unreachable, blackhole, etc.) - they are confusing
+    # Skip kernel routes (unreachable, blackhole, etc.) - they are confusing.
+    # Reset last_entry so the skipped route's ECMP continuation lines cannot
+    # inflate the ECMP count of the previous route.
     if protocol == 'kernel':
+        last_entry = None
         continue
     
     last_entry = {
@@ -3384,10 +3427,10 @@ case "$ACTION" in
         find_ip_vrf "$IP"
         ;;
     "trace-path-ip")
-        SOURCE_IP=$(echo "$QUERY_STRING" | grep -oE 'source_ip=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        DEST_IP=$(echo "$QUERY_STRING" | grep -oE 'dest_ip=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        VRF=$(echo "$QUERY_STRING" | grep -oE 'vrf=[^&]+' | head -1 | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        DST_VRF=$(echo "$QUERY_STRING" | grep -oE 'dst_vrf=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+        SOURCE_IP=$(get_query_param source_ip)
+        DEST_IP=$(get_query_param dest_ip)
+        VRF=$(get_query_param vrf)
+        DST_VRF=$(get_query_param dst_vrf)
         trace_path_ip "$SOURCE_IP" "$DEST_IP" "$VRF" "$DST_VRF"
         ;;
     "get-vrfs")

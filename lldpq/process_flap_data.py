@@ -9,6 +9,7 @@ Licensed under MIT License - see LICENSE file for details
 
 import os
 import sys
+import time
 from datetime import datetime
 from link_flap_analyzer import LinkFlapAnalyzer
 from collection_freshness import (
@@ -219,7 +220,41 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     # Algorithm status
     total_problematic = len(summary['critical_ports']) + len(summary['warning_ports'])
     stability_ratio = ((summary['total_ports'] - total_problematic) / summary['total_ports'] * 100) if summary['total_ports'] > 0 else 0
-    
+
+    # Machine-readable dashboard summary. Additive to the HTML report and
+    # carrying the same headline numbers/collection status the report embeds.
+    coverage = summary.get("collection_coverage", {})
+    expected_devices = int(coverage.get("expected_devices", 0) or 0)
+    current_devices = int(coverage.get("current_devices", 0) or 0)
+    if all_devices_unavailable or (expected_devices and current_devices == 0):
+        collection_status = "unavailable"
+    elif expected_devices and current_devices < expected_devices:
+        collection_status = "partial"
+    else:
+        collection_status = "current"
+    flap_analyzer._atomic_json_write(
+        os.path.join(result_dir, "summary", "flap-summary.json"),
+        {
+            "domain": "flap",
+            "generated_at": int(time.time()),
+            "collection_status": collection_status,
+            "coverage_expected": expected_devices,
+            "coverage_current": current_devices,
+            "total_devices": len({
+                port.split(':', 1)[0]
+                for port in flap_analyzer.carrier_transitions_stats
+            }),
+            "total_ports": summary["total_ports"],
+            "stable_ports": len(summary["ok_ports"]),
+            "problematic_ports": total_problematic,
+            "critical_ports": len(summary["critical_ports"]),
+            "warning_ports": len(summary["warning_ports"]),
+            "stability_percent": (
+                round(stability_ratio, 1) if summary["total_ports"] > 0 else None
+            ),
+        },
+    )
+
     coverage_unavailable = bool(expected_hosts and not current_hosts)
     if all_devices_unavailable:
         print("\nNetwork Stability: UNAVAILABLE (no reachable devices)")

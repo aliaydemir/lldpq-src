@@ -17,6 +17,7 @@ import re
 import html
 import statistics
 import tempfile
+import time
 from datetime import datetime, timezone
 from collection_freshness import (
     is_current_collection,
@@ -2157,7 +2158,27 @@ def generate_hardware_html():
     # Write HTML file atomically so a concurrent web reader or a crash mid-write
     # never observes a truncated or empty analysis page.
     _atomic_write("monitor-results/hardware-analysis.html", html_content)
-    
+
+    # Machine-readable dashboard summary. Additive to the HTML report and
+    # carrying the same headline numbers/collection status the report embeds.
+    _atomic_write(
+        "monitor-results/summary/hardware-summary.json",
+        json.dumps({
+            "domain": "hardware",
+            "generated_at": int(time.time()),
+            "collection_status": coverage_status,
+            "coverage_expected": expected_devices,
+            "coverage_current": current_device_count,
+            "coverage_partial": coverage_partial,
+            "total_devices": total_devices,
+            "excellent": len(summary['excellent_devices']),
+            "good": len(summary['good_devices']),
+            "warning": len(summary['warning_devices']),
+            "critical": len(summary['critical_devices']),
+            "unknown": unknown_device_count,
+        }) + "\n",
+    )
+
     print(f"Hardware analysis HTML generated with {total_devices} devices!")
     print(f"   - Excellent: {len(summary['excellent_devices'])}")
     print(f"   - Good: {len(summary['good_devices'])}")

@@ -57,6 +57,8 @@ ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 KIND=$(echo "$QUERY_STRING"   | grep -oP 'kind=\K[^&]*'   | head -1)
 QS_VERSION=$(echo "$QUERY_STRING" | grep -oP 'version=\K[^&]*' | head -1)
 QS_MODE=$(echo "$QUERY_STRING"    | grep -oP 'mode=\K[^&]*'    | head -1)
+QS_SCOPE=$(echo "$QUERY_STRING"   | grep -oP 'scope=\K[^&]*'   | head -1)
+QS_MGMT=$(echo "$QUERY_STRING"    | grep -oP 'mgmt=\K[^&]*'    | head -1)
 
 # Read the raw request body binary-safe (uploads are xlsx). Large/binary bodies
 # overflow the kernel per-string env limit on exec, so always spool to a file.
@@ -73,11 +75,12 @@ fi
 export LLDPQ_DIR LLDPQ_USER WEB_ROOT AI_STATE_DIR INVENTORY_KEEP
 export DIRECT_WRITE_STATE_DIR SETUP_SAFETY AI_GENERATE PARSE_DEVICES TOPOLOGY_EDGES
 export TOPOLOGY_FILE TOPOLOGY_CONFIG_FILE DEVICES_FILE INVENTORY_LOCK
-export ACTION KIND QS_VERSION QS_MODE POST_DATA_FILE CONTENT_TYPE
+export ACTION KIND QS_VERSION QS_MODE QS_SCOPE QS_MGMT POST_DATA_FILE CONTENT_TYPE
 
 python3 << 'PYTHON_END'
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -104,6 +107,8 @@ ACTION = os.environ.get('ACTION', '')
 KIND = os.environ.get('KIND', '')
 QS_VERSION = os.environ.get('QS_VERSION', '')
 QS_MODE = os.environ.get('QS_MODE', '')
+QS_SCOPE = os.environ.get('QS_SCOPE', '')
+QS_MGMT = os.environ.get('QS_MGMT', '')
 POST_DATA_FILE = os.environ.get('POST_DATA_FILE', '')
 
 try:
@@ -448,6 +453,7 @@ def publish_active(kind, wrapper):
     target = os.path.join(MR_DIR, 'active-%s.json' % kind)
     # Prefer a direct atomic write (monitor-results is normally www-data
     # writable); fall back to setup_safety save-text as the lldpq user.
+    tmp = None
     try:
         os.makedirs(MR_DIR, exist_ok=True)
         directory = MR_DIR
@@ -458,8 +464,15 @@ def publish_active(kind, wrapper):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
+        tmp = None
         return True, None
     except (OSError, PermissionError):
+        # Never leak the temp file into the web-served directory.
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         result, err = run_setup_safety(
             ['save-text', '--request-json', '--target', target,
              '--managed-root', WEB_ROOT,
@@ -595,6 +608,37 @@ def action_activate():
        publish_error=perr, summary=wrapper.get('summary', {}))
 
 
+def action_delete():
+    body = read_body_bytes()
+    payload = parse_json_body(body) if body else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    kind = payload.get('kind') or KIND
+    version = payload.get('version') or QS_VERSION
+    if kind not in ('p2p', 'ipam'):
+        fail("kind must be 'p2p' or 'ipam'")
+    if not version or not _VERSION_RE.match(str(version)):
+        fail('invalid version id')
+    directory = kind_dir(kind)
+    active = (load_json(active_pointer_path(kind)) or {}).get('active', '')
+    if version == active:
+        fail('cannot delete the active version; activate another version first')
+    path = os.path.join(directory, version)
+    if not os.path.exists(path):
+        fail('version not found')
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        fail('delete failed: %s' % exc)
+    ok(kind=kind, version=version, versions=list_versions(kind))
+
+
+def action_bootstrap_status():
+    # Feature probe for the optional Bootstrap Advisor. No advisor backend
+    # ships yet; a future backend flips available to reveal the panel.
+    ok(available=False)
+
+
 def action_validate():
     kind = KIND or 'p2p'
     if kind not in ('p2p', 'ipam'):
@@ -613,6 +657,7 @@ def action_validate():
 def validate_ipam(data):
     issues = []
     seen = {}
+    ip_owner = {}
     for record in data.get('fabric', []):
         host = str(record.get('hostname') or record.get('device') or '').strip()
         if not host:
@@ -623,6 +668,23 @@ def validate_ipam(data):
                            'message': 'duplicate fabric record for %s' % host})
         else:
             seen[key] = True
+        mgmt_ip = str(record.get('mgmt_ip') or '').strip()
+        if not mgmt_ip:
+            issues.append({'severity': 'warning', 'kind': 'missing-mgmt-ip',
+                           'message': '%s has no mgmt_ip (record is skipped by the devices.yaml generator)' % host})
+            continue
+        try:
+            ipaddress.ip_address(mgmt_ip)
+        except ValueError:
+            issues.append({'severity': 'error', 'kind': 'invalid-mgmt-ip',
+                           'message': '%s has an invalid mgmt_ip: %s' % (host, mgmt_ip)})
+            continue
+        owner = ip_owner.get(mgmt_ip)
+        if owner and owner.casefold() != key:
+            issues.append({'severity': 'error', 'kind': 'duplicate-mgmt-ip',
+                           'message': 'mgmt_ip %s is assigned to both %s and %s' % (mgmt_ip, owner, host)})
+        else:
+            ip_owner[mgmt_ip] = host
     counts = {
         'subnets': len(data.get('subnets', [])),
         'hosts': len(data.get('hosts', [])),
@@ -669,14 +731,41 @@ def _reverse_display_aliases():
 
 def action_generate_topology():
     mode = QS_MODE or 'preview'
+    # Default mirrors the UI default: the expected topology LLDPq validates is
+    # the Ethernet switch fabric; hosts/IB come in via an explicit scope.
+    scope = QS_SCOPE or 'sw-to-sw'
+    if scope not in ai_generate.TOPOLOGY_SCOPES:
+        fail("scope must be one of: %s" % ", ".join(ai_generate.TOPOLOGY_SCOPES))
+    include_mgmt = QS_MGMT in ('1', 'true', 'yes', 'on')
     data, version = _load_active('p2p')
     device_aliases, port_aliases = _reverse_display_aliases()
+    # The IPAM fabric sheet is the authoritative switch list for the sw-to-sw
+    # scope (storage appliances may name their NICs swp-style and would fool
+    # the port-form fallback heuristic). Optional: absent IPAM design degrades
+    # to the heuristic.
+    switch_names = set()
+    if scope == 'sw-to-sw':
+        try:
+            ipam_wrapper, _ipam_ver = load_version('ipam', '')
+            if ipam_wrapper:
+                switch_names = ai_generate.switch_names_from_ipam(
+                    ipam_wrapper.get('data') or {})
+        except SystemExit:
+            raise
+        except Exception:
+            switch_names = set()
     content = ai_generate.p2p_to_topology_dot(
-        data, device_aliases=device_aliases, port_aliases=port_aliases)
+        data, device_aliases=device_aliases, port_aliases=port_aliases,
+        scope=scope, include_mgmt=include_mgmt,
+        switch_names=switch_names or None)
     token = content_token(content)
-    stats = {'edges': content.count(' -- '), 'source_version': version}
+    stats = {'edges': content.count(' -- '), 'source_version': version,
+             'scope': scope, 'include_mgmt': include_mgmt,
+             'switch_source': ('ipam (%d switches)' % (len(switch_names) // 2)
+                               if switch_names else 'heuristic')}
     if mode == 'preview':
-        ok(preview=content, token=token, target='topology.dot', stats=stats)
+        ok(preview=content, token=token, target='topology.dot', stats=stats,
+           source_version=version)
     if mode != 'apply':
         fail('mode must be preview or apply')
     payload = _apply_request()
@@ -756,6 +845,8 @@ _ACTIONS = {
     'list': action_list,
     'activate': action_activate,
     'active-design': action_active_design,
+    'delete': action_delete,
+    'bootstrap-status': action_bootstrap_status,
     'validate': action_validate,
     'generate-topology': action_generate_topology,
     'generate-devices': action_generate_devices,

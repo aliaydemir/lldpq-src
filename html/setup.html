@@ -188,6 +188,7 @@
                         <input type="password" id="key-pw" placeholder="switch admin password (only needed to push the key)" autocomplete="new-password">
                         <button class="btn secondary" id="verify-btn" onclick="verifyKeys()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Verify (no password)</button>
                         <button class="btn primary" id="key-btn" onclick="distributeKeys()"><svg viewBox="0 0 24 24"><path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/></svg>Distribute to all</button>
+                        <button class="btn secondary" id="key-retry-btn" style="display:none" onclick="retryFailedKeys()" title="Push the key / fix sudo again only on the devices that failed in the last distribution"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Retry failed devices</button>
                     </div>
                     <div class="status info" id="key-progress"></div>
                     <div class="summary" id="key-summary"></div>
@@ -390,6 +391,11 @@
                             </label>
                             <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
                                 <input type="file" id="offline-file" accept=".tar.gz,.tgz,application/gzip,application/x-gzip" style="flex:1; min-width:240px; padding:8px; background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:6px; font-size:13px;">
+                            </div>
+                            <div id="offline-progress" style="display:none; margin-bottom:8px;">
+                                <div style="height:8px; background:#1a1a1a; border:1px solid #404040; border-radius:6px; overflow:hidden;">
+                                    <div id="offline-progress-fill" style="height:100%; width:0%; background:#76b900;"></div>
+                                </div>
                             </div>
                             <div class="p-toolbar">
                                 <button class="btn primary" id="offline-upload-btn" onclick="uploadAndUpdate()"><svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20M13,13V18H10V13H7L12,8L17,13H13Z"/></svg>Upload &amp; update</button>
@@ -621,6 +627,7 @@ let purgeArmed = false;      // two-click guard before deleting update backups
 let keyInfoLoaded = false;   // SSH key panel loaded once
 let keyExists = false;       // a collector key currently exists
 let genArmed = false;        // two-click guard before replacing an existing key
+let keyRetryIps = [];        // IPs that failed the last distribution (drives "Retry failed devices")
 let runActive = false;       // an lldpq run is in progress (drives polling)
 let runLogShown = false;     // run log fetched once on entering the step
 let runPollTimer = null;
@@ -1174,21 +1181,38 @@ async function saveAliases() {
     }
 }
 
+function splitAliasBulkLine(line) {
+    // Split on the FIRST separator only (tab, else comma, else whitespace) and
+    // keep the remainder intact — a limited String.split() would silently drop
+    // everything after the second field and import wrong label/canonical pairs.
+    let sep;
+    if (line.indexOf('\t') >= 0) sep = /\t/;
+    else if (line.indexOf(',') >= 0) sep = /\s*,\s*/;
+    else sep = /\s+/;
+    const m = sep.exec(line);
+    if (!m) return null;
+    const label = line.slice(0, m.index).trim();
+    const real = line.slice(m.index + m[0].length).trim();
+    if (!label || !real) return null;
+    return [real, label];
+}
+
 function importAliasBulk(section) {
     const textId = section === 'devices' ? 'alias-device-bulk' : 'alias-interface-bulk';
     const text = document.getElementById(textId).value;
     const rows = [];
-    try {
-        text.split(/\r?\n/).forEach(function (line) {
-            line = line.trim();
-            if (!line || line.startsWith('#')) return;
-            let parts = line.split('\t');
-            if (parts.length < 2) parts = line.split(/\s*,\s*/, 2);
-            if (parts.length < 2) parts = line.split(/\s+/, 2);
-            if (parts.length < 2 || !parts[0].trim() || !parts[1].trim()) throw new Error('Each bulk line needs a display label and canonical name.');
-            rows.push([parts[1].trim(), parts[0].trim()]);
-        });
-    } catch (e) { setStatus('aliases-status', e.message, 'err'); return; }
+    const malformed = [];
+    text.split(/\r?\n/).forEach(function (line, index) {
+        line = line.trim();
+        if (!line || line.startsWith('#')) return;
+        const pair = splitAliasBulkLine(line);
+        if (pair) rows.push(pair); else malformed.push(index + 1);
+    });
+    if (malformed.length) {
+        const shown = malformed.slice(0, 5).join(', ') + (malformed.length > 5 ? ', …' : '');
+        setStatus('aliases-status', malformed.length + ' malformed bulk line(s) (line ' + shown + ') — each line needs a display label and canonical name. Nothing was imported.', 'err');
+        return;
+    }
     if (!rows.length) { setStatus('aliases-status', 'Paste at least one alias pair first.', 'err'); return; }
     const info = aliasSectionInfo(section);
     const box = document.getElementById(info.container);
@@ -1463,27 +1487,37 @@ function setKeySummary(container, parts) {
     });
 }
 
-async function distributeKeys() {
+function retryFailedKeys() {
+    if (!keyRetryIps.length) { setStatus('key-progress', 'No failed devices from the last distribution.', 'err'); return; }
+    distributeKeys(keyRetryIps.slice());
+}
+
+async function distributeKeys(retryIps) {
     const pw = document.getElementById('key-pw').value;
     const btn = document.getElementById('key-btn');
+    const retryBtn = document.getElementById('key-retry-btn');
+    const retrying = Array.isArray(retryIps) && retryIps.length > 0;
     if (!pw) { setStatus('key-progress', 'Enter the switch admin password first.', 'err'); return; }
     btn.disabled = true;
-    setStatus('key-progress', 'Distributing key & enabling sudo (this can take a while for large fabrics)…', 'info');
+    if (retryBtn) retryBtn.disabled = true;
+    setStatus('key-progress', retrying
+        ? 'Retrying ' + retryIps.length + ' failed device(s)…'
+        : 'Distributing key & enabling sudo (this can take a while for large fabrics)…', 'info');
     document.getElementById('key-results').style.display = 'none';
     document.getElementById('key-summary').style.display = 'none';
     try {
+        const payload = { password: pw };
+        if (retrying) payload.retry_devices = retryIps;
         const r = await fetch('/setup-api.sh', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ password: pw })
+            body: JSON.stringify(payload)
         });
         const data = await r.json().catch(() => ({}));
         if (!data.success) {
             setStatus('key-progress', data.error || 'Distribution failed', 'err');
-            btn.disabled = false;
             return;
         }
-        document.getElementById('key-pw').value = '';
         setResultHeader(['Device', 'IP', 'SSH Key', 'Sudo']);
         const body = document.getElementById('key-results-body');
         body.replaceChildren();
@@ -1506,12 +1540,20 @@ async function distributeKeys() {
             { count:data.sudo_fix_ok || 0, total:total, text:' have passwordless sudo.' }
         ]);
         const allOk = (data.send_key_ok || 0) === total && (data.sudo_fix_ok || 0) === total && total > 0;
-        setStatus('key-progress', allOk ? 'All devices reachable with the collector key and passwordless sudo \u2713' : 'Done — check failed key or sudo rows below.', allOk ? 'ok' : 'info');
+        keyRetryIps = (data.results || [])
+            .filter(x => !((x.send_key === 'ok' || x.send_key === 'already') && x.sudo_fix === 'ok'))
+            .map(x => x.ip).filter(Boolean);
+        if (retryBtn) retryBtn.style.display = keyRetryIps.length ? 'inline-flex' : 'none';
+        // Keep the transient password in the field while failures remain so
+        // "Retry failed devices" can resend it; clear it on full success.
+        if (!keyRetryIps.length) document.getElementById('key-pw').value = '';
+        setStatus('key-progress', allOk ? 'All devices reachable with the collector key and passwordless sudo \u2713' : 'Done — check failed key or sudo rows below, then use \u201cRetry failed devices\u201d.', allOk ? 'ok' : 'info');
         markDone('keys', allOk);
     } catch (e) {
         setStatus('key-progress', 'Distribution failed: ' + e.message, 'err');
     } finally {
         btn.disabled = false;
+        if (retryBtn) retryBtn.disabled = false;
     }
 }
 
@@ -1549,7 +1591,10 @@ async function pollRunLog(epoch = runPollEpoch) {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         const d = await r.json().catch(() => ({}));
         if (epoch !== runPollEpoch) return;
-        if (runJobId && d.job_id !== runJobId) {
+        // A transiently unreadable status can omit the job id for one poll.
+        // Only an explicitly DIFFERENT id means another job really replaced it.
+        if (runJobId && !d.job_id) throw new Error('Run job identity is temporarily unavailable');
+        if (runJobId && d.job_id && d.job_id !== runJobId) {
             runActive = false;
             document.getElementById('run-btn').disabled = !!d.running;
             setStatus('run-status', 'This run\u2019s status was replaced by another job; use Show Log to inspect the current job.', 'info');
@@ -1595,10 +1640,14 @@ async function showRunLog() {
         const d = await r.json().catch(() => ({}));
         if (epoch !== runPollEpoch) return;
         if (!d.success) throw new Error(d.error || 'Run log is temporarily unavailable');
-        if (d.log || d.done || d.running || d.job_id || d.pid_recorded) {
+        // An update replaces the LLDPq tree (and .run.log) but the last-job id
+        // survives in the service state dir. A bare job id with no log, no
+        // completion and no PID is not evidence of an interrupted run, so it
+        // must not trigger the "interrupted" error or blank the log pane.
+        if (d.log || d.done || d.running || d.pid_recorded) {
             runJobId = d.job_id || null;
             const out = document.getElementById('run-output');
-            out.textContent = d.log; out.scrollTop = out.scrollHeight;
+            out.textContent = d.log || '(no output yet)'; out.scrollTop = out.scrollHeight;
             runActive = !d.done && !!d.running;
             document.getElementById('run-btn').disabled = runActive;
             if (!d.done && d.running) {
@@ -1714,6 +1763,31 @@ async function updateLLDPq() {
     }
 }
 
+function uploadOfflinePackage(file, onProgress) {
+    // fetch() cannot report request-body progress; XMLHttpRequest can. Only
+    // the transport of the upload changes — the post-upload flow is identical.
+    return new Promise(function (resolve, reject) {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/setup-api.sh?action=upload-src');
+        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        xhr.upload.onprogress = function (e) {
+            if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+        };
+        xhr.onload = function () {
+            if (xhr.status < 200 || xhr.status >= 300) {
+                reject(new Error('HTTP ' + xhr.status + (xhr.status === 413 ? ' \u2014 file exceeds the server upload limit' : '')));
+                return;
+            }
+            let d = {};
+            try { d = JSON.parse(xhr.responseText || '{}'); } catch (parseError) {}
+            resolve(d);
+        };
+        xhr.onerror = function () { reject(new Error('network error')); };
+        xhr.onabort = function () { reject(new Error('upload aborted')); };
+        xhr.send(file);
+    });
+}
+
 async function uploadAndUpdate() {
     const fi = document.getElementById('offline-file');
     const file = fi && fi.files && fi.files[0];
@@ -1726,20 +1800,29 @@ async function uploadAndUpdate() {
     setUpdateButtons(true);
     updateActive = true;
     const mb = Math.max(1, Math.round(file.size / 1048576));
-    setStatus('update-status', 'Uploading ' + file.name + ' (~' + mb + ' MB)\u2026', 'info');
+    const progWrap = document.getElementById('offline-progress');
+    const progFill = document.getElementById('offline-progress-fill');
+    if (progFill) progFill.style.width = '0%';
+    if (progWrap) progWrap.style.display = 'block';
+    setStatus('update-status', 'Uploading ' + file.name + ' (~' + mb + ' MB)\u2026 0%', 'info');
     document.getElementById('update-output').textContent = 'Uploading\u2026\n';
     let path;
     try {
-        const up = await fetch('/setup-api.sh?action=upload-src', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
-        if (!up.ok) throw new Error('HTTP ' + up.status + (up.status === 413 ? ' \u2014 file exceeds the server upload limit' : ''));
-        const ud = await up.json().catch(() => ({}));
+        const ud = await uploadOfflinePackage(file, function (loaded, total) {
+            if (epoch !== updatePollEpoch) return;
+            const pct = total ? Math.min(100, Math.round(loaded * 100 / total)) : 0;
+            if (progFill) progFill.style.width = pct + '%';
+            setStatus('update-status', 'Uploading ' + file.name + ' (~' + mb + ' MB)\u2026 ' + pct + '%', 'info');
+        });
         if (epoch !== updatePollEpoch) return;
-        if (!ud.success) { setStatus('update-status', ud.error || 'Upload failed', 'err'); setUpdateButtons(false); updateActive = false; return; }
+        if (!ud.success) { if (progWrap) progWrap.style.display = 'none'; setStatus('update-status', ud.error || 'Upload failed', 'err'); setUpdateButtons(false); updateActive = false; return; }
         path = ud.path;
     } catch (e) {
         if (epoch !== updatePollEpoch) return;
+        if (progWrap) progWrap.style.display = 'none';
         setStatus('update-status', 'Upload failed: ' + e.message, 'err'); setUpdateButtons(false); updateActive = false; return;
     }
+    if (progWrap) progWrap.style.display = 'none';
     // Uploaded to the host — now run the offline update from the uploaded file.
     setStatus('update-status', 'Uploaded \u2713 \u2014 starting offline update\u2026', 'info');
     document.getElementById('update-output').textContent = 'Starting\u2026\n';
@@ -2213,7 +2296,7 @@ function invalidateSetupCachesAfterRestore(){
     aliasesLoadSeq++; aliasesOpSeq++; aliasesLoaded=false; aliasesDirty=false; aliasesRevision=null;
     notifLoadSeq++; notifOpSeq++; notifLoaded=false; notifDirty=false; notificationsReady=false; notifRevision=null;
     ansibleLoadSeq++; ansibleOpSeq++; ansibleLoaded=false; ansibleDirty=false; ansibleBusy=false;
-    keyInfoLoaded=false; schedLoaded=false; parallelLoaded=false; maintLoaded=false;
+    keyInfoLoaded=false; hostnameLoaded=false; schedLoaded=false; parallelLoaded=false; maintLoaded=false;
     publishAliasUpdate(null);
 }
 

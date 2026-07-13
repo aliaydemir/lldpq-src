@@ -1644,6 +1644,33 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__DEVICES__", json.dumps(sorted(all_devices)))
         _atomic_write(output_file, html_doc)
 
+        # Machine-readable dashboard summary. Additive to the HTML report and
+        # carrying the same headline numbers/collection status it embeds in the
+        # data-analysis-summary machine div.
+        summary_path = os.path.join(
+            os.path.dirname(os.path.abspath(output_file)),
+            "summary", "duplicate-summary.json",
+        )
+        _atomic_write(summary_path, json.dumps({
+            "domain": "duplicate",
+            "generated_at": int(time.time()),
+            "collection_status": collection_status,
+            "confirmed_ip_active": s["confirmed_ip_active"],
+            "ip_quiesced": s["ip_quiesced"],
+            "ip_arp_observed": s["ip_arp_observed"],
+            "confirmed_mac_total": s["confirmed_mac_total"],
+            "mac_dad_total": s["mac_dad_total"],
+            "mac_mobility_active": s["mac_mobility_active"],
+            "mac_mobility_total": s["mac_mobility_total"],
+            "coverage_expected": s["coverage_expected"],
+            "coverage_current": s["coverage_current"],
+            "coverage_ip_current": s["coverage_ip_current"],
+            "coverage_mac_current": s["coverage_mac_current"],
+            "coverage_mac_evidence_current": s["coverage_mac_evidence_current"],
+            "coverage_failures": s["coverage_failures"],
+            "coverage_partial": bool(s["coverage_partial"]),
+        }) + "\n")
+
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
