@@ -79,6 +79,10 @@ def _atomic_write(path, content):
         prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=directory
     )
     try:
+        # Web-served output: nginx must always retain read access, so lift
+        # mkstemp's private 0600 (and any inherited restrictive mode).
+        mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else 0o664
+        os.fchmod(fd, mode | 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()

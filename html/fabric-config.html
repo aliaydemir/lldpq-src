@@ -3590,17 +3590,17 @@
                     const result = await response.json();
                     
                     if (result.success) {
-                        // Assign to current device
-                        const createdVlans = result.created_vlans || [];
-                        
+                        // Assign to current device (vlan_templates expects profile names, not VLAN IDs)
+                        const createdProfiles = result.created_profiles || [profileName];
+
                         let assignedCount = 0;
-                        if (selectedDevice && createdVlans.length > 0) {
+                        if (selectedDevice && createdProfiles.length > 0) {
                             createBtn.textContent = 'Assigning to device...';
                             try {
                                 const assignResp = await fetch('/fabric-api.sh?action=assign-vlans', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ device: selectedDevice, vlans: createdVlans })
+                                    body: JSON.stringify({ device: selectedDevice, vlans: createdProfiles })
                                 });
                                 const assignResult = await assignResp.json();
                                 if (assignResult.success) assignedCount = 1;

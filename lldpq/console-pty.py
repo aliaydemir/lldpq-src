@@ -900,6 +900,7 @@ async def handle(reader, writer):
         target = (query.get("target") or [""])[0]
         log_target = _sanitize_log(target, 128)
         sid = (query.get("sid") or [""])[0]
+        kill_only = (query.get("kill") or [""])[0] == "1"
         if not _SID_RE.fullmatch(sid):
             await http_reject("400 Bad Request", "invalid session id")
             return
@@ -940,6 +941,14 @@ async def handle(reader, writer):
                 await http_reject("409 Conflict", "Console session target does not match")
                 return
         else:
+            if kill_only:
+                # Teardown-only attach for a session that no longer exists.
+                # There is nothing to kill, so never spawn a new SSH login
+                # just to deliver the queued {t:'end'}.
+                audit("KILL-NOOP ip=%s user=%s target=%s sid=%s (no such session)" %
+                      (peer_ip, user, log_target, sid[:8]))
+                await http_reject("410 Gone", "no such session")
+                return
             label, argv = resolve_target(target)
             if not argv:
                 audit("DENY ip=%s user=%s target=%s (unknown target)" % (peer_ip, user, log_target))

@@ -432,7 +432,8 @@ def main():
                 report_mode = stat.S_IMODE(os.stat(output_file_path).st_mode)
             except FileNotFoundError:
                 report_mode = 0o664
-            os.fchmod(output_file.fileno(), report_mode)
+            # Web-served output: nginx must always retain read access.
+            os.fchmod(output_file.fileno(), report_mode | 0o644)
             write_results_report(output_file, results, date_str)
             output_file.flush()
             os.fsync(output_file.fileno())

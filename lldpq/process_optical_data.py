@@ -11,6 +11,8 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
 from optical_analyzer import OpticalAnalyzer, _atomic_write
 from collection_freshness import (
@@ -110,6 +112,218 @@ def describe_optical_collection_failure(reason, interface=None):
         return f'Bounded optical diagnostics are unavailable for {interface}'
     return 'Optical diagnostics collection was incomplete'
 
+# Per-process analyzer for parse workers: thresholds and parsing logic only,
+# without the multi-megabyte history the parent keeps.
+_parse_worker_analyzer = None
+
+
+def _init_optical_parse_worker(result_dir):
+    global _parse_worker_analyzer
+    _parse_worker_analyzer = OpticalAnalyzer(result_dir, load_history=False)
+
+
+def _classify_optical_file(filepath, hostname):
+    """Parse one device's optical file and return merge operations.
+
+    Runs in a worker process.  Decisions that need the parent's optical
+    history (unplugged detection) are deferred as 'maybe_unplugged' ops so
+    the parent resolves them during the merge.
+    """
+    port_data, file_failures = read_optical_diagnostics_file(filepath)
+    failed_interfaces = {
+        interface for _reason, interface in file_failures if interface
+    }
+    analyzer = _parse_worker_analyzer
+    ops = []
+
+    def updated_entries(port_name):
+        stats_entry = analyzer.current_optical_stats.get(port_name)
+        history = analyzer.optical_history.get(port_name)
+        return stats_entry, (history[-1] if history else None)
+
+    for interface, optical_data in port_data.items():
+        port_name = f"{hostname}:{interface}"
+
+        if interface in failed_interfaces:
+            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            continue
+
+        # Skip non-optical interfaces (management, virtual interfaces)
+        if any(skip_iface in interface.lower() for skip_iface in ['eth0', 'lo', 'bond', 'mgmt', 'vlan']):
+            continue
+
+        # Empty interface sections do not prove that an optical module
+        # exists, so they must not become monitored optical ports.
+        if not optical_data or len(optical_data.strip()) < 10:
+            continue
+
+        # The collector emits these markers for ordinary empty cages,
+        # down ports and interfaces without readable module EEPROM.
+        # Device-level collection coverage is tracked separately; an
+        # absent DOM sample is not an optical fault or a monitored port.
+        if (NO_TRANSCEIVER_DATA_RE.search(optical_data) or
+            ("diagnostics-status          : N/A" in optical_data and
+             "temperature" not in optical_data and "voltage" not in optical_data and
+             "rx-power" not in optical_data and "tx-power" not in optical_data)):
+            # ethtool reports an empty cage as a down interface with
+            # no transceiver data.  A port with previous optical
+            # readings that now reads empty is an unplugged module,
+            # not a never-populated cage.  Previous readings live in
+            # the parent's history, so the decision is deferred.
+            if (NO_TRANSCEIVER_DATA_RE.search(optical_data) and
+                    re.search(r'^\s*Interface\s+state\s*:\s*down\b',
+                              optical_data,
+                              re.IGNORECASE | re.MULTILINE)):
+                ops.append(('maybe_unplugged', port_name, optical_data[:500]))
+            continue
+
+        # DAC/Copper cables do not provide optical diagnostics.  Keep
+        # this check before interface-state handling so a down DAC is
+        # not reclassified as a failed optical link.  Vendor identity
+        # lines (SN/PN/date code) may coincidentally contain 'DAC', so
+        # classify from descriptor lines only.
+        if any(indicator in line
+               for line in optical_data.split('\n')
+               if not re.match(r'\s*(?:vendor|serial|date)',
+                               line, re.IGNORECASE)
+               for indicator in [
+                   'Passive copper', 'Active copper', 'Copper cable',
+                   'Base-CR', 'DAC', 'Twinax', 'No separable connector'
+               ]):
+            continue
+
+        # Check for unplugged ports - add as "unplugged" status for troubleshooting
+        if re.search(r'^\s*status\s*:\s*unplugged\b', optical_data,
+                     re.IGNORECASE | re.MULTILINE):
+            ops.append(('state', port_name, 'unplugged', optical_data[:500]))
+            continue
+
+        state_match = re.search(
+            r'^\s*Interface\s+state\s*:\s*([^\s]+)',
+            optical_data,
+            re.IGNORECASE | re.MULTILINE,
+        )
+        interface_state = (
+            state_match.group(1).strip().lower()
+            if state_match else None
+        )
+        if interface_state in {'down', 'lowerlayerdown', 'dormant'}:
+            # Preserve a DOWN row only when real DOM values remain
+            # readable.  The no-data and DAC cases were excluded above.
+            parsed = analyzer.parse_optical_data(optical_data)
+            usable_dom = parsed is not None and any(
+                parsed.get(metric) is not None for metric in (
+                    'rx_power_dbm', 'tx_power_dbm', 'temperature_c',
+                    'voltage_v', 'bias_current_ma'
+                )
+            )
+            if not usable_dom:
+                continue
+            if analyzer.update_optical_stats(port_name, optical_data):
+                stats_entry, history_entry = updated_entries(port_name)
+                if stats_entry:
+                    stats_entry['health_status'] = 'down'
+                if history_entry:
+                    history_entry['health'] = 'down'
+                ops.append(('update', port_name, stats_entry, history_entry))
+            continue
+        if interface_state == 'unknown':
+            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            continue
+
+        # Check for ports with no meaningful optical readings (N/A values, temp 0.0, etc.)
+        if (("temperature                 : 0.0" in optical_data or
+             "temperature                 : 0.00" in optical_data) and
+            ("voltage                     : 0.0" in optical_data or
+             "voltage                     : 0.00" in optical_data)):
+            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            continue
+
+        # Update optical analyzer
+        if analyzer.update_optical_stats(port_name, optical_data):
+            ops.append(('update', port_name, *updated_entries(port_name)))
+
+    # A well-formed timeout marker normally sits inside its interface
+    # block.  Retain visibility even if a future collector emits the
+    # marker without that block.
+    for reason, interface in file_failures:
+        if interface and interface not in port_data:
+            ops.append((
+                'state', f"{hostname}:{interface}", 'unknown',
+                describe_optical_collection_failure(reason, interface),
+            ))
+
+    return ops, file_failures
+
+
+def _merge_optical_ops(analyzer, hostname, ops):
+    """Apply one file's worker ops to the parent analyzer state."""
+    for op in ops:
+        kind = op[0]
+        if kind == 'state':
+            _kind, port_name, health, snippet = op
+            record_optical_state(analyzer, port_name, hostname, health, snippet)
+        elif kind == 'maybe_unplugged':
+            _kind, port_name, snippet = op
+            if port_name in analyzer.optical_history:
+                record_optical_state(
+                    analyzer, port_name, hostname, 'unplugged', snippet
+                )
+        elif kind == 'update':
+            _kind, port_name, stats_entry, history_entry = op
+            if stats_entry:
+                analyzer.current_optical_stats[port_name] = stats_entry
+            if history_entry:
+                history = analyzer.optical_history.setdefault(port_name, [])
+                history.append(history_entry)
+                # Keep last 100 entries, matching update_optical_stats
+                if len(history) > 100:
+                    analyzer.optical_history[port_name] = history[-100:]
+
+
+def _optical_parse_worker_limit(task_count):
+    raw = os.environ.get("OPTICAL_PARSE_MAX_PARALLEL", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        value = min(8, os.cpu_count() or 2)
+    return max(1, min(value, task_count))
+
+
+def _classify_optical_files(result_dir, tasks):
+    """Yield (hostname, ops, file_failures) per file, parallel when possible."""
+    completed = 0
+    workers = _optical_parse_worker_limit(len(tasks))
+    if workers > 1:
+        try:
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_optical_parse_worker,
+                initargs=(result_dir,),
+            ) as executor:
+                futures = [
+                    (hostname,
+                     executor.submit(_classify_optical_file, filepath, hostname))
+                    for filepath, hostname in tasks
+                ]
+                for hostname, future in futures:
+                    ops, file_failures = future.result()
+                    yield hostname, ops, file_failures
+                    completed += 1
+                return
+        except (OSError, PermissionError, BrokenProcessPool):
+            # Constrained containers can deny multiprocessing primitives.
+            # Fall back to the same complete parse for the remaining files,
+            # never to a skipped device.
+            pass
+    _init_optical_parse_worker(result_dir)
+    for filepath, hostname in tasks[completed:]:
+        ops, file_failures = _classify_optical_file(filepath, hostname)
+        yield hostname, ops, file_failures
+
+
 def process_optical_data_files(data_dir="monitor-results/optical-data"):
     """Process optical data files and update optical analyzer"""
     data_dir = os.path.abspath(data_dir)
@@ -186,167 +400,29 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     if not files and not all_devices_unavailable:
         print("⚠ No current optical collection files found; publishing partial coverage")
 
-    # Process all optical diagnostic files
+    # Process all optical diagnostic files.  The regex-heavy classification
+    # fans out to worker processes; history-dependent decisions and all state
+    # mutation happen here, in submission order.
     total_processed = 0
     failed_collection_hosts = set()
     collection_failures = {}
-    for filename in files:
-        if filename.endswith("_optical.txt"):
-            hostname = filename.replace("_optical.txt", "")
-            filepath = os.path.join(data_dir, filename)
-
-
-            # Category-local collector failures remain in this file so the
-            # optical report can expose incomplete coverage without invalidating
-            # BGP, BER, PFC, hardware, logs, or other complete categories.
-            port_data, file_failures = read_optical_diagnostics_file(filepath)
-            failed_interfaces = {
-                interface for _reason, interface in file_failures if interface
-            }
-            if file_failures:
-                failed_collection_hosts.add(hostname)
-                collection_failures[hostname] = [
-                    describe_optical_collection_failure(reason, interface)
-                    for reason, interface in file_failures
-                ]
-            total_processed += 1
-
-            for interface, optical_data in port_data.items():
-                port_name = f"{hostname}:{interface}"
-
-                if interface in failed_interfaces:
-                    record_optical_state(
-                        optical_analyzer, port_name, hostname, 'unknown', optical_data
-                    )
-                    continue
-
-                # Skip non-optical interfaces (management, virtual interfaces)
-                if any(skip_iface in interface.lower() for skip_iface in ['eth0', 'lo', 'bond', 'mgmt', 'vlan']):
-                    continue
-
-                # Empty interface sections do not prove that an optical module
-                # exists, so they must not become monitored optical ports.
-                if not optical_data or len(optical_data.strip()) < 10:
-                    continue
-
-                # The collector emits these markers for ordinary empty cages,
-                # down ports and interfaces without readable module EEPROM.
-                # Device-level collection coverage is tracked separately; an
-                # absent DOM sample is not an optical fault or a monitored port.
-                if (NO_TRANSCEIVER_DATA_RE.search(optical_data) or
-                    ("diagnostics-status          : N/A" in optical_data and
-                     "temperature" not in optical_data and "voltage" not in optical_data and
-                     "rx-power" not in optical_data and "tx-power" not in optical_data)):
-                    # ethtool reports an empty cage as a down interface with
-                    # no transceiver data.  A port with previous optical
-                    # readings that now reads empty is an unplugged module,
-                    # not a never-populated cage.
-                    if (NO_TRANSCEIVER_DATA_RE.search(optical_data) and
-                            port_name in optical_analyzer.optical_history and
-                            re.search(r'^\s*Interface\s+state\s*:\s*down\b',
-                                      optical_data,
-                                      re.IGNORECASE | re.MULTILINE)):
-                        record_optical_state(
-                            optical_analyzer, port_name, hostname,
-                            'unplugged', optical_data
-                        )
-                    continue
-
-                # DAC/Copper cables do not provide optical diagnostics.  Keep
-                # this check before interface-state handling so a down DAC is
-                # not reclassified as a failed optical link.  Vendor identity
-                # lines (SN/PN/date code) may coincidentally contain 'DAC', so
-                # classify from descriptor lines only.
-                if any(indicator in line
-                       for line in optical_data.split('\n')
-                       if not re.match(r'\s*(?:vendor|serial|date)',
-                                       line, re.IGNORECASE)
-                       for indicator in [
-                           'Passive copper', 'Active copper', 'Copper cable',
-                           'Base-CR', 'DAC', 'Twinax', 'No separable connector'
-                       ]):
-                    continue
-
-                # Check for unplugged ports - add as "unplugged" status for troubleshooting
-                if re.search(r'^\s*status\s*:\s*unplugged\b', optical_data,
-                             re.IGNORECASE | re.MULTILINE):
-                    record_optical_state(
-                        optical_analyzer, port_name, hostname, 'unplugged', optical_data
-                    )
-                    continue
-
-                state_match = re.search(
-                    r'^\s*Interface\s+state\s*:\s*([^\s]+)',
-                    optical_data,
-                    re.IGNORECASE | re.MULTILINE,
-                )
-                interface_state = (
-                    state_match.group(1).strip().lower()
-                    if state_match else None
-                )
-                if interface_state in {'down', 'lowerlayerdown', 'dormant'}:
-                    # Preserve a DOWN row only when real DOM values remain
-                    # readable.  The no-data and DAC cases were excluded above.
-                    parsed = optical_analyzer.parse_optical_data(optical_data)
-                    usable_dom = parsed is not None and any(
-                        parsed.get(metric) is not None for metric in (
-                            'rx_power_dbm', 'tx_power_dbm', 'temperature_c',
-                            'voltage_v', 'bias_current_ma'
-                        )
-                    )
-                    if not usable_dom:
-                        continue
-                    if optical_analyzer.update_optical_stats(port_name, optical_data):
-                        current = optical_analyzer.current_optical_stats.get(port_name)
-                        if current:
-                            current['health_status'] = 'down'
-                        history = optical_analyzer.optical_history.get(port_name, [])
-                        if history:
-                            history[-1]['health'] = 'down'
-                    continue
-                if interface_state == 'unknown':
-                    record_optical_state(
-                        optical_analyzer, port_name, hostname, 'unknown', optical_data
-                    )
-                    continue
-
-                # Check for ports with no meaningful optical readings (N/A values, temp 0.0, etc.)
-                if (("temperature                 : 0.0" in optical_data or 
-                     "temperature                 : 0.00" in optical_data) and
-                    ("voltage                     : 0.0" in optical_data or
-                     "voltage                     : 0.00" in optical_data)):
-                    record_optical_state(
-                        optical_analyzer, port_name, hostname, 'unknown', optical_data
-                    )
-                    continue
-
-                # Update optical analyzer
-                optical_analyzer.update_optical_stats(port_name, optical_data)
-
-                # Show results
-                if port_name in optical_analyzer.current_optical_stats:
-                    current_optical = optical_analyzer.current_optical_stats[port_name]
-                    health = current_optical['health_status']
-                    rx_power = current_optical.get('rx_power_dbm')
-                    temperature = current_optical.get('temperature_c')
-                    voltage = current_optical.get('voltage_v')
-
-                    rx_power_str = f"{rx_power:.2f} dBm" if rx_power is not None else "N/A"
-                    temp_str = f"{temperature:.1f}°C" if temperature is not None else "N/A"
-                    voltage_str = f"{voltage:.2f}V" if voltage is not None else "N/A"
-                    # Per-interface logging removed for performance
-                else:
-                    pass  # No optical parameters detected
-
-            # A well-formed timeout marker normally sits inside its interface
-            # block.  Retain visibility even if a future collector emits the
-            # marker without that block.
-            for reason, interface in file_failures:
-                if interface and interface not in port_data:
-                    record_optical_state(
-                        optical_analyzer, f"{hostname}:{interface}", hostname,
-                        'unknown', describe_optical_collection_failure(reason, interface),
-                    )
+    tasks = [
+        (os.path.join(data_dir, filename),
+         filename.removesuffix("_optical.txt"))
+        for filename in files
+    ]
+    for hostname, ops, file_failures in _classify_optical_files(result_dir, tasks):
+        # Category-local collector failures remain per file so the optical
+        # report can expose incomplete coverage without invalidating BGP,
+        # BER, PFC, hardware, logs, or other complete categories.
+        if file_failures:
+            failed_collection_hosts.add(hostname)
+            collection_failures[hostname] = [
+                describe_optical_collection_failure(reason, interface)
+                for reason, interface in file_failures
+            ]
+        total_processed += 1
+        _merge_optical_ops(optical_analyzer, hostname, ops)
 
     print(f"\nProcessed {total_processed} files total")
     finish_phase("parse_records")

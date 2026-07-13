@@ -891,34 +891,40 @@
             document.getElementById('bfd-enabled').textContent = `${bfdCount}/${allPeers.length}`;
         }
         
+        function repopulateSelect(select, values) {
+            // Clear dynamic options (keep static first option), preserve selection if still valid
+            const previous = select.value;
+            const firstOption = select.options.length ? select.options[0].outerHTML : '';
+            let html = firstOption;
+            values.forEach(v => {
+                html += `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`;
+            });
+            select.innerHTML = html;
+            if (previous && values.includes(previous)) {
+                select.value = previous;
+            }
+        }
+
         function populateFilters() {
             // Devices
             const deviceSelect = document.getElementById('filter-device');
             const uniqueDevices = [...new Set(allPeers.map(p => p.device))].sort();
-            uniqueDevices.forEach(d => {
-                deviceSelect.innerHTML += `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`;
-            });
+            repopulateSelect(deviceSelect, uniqueDevices);
 
             // VRFs
             const vrfSelect = document.getElementById('filter-vrf');
             const uniqueVrfs = [...new Set(allPeers.map(p => p.vrf))].sort();
-            uniqueVrfs.forEach(v => {
-                vrfSelect.innerHTML += `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`;
-            });
+            repopulateSelect(vrfSelect, uniqueVrfs);
 
             // Profiles
             const profileSelect = document.getElementById('filter-profile');
             const uniqueProfiles = [...new Set(allPeers.map(p => p.bgp_profile))].sort();
-            uniqueProfiles.forEach(p => {
-                profileSelect.innerHTML += `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`;
-            });
+            repopulateSelect(profileSelect, uniqueProfiles);
 
             // Add device dropdown
             const addDeviceSelect = document.getElementById('add-device');
-            allDevices.forEach(d => {
-                const hostname = d.hostname || d;
-                addDeviceSelect.innerHTML += `<option value="${escapeHtml(hostname)}">${escapeHtml(hostname)}</option>`;
-            });
+            const deviceNames = allDevices.map(d => d.hostname || d);
+            repopulateSelect(addDeviceSelect, deviceNames);
         }
         
         function applyFilters() {

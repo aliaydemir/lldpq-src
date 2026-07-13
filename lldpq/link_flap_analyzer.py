@@ -221,7 +221,8 @@ class LinkFlapAnalyzer:
         )
         try:
             mode = stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o664
-            os.fchmod(descriptor, mode)
+            # Web-served output: nginx must always retain read access.
+            os.fchmod(descriptor, mode | 0o644)
             if metadata is not None:
                 os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -263,7 +264,8 @@ class LinkFlapAnalyzer:
         )
         try:
             mode = stat.S_IMODE(metadata.st_mode) if metadata is not None else 0o664
-            os.fchmod(descriptor, mode)
+            # Web-served output: nginx must always retain read access.
+            os.fchmod(descriptor, mode | 0o644)
             if metadata is not None:
                 try:
                     os.fchown(descriptor, metadata.st_uid, metadata.st_gid)

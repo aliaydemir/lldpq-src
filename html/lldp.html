@@ -1927,11 +1927,16 @@
         // page reload.
         function reloadLLDPReportInPlace() {
             const preservedDevices = selectedDevices.slice();
+            lldpReportReloadRetryPending = false;
             p2pDesignStatus = 'loading';
             xcvrInvStatus = 'loading';
             return Promise.all([loadLLDPData(), loadP2pDesign(), loadTransceiverInventory()])
                 .then(() => {
                     if (document.getElementById('error').style.display === 'block') {
+                        // The job itself succeeded; only the report fetch
+                        // failed. Retry must re-fetch the published report,
+                        // never queue a new fleet-wide collection.
+                        lldpReportReloadRetryPending = true;
                         setLLDPButton('failure', true);
                         updateLLDPNotification('failure', 'LLDP Report Could Not Be Loaded',
                             'The check finished but the new report could not be loaded.',
@@ -1966,6 +1971,9 @@
         let lldpPollGeneration = 0;
         let lldpPollTimer = null;
         let lldpStatusNotification = null;
+        // Set when the LLDP job finished but the new report failed to load;
+        // the Retry button then reloads the report instead of starting a job.
+        let lldpReportReloadRetryPending = false;
 
         function setStoredLLDPToken(token) {
             try {
@@ -2230,6 +2238,17 @@
         }
 
         async function runLLDPCheck() {
+            if (lldpReportReloadRetryPending) {
+                // The last check already completed; re-fetch the published
+                // report instead of queueing a whole new collection.
+                lldpReportReloadRetryPending = false;
+                setLLDPButton('running', false);
+                updateLLDPNotification('running', 'Reloading LLDP Report',
+                    'Re-fetching the published report...',
+                    'No new LLDP check was started.');
+                reloadLLDPReportInPlace();
+                return;
+            }
             // Cancel/ignore all callbacks associated with an older token.
             lldpPollGeneration += 1;
             activeLLDPJobToken = null;

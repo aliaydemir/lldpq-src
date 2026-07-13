@@ -308,7 +308,8 @@ def mark_html_collection_unavailable(output_file: str) -> None:
             handle.write(updated)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, path.stat().st_mode & 0o7777)
+        # Web-served output: nginx must always retain read access.
+        os.chmod(temporary, (path.stat().st_mode & 0o7777) | 0o644)
         os.replace(temporary, path)
     except Exception:
         try:

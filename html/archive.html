@@ -431,19 +431,23 @@
             const fragment = document.createDocumentFragment();
             const lines = results.split('\n');
             lines.forEach(line => {
+                // Column-aware coloring: banners/headers keep their color and
+                // data rows are matched on the Status field (column 2), so a
+                // hostname containing 'Fail'/'Pass' can never repaint a row.
                 let colorClass = 'lime';
-                if (line.startsWith('====')) {
+                if (line.startsWith('===') || line.startsWith('Created on')) {
                     colorClass = 'steelBlue';
-                } else if (line.toLowerCase().includes('fail')) {
-                    colorClass = 'tomato';
-                } else if (line.toLowerCase().includes('created') || line.toLowerCase().includes('reated')) {
-                    colorClass = 'steelBlue';
-                } else if (line.toLowerCase().includes('no-info')) {
-                    colorClass = 'red';
-                } else if (line.toLowerCase().includes('pass')) {
-                    colorClass = 'green';
+                } else {
+                    const status = line.trim().split(/\s+/)[1] || '';
+                    if (status === 'Fail') {
+                        colorClass = 'tomato';
+                    } else if (status === 'No-Info') {
+                        colorClass = 'red';
+                    } else if (status === 'Pass') {
+                        colorClass = 'green';
+                    }
                 }
-                
+
                 const span = document.createElement('span');
                 span.className = colorClass;
                 span.textContent = line;
@@ -501,16 +505,12 @@
             }, 5000);
         }
 
-        window.onload = function() {
+        window.onload = async function() {
+            const ok = await LLDPqAuth.check();
+            if (!ok) return;
             setLastUpdated();
             listFiles();
         };
-    </script>
-
-    <script>
-        (async function() {
-            await LLDPqAuth.check();
-        })();
     </script>
 </body>
 </html>

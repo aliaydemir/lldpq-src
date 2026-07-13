@@ -783,6 +783,10 @@
                     <div class="card-value status-critical" id="ber-critical">0</div>
                     <div class="card-label">Critical</div>
                 </div>
+                <div class="summary-card" style="border-left-color:#9e9e9e;" onclick="window.location.href='monitor-results/ber-analysis.html'">
+                    <div class="card-value" style="color:#9e9e9e;" id="ber-unknown">0</div>
+                    <div class="card-label">Unknown</div>
+                </div>
             </div>
             </div>
         </div>
@@ -1647,21 +1651,27 @@
                 summaryData.totalDevices = number(payload.total_devices);
             } else if (dataType === 'ber') {
                 summaryData.totalPorts = number(payload.total_ports);
-                summaryData.excellent = number(payload.excellent) || 0;
-                summaryData.good = number(payload.good) || 0;
-                summaryData.warning = number(payload.warning) || 0;
-                summaryData.critical = number(payload.critical) || 0;
-                summaryData.unknown = number(payload.unknown) || 0;
+                summaryData.excellent = number(payload.excellent);
+                summaryData.good = number(payload.good);
+                summaryData.warning = number(payload.warning);
+                summaryData.critical = number(payload.critical);
+                summaryData.unknown = number(payload.unknown);
+                const berCategories = [
+                    summaryData.excellent, summaryData.good,
+                    summaryData.warning, summaryData.critical,
+                    summaryData.unknown
+                ];
+                if (summaryData.totalPorts === null ||
+                    berCategories.some(value => value === null) ||
+                    berCategories.reduce((total, value) => total + value, 0) !== summaryData.totalPorts) {
+                    return null;
+                }
                 // UNKNOWN ports (admin-down / link-down / still awaiting their
                 // first full sample) are an expected steady state, not a
                 // coverage gap. BER partiality is driven only by host-coverage
                 // completeness (payload.coverage_partial / coverage_current,
                 // already applied above), so per-port UNKNOWN counts must not
                 // mark the domain partial.
-                if (summaryData.totalPorts === null) {
-                    summaryData.unavailable = true;
-                    summaryData.coveragePartial = true;
-                }
             } else if (dataType === 'pfc') {
                 const requiredMetrics = {
                     totalPorts: number(payload.total_ports),
@@ -2072,7 +2082,10 @@
                             summaryData.warning = metric('#warning-ports') || 0;
                             summaryData.critical = metric('#critical-ports') || 0;
                             summaryData.unknown = metric('#unknown-ports') || 0;
-                            summaryData.coveragePartial = summaryData.coveragePartial || summaryData.unknown > 0;
+                            // Per-port UNKNOWN counts are an expected steady
+                            // state (admin-down / link-down / awaiting a full
+                            // sample) and must not mark the domain partial,
+                            // matching the JSON-path semantics.
                         } else if (dataType === 'pfc') {
                             const requiredMetrics = {
                                 totalPorts: metadataNumber('totalPorts'),
@@ -2265,6 +2278,7 @@
                 updateDashboardCard('ber-good', dashboardMetric(berData, berData.good));
                 updateDashboardCard('ber-warning', dashboardMetric(berData, berData.warning));
                 updateDashboardCard('ber-critical', dashboardMetric(berData, berData.critical));
+                updateDashboardCard('ber-unknown', dashboardMetric(berData, berData.unknown));
 
                 const pfcCoverageAvailable = Number.isFinite(Number(pfcData.coverageCurrent)) &&
                     Number.isFinite(Number(pfcData.coverageExpected));

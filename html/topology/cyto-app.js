@@ -507,14 +507,28 @@ function searchDevice(query) {
 /**
  * Focus on a specific node
  */
+// Track the active focus highlight so re-focusing a node doesn't capture the
+// temporary green border as the "original" style
+let focusHighlight = null; // { node, borderWidth, borderColor, timer }
+
+function clearFocusHighlight() {
+    if (!focusHighlight) return;
+    clearTimeout(focusHighlight.timer);
+    focusHighlight.node.style({
+        'border-width': focusHighlight.borderWidth,
+        'border-color': focusHighlight.borderColor
+    });
+    focusHighlight = null;
+}
+
 function focusNode(nodeId) {
     const node = cy.getElementById(nodeId);
     if (!node || node.length === 0) return;
-    
+
     // Hide search results
     document.getElementById('searchResults').classList.remove('show');
     document.getElementById('searchInput').value = node.data('label');
-    
+
     // Animate to the node
     cy.animate({
         center: { eles: node },
@@ -522,23 +536,26 @@ function focusNode(nodeId) {
     }, {
         duration: 500
     });
-    
+
+    // Restore any previously highlighted node before capturing styles
+    clearFocusHighlight();
+
     // Highlight the node temporarily
     const originalBorderWidth = node.style('border-width');
     const originalBorderColor = node.style('border-color');
-    
+
     node.style({
         'border-width': 4,
         'border-color': '#76b900'
     });
-    
+
     // Reset after 3 seconds
-    setTimeout(() => {
-        node.style({
-            'border-width': originalBorderWidth,
-            'border-color': originalBorderColor
-        });
-    }, 3000);
+    focusHighlight = {
+        node: node,
+        borderWidth: originalBorderWidth,
+        borderColor: originalBorderColor,
+        timer: setTimeout(clearFocusHighlight, 3000)
+    };
 }
 
 // Close search results when clicking outside
@@ -580,7 +597,19 @@ function showContextMenu(event, node) {
     // Set current layer and icon values in dropdowns
     const currentLayer = String(node.data('level') ?? 5);
     const currentIcon = node.data('icon') || 'switch';
-    document.getElementById('node-layer-select').value = currentLayer;
+    const layerSelect = document.getElementById('node-layer-select');
+    // Layers come from topology_config.yaml as arbitrary ints; if the current
+    // value has no matching option (e.g. 0 or >= 12), insert one in numeric
+    // order so the select reflects the node's real layer.
+    if (!Array.from(layerSelect.options).some(o => o.value === currentLayer)) {
+        const opt = document.createElement('option');
+        opt.value = currentLayer;
+        opt.textContent = currentLayer;
+        const num = parseInt(currentLayer, 10);
+        const next = Array.from(layerSelect.options).find(o => parseInt(o.value, 10) > num);
+        layerSelect.insertBefore(opt, next || null);
+    }
+    layerSelect.value = currentLayer;
     document.getElementById('node-icon-select').value = currentIcon;
     
     // Get mouse position
@@ -1042,6 +1071,8 @@ document.addEventListener('contextmenu', function(e) {
 /**
  * Show a brief notification
  */
+let notificationHideTimer = null;
+
 function showNotification(message) {
     // Create notification element if doesn't exist
     let notif = document.getElementById('notification');
@@ -1055,7 +1086,9 @@ function showNotification(message) {
     notif.textContent = message;
     notif.style.opacity = '1';
     
-    setTimeout(() => {
+    // Cancel any pending hide so a new notification gets its full 2s
+    clearTimeout(notificationHideTimer);
+    notificationHideTimer = setTimeout(() => {
         notif.style.opacity = '0';
     }, 2000);
 }

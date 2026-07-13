@@ -185,7 +185,8 @@ class BERAnalyzer:
             prefix=f".{os.path.basename(path)}.", dir=directory
         )
         try:
-            os.fchmod(descriptor, mode)
+            # Web-served output: nginx must always retain read access.
+            os.fchmod(descriptor, mode | 0o644)
             with os.fdopen(descriptor, "w") as stream:
                 descriptor = -1
                 json.dump(value, stream, separators=(",", ":"))
@@ -225,7 +226,8 @@ class BERAnalyzer:
             prefix=f".{os.path.basename(path)}.", dir=directory
         )
         try:
-            os.fchmod(descriptor, mode)
+            # Web-served output: nginx must always retain read access.
+            os.fchmod(descriptor, mode | 0o644)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = -1
                 stream.write(text)
@@ -952,6 +954,16 @@ class BERAnalyzer:
             or error_delta > 0
             or (isinstance(symbol_delta, int) and symbol_delta > 0)
         )
+        # Guard 2 fallback: some platforms' l1-show reports no
+        # phy_symbol_errors counter at all, so an idle-but-live degraded link
+        # can never prove activity through a symbol advance and would stay
+        # UNKNOWN indefinitely. Without a counter a stale snapshot cannot be
+        # distinguished from a live reading anyway, so grade any plausible
+        # (below the invalid floor) PHY BER on counter-less ports; Guard 1
+        # above still discards the admin-down 1.0e+00 sentinel.
+        if not link_active and not isinstance(symbol_errors, int):
+            link_active = (isinstance(raw_ber, (int, float))
+                           or isinstance(effective_ber, (int, float)))
 
         raw_grade = BERGrade.UNKNOWN.value
         if link_active and isinstance(raw_ber, (int, float)):

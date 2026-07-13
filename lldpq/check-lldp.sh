@@ -1037,9 +1037,22 @@ fi
 echo "Publishing LLDP generation..."
 sudo mkdir -p "$WEB_ROOT/hstr" || exit 1
 if [[ -f "$WEB_ROOT/problems-lldp_results.ini" ]]; then
-    publish_web_file \
-        "$WEB_ROOT/problems-lldp_results.ini" \
-        "$WEB_ROOT/hstr/Problems-${DATE}.ini" || exit 1
+    # Name the archive after the archived report's own "Created on" header so
+    # the label archive.html renders matches the content; fall back to the
+    # current run's DATE when the header is missing or unparseable.
+    archive_stamp=$(grep -m1 '^Created on ' "$WEB_ROOT/problems-lldp_results.ini" | \
+        sed -n 's/^Created on \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\) \([0-9]\{2\}\)-\([0-9]\{2\}\)\(-[0-9]\{2\}\)\{0,1\}[[:space:]]*$/\1--\2-\3/p')
+    [[ -n "$archive_stamp" ]] || archive_stamp="$DATE"
+    archive_file="$WEB_ROOT/hstr/Problems-${archive_stamp}.ini"
+    if [[ -e "$archive_file" ]]; then
+        # Same creation stamp means same content; skipping is safer than
+        # overwriting an already-archived history file.
+        echo "Archive $archive_file already exists; skipping duplicate copy."
+    else
+        publish_web_file \
+            "$WEB_ROOT/problems-lldp_results.ini" \
+            "$archive_file" || exit 1
+    fi
 fi
 if ! commit_lldp_outputs; then
     echo "LLDP generation was not activated; last-known-good files were preserved." >&2

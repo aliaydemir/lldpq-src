@@ -337,7 +337,8 @@
         <table class="data-table">
             <thead>
                 <tr>
-                    <th onclick="sortBy('device')">Device <span class="sort-arrow" id="sort-device"></span></th>
+                    <!-- Table renders pre-sorted by device asc, so show the active indicator from the start -->
+                    <th onclick="sortBy('device')">Device <span class="sort-arrow active" id="sort-device">▲</span></th>
                     <th onclick="sortBy('port')">Port <span class="sort-arrow" id="sort-port"></span></th>
                     <th onclick="sortBy('identifier')">Identifier <span class="sort-arrow" id="sort-identifier"></span></th>
                     <th onclick="sortBy('vendor')">Vendor <span class="sort-arrow" id="sort-vendor"></span></th>

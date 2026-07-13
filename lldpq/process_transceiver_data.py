@@ -249,7 +249,8 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
         prefix='.transceiver_inventory.json.', dir=output_dir)
     try:
         mode = (os.stat(output_path).st_mode & 0o7777) if os.path.exists(output_path) else 0o664
-        os.fchmod(fd, mode)
+        # Web-served output: nginx must always retain read access.
+        os.fchmod(fd, mode | 0o644)
         with os.fdopen(fd, 'w') as f:
             json.dump(result, f, indent=2)
             f.flush()

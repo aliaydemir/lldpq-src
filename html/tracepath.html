@@ -729,11 +729,6 @@
             }
         }
         
-        // Load device count on page load
-        document.addEventListener('DOMContentLoaded', function() {
-            loadDeviceCount();
-        });
-
         async function fetchJsonWithTimeout(url, timeoutMs = LOOKUP_TIMEOUT_MS) {
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -960,9 +955,6 @@
             cancelDstVrfDetection();
         });
         
-        // Load all VRFs on page load
-        document.addEventListener('DOMContentLoaded', loadAllVrfs);
-
         // Prefill the form from URL query parameters (source_ip, dest_ip,
         // vrf, dst_vrf) and auto-run the trace when both endpoints are given.
         function applyUrlParams() {
@@ -986,7 +978,6 @@
             if (sourceIp) detectSrcVrfs(vrf, Boolean(vrf));
             if (destIp && !dstVrf) detectDstVrfs();
         }
-        document.addEventListener('DOMContentLoaded', applyUrlParams);
 
         function setTraceButtonLoading(isLoading) {
             const button = document.getElementById('traceBtn');
@@ -1577,7 +1568,12 @@
 
     <script>
         (async function() {
-            await LLDPqAuth.check();
+            const ok = await LLDPqAuth.check();
+            if (!ok) return;
+            // Initial data loads run only after the auth check succeeds.
+            loadDeviceCount();
+            loadAllVrfs();
+            applyUrlParams();
         })();
     </script>
 </body>

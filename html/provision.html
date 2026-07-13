@@ -783,6 +783,22 @@
             .handover-bulk-panel { flex-direction: column; }
             .config-grid { grid-template-columns: 1fr; }
         }
+
+        /* Sortable header arrows (canonical pattern, matches lldp.html) */
+        th.sortable {
+            cursor: pointer;
+            user-select: none;
+        }
+        .sort-arrow {
+            font-size: 10px;
+            color: #666;
+            margin-left: 5px;
+            opacity: 0.5;
+        }
+        .sort-arrow::before { content: '▲▼'; }
+        .sortable.asc .sort-arrow::before { content: '▲'; color: #76b900; opacity: 1; }
+        .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
+        .sortable.asc .sort-arrow, .sortable.desc .sort-arrow { opacity: 1; }
     </style>
 </head>
 <body>
@@ -909,14 +925,14 @@
         <table class="data-table" id="discoveredTable">
             <thead>
                 <tr>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('hostname')">Hostname <span id="sort-hostname" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('discovered_mac')">MAC Address <span id="sort-discovered_mac" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('ip')">IP Address <span id="sort-ip" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('serial')">Serial <span id="sort-serial" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('role')">Role <span id="sort-role" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('device_type')">Access <span id="sort-device_type" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('post_provision')">Base Config <span id="sort-post_provision" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortDiscovered('mac_status')">Status <span id="sort-mac_status" style="opacity:0.4;">&#9650;</span></th>
+                    <th class="sortable" onclick="sortDiscovered('hostname')">Hostname <span class="sort-arrow" id="sort-hostname"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('discovered_mac')">MAC Address <span class="sort-arrow" id="sort-discovered_mac"></span></th>
+                    <th class="sortable asc" onclick="sortDiscovered('ip')">IP Address <span class="sort-arrow" id="sort-ip"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('serial')">Serial <span class="sort-arrow" id="sort-serial"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('role')">Role <span class="sort-arrow" id="sort-role"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('device_type')">Access <span class="sort-arrow" id="sort-device_type"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('post_provision')">Base Config <span class="sort-arrow" id="sort-post_provision"></span></th>
+                    <th class="sortable" onclick="sortDiscovered('mac_status')">Status <span class="sort-arrow" id="sort-mac_status"></span></th>
                     <th style="width:80px;" title="Re-deploy a matching saved NVUE configuration">NVUE Config</th>
                 </tr>
             </thead>
@@ -1067,12 +1083,12 @@
         <table class="data-table" id="bindingsTable">
             <thead>
                 <tr>
-                    <th style="cursor:pointer;" onclick="sortBindings('hostname')">Hostname <span id="bsort-hostname" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortBindings('mac')">MAC Address <span id="bsort-mac" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortBindings('ip')">IP Address <span id="bsort-ip" style="opacity:1;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortBindings('serial')">Serial <span id="bsort-serial" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortBindings('role')">Role <span id="bsort-role" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortBindings('inv_status')">Status <span id="bsort-inv_status" style="opacity:0.4;">&#9650;</span></th>
+                    <th class="sortable" onclick="sortBindings('hostname')">Hostname <span class="sort-arrow" id="bsort-hostname"></span></th>
+                    <th class="sortable" onclick="sortBindings('mac')">MAC Address <span class="sort-arrow" id="bsort-mac"></span></th>
+                    <th class="sortable asc" onclick="sortBindings('ip')">IP Address <span class="sort-arrow" id="bsort-ip"></span></th>
+                    <th class="sortable" onclick="sortBindings('serial')">Serial <span class="sort-arrow" id="bsort-serial"></span></th>
+                    <th class="sortable" onclick="sortBindings('role')">Role <span class="sort-arrow" id="bsort-role"></span></th>
+                    <th class="sortable" onclick="sortBindings('inv_status')">Status <span class="sort-arrow" id="bsort-inv_status"></span></th>
                     <th style="width:50px; text-align:center;" title="DHCP binding required"><input type="checkbox" id="dhcpSelectAll" onchange="toggleAllDhcp(this.checked)" checked style="cursor:pointer;"> DHCP</th>
                     <th style="width:50px; text-align:center;">Live</th>
                     <th style="width:70px; text-align:center;" title="Base Config deployed">Base</th>
@@ -1153,12 +1169,12 @@
             <thead>
                 <tr>
                     <th style="width:42px; text-align:center;"><input type="checkbox" id="handoverSelectAll" onchange="selectAllTrackingFiltered(this.checked)" aria-label="Select all filtered switches"></th>
-                    <th data-tracking-sort="hostname" aria-sort="ascending" style="cursor:pointer;" onclick="sortTracking('hostname')">Hostname <span id="tsort-hostname" style="opacity:1;">&#9650;</span></th>
-                    <th data-tracking-sort="ip" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('ip')">IP Address <span id="tsort-ip" style="opacity:0.4;">&#9650;</span></th>
-                    <th data-tracking-sort="role" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('role')">Role <span id="tsort-role" style="opacity:0.4;">&#9650;</span></th>
-                    <th data-tracking-sort="state" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('state')">State <span id="tsort-state" style="opacity:0.4;">&#9650;</span></th>
-                    <th data-tracking-sort="changed_at" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('changed_at')">Changed At <span id="tsort-changed_at" style="opacity:0.4;">&#9650;</span></th>
-                    <th data-tracking-sort="changed_by" aria-sort="none" style="cursor:pointer;" onclick="sortTracking('changed_by')">Changed By <span id="tsort-changed_by" style="opacity:0.4;">&#9650;</span></th>
+                    <th class="sortable asc" data-tracking-sort="hostname" aria-sort="ascending" onclick="sortTracking('hostname')">Hostname <span class="sort-arrow" id="tsort-hostname"></span></th>
+                    <th class="sortable" data-tracking-sort="ip" aria-sort="none" onclick="sortTracking('ip')">IP Address <span class="sort-arrow" id="tsort-ip"></span></th>
+                    <th class="sortable" data-tracking-sort="role" aria-sort="none" onclick="sortTracking('role')">Role <span class="sort-arrow" id="tsort-role"></span></th>
+                    <th class="sortable" data-tracking-sort="state" aria-sort="none" onclick="sortTracking('state')">State <span class="sort-arrow" id="tsort-state"></span></th>
+                    <th class="sortable" data-tracking-sort="changed_at" aria-sort="none" onclick="sortTracking('changed_at')">Changed At <span class="sort-arrow" id="tsort-changed_at"></span></th>
+                    <th class="sortable" data-tracking-sort="changed_by" aria-sort="none" onclick="sortTracking('changed_by')">Changed By <span class="sort-arrow" id="tsort-changed_by"></span></th>
                 </tr>
             </thead>
             <tbody id="handoverBody">
@@ -1376,17 +1392,17 @@
     </div>
 
     <div class="table-wrapper" style="max-height: calc(100vh - 330px);">
-        <table class="data-table">
+        <table class="data-table" id="upgradeTable">
             <thead>
                 <tr>
                     <th style="width:36px;"><input type="checkbox" id="upgradeSelectAllBox" onchange="upgradeSelectAll(this.checked)" style="accent-color:#76b900;"></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('hostname')">Hostname <span id="usort-hostname" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('ip')">IP <span id="usort-ip" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('role')">Role <span id="usort-role" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('current_version')">Current <span id="usort-current_version" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('target_version')">Target <span id="usort-target_version" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('startup_config')">Startup <span id="usort-startup_config" style="opacity:0.4;">&#9650;</span></th>
-                    <th style="cursor:pointer;" onclick="sortUpgrade('status')">Status <span id="usort-status" style="opacity:0.4;">&#9650;</span></th>
+                    <th class="sortable asc" onclick="sortUpgrade('hostname')">Hostname <span class="sort-arrow" id="usort-hostname"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('ip')">IP <span class="sort-arrow" id="usort-ip"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('role')">Role <span class="sort-arrow" id="usort-role"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('current_version')">Current <span class="sort-arrow" id="usort-current_version"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('target_version')">Target <span class="sort-arrow" id="usort-target_version"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('startup_config')">Startup <span class="sort-arrow" id="usort-startup_config"></span></th>
+                    <th class="sortable" onclick="sortUpgrade('status')">Status <span class="sort-arrow" id="usort-status"></span></th>
                     <th>Details</th>
                 </tr>
             </thead>
@@ -1819,17 +1835,12 @@ function sortTracking(column) {
 
     document.querySelectorAll('#handoverTable th[data-tracking-sort]').forEach(header => {
         header.setAttribute('aria-sort', 'none');
-    });
-    document.querySelectorAll('[id^="tsort-"]').forEach(indicator => {
-        indicator.style.opacity = '0.4';
-        indicator.innerHTML = '&#9650;';
+        header.classList.remove('asc', 'desc');
     });
     const header = document.querySelector(`#handoverTable th[data-tracking-sort="${column}"]`);
-    const indicator = document.getElementById('tsort-' + column);
-    if (header) header.setAttribute('aria-sort', trackingSortAsc ? 'ascending' : 'descending');
-    if (indicator) {
-        indicator.style.opacity = '1';
-        indicator.innerHTML = trackingSortAsc ? '&#9650;' : '&#9660;';
+    if (header) {
+        header.setAttribute('aria-sort', trackingSortAsc ? 'ascending' : 'descending');
+        header.classList.add(trackingSortAsc ? 'asc' : 'desc');
     }
     renderTracking();
 }
@@ -2591,9 +2602,9 @@ let bindSortAsc = true;
 function sortBindings(col) {
     if (bindSortCol === col) { bindSortAsc = !bindSortAsc; }
     else { bindSortCol = col; bindSortAsc = true; }
-    document.querySelectorAll('[id^="bsort-"]').forEach(el => { if (el) { el.style.opacity = '0.4'; el.innerHTML = '&#9650;'; } });
+    document.querySelectorAll('#bindingsTable th.sortable').forEach(th => th.classList.remove('asc', 'desc'));
     const ind = document.getElementById('bsort-' + col);
-    if (ind) { ind.style.opacity = '1'; ind.innerHTML = bindSortAsc ? '&#9650;' : '&#9660;'; }
+    if (ind) ind.closest('th').classList.add(bindSortAsc ? 'asc' : 'desc');
     renderBindings();
 }
 
@@ -3657,9 +3668,9 @@ function sortDiscovered(col) {
         discSortCol = col;
         discSortAsc = true;
     }
-    document.querySelectorAll('[id^="sort-"]').forEach(el => { el.style.opacity = '0.4'; el.innerHTML = '&#9650;'; });
+    document.querySelectorAll('#discoveredTable th.sortable').forEach(th => th.classList.remove('asc', 'desc'));
     const indicator = document.getElementById('sort-' + col);
-    if (indicator) { indicator.style.opacity = '1'; indicator.innerHTML = discSortAsc ? '&#9650;' : '&#9660;'; }
+    if (indicator) indicator.closest('th').classList.add(discSortAsc ? 'asc' : 'desc');
     renderDiscovered();
 }
 
@@ -4888,12 +4899,9 @@ function sortUpgrade(col) {
         upgradeSortCol = col;
         upgradeSortDir = 1;
     }
-    document.querySelectorAll('[id^="usort-"]').forEach(el => { el.style.opacity = '0.4'; el.innerHTML = '&#9650;'; });
+    document.querySelectorAll('#upgradeTable th.sortable').forEach(th => th.classList.remove('asc', 'desc'));
     const indicator = document.getElementById('usort-' + col);
-    if (indicator) {
-        indicator.style.opacity = '1';
-        indicator.innerHTML = upgradeSortDir > 0 ? '&#9650;' : '&#9660;';
-    }
+    if (indicator) indicator.closest('th').classList.add(upgradeSortDir > 0 ? 'asc' : 'desc');
     renderUpgradeTable(_lastUpgradeJob);
 }
 

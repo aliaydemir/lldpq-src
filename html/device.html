@@ -3102,8 +3102,12 @@
                     };
 
                     // Poll pcap-status until the capture finishes, then reveal Download.
+                    // Each poll runs an ssh on the server behind single-worker fcgiwrap,
+                    // so keep the interval coarse and never overlap in-flight polls.
                     let pollCount = 0;
-                    const maxPolls = parseInt(duration, 10) + 30;
+                    let pollInFlight = false;
+                    const pcapPollMs = 2000;
+                    const maxPolls = Math.ceil(((parseInt(duration, 10) + 30) * 1000) / pcapPollMs);
                     captureContext.pollInterval = setInterval(async () => {
                         if (!isCurrentCapture(captureContext)) {
                             if (activeCaptureContext === captureContext) {
@@ -3111,6 +3115,8 @@
                             }
                             return;
                         }
+                        if (pollInFlight) return; // previous ssh-backed poll still running
+                        pollInFlight = true;
                         pollCount++;
                         try {
                             const statusResp = await fetch('/fabric-api.sh?action=pcap-status', {
@@ -3123,9 +3129,21 @@
                             if (!isCurrentCapture(captureContext)) return;
 
                             if (statusData.success && statusData.finished) {
-                                const sizeKb = statusData.size
-                                    ? ' (' + (statusData.size / 1024).toFixed(1) + ' KB)'
-                                    : '';
+                                if (!statusData.size) {
+                                    // tcpdump exited without writing anything (e.g. bad
+                                    // interface or filter) - do not offer an empty download.
+                                    releaseCaptureContext(captureContext);
+                                    capturePcapPath = null;
+                                    capturePcapSourceDevice = null;
+                                    pcapResultEl.style.display = 'none';
+                                    outputEl.textContent = 'Capture failed - no data written (check interface name and filters).'
+                                        + (statusData.error_output ? '\n' + statusData.error_output : '');
+                                    statusEl.textContent = 'Capture failed';
+                                    statusEl.style.color = '#f44336';
+                                    restoreButtons();
+                                    return;
+                                }
+                                const sizeKb = ' (' + (statusData.size / 1024).toFixed(1) + ' KB)';
                                 outputEl.textContent = 'Capture complete. PCAP ready for download' + sizeKb + '.';
                                 revealPcapReady('Capture complete - PCAP ready for download', '#76b900');
                                 return;
@@ -3138,12 +3156,14 @@
                             }
                         } catch (e) {
                             // Ignore transient poll errors and keep polling until the ceiling.
+                        } finally {
+                            pollInFlight = false;
                         }
                         if (isCurrentCapture(captureContext) && pollCount >= maxPolls) {
                             outputEl.textContent = 'Capture status polling timed out; the PCAP file may still be available for download.';
                             revealPcapReady('Capture status unknown - try downloading', '#ff9800');
                         }
-                    }, 1000);
+                    }, pcapPollMs);
                     return true;
                 } catch (e) {
                     if (!isCurrentCapture(captureContext)) {
@@ -3211,6 +3231,7 @@
                     // Start polling for output
                     let lastLength = 0;
                     let emptyCount = 0;
+                    let livePollInFlight = false;
                     captureContext.pollInterval = setInterval(async () => {
                         if (!isCurrentCapture(captureContext)) {
                             if (activeCaptureContext === captureContext) {
@@ -3218,6 +3239,8 @@
                             }
                             return;
                         }
+                        if (livePollInFlight) return; // previous ssh-backed poll still running
+                        livePollInFlight = true;
                         try {
                             const resp = await fetch('/fabric-api.sh?action=run-device-command', {
                                 method: 'POST',
@@ -3241,6 +3264,8 @@
                             }
                         } catch (e) {
                             // Ignore polling errors
+                        } finally {
+                            livePollInFlight = false;
                         }
                     }, 1000); // Poll every 1 second
                     

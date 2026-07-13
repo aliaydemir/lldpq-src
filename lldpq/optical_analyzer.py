@@ -67,6 +67,10 @@ def _atomic_write(path: str, content: str) -> None:
         prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
     )
     try:
+        # Web-served output: nginx must always retain read access, so lift
+        # mkstemp's private 0600 (and any inherited restrictive mode).
+        mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else 0o664
+        os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
@@ -122,15 +126,18 @@ class OpticalAnalyzer:
     # string explicitly says so (LR1/ER1/ZR1, for example).
     UNNUMBERED_SINGLE_LANE_MEDIA = frozenset({'DR', 'FR'})
 
-    def __init__(self, data_dir="monitor-results"):
+    def __init__(self, data_dir="monitor-results", load_history=True):
         self.data_dir = data_dir
         self.optical_history = {}  # port -> historical readings
         self.current_optical_stats = {}  # port -> current optical status
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
         self._load_network_thresholds()
 
-        # Load historical data
-        self.load_optical_history()
+        # Parse worker processes only need thresholds and parsing logic;
+        # loading the multi-megabyte history in every worker would cost more
+        # than the parallel parse saves.
+        if load_history:
+            self.load_optical_history()
 
     def _load_network_thresholds(self) -> None:
         """Load the configurable margin while retaining safe defaults.

@@ -465,7 +465,9 @@ except:
     if os.path.exists(_tmp_path): os.unlink(_tmp_path)
     raise
 
-print(json.dumps({'success': True, 'message': f'Created {count} VLANs in profile {profile_name}', 'created_vlans': list(range(start_id, end_id + 1))}))
+# created_vlans keeps VLAN IDs for display counts; created_profiles carries the
+# vlan_profiles.yaml profile name(s) that assign-vlans/vlan_templates expect.
+print(json.dumps({'success': True, 'message': f'Created {count} VLANs in profile {profile_name}', 'created_vlans': list(range(start_id, end_id + 1)), 'created_profiles': [profile_name]}))
 PYTHON
 }
 
@@ -1529,8 +1531,12 @@ try:
         profile_entry['l2vpn_evpn_af'] = {'enable_evpn': True}
     
     if peer_groups:
+        # Existing data omits enable_evpn when off - drop explicit false
+        for pg_val in peer_groups.values():
+            if hasattr(pg_val, 'get') and pg_val.get('enable_evpn') is False:
+                pg_val.pop('enable_evpn', None)
         profile_entry['peer_groups'] = peer_groups
-    
+
     config['bgp_profiles'][profile_name] = profile_entry
     
     _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(bgp_file), suffix='.tmp')
@@ -1565,6 +1571,7 @@ import json
 import os
 import re
 import sys
+import glob
 import tempfile
 import shutil
 from ruamel.yaml import YAML
@@ -1584,6 +1591,7 @@ redistribute_static = data.get('redistribute_static', False)
 export_to_evpn_type5 = data.get('export_to_evpn_type5', False)
 enable_evpn = data.get('enable_evpn', False)
 peer_groups = data.get('peer_groups', {})
+removed_peer_groups = data.get('removed_peer_groups', []) or []
 
 if not original_name or not profile_name:
     print(json.dumps({'success': False, 'error': 'Profile names are required'}))
@@ -1643,11 +1651,40 @@ try:
             existing_pg = {}
             profile_entry['peer_groups'] = existing_pg
         for pg_name, pg_val in peer_groups.items():
+            # Peer-group enable_evpn: false means "off" - existing data omits
+            # the key when EVPN is disabled, so remove instead of storing false.
+            if hasattr(pg_val, 'get') and pg_val.get('enable_evpn') is False:
+                pg_val.pop('enable_evpn', None)
+                cur = existing_pg.get(pg_name)
+                if hasattr(cur, 'pop'):
+                    cur.pop('enable_evpn', None)
             cur = existing_pg.get(pg_name)
             if hasattr(cur, 'update') and hasattr(pg_val, 'items'):
+                # Merge peers per-key: the modal sends the authoritative peer
+                # set (values are {}), so keep existing attrs (weight, policy,
+                # soft_reconfiguration) for retained peers and drop absent ones.
+                new_peers = pg_val.pop('peers', None)
                 cur.update(pg_val)
+                if new_peers is not None:
+                    old_peers = cur.get('peers')
+                    if hasattr(new_peers, 'items') and hasattr(old_peers, 'get'):
+                        merged_peers = {}
+                        for p, p_val in new_peers.items():
+                            prev = old_peers.get(p)
+                            merged_peers[p] = prev if hasattr(prev, 'items') and not p_val else p_val
+                        cur['peers'] = merged_peers
+                    else:
+                        cur['peers'] = new_peers
             else:
                 existing_pg[pg_name] = pg_val
+
+    # Delete peer groups the modal explicitly removed
+    if removed_peer_groups:
+        existing_pg = profile_entry.get('peer_groups')
+        if hasattr(existing_pg, 'pop'):
+            for pg_name in removed_peer_groups:
+                if pg_name not in peer_groups:
+                    existing_pg.pop(pg_name, None)
 
     # Remove old profile if renaming
     if original_name != profile_name:
@@ -1663,10 +1700,52 @@ try:
     except:
         if os.path.exists(_tmp_path): os.unlink(_tmp_path)
         raise
-    
+
+    # On rename, rewrite vrfs.*.bgp.bgp_profile references in host_vars (and
+    # group_vars, which can also carry vrfs) so no dangling refs are left.
+    updated_hosts = []
+    if original_name != profile_name:
+        inventory_base = os.path.join(ansible_dir, 'inventory')
+        host_vars_dir = os.path.join(inventory_base, 'host_vars')
+        ref_files = glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml'))
+        ref_files += [p for p in
+                      glob.glob(os.path.join(inventory_base, 'group_vars', '**', '*.yaml'), recursive=True) +
+                      glob.glob(os.path.join(inventory_base, 'group_vars', '**', '*.yml'), recursive=True)
+                      if os.path.abspath(p) != os.path.abspath(bgp_file)]
+        for hv in ref_files:
+            try:
+                with open(hv, 'r') as f:
+                    hv_cfg = yaml.load(f) or {}
+            except Exception:
+                continue
+            if not hasattr(hv_cfg, 'get'):
+                continue
+            changed = False
+            vrfs = hv_cfg.get('vrfs')
+            if hasattr(vrfs, 'items'):
+                for _vrf_name, vrf_cfg in vrfs.items():
+                    if hasattr(vrf_cfg, 'get'):
+                        bgp = vrf_cfg.get('bgp')
+                        if hasattr(bgp, 'get') and bgp.get('bgp_profile') == original_name:
+                            bgp['bgp_profile'] = profile_name
+                            changed = True
+            if changed:
+                _hfd, _hpath = tempfile.mkstemp(dir=os.path.dirname(hv), suffix='.tmp')
+                try:
+                    with os.fdopen(_hfd, 'w') as _hf:
+                        yaml.dump(hv_cfg, _hf)
+                    shutil.move(_hpath, hv)
+                    if os.path.dirname(hv) == host_vars_dir:
+                        updated_hosts.append(os.path.basename(hv).rsplit('.', 1)[0])
+                    else:
+                        updated_hosts.append(os.path.relpath(hv, inventory_base))
+                except Exception:
+                    if os.path.exists(_hpath): os.unlink(_hpath)
+
     print(json.dumps({
         'success': True,
-        'message': f'BGP profile {profile_name} updated successfully'
+        'message': f'BGP profile {profile_name} updated successfully',
+        'updated_hosts': updated_hosts
     }))
 
 except Exception as e:
@@ -1891,9 +1970,10 @@ access_vlan = data.get('access_vlan')
 native_vlan = data.get('native_vlan')
 trunk_allowed_vlans = data.get('trunk_allowed_vlans', [])
 trunk_allowed_vlan_all = data.get('trunk_allowed_vlan_all', False)
-stp_bpduguard = data.get('stp_bpduguard', True)
-stp_portadminedge = data.get('stp_portadminedge', True)
-stp_portautoedgedisable = data.get('stp_portautoedgedisable', True)
+# None = not submitted by the modal (it only sends stp_* in access mode)
+stp_bpduguard = data.get('stp_bpduguard')
+stp_portadminedge = data.get('stp_portadminedge')
+stp_portautoedgedisable = data.get('stp_portautoedgedisable')
 
 if not original_name:
     print(json.dumps({'success': False, 'error': 'Original profile name is required'}))
@@ -1940,9 +2020,9 @@ if sw_port_mode == 'access':
         profile_entry['access_vlan'] = int(access_vlan)
     else:
         profile_entry.pop('access_vlan', None)
-    profile_entry['stp_bpduguard'] = stp_bpduguard
-    profile_entry['stp_portadminedge'] = stp_portadminedge
-    profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
+    profile_entry['stp_bpduguard'] = True if stp_bpduguard is None else stp_bpduguard
+    profile_entry['stp_portadminedge'] = True if stp_portadminedge is None else stp_portadminedge
+    profile_entry['stp_portautoedgedisable'] = True if stp_portautoedgedisable is None else stp_portautoedgedisable
     # Access profiles carry no trunk keys
     for k in ('trunk_untagged', 'trunk_allowed_vlan_all', 'trunk_allowed_vlan_list'):
         profile_entry.pop(k, None)
@@ -1957,10 +2037,14 @@ elif sw_port_mode == 'trunk':
     elif trunk_allowed_vlans:
         profile_entry['trunk_allowed_vlan_list'] = trunk_allowed_vlans
         profile_entry.pop('trunk_allowed_vlan_all', None)
-    # Trunk profiles legitimately carry stp_* options: preserve/set them
-    profile_entry['stp_bpduguard'] = stp_bpduguard
-    profile_entry['stp_portadminedge'] = stp_portadminedge
-    profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
+    # Trunk profiles legitimately carry stp_* options, but the modal does not
+    # send them in trunk mode: only set what was submitted, preserve the rest.
+    if stp_bpduguard is not None:
+        profile_entry['stp_bpduguard'] = stp_bpduguard
+    if stp_portadminedge is not None:
+        profile_entry['stp_portadminedge'] = stp_portadminedge
+    if stp_portautoedgedisable is not None:
+        profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
     # Access-only key does not belong on a trunk profile
     profile_entry.pop('access_vlan', None)
 
@@ -2279,6 +2363,7 @@ delete_vlan() {
 
     python3 << PYTHON
 import json
+import glob
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -2358,11 +2443,38 @@ if vlan_id:
         
         port_profile_deleted = True
 
+# Cascade: remove the deleted profile from vlan_templates in all host_vars
+# so no dangling references are left behind.
+updated_hosts = []
+host_vars_dir = os.path.join(inventory_base, 'host_vars')
+for hv in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
+    try:
+        with open(hv, 'r') as f:
+            hv_cfg = yaml.load(f) or {}
+    except Exception:
+        continue
+    if not hasattr(hv_cfg, 'get'):
+        continue
+    templates = hv_cfg.get('vlan_templates')
+    if not isinstance(templates, list) or profile_name not in templates:
+        continue
+    while profile_name in templates:
+        templates.remove(profile_name)
+    _hfd, _hpath = tempfile.mkstemp(dir=os.path.dirname(hv), suffix='.tmp')
+    try:
+        with os.fdopen(_hfd, 'w') as _hf:
+            yaml.dump(hv_cfg, _hf)
+        shutil.move(_hpath, hv)
+        updated_hosts.append(os.path.basename(hv).rsplit('.', 1)[0])
+    except Exception:
+        if os.path.exists(_hpath): os.unlink(_hpath)
+
 print(json.dumps({
     'success': True,
     'profile_name': profile_name,
     'port_profile': port_profile_name,
-    'port_profile_deleted': port_profile_deleted
+    'port_profile_deleted': port_profile_deleted,
+    'updated_hosts': updated_hosts
 }))
 PYTHON
 }
@@ -2615,28 +2727,36 @@ try:
             print(json.dumps({'success': False, 'error': 'Invalid VLAN ID'}))
             sys.exit(0)
 
-        # Build updated VLAN entry
-        vlan_entry = {
-            'description': description,
-            'l2vni': l2vni if l2vni else existing_vlans.get(vlan_id, existing_vlans.get(str(vlan_id), {})).get('l2vni', 100000 + vlan_id)
-        }
+        # Merge onto the existing VLAN entry so schema keys the modal doesn't
+        # cover (e.g. mcast_group, MLAG primary_ip/secondary_ip) survive.
+        vlan_entry = existing_vlans.get(vlan_id, existing_vlans.get(str(vlan_id)))
+        if not hasattr(vlan_entry, 'get'):
+            vlan_entry = {}
+        vlan_entry['description'] = description
+        vlan_entry['l2vni'] = l2vni if l2vni else vlan_entry.get('l2vni', 100000 + vlan_id)
 
         if svi_enabled:
             vlan_entry['vrf'] = vrf
-            vlan_entry['ipv6'] = False
+            vlan_entry.setdefault('ipv6', False)
 
             if vrr_enabled:
-                if vrr_vip:
-                    vlan_entry['vrr_vip'] = vrr_vip
-                if even_ip:
-                    vlan_entry['even_ip'] = even_ip
-                if odd_ip:
-                    vlan_entry['odd_ip'] = odd_ip
-                if vrr_vmac:
-                    vlan_entry['vrr_vmac'] = vrr_vmac
+                for key, val in (('vrr_vip', vrr_vip), ('even_ip', even_ip), ('odd_ip', odd_ip), ('vrr_vmac', vrr_vmac)):
+                    if val:
+                        vlan_entry[key] = val
+                    else:
+                        vlan_entry.pop(key, None)
+                vlan_entry.pop('ip', None)
             else:
                 if gateway_ip:
                     vlan_entry['ip'] = gateway_ip
+                else:
+                    vlan_entry.pop('ip', None)
+                for key in ('vrr_vip', 'even_ip', 'odd_ip', 'vrr_vmac'):
+                    vlan_entry.pop(key, None)
+        else:
+            # SVI disabled: drop only the modal-managed L3 keys
+            for key in ('vrf', 'ipv6', 'ip', 'vrr_vip', 'even_ip', 'odd_ip', 'vrr_vmac'):
+                vlan_entry.pop(key, None)
 
         # Update this VLAN in the profile's existing vlans (preserve other VLANs)
         if vlan_id not in existing_vlans and str(vlan_id) in existing_vlans:
@@ -2644,10 +2764,14 @@ try:
         else:
             existing_vlans[vlan_id] = vlan_entry
 
-        profile_entry = {
-            'vrr': {'state': vrr_enabled if svi_enabled else False},
-            'vlans': existing_vlans
-        }
+        # Merge at profile level too (preserve keys other than vrr/vlans)
+        profile_entry = existing
+        vrr_cfg = profile_entry.get('vrr')
+        if hasattr(vrr_cfg, 'get'):
+            vrr_cfg['state'] = vrr_enabled if svi_enabled else False
+        else:
+            profile_entry['vrr'] = {'state': vrr_enabled if svi_enabled else False}
+        profile_entry['vlans'] = existing_vlans
 
     # If profile name changed, remove old and add new
     if is_rename:
@@ -2770,9 +2894,6 @@ case "$ACTION" in
         ;;
     "get-available-vrfs")
         get_available_vrfs
-        ;;
-    "get-bgp-profiles")
-        get_bgp_profiles
         ;;
     "get-leaking-vrfs")
         get_leaking_vrfs
@@ -3126,6 +3247,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3149,6 +3271,10 @@ giaddr = params.get('giaddr', '')  # Optional gateway interface
 
 if not device or not vrf:
     print(json.dumps({'success': False, 'error': 'Device and VRF are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3212,6 +3338,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3230,6 +3357,10 @@ index = params.get('index')
 
 if not device or index is None:
     print(json.dumps({'success': False, 'error': 'Device and index are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3282,6 +3413,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3298,7 +3430,11 @@ try:
     if not device:
         print(json.dumps({'success': False, 'error': 'Device is required'}))
         sys.exit(0)
-    
+
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+        print(json.dumps({'success': False, 'error': 'Invalid device name'}))
+        sys.exit(0)
+
     if not evpn_mh.get('sysmac'):
         print(json.dumps({'success': False, 'error': 'System MAC is required'}))
         sys.exit(0)
@@ -3341,6 +3477,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3356,7 +3493,11 @@ try:
     if not device:
         print(json.dumps({'success': False, 'error': 'Device is required'}))
         sys.exit(0)
-    
+
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+        print(json.dumps({'success': False, 'error': 'Invalid device name'}))
+        sys.exit(0)
+
     ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
     host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
     
@@ -3496,6 +3637,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3518,6 +3660,10 @@ bond_name = data.get('name', '')
 
 if not device or not bond_name:
     print(json.dumps({'success': False, 'error': 'Device and bond name are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3562,6 +3708,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3584,6 +3731,10 @@ subif_name = data.get('name', '')  # e.g., swp1.1001
 
 if not device or not subif_name:
     print(json.dumps({'success': False, 'error': 'Device and subinterface name are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 # Parse parent interface and subif ID
@@ -4250,6 +4401,7 @@ PYTHON
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -4274,7 +4426,11 @@ try:
     if not all([device, vrf, remote_peer]):
         print(json.dumps({'success': False, 'error': 'Missing required fields'}))
         sys.exit(0)
-    
+
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+        print(json.dumps({'success': False, 'error': 'Invalid device name'}))
+        sys.exit(0)
+
     # 1. Update host_vars - remove subinterface if specified
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
     subif_removed = False
@@ -4656,11 +4812,17 @@ ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 
 try:
     host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
-    hosts_file = os.path.join(ansible_dir, 'inventory', 'hosts')
-    
+    # Fallback: try inventory.ini first, then hosts
+    hosts_file = None
+    for name in ['inventory.ini', 'hosts']:
+        path = os.path.join(ansible_dir, 'inventory', name)
+        if os.path.exists(path):
+            hosts_file = path
+            break
+
     # Build hostname -> IP mapping from hosts file
     host_ips = {}
-    if os.path.exists(hosts_file):
+    if hosts_file:
         with open(hosts_file, 'r') as f:
             for line in f:
                 line = line.strip()
@@ -7020,7 +7182,7 @@ remote_capture = (
 # A closed browser tab otherwise leaks these on the switch tmpfs (RAM) forever.
 sweep_cmd = (
     "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
-    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' -o -name 'capture_*.pcap.err' \\) "
     "-mmin +60 -delete >/dev/null 2>&1; "
 )
 remote_cmd = (
@@ -7246,7 +7408,7 @@ remote_tail = (
 # A closed browser tab otherwise leaks these on the switch tmpfs (RAM) forever.
 sweep_cmd = (
     "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
-    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' -o -name 'capture_*.pcap.err' \\) "
     "-mmin +60 -delete >/dev/null 2>&1; "
 )
 remote_cmd = (
@@ -7479,14 +7641,16 @@ remote_capture = (
     'kill -TERM -- "-${child_pid}" 2>/dev/null; '
     'fi; exit 143; }; '
     'trap terminate_child TERM INT; '
-    f'{capture_worker} > /dev/null 2>&1 & '
+    # Keep tcpdump's stderr so pcap-status can surface a start failure
+    # (bad interface/filter) instead of reporting an empty "success".
+    f'{capture_worker} > /dev/null 2> {shlex.quote(pcap_file + ".err")} & '
     'child_pid=$!; wait "$child_pid"; status=$?; '
     'trap - TERM INT; exit "$status"'
 )
 # Sweep leftover live/tail/pcap temp files older than 60 min before launching.
 sweep_cmd = (
     "sudo find /tmp -maxdepth 1 \\( -name 'live_*.txt' -o "
-    "-name 'tail_*.txt' -o -name 'capture_*.pcap' \\) "
+    "-name 'tail_*.txt' -o -name 'capture_*.pcap' -o -name 'capture_*.pcap.err' \\) "
     "-mmin +60 -delete >/dev/null 2>&1; "
 )
 remote_cmd = (
@@ -7650,7 +7814,11 @@ remote_status = (
     f'if sudo pgrep -f {shlex.quote(process_pattern)} >/dev/null 2>&1; '
     'then st=RUNNING; fi; '
     f'sz=$(stat -c %s {shlex.quote(pcap_file)} 2>/dev/null || echo 0); '
-    "printf '%s %s\\n' \"$st\" \"$sz\""
+    # tcpdump's saved stderr, base64 on the status line so SSH banners and
+    # embedded spaces/newlines cannot break the single-line parse below.
+    f'err=$(tail -c 300 {shlex.quote(pcap_file + ".err")} 2>/dev/null'
+    ' | base64 2>/dev/null | tr -d "\\n"); '
+    "printf '%s %s %s\\n' \"$st\" \"$sz\" \"${err:--}\""
 )
 
 ssh_command = [
@@ -7676,7 +7844,7 @@ if result.returncode != 0:
 
 lines = [ln.rstrip('\r') for ln in result.stdout.splitlines() if ln.strip()]
 parsed = lines[-1].split() if lines else []
-if len(parsed) != 2 or parsed[0] not in ('RUNNING', 'DONE'):
+if len(parsed) not in (2, 3) or parsed[0] not in ('RUNNING', 'DONE'):
     fail('Could not parse capture status')
 running = parsed[0] == 'RUNNING'
 try:
@@ -7684,14 +7852,27 @@ try:
 except ValueError:
     size = 0
 
-print(json.dumps({
+error_output = ''
+if len(parsed) == 3 and parsed[2] != '-':
+    import base64
+    try:
+        error_output = base64.b64decode(parsed[2]).decode('utf-8', 'replace').strip()
+    except Exception:
+        error_output = ''
+
+response = {
     'success': True,
     'device': device,
     'pcap_file': pcap_file,
     'running': running,
     'finished': not running,
     'size': size
-}))
+}
+# Only surface tcpdump's stderr when the capture produced no data; a normal
+# run also writes "listening on ..." there and that would just be noise.
+if not running and size == 0 and error_output:
+    response['error_output'] = error_output
+print(json.dumps(response))
 
 PYTHON_PCAP_STATUS
         exit 0

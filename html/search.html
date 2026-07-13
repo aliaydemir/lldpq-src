@@ -386,11 +386,13 @@
             margin-left: 5px;
             opacity: 0.5;
             font-size: 10px;
+            color: #666;
         }
-        
-        .data-table th.sort-asc .sort-icon::after { content: '▲'; opacity: 1; }
-        .data-table th.sort-desc .sort-icon::after { content: '▼'; opacity: 1; }
-        .data-table th:not(.sort-asc):not(.sort-desc) .sort-icon::after { content: '⇅'; }
+
+        .data-table th .sort-icon::after { content: '▲▼'; }
+        .data-table th.sort-asc .sort-icon::after { content: '▲'; color: #76b900; }
+        .data-table th.sort-desc .sort-icon::after { content: '▼'; color: #76b900; }
+        .data-table th.sort-asc .sort-icon, .data-table th.sort-desc .sort-icon { opacity: 1; }
         
         .data-table th.text-right,
         .data-table td.text-right {

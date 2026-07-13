@@ -46,7 +46,8 @@ def _atomic_write(path, content):
     )
     try:
         mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else 0o664
-        os.fchmod(descriptor, mode)
+        # Web-served output: nginx must always retain read access.
+        os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
             handle.write(content)
             handle.flush()

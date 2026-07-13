@@ -516,6 +516,10 @@ def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        # Web-served output: nginx must always retain read access, so lift
+        # mkstemp's private 0600 (and any inherited restrictive mode).
+        mode = (path.stat().st_mode & 0o7777) if path.exists() else 0o664
+        os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
@@ -537,7 +541,8 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     )
     try:
         mode = (path.stat().st_mode & 0o7777) if path.exists() else 0o664
-        os.fchmod(descriptor, mode)
+        # Web-served output: nginx must always retain read access.
+        os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
             json.dump(value, handle, separators=(",", ":"))

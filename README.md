@@ -685,6 +685,7 @@ removes the remaining partial tree.
 - **NVIDIA Cumulus Linux 5.x switches** with management IP access
 - **SSH key auth** to all switches (setup via web UI — see [SSH Setup](#08-ssh-setup))
 - All other dependencies (nginx, fcgiwrap, python3 ≥ 3.9, etc.) are installed automatically by `install.sh`
+- **Python packages**: `python3-yaml` (PyYAML), `python3-ruamel.yaml` and `python3-requests` are required by the fabric/ansible backends — `install.sh` checks and installs them; on air-gapped systems install the OS packages manually before running it
 
 ## [07] disk usage
 

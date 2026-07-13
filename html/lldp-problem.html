@@ -156,18 +156,19 @@
 
         function fetchAndDisplayLLDPResults() {
             fetch('problems-lldp_results.ini', { cache: 'no-store' })
-                .then(response => {
+                .then(async response => {
                     if (!response.ok) {
                         throw new Error('File not found');
                     }
-                    return response.text();
+                    const lastModified = response.headers?.get?.('Last-Modified') || '';
+                    return { data: await response.text(), lastModified };
                 })
-                .then(data => {
+                .then(({ data, lastModified }) => {
                     retryCount = 0;
                     const firstLine = data.split(/\r?\n/).find(line => line.trim())?.trim() || '';
                     setLastUpdated(firstLine.startsWith('Created on ')
                         ? firstLine.slice('Created on '.length)
-                        : '');
+                        : '', lastModified);
                     if (data.includes('Good news') || !/^===/m.test(data)) {
                         showNoProblems();
                     } else {
@@ -199,10 +200,20 @@
             return Number.isNaN(parsed.getTime()) ? null : parsed;
         }
 
-        function setLastUpdated(timestampFromFile) {
+        function parseLastModifiedHeader(value) {
+            if (!(value || '').trim()) return null;
+            const parsed = new Date(value);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function setLastUpdated(timestampFromFile, lastModifiedHeader) {
             const output = document.getElementById('last-updated');
             const warning = document.getElementById('stale-warning');
-            const parsed = parseReportTimestamp(timestampFromFile);
+            // Prefer the HTTP Last-Modified header: it carries a timezone,
+            // while the report timestamp is naive server-local time and would
+            // be misread in the browser's timezone.
+            const parsed = parseLastModifiedHeader(lastModifiedHeader) ||
+                parseReportTimestamp(timestampFromFile);
             if (!parsed) {
                 output.textContent = 'Unavailable';
                 warning.style.display = 'none';

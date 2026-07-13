@@ -1671,8 +1671,10 @@ def _action_save_bindings_locked():
 
     try:
         current_revision = inventory_revision()
+        # Callers that omit 'revision' opt out of the client-side conflict check
+        # (legacy API behavior); the initial-vs-current server check still applies.
         if current_revision != initial_revision or (
-            (not first_run) and client_revision != current_revision
+            (not first_run) and client_revision and client_revision != current_revision
         ):
             result_json({
                 'success': False,
@@ -7576,7 +7578,8 @@ def action_rebuild_devices_yaml():
     client_revision = str(data.get('revision', '')).strip()
     first_run = bool(data.get('first_run', False))
     initial_revision = inventory_revision()
-    if (not first_run) and client_revision != initial_revision:
+    # Callers that omit 'revision' opt out of the conflict check (legacy API behavior).
+    if (not first_run) and client_revision and client_revision != initial_revision:
         result_json({'success': False, 'error_code': 'inventory_conflict',
                      'error': 'Inventory changed on the server. Reload before rebuilding.',
                      'revision': initial_revision})

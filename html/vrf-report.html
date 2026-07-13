@@ -154,6 +154,7 @@
         
         .section-content {
             padding: 0;
+            overflow-x: auto;
         }
         
         /* Data Table */
@@ -1624,7 +1625,8 @@ html += `
                     enable_bfd: enableBfd
                 };
                 
-                if (enableEvpn) pg.enable_evpn = true;
+                // Always send enable_evpn so the backend can remove it when unchecked
+                pg.enable_evpn = enableEvpn;
                 if (description) pg.description = description;
                 
                 // Parse peers - could be interfaces (swpX) or IPs (IPv4/IPv6)
@@ -1816,7 +1818,11 @@ html += `
                 enable_evpn: document.getElementById('edit-bgp-enable-evpn').checked,
                 peer_groups: getPeerGroupsFromContainer('edit-bgp-peer-groups-container')
             };
-            
+
+            // Tell the backend which peer groups were removed in the modal
+            const originalPeerGroups = (bgpProfiles[originalName] || {}).peer_groups || {};
+            data.removed_peer_groups = Object.keys(originalPeerGroups).filter(g => !(g in data.peer_groups));
+
             try {
                 const response = await fetch('/fabric-api.sh?action=update-bgp-profile', {
                     method: 'POST',

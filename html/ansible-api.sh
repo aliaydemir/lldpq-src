@@ -363,7 +363,7 @@ run_deploy() {
     mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
 
     # Sweep stale job logs (older than 1 day) so state does not grow unbounded.
-    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' \) -mtime +1 -delete 2>/dev/null || true
+    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' -o -name '*.pid' \) -mtime +1 -delete 2>/dev/null || true
 
     # Single-runner lock: acquire it here so a concurrent request gets an
     # immediate "locked" response. The backgrounded job inherits this fd and
@@ -378,6 +378,7 @@ run_deploy() {
     local job_id="deploy-$(date +%Y%m%d-%H%M%S)-$$"
     local log_file="$DEPLOY_STATE_DIR/$job_id.log"
     local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
+    local pid_file="$DEPLOY_STATE_DIR/$job_id.pid"
 
     : > "$log_file" 2>/dev/null || {
         json_response '{"success": false, "error": "Cannot create deploy log"}'
@@ -387,13 +388,18 @@ run_deploy() {
     # Detach: setsid + closed stdio so the job outlives this CGI request, the
     # nginx timeout and the browser tab. fd 9 (the lock) is intentionally left
     # open for the child so the single-runner lock is held until it exits.
+    # The child records its own PID first so deploy-status can detect a job that
+    # died without writing an rc. The rc is written to a temp file and mv'd into
+    # place (atomic rename) so a poll can never read a half-written rc.
     setsid bash -c '
-        cd "$1" || { echo "ERROR: cannot access ansible directory: $1" >> "$2"; echo 1 > "$3"; exit 1; }
+        echo "$$" > "$5" 2>/dev/null
+        cd "$1" || { echo "ERROR: cannot access ansible directory: $1" >> "$2"; echo 1 > "$3.tmp"; mv -f "$3.tmp" "$3"; exit 1; }
         ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/deploy_switch_configs.yaml -l "$4,localhost" >> "$2" 2>&1
         rc=$?
-        echo "$rc" > "$3"
+        echo "$rc" > "$3.tmp"
+        mv -f "$3.tmp" "$3"
         exit "$rc"
-    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$host" </dev/null >/dev/null 2>&1 &
+    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$host" "$pid_file" </dev/null >/dev/null 2>&1 &
 
     json_response "{\"success\": true, \"started\": true, \"job_id\": \"$job_id\"}"
 }
@@ -413,6 +419,7 @@ deploy_status() {
 
     local log_file="$DEPLOY_STATE_DIR/$job_id.log"
     local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
+    local pid_file="$DEPLOY_STATE_DIR/$job_id.pid"
 
     if [ ! -f "$log_file" ]; then
         json_response '{"success": false, "error": "Unknown or expired deploy job"}'
@@ -421,9 +428,28 @@ deploy_status() {
 
     local output_json=$(cat "$log_file" 2>/dev/null | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 
+    local rc=""
     if [ -f "$rc_file" ]; then
-        local rc=$(tr -cd '0-9' < "$rc_file")
+        rc=$(tr -cd '0-9' < "$rc_file")
         rc=${rc:-1}
+    else
+        # No rc yet: verify the recorded job process is still alive, otherwise a
+        # crashed/OOM-killed/rebooted job would look "running" forever.
+        local pid=""
+        [ -f "$pid_file" ] && pid=$(tr -cd '0-9' < "$pid_file")
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            # Re-check the rc once: the job may have written it between checks.
+            if [ -f "$rc_file" ]; then
+                rc=$(tr -cd '0-9' < "$rc_file")
+                rc=${rc:-1}
+            else
+                json_response "{\"success\": false, \"done\": true, \"exit_code\": 1, \"output\": $output_json, \"error\": \"Deploy process died without writing a result\"}"
+                return
+            fi
+        fi
+    fi
+
+    if [ -n "$rc" ]; then
         if [ "$rc" -eq 0 ] 2>/dev/null; then
             json_response "{\"success\": true, \"done\": true, \"exit_code\": $rc, \"output\": $output_json}"
         else

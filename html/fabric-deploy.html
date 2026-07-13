@@ -866,7 +866,17 @@
     <script>
         let devices = {};
         let totalDeviceCount = 0;
-        let modifiedDevices = new Set();
+        // Pending-change devices come from two independent sources and are
+        // unioned for display: Fabric Scan / scan cache (config diff) and quick
+        // git scans. A git scan must never clear scan-derived marks; only a new
+        // Fabric Scan or a clean deploy of a device clears its scan mark.
+        let scanModifiedDevices = new Set();   // from Fabric Scan or scan cache
+        let gitModifiedDevices = new Set();    // from git status scans
+        let modifiedDevices = new Set();       // union of the two (display)
+
+        function rebuildModifiedDevices() {
+            modifiedDevices = new Set([...scanModifiedDevices, ...gitModifiedDevices]);
+        }
 
         // Cache configuration
         const CACHE_KEY = 'fabricDeploy_scanCache';
@@ -875,6 +885,7 @@
         // Active background deploy job (survives tab close / reload)
         const DEPLOY_JOB_KEY = 'fabricDeploy_activeJob';
         const DEPLOY_POLL_INTERVAL = 2000;
+        const DEPLOY_POLL_MAX_ERRORS = 5;
 
         function escapeHtml(value) {
             if (value === null || value === undefined) return '';
@@ -979,13 +990,14 @@
                         }
                     }
                     
-                    // Check if changes detected (compare with current)
-                    const previousCount = modifiedDevices.size;
-                    const hasChanges = newPendingDevices.size !== previousCount || 
-                        ![...newPendingDevices].every(d => modifiedDevices.has(d));
-                    
-                    // Set directly (no merge - always fresh from git status)
-                    modifiedDevices = newPendingDevices;
+                    // Git results replace only the git-derived set; devices
+                    // marked by a Fabric Scan are never cleared by a git scan.
+                    const previousUnion = modifiedDevices;
+                    const previousCount = previousUnion.size;
+                    gitModifiedDevices = newPendingDevices;
+                    rebuildModifiedDevices();
+                    const hasChanges = modifiedDevices.size !== previousCount ||
+                        ![...modifiedDevices].every(d => previousUnion.has(d));
                     
                     // Update UI if changes detected
                     if (hasChanges) {
@@ -1000,7 +1012,7 @@
                         updateSummaryCards();
 
                         // Flash the pending count to draw attention if new changes
-                        if (newPendingDevices.size > previousCount) {
+                        if (modifiedDevices.size > previousCount) {
                             const pendingEl = document.getElementById('pending-changes');
                             if (pendingEl) {
                                 pendingEl.style.animation = 'none';
@@ -1073,7 +1085,8 @@
             if (!cache) cache = loadScanCache();
             if (!cache || !Array.isArray(cache.pendingDevices)) return false;
 
-            modifiedDevices = new Set(cache.pendingDevices);
+            scanModifiedDevices = new Set(cache.pendingDevices);
+            rebuildModifiedDevices();
             if (cache.timestamp) {
                 showScanAge(cache.timestamp);
                 if (Date.now() - cache.timestamp > CACHE_STALE_THRESHOLD) {
@@ -1173,8 +1186,10 @@
                     console.log('[quickGitScan] Detected host_vars devices:', Array.from(gitPendingDevices));
                     console.log('[quickGitScan] Detected group_vars:', Array.from(modifiedGroups));
                     
-                    // Set modifiedDevices directly from git status (no caching, always fresh)
-                    modifiedDevices = gitPendingDevices;
+                    // Update only the git-derived set and re-union: never clear
+                    // devices marked modified by a Fabric Scan / scan cache.
+                    gitModifiedDevices = gitPendingDevices;
+                    rebuildModifiedDevices();
                     console.log('[quickGitScan] modifiedDevices:', modifiedDevices.size);
                     
                     // Show banner if group_vars changed
@@ -2007,8 +2022,9 @@
                     
                     console.log('Total pending devices found:', pendingDevices.size, Array.from(pendingDevices));
                     
-                    // Update modifiedDevices with real diff results
-                    modifiedDevices = pendingDevices;
+                    // Update the scan-derived set with real diff results and re-union
+                    scanModifiedDevices = pendingDevices;
+                    rebuildModifiedDevices();
                     
                     // Save to cache
                     saveScanCache(pendingDevices);
@@ -2114,8 +2130,12 @@
             // Per-host truth: only clear a badge when the recap proves the host is clean
             const cleanHosts = parseRecapCleanHosts(fullOutput);
             for (const hostname of selected) {
-                if (cleanHosts.has(hostname)) modifiedDevices.delete(hostname);
+                if (cleanHosts.has(hostname)) {
+                    scanModifiedDevices.delete(hostname);
+                    gitModifiedDevices.delete(hostname);
+                }
             }
+            rebuildModifiedDevices();
             renderDeviceList();
             updateSummaryCards();
         }
@@ -2123,15 +2143,33 @@
         // Poll deploy-status until done, streaming the growing log into the output area.
         async function pollDeployStatus(jobId, selected) {
             let lastLen = 0;
+            let pollErrors = 0;
             while (true) {
-                let data;
+                let resp, data;
                 try {
-                    const resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
+                    resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
                     data = await resp.json();
+                    pollErrors = 0;
                 } catch (e) {
-                    appendOutput('Error polling deploy status: ' + e.message, 'error');
+                    // Transient fetch/parse error: retry a few times, then stop.
+                    // Keep DEPLOY_JOB_KEY so a reload can resume watching the job.
+                    pollErrors++;
+                    if (pollErrors >= DEPLOY_POLL_MAX_ERRORS) {
+                        appendOutput('Error polling deploy status: ' + e.message, 'error');
+                        appendOutput('Stopped polling after repeated errors. The deploy keeps running in the background - reload the page to resume watching it.', 'error');
+                        showLoading(false);
+                        return;
+                    }
                     await sleep(DEPLOY_POLL_INTERVAL);
                     continue;
+                }
+
+                // Session expired/denied mid-deploy: keep DEPLOY_JOB_KEY so the
+                // job can be resumed after re-login; do not treat it as unknown.
+                if (resp.status === 401 || resp.status === 403) {
+                    appendOutput('Session expired. Log in again to resume watching this deploy (it keeps running in the background).', 'error');
+                    showLoading(false);
+                    return;
                 }
 
                 // Unknown/expired job (not running, not done, no success)
@@ -2244,8 +2282,12 @@
 
                 const cleanHosts = parseRecapCleanHosts(output);
                 for (const hostname of selected) {
-                    if (cleanHosts.has(hostname)) modifiedDevices.delete(hostname);
+                    if (cleanHosts.has(hostname)) {
+                        scanModifiedDevices.delete(hostname);
+                        gitModifiedDevices.delete(hostname);
+                    }
                 }
+                rebuildModifiedDevices();
                 renderDeviceList();
                 updateSummaryCards();
             } catch (e) {

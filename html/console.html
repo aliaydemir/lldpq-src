@@ -555,7 +555,9 @@
     function terminateRemote(sess) {
         try {
             const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-            const ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`);
+            // kill=1 tells the bridge this attach is teardown-only: if the sid is
+            // already gone it must close without spawning a fresh SSH session.
+            const ws = new WebSocket(`${proto}://${location.host}/console-ws?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}&kill=1`);
             ws.onopen = () => { try { ws.send(JSON.stringify({ t: 'end' })); } catch (e) {} try { ws.close(); } catch (e) {} };
             ws.onerror = () => { try { ws.close(); } catch (e) {} };
         } catch (e) {}

@@ -915,16 +915,17 @@
             border-right-color: #e0e0e0;
         }
         
-        body.light-theme .file-tree-item {
+        body.light-theme .file-item {
             color: #333;
         }
-        
-        body.light-theme .file-tree-item:hover {
+
+        body.light-theme .file-item:hover {
             background: #e0e0e0;
         }
-        
-        body.light-theme .file-tree-item.active {
+
+        body.light-theme .file-item.active {
             background: #d0d0d0;
+            color: #333;
         }
         
         body.light-theme .editor-tabs {
@@ -1014,7 +1015,98 @@
             border-top-color: #e0e0e0;
             color: #999;
         }
-        
+
+        body.light-theme .file-search-container {
+            background: #f3f3f3;
+            border-bottom-color: #e0e0e0;
+        }
+
+        body.light-theme .file-search-input {
+            background: #ffffff;
+            border-color: #d0d0d0;
+            color: #333;
+        }
+
+        body.light-theme .file-search-input::placeholder {
+            color: #999;
+        }
+
+        body.light-theme .status {
+            background: #e0e0e0;
+        }
+
+        body.light-theme .status.saved,
+        body.light-theme .status.valid {
+            color: #2e7d6b;
+        }
+
+        body.light-theme .status.modified {
+            color: #9a7d00;
+        }
+
+        body.light-theme .validation-indicator {
+            background: #e0e0e0;
+        }
+
+        body.light-theme .validation-indicator.valid {
+            color: #2e7d6b;
+        }
+
+        body.light-theme .dropdown-menu {
+            background: #ffffff;
+            border-color: #d0d0d0;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+
+        body.light-theme .dropdown-menu a {
+            color: #333;
+            border-bottom-color: #e0e0e0;
+        }
+
+        body.light-theme .dropdown-menu a:hover {
+            background: #e0e0e0;
+            color: #333;
+        }
+
+        body.light-theme .host-dropdown-trigger {
+            background: #ffffff;
+            border-color: #d0d0d0;
+            color: #333;
+        }
+
+        body.light-theme .host-dropdown-trigger:hover {
+            border-color: #b0b0b0;
+        }
+
+        body.light-theme .host-dropdown-menu {
+            background: #ffffff;
+            border-color: #d0d0d0;
+            box-shadow: 0 -4px 15px rgba(0,0,0,0.15);
+        }
+
+        body.light-theme .host-dropdown-item {
+            color: #333;
+        }
+
+        body.light-theme .host-dropdown-item:hover {
+            background: #e0e0e0;
+        }
+
+        body.light-theme .host-dropdown-group {
+            background: #f3f3f3;
+            color: #616161;
+            border-top-color: #e0e0e0;
+        }
+
+        body.light-theme .output-header {
+            background: #ececec;
+            border-bottom-color: #e0e0e0;
+        }
+
+        body.light-theme .output-content {
+            color: #333;
+        }
+
         /* Help Modal */
         .help-modal-overlay {
             display: none;
@@ -3463,6 +3555,68 @@
             }
         }
         
+        // Poll a background deploy job until done, refreshing the output panel
+        // with the growing log. Terminal states: rc=0 success, rc!=0 failure,
+        // unknown/expired job, auth denial (401/403), repeated poll errors.
+        const DEPLOY_POLL_INTERVAL = 2000;
+        const DEPLOY_POLL_MAX_ERRORS = 5;
+
+        async function pollDeployStatus(jobId) {
+            let lastLen = 0;
+            let pollErrors = 0;
+            while (true) {
+                let resp, data;
+                try {
+                    resp = await fetch('/ansible-api?action=deploy-status&job=' + encodeURIComponent(jobId));
+                    data = await resp.json();
+                    pollErrors = 0;
+                } catch (e) {
+                    pollErrors++;
+                    if (pollErrors >= DEPLOY_POLL_MAX_ERRORS) {
+                        showOutput('Error polling deploy status: ' + e.message + '\nStopped polling after repeated errors. The deploy keeps running in the background.', 'error');
+                        showLoading(false);
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, DEPLOY_POLL_INTERVAL));
+                    continue;
+                }
+
+                // Session expired/denied mid-deploy: the job keeps running server-side
+                if (resp.status === 401 || resp.status === 403) {
+                    showOutput('Session expired while deploying. Log in again; the deploy keeps running in the background.', 'error');
+                    showLoading(false);
+                    return;
+                }
+
+                // Unknown/expired job (not running, not done, no success)
+                if (!data.success && !data.running && !data.done) {
+                    showOutput(data.error || 'Unknown or expired deploy job', 'error');
+                    showLoading(false);
+                    return;
+                }
+
+                const out = data.output || '';
+
+                if (data.done) {
+                    showLoading(false);
+                    if (data.success) {
+                        showOutput(out || ('Deployment completed (exit code ' + data.exit_code + ').'), 'success');
+                    } else {
+                        showOutput((out ? out + '\n' : '') + (data.error || ('Deploy failed with exit code ' + data.exit_code)), 'error');
+                    }
+                    return;
+                }
+
+                // Still running: refresh the panel when the log has grown
+                if (out.length > lastLen) {
+                    showOutput(out);
+                    lastLen = out.length;
+                }
+
+                await new Promise(resolve => setTimeout(resolve, DEPLOY_POLL_INTERVAL));
+            }
+        }
+
         // Run deploy
         async function runDeploy() {
             const host = getSelectedHosts();
@@ -3470,11 +3624,27 @@
                 showOutput('Please select at least one target host/group', 'error');
                 return;
             }
-            
+
             // Note: confirm() removed as browsers block it
             showLoading(true, 'Deploying to ' + host + '...');
             try {
                 const result = await apiCall('deploy', { host });
+
+                // Lock held by another deploy/diff/generate
+                if (result && result.locked) {
+                    showOutput(result.error || 'Another operation is in progress. Try again shortly.', 'error');
+                    showLoading(false);
+                    return;
+                }
+
+                // Background job (current contract): poll deploy-status for the log/rc
+                if (result && result.started && result.job_id) {
+                    showOutput('Deploy started (job ' + result.job_id + '). Streaming log...');
+                    await pollDeployStatus(result.job_id);
+                    return;
+                }
+
+                // Fallback: backend returned a synchronous result
                 showOutput(result.output || result.error, result.success ? 'success' : 'error');
             } catch (e) {
                 showOutput('Error: ' + e.message, 'error');
