@@ -27,7 +27,7 @@ fi
 case "${LLDPQ_ADMIN_PAGE:-}" in
     /setup.html|/provision.html|/ai.html|/device.html|/console.html|/commands.html|\
     /vlan-report.html|/vrf-report.html|/fabric-exit.html|/fabric-config.html|\
-    /fabric-editor.html|/fabric-deploy.html|/lldpq-ztp-new-device-flow.html|\
+    /fabric-editor.html|/fabric-deploy.html|/fabric-migration.html|/lldpq-ztp-new-device-flow.html|\
     /fabric-scan-cache.json) ;;
     *)
         printf 'Status: 404 Not Found\n'

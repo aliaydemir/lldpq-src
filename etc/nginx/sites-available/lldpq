@@ -21,7 +21,7 @@ server {
         # Every page omitted from the operator menu is also admin-gated when
         # its URL is entered directly. The gateway validates the same session
         # cookie as the APIs before it releases any static HTML bytes.
-        location ~ ^/(?:setup|provision|ai|device|console|commands|vlan-report|vrf-report|fabric-exit|fabric-config|fabric-editor|fabric-deploy|lldpq-ztp-new-device-flow)\.html$ {
+        location ~ ^/(?:setup|provision|ai|device|console|commands|vlan-report|vrf-report|fabric-exit|fabric-config|fabric-editor|fabric-deploy|fabric-migration|lldpq-ztp-new-device-flow)\.html$ {
             fastcgi_pass unix:/var/run/fcgiwrap.socket;
             fastcgi_param SCRIPT_FILENAME /var/www/html/admin-page.sh;
             fastcgi_param LLDPQ_ADMIN_PAGE $uri;

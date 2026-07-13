@@ -1,0 +1,1519 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <link rel="shortcut icon" href="/png/favicon.ico">
+    <title>..::LLDPQ::..</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <script src="css/auth.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        /* Page Header */
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #404040;
+        }
+        .page-title {
+            font-size: 24px;
+            font-weight: 600;
+            color: #76b900;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .page-title svg { width: 28px; height: 28px; fill: #76b900; }
+        .page-sub { font-size: 13px; color: #888; margin-top: 4px; }
+        .action-buttons { display: flex; gap: 10px; align-items: center; }
+
+        /* Buttons */
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s ease;
+            font-family: inherit;
+        }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background: linear-gradient(0deg, #76b900 0%, #8bc34a 100%); color: white; }
+        .btn-primary:hover:not(:disabled) { background: linear-gradient(0deg, #8bc34a 0%, #9ccc65 100%); }
+        .btn-secondary { background: #3c3c3c; color: #d4d4d4; border: 1px solid #555; }
+        .btn-secondary:hover:not(:disabled) { background: #4a4a4a; border-color: #76b900; }
+        .btn-warning { background: linear-gradient(0deg, #e65100 0%, #ff9800 100%); color: white; }
+        .btn-warning:hover:not(:disabled) { background: linear-gradient(0deg, #ff9800 0%, #ffb74d 100%); }
+
+        /* Wizard steps */
+        .wizard { display: flex; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+        .wstep {
+            display: flex; align-items: center; gap: 8px;
+            cursor: pointer; padding: 6px 10px; border-radius: 6px; user-select: none;
+        }
+        .wstep:hover { background: #252526; }
+        .wstep.disabled { cursor: not-allowed; opacity: 0.45; }
+        .wstep .num {
+            width: 26px; height: 26px; border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 600;
+            background: #3c3c3c; color: #888; border: 1px solid #555;
+        }
+        .wstep .lbl { font-size: 13px; color: #888; }
+        .wstep.active .num { background: #76b900; color: #1e1e1e; border-color: #76b900; }
+        .wstep.active .lbl { color: #76b900; font-weight: 600; }
+        .wstep.done .num { background: #2d3a1a; color: #a5d66c; border-color: #76b900; }
+        .wstep.done .lbl { color: #a5d66c; }
+        .wconn { flex: 0 0 30px; height: 1px; background: #404040; margin: 0 2px; }
+
+        /* Summary Cards */
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .summary-card {
+            background: #252526;
+            padding: 15px;
+            border-radius: 6px;
+            border-left: 3px solid #76b900;
+        }
+        .card-total { border-left-color: #76b900; }
+        .card-info { border-left-color: #4fc3f7; }
+        .card-warning { border-left-color: #ff9800; }
+        .card-success { border-left-color: #4caf50; }
+        .card-value { font-size: 28px; font-weight: bold; }
+        .card-total .card-value { color: #76b900; }
+        .card-info .card-value { color: #4fc3f7; }
+        .card-warning .card-value { color: #ffb74d; }
+        .card-success .card-value { color: #81c784; }
+        .card-label {
+            font-size: 12px; color: #888; margin-top: 5px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+
+        /* Panels / layout */
+        .main-container { display: grid; grid-template-columns: 340px 1fr; gap: 20px; }
+        .panel {
+            background: #252526; border-radius: 8px; overflow: hidden;
+            display: flex; flex-direction: column;
+        }
+        .panel-header {
+            background: #2d2d2d; padding: 12px 15px;
+            border-bottom: 1px solid #404040;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .panel-title { font-size: 14px; font-weight: 600; color: #76b900; }
+        .select-actions { display: flex; gap: 10px; }
+        .select-actions a { color: #4fc3f7; font-size: 12px; text-decoration: none; cursor: pointer; }
+        .select-actions a:hover { text-decoration: underline; }
+        .panel-body { padding: 10px; overflow-y: auto; }
+
+        /* Device list */
+        .device-group-title {
+            font-size: 11px; color: #888; text-transform: uppercase;
+            letter-spacing: 0.5px; padding: 8px 5px 4px 5px;
+            display: flex; align-items: center; gap: 6px;
+        }
+        .device-item {
+            display: flex; align-items: center; gap: 8px;
+            padding: 5px 8px; border-radius: 4px; font-size: 13px;
+        }
+        .device-item:hover { background: #2d2d2d; }
+        .device-item input, .device-group-title input { accent-color: #76b900; }
+        .device-item .ip { margin-left: auto; color: #666; font-size: 11px; }
+        .search-input {
+            background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 4px;
+            color: #ccc; font-size: 12px; padding: 6px 10px; outline: none;
+            font-family: inherit;
+        }
+        .search-input:focus { border-color: #76b900; }
+        .search-input.bad { border-color: #f44336; }
+
+        /* Filters row */
+        .filter-row {
+            display: flex; gap: 10px; align-items: center;
+            padding: 10px 12px;
+            background: #252526; border-bottom: 1px solid #3c3c3c;
+            flex-wrap: wrap;
+        }
+        .filter-row label { font-size: 12px; color: #888; }
+        .chip {
+            font-size: 11px; padding: 3px 10px; border-radius: 10px;
+            background: #2d2d2d; color: #888; border: 1px solid #444;
+            cursor: pointer; user-select: none;
+        }
+        .chip.on { background: #1e2a10; color: #a5d66c; border-color: #4a6b1d; }
+
+        /* Tables */
+        table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+        table.tbl th {
+            text-align: left; padding: 8px 10px;
+            background: #2d2d2d; color: #888; font-weight: 600;
+            text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.5px;
+            border-bottom: 1px solid #404040;
+            position: sticky; top: 0; z-index: 1;
+        }
+        table.tbl td { padding: 6px 10px; border-bottom: 1px solid #303030; color: #ccc; }
+        table.tbl tr:hover td { background: #2a2a2a; }
+        .mono { font-family: 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; }
+        .muted { color: #666; }
+
+        /* Profile badges */
+        .pbadge {
+            display: inline-block; padding: 2px 8px; border-radius: 3px;
+            font-size: 11px; font-family: Menlo, Consolas, monospace;
+            white-space: nowrap;
+        }
+        .p-old { background: #3a1f1f; color: #ef9a9a; border: 1px solid #6b2b2b; }
+        .p-new { background: #1e2a10; color: #a5d66c; border: 1px solid #4a6b1d; }
+        .p-cur { background: #2d2d2d; color: #aaa; border: 1px solid #444; }
+        .arrow { color: #666; margin: 0 6px; }
+
+        /* Mapping rows */
+        .map-row {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 14px; border-bottom: 1px solid #303030;
+            flex-wrap: wrap;
+        }
+        .map-row select {
+            background: #1e1e1e; border: 1px solid #3c3c3c; border-radius: 4px;
+            color: #ccc; font-size: 12.5px; padding: 6px 10px; outline: none;
+            font-family: Menlo, Consolas, monospace;
+        }
+        .map-info { font-size: 12px; color: #81c784; }
+        .map-info.warn { color: #ffb74d; }
+        .map-count { font-size: 11px; color: #888; margin-left: auto; }
+
+        /* Terminal */
+        .term {
+            background: #111; border: 1px solid #333; border-radius: 6px;
+            padding: 12px 14px; font-family: Menlo, Consolas, monospace;
+            font-size: 12px; line-height: 1.55; overflow: auto;
+            white-space: pre-wrap; color: #bbb;
+            max-height: 420px; min-height: 120px;
+        }
+        .term .ok { color: #81c784; }
+        .term .chg { color: #ffb74d; }
+        .term .err { color: #ef9a9a; }
+        .term .hdr { color: #4fc3f7; }
+
+        /* Step sections */
+        .step-section { display: none; }
+        .step-section.visible { display: block; }
+        .step-foot {
+            display: flex; justify-content: space-between; align-items: center;
+            margin-top: 18px; padding-top: 14px; border-top: 1px solid #333;
+            gap: 10px; flex-wrap: wrap;
+        }
+        .foot-note { font-size: 11px; color: #555; }
+
+        .status-pill {
+            display: inline-flex; align-items: center; gap: 5px;
+            padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 600;
+            white-space: nowrap;
+        }
+        .st-pass { background: #1e2a10; color: #81c784; }
+        .st-warn { background: #2d2a1a; color: #ffb74d; }
+        .st-fail { background: #3a1f1f; color: #ef9a9a; }
+
+        .note-box {
+            background: #252526; border-left: 3px solid #4fc3f7; border-radius: 4px;
+            padding: 10px 14px; font-size: 12.5px; color: #aaa; margin: 12px 0;
+        }
+        .note-box.warn { border-left-color: #ff9800; }
+        .note-box.good { border-left-color: #76b900; }
+
+        /* Modals */
+        .modal-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.6); z-index: 100;
+            align-items: center; justify-content: center;
+        }
+        .modal-overlay.visible { display: flex; }
+        .modal {
+            background: #252526; border: 1px solid #404040; border-radius: 8px;
+            width: min(640px, 92vw); max-height: 84vh; display: flex; flex-direction: column;
+        }
+        .modal-header {
+            padding: 14px 18px; border-bottom: 1px solid #404040;
+            font-size: 15px; font-weight: 600; color: #76b900;
+        }
+        .modal-header.warning { color: #ffb74d; }
+        .modal-body { padding: 16px 18px; overflow-y: auto; font-size: 13px; white-space: pre-wrap; }
+        .modal-foot {
+            padding: 12px 18px; border-top: 1px solid #404040;
+            display: flex; justify-content: flex-end; gap: 10px;
+        }
+        .modal textarea {
+            width: 100%; min-height: 120px; background: #1e1e1e; color: #ccc;
+            border: 1px solid #3c3c3c; border-radius: 4px; padding: 8px;
+            font-family: Menlo, Consolas, monospace; font-size: 12px;
+        }
+
+        /* Loading overlay */
+        #loading-overlay {
+            display: none; position: fixed; inset: 0;
+            background: rgba(0,0,0,0.55); z-index: 200;
+            align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+        }
+        #loading-overlay.visible { display: flex; }
+        .spinner {
+            width: 38px; height: 38px; border-radius: 50%;
+            border: 3px solid #333; border-top-color: #76b900;
+            animation: spin 0.9s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        #loading-text { color: #ccc; font-size: 13px; }
+    </style>
+</head>
+<body>
+
+<div class="page-header">
+    <div>
+        <div class="page-title">
+            <svg viewBox="0 0 24 24"><path d="M4 7h11v2H4zm0 4h11v2H4zm0 4h7v2H4zm14.6-6.6L16 6l1.4-1.4L20.8 8l-3.4 3.4L16 10zm0 8L16 14l1.4-1.4 3.4 3.4-3.4 3.4L16 18z"/></svg>
+            Fabric Migration
+        </div>
+        <div class="page-sub">Bulk port-profile migration &mdash; move racks or endpoint groups between tenants</div>
+    </div>
+    <div class="action-buttons">
+        <button class="btn btn-secondary" onclick="openPlansModal()">Saved Plans</button>
+        <button class="btn btn-secondary" onclick="openPatternsModal()">Rack Patterns</button>
+    </div>
+</div>
+
+<div class="wizard" id="wizbar">
+    <div class="wstep" data-step="1" onclick="goStep(1)"><div class="num">1</div><div class="lbl">Select Ports</div></div>
+    <div class="wconn"></div>
+    <div class="wstep" data-step="2" onclick="goStep(2)"><div class="num">2</div><div class="lbl">Profile Mapping</div></div>
+    <div class="wconn"></div>
+    <div class="wstep" data-step="3" onclick="goStep(3)"><div class="num">3</div><div class="lbl">Preview &amp; Apply</div></div>
+    <div class="wconn"></div>
+    <div class="wstep" data-step="4" onclick="goStep(4)"><div class="num">4</div><div class="lbl">Diff &amp; Deploy</div></div>
+    <div class="wconn"></div>
+    <div class="wstep" data-step="5" onclick="goStep(5)"><div class="num">5</div><div class="lbl">Verify</div></div>
+</div>
+
+<div id="loaded-plan-banner" class="note-box good" style="display:none;"></div>
+
+<!-- ============ STEP 1 ============ -->
+<div class="step-section" id="step1">
+    <div class="summary-grid">
+        <div class="summary-card card-total"><div class="card-value" id="c1-devices">0</div><div class="card-label">Devices selected</div></div>
+        <div class="summary-card card-info"><div class="card-value" id="c1-ports">0</div><div class="card-label">Ports loaded</div></div>
+        <div class="summary-card card-success"><div class="card-value" id="c1-checked">0</div><div class="card-label">Ports selected</div></div>
+        <div class="summary-card card-warning"><div class="card-value" id="c1-profiles">0</div><div class="card-label">Source profiles</div></div>
+    </div>
+
+    <div class="main-container">
+        <div class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Devices</span>
+                <div class="select-actions">
+                    <a onclick="setAllDevices(true)">All</a>
+                    <a onclick="setAllDevices(false)">None</a>
+                </div>
+            </div>
+            <div style="padding: 8px 10px; border-bottom: 1px solid #3c3c3c;">
+                <input type="text" id="device-search" class="search-input" placeholder="Search devices..." style="width:100%;" oninput="renderDeviceList()">
+            </div>
+            <div class="panel-body" id="device-list" style="max-height: 460px;"></div>
+            <div style="padding: 10px; border-top: 1px solid #3c3c3c;">
+                <button class="btn btn-primary" style="width:100%; justify-content:center;" onclick="loadPorts()">Load Ports from Selected Devices</button>
+            </div>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <span class="panel-title">Ports &amp; Bonds (with a port profile)</span>
+                <div class="select-actions">
+                    <a onclick="setFilteredChecked(true)">Select filtered</a>
+                    <a onclick="setFilteredChecked(false)">Clear filtered</a>
+                </div>
+            </div>
+            <div class="filter-row">
+                <label>Rack:</label>
+                <input type="text" id="rack-input" class="search-input" placeholder="e.g. 14" style="width:70px;">
+                <button class="btn btn-secondary" onclick="applyRackFilter()">Apply rack patterns</button>
+                <label>Name/description filter (regex):</label>
+                <input type="text" id="port-filter" class="search-input" placeholder="e.g. ^A14-|bond_1_14_" style="flex:1; min-width:180px;" oninput="onPortFilterInput()">
+                <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearPortFilter()">clear</a>
+            </div>
+            <div class="filter-row" id="profile-chips"></div>
+            <div class="panel-body" style="max-height: 420px;">
+                <table class="tbl">
+                    <thead><tr>
+                        <th style="width:28px;"><input type="checkbox" id="check-all" onchange="setFilteredChecked(this.checked)"></th>
+                        <th>Device</th><th>Port</th><th>Description</th><th>Current Profile</th><th>Match</th>
+                    </tr></thead>
+                    <tbody id="port-table-body">
+                        <tr><td colspan="6" class="muted" style="padding:20px;">Select devices on the left and click "Load Ports".</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div style="padding: 8px 12px; border-top: 1px solid #3c3c3c;" class="foot-note" id="unmanaged-note"></div>
+        </div>
+    </div>
+
+    <div class="step-foot">
+        <span class="foot-note">Only interfaces/bonds carrying a <span class="mono">sw_port_profile</span> can be migrated. L3 ports, bond members and unmanaged ports are excluded.</span>
+        <button class="btn btn-primary" onclick="goStep(2)">Next: Profile Mapping &rarr;</button>
+    </div>
+</div>
+
+<!-- ============ STEP 2 ============ -->
+<div class="step-section" id="step2">
+    <div class="panel">
+        <div class="panel-header"><span class="panel-title">Profile Mapping (old &rarr; new)</span></div>
+        <div id="mapping-rows"></div>
+    </div>
+    <div id="readiness-box"></div>
+    <div class="step-foot">
+        <button class="btn btn-secondary" onclick="goStep(1)">&larr; Back</button>
+        <button class="btn btn-primary" onclick="goStep(3)">Next: Preview &rarr;</button>
+    </div>
+</div>
+
+<!-- ============ STEP 3 ============ -->
+<div class="step-section" id="step3">
+    <div class="summary-grid">
+        <div class="summary-card card-total"><div class="card-value" id="c3-changes">0</div><div class="card-label">Port changes</div></div>
+        <div class="summary-card card-info"><div class="card-value" id="c3-files">0</div><div class="card-label">host_vars files</div></div>
+        <div class="summary-card card-warning"><div class="card-value" id="c3-unmapped">0</div><div class="card-label">Selected but unmapped</div></div>
+        <div class="summary-card card-success"><div class="card-value">&#10003;</div><div class="card-label">Reversible (plan saved)</div></div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Change Plan</span>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <label style="font-size:12px; color:#888;">Plan name:</label>
+                <input type="text" id="plan-name" class="search-input" style="width:240px;">
+            </div>
+        </div>
+        <div class="panel-body" style="max-height: 380px;">
+            <table class="tbl">
+                <thead><tr><th>Device</th><th>Ports</th><th>Change</th></tr></thead>
+                <tbody id="preview-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="apply-results"></div>
+
+    <div class="step-foot">
+        <button class="btn btn-secondary" onclick="goStep(2)">&larr; Back</button>
+        <div style="display:flex; gap:10px;">
+            <button class="btn btn-secondary" onclick="applyPlan(true)">Server Dry-Run</button>
+            <button class="btn btn-warning" id="apply-btn" onclick="applyPlan(false)">Apply to host_vars</button>
+            <button class="btn btn-primary" id="to-step4-btn" onclick="goStep(4)" disabled>Next: Diff &amp; Deploy &rarr;</button>
+        </div>
+    </div>
+</div>
+
+<!-- ============ STEP 4 ============ -->
+<div class="step-section" id="step4">
+    <div class="note-box" id="deploy-scope-note"></div>
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Ansible Output</span>
+            <div class="select-actions">
+                <a onclick="clearTerm('deploy-term')">clear</a>
+            </div>
+        </div>
+        <div style="padding: 12px;">
+            <div class="term" id="deploy-term">Run Generate / Diff to review the rendered NVUE change, then Deploy.</div>
+        </div>
+    </div>
+    <div class="step-foot">
+        <button class="btn btn-secondary" onclick="goStep(3)">&larr; Back</button>
+        <div style="display:flex; gap:10px;">
+            <button class="btn btn-secondary" onclick="runGenerate()">Generate</button>
+            <button class="btn btn-secondary" onclick="runDiff()">Diff</button>
+            <button class="btn btn-warning" onclick="runDeploy()">Deploy</button>
+            <button class="btn btn-primary" onclick="goStep(5)">Next: Verify &rarr;</button>
+        </div>
+    </div>
+</div>
+
+<!-- ============ STEP 5 ============ -->
+<div class="step-section" id="step5">
+    <div class="summary-grid">
+        <div class="summary-card card-success"><div class="card-value" id="c5-pass">-</div><div class="card-label">Ports on target VLAN</div></div>
+        <div class="summary-card card-warning"><div class="card-value" id="c5-warn">-</div><div class="card-label">Warnings</div></div>
+        <div class="summary-card card-info"><div class="card-value" id="c5-arp">-</div><div class="card-label">ARP entries in target VRFs</div></div>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            <span class="panel-title">Post-migration Checks (live <span class="mono">bridge vlan</span> + fabric tables)</span>
+            <div class="select-actions"><a onclick="runVerification()">Re-run</a></div>
+        </div>
+        <div class="panel-body" style="max-height: 420px;">
+            <table class="tbl">
+                <thead><tr><th>Device</th><th>Port</th><th>Expected VLAN</th><th>Live PVID</th><th>Status</th></tr></thead>
+                <tbody id="verify-table-body">
+                    <tr><td colspan="5" class="muted" style="padding:20px;">Click "Run Verification" after deploying.</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div style="padding: 8px 12px; border-top: 1px solid #3c3c3c;" class="foot-note" id="arp-note"></div>
+    </div>
+
+    <div class="step-foot">
+        <button class="btn btn-secondary" onclick="goStep(4)">&larr; Back</button>
+        <div style="display:flex; gap:10px;">
+            <button class="btn btn-primary" onclick="runVerification()">Run Verification</button>
+            <button class="btn btn-warning" id="rollback-btn" onclick="rollbackPlan()" disabled>Rollback This Migration</button>
+        </div>
+    </div>
+</div>
+
+<!-- Alert modal -->
+<div class="modal-overlay" id="alert-modal" onclick="if(event.target===this) hideAlert()">
+    <div class="modal">
+        <div class="modal-header" id="alert-title">Warning</div>
+        <div class="modal-body" id="alert-message"></div>
+        <div class="modal-foot"><button class="btn btn-primary" onclick="hideAlert()">OK</button></div>
+    </div>
+</div>
+
+<!-- Confirm modal -->
+<div class="modal-overlay" id="confirm-modal" onclick="if(event.target===this) resolveConfirm(false)">
+    <div class="modal">
+        <div class="modal-header warning" id="confirm-title">Confirm Action</div>
+        <div class="modal-body" id="confirm-message"></div>
+        <div class="modal-foot">
+            <button class="btn btn-secondary" onclick="resolveConfirm(false)">Cancel</button>
+            <button class="btn btn-warning" onclick="resolveConfirm(true)">Confirm</button>
+        </div>
+    </div>
+</div>
+
+<!-- Saved plans modal -->
+<div class="modal-overlay" id="plans-modal" onclick="if(event.target===this) closePlansModal()">
+    <div class="modal" style="width:min(760px,94vw);">
+        <div class="modal-header">Saved Migration Plans</div>
+        <div class="modal-body" id="plans-body" style="white-space:normal;">Loading...</div>
+        <div class="modal-foot"><button class="btn btn-secondary" onclick="closePlansModal()">Close</button></div>
+    </div>
+</div>
+
+<!-- Rack patterns modal -->
+<div class="modal-overlay" id="patterns-modal" onclick="if(event.target===this) closePatternsModal()">
+    <div class="modal">
+        <div class="modal-header">Rack Match Patterns</div>
+        <div class="modal-body" style="white-space:normal;">
+            <p style="color:#888; font-size:12px; margin-bottom:10px;">
+                One regex per line, applied to interface/bond <b>names and descriptions</b>.
+                Placeholders: <span class="mono">{rack}</span> = rack number, <span class="mono">{rack2}</span> = zero-padded 2 digits.
+                These are site-specific naming conventions; adjust for your fabric.
+            </p>
+            <textarea id="patterns-text" spellcheck="false"></textarea>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-secondary" onclick="resetPatterns()">Reset to defaults</button>
+            <button class="btn btn-primary" onclick="savePatterns()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div id="loading-overlay"><div class="spinner"></div><div id="loading-text">Working...</div></div>
+
+<script>
+    // ---------- State ----------
+    let devices = {};           // group -> [{hostname, ip}]
+    let deviceData = {};        // hostname -> get-device response
+    let portProfiles = {};      // sw_port_profiles.yaml content (global)
+    let vlanProfilesData = {};  // VLAN profile name -> summary (global)
+    let portRows = [];          // {device, section, name, desc, profile, checked, evidence}
+    let activeProfiles = null;  // Set of profiles enabled via chips (null = all)
+    let mappings = {};          // source profile -> target profile
+    let currentPlan = null;     // {name, changes:{dev:{interfaces:{},bonds:{}}}, entries:[...]}
+    let appliedPlan = null;     // plan record after successful apply (or loaded plan)
+    let unmanagedCount = 0;
+
+    const DEPLOY_JOB_KEY = 'fabricMigration_activeJob';
+    const PATTERNS_KEY = 'fabricMigration_rackPatterns';
+    const DEPLOY_POLL_INTERVAL = 2000;
+    const DEPLOY_POLL_MAX_ERRORS = 5;
+    const DEFAULT_RACK_PATTERNS = [
+        '^A{rack2}-',            // TOR endpoint descriptions: A14-37-S1-DGX-01-C18:BMC
+        'GB300-\\d+-{rack}-',    // tray/shelf descriptions: GB300-1-14-Tray-01:M1
+        '^bond_\\d+_{rack}_',    // per-tray bonds: bond_1_14_1
+        '^[a-z-]+tor-\\d+-{rack}-' // peer-TOR descriptions on aggregation leafs
+    ];
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(s) {
+        return String(s == null ? '' : s)
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    // ---------- Modals / overlay ----------
+    function showAlert(message, title = 'Warning') {
+        $('alert-title').textContent = title;
+        $('alert-message').textContent = message;
+        $('alert-modal').classList.add('visible');
+    }
+    function hideAlert() { $('alert-modal').classList.remove('visible'); }
+
+    let confirmResolver = null;
+    function confirmAsync(message, title = 'Confirm Action') {
+        return new Promise((resolve) => {
+            confirmResolver = resolve;
+            $('confirm-title').textContent = title;
+            $('confirm-message').textContent = message;
+            $('confirm-modal').classList.add('visible');
+        });
+    }
+    function resolveConfirm(v) {
+        $('confirm-modal').classList.remove('visible');
+        if (confirmResolver) { confirmResolver(v); confirmResolver = null; }
+    }
+
+    function showLoading(on, text) {
+        $('loading-text').textContent = text || 'Working...';
+        $('loading-overlay').classList.toggle('visible', !!on);
+    }
+
+    // ---------- Wizard ----------
+    function canEnter(step) {
+        if (step <= 1) return true;
+        if (step === 2) return portRows.some(r => r.checked);
+        if (step === 3) return Object.keys(mappings).some(k => mappings[k]);
+        return !!appliedPlan; // steps 4-5 need an applied or loaded plan
+    }
+    function goStep(n) {
+        if (!canEnter(n)) {
+            const why = { 2: 'Select at least one port first.', 3: 'Define at least one profile mapping first.',
+                          4: 'Apply a change plan (or load a saved plan) first.', 5: 'Apply a change plan (or load a saved plan) first.' }[n];
+            if (why) showAlert(why, 'Step not ready');
+            return;
+        }
+        if (n === 2) buildMappingUI();
+        if (n === 3) buildPreview();
+        if (n === 4) buildDeployScope();
+        for (let i = 1; i <= 5; i++) $('step' + i).classList.toggle('visible', i === n);
+        document.querySelectorAll('.wstep').forEach(el => {
+            const s = parseInt(el.dataset.step);
+            el.classList.toggle('active', s === n);
+            el.classList.toggle('done', s < n);
+            el.classList.toggle('disabled', !canEnter(s));
+        });
+    }
+
+    // ---------- Step 1: devices & ports ----------
+    async function loadDevices() {
+        const resp = await fetch('/fabric-api.sh?action=list-devices');
+        const data = await resp.json();
+        if (!data.success) { showAlert('Failed to load devices: ' + (data.error || 'unknown'), 'Error'); return; }
+        devices = data.devices || {};
+        renderDeviceList();
+    }
+
+    function renderDeviceList() {
+        const q = ($('device-search').value || '').toLowerCase();
+        let html = '';
+        for (const group of Object.keys(devices)) {
+            const members = devices[group].filter(d => !q || d.hostname.toLowerCase().includes(q));
+            if (!members.length) continue;
+            html += `<div class="device-group-title"><input type="checkbox" data-group="${escapeHtml(group)}"> ${escapeHtml(group)}</div>`;
+            for (const d of members) {
+                const checked = selectedDevices.has(d.hostname) ? 'checked' : '';
+                html += `<div class="device-item"><input type="checkbox" ${checked} data-host="${escapeHtml(d.hostname)}"> ${escapeHtml(d.hostname)} <span class="ip">${escapeHtml(d.ip || '')}</span></div>`;
+            }
+        }
+        $('device-list').innerHTML = html || '<div class="muted" style="padding:10px;">No devices found.</div>';
+        updateStep1Cards();
+    }
+
+    const selectedDevices = new Set();
+    function toggleDevice(h, on) { on ? selectedDevices.add(h) : selectedDevices.delete(h); updateStep1Cards(); }
+    function toggleGroup(group, on) {
+        for (const d of (devices[group] || [])) { on ? selectedDevices.add(d.hostname) : selectedDevices.delete(d.hostname); }
+        renderDeviceList();
+    }
+    function setAllDevices(on) {
+        selectedDevices.clear();
+        if (on) for (const g of Object.keys(devices)) for (const d of devices[g]) selectedDevices.add(d.hostname);
+        renderDeviceList();
+    }
+
+    // Bounded-concurrency fetch pool: 58 parallel CGI hits would hammer fcgiwrap.
+    async function fetchPool(items, limit, fn) {
+        const results = [];
+        let next = 0;
+        async function worker() {
+            while (next < items.length) {
+                const idx = next++;
+                results[idx] = await fn(items[idx]);
+            }
+        }
+        await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+        return results;
+    }
+
+    async function loadPorts() {
+        const hosts = [...selectedDevices];
+        if (!hosts.length) { showAlert('Select at least one device.', 'No Selection'); return; }
+        showLoading(true, `Loading host_vars for ${hosts.length} device(s)...`);
+        try {
+            const results = await fetchPool(hosts, 8, async h => {
+                try {
+                    const r = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(h)}`);
+                    return [h, await r.json()];
+                } catch (e) { return [h, { success: false, error: e.message }]; }
+            });
+            portRows = [];
+            unmanagedCount = 0;
+            const failed = [];
+            for (const [h, data] of results) {
+                if (!data.success) { failed.push(h); continue; }
+                deviceData[h] = data;
+                if (data.port_profiles && Object.keys(data.port_profiles).length) portProfiles = data.port_profiles;
+                if (data.vlan_profiles && Object.keys(data.vlan_profiles).length) vlanProfilesData = data.vlan_profiles;
+                for (const section of ['interfaces', 'bonds']) {
+                    const node = (data.config || {})[section] || {};
+                    for (const [name, cfg] of Object.entries(node)) {
+                        if (!cfg || typeof cfg !== 'object') continue;
+                        if (typeof cfg.sw_port_profile === 'string' && cfg.sw_port_profile) {
+                            portRows.push({ device: h, section, name, desc: cfg.description || '',
+                                            profile: cfg.sw_port_profile, checked: false, evidence: '' });
+                        } else {
+                            unmanagedCount++;
+                        }
+                    }
+                }
+            }
+            portRows.sort((a, b) => a.device.localeCompare(b.device) ||
+                a.name.localeCompare(b.name, undefined, { numeric: true }));
+            activeProfiles = null;
+            renderProfileChips();
+            renderPortTable();
+            if (failed.length) showAlert('Failed to load: ' + failed.join(', '), 'Partial Load');
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    function distinctProfiles(rows) {
+        const m = new Map();
+        for (const r of rows) m.set(r.profile, (m.get(r.profile) || 0) + 1);
+        return m;
+    }
+
+    function renderProfileChips() {
+        const counts = distinctProfiles(portRows);
+        let html = '<label>Current profile:</label>';
+        for (const [p, n] of [...counts.entries()].sort()) {
+            const on = !activeProfiles || activeProfiles.has(p);
+            html += `<span class="chip ${on ? 'on' : ''}" data-profile="${escapeHtml(p)}">${escapeHtml(p)} (${n})</span>`;
+        }
+        $('profile-chips').innerHTML = counts.size ? html : '';
+    }
+
+    function toggleProfileChip(p) {
+        const counts = distinctProfiles(portRows);
+        if (!activeProfiles) activeProfiles = new Set(counts.keys());
+        activeProfiles.has(p) ? activeProfiles.delete(p) : activeProfiles.add(p);
+        if (activeProfiles.size === counts.size) activeProfiles = null;
+        renderProfileChips();
+        renderPortTable();
+    }
+
+    let portFilterRe = null;
+    function onPortFilterInput() {
+        const v = $('port-filter').value.trim();
+        try {
+            portFilterRe = v ? new RegExp(v, 'i') : null;
+            $('port-filter').classList.remove('bad');
+        } catch (e) {
+            portFilterRe = null;
+            $('port-filter').classList.add('bad');
+            return;
+        }
+        for (const r of portRows) r.evidence = '';
+        renderPortTable();
+    }
+    function clearPortFilter() { $('port-filter').value = ''; onPortFilterInput(); }
+
+    function getRackPatterns() {
+        try {
+            const saved = JSON.parse(localStorage.getItem(PATTERNS_KEY));
+            if (Array.isArray(saved) && saved.length) return saved;
+        } catch (e) { /* fall through */ }
+        return DEFAULT_RACK_PATTERNS.slice();
+    }
+
+    async function applyRackFilter() {
+        const rack = parseInt($('rack-input').value, 10);
+        if (!rack && rack !== 0) { showAlert('Enter a rack number first.', 'Rack Filter'); return; }
+        // Convenience: auto-load ports if the user jumped straight to the rack filter
+        if (!portRows.length) {
+            if (!selectedDevices.size) {
+                showAlert('Select devices on the left first (the rack filter runs on their loaded ports).', 'Rack Filter');
+                return;
+            }
+            await loadPorts();
+            if (!portRows.length) return;
+        }
+        const pats = getRackPatterns().map(p => p
+            .replaceAll('{rack2}', String(rack).padStart(2, '0'))
+            .replaceAll('{rack}', String(rack)));
+        const compiled = [];
+        for (const p of pats) {
+            try { compiled.push({ src: p, re: new RegExp(p, 'i') }); } catch (e) { /* skip bad pattern */ }
+        }
+        let matched = 0;
+        for (const r of portRows) {
+            const hit = compiled.find(c => c.re.test(r.name) || c.re.test(r.desc));
+            r.evidence = hit ? hit.src : '';
+            if (hit) matched++;
+        }
+        portFilterRe = { test: () => true, rackMode: true };  // visibility driven by evidence
+        $('port-filter').value = pats.join(' | ');
+        $('port-filter').classList.remove('bad');
+        renderPortTable();
+        if (!matched) showAlert('No ports matched the rack patterns. Check "Rack Patterns" in the header for your site conventions.', 'Rack Filter');
+    }
+
+    function rowVisible(r) {
+        if (activeProfiles && !activeProfiles.has(r.profile)) return false;
+        if (portFilterRe && portFilterRe.rackMode) return !!r.evidence;
+        if (portFilterRe) return portFilterRe.test(r.name) || portFilterRe.test(r.desc);
+        return true;
+    }
+
+    function renderPortTable() {
+        const rows = portRows.filter(rowVisible);
+        let html = '';
+        for (const r of rows) {
+            const idx = portRows.indexOf(r);
+            html += `<tr>
+                <td><input type="checkbox" ${r.checked ? 'checked' : ''} onchange="portRows[${idx}].checked = this.checked; updateStep1Cards();"></td>
+                <td>${escapeHtml(r.device)}</td>
+                <td class="mono">${escapeHtml(r.name)}${r.section === 'bonds' ? ' <span class="muted">(bond)</span>' : ''}</td>
+                <td class="mono muted">${escapeHtml(r.desc)}</td>
+                <td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>
+                <td class="mono muted" style="font-size:10.5px;">${escapeHtml(r.evidence)}</td>
+            </tr>`;
+        }
+        $('port-table-body').innerHTML = html ||
+            `<tr><td colspan="6" class="muted" style="padding:20px;">${portRows.length ? 'No ports match the current filters.' : 'Select devices on the left and click "Load Ports".'}</td></tr>`;
+        $('unmanaged-note').textContent = unmanagedCount
+            ? `${unmanagedCount} interface(s)/bond(s) without sw_port_profile (L3 / bond members / unmanaged) are not shown.` : '';
+        updateStep1Cards();
+    }
+
+    function setFilteredChecked(on) {
+        for (const r of portRows) if (rowVisible(r)) r.checked = on;
+        renderPortTable();
+    }
+
+    function updateStep1Cards() {
+        $('c1-devices').textContent = selectedDevices.size;
+        $('c1-ports').textContent = portRows.length;
+        const checked = portRows.filter(r => r.checked);
+        $('c1-checked').textContent = checked.length;
+        $('c1-profiles').textContent = distinctProfiles(checked).size;
+    }
+
+    // ---------- Step 2: mapping ----------
+    function profileInfo(name) {
+        const p = portProfiles[name] || {};
+        const mode = p.sw_port_mode || '?';
+        const vlan = p.access_vlan != null ? parseInt(p.access_vlan, 10) : null;
+        let vrf = null, gw = null, desc = null, sviProfile = null;
+        if (vlan != null) {
+            for (const [vpName, vp] of Object.entries(vlanProfilesData)) {
+                const vlans = vp.vlans || {};
+                if (vlans[vlan] !== undefined || vlans[String(vlan)] !== undefined) {
+                    const vcfg = vlans[vlan] || vlans[String(vlan)] || {};
+                    vrf = vcfg.vrf || vp.vrf || 'default';
+                    gw = vcfg.ip || vcfg.vrr_vip || null;
+                    desc = vcfg.description || vp.description || '';
+                    sviProfile = vpName;
+                    break;
+                }
+            }
+        }
+        return { mode, vlan, vrf, gw, desc, sviProfile };
+    }
+
+    function buildMappingUI() {
+        const checked = portRows.filter(r => r.checked);
+        const counts = distinctProfiles(checked);
+        // Drop mappings whose source is no longer selected
+        for (const k of Object.keys(mappings)) if (!counts.has(k)) delete mappings[k];
+
+        const allProfiles = Object.keys(portProfiles).sort();
+        let html = '';
+        for (const [src, n] of [...counts.entries()].sort()) {
+            const si = profileInfo(src);
+            const devs = new Set(checked.filter(r => r.profile === src).map(r => r.device));
+            let opts = '<option value="">(keep unchanged)</option>';
+            for (const p of allProfiles) {
+                if (p === src) continue;
+                opts += `<option value="${escapeHtml(p)}" ${mappings[src] === p ? 'selected' : ''}>${escapeHtml(p)}</option>`;
+            }
+            const tgt = mappings[src];
+            html += `<div class="map-row">
+                <span class="pbadge p-old">${escapeHtml(src)}</span>
+                <span class="muted" style="font-size:11px;">${si.vlan != null ? 'vlan ' + si.vlan + ' &middot; ' + escapeHtml(si.vrf || '') : escapeHtml(si.mode)}</span>
+                <span class="arrow">&rarr;</span>
+                <select data-src="${escapeHtml(src)}">${opts}</select>
+                <span class="map-info" id="mapinfo-${escapeHtml(src)}">${tgt ? targetInfoHtml(tgt) : ''}</span>
+                <span class="map-count">${n} port(s) &middot; ${devs.size} device(s)</span>
+            </div>`;
+        }
+        $('mapping-rows').innerHTML = html || '<div class="muted" style="padding:16px;">No ports selected in Step 1.</div>';
+        renderReadiness();
+    }
+
+    function targetInfoHtml(tgt) {
+        const ti = profileInfo(tgt);
+        if (ti.vlan == null) return `<span class="muted">mode ${escapeHtml(ti.mode)}</span>`;
+        return `&#10003; vlan ${ti.vlan} &middot; ${escapeHtml(ti.vrf || 'default')}${ti.gw ? ' &middot; gw ' + escapeHtml(ti.gw) : ''}${ti.desc ? ' &middot; ' + escapeHtml(ti.desc) : ''}`;
+    }
+
+    function setMapping(src, tgt) {
+        if (tgt) mappings[src] = tgt; else delete mappings[src];
+        const el = $('mapinfo-' + src);
+        if (el) el.innerHTML = tgt ? targetInfoHtml(tgt) : '';
+        renderReadiness();
+        goStepRefresh();
+    }
+    function goStepRefresh() {
+        document.querySelectorAll('.wstep').forEach(el => {
+            el.classList.toggle('disabled', !canEnter(parseInt(el.dataset.step)));
+        });
+    }
+
+    // Readiness: target VLAN SVI template + DHCP relay presence per affected device
+    function renderReadiness() {
+        const checked = portRows.filter(r => r.checked && mappings[r.profile]);
+        if (!checked.length) { $('readiness-box').innerHTML = ''; return; }
+        const lines = [];
+        const pairs = new Set();
+        for (const r of checked) {
+            const tgt = mappings[r.profile];
+            const key = r.device + '|' + tgt;
+            if (pairs.has(key)) continue;
+            pairs.add(key);
+            const ti = profileInfo(tgt);
+            if (ti.vlan == null) continue; // trunk or L2-only target: nothing to check here
+            const cfg = (deviceData[r.device] || {}).config || {};
+            const templates = cfg.vlan_templates || [];
+            const sviOk = ti.sviProfile && templates.includes(ti.sviProfile);
+            let relayOk = false;
+            for (const rel of (cfg.dhcp_relay || [])) {
+                if ((rel.interfaces || []).includes('vlan' + ti.vlan)) { relayOk = true; break; }
+            }
+            lines.push({ device: r.device, tgt, vlan: ti.vlan, sviProfile: ti.sviProfile, sviOk, relayOk });
+        }
+        if (!lines.length) { $('readiness-box').innerHTML = ''; return; }
+        const warn = lines.filter(l => !l.sviOk);
+        let html = `<div class="note-box ${warn.length ? 'warn' : 'good'}"><b>Readiness check</b> (target SVI template + DHCP relay on each affected device):<br>`;
+        for (const l of lines) {
+            html += `<span class="mono">${escapeHtml(l.device)}</span> &middot; ${escapeHtml(l.tgt)} (vlan ${l.vlan}): ` +
+                `SVI template ${l.sviOk ? '<span style="color:#81c784;">OK</span>' : '<span style="color:#ef9a9a;">MISSING (' + escapeHtml(l.sviProfile || '?') + ' not in vlan_templates)</span>'}` +
+                ` &middot; relay ${l.relayOk ? '<span style="color:#81c784;">OK</span>' : '<span style="color:#ffb74d;">not found (may be intentional)</span>'}<br>`;
+        }
+        html += warn.length
+            ? '<br><b style="color:#ffb74d;">Missing SVI templates mean the target VLAN is not provisioned on that switch. Fix in Fabric Config before deploying.</b>'
+            : '';
+        html += '</div>';
+        $('readiness-box').innerHTML = html;
+    }
+
+    // ---------- Step 3: preview & apply ----------
+    function computePlan() {
+        const entries = [];
+        let unmapped = 0;
+        for (const r of portRows) {
+            if (!r.checked) continue;
+            const tgt = mappings[r.profile];
+            if (!tgt || tgt === r.profile) { unmapped++; continue; }
+            entries.push({ device: r.device, section: r.section, name: r.name, old: r.profile, new: tgt });
+        }
+        const changes = {};
+        for (const e of entries) {
+            changes[e.device] = changes[e.device] || { interfaces: {}, bonds: {} };
+            changes[e.device][e.section][e.name] = { old: e.old, new: e.new };
+        }
+        return { entries, changes, unmapped };
+    }
+
+    function buildPreview() {
+        currentPlan = computePlan();
+        if (!$('plan-name').value) {
+            const d = new Date();
+            $('plan-name').value = 'migration-' + d.toISOString().slice(0, 10);
+        }
+        // group by device+old+new
+        const groups = new Map();
+        for (const e of currentPlan.entries) {
+            const k = `${e.device}|${e.old}|${e.new}`;
+            if (!groups.has(k)) groups.set(k, []);
+            groups.get(k).push(e.name);
+        }
+        let html = '';
+        for (const [k, names] of groups) {
+            const [dev, oldP, newP] = k.split('|');
+            const shown = names.slice(0, 8).map(escapeHtml).join(', ') + (names.length > 8 ? ` &hellip; +${names.length - 8} more` : '');
+            html += `<tr>
+                <td>${escapeHtml(dev)}</td>
+                <td class="mono" title="${escapeHtml(names.join(', '))}">${shown} <span class="muted">(${names.length})</span></td>
+                <td><span class="pbadge p-old">${escapeHtml(oldP)}</span><span class="arrow">&rarr;</span><span class="pbadge p-new">${escapeHtml(newP)}</span></td>
+            </tr>`;
+        }
+        $('preview-table-body').innerHTML = html || '<tr><td colspan="3" class="muted" style="padding:20px;">Nothing to change: no selected port has a mapping.</td></tr>';
+        $('c3-changes').textContent = currentPlan.entries.length;
+        $('c3-files').textContent = Object.keys(currentPlan.changes).length;
+        $('c3-unmapped').textContent = currentPlan.unmapped;
+    }
+
+    async function applyPlan(dryRun) {
+        buildPreview();
+        if (!currentPlan.entries.length) { showAlert('Nothing to apply.', 'Empty Plan'); return; }
+        if (!dryRun) {
+            const devs = Object.keys(currentPlan.changes);
+            const ok = await confirmAsync(
+                `Write ${currentPlan.entries.length} port-profile change(s) into ${devs.length} host_vars file(s)?\n\n` +
+                devs.join('\n') +
+                `\n\nThis edits Ansible intent only - nothing touches the switches until you Deploy.`,
+                'Apply Change Plan');
+            if (!ok) return;
+        }
+        showLoading(true, dryRun ? 'Server dry-run...' : 'Writing host_vars...');
+        try {
+            const resp = await fetch('/fabric-api.sh?action=migrate-port-profiles', {
+                method: 'POST',
+                body: JSON.stringify({ plan_name: $('plan-name').value || 'migration', dry_run: !!dryRun, changes: currentPlan.changes })
+            });
+            const data = await resp.json();
+            renderApplyResults(data, dryRun);
+            if (data.success && !dryRun) {
+                appliedPlan = {
+                    id: data.plan_id,
+                    name: $('plan-name').value,
+                    changes: {},
+                };
+                // keep only actually-applied entries for verify/rollback;
+                // a device that errored server-side wrote nothing at all
+                for (const [dev, res] of Object.entries(data.results || {})) {
+                    appliedPlan.changes[dev] = { applied: [] };
+                    if (res.error) continue;
+                    const skippedKeys = new Set((res.skipped || []).map(s => `${s.section}|${s.name}`));
+                    appliedPlan.changes[dev].applied = currentPlan.entries
+                        .filter(e => e.device === dev && !skippedKeys.has(`${e.section}|${e.name}`))
+                        .map(e => ({ section: e.section, name: e.name, old: e.old, new: e.new }));
+                }
+                // sync local rows for server-applied entries only, and uncheck
+                // them so a stale mapping cannot re-fire a chained migration
+                for (const [dev, res] of Object.entries(appliedPlan.changes)) {
+                    for (const a of res.applied) {
+                        const row = portRows.find(r => r.device === dev && r.name === a.name && r.section === a.section);
+                        if (row) { row.profile = a.new; row.checked = false; }
+                    }
+                }
+                $('to-step4-btn').disabled = false;
+                $('rollback-btn').disabled = false;
+                goStepRefresh();
+            }
+        } catch (e) {
+            showAlert('Apply failed: ' + e.message, 'Error');
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    function renderApplyResults(data, dryRun) {
+        if (!data.success) {
+            $('apply-results').innerHTML = `<div class="note-box warn"><b>Error:</b> ${escapeHtml(data.error || 'unknown')}</div>`;
+            return;
+        }
+        let html = `<div class="note-box ${data.total_skipped ? 'warn' : 'good'}">` +
+            `<b>${dryRun ? 'Dry-run' : 'Applied'}:</b> ${data.total_applied} change(s), ${data.total_skipped} skipped.`;
+        if (data.plan_id) {
+            html += ` Plan saved as <span class="mono">${escapeHtml(data.plan_id)}</span> (rollback available in Step 5).`;
+        } else if (!dryRun && data.total_applied > 0) {
+            html += ` <span style="color:#ffb74d;">Plan record could not be saved (check ANSIBLE_DIR permissions); rollback stays available in this browser session only.</span>`;
+        }
+        html += '<br>';
+        for (const [dev, res] of Object.entries(data.results || {})) {
+            html += `<span class="mono">${escapeHtml(dev)}</span>: ${res.applied} applied`;
+            if (res.error) html += ` &middot; <span style="color:#ef9a9a;">${escapeHtml(res.error)}</span>`;
+            for (const s of (res.skipped || [])) {
+                html += `<br>&nbsp;&nbsp;<span style="color:#ffb74d;">skipped ${escapeHtml(s.name)}</span> <span class="muted">- ${escapeHtml(s.reason)}</span>`;
+            }
+            html += '<br>';
+        }
+        html += '</div>';
+        $('apply-results').innerHTML = html;
+    }
+
+    // ---------- Step 4: generate / diff / deploy ----------
+    function planDevices() {
+        if (!appliedPlan) return [];
+        return Object.keys(appliedPlan.changes).filter(d => (appliedPlan.changes[d].applied || []).length);
+    }
+
+    function buildDeployScope() {
+        const devs = planDevices();
+        $('deploy-scope-note').innerHTML = devs.length
+            ? `<b>Scope:</b> ${devs.map(escapeHtml).join(', ')} &mdash; plan <span class="mono">${escapeHtml(appliedPlan.id || appliedPlan.name || '')}</span>`
+            : 'No applied plan.';
+    }
+
+    function termAppend(id, text, cls) {
+        const el = $(id);
+        const span = document.createElement('span');
+        if (cls) span.className = cls;
+        span.textContent = text + '\n';
+        el.appendChild(span);
+        el.scrollTop = el.scrollHeight;
+    }
+    function clearTerm(id) { $(id).textContent = ''; }
+
+    function stripAnsi(s) { return String(s || '').replace(/\x1b\[[0-9;]*m/g, ''); }
+
+    function termAppendAnsible(id, text) {
+        for (const line of stripAnsi(text).split('\n')) {
+            let cls = '';
+            if (/^(PLAY|TASK|PLAY RECAP)/.test(line)) cls = 'hdr';
+            else if (/failed=[1-9]|unreachable=[1-9]|^fatal|FAILED/.test(line)) cls = 'err';
+            else if (/^changed:|changed=[1-9]/.test(line)) cls = 'chg';
+            else if (/^ok:|failed=0/.test(line)) cls = 'ok';
+            termAppend(id, line, cls);
+        }
+    }
+
+    async function ansibleApiCall(action, hosts) {
+        const params = new URLSearchParams({ action });
+        if (hosts) params.append('host', hosts);
+        const response = await fetch(`/ansible-api?${params}`);
+        return await response.json();
+    }
+
+    async function runGenerate() {
+        const devs = planDevices();
+        if (!devs.length) return;
+        clearTerm('deploy-term');
+        termAppend('deploy-term', `=== GENERATE: ${devs.join(', ')} ===`, 'hdr');
+        showLoading(true, 'Generating configs...');
+        try {
+            const result = await ansibleApiCall('generate', devs.join(','));
+            if (result.locked) { termAppend('deploy-term', result.error || 'Another operation is in progress.', 'err'); return; }
+            termAppendAnsible('deploy-term', result.output || result.error || '');
+            termAppend('deploy-term', result.success ? 'Generate completed.' : 'Generate failed.', result.success ? 'ok' : 'err');
+        } catch (e) {
+            termAppend('deploy-term', 'Error: ' + e.message, 'err');
+        } finally { showLoading(false); }
+    }
+
+    async function runDiff() {
+        const devs = planDevices();
+        if (!devs.length) return;
+        clearTerm('deploy-term');
+        termAppend('deploy-term', `=== DIFF: ${devs.join(', ')} ===`, 'hdr');
+        showLoading(true, 'Running diff playbook (this can take a minute)...');
+        try {
+            const result = await ansibleApiCall('diff', devs.join(','));
+            if (result.locked) { termAppend('deploy-term', result.error || 'Another operation is in progress.', 'err'); return; }
+            termAppendAnsible('deploy-term', result.output || result.error || '');
+        } catch (e) {
+            termAppend('deploy-term', 'Error: ' + e.message, 'err');
+        } finally { showLoading(false); }
+    }
+
+    async function pollDeployStatus(jobId) {
+        let lastLen = 0, pollErrors = 0;
+        while (true) {
+            let resp, data;
+            try {
+                resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
+                data = await resp.json();
+                pollErrors = 0;
+            } catch (e) {
+                if (++pollErrors >= DEPLOY_POLL_MAX_ERRORS) {
+                    termAppend('deploy-term', 'Stopped polling after repeated errors; the deploy keeps running. Reload to resume.', 'err');
+                    showLoading(false);
+                    return;
+                }
+                await sleep(DEPLOY_POLL_INTERVAL);
+                continue;
+            }
+            if (resp.status === 401 || resp.status === 403) {
+                termAppend('deploy-term', 'Session expired. Log in again to resume watching this deploy.', 'err');
+                showLoading(false);
+                return;
+            }
+            if (!data.success && !data.running && !data.done) {
+                termAppend('deploy-term', data.error || 'Unknown or expired deploy job', 'err');
+                localStorage.removeItem(DEPLOY_JOB_KEY);
+                showLoading(false);
+                return;
+            }
+            const out = data.output || '';
+            if (out.length > lastLen) {
+                termAppendAnsible('deploy-term', out.slice(lastLen));
+                lastLen = out.length;
+            }
+            if (data.done) {
+                localStorage.removeItem(DEPLOY_JOB_KEY);
+                showLoading(false);
+                termAppend('deploy-term', `Deploy finished (exit code ${data.exit_code}).`, data.success ? 'ok' : 'err');
+                return;
+            }
+            await sleep(DEPLOY_POLL_INTERVAL);
+        }
+    }
+
+    function resumeDeployJob() {
+        let saved = null;
+        try { saved = JSON.parse(localStorage.getItem(DEPLOY_JOB_KEY)); }
+        catch (e) { localStorage.removeItem(DEPLOY_JOB_KEY); }
+        if (!saved || !saved.job_id) return;
+        if (saved.plan) { appliedPlan = saved.plan; $('rollback-btn').disabled = false; $('to-step4-btn').disabled = false; }
+        goStep(4);
+        termAppend('deploy-term', `=== DEPLOY (resumed): job ${saved.job_id} ===`, 'hdr');
+        pollDeployStatus(saved.job_id);
+    }
+
+    async function runDeploy() {
+        const devs = planDevices();
+        if (!devs.length) return;
+        const ok = await confirmAsync(
+            `Deploy to ${devs.length} device(s)?\n\n${devs.join('\n')}\n\nThis will apply the new access VLANs on live switches!`,
+            'Confirm Deploy');
+        if (!ok) return;
+        clearTerm('deploy-term');
+        termAppend('deploy-term', `=== DEPLOY: ${devs.join(', ')} ===`, 'hdr');
+        showLoading(true, `Deploying to ${devs.length} device(s)...`);
+        try {
+            const result = await ansibleApiCall('deploy', devs.join(','));
+            if (result.locked) {
+                termAppend('deploy-term', result.error || 'Another operation is in progress. Try again shortly.', 'err');
+                showLoading(false);
+                return;
+            }
+            if (result.started && result.job_id) {
+                localStorage.setItem(DEPLOY_JOB_KEY, JSON.stringify({ job_id: result.job_id, plan: appliedPlan }));
+                // Job runs in the background: drop the blocking overlay so the
+                // user can read the streamed log while it polls.
+                showLoading(false);
+                termAppend('deploy-term', `Deploy started (job ${result.job_id}). Streaming log...`, 'hdr');
+                await pollDeployStatus(result.job_id);
+                return;
+            }
+            // synchronous fallback
+            showLoading(false);
+            termAppendAnsible('deploy-term', result.output || result.error || '');
+            termAppend('deploy-term', result.success ? 'Deployment completed.' : 'Deployment failed.', result.success ? 'ok' : 'err');
+        } catch (e) {
+            termAppend('deploy-term', 'Error: ' + e.message, 'err');
+            showLoading(false);
+        }
+    }
+
+    // ---------- Step 5: verify ----------
+    function parseBridgeVlan(output) {
+        // "port    vlan-id" header, then "swp31    212 PVID Egress Untagged",
+        // continuation lines are indented and belong to the previous port.
+        const ports = {};
+        let current = null;
+        for (const raw of (output || '').split('\n')) {
+            if (!raw.trim() || /^port\s/i.test(raw.trim())) continue;
+            const indented = /^\s/.test(raw);
+            const tokens = raw.trim().split(/\s+/);
+            if (!indented) {
+                current = tokens.shift();
+                ports[current] = ports[current] || { pvid: null, vlans: [] };
+            }
+            if (!current || !tokens.length) continue;
+            const vid = parseInt(tokens[0], 10);
+            if (Number.isNaN(vid)) continue;
+            ports[current].vlans.push(vid);
+            if (tokens.join(' ').includes('PVID')) ports[current].pvid = vid;
+        }
+        return ports;
+    }
+
+    async function runVerification() {
+        const devs = planDevices();
+        if (!devs.length) { showAlert('No applied plan to verify.', 'Verify'); return; }
+        showLoading(true, `Checking live VLAN state on ${devs.length} device(s)...`);
+        const rows = [];
+        let pass = 0, warn = 0;
+        try {
+            const liveByDev = {};
+            await Promise.all(devs.map(async dev => {
+                try {
+                    const resp = await fetch('/fabric-api.sh?action=run-device-command', {
+                        method: 'POST',
+                        body: JSON.stringify({ device: dev, command: 'sudo bridge vlan show' })
+                    });
+                    const data = await resp.json();
+                    liveByDev[dev] = data.success ? parseBridgeVlan(data.output) : { __error: data.error || 'command failed' };
+                } catch (e) {
+                    liveByDev[dev] = { __error: e.message };
+                }
+            }));
+
+            for (const dev of devs) {
+                const live = liveByDev[dev] || {};
+                for (const e of (appliedPlan.changes[dev].applied || [])) {
+                    const ti = profileInfo(e.new);
+                    const oi = e.old ? profileInfo(e.old) : { vlan: null };
+                    const expected = ti.vlan;
+                    let livePvid = null, status, cls;
+                    if (live.__error) {
+                        status = 'NO DATA - ' + live.__error; cls = 'st-warn'; warn++;
+                    } else if (expected == null) {
+                        status = 'SKIP (target is not an access profile)'; cls = 'st-warn'; warn++;
+                    } else if (!live[e.name]) {
+                        status = 'PORT NOT IN BRIDGE (down/renamed?)'; cls = 'st-warn'; warn++;
+                    } else {
+                        livePvid = live[e.name].pvid;
+                        const residue = oi.vlan != null && live[e.name].vlans.includes(oi.vlan) && oi.vlan !== expected;
+                        if (livePvid === expected && !residue) { status = 'PASS'; cls = 'st-pass'; pass++; }
+                        else if (livePvid === oi.vlan) { status = 'NOT MIGRATED (still on old VLAN - deploy pending?)'; cls = 'st-fail'; warn++; }
+                        else if (residue) { status = `OLD VLAN ${oi.vlan} STILL PRESENT`; cls = 'st-fail'; warn++; }
+                        else { status = `UNEXPECTED PVID ${livePvid}`; cls = 'st-fail'; warn++; }
+                    }
+                    rows.push(`<tr>
+                        <td>${escapeHtml(dev)}</td>
+                        <td class="mono">${escapeHtml(e.name)}</td>
+                        <td class="mono">${expected != null ? expected : '-'}</td>
+                        <td class="mono">${livePvid != null ? livePvid : '-'}</td>
+                        <td><span class="status-pill ${cls}">${escapeHtml(status)}</span></td>
+                    </tr>`);
+                }
+            }
+            $('verify-table-body').innerHTML = rows.join('') || '<tr><td colspan="5" class="muted" style="padding:20px;">Plan has no applied entries.</td></tr>';
+            $('c5-pass').textContent = pass + '/' + (pass + warn);
+            $('c5-warn').textContent = warn;
+            await checkArpInTargetVrfs(devs);
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    async function checkArpInTargetVrfs(devs) {
+        // Which VRFs do the target profiles land in?
+        const vrfs = new Set();
+        for (const dev of devs) {
+            for (const e of (appliedPlan.changes[dev].applied || [])) {
+                const ti = profileInfo(e.new);
+                if (ti.vrf && ti.vrf !== 'default') vrfs.add(ti.vrf);
+            }
+        }
+        if (!vrfs.size) { $('c5-arp').textContent = '-'; return; }
+        let total = 0;
+        const notes = [];
+        for (const dev of devs) {
+            try {
+                const resp = await fetch(`/fabric-api.sh?action=get-fabric-table&hostname=${encodeURIComponent(dev)}&t=${Date.now()}`);
+                const payload = await resp.json();
+                if (!payload.success) { notes.push(`${dev}: fabric-tables not available`); continue; }
+                const data = payload.table || {};
+                const n = (data.arp || []).filter(a => vrfs.has(a.vrf)).length;
+                total += n;
+                const at = (data._collection || {}).checked_at || '';
+                notes.push(`${dev}: ${n} ARP in ${[...vrfs].join('/')}${at ? ' (as of ' + at + ')' : ''}`);
+            } catch (e) {
+                notes.push(`${dev}: fabric-tables not available`);
+            }
+        }
+        $('c5-arp').textContent = total;
+        $('arp-note').textContent = notes.join('  |  ') +
+            '  -  ARP counts come from the periodic fabric scan; endpoints appear after they re-DHCP (bounce ports if needed).';
+    }
+
+    async function rollbackPlan() {
+        if (!appliedPlan) return;
+        const inverse = {};
+        let n = 0, noOld = 0;
+        for (const [dev, rec] of Object.entries(appliedPlan.changes)) {
+            for (const e of (rec.applied || [])) {
+                if (!e.old) { noOld++; continue; }
+                inverse[dev] = inverse[dev] || { interfaces: {}, bonds: {} };
+                inverse[dev][e.section][e.name] = { old: e.new, new: e.old };
+                n++;
+            }
+        }
+        if (!n) { showAlert('This plan has no reversible entries.', 'Rollback'); return; }
+        const ok = await confirmAsync(
+            `Revert ${n} port-profile change(s) back to their original profiles?` +
+            (noOld ? `\n(${noOld} entries had no recorded original profile and will be left as-is.)` : '') +
+            `\n\nAfter the rollback is written you still need to Diff + Deploy it.`,
+            'Confirm Rollback');
+        if (!ok) return;
+        showLoading(true, 'Writing rollback...');
+        try {
+            const resp = await fetch('/fabric-api.sh?action=migrate-port-profiles', {
+                method: 'POST',
+                body: JSON.stringify({ plan_name: (appliedPlan.name || 'migration') + '-rollback', changes: inverse })
+            });
+            const data = await resp.json();
+            if (!data.success) { showAlert('Rollback failed: ' + (data.error || 'unknown'), 'Error'); return; }
+            // The rollback becomes the new applied plan (so it can be diffed/deployed/verified)
+            const newPlan = { id: data.plan_id, name: (appliedPlan.name || 'migration') + '-rollback', changes: {} };
+            for (const [dev, sections] of Object.entries(inverse)) {
+                const res = (data.results || {})[dev] || {};
+                newPlan.changes[dev] = { applied: [] };
+                if (res.error) continue;
+                const skipped = new Set((res.skipped || []).map(s => `${s.section}|${s.name}`));
+                for (const section of ['interfaces', 'bonds']) {
+                    for (const [name, mv] of Object.entries(sections[section] || {})) {
+                        if (!skipped.has(`${section}|${name}`)) newPlan.changes[dev].applied.push({ section, name, old: mv.old, new: mv.new });
+                    }
+                }
+            }
+            appliedPlan = newPlan;
+            showAlert(`Rollback written (${data.total_applied} changes, plan ${data.plan_id || 'n/a'}).\n\nNow run Diff + Deploy in Step 4 to push it to the switches.`, 'Rollback Applied');
+            goStep(4);
+        } catch (e) {
+            showAlert('Rollback failed: ' + e.message, 'Error');
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    // ---------- Saved plans ----------
+    async function openPlansModal() {
+        $('plans-modal').classList.add('visible');
+        $('plans-body').textContent = 'Loading...';
+        try {
+            const resp = await fetch('/fabric-api.sh?action=list-migration-plans');
+            const data = await resp.json();
+            if (!data.success) { $('plans-body').textContent = 'Error: ' + (data.error || 'unknown'); return; }
+            if (!data.plans.length) { $('plans-body').textContent = 'No saved plans yet. Plans are recorded automatically when you Apply a migration.'; return; }
+            let html = '<table class="tbl"><thead><tr><th>Plan</th><th>Created</th><th>Devices</th><th>Changes</th><th></th></tr></thead><tbody>';
+            for (const p of data.plans) {
+                html += `<tr>
+                    <td class="mono">${escapeHtml(p.id)}</td>
+                    <td class="muted">${escapeHtml(p.created || '')}</td>
+                    <td class="muted">${escapeHtml((p.devices || []).join(', '))}</td>
+                    <td>${p.total_applied}</td>
+                    <td><a style="color:#4fc3f7; cursor:pointer;" data-plan="${escapeHtml(p.id)}">Load</a></td>
+                </tr>`;
+            }
+            html += '</tbody></table>';
+            $('plans-body').innerHTML = html;
+        } catch (e) {
+            $('plans-body').textContent = 'Error: ' + e.message;
+        }
+    }
+    function closePlansModal() { $('plans-modal').classList.remove('visible'); }
+
+    async function loadPlan(id) {
+        closePlansModal();
+        showLoading(true, 'Loading plan...');
+        try {
+            const resp = await fetch(`/fabric-api.sh?action=get-migration-plan&plan=${encodeURIComponent(id)}`);
+            const data = await resp.json();
+            if (!data.success) { showAlert('Failed to load plan: ' + (data.error || 'unknown'), 'Error'); return; }
+            const plan = data.plan;
+            appliedPlan = { id: plan.id, name: plan.name, changes: {} };
+            for (const [dev, rec] of Object.entries(plan.changes || {})) {
+                appliedPlan.changes[dev] = { applied: rec.applied || [] };
+            }
+            // Load device data for the plan's devices so verify can resolve profiles
+            const devs = planDevices();
+            await Promise.all(devs.map(async h => {
+                if (deviceData[h]) return;
+                try {
+                    const r = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(h)}`);
+                    const d = await r.json();
+                    if (d.success) {
+                        deviceData[h] = d;
+                        if (d.port_profiles && Object.keys(d.port_profiles).length) portProfiles = d.port_profiles;
+                        if (d.vlan_profiles && Object.keys(d.vlan_profiles).length) vlanProfilesData = d.vlan_profiles;
+                    }
+                } catch (e) { /* verify will report missing data */ }
+            }));
+            $('rollback-btn').disabled = false;
+            $('to-step4-btn').disabled = false;
+            $('loaded-plan-banner').style.display = 'block';
+            $('loaded-plan-banner').innerHTML = `<b>Loaded plan:</b> <span class="mono">${escapeHtml(plan.id)}</span> ` +
+                `(${plan.total_applied} changes on ${Object.keys(plan.changes || {}).length} device(s), created ${escapeHtml(plan.created || '')}). ` +
+                `You can Verify it or Roll it back.`;
+            goStep(5);
+        } finally {
+            showLoading(false);
+        }
+    }
+
+    // ---------- Rack patterns ----------
+    function openPatternsModal() {
+        $('patterns-text').value = getRackPatterns().join('\n');
+        $('patterns-modal').classList.add('visible');
+    }
+    function closePatternsModal() { $('patterns-modal').classList.remove('visible'); }
+    function savePatterns() {
+        const lines = $('patterns-text').value.split('\n').map(l => l.trim()).filter(Boolean);
+        localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines));
+        closePatternsModal();
+    }
+    function resetPatterns() {
+        localStorage.removeItem(PATTERNS_KEY);
+        $('patterns-text').value = DEFAULT_RACK_PATTERNS.join('\n');
+    }
+
+    // ---------- Init ----------
+    async function init() {
+        const isAuth = await LLDPqAuth.check();
+        if (!isAuth) return;
+        if (!LLDPqAuth.isAdmin()) {
+            document.body.innerHTML = '<div style="display:flex; align-items:center; justify-content:center; height:100vh; color:#888;">Access denied. Admin only.</div>';
+            return;
+        }
+        // Delegated listeners: rendered rows carry data-* attributes instead of
+        // inline handlers, so names never pass through HTML->JS re-parsing.
+        $('device-list').addEventListener('change', e => {
+            const cb = e.target;
+            if (!(cb instanceof HTMLInputElement)) return;
+            if (cb.dataset.group !== undefined) toggleGroup(cb.dataset.group, cb.checked);
+            else if (cb.dataset.host !== undefined) toggleDevice(cb.dataset.host, cb.checked);
+        });
+        $('profile-chips').addEventListener('click', e => {
+            const el = e.target.closest('.chip');
+            if (el) toggleProfileChip(el.dataset.profile);
+        });
+        $('mapping-rows').addEventListener('change', e => {
+            const sel = e.target;
+            if (sel.tagName === 'SELECT' && sel.dataset.src !== undefined) setMapping(sel.dataset.src, sel.value);
+        });
+        $('plans-body').addEventListener('click', e => {
+            const a = e.target.closest('a[data-plan]');
+            if (a) loadPlan(a.dataset.plan);
+        });
+        await loadDevices();
+        goStep(1);
+        resumeDeployJob();
+    }
+    init();
+</script>
+</body>
+</html>

@@ -227,7 +227,9 @@ class LinkFlapAnalyzer:
                 os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = -1
-                json.dump(value, stream, separators=(",", ":"))
+                # Single-string write: streaming json.dump is several times
+                # slower than dumps on large history documents.
+                stream.write(json.dumps(value, separators=(",", ":")))
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())

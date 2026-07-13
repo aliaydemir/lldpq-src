@@ -512,6 +512,53 @@ def _read_state(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
         return default
 
 
+# Flush threshold for the chunked JSON writer.  Pieces accumulate to roughly
+# this many characters before one large handle.write call.
+_JSON_CHUNK_CHARS = 1 << 22
+
+
+def _write_chunked_json(handle, value: Any) -> None:
+    """Serialize with the C encoder in memory-bounded pieces.
+
+    json.dump falls back to the slow Python-loop iterator encoder (measured
+    several times slower than json.dumps on the multi-hundred-MB history
+    document), while json.dumps builds the entire document in memory.  Walking
+    dict containers key by key and C-encoding only the leaf values keeps the
+    buffered output near _JSON_CHUNK_CHARS plus one leaf (a port's history
+    list, tens of KB) at dumps-like speed.
+    """
+    parts: List[str] = []
+    size = 0
+
+    def emit(piece: str) -> None:
+        nonlocal size
+        parts.append(piece)
+        size += len(piece)
+        if size >= _JSON_CHUNK_CHARS:
+            handle.write("".join(parts))
+            parts.clear()
+            size = 0
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            emit("{")
+            first = True
+            for key, item in node.items():
+                if not first:
+                    emit(",")
+                first = False
+                emit(json.dumps(str(key)))
+                emit(":")
+                walk(item)
+            emit("}")
+        else:
+            emit(json.dumps(node, separators=(",", ":")))
+
+    walk(value)
+    if parts:
+        handle.write("".join(parts))
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -545,7 +592,7 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
-            json.dump(value, handle, separators=(",", ":"))
+            _write_chunked_json(handle, value)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())

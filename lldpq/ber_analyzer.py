@@ -189,7 +189,9 @@ class BERAnalyzer:
             os.fchmod(descriptor, mode | 0o644)
             with os.fdopen(descriptor, "w") as stream:
                 descriptor = -1
-                json.dump(value, stream, separators=(",", ":"))
+                # Single-string write: streaming json.dump is several times
+                # slower than dumps on large history documents.
+                stream.write(json.dumps(value, separators=(",", ":")))
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())

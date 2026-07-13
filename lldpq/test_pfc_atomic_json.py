@@ -16,7 +16,7 @@ from process_pfc_ecn_data import _atomic_json
 
 
 class PfcAtomicJsonTests(unittest.TestCase):
-    def test_streams_compact_json_without_json_dumps_buffer(self):
+    def test_streams_compact_json_without_full_document_buffer(self):
         value = {
             "version": 1,
             "history": {
@@ -24,17 +24,30 @@ class PfcAtomicJsonTests(unittest.TestCase):
                 for index in range(500)
             },
         }
+        # Memory-bounded contract: dict containers are walked key by key, so
+        # no single C-encoder call may see a piece anywhere near the whole
+        # document (here the largest legal piece is one port's tiny list).
+        real_dumps = json.dumps
+        encoded_sizes = []
+
+        def tracking_dumps(node, *args, **kwargs):
+            text = real_dumps(node, *args, **kwargs)
+            encoded_sizes.append(len(text))
+            return text
+
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "history.json"
             with mock.patch(
                 "process_pfc_ecn_data.json.dumps",
-                side_effect=AssertionError("full JSON buffer must not be built"),
+                side_effect=tracking_dumps,
             ):
                 _atomic_json(path, value)
             text = path.read_text(encoding="utf-8")
         self.assertEqual(json.loads(text), value)
         self.assertTrue(text.endswith("\n"))
         self.assertNotIn("\n  ", text)
+        self.assertTrue(encoded_sizes)
+        self.assertLess(max(encoded_sizes), len(text) // 10)
 
     def test_failed_replace_preserves_previous_generation(self):
         with tempfile.TemporaryDirectory() as temporary:
