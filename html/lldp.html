@@ -1279,6 +1279,7 @@
                 peer_rack: rec[peer + '_rack'] || '', peer_ru: rec[peer + '_ru'] || '',
                 peer_transceiver: rec[peer + '_transceiver'] || '',
                 seq: rec.seq || '', bundle_id: rec.bundle_id || '',
+                sheet_name: rec.sheet_name || '', row_number: rec.row_number || '',
                 cable_type: rec.cable_type || '', cable_length: rec.cable_length || '',
                 cable_part: rec.cable_part || '',
                 connection_type: rec.connection_type || '', network_type: rec.network_type || '',
@@ -1407,7 +1408,8 @@
                     `<div class="detail-empty">${escHtml(msg)}</div></div>`;
             }
             return `<div class="peer-card"><div class="peer-title">DESIGN</div>` +
-                kvRow('SEQ', d.seq) +
+                kvRow('Sheet / Line / SEQ', [d.sheet_name, d.row_number, d.seq]
+                    .map(displayValue).join(' / ')) +
                 kvRow('Bundle ID', d.bundle_id) +
                 kvRow('Local Rack / RU', joinRackRu(d.local_rack, d.local_ru)) +
                 kvRow('Design Peer', joinDevPort(d.peer_device, d.peer_port)) +

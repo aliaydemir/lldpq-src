@@ -184,9 +184,12 @@ class OpticalAnalyzer:
                 "current_optical_stats": self.current_optical_stats,
                 "last_update": time.time()
             }
+            # Compact separators: this file carries every port's 100-sample
+            # history, so pretty-printing multiplies serialize/parse time and
+            # size for a machine-only artifact.
             _atomic_write(
                 f"{self.data_dir}/optical_history.json",
-                json.dumps(data, indent=2),
+                json.dumps(data, separators=(",", ":")),
             )
         except Exception as e:
             print(f"Error saving optical history: {e}")

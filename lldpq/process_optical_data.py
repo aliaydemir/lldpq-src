@@ -114,7 +114,25 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     """Process optical data files and update optical analyzer"""
     data_dir = os.path.abspath(data_dir)
     result_dir = os.path.dirname(data_dir.rstrip(os.sep))
+
+    timing_enabled = os.environ.get("LLDPQ_ANALYZER_TIMING", "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    phase_started = time.monotonic()
+
+    def finish_phase(name):
+        nonlocal phase_started
+        now = time.monotonic()
+        if timing_enabled:
+            elapsed_ms = max(0, int((now - phase_started) * 1000))
+            print(
+                f"__LLDPQ_ANALYZER_TIMING__:optical:{name}:{elapsed_ms}",
+                flush=True,
+            )
+        phase_started = now
+
     optical_analyzer = OpticalAnalyzer(result_dir)
+    finish_phase("load")
     # Historical readings remain in optical_history; only files from this
     # successful collection may populate the current snapshot.
     optical_analyzer.current_optical_stats = {}
@@ -331,10 +349,12 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                     )
 
     print(f"\nProcessed {total_processed} files total")
+    finish_phase("parse_records")
 
     # Save updated optical history
     optical_analyzer.save_optical_history()
     print("Optical history saved")
+    finish_phase("write_history")
 
     # Generate web report
     output_file = os.path.join(result_dir, "optical-analysis.html")
@@ -363,6 +383,7 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     if all_devices_unavailable:
         mark_html_collection_unavailable(output_file)
     print(f"Optical analysis report generated: {output_file}")
+    finish_phase("render")
 
     # Generate summary for dashboard
     summary = optical_analyzer.get_optical_summary()
@@ -404,6 +425,7 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
             "unknown": len(summary["unknown_ports"]),
         }) + "\n",
     )
+    finish_phase("write_summary")
     print(f"Summary stats: {len(optical_analyzer.current_optical_stats)} total ports analyzed")
 
     print(f"\nOptical Analysis Summary:")
