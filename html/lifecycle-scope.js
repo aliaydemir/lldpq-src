@@ -241,7 +241,8 @@
     }
 
     function updateLLDP() {
-        var rows = scopedRows('#lldp-data > tr');
+        // Expanded detail panels are presentation rows, not port records.
+        var rows = scopedRows('#lldp-data > tr:not(.lldp-detail-row)');
         var counts = { success: 0, failed: 0, warning: 0, 'no info': 0 };
         rows.forEach(function (row) {
             var status = textAt(row, 7);

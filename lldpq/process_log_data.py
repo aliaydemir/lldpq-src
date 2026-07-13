@@ -536,6 +536,7 @@ class LogAnalyzer:
         .sortable {{ cursor: pointer; user-select: none; padding-right: 20px; }}
         .sortable:hover {{ background: #3c3c3c; }}
         .sort-arrow {{ font-size: 10px; color: #666; margin-left: 5px; opacity: 0.5; }}
+        .sort-arrow::before {{ content: '▲▼'; }}
         .sortable.asc .sort-arrow::before {{ content: '▲'; color: #76b900; opacity: 1; }}
         .sortable.desc .sort-arrow::before {{ content: '▼'; color: #76b900; opacity: 1; }}
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
@@ -655,12 +656,12 @@ class LogAnalyzer:
             <table class="log-table" id="log-table">
                 <thead>
                     <tr>
-                        <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="1" data-type="number">Critical <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="2" data-type="number">Warning <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="3" data-type="number">Error <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="4" data-type="number">Info <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="5" data-type="number">Total <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="1" data-type="number">Critical <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="2" data-type="number">Warning <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="3" data-type="number">Error <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="4" data-type="number">Info <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="5" data-type="number">Total <span class="sort-arrow"></span></th>
                     </tr>
                 </thead>
                 <tbody>"""

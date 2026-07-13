@@ -159,8 +159,89 @@ if [ "$ACTION" = "validate" ]; then
     fi
     
     if [ ! -d "$CONFIG_DIR" ]; then
-        echo '{"success": false, "error": "Config directory not found: '"$CONFIG_DIR"'"}'
+        echo '{"success": false, "needs_generate": true, "error": "Generated config directory not found. Run Generate first to build device configs."}'
         exit 0
+    fi
+
+    # Compute a generate-state signal (missing/stale generated configs vs their
+    # host_vars/group_vars sources) so the UI can warn "run Generate first"
+    # before deploying freshly-templated config over stale validated bytes.
+    GEN_STATE=$(CONFIG_DIR="$CONFIG_DIR" \
+        HOSTVARS_DIR="$ANSIBLE_DIR/inventory/host_vars" \
+        GROUPVARS_DIR="$ANSIBLE_DIR/inventory/group_vars" \
+        REQ_DEVICES="$DEVICES" python3 << 'PYEOF'
+import os, json, glob
+
+config_dir = os.environ.get('CONFIG_DIR', '')
+hostvars_dir = os.environ.get('HOSTVARS_DIR', '')
+groupvars_dir = os.environ.get('GROUPVARS_DIR', '')
+req = os.environ.get('REQ_DEVICES', '').strip()
+
+
+def gen_path(dev):
+    for ext in ('.yaml', '.yml'):
+        p = os.path.join(config_dir, dev + ext)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def src_mtime(dev):
+    mt = 0.0
+    for ext in ('.yaml', '.yml'):
+        p = os.path.join(hostvars_dir, dev + ext)
+        if os.path.isfile(p):
+            try:
+                mt = max(mt, os.path.getmtime(p))
+            except OSError:
+                pass
+    return mt
+
+
+global_mt = 0.0
+if groupvars_dir and os.path.isdir(groupvars_dir):
+    for root, _dirs, files in os.walk(groupvars_dir):
+        for fn in files:
+            if fn.endswith(('.yaml', '.yml')):
+                try:
+                    global_mt = max(global_mt, os.path.getmtime(os.path.join(root, fn)))
+                except OSError:
+                    pass
+
+if req:
+    devices = [d.strip() for d in req.split(',') if d.strip()]
+else:
+    devices = []
+    if os.path.isdir(config_dir):
+        for p in glob.glob(os.path.join(config_dir, '*.yaml')) + glob.glob(os.path.join(config_dir, '*.yml')):
+            devices.append(os.path.splitext(os.path.basename(p))[0])
+    devices = sorted(set(devices))
+
+missing = []
+stale = []
+for dev in devices:
+    gp = gen_path(dev)
+    if gp is None:
+        missing.append(dev)
+        continue
+    try:
+        gmt = os.path.getmtime(gp)
+    except OSError:
+        missing.append(dev)
+        continue
+    if max(src_mtime(dev), global_mt) > gmt:
+        stale.append(dev)
+
+print(json.dumps({
+    'missing_devices': sorted(set(missing)),
+    'stale_devices': sorted(set(stale)),
+    'needs_generate': bool(missing or stale),
+}))
+PYEOF
+)
+    # Fall back to a safe default if the probe failed for any reason.
+    if ! printf '%s' "$GEN_STATE" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then
+        GEN_STATE='{"missing_devices": [], "stale_devices": [], "needs_generate": false}'
     fi
     
     STDERR_FILE=$(mktemp)
@@ -182,8 +263,8 @@ if [ "$ACTION" = "validate" ]; then
         if [ "$LINKED" -eq 0 ]; then
             rm -rf "$TEMP_DIR"
             rm -f "$STDERR_FILE"
-            ERROR=$(printf '%s' "No generated config for $DEVICES" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-            echo '{"success": false, "error": '"$ERROR"'}'
+            ERROR=$(printf '%s' "No generated config for $DEVICES. Run Generate first." | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+            echo '{"success": false, "needs_generate": true, "generate_state": '"$GEN_STATE"', "error": '"$ERROR"'}'
             exit 0
         fi
         RESULT=$(python3 "$VALIDATE_SCRIPT" --dir "$TEMP_DIR" --json --no-topology 2>"$STDERR_FILE")
@@ -198,15 +279,15 @@ if [ "$ACTION" = "validate" ]; then
     rm -f "$STDERR_FILE"
 
     if [ "$rc" -eq 0 ]; then
-        echo '{"success": true, "valid": true, "result": '"$RESULT"'}'
+        echo '{"success": true, "valid": true, "generate_state": '"$GEN_STATE"', "result": '"$RESULT"'}'
     else
         # Check if it's JSON output (validation found errors)
         if echo "$RESULT" | python3 -c 'import sys,json; json.load(sys.stdin)' 2>/dev/null; then
-            echo '{"success": true, "valid": false, "result": '"$RESULT"'}'
+            echo '{"success": true, "valid": false, "generate_state": '"$GEN_STATE"', "result": '"$RESULT"'}'
         else
             # Script error - report stderr, not the JSON stdout stream
             ERROR=$(printf '%s' "$ERR_OUTPUT" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-            echo '{"success": false, "error": '"$ERROR"'}'
+            echo '{"success": false, "generate_state": '"$GEN_STATE"', "error": '"$ERROR"'}'
         fi
     fi
     exit 0

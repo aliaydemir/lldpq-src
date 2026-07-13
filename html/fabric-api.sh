@@ -30,6 +30,16 @@ fi
 # Export for Python scripts
 export ANSIBLE_DIR
 
+# Serialize concurrent YAML read-modify-write across admin edits.
+# A single process-wide advisory lock (held on fd 9 until this CGI process
+# exits) protects bgp_profiles.yaml / vlan_profiles.yaml / sw_port_profiles.yaml
+# and host_vars/*.yaml from lost-update races between concurrent admins.
+FABRIC_LOCK_FILE="${FABRIC_LOCK_FILE:-/tmp/fabric-api.lock}"
+acquire_lock() {
+    exec 9>>"$FABRIC_LOCK_FILE" 2>/dev/null || return 0
+    flock 9 2>/dev/null || true
+}
+
 # Output JSON header
 echo "Content-Type: application/json"
 echo ""
@@ -179,17 +189,23 @@ get_device() {
     fi
     
     local host_vars_file="$ANSIBLE_DIR/inventory/host_vars/${hostname}.yaml"
-    
+
+    export DEVICE_HOSTNAME="$hostname"
+
     # Python script to parse host_vars and find device info
     # Host vars file is optional - some devices (like spines) may not have it
-    python3 << PYTHON
+    python3 << 'PYTHON'
 import sys
 import json
 import yaml  # PyYAML - faster for read-only operations
 import os
+import re
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
-hostname = "$hostname"
+hostname = os.environ.get('DEVICE_HOSTNAME', '')
+if not re.match(r'^[A-Za-z0-9_.-]+$', hostname):
+    print(json.dumps({'success': False, 'error': 'Invalid hostname'}))
+    sys.exit(0)
 host_vars_file = f"{ansible_dir}/inventory/host_vars/{hostname}.yaml"
 # Fallback: try inventory.ini first, then hosts
 hosts_file = None
@@ -361,6 +377,7 @@ PYTHON
 
 # Bulk create VLANs
 bulk_create_vlans() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
@@ -386,6 +403,11 @@ end_id = data.get('end_id', 1)
 profile_name = data.get('profile_name', f'VLAN_{start_id}_{end_id}_L2')
 description = data.get('description', f'L2 VLANs {start_id}-{end_id}')
 l2vni_offset = data.get('l2vni_offset', 100000)
+
+import re
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(profile_name)):
+    print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
+    exit(0)
 
 # Validate
 if start_id < 1 or end_id > 4094 or start_id > end_id:
@@ -443,7 +465,7 @@ except:
     if os.path.exists(_tmp_path): os.unlink(_tmp_path)
     raise
 
-print(json.dumps({'success': True, 'message': f'Created {count} VLANs in profile {profile_name}'}))
+print(json.dumps({'success': True, 'message': f'Created {count} VLANs in profile {profile_name}', 'created_vlans': list(range(start_id, end_id + 1))}))
 PYTHON
 }
 
@@ -494,43 +516,6 @@ PYTHON
 }
 
 # Get BGP profiles (filtered - exclude VxLAN_UNDERLAY*)
-get_bgp_profiles() {
-    python3 << PYTHON
-import json
-from ruamel.yaml import YAML
-yaml = YAML()
-yaml.preserve_quotes = True
-import tempfile
-import shutil
-import os
-
-ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
-bgp_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'bgp_profiles.yaml')
-
-profiles = []
-infra_vrfs = ['default']  # Default fallback
-
-try:
-    if os.path.exists(bgp_file):
-        with open(bgp_file, 'r') as f:
-            data = yaml.load(f) or {}
-            bgp_profiles = data.get('bgp_profiles', {})
-            
-            # Get infra_vrfs list from config
-            infra_vrfs = data.get('infra_vrfs', ['default'])
-            
-            for name in sorted(bgp_profiles.keys()):
-                # Filter out underlay profiles
-                if name.startswith('VxLAN_UNDERLAY'):
-                    continue
-                profiles.append({'name': name})
-    
-    print(json.dumps({'success': True, 'profiles': profiles, 'infra_vrfs': infra_vrfs}))
-except Exception as e:
-    print(json.dumps({'success': False, 'error': str(e)}))
-PYTHON
-}
-
 # ==================== VRF MANAGEMENT ====================
 
 # Get available VRFs from all devices
@@ -583,10 +568,12 @@ PYTHON
 
 # Create VRF in device's host_vars
 create_vrf() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -611,6 +598,14 @@ leak_from_vrf = data.get('leak_from_vrf')
 
 if not device or not vrf_name:
     print(json.dumps({'success': False, 'error': 'Device and VRF name are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(vrf_name)):
+    print(json.dumps({'success': False, 'error': 'Invalid VRF name (allowed: letters, digits, _ . -)'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 if not l3vni:
@@ -739,10 +734,12 @@ PYTHON
 
 # Create VRF on multiple devices (bulk)
 create_vrf_bulk() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -774,6 +771,15 @@ if not vrf_name or not l3vni:
     print(json.dumps({'success': False, 'error': 'VRF name and L3VNI are required'}))
     sys.exit(0)
 
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(vrf_name)):
+    print(json.dumps({'success': False, 'error': 'Invalid VRF name (allowed: letters, digits, _ . -)'}))
+    sys.exit(0)
+
+for _d in devices:
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(_d)):
+        print(json.dumps({'success': False, 'error': f'Invalid device name: {_d}'}))
+        sys.exit(0)
+
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
 bgp_profiles_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'bgp_profiles.yaml')
@@ -782,6 +788,7 @@ bgp_profiles_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 
 leaking_configured = False
 tenant_profile = None
 shared_profile = None
+leaking_error = None
 
 if leaking_enabled and leak_from_vrf:
     try:
@@ -824,7 +831,7 @@ if leaking_enabled and leak_from_vrf:
         if tenant_profile:
             bgp_profile = tenant_profile
     except Exception as e:
-        pass
+        leaking_error = str(e)
 
 # Create VRF entry
 vrf_entry = {
@@ -836,6 +843,7 @@ if vxlan_int:
     vrf_entry['vxlan_int'] = vxlan_int
 
 devices_created = []
+devices_skipped = []
 device_errors = {}
 
 for device in devices:
@@ -845,23 +853,28 @@ for device in devices:
             alt_file = os.path.join(host_vars_dir, f'{device}.yml')
             if os.path.exists(alt_file):
                 host_file = alt_file
-        
+
         # Load host_vars
         host_data = {}
         if os.path.exists(host_file):
             with open(host_file, 'r') as f:
                 host_data = yaml.load(f) or {}
-        
+
         # Get device's BGP ASN
         device_asn = None
         bgp_config = host_data.get('bgp', {})
         if isinstance(bgp_config, dict):
             device_asn = bgp_config.get('asn')
-        
+
         # Initialize vrfs if not exists
         if 'vrfs' not in host_data:
             host_data['vrfs'] = {}
-        
+
+        # Skip devices where this VRF already exists (mirror single-device create_vrf)
+        if vrf_name in host_data['vrfs']:
+            devices_skipped.append(device)
+            continue
+
         # Create device-specific VRF entry with its own ASN (nested bgp format, same as create_vrf)
         device_vrf_entry = vrf_entry.copy()
         if device_asn or bgp_profile:
@@ -892,20 +905,30 @@ result = {
     'success': len(devices_created) > 0,
     'vrf_name': vrf_name,
     'devices_created': len(devices_created),
-    'devices_list': devices_created
+    'devices_list': devices_created,
+    'devices_skipped': devices_skipped
 }
+
+warnings = []
 
 if device_errors:
     result['device_errors'] = device_errors
-if not devices_created:
+if devices_skipped:
+    warnings.append('VRF already existed (skipped) on: ' + ', '.join(devices_skipped))
+if not devices_created and not devices_skipped:
     result['error'] = 'VRF was not created on any device: ' + '; '.join(f'{d}: {e}' for d, e in device_errors.items())
 
 if leaking_enabled:
     result['leaking_configured'] = leaking_configured
     result['tenant_profile'] = tenant_profile
     result['shared_profile'] = shared_profile
-    if not tenant_profile:
-        result['warning'] = f'No profile found that imports from {leak_from_vrf}'
+    if leaking_error:
+        warnings.append(f'Route-leaking setup failed: {leaking_error}')
+    elif not tenant_profile:
+        warnings.append(f'No profile found that imports from {leak_from_vrf}')
+
+if warnings:
+    result['warning'] = '; '.join(warnings)
 
 print(json.dumps(result))
 PYTHON
@@ -913,10 +936,12 @@ PYTHON
 
 # Assign VRFs to device
 assign_vrfs() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -937,6 +962,10 @@ vrf_names = data.get('vrfs', [])
 
 if not device or not vrf_names:
     print(json.dumps({'success': False, 'error': 'Device and VRF names are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -1018,10 +1047,12 @@ PYTHON
 
 # Unassign VRF from device
 unassign_vrf() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -1040,6 +1071,10 @@ vrf_name = data.get('vrf')
 
 if not device or not vrf_name:
     print(json.dumps({'success': False, 'error': 'Device and VRF name are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 if vrf_name == 'default':
@@ -1133,6 +1168,7 @@ PYTHON
 
 # Delete VRF globally (from all devices)
 delete_vrf_global() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
@@ -1166,13 +1202,14 @@ host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
 bgp_profiles_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'bgp_profiles.yaml')
 
 devices_updated = []
+file_errors = {}
 
 # Remove VRF from all host_vars files
 for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
     try:
         with open(host_file, 'r') as f:
             host_data = yaml.load(f) or {}
-        
+
         if 'vrfs' in host_data and vrf_name in host_data['vrfs']:
             del host_data['vrfs'][vrf_name]
             _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(host_file), suffix='.tmp')
@@ -1185,8 +1222,8 @@ for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os
                 raise
             hostname = os.path.basename(host_file).replace('.yaml', '').replace('.yml', '')
             devices_updated.append(hostname)
-    except:
-        pass
+    except Exception as e:
+        file_errors[os.path.basename(host_file)] = str(e)
 
 # Remove VRF from bgp_profiles.yaml (leaking references)
 leaking_removed = False
@@ -1194,20 +1231,20 @@ try:
     if os.path.exists(bgp_profiles_file):
         with open(bgp_profiles_file, 'r') as f:
             bgp_data = yaml.load(f) or {}
-        
+
         bgp_profiles = bgp_data.get('bgp_profiles', {})
         modified = False
-        
+
         for profile_name, profile_config in bgp_profiles.items():
             ipv4_af = profile_config.get('ipv4_unicast_af', {})
             route_import = ipv4_af.get('route_import', {})
             from_vrf_list = route_import.get('from_vrf', [])
-            
+
             if vrf_name in from_vrf_list:
                 from_vrf_list.remove(vrf_name)
                 modified = True
                 leaking_removed = True
-        
+
         if modified:
             _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(bgp_profiles_file), suffix='.tmp')
             try:
@@ -1217,14 +1254,19 @@ try:
             except:
                 if os.path.exists(_tmp_path): os.unlink(_tmp_path)
                 raise
-except:
-    pass
+except Exception as e:
+    file_errors['bgp_profiles.yaml'] = str(e)
 
-print(json.dumps({
-    'success': True,
+result = {
+    'success': not file_errors,
     'devices_updated': devices_updated,
     'leaking_removed': leaking_removed
-}))
+}
+if file_errors:
+    result['file_errors'] = file_errors
+    result['error'] = 'Some files failed to update: ' + ', '.join(file_errors.keys())
+
+print(json.dumps(result))
 PYTHON
 }
 
@@ -1410,7 +1452,7 @@ try:
         'success': True,
         'profiles': profiles,
         'bgp_profiles': bgp_profiles,
-        'infra_vrfs': config.get('infra_vrfs', [])
+        'infra_vrfs': config.get('infra_vrfs') or ['default']
     }))
 
 except Exception as e:
@@ -1423,11 +1465,13 @@ PYTHON
 
 # Create BGP Profile (using ruamel.yaml to preserve comments)
 create_bgp_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
 import os
+import re
 import sys
 import tempfile
 import shutil
@@ -1450,6 +1494,10 @@ peer_groups = data.get('peer_groups', {})
 
 if not profile_name:
     print(json.dumps({'success': False, 'error': 'Profile name is required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', profile_name):
+    print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -1509,11 +1557,13 @@ PYTHON
 
 # Update BGP Profile (using ruamel.yaml to preserve comments)
 update_bgp_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
 import os
+import re
 import sys
 import tempfile
 import shutil
@@ -1539,40 +1589,72 @@ if not original_name or not profile_name:
     print(json.dumps({'success': False, 'error': 'Profile names are required'}))
     sys.exit(0)
 
+if not re.match(r'^[A-Za-z0-9_.-]+$', profile_name):
+    print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
+    sys.exit(0)
+
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 bgp_file = f"{ansible_dir}/inventory/group_vars/all/bgp_profiles.yaml"
 
 try:
     with open(bgp_file, 'r') as f:
         config = yaml.load(f) or {}
-    
+
     if 'bgp_profiles' not in config or original_name not in config['bgp_profiles']:
         print(json.dumps({'success': False, 'error': f'Profile {original_name} not found'}))
         sys.exit(0)
-    
-    # Build updated profile entry
-    profile_entry = {
-        'ipv4_unicast_af': {
-            'redistribute_connected_routes': redistribute_connected,
-            'redistribute_static_routes': redistribute_static
-        }
-    }
-    
+
+    if original_name != profile_name and profile_name in config['bgp_profiles']:
+        print(json.dumps({'success': False, 'error': f'Profile {profile_name} already exists'}))
+        sys.exit(0)
+
+    # MERGE onto the existing entry so route-leaking (ipv4_unicast_af.route_import
+    # from_vrf/route_map) and dict-form per-peer attributes are preserved.
+    profile_entry = config['bgp_profiles'].get(original_name)
+    if not hasattr(profile_entry, 'get'):
+        profile_entry = {}
+
+    af = profile_entry.get('ipv4_unicast_af')
+    if not hasattr(af, 'get'):
+        af = {}
+        profile_entry['ipv4_unicast_af'] = af
+    af['redistribute_connected_routes'] = redistribute_connected
+    af['redistribute_static_routes'] = redistribute_static
     if export_to_evpn_type5:
-        profile_entry['ipv4_unicast_af']['export_to_evpn_type5'] = True
-    
+        af['export_to_evpn_type5'] = True
+    else:
+        af.pop('export_to_evpn_type5', None)
+    # NOTE: af['route_import'] intentionally left untouched (route leaking).
+
     if enable_evpn:
-        profile_entry['l2vpn_evpn_af'] = {'enable_evpn': True}
-    
+        evpn = profile_entry.get('l2vpn_evpn_af')
+        if not hasattr(evpn, 'get'):
+            evpn = {}
+            profile_entry['l2vpn_evpn_af'] = evpn
+        evpn['enable_evpn'] = True
+    else:
+        profile_entry.pop('l2vpn_evpn_af', None)
+
+    # Merge peer_groups so existing per-peer dict attributes survive. Only the
+    # peer groups the modal sends are touched; others are left intact.
     if peer_groups:
-        profile_entry['peer_groups'] = peer_groups
-    
+        existing_pg = profile_entry.get('peer_groups')
+        if not hasattr(existing_pg, 'get'):
+            existing_pg = {}
+            profile_entry['peer_groups'] = existing_pg
+        for pg_name, pg_val in peer_groups.items():
+            cur = existing_pg.get(pg_name)
+            if hasattr(cur, 'update') and hasattr(pg_val, 'items'):
+                cur.update(pg_val)
+            else:
+                existing_pg[pg_name] = pg_val
+
     # Remove old profile if renaming
     if original_name != profile_name:
         del config['bgp_profiles'][original_name]
-    
+
     config['bgp_profiles'][profile_name] = profile_entry
-    
+
     _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(bgp_file), suffix='.tmp')
     try:
         with os.fdopen(_tmp_fd, 'w') as _tmp_f:
@@ -1597,12 +1679,14 @@ PYTHON
 
 # Delete BGP Profile (using ruamel.yaml to preserve comments)
 delete_bgp_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
 import os
 import sys
+import glob
 import tempfile
 import shutil
 from ruamel.yaml import YAML
@@ -1627,11 +1711,39 @@ bgp_file = f"{ansible_dir}/inventory/group_vars/all/bgp_profiles.yaml"
 try:
     with open(bgp_file, 'r') as f:
         config = yaml.load(f) or {}
-    
+
     if 'bgp_profiles' not in config or profile_name not in config['bgp_profiles']:
         print(json.dumps({'success': False, 'error': f'Profile {profile_name} not found'}))
         sys.exit(0)
-    
+
+    # Refuse to delete a profile that is still referenced by any VRF's
+    # bgp.bgp_profile in host_vars (would leave a dangling pointer).
+    host_vars_dir = f"{ansible_dir}/inventory/host_vars"
+    in_use = []
+    for hv in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        try:
+            with open(hv, 'r') as f:
+                hv_cfg = yaml.load(f) or {}
+        except Exception:
+            continue
+        if not hasattr(hv_cfg, 'get'):
+            continue
+        vrfs = hv_cfg.get('vrfs')
+        if not hasattr(vrfs, 'items'):
+            continue
+        for vrf_name, vrf_cfg in vrfs.items():
+            if hasattr(vrf_cfg, 'get'):
+                bgp = vrf_cfg.get('bgp')
+                if hasattr(bgp, 'get') and bgp.get('bgp_profile') == profile_name:
+                    in_use.append({'device': os.path.basename(hv).rsplit('.', 1)[0], 'vrf': vrf_name})
+    if in_use:
+        print(json.dumps({
+            'success': False,
+            'error': f'BGP profile {profile_name} is still in use by {len(in_use)} VRF(s)',
+            'in_use': in_use
+        }))
+        sys.exit(0)
+
     del config['bgp_profiles'][profile_name]
     
     _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(bgp_file), suffix='.tmp')
@@ -1658,10 +1770,12 @@ PYTHON
 
 # Create Port Profile
 create_port_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -1688,6 +1802,10 @@ stp_portautoedgedisable = data.get('stp_portautoedgedisable', True)
 
 if not profile_name:
     print(json.dumps({'success': False, 'error': 'Profile name is required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', profile_name):
+    print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -1745,10 +1863,13 @@ PYTHON
 
 # Update Port Profile
 update_port_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
 import json
+import re
+import glob
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -1778,6 +1899,14 @@ if not original_name:
     print(json.dumps({'success': False, 'error': 'Original profile name is required'}))
     sys.exit(0)
 
+if not profile_name:
+    print(json.dumps({'success': False, 'error': 'Profile name is required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', profile_name):
+    print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
+    sys.exit(0)
+
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 port_file = f"{ansible_dir}/inventory/group_vars/all/sw_port_profiles.yaml"
 
@@ -1790,10 +1919,18 @@ if 'sw_port_profiles' not in config or original_name not in config['sw_port_prof
     print(json.dumps({'success': False, 'error': f'Profile {original_name} not found'}))
     sys.exit(0)
 
-# Build updated entry
-profile_entry = {
-    'sw_port_mode': sw_port_mode
-}
+# Reject rename onto an already-existing profile name
+if original_name != profile_name and profile_name in config['sw_port_profiles']:
+    print(json.dumps({'success': False, 'error': f'Profile {profile_name} already exists'}))
+    sys.exit(0)
+
+# Merge on top of the existing entry so keys not covered by the modal
+# (e.g. stp_* on trunk profiles) survive the edit.
+existing_entry = config['sw_port_profiles'].get(original_name)
+if not hasattr(existing_entry, 'get'):
+    existing_entry = {}
+profile_entry = existing_entry
+profile_entry['sw_port_mode'] = sw_port_mode
 
 if description:
     profile_entry['description'] = description
@@ -1801,16 +1938,31 @@ if description:
 if sw_port_mode == 'access':
     if access_vlan:
         profile_entry['access_vlan'] = int(access_vlan)
+    else:
+        profile_entry.pop('access_vlan', None)
     profile_entry['stp_bpduguard'] = stp_bpduguard
     profile_entry['stp_portadminedge'] = stp_portadminedge
     profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
+    # Access profiles carry no trunk keys
+    for k in ('trunk_untagged', 'trunk_allowed_vlan_all', 'trunk_allowed_vlan_list'):
+        profile_entry.pop(k, None)
 elif sw_port_mode == 'trunk':
     if native_vlan:
         profile_entry['trunk_untagged'] = int(native_vlan)
+    else:
+        profile_entry.pop('trunk_untagged', None)
     if trunk_allowed_vlan_all:
         profile_entry['trunk_allowed_vlan_all'] = True
+        profile_entry.pop('trunk_allowed_vlan_list', None)
     elif trunk_allowed_vlans:
         profile_entry['trunk_allowed_vlan_list'] = trunk_allowed_vlans
+        profile_entry.pop('trunk_allowed_vlan_all', None)
+    # Trunk profiles legitimately carry stp_* options: preserve/set them
+    profile_entry['stp_bpduguard'] = stp_bpduguard
+    profile_entry['stp_portadminedge'] = stp_portadminedge
+    profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
+    # Access-only key does not belong on a trunk profile
+    profile_entry.pop('access_vlan', None)
 
 # Remove old if renaming
 if original_name != profile_name:
@@ -1827,12 +1979,44 @@ except:
     if os.path.exists(_tmp_path): os.unlink(_tmp_path)
     raise
 
-print(json.dumps({'success': True, 'profile_name': profile_name}))
+# On rename, rewrite sw_port_profile references in host_vars interfaces{}/bonds{}
+updated_hosts = []
+if original_name != profile_name:
+    host_vars_dir = f"{ansible_dir}/inventory/host_vars"
+    for hv in glob.glob(f"{host_vars_dir}/*.yaml"):
+        try:
+            with open(hv, 'r') as f:
+                hv_cfg = yaml.load(f) or {}
+        except Exception:
+            continue
+        if not hasattr(hv_cfg, 'get'):
+            continue
+        changed = False
+        for section in ('interfaces', 'bonds'):
+            sect = hv_cfg.get(section)
+            if not hasattr(sect, 'items'):
+                continue
+            for _pname, pcfg in sect.items():
+                if hasattr(pcfg, 'get') and pcfg.get('sw_port_profile') == original_name:
+                    pcfg['sw_port_profile'] = profile_name
+                    changed = True
+        if changed:
+            _hfd, _hpath = tempfile.mkstemp(dir=os.path.dirname(hv), suffix='.tmp')
+            try:
+                with os.fdopen(_hfd, 'w') as _hf:
+                    yaml.dump(hv_cfg, _hf)
+                shutil.move(_hpath, hv)
+                updated_hosts.append(os.path.basename(hv).replace('.yaml', ''))
+            except Exception:
+                if os.path.exists(_hpath): os.unlink(_hpath)
+
+print(json.dumps({'success': True, 'profile_name': profile_name, 'updated_hosts': updated_hosts}))
 PYTHON
 }
 
 # Delete Port Profile
 delete_port_profile() {
+    acquire_lock
     read -r POST_DATA
     export POST_DATA
     python3 << PYTHON
@@ -1885,12 +2069,14 @@ PYTHON
 
 # Create VLAN - adds to vlan_profiles.yaml and sw_port_profiles.yaml
 create_vlan() {
+    acquire_lock
     # Read POST data
     read -r POST_DATA
     export POST_DATA
-    
+
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -1910,6 +2096,9 @@ try:
     
     vlan_id = int(data.get('vlan_id'))
     profile_name = data.get('profile_name', f'VLAN_{vlan_id}')
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(profile_name)):
+        print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
+        sys.exit(0)
     description = data.get('description', '')
     l2vni = data.get('l2vni', 100000 + vlan_id)
     stp_bpduguard = data.get('stp_bpduguard', True)
@@ -2083,6 +2272,7 @@ PYTHON
 }
 
 delete_vlan() {
+    acquire_lock
     # Read POST data
     read -r POST_DATA
     export POST_DATA
@@ -2178,12 +2368,14 @@ PYTHON
 }
 
 assign_vlans() {
+    acquire_lock
     # Read POST data
     read -r POST_DATA
     export POST_DATA
 
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -2200,6 +2392,10 @@ vlans = data.get('vlans', [])
 
 if not device:
     print(json.dumps({'success': False, 'error': 'Device name is required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 if not vlans:
@@ -2255,12 +2451,14 @@ PYTHON
 }
 
 unassign_vlan() {
+    acquire_lock
     # Read POST data
     read -r POST_DATA
     export POST_DATA
 
     python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -2277,6 +2475,10 @@ vlan = data.get('vlan', '')
 
 if not device:
     print(json.dumps({'success': False, 'error': 'Device name is required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 if not vlan:
@@ -2330,12 +2532,15 @@ PYTHON
 }
 
 update_vlan() {
+    acquire_lock
     # Read POST data
     read -r POST_DATA
     export POST_DATA
 
     python3 << PYTHON
 import json
+import re
+import glob
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -2366,6 +2571,10 @@ try:
         print(json.dumps({'success': False, 'error': 'Original profile name is required'}))
         sys.exit(0)
 
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(profile_name)):
+        print(json.dumps({'success': False, 'error': 'Invalid profile name (allowed: letters, digits, _ . -)'}))
+        sys.exit(0)
+
     # Paths
     ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
     inventory_base = os.path.join(ansible_dir, 'inventory')
@@ -2381,46 +2590,67 @@ try:
         print(json.dumps({'success': False, 'error': f'VLAN profile {original_name} not found'}))
         sys.exit(0)
 
+    is_rename = profile_name != original_name
+
+    # Reject rename onto an already-existing profile (mirror create_vlan guard)
+    if is_rename and profile_name in vlan_config['vlan_profiles']:
+        print(json.dumps({'success': False, 'error': f'VLAN profile {profile_name} already exists'}))
+        sys.exit(0)
+
     # Get existing profile data
     existing = vlan_config['vlan_profiles'][original_name]
-
-    # Build updated VLAN entry
-    vlan_entry = {
-        'description': description,
-        'l2vni': l2vni if l2vni else existing.get('vlans', {}).get(vlan_id, {}).get('l2vni', 100000 + vlan_id)
-    }
-
-    if svi_enabled:
-        vlan_entry['vrf'] = vrf
-        vlan_entry['ipv6'] = False
-
-        if vrr_enabled:
-            if vrr_vip:
-                vlan_entry['vrr_vip'] = vrr_vip
-            if even_ip:
-                vlan_entry['even_ip'] = even_ip
-            if odd_ip:
-                vlan_entry['odd_ip'] = odd_ip
-            if vrr_vmac:
-                vlan_entry['vrr_vmac'] = vrr_vmac
-        else:
-            if gateway_ip:
-                vlan_entry['ip'] = gateway_ip
-
-    # Update this VLAN in the profile's existing vlans (preserve other VLANs)
     existing_vlans = existing.get('vlans', {}) or {}
-    if vlan_id not in existing_vlans and str(vlan_id) in existing_vlans:
-        existing_vlans[str(vlan_id)] = vlan_entry
-    else:
-        existing_vlans[vlan_id] = vlan_entry
 
-    profile_entry = {
-        'vrr': {'state': vrr_enabled if svi_enabled else False},
-        'vlans': existing_vlans
-    }
+    # Range / multi-VLAN profiles: vlan_id arrives null. Never build a null key
+    # or compute '100000 + None'. Only a rename is supported for these.
+    if vlan_id is None:
+        if not is_rename:
+            print(json.dumps({'success': False, 'error': 'Range/multi-VLAN profiles are not single-VLAN editable; only rename is supported'}))
+            sys.exit(0)
+        profile_entry = existing
+    else:
+        try:
+            vlan_id = int(vlan_id)
+        except (TypeError, ValueError):
+            print(json.dumps({'success': False, 'error': 'Invalid VLAN ID'}))
+            sys.exit(0)
+
+        # Build updated VLAN entry
+        vlan_entry = {
+            'description': description,
+            'l2vni': l2vni if l2vni else existing_vlans.get(vlan_id, existing_vlans.get(str(vlan_id), {})).get('l2vni', 100000 + vlan_id)
+        }
+
+        if svi_enabled:
+            vlan_entry['vrf'] = vrf
+            vlan_entry['ipv6'] = False
+
+            if vrr_enabled:
+                if vrr_vip:
+                    vlan_entry['vrr_vip'] = vrr_vip
+                if even_ip:
+                    vlan_entry['even_ip'] = even_ip
+                if odd_ip:
+                    vlan_entry['odd_ip'] = odd_ip
+                if vrr_vmac:
+                    vlan_entry['vrr_vmac'] = vrr_vmac
+            else:
+                if gateway_ip:
+                    vlan_entry['ip'] = gateway_ip
+
+        # Update this VLAN in the profile's existing vlans (preserve other VLANs)
+        if vlan_id not in existing_vlans and str(vlan_id) in existing_vlans:
+            existing_vlans[str(vlan_id)] = vlan_entry
+        else:
+            existing_vlans[vlan_id] = vlan_entry
+
+        profile_entry = {
+            'vrr': {'state': vrr_enabled if svi_enabled else False},
+            'vlans': existing_vlans
+        }
 
     # If profile name changed, remove old and add new
-    if profile_name != original_name:
+    if is_rename:
         del vlan_config['vlan_profiles'][original_name]
 
     vlan_config['vlan_profiles'][profile_name] = profile_entry
@@ -2435,10 +2665,41 @@ try:
         if os.path.exists(_tmp_path): os.unlink(_tmp_path)
         raise
 
+    # On rename, rewrite vlan_templates references (old -> new) in host_vars
+    updated_hosts = []
+    if is_rename:
+        host_vars_dir = os.path.join(inventory_base, 'host_vars')
+        for hv in glob.glob(os.path.join(host_vars_dir, '*.yaml')):
+            try:
+                with open(hv, 'r') as f:
+                    hv_cfg = yaml.load(f) or {}
+            except Exception:
+                continue
+            if not hasattr(hv_cfg, 'get'):
+                continue
+            templates = hv_cfg.get('vlan_templates')
+            if not isinstance(templates, list):
+                continue
+            changed = False
+            for i, t in enumerate(templates):
+                if t == original_name:
+                    templates[i] = profile_name
+                    changed = True
+            if changed:
+                _hfd, _hpath = tempfile.mkstemp(dir=os.path.dirname(hv), suffix='.tmp')
+                try:
+                    with os.fdopen(_hfd, 'w') as _hf:
+                        yaml.dump(hv_cfg, _hf)
+                    shutil.move(_hpath, hv)
+                    updated_hosts.append(os.path.basename(hv).replace('.yaml', ''))
+                except Exception:
+                    if os.path.exists(_hpath): os.unlink(_hpath)
+
     print(json.dumps({
         'success': True,
         'profile_name': profile_name,
-        'renamed': profile_name != original_name
+        'renamed': is_rename,
+        'updated_hosts': updated_hosts
     }))
 
 except Exception as e:
@@ -2763,6 +3024,7 @@ PYTHON
         ;;
     "add-subnet-leak")
         # Add a subnet to prefix-list for leaking
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -2859,6 +3121,7 @@ PYTHON
         ;;
     "save-dhcp-relay")
         # Save (create or update) DHCP relay entry
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -2944,6 +3207,7 @@ PYTHON
         ;;
     "delete-dhcp-relay")
         # Delete DHCP relay entry
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -3013,6 +3277,7 @@ PYTHON
         ;;
     "save-evpn-mh")
         # Save EVPN Multihoming configuration
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -3071,6 +3336,7 @@ PYTHON
         ;;
     "delete-evpn-mh")
         # Delete EVPN Multihoming configuration
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -3125,10 +3391,12 @@ PYTHON
         ;;
     create-bond)
         # Create a new bond interface
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3156,6 +3424,14 @@ description = data.get('description', '')
 
 if not device or not bond_name:
     print(json.dumps({'success': False, 'error': 'Device and bond name are required'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_./-]+$', str(bond_name)):
+    print(json.dumps({'success': False, 'error': 'Invalid bond name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3215,6 +3491,7 @@ PYTHON
         ;;
     delete-bond)
         # Delete a bond interface
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -3280,6 +3557,7 @@ PYTHON
         ;;
     delete-subinterface)
         # Delete a subinterface
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -3367,10 +3645,12 @@ PYTHON
         ;;
     update-interface)
         # Update interface or bond settings
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
 import json
+import re
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3396,6 +3676,10 @@ description = data.get('description', '')
 
 if not device or not interface_name:
     print(json.dumps({'success': False, 'error': 'Missing device or interface_name'}))
+    sys.exit(0)
+
+if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+    print(json.dumps({'success': False, 'error': 'Invalid device name'}))
     sys.exit(0)
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3428,10 +3712,39 @@ try:
         elif 'description' in bond:
             del bond['description']
         
-        # Update bond_members
-        bond_members = data.get('bond_members', [])
-        if bond_members:
-            bond['bond_members'] = bond_members
+        # Update bond_members (validate: dedup, valid names, not in another bond,
+        # and strip each member's own L2/L3 keys since it becomes a bond slave)
+        raw_members = data.get('bond_members', []) or []
+        seen = set()
+        members = []
+        for m in raw_members:
+            m = str(m).strip()
+            if not m or m in seen:
+                continue
+            if not re.match(r'^[A-Za-z0-9_./-]+$', m):
+                print(json.dumps({'success': False, 'error': f'Invalid bond member name: {m}'}))
+                sys.exit(0)
+            seen.add(m)
+            members.append(m)
+        # Reject members already enslaved by a different bond
+        for other_name, other_bond in (host_data.get('bonds') or {}).items():
+            if other_name == interface_name or not hasattr(other_bond, 'get'):
+                continue
+            other_members = other_bond.get('bond_members') or []
+            for m in members:
+                if m in other_members:
+                    print(json.dumps({'success': False, 'error': f'Member {m} is already in bond {other_name}'}))
+                    sys.exit(0)
+        # Strip each member's own L2/L3 keys
+        _ifaces = host_data.get('interfaces')
+        if hasattr(_ifaces, 'get'):
+            for m in members:
+                mi = _ifaces.get(m)
+                if hasattr(mi, 'pop'):
+                    for _k in ('sw_port_profile', 'ip', 'vrf'):
+                        mi.pop(_k, None)
+        if members:
+            bond['bond_members'] = members
         elif 'bond_members' in bond:
             del bond['bond_members']
         
@@ -3481,36 +3794,41 @@ try:
     elif interface_type == 'bond-member':
         # Bond member - manage bond membership
         target_bond = data.get('target_bond', '')
-        previous_bond = data.get('previous_bond', '')
-        
-        # Remove from previous bond if different
-        if previous_bond and previous_bond != target_bond:
-            if 'bonds' in host_data and previous_bond in host_data['bonds']:
-                old_bond = host_data['bonds'][previous_bond]
-                if 'bond_members' in old_bond and interface_name in old_bond['bond_members']:
-                    old_bond['bond_members'].remove(interface_name)
-        
+
+        # Remove from every bond except the target (guarantees single membership,
+        # covers previous_bond and any stale membership elsewhere)
+        for _bn, _b in (host_data.get('bonds') or {}).items():
+            if _bn == target_bond or not hasattr(_b, 'get'):
+                continue
+            _bm = _b.get('bond_members')
+            if _bm and interface_name in _bm:
+                _bm.remove(interface_name)
+
         # Add to target bond
         if target_bond:
             if 'bonds' not in host_data:
                 host_data['bonds'] = {}
             if target_bond not in host_data['bonds']:
                 host_data['bonds'][target_bond] = {}
-            
+
             bond = host_data['bonds'][target_bond]
             if 'bond_members' not in bond:
                 bond['bond_members'] = []
-            
+
             if interface_name not in bond['bond_members']:
                 bond['bond_members'].append(interface_name)
-        
-        # Update description on interface
+
+        # Update description on interface; a bond slave must not carry its own
+        # L2/L3 config, so drop sw_port_profile/ip/vrf from its interface entry.
         if 'interfaces' not in host_data:
             host_data['interfaces'] = {}
         if interface_name not in host_data['interfaces']:
             host_data['interfaces'][interface_name] = {}
-        
+
         iface = host_data['interfaces'][interface_name]
+        for _k in ('sw_port_profile', 'ip', 'vrf'):
+            if _k in iface:
+                del iface[_k]
         if description:
             iface['description'] = description
         elif 'description' in iface:
@@ -3532,27 +3850,31 @@ try:
             host_data['interfaces'][interface_name] = {}
         
         iface = host_data['interfaces'][interface_name]
-        
+
+        # Switching to L3: drop any L2 switchport profile left over
+        if 'sw_port_profile' in iface:
+            del iface['sw_port_profile']
+
         # Update IP
         ip = data.get('ip', '')
         if ip:
             iface['ip'] = ip
         elif 'ip' in iface:
             del iface['ip']
-        
+
         # Update VRF
         vrf = data.get('vrf', '')
         if vrf:
             iface['vrf'] = vrf
         elif 'vrf' in iface:
             del iface['vrf']
-        
+
         # Update description
         if description:
             iface['description'] = description
         elif 'description' in iface:
             del iface['description']
-            
+
     elif interface_type == 'subif':
         # Subinterface - format: swp1.1001
         # First, remove from any previous bond
@@ -3619,20 +3941,25 @@ try:
             host_data['interfaces'][interface_name] = {}
         
         iface = host_data['interfaces'][interface_name]
-        
+
+        # Switching to L2/access: drop any L3 addressing left over
+        for _k in ('ip', 'vrf'):
+            if _k in iface:
+                del iface[_k]
+
         # Update profile
         profile = data.get('profile', '')
         if profile:
             iface['sw_port_profile'] = profile
         elif 'sw_port_profile' in iface:
             del iface['sw_port_profile']
-        
+
         # Update description
         if description:
             iface['description'] = description
         elif 'description' in iface:
             del iface['description']
-    
+
     # Write back
     _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(host_file), suffix='.tmp')
     try:
@@ -3652,10 +3979,13 @@ PYTHON
         # Add a new external BGP peer
         # Creates subinterface + adds peer to BGP profile
         # If create_border_profile=true, creates OVERLAY_BORDER_XX profile with External peer group
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
 import json
+import re
+import ipaddress
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -3677,13 +4007,54 @@ try:
     vlan_id = data.get('vlan_id', '')
     local_ip = data.get('local_ip', '')
     remote_peer = data.get('remote_peer', '')
+    weight = data.get('weight')
+    policy_name = data.get('policy_name')
+    policy_direction = data.get('policy_direction')
+    soft_reconfiguration = data.get('soft_reconfiguration', False)
     create_border_profile = data.get('create_border_profile', False)
     border_profile_suffix = data.get('border_profile_suffix', '00')
-    
+
     if not all([device, vrf, interface, local_ip, remote_peer]):
         print(json.dumps({'success': False, 'error': 'Missing required fields'}))
         exit(0)
-    
+
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+        print(json.dumps({'success': False, 'error': 'Invalid device name'}))
+        exit(0)
+
+    # Validate remote_peer as a bare IP address
+    try:
+        ipaddress.ip_address(str(remote_peer))
+    except ValueError:
+        print(json.dumps({'success': False, 'error': f'Invalid remote peer IP: {remote_peer}'}))
+        exit(0)
+
+    # Normalize local_ip: accept CIDR as-is, otherwise validate host and append /31
+    if '/' in str(local_ip):
+        try:
+            ipaddress.ip_interface(str(local_ip))
+        except ValueError:
+            print(json.dumps({'success': False, 'error': f'Invalid local IP: {local_ip}'}))
+            exit(0)
+        local_ip_norm = str(local_ip)
+    else:
+        try:
+            ipaddress.ip_address(str(local_ip))
+        except ValueError:
+            print(json.dumps({'success': False, 'error': f'Invalid local IP: {local_ip}'}))
+            exit(0)
+        local_ip_norm = f'{local_ip}/31'
+
+    # Build the peer_config the same way update-external-peer does
+    peer_config = {}
+    if weight is not None:
+        peer_config['weight'] = int(weight)
+    if policy_name and policy_direction:
+        peer_config['policy'] = {'name': policy_name, 'direction': policy_direction}
+    if soft_reconfiguration:
+        peer_config['soft_reconfiguration'] = True
+    new_peer_value = peer_config if peer_config else None
+
     # Parse interface name
     if '.' in interface:
         parent_if, sub_id = interface.split('.', 1)
@@ -3733,7 +4104,17 @@ try:
                 has_external = True
                 external_pg_name = _pg_name
                 break
-    
+
+    # Refuse if this remote_peer already exists in that peer group (do not clobber
+    # the existing peer and its subinterface)
+    if has_external and bgp_profile in profiles:
+        _existing_peers = profiles[bgp_profile].get('peer_groups', {}).get(external_pg_name, {}).get('peers', {})
+        _dup = (hasattr(_existing_peers, 'get') and remote_peer in _existing_peers) or \
+               (isinstance(_existing_peers, list) and remote_peer in _existing_peers)
+        if _dup:
+            print(json.dumps({'success': False, 'error': f'Peer {remote_peer} already exists in {external_pg_name}'}))
+            exit(0)
+
     # If no External and create_border_profile requested, create new OVERLAY_BORDER_XX profile
     if not has_external and create_border_profile:
         new_profile_name = f'OVERLAY_BORDER_{border_profile_suffix}'
@@ -3751,7 +4132,7 @@ try:
                     'peer_type': 'external',
                     'enable_bfd': False,
                     'peers': {
-                        remote_peer: None
+                        remote_peer: new_peer_value
                     }
                 }
             }
@@ -3800,7 +4181,7 @@ try:
     
     # Add subinterface
     host_data['interfaces'][parent_if]['subinterfaces'][int(sub_id)] = {
-        'ip': local_ip,
+        'ip': local_ip_norm,
         'vlan': int(sub_id),
         'vrf': vrf
     }
@@ -3831,10 +4212,14 @@ try:
         
         # Handle both list and dict formats
         if isinstance(external_pg['peers'], list):
-            if remote_peer not in external_pg['peers']:
+            if new_peer_value is not None:
+                # Promote to dict form so the modal fields can be stored
+                external_pg['peers'] = {str(p): {} for p in external_pg['peers']}
+                external_pg['peers'][remote_peer] = new_peer_value
+            elif remote_peer not in external_pg['peers']:
                 external_pg['peers'].append(remote_peer)
         else:
-            external_pg['peers'][remote_peer] = None
+            external_pg['peers'][remote_peer] = new_peer_value
         
         # Save bgp_profiles
         _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(bgp_profiles_file), suffix='.tmp')
@@ -3860,6 +4245,7 @@ PYTHON
         ;;
     delete-external-peer)
         # Delete an external BGP peer
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
@@ -4032,10 +4418,13 @@ PYTHON
         ;;
     update-external-peer)
         # Update an existing external BGP peer
+        acquire_lock
         read -r POST_DATA
         export POST_DATA
         python3 << PYTHON
 import json
+import re
+import ipaddress
 from ruamel.yaml import YAML
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -4055,7 +4444,7 @@ try:
     device = data.get('device', '')
     vrf = data.get('vrf', '')
     original_peer = data.get('original_peer', '')
-    interface = data.get('interface', '')  # e.g., swp1.1002
+    interface = data.get('interface', '')  # e.g., swp1.1002, or 'lo', or bare 'swp5'
     local_ip = data.get('local_ip', '')
     remote_peer = data.get('remote_peer', '')
     weight = data.get('weight')  # Can be None or int
@@ -4063,66 +4452,97 @@ try:
     policy_direction = data.get('policy_direction')  # Can be None or 'inbound'/'outbound'
     soft_reconfiguration = data.get('soft_reconfiguration', False)  # Boolean
     bfd_enabled = data.get('bfd_enabled', False)
-    
+
     if not all([device, vrf, interface, local_ip, remote_peer]):
         print(json.dumps({'success': False, 'error': 'Missing required fields'}))
         sys.exit(0)
-    
-    # Parse interface name
-    if '.' in interface:
-        parent_if, sub_id = interface.split('.', 1)
-    else:
-        print(json.dumps({'success': False, 'error': 'Invalid interface format, expected swpX.VLAN'}))
+
+    if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
+        print(json.dumps({'success': False, 'error': 'Invalid device name'}))
         sys.exit(0)
-    
+
+    # Validate remote_peer as a bare IP address
+    try:
+        ipaddress.ip_address(str(remote_peer))
+    except ValueError:
+        print(json.dumps({'success': False, 'error': f'Invalid remote peer IP: {remote_peer}'}))
+        sys.exit(0)
+
+    # Normalize local_ip consistently with add-external-peer (append /31 when no prefix)
+    if '/' in str(local_ip):
+        try:
+            ipaddress.ip_interface(str(local_ip))
+        except ValueError:
+            print(json.dumps({'success': False, 'error': f'Invalid local IP: {local_ip}'}))
+            sys.exit(0)
+        local_ip_norm = str(local_ip)
+    else:
+        try:
+            ipaddress.ip_address(str(local_ip))
+        except ValueError:
+            print(json.dumps({'success': False, 'error': f'Invalid local IP: {local_ip}'}))
+            sys.exit(0)
+        local_ip_norm = f'{local_ip}/31'
+
+    # Subinterface rewrite only applies to swpX.VLAN peers. lo/multihop and bare
+    # direct-interface peers have no subinterface to rewrite.
+    is_subif = ('.' in interface) and interface != 'lo'
+    parent_if = sub_id = None
+    if is_subif:
+        parent_if, sub_id = interface.split('.', 1)
+        if not sub_id.isdigit():
+            print(json.dumps({'success': False, 'error': 'Invalid interface format, expected swpX.VLAN'}))
+            sys.exit(0)
+
     # 1. Update host_vars - update subinterface
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
-    
+
     if not os.path.exists(host_file):
         print(json.dumps({'success': False, 'error': f'Device file not found: {device}.yaml'}))
         sys.exit(0)
-    
+
     with open(host_file, 'r') as f:
         host_data = yaml.load(f) or {}
-    
+
     # Get VRF's BGP profile
     vrfs = host_data.get('vrfs', {})
     if vrf not in vrfs:
         print(json.dumps({'success': False, 'error': f'VRF {vrf} not found on device'}))
         sys.exit(0)
-    
+
     bgp_profile = vrfs[vrf].get('bgp', {}).get('bgp_profile', '')
     if not bgp_profile:
         print(json.dumps({'success': False, 'error': f'No BGP profile configured for VRF {vrf}'}))
         sys.exit(0)
-    
-    # Update subinterface
-    if 'interfaces' not in host_data:
-        host_data['interfaces'] = {}
-    
-    if parent_if not in host_data['interfaces']:
-        host_data['interfaces'][parent_if] = {'description': 'External BGP'}
-    
-    if 'subinterfaces' not in host_data['interfaces'][parent_if]:
-        host_data['interfaces'][parent_if]['subinterfaces'] = {}
-    
-    # Update subinterface config
-    host_data['interfaces'][parent_if]['subinterfaces'][int(sub_id)] = {
-        'ip': local_ip if '/' in local_ip else f'{local_ip}/31',
-        'vlan': int(sub_id),
-        'vrf': vrf
-    }
-    
-    # Save host_vars
-    _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(host_file), suffix='.tmp')
-    try:
-        with os.fdopen(_tmp_fd, 'w') as _tmp_f:
-            yaml.dump(host_data, _tmp_f)
-        shutil.move(_tmp_path, host_file)
-    except:
-        if os.path.exists(_tmp_path): os.unlink(_tmp_path)
-        raise
-    
+
+    if is_subif:
+        # Update subinterface
+        if 'interfaces' not in host_data:
+            host_data['interfaces'] = {}
+
+        if parent_if not in host_data['interfaces']:
+            host_data['interfaces'][parent_if] = {'description': 'External BGP'}
+
+        if 'subinterfaces' not in host_data['interfaces'][parent_if]:
+            host_data['interfaces'][parent_if]['subinterfaces'] = {}
+
+        # Update subinterface config
+        host_data['interfaces'][parent_if]['subinterfaces'][int(sub_id)] = {
+            'ip': local_ip_norm,
+            'vlan': int(sub_id),
+            'vrf': vrf
+        }
+
+        # Save host_vars
+        _tmp_fd, _tmp_path = tempfile.mkstemp(dir=os.path.dirname(host_file), suffix='.tmp')
+        try:
+            with os.fdopen(_tmp_fd, 'w') as _tmp_f:
+                yaml.dump(host_data, _tmp_f)
+            shutil.move(_tmp_path, host_file)
+        except:
+            if os.path.exists(_tmp_path): os.unlink(_tmp_path)
+            raise
+
     # 2. Update BGP profile - update peer in External group
     bgp_profiles_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'bgp_profiles.yaml')
     
@@ -4169,22 +4589,37 @@ try:
         peers = {str(p): {} for p in peers}
         external_pg['peers'] = peers
     
+    # Preserve the existing peer node (description and any unknown keys) across the edit
+    _prev = None
+    if original_peer and original_peer in peers and hasattr(peers[original_peer], 'items'):
+        _prev = peers[original_peer]
+    elif remote_peer in peers and hasattr(peers[remote_peer], 'items'):
+        _prev = peers[remote_peer]
+
     # Handle peer IP change
     if original_peer and original_peer != remote_peer:
         if original_peer in peers:
             del peers[original_peer]
-    
-    # Set/update peer with weight, policy, and soft_reconfiguration
-    peer_config = {}
+
+    # Start from the existing config so description/unknown keys survive
+    peer_config = _prev if hasattr(_prev, 'items') else {}
+
+    # Set/update the modal-controlled fields (weight, policy, soft_reconfiguration)
     if weight is not None:
         peer_config['weight'] = int(weight)
+    else:
+        peer_config.pop('weight', None)
     if policy_name and policy_direction:
         peer_config['policy'] = {
             'name': policy_name,
             'direction': policy_direction
         }
+    else:
+        peer_config.pop('policy', None)
     if soft_reconfiguration:
         peer_config['soft_reconfiguration'] = True
+    else:
+        peer_config.pop('soft_reconfiguration', None)
     peers[remote_peer] = peer_config if peer_config else {}
     
     # Save bgp_profiles

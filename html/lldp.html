@@ -247,10 +247,11 @@
             opacity: 0.5;
         }
         
+        .sort-arrow::before { content: '▲▼'; }
         .sortable.asc .sort-arrow::before { content: '▲'; color: #76b900; opacity: 1; }
         .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow { opacity: 1; }
-        
+
         /* Buttons */
         .btn {
             padding: 8px 14px;
@@ -402,6 +403,7 @@
         .detail-status-mismatch { background: rgba(244, 67, 54, 0.1); border: 1px solid rgba(244, 67, 54, 0.35); }
         .detail-status-design-unresolved { background: rgba(255, 152, 0, 0.1); border: 1px solid rgba(255, 152, 0, 0.35); }
         .detail-status-no-active-design { background: rgba(158, 158, 158, 0.1); border: 1px solid rgba(158, 158, 158, 0.3); }
+        .detail-status-loading { background: rgba(158, 158, 158, 0.1); border: 1px solid rgba(158, 158, 158, 0.3); }
         @media (max-width: 800px) { .compare-grid { grid-template-columns: 1fr; } }
 
         /* Scrollbar */
@@ -424,7 +426,7 @@
                 </select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
-            <input type="text" id="tableFilter" aria-label="Filter LLDP connections" placeholder="Filter Device..." oninput="filterTable()" style="height:34px;padding:0 10px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;font-size:13px;width:220px;outline:none;" autocomplete="off">
+            <input type="text" id="tableFilter" aria-label="Filter LLDP connections" placeholder="Filter Device..." oninput="debouncedFilterTable()" style="height:34px;padding:0 10px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;font-size:13px;width:220px;outline:none;" autocomplete="off">
             <button id="run-lldp" onclick="runLLDPCheck()" class="btn btn-secondary">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M8,5.14V19.14L19,12.14L8,5.14Z"/>
@@ -515,31 +517,31 @@
                 <thead>
                 <tr>
                     <th class="sortable" data-column="0" data-type="string">
-                        Local Device <span class="sort-arrow">▲▼</span>
+                        Local Device <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="1" data-type="port">
-                        Local Port <span class="sort-arrow">▲▼</span>
+                        Local Port <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="2" data-type="port-status">
-                        Port Status <span class="sort-arrow">▲▼</span>
+                        Port Status <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="3" data-type="string">
-                        Expected Neighbor <span class="sort-arrow">▲▼</span>
+                        Expected Neighbor <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="4" data-type="port">
-                        Expected Port <span class="sort-arrow">▲▼</span>
+                        Expected Port <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="5" data-type="string">
-                        Active Neighbor <span class="sort-arrow">▲▼</span>
+                        Active Neighbor <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="6" data-type="port">
-                        Active Port <span class="sort-arrow">▲▼</span>
+                        Active Port <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="7" data-type="lldp-status">
-                        Status <span class="sort-arrow">▲▼</span>
+                        Status <span class="sort-arrow"></span>
                     </th>
                     <th class="sortable" data-column="8" data-type="string">
-                        Connection Health <span class="sort-arrow">▲▼</span>
+                        Connection Health <span class="sort-arrow"></span>
                     </th>
                 </tr>
                 </thead>
@@ -1000,6 +1002,12 @@
             return applyCurrentFilters();
         }
 
+        let filterDebounceTimer = null;
+        function debouncedFilterTable() {
+            clearTimeout(filterDebounceTimer);
+            filterDebounceTimer = setTimeout(filterTable, 200);
+        }
+
         function determineLLDPStatus(connection) {
             const { lldpStatus, expectedDevice, expectedPort, actualDevice, actualPort, portStatus, localPort } = connection;
             const normalizedLLDPStatus = normalizedValue(lldpStatus).toLowerCase();
@@ -1324,18 +1332,22 @@
                                 p2pDesignStatus = 'absent'; p2pIndex = new Map();
                             }
                         })
-                        .catch(() => { p2pDesignStatus = 'absent'; p2pIndex = new Map(); }));
+                        .catch(() => { p2pDesignStatus = 'absent'; p2pIndex = new Map(); }))
+                // A detail panel opened while the design was still loading must
+                // settle to the real status, not stay on the loading badge.
+                .then(() => refreshOpenLldpDetails());
         }
         function loadTransceiverInventory() {
             return fetch('/monitor-results/transceiver_inventory.json', { cache: 'no-store' })
                 .then(r => r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)))
                 .then(d => { buildXcvrIndex((d && d.modules) || []); xcvrInvStatus = 'ready'; })
-                .catch(() => { xcvrInvStatus = 'absent'; xcvrIndex = new Map(); });
+                .catch(() => { xcvrInvStatus = 'absent'; xcvrIndex = new Map(); })
+                .then(() => refreshOpenLldpDetails());
         }
 
         function designStatusFor(conn) {
             if (p2pDesignStatus === 'loading') {
-                return { code: 'no-active-design', label: 'No Active Design', badge: 'badge-gray',
+                return { code: 'loading', label: 'Loading...', badge: 'badge-gray',
                     reason: 'Design data is still loading.', design: null };
             }
             if (p2pDesignStatus !== 'ready') {
@@ -1386,9 +1398,11 @@
         function designCardHtml(status) {
             const d = status.design;
             if (!d) {
-                const msg = status.code === 'no-active-design'
-                    ? 'No active design uploaded.'
-                    : 'No design record matches this device:port.';
+                const msg = status.code === 'loading'
+                    ? 'Design data is still loading.'
+                    : status.code === 'no-active-design'
+                        ? 'No active design uploaded.'
+                        : 'No design record matches this device:port.';
                 return `<div class="peer-card"><div class="peer-title">DESIGN</div>` +
                     `<div class="detail-empty">${escHtml(msg)}</div></div>`;
             }
@@ -1413,7 +1427,8 @@
                 xcvrText = [xcvr.vendor, xcvr.part_number].filter(Boolean).join(' ')
                     || displayValue(xcvr.identifier);
             } else {
-                xcvrText = xcvrInvStatus === 'ready' ? 'Not reported' : 'Inventory unavailable';
+                xcvrText = xcvrInvStatus === 'ready' ? 'Not reported'
+                    : (xcvrInvStatus === 'loading' ? 'Loading...' : 'Inventory unavailable');
             }
             const portCls = conn.portStatus === 'UP' ? 'good' : (conn.portStatus === 'DOWN' ? 'bad' : '');
             return `<div class="peer-card"><div class="peer-title">ACTUAL</div>` +
@@ -1427,6 +1442,12 @@
         }
         function closeAllLldpDetails() {
             document.querySelectorAll('tr.lldp-detail-row').forEach(r => r.remove());
+        }
+        function refreshOpenLldpDetails() {
+            document.querySelectorAll('tr.lldp-detail-row').forEach(detail => {
+                const conn = rowConnectionMap.get(detail);
+                if (conn && detail.isConnected) detail.innerHTML = lldpDetailHtml(conn);
+            });
         }
         function lldpDetailHtml(conn) {
             const status = designStatusFor(conn);
@@ -1448,6 +1469,7 @@
             const detail = document.createElement('tr');
             detail.className = 'lldp-detail-row';
             detail.innerHTML = lldpDetailHtml(conn);
+            rowConnectionMap.set(detail, conn);
             row.after(detail);
             // A tab opened before the design was activated cached the 404: retry
             // once per expand and refresh the still-open panel when it lands.
@@ -1462,10 +1484,12 @@
         function renderConnectionsTable(connections) {
             const tbody = document.getElementById('lldp-data');
             tbody.innerHTML = '';
-            
+            const fragment = document.createDocumentFragment();
+
             connections.forEach(connection => {
                 const status = determineLLDPStatus(connection);
-                const row = tbody.insertRow();
+                const row = document.createElement('tr');
+                fragment.appendChild(row);
                 rowConnectionMap.set(row, connection);
                 // Raw lifecycle identity. Display aliases must never influence
                 // Commissioning/Handed Over scope membership.
@@ -1510,6 +1534,7 @@
                 
                 row.insertCell(8).textContent = status.health;
             });
+            tbody.appendChild(fragment);
             applyCurrentSortToRenderedTable();
         }
 
@@ -1633,11 +1658,23 @@
             initDeviceSearch();
         }
 
-        function showFallbackContent() {
+        function showFallbackContent(error) {
             document.getElementById('loading').style.display = 'none';
             document.getElementById('lldp-table').style.display = 'none';
-            document.getElementById('error').style.display = 'block';
-            
+            const errorBox = document.getElementById('error');
+            const message = error && error.message ? String(error.message) : '';
+            let text;
+            if (message === 'LLDP report contains no port rows') {
+                text = 'No LLDP results yet. Run an LLDP check to generate the first report.';
+            } else if (message) {
+                text = `Error loading LLDP data: ${message}`;
+            } else {
+                text = 'Error loading LLDP data. Please check if the data file exists.';
+            }
+            const errorText = errorBox.querySelector('p');
+            if (errorText) errorText.textContent = text;
+            errorBox.style.display = 'block';
+
             // Reset summary cards to 0 when no data available
             totalConnections = 0;
             successConnections = 0;
@@ -1732,7 +1769,7 @@
         }
 
         function loadLLDPData() {
-            fetch('lldp_results.ini')
+            return fetch('lldp_results.ini')
                 .then(async response => {
                     if (!response.ok) {
                         throw new Error(`Data file not found. Status: ${response.status}`);
@@ -1750,10 +1787,11 @@
                     parseAndDisplayLLDPData(data);
                     setLastUpdated(timestampStr, lastModified);
                     document.getElementById('loading').style.display = 'none';
+                    document.getElementById('error').style.display = 'none';
                     document.getElementById('lldp-table').style.display = 'table';
                 })
                 .catch(error => {
-                    showFallbackContent();
+                    showFallbackContent(error);
                 });
         }
 
@@ -1881,6 +1919,44 @@
             return (priority[a] || 0) - (priority[b] || 0);
         }
 
+        // In-place reload after a confirmed LLDP run: re-fetch the report and
+        // the design/transceiver joins, then re-apply the operator's filter,
+        // sort, and device selection instead of discarding them via a full
+        // page reload.
+        function reloadLLDPReportInPlace() {
+            const preservedDevices = selectedDevices.slice();
+            p2pDesignStatus = 'loading';
+            xcvrInvStatus = 'loading';
+            return Promise.all([loadLLDPData(), loadP2pDesign(), loadTransceiverInventory()])
+                .then(() => {
+                    if (document.getElementById('error').style.display === 'block') {
+                        setLLDPButton('failure', true);
+                        updateLLDPNotification('failure', 'LLDP Report Could Not Be Loaded',
+                            'The check finished but the new report could not be loaded.',
+                            'Use the Retry button to reload it.');
+                        autoHideLLDPNotification();
+                        return;
+                    }
+                    // populateDeviceList() cleared the Select2 selection;
+                    // restore the devices that still exist in the new report.
+                    const available = new Set(localDeviceOptions(allConnections));
+                    const kept = preservedDevices.filter(device => available.has(device));
+                    selectedDevices = kept;
+                    deviceSearchActive = kept.length > 0;
+                    _suppressDeviceChange = true;
+                    $('#deviceSearch').val(kept.length ? kept : null).trigger('change');
+                    _suppressDeviceChange = false;
+                    document.getElementById('clearSearchBtn').style.display =
+                        deviceSearchActive ? 'inline-block' : 'none';
+                    updateSummaryCardSelection();
+                    applyCurrentFilters();
+                    setLLDPButton('idle', true);
+                    updateLLDPNotification('success', '✅ LLDP Check Complete',
+                        'The new report is loaded.', 'Your filters and sorting were preserved.');
+                    autoHideLLDPNotification();
+                });
+        }
+
         // Run LLDP Check Function.  Completion is tied to the opaque token
         // returned by the server; elapsed time is never treated as success.
         const LLDP_JOB_STORAGE_KEY = 'lldpq.activeLldpJobToken';
@@ -1928,6 +2004,24 @@
             }
         }
 
+        let lldpNotificationHideTimer = null;
+
+        function dismissLLDPNotification() {
+            if (lldpNotificationHideTimer) {
+                clearTimeout(lldpNotificationHideTimer);
+                lldpNotificationHideTimer = null;
+            }
+            if (lldpStatusNotification) {
+                lldpStatusNotification.remove();
+                lldpStatusNotification = null;
+            }
+        }
+
+        function autoHideLLDPNotification(delayMs = 8000) {
+            if (lldpNotificationHideTimer) clearTimeout(lldpNotificationHideTimer);
+            lldpNotificationHideTimer = setTimeout(dismissLLDPNotification, delayMs);
+        }
+
         function updateLLDPNotification(kind, title, message, detail = '') {
             const colors = {
                 success: '#76b900',
@@ -1936,6 +2030,10 @@
                 failure: '#f44336'
             };
             const color = colors[kind] || colors.queued;
+            if (lldpNotificationHideTimer) {
+                clearTimeout(lldpNotificationHideTimer);
+                lldpNotificationHideTimer = null;
+            }
             if (!lldpStatusNotification) {
                 lldpStatusNotification = document.createElement('div');
                 lldpStatusNotification.setAttribute('role', 'status');
@@ -1958,12 +2056,18 @@
             }
             lldpStatusNotification.style.borderLeft = `4px solid ${color}`;
             lldpStatusNotification.replaceChildren();
+            const dismiss = document.createElement('button');
+            dismiss.type = 'button';
+            dismiss.setAttribute('aria-label', 'Dismiss notification');
+            dismiss.textContent = '×';
+            dismiss.style.cssText = 'position:absolute; top:4px; right:8px; background:none; border:none; color:#888; font-size:16px; cursor:pointer; line-height:1; padding:0;';
+            dismiss.addEventListener('click', dismissLLDPNotification);
             const heading = document.createElement('strong');
             heading.style.color = color;
             heading.textContent = title;
             const body = document.createElement('div');
             body.textContent = message;
-            lldpStatusNotification.append(heading, document.createElement('br'), body);
+            lldpStatusNotification.append(dismiss, heading, document.createElement('br'), body);
             if (detail) {
                 const small = document.createElement('small');
                 small.style.color = '#888';
@@ -1990,6 +2094,18 @@
                     }
                 });
                 const data = await response.json();
+                if ((response.status === 401 || response.status === 403) && data && data.success === false) {
+                    // auth-guard rejected the session. Polling with a dead
+                    // session can never succeed; stop instead of retrying.
+                    activeLLDPJobToken = null;
+                    lldpPollGeneration += 1;
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'Session Expired',
+                        'Your session expired — log in again.',
+                        data.error || 'Status polling stopped; the job itself was not cancelled.');
+                    autoHideLLDPNotification();
+                    return;
+                }
                 if (data.status === 'error' && data.message === 'LLDP job was not found') {
                     // A persisted session token may outlive the server-side TTL
                     // or a restored installation.  This one response is
@@ -2001,6 +2117,7 @@
                     setLLDPButton('failure', true);
                     updateLLDPNotification('failure', 'LLDP Job Is No Longer Available',
                         data.message, 'Start a new LLDP check to create a fresh tracked request.');
+                    autoHideLLDPNotification();
                     return;
                 }
                 if (!response.ok || data.status === 'error') {
@@ -2012,11 +2129,16 @@
 
                 const reason = data.reason || 'Waiting for LLDP status';
                 if (data.status === 'success') {
+                    // Clear the stored token before reloading the report, so a
+                    // failed refresh can never re-trigger a completed job loop
+                    // (same safety the full-page reload relied on).
                     setStoredLLDPToken('');
+                    activeLLDPJobToken = null;
+                    lldpPollGeneration += 1;
                     updateLLDPNotification('success', '✅ LLDP Check Complete',
                         'The matching LLDP report completed successfully.', 'Loading the new report...');
                     setLLDPButton('running', false);
-                    location.reload();
+                    reloadLLDPReportInPlace();
                     return;
                 }
                 const nowSeconds = Math.floor(Date.now() / 1000);
@@ -2076,6 +2198,7 @@
                     } else {
                         setStoredLLDPToken('');
                         activeLLDPJobToken = null;
+                        autoHideLLDPNotification();
                     }
                     return;
                 }
@@ -2132,6 +2255,7 @@
                 setLLDPButton('failure', true);
                 updateLLDPNotification('failure', 'Could Not Start LLDP Check', error.message,
                     'No report was treated as newly completed.');
+                autoHideLLDPNotification();
             }
         }
 
@@ -2180,7 +2304,7 @@
         }
 
         function renderedConnectionsInTableOrder() {
-            const rows = document.querySelectorAll('#lldp-data tr');
+            const rows = document.querySelectorAll('#lldp-data tr:not(.lldp-detail-row)');
             return Array.from(rows)
                 .filter(row => row.style.display !== 'none')
                 .map(row => rowConnectionMap.get(row))

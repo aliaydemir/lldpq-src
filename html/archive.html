@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <style>
         * {
             margin: 0;
@@ -69,6 +70,8 @@
         .file-selector {
             display: flex;
             justify-content: center;
+            gap: 12px;
+            flex-wrap: wrap;
         }
         
         .file-dropdown {
@@ -134,6 +137,7 @@
         .red { color: #f44336; font-weight: bold; }
         .green { color: #76b900; }
         .lime { color: #8bd400; }
+        .dim { color: #888; }
         
         /* Messages */
         .loading-text {
@@ -181,6 +185,9 @@
                 <select id="fileDropdown" class="file-dropdown" onchange="handleFileSelection()">
                     <option value="">-- Select a historical result file --</option>
                 </select>
+                <select id="compareDropdown" class="file-dropdown" onchange="handleCompareSelection()" style="display: none;">
+                    <option value="">-- Compare with... --</option>
+                </select>
             </div>
         </div>
     </div>
@@ -195,7 +202,18 @@
         </div>
         <div id="metinAlani" class="results-content"></div>
     </div>
-    
+
+    <!-- Diff Display -->
+    <div id="diffContainer" class="results-container">
+        <div class="results-header">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
+            </svg>
+            <span id="diffTitle">Comparison</span>
+        </div>
+        <div id="diffAlani" class="results-content"></div>
+    </div>
+
     <div id="loadingText" class="loading-text" style="display: none;">
         Loading file content...
     </div>
@@ -216,22 +234,52 @@
             document.getElementById('last-updated').textContent = formattedDate;
         }
 
+        let fetchToken = 0;
+        let compareToken = 0;
+        let currentFileText = '';
+        let currentFileName = '';
+
+        function formatFileLabel(fileName) {
+            const match = fileName.match(/^Problems-(\d{4}-\d{2}-\d{2})--(\d{2})-(\d{2})/);
+            return match ? `${match[1]} ${match[2]}:${match[3]}` : fileName;
+        }
+
         function listFiles() {
             fetch('/hstr/')
-                .then(response => response.text())
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return response.text();
+                })
                 .then(data => {
                     const parser = new DOMParser();
                     const htmlDoc = parser.parseFromString(data, 'text/html');
                     const files = Array.from(htmlDoc.querySelectorAll('a')).map(a => a.href).filter(href => href.includes('Problems'));
                     const fileDropdown = document.getElementById('fileDropdown');
+                    const compareDropdown = document.getElementById('compareDropdown');
 
-                    files.forEach(file => {
-                        const fileName = file.split('/').pop();
+                    const fileNames = files.map(file => file.split('/').pop());
+                    fileNames.sort((a, b) => b.localeCompare(a));
+
+                    if (fileNames.length === 0) {
+                        showEmptyState('No archived results yet');
+                        return;
+                    }
+
+                    fileNames.forEach(fileName => {
                         const option = document.createElement('option');
                         option.value = fileName;
-                        option.textContent = fileName;
+                        option.textContent = formatFileLabel(fileName);
                         fileDropdown.appendChild(option);
+                        compareDropdown.appendChild(option.cloneNode(true));
                     });
+
+                    const hashFile = decodeURIComponent(location.hash.slice(1));
+                    if (hashFile && fileNames.includes(hashFile)) {
+                        fileDropdown.value = hashFile;
+                        handleFileSelection();
+                    }
                 })
                 .catch(error => {
                     console.error('Error fetching file list:', error);
@@ -242,16 +290,20 @@
         function handleFileSelection() {
             const fileDropdown = document.getElementById('fileDropdown');
             const selectedFile = fileDropdown.value;
+            resetCompare();
             if (selectedFile) {
+                history.replaceState(null, '', '#' + encodeURIComponent(selectedFile));
                 fetchFileContent(selectedFile);
             } else {
+                history.replaceState(null, '', location.pathname + location.search);
                 hideResults();
             }
         }
 
         function fetchFileContent(fileName) {
+            const token = ++fetchToken;
             showLoading();
-            
+
             fetch(`/hstr/${fileName}`)
                 .then(response => {
                     if (!response.ok) {
@@ -260,21 +312,123 @@
                     return response.text();
                 })
                 .then(data => {
+                    if (token !== fetchToken) return;
                     hideLoading();
+                    currentFileText = data;
+                    currentFileName = fileName;
                     document.getElementById('fileName').textContent = fileName;
                     displayLLDPResults(data);
                     showResults();
+                    document.getElementById('compareDropdown').style.display = '';
                 })
                 .catch(error => {
+                    if (token !== fetchToken) return;
                     hideLoading();
                     showError('Error fetching LLDP results: ' + error.message);
                 });
+        }
+
+        function resetCompare() {
+            compareToken++;
+            const compareDropdown = document.getElementById('compareDropdown');
+            compareDropdown.value = '';
+            compareDropdown.style.display = 'none';
+            document.getElementById('diffContainer').classList.remove('show');
+        }
+
+        function handleCompareSelection() {
+            const compareDropdown = document.getElementById('compareDropdown');
+            const compareFile = compareDropdown.value;
+            const diffContainer = document.getElementById('diffContainer');
+            if (!compareFile || !currentFileName) {
+                compareToken++;
+                diffContainer.classList.remove('show');
+                return;
+            }
+            const token = ++compareToken;
+            fetch(`/hstr/${compareFile}`)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return response.text();
+                })
+                .then(data => {
+                    if (token !== compareToken) return;
+                    document.getElementById('diffTitle').textContent = `${formatFileLabel(currentFileName)} vs ${formatFileLabel(compareFile)}`;
+                    displayDiff(data, currentFileText);
+                    diffContainer.classList.add('show');
+                })
+                .catch(error => {
+                    if (token !== compareToken) return;
+                    showError('Error fetching compare file: ' + error.message);
+                });
+        }
+
+        function displayDiff(oldText, newText) {
+            const oldLines = oldText.split('\n');
+            const newLines = newText.split('\n');
+
+            const counts = new Map();
+            oldLines.forEach(line => counts.set(line, (counts.get(line) || 0) + 1));
+            const added = newLines.map(line => {
+                const count = counts.get(line) || 0;
+                if (count > 0) {
+                    counts.set(line, count - 1);
+                    return false;
+                }
+                return true;
+            });
+            counts.clear();
+            newLines.forEach(line => counts.set(line, (counts.get(line) || 0) + 1));
+            const removed = oldLines.map(line => {
+                const count = counts.get(line) || 0;
+                if (count > 0) {
+                    counts.set(line, count - 1);
+                    return false;
+                }
+                return true;
+            });
+
+            const element = document.getElementById('diffAlani');
+            element.innerHTML = '';
+            const fragment = document.createDocumentFragment();
+            const appendLine = (prefix, line, colorClass) => {
+                const span = document.createElement('span');
+                span.className = colorClass;
+                span.textContent = prefix + line;
+                fragment.appendChild(span);
+                fragment.appendChild(document.createElement('br'));
+            };
+
+            let i = 0, j = 0;
+            while (i < oldLines.length || j < newLines.length) {
+                if (i < oldLines.length && removed[i]) {
+                    appendLine('- ', oldLines[i], 'tomato');
+                    i++;
+                } else if (j < newLines.length && added[j]) {
+                    appendLine('+ ', newLines[j], 'green');
+                    j++;
+                } else if (i < oldLines.length && j < newLines.length) {
+                    appendLine('  ', newLines[j], 'dim');
+                    i++;
+                    j++;
+                } else if (j < newLines.length) {
+                    appendLine('  ', newLines[j], 'dim');
+                    j++;
+                } else {
+                    appendLine('  ', oldLines[i], 'dim');
+                    i++;
+                }
+            }
+            element.appendChild(fragment);
         }
 
         function displayLLDPResults(results) {
             const element = document.getElementById('metinAlani');
             element.innerHTML = '';
             
+            const fragment = document.createDocumentFragment();
             const lines = results.split('\n');
             lines.forEach(line => {
                 let colorClass = 'lime';
@@ -293,9 +447,10 @@
                 const span = document.createElement('span');
                 span.className = colorClass;
                 span.textContent = line;
-                element.appendChild(span);
-                element.appendChild(document.createElement('br'));
+                fragment.appendChild(span);
+                fragment.appendChild(document.createElement('br'));
             });
+            element.appendChild(fragment);
         }
 
         function showLoading() {
@@ -313,6 +468,14 @@
 
         function hideResults() {
             document.getElementById('resultsContainer').classList.remove('show');
+        }
+
+        function showEmptyState(message) {
+            const emptyDiv = document.createElement('div');
+            emptyDiv.className = 'loading-text';
+            emptyDiv.textContent = message;
+            const fileSelector = document.querySelector('.file-selector');
+            fileSelector.parentNode.insertBefore(emptyDiv, fileSelector.nextSibling);
         }
 
         function showError(message) {
@@ -342,6 +505,12 @@
             setLastUpdated();
             listFiles();
         };
+    </script>
+
+    <script>
+        (async function() {
+            await LLDPqAuth.check();
+        })();
     </script>
 </body>
 </html>

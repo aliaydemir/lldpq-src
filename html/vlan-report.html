@@ -171,8 +171,10 @@
             opacity: 0.5;
         }
         
+        .sort-arrow::before { content: '▲▼'; }
         .sortable.asc .sort-arrow::before { content: '▲'; color: #76b900; opacity: 1; }
         .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
+        .sortable.asc .sort-arrow, .sortable.desc .sort-arrow { opacity: 1; }
         
         /* Badges */
         .badge {
@@ -868,8 +870,9 @@
                                 <input type="checkbox" id="edit-vlan-leaking-enabled" onchange="toggleEditLeakingFields()">
                                 <span>Add Subnet to Leaking</span>
                             </label>
+                            <div class="form-hint" id="edit-leaking-locked-hint" style="display: none;">This subnet is already leaked. Removing a leak is not supported here.</div>
                         </div>
-                        
+
                         <div id="edit-leaking-fields" class="conditional-fields">
                             <div class="form-group">
                                 <label>Leak To VRF</label>
@@ -1113,6 +1116,18 @@
         let leakedSubnets = {};  // subnet -> {target_vrf, route_map}
         let portProfiles = {};
         let deletingPortProfile = null;
+        let sortState = { column: 'id', dir: 'asc' };
+
+        // Escape any server/user supplied string before injecting into innerHTML
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
         
         // Initialize
         async function init() {
@@ -1150,6 +1165,8 @@
                 if (portData.success) {
                     portProfiles = portData.port_profiles || {};
                     renderPortProfilesTable();
+                } else {
+                    document.getElementById('port-profiles-content').innerHTML = '<div class="no-data">Failed to load port profiles: ' + escapeHtml(portData.error || 'Unknown error') + '</div>';
                 }
                 
                 if (data.success) {
@@ -1162,10 +1179,11 @@
                     updateSummary();
                     renderTable();
                 } else {
-                    document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + (data.error || 'Unknown error') + '</div>';
+                    document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + escapeHtml(data.error || 'Unknown error') + '</div>';
                 }
             } catch (e) {
-                document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + e.message + '</div>';
+                document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + escapeHtml(e.message) + '</div>';
+                document.getElementById('port-profiles-content').innerHTML = '<div class="no-data">Failed to load port profiles: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -1322,27 +1340,50 @@
                 return;
             }
             
-            // Sort by VLAN ID
+            // Sort by the active column/direction
+            const sortDir = sortState.dir === 'desc' ? -1 : 1;
             vlanNames.sort((a, b) => {
-                const detailsA = getVlanDetails(vlanProfiles[a]);
-                const detailsB = getVlanDetails(vlanProfiles[b]);
-                return parseInt(detailsA.vlanId) - parseInt(detailsB.vlanId);
+                const da = getVlanDetails(vlanProfiles[a]);
+                const db = getVlanDetails(vlanProfiles[b]);
+                let cmp = 0;
+                switch (sortState.column) {
+                    case 'name':
+                        cmp = a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+                        break;
+                    case 'vrf':
+                        cmp = String(da.vrf).localeCompare(String(db.vrf), undefined, { sensitivity: 'base' });
+                        break;
+                    case 'l2vni':
+                        cmp = (parseInt(da.l2vni) || 0) - (parseInt(db.l2vni) || 0);
+                        break;
+                    case 'devices':
+                        cmp = (vlanDeviceMap[a] || []).length - (vlanDeviceMap[b] || []).length;
+                        break;
+                    case 'id':
+                    default:
+                        cmp = (parseInt(da.vlanId) || 0) - (parseInt(db.vlanId) || 0);
+                        break;
+                }
+                if (cmp === 0) cmp = a.localeCompare(b, undefined, { numeric: true });
+                return cmp * sortDir;
             });
-            
+
+            const sortCls = (col) => 'sortable' + (sortState.column === col ? ' ' + sortState.dir : '');
+
             let html = `
                 <table class="data-table">
                     <thead>
                         <tr>
                             <th style="width: 30px;"></th>
-                            <th class="sortable">VLAN Profile <span class="sort-arrow">▲▼</span></th>
-                            <th class="sortable">ID <span class="sort-arrow">▲▼</span></th>
+                            <th class="${sortCls('name')}" data-sort="name">VLAN Profile <span class="sort-arrow"></span></th>
+                            <th class="${sortCls('id')}" data-sort="id">ID <span class="sort-arrow"></span></th>
                             <th>VRR VIP</th>
                             <th>IP</th>
-                            <th class="sortable">VRF <span class="sort-arrow">▲▼</span></th>
-                            <th class="sortable">L2VNI <span class="sort-arrow">▲▼</span></th>
+                            <th class="${sortCls('vrf')}" data-sort="vrf">VRF <span class="sort-arrow"></span></th>
+                            <th class="${sortCls('l2vni')}" data-sort="l2vni">L2VNI <span class="sort-arrow"></span></th>
                             <th>Leak To</th>
                             <th>Description</th>
-                            <th class="sortable">Devices <span class="sort-arrow">▲▼</span></th>
+                            <th class="${sortCls('devices')}" data-sort="devices">Devices <span class="sort-arrow"></span></th>
                             <th style="text-align: right;">Actions</th>
                         </tr>
                     </thead>
@@ -1357,17 +1398,18 @@
                 
                 const vrfBadgeClass = getVrfBadgeClass(details.vrf);
                 
+                const vlanNameEsc = escapeHtml(vlanName);
                 html += `
-                    <tr class="expandable" onclick="toggleDeviceList('${vlanName}')">
-                        <td><span class="expand-icon" id="icon-${vlanName}">›</span></td>
-                        <td><span class="vlan-name">${vlanName}</span></td>
-                        <td>${details.vlanId}</td>
-                        <td>${details.vrrVip !== '-' ? `<span class="badge badge-orange">${details.vrrVip}</span>` : '-'}</td>
-                        <td>${details.ip !== '-' ? `<span class="badge badge-blue">${details.ip}</span>` : '-'}</td>
-                        <td><span class="badge ${vrfBadgeClass}">${details.vrf}</span></td>
-                        <td>${details.l2vni !== '-' ? details.l2vni : '-'}</td>
-                        <td>${details.subnet !== '-' && leakedSubnets[details.subnet] ? `<span class="badge ${getVrfBadgeClass(leakedSubnets[details.subnet].target_vrf)}">${leakedSubnets[details.subnet].target_vrf}</span>` : '-'}</td>
-                        <td style="color: #888;">${details.description}</td>
+                    <tr class="expandable" data-action="toggle-devices" data-vlan="${vlanNameEsc}">
+                        <td><span class="expand-icon" id="icon-${vlanNameEsc}">›</span></td>
+                        <td><span class="vlan-name">${vlanNameEsc}</span></td>
+                        <td>${escapeHtml(details.vlanId)}</td>
+                        <td>${details.vrrVip !== '-' ? `<span class="badge badge-orange">${escapeHtml(details.vrrVip)}</span>` : '-'}</td>
+                        <td>${details.ip !== '-' ? `<span class="badge badge-blue">${escapeHtml(details.ip)}</span>` : '-'}</td>
+                        <td><span class="badge ${vrfBadgeClass}">${escapeHtml(details.vrf)}</span></td>
+                        <td>${details.l2vni !== '-' ? escapeHtml(details.l2vni) : '-'}</td>
+                        <td>${details.subnet !== '-' && leakedSubnets[details.subnet] ? `<span class="badge ${getVrfBadgeClass(leakedSubnets[details.subnet].target_vrf)}">${escapeHtml(leakedSubnets[details.subnet].target_vrf)}</span>` : '-'}</td>
+                        <td style="color: #888;">${escapeHtml(details.description)}</td>
                         <td>
                             <span class="badge ${deviceCount > 0 ? 'badge-green' : 'badge-gray'}">
                                 ${deviceCount} device${deviceCount !== 1 ? 's' : ''}
@@ -1375,12 +1417,12 @@
                         </td>
                         <td>
                             <div class="row-actions">
-                                <button class="btn-icon btn-icon-edit" onclick="event.stopPropagation(); editVlan('${vlanName}')" title="Edit">
+                                <button class="btn-icon btn-icon-edit" data-action="edit-vlan" data-vlan="${vlanNameEsc}" title="Edit">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                     </svg>
                                 </button>
-                                <button class="btn-icon btn-icon-delete" onclick="event.stopPropagation(); confirmDeleteVlan('${vlanName}')" title="Delete">
+                                <button class="btn-icon btn-icon-delete" data-action="delete-vlan" data-vlan="${vlanNameEsc}" title="Delete">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
@@ -1388,11 +1430,11 @@
                             </div>
                         </td>
                     </tr>
-                    <tr class="device-list-row" id="devices-${vlanName}">
+                    <tr class="device-list-row" id="devices-${vlanNameEsc}">
                         <td colspan="11">
                             ${devices.length > 0 ? `
                                 <div class="device-chips">
-                                    ${devices.map(d => `<span class="device-chip" onclick="openDeviceConfig('${d}')" title="Open ${d} config in Fabric Config"><span>${d}</span><button class="remove-btn" onclick="event.stopPropagation(); confirmRemoveVlanFromDevice('${vlanName}', '${d}')" title="Remove from ${d}">×</button></span>`).join('')}
+                                    ${devices.map(d => `<span class="device-chip" data-action="open-device" data-device="${escapeHtml(d)}" title="Open ${escapeHtml(d)} config in Fabric Config"><span>${escapeHtml(d)}</span><button class="remove-btn" data-action="remove-vlan-device" data-vlan="${vlanNameEsc}" data-device="${escapeHtml(d)}" title="Remove from ${escapeHtml(d)}">×</button></span>`).join('')}
                                 </div>
                             ` : '<span style="color: #888;">No devices assigned</span>'}
                         </td>
@@ -1452,13 +1494,13 @@
                         const groupId = group.replace(/[^a-zA-Z0-9]/g, '_');
                         html += `<div style="display: flex; align-items: center; gap: 6px; color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333; cursor: pointer;" onclick="toggleGroupDevices('${groupId}', 'create-vlan-devices', true)">
                             <input type="checkbox" id="group-${groupId}" style="width: 12px; height: 12px;" onclick="event.stopPropagation(); toggleGroupDevices('${groupId}', 'create-vlan-devices')">
-                            <span>${group}</span>
+                            <span>${escapeHtml(group)}</span>
                         </div>`;
                         devices.forEach(device => {
                             const hostname = device.hostname || device;
                             html += `<label style="display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 20px; cursor: pointer; font-size: 12px; color: #ccc;">
-                                <input type="checkbox" name="create-vlan-devices" data-group="${groupId}" value="${hostname}" style="width: 14px; height: 14px;" onchange="updateGroupCheckbox('${groupId}', 'create-vlan-devices')">
-                                ${hostname}
+                                <input type="checkbox" name="create-vlan-devices" data-group="${groupId}" value="${escapeHtml(hostname)}" style="width: 14px; height: 14px;" onchange="updateGroupCheckbox('${groupId}', 'create-vlan-devices')">
+                                ${escapeHtml(hostname)}
                             </label>`;
                         });
                     }
@@ -1538,8 +1580,8 @@
                 const data = await response.json();
                 if (data.success) {
                     availableVrfs = data.vrfs || ['default'];
-                    document.getElementById('vlan-vrf').innerHTML = availableVrfs.map(v => 
-                        `<option value="${v}">${v}</option>`
+                    document.getElementById('vlan-vrf').innerHTML = availableVrfs.map(v =>
+                        `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
                     ).join('');
                 }
             } catch (e) {
@@ -1615,9 +1657,9 @@
                     
                     select.innerHTML = '<option value="">Select VRF...</option>';
                     targets.forEach(t => {
-                        select.innerHTML += `<option value="${t.target_vrf}" data-routemap="${t.route_map}">${t.target_vrf}</option>`;
+                        select.innerHTML += `<option value="${escapeHtml(t.target_vrf)}" data-routemap="${escapeHtml(t.route_map)}">${escapeHtml(t.target_vrf)}</option>`;
                     });
-                    
+
                     if (targets.length === 0) {
                         select.innerHTML = '<option value="">No leaking configured for this VRF</option>';
                     }
@@ -1626,7 +1668,7 @@
                 select.innerHTML = '<option value="">Error loading VRFs</option>';
             }
         }
-        
+
         async function createVlan() {
             const createBtn = document.getElementById('btn-create');
             const isRangeMode = document.getElementById('vlan-range-mode').checked;
@@ -1689,27 +1731,34 @@
                         // Assign to selected devices
                         const selectedDevices = Array.from(document.querySelectorAll('input[name="create-vlan-devices"]:checked')).map(cb => cb.value);
                         const createdVlans = result.created_vlans || [];
-                        
+                        const createdCount = createdVlans.length || count;
+                        const failedDevices = [];
+                        let assignedCount = 0;
+
                         if (selectedDevices.length > 0 && createdVlans.length > 0) {
                             createBtn.textContent = 'Assigning to devices...';
-                            let assignedCount = 0;
                             for (const device of selectedDevices) {
                                 try {
                                     const assignResp = await fetch('/fabric-api.sh?action=assign-vlans', {
                                         method: 'POST',
                                         headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ device: device, vlans: createdVlans })
+                                        body: JSON.stringify({ device: device, vlans: [profileName] })
                                     });
                                     const assignResult = await assignResp.json();
                                     if (assignResult.success) assignedCount++;
-                                } catch (e) {}
+                                    else failedDevices.push(device + (assignResult.error ? ' (' + assignResult.error + ')' : ''));
+                                } catch (e) { failedDevices.push(device); }
                             }
-                            closeCreateModal();
-                            alert(`${count} VLANs created and assigned to ${assignedCount} device(s)! Run Deploy to apply changes.`);
-                        } else {
-                            closeCreateModal();
-                            alert(`${count} VLANs created successfully! Run Deploy to apply changes.`);
                         }
+
+                        closeCreateModal();
+                        let msg = `${createdCount} VLAN${createdCount !== 1 ? 's' : ''} created`;
+                        if (selectedDevices.length > 0) msg += ` and assigned to ${assignedCount} device(s)`;
+                        msg += '!';
+                        if (result.warning) msg += `\nWarning: ${result.warning}`;
+                        if (failedDevices.length > 0) msg += `\nFailed to assign on: ${failedDevices.join(', ')}`;
+                        msg += '\nRun Deploy to apply changes.';
+                        alert(msg);
                         await loadData();
                     } else {
                         alert('Error: ' + (result.error || 'Unknown error'));
@@ -1740,6 +1789,7 @@
                 profile_name: document.getElementById('vlan-profile-name').value || 'VLAN_' + vlanId,
                 description: description,
                 l2vni: parseInt(document.getElementById('vlan-l2vni').value) || (100000 + vlanId),
+                stp_bpduguard: document.getElementById('vlan-stp-guard').checked,
                 svi_enabled: sviEnabled,
                 vrr_enabled: vrrEnabled
             };
@@ -1776,6 +1826,7 @@
                     const profileName = data.profile_name;
                     
                     let assignedCount = 0;
+                    const failedDevices = [];
                     if (selectedDevices.length > 0) {
                         for (const device of selectedDevices) {
                             try {
@@ -1786,7 +1837,8 @@
                                 });
                                 const assignResult = await assignResp.json();
                                 if (assignResult.success) assignedCount++;
-                            } catch (e) {}
+                                else failedDevices.push(device + (assignResult.error ? ' (' + assignResult.error + ')' : ''));
+                            } catch (e) { failedDevices.push(device); }
                         }
                     }
                     
@@ -1844,11 +1896,13 @@
                     }
                     
                     closeCreateModal();
-                    if (assignedCount > 0) {
-                        alert(`VLAN created and assigned to ${assignedCount} device(s)!${leakingMsg} Run Deploy to apply changes.`);
-                    } else {
-                        alert(`VLAN created successfully!${leakingMsg} Run Deploy to apply changes.`);
-                    }
+                    let msg = assignedCount > 0
+                        ? `VLAN created and assigned to ${assignedCount} device(s)!${leakingMsg}`
+                        : `VLAN created successfully!${leakingMsg}`;
+                    if (result.warning) msg += `\nWarning: ${result.warning}`;
+                    if (failedDevices.length > 0) msg += `\nFailed to assign on: ${failedDevices.join(', ')}`;
+                    msg += ' Run Deploy to apply changes.';
+                    alert(msg);
                     await loadData();
                 } else {
                     alert('Error: ' + (result.error || 'Unknown error'));
@@ -1874,8 +1928,8 @@
             
             await loadVrfs();
             const vrfSelect = document.getElementById('edit-vlan-vrf');
-            vrfSelect.innerHTML = availableVrfs.map(v => 
-                `<option value="${v}">${v}</option>`
+            vrfSelect.innerHTML = availableVrfs.map(v =>
+                `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
             ).join('');
             
             const details = getVlanDetails(vp);
@@ -1942,11 +1996,19 @@
             
             // Check if subnet is already leaked and pre-populate
             const editDetails = getVlanDetails(vp);
+            const leakCheckbox = document.getElementById('edit-vlan-leaking-enabled');
+            const leakSelect = document.getElementById('edit-vlan-leak-target-vrf');
+            const leakLockedHint = document.getElementById('edit-leaking-locked-hint');
             if (editDetails.subnet !== '-' && leakedSubnets[editDetails.subnet]) {
                 const leakInfo = leakedSubnets[editDetails.subnet];
-                document.getElementById('edit-vlan-leaking-enabled').checked = true;
+                leakCheckbox.checked = true;
+                // Backend has no remove-leak path: lock the pre-checked controls so
+                // unchecking does not present a removal that never happens.
+                leakCheckbox.disabled = true;
+                leakSelect.disabled = true;
+                leakLockedHint.style.display = 'block';
                 document.getElementById('edit-leaking-fields').classList.add('visible');
-                
+
                 // Load targets and select the current one
                 loadEditLeakingTargets().then(() => {
                     const select = document.getElementById('edit-vlan-leak-target-vrf');
@@ -1958,7 +2020,10 @@
                     }
                 });
             } else {
-                document.getElementById('edit-vlan-leaking-enabled').checked = false;
+                leakCheckbox.checked = false;
+                leakCheckbox.disabled = false;
+                leakSelect.disabled = false;
+                leakLockedHint.style.display = 'none';
                 document.getElementById('edit-leaking-fields').classList.remove('visible');
             }
             
@@ -2020,9 +2085,9 @@
                     
                     select.innerHTML = '<option value="">Select VRF...</option>';
                     targets.forEach(t => {
-                        select.innerHTML += `<option value="${t.target_vrf}" data-routemap="${t.route_map}">${t.target_vrf}</option>`;
+                        select.innerHTML += `<option value="${escapeHtml(t.target_vrf)}" data-routemap="${escapeHtml(t.route_map)}">${escapeHtml(t.target_vrf)}</option>`;
                     });
-                    
+
                     if (targets.length === 0) {
                         select.innerHTML = '<option value="">No leaking configured for this VRF</option>';
                     }
@@ -2031,7 +2096,7 @@
                 select.innerHTML = '<option value="">Error loading VRFs</option>';
             }
         }
-        
+
         async function saveVlanEdit() {
             const saveBtn = document.getElementById('btn-save-edit');
             const originalName = document.getElementById('edit-vlan-original-name').value;
@@ -2156,7 +2221,7 @@
                 affectedDiv.innerHTML = `
                     <p style="color: #ff6b6b; margin-bottom: 8px;">Warning: This VLAN is assigned to ${devices.length} device(s):</p>
                     <div style="display: flex; flex-wrap: wrap; gap: 5px; justify-content: center;">
-                        ${devices.map(d => `<span style="background: #444; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${d}</span>`).join('')}
+                        ${devices.map(d => `<span style="background: #444; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${escapeHtml(d)}</span>`).join('')}
                     </div>
                 `;
             } else {
@@ -2301,25 +2366,25 @@
             for (const [name, profile] of profiles) {
                 const mode = profile.sw_port_mode || 'access';
                 const modeColor = mode === 'trunk' ? '#4fc3f7' : '#76b900';
-                const modeLabel = mode.toUpperCase();
+                const modeLabel = escapeHtml(mode.toUpperCase());
                 
                 let vlanInfo = '-';
                 if (mode === 'access' && profile.access_vlan) {
-                    vlanInfo = profile.access_vlan;
+                    vlanInfo = escapeHtml(profile.access_vlan);
                 } else if (mode === 'trunk') {
                     if (profile.trunk_allowed_vlan_all) {
                         vlanInfo = '<span style="color: #4fc3f7;">ALL</span>';
                     } else if (profile.trunk_allowed_vlan_range) {
-                        vlanInfo = `<span style="color: #4fc3f7;">${profile.trunk_allowed_vlan_range}</span>`;
+                        vlanInfo = `<span style="color: #4fc3f7;">${escapeHtml(profile.trunk_allowed_vlan_range)}</span>`;
                     } else {
                         // Check both field names
                         const vlans = profile.trunk_allowed_vlans || profile.trunk_allowed_vlan_list || [];
                         if (vlans.length > 0) {
-                            vlanInfo = vlans.length > 5 ? vlans.slice(0, 5).join(', ') + '...' : vlans.join(', ');
+                            vlanInfo = escapeHtml(vlans.length > 5 ? vlans.slice(0, 5).join(', ') + '...' : vlans.join(', '));
                         }
                     }
                 }
-                
+
                 // Native VLAN for trunk (check both field names)
                 const nativeVlan = profile.native_vlan || profile.trunk_untagged || '-';
                 
@@ -2328,23 +2393,24 @@
                 const adminEdge = profile.stp_portadminedge ? checkIcon : dashIcon;
                 const autoEdge = profile.stp_portautoedgedisable ? checkIcon : dashIcon;
                 
+                const nameEsc = escapeHtml(name);
                 html += `
                     <tr style="border-bottom: 1px solid #333;">
-                        <td style="padding: 12px; color: #76b900; font-weight: 500;">${name}</td>
+                        <td style="padding: 12px; color: #76b900; font-weight: 500;">${nameEsc}</td>
                         <td style="padding: 12px;">
                             <span style="background: ${modeColor}22; color: ${modeColor}; padding: 3px 8px; border-radius: 4px; font-size: 11px;">${modeLabel}</span>
                         </td>
                         <td style="padding: 12px; color: #ccc;">${vlanInfo}</td>
-                        <td style="padding: 12px; text-align: center; color: #ccc;">${nativeVlan}</td>
+                        <td style="padding: 12px; text-align: center; color: #ccc;">${escapeHtml(nativeVlan)}</td>
                         <td style="padding: 12px; text-align: center;">${bpduGuard}</td>
                         <td style="padding: 12px; text-align: center;">${adminEdge}</td>
                         <td style="padding: 12px; text-align: center;">${autoEdge}</td>
-                        <td style="padding: 12px; color: #888;">${profile.description || '-'}</td>
+                        <td style="padding: 12px; color: #888;">${escapeHtml(profile.description || '-')}</td>
                         <td style="padding: 12px; text-align: right;">
-                            <button onclick="openEditPortProfileModal('${name}')" style="background: none; border: none; color: #76b900; cursor: pointer; margin-right: 10px;" title="Edit">
+                            <button data-action="edit-pp" data-name="${nameEsc}" style="background: none; border: none; color: #76b900; cursor: pointer; margin-right: 10px;" title="Edit">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/></svg>
                             </button>
-                            <button onclick="openDeletePortProfileModal('${name}')" style="background: none; border: none; color: #ff6b6b; cursor: pointer;" title="Delete">
+                            <button data-action="delete-pp" data-name="${nameEsc}" style="background: none; border: none; color: #ff6b6b; cursor: pointer;" title="Delete">
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
                             </button>
                         </td>
@@ -2378,7 +2444,7 @@
             const editTrunkSelect = document.getElementById('edit-pp-trunk-vlans');
             const editNativeSelect = document.getElementById('edit-pp-native-vlan');
             
-            const optionsHtml = vlanOptions.map(v => `<option value="${v.id}">${v.id} (${v.name})</option>`).join('');
+            const optionsHtml = vlanOptions.map(v => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.id)} (${escapeHtml(v.name)})</option>`).join('');
             
             accessSelect.innerHTML = '<option value="">Select VLAN...</option>' + optionsHtml;
             trunkSelect.innerHTML = optionsHtml;
@@ -2681,6 +2747,51 @@
             btn.textContent = 'Delete';
         }
         
+        // Delegated handler for dynamically rendered rows and sortable headers.
+        // Using closest() picks the innermost data-action target, so nested
+        // buttons naturally win over their container without stopPropagation.
+        document.addEventListener('click', function(e) {
+            const sortTh = e.target.closest('th.sortable[data-sort]');
+            if (sortTh) {
+                const col = sortTh.dataset.sort;
+                if (sortState.column === col) {
+                    sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortState.column = col;
+                    sortState.dir = 'asc';
+                }
+                renderTable();
+                return;
+            }
+
+            const el = e.target.closest('[data-action]');
+            if (!el) return;
+            const action = el.dataset.action;
+            switch (action) {
+                case 'toggle-devices':
+                    toggleDeviceList(el.dataset.vlan);
+                    break;
+                case 'edit-vlan':
+                    editVlan(el.dataset.vlan);
+                    break;
+                case 'delete-vlan':
+                    confirmDeleteVlan(el.dataset.vlan);
+                    break;
+                case 'open-device':
+                    openDeviceConfig(el.dataset.device);
+                    break;
+                case 'remove-vlan-device':
+                    confirmRemoveVlanFromDevice(el.dataset.vlan, el.dataset.device);
+                    break;
+                case 'edit-pp':
+                    openEditPortProfileModal(el.dataset.name);
+                    break;
+                case 'delete-pp':
+                    openDeletePortProfileModal(el.dataset.name);
+                    break;
+            }
+        });
+
         document.addEventListener('DOMContentLoaded', init);
     </script>
 </body>

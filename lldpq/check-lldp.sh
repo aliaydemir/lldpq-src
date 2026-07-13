@@ -627,19 +627,25 @@ def verify_committed_generation():
         fsync_directory(directory)
 
 def sync_backup_phase():
-    """Make every old->backup rename durable before new-file activation."""
+    """Make every original->backup copy durable before new-file activation."""
     directories = set()
     for record in records:
         destination = record["destination"]
         directories.add(os.path.dirname(destination))
-        if lexists(destination):
-            raise RuntimeError(f"LLDP old destination still exists: {destination}")
         if record["original"] == "present":
+            if not regular(destination):
+                raise RuntimeError(
+                    f"LLDP destination is no longer a regular file: {destination}"
+                )
             backup = record["backup"]
             if (backup is None or not lexists(backup) or not regular(backup)
                     or digest(backup) != record["original_sha256"]):
                 raise RuntimeError(f"LLDP backup phase is incomplete: {backup}")
             fsync_file(backup)
+        elif lexists(destination):
+            raise RuntimeError(
+                f"unexpected LLDP destination before activation: {destination}"
+            )
     for directory in directories:
         fsync_directory(directory)
 
@@ -650,8 +656,9 @@ if lexists(recovery_marker):
     raise SystemExit("unresolved LLDP recovery authority already exists")
 
 try:
-    # Prepare every replacement beside its destination before moving any LKG
-    # path. Activation then consists only of same-filesystem renames.
+    # Prepare every replacement and backup copy beside its destination before
+    # touching any LKG path. Activation then consists only of same-filesystem
+    # atomic replaces of destinations that remain served the whole time.
     for index, (source, destination) in enumerate(items):
         if not regular(source) or os.stat(source).st_size == 0:
             raise RuntimeError(f"invalid staged LLDP output: {source}")
@@ -673,6 +680,11 @@ try:
         fsync_file(stage)
 
         if lexists(destination):
+            # The backup is a copy, so the served destination stays in place
+            # until its atomic replacement: readers never observe an absence
+            # window. The copy happens before the authority exists and never
+            # touches a destination, so a partial copy is a stray temp file,
+            # not a rollback obstacle.
             original = "present"
             original_hash = digest(destination)
             descriptor, backup = tempfile.mkstemp(
@@ -680,7 +692,7 @@ try:
                 dir=destination_parent,
             )
             os.close(descriptor)
-            os.unlink(backup)
+            shutil.copyfile(destination, backup)
         else:
             original = "missing"
             original_hash = None
@@ -696,12 +708,11 @@ try:
         })
 
     # The complete JSON authority is flushed before the first destination
-    # rename, which makes a SIGKILL at every subsequent instruction recoverable.
+    # replace, which makes a SIGKILL at every subsequent instruction
+    # recoverable. Every destination is only ever atomically replaced by its
+    # staged file, so published paths exist continuously throughout the commit.
     write_recovery_authority()
 
-    for record in records:
-        if record["original"] == "present":
-            os.replace(record["destination"], record["backup"])
     sync_backup_phase()
     for record in records:
         os.replace(record["stage"], record["destination"])
@@ -719,11 +730,12 @@ except BaseException as exc:
             rollback_error = recovery_exc
     elif not authority_owned:
         for record in records:
-            try:
-                if lexists(record["stage"]):
-                    cleanup_path(record["stage"])
-            except OSError:
-                pass
+            for leftover in (record["stage"], record["backup"]):
+                try:
+                    if leftover is not None and lexists(leftover):
+                        cleanup_path(leftover)
+                except OSError:
+                    pass
     if rollback_error is not None:
         print(
             f"CRITICAL: LLDP rollback is incomplete; recovery marker: "
@@ -970,13 +982,29 @@ raw_problems="$postprocess_dir/raw-problems-lldp_results.ini"
 problems="$postprocess_dir/problems-lldp_results.ini"
 down="$postprocess_dir/down-lldp_results.ini"
 
-if ! awk '!/Pass/' "$collection_dir/lldp_results.ini" > "$raw_problems"; then
+# Column-aware filtering: banners/headers/separators are kept structurally and
+# data rows are selected on the Status field, so hostnames or neighbor names
+# containing 'Pass'/'Fail'/'No-Info' can never be misclassified by substring.
+if ! awk 'NR == 1 || /^[=-]/ || !NF || $1 == "Port" { print; next } $2 != "Pass"' \
+        "$collection_dir/lldp_results.ini" > "$raw_problems"; then
     echo "Failed to derive LLDP problem input" >&2
     exit 1
 fi
-if ! awk 'NF' RS='\n\n' "$raw_problems" | \
-     awk '/No-Info/ || /Fail/' RS= | \
-     sed '/^================================/i\\' > "$problems"; then
+if ! awk '
+    function flush_section() {
+        if (banner == "" || !keep) return
+        if (!started) { if (created != "") print created; started = 1 }
+        printf "\n%s\n%s", banner, body
+    }
+    NR == 1 && /^Created on/ { created = $0; next }
+    /^===/ { flush_section(); banner = $0; body = ""; keep = 0; next }
+    banner == "" || !NF { next }
+    {
+        body = body $0 "\n"
+        if ($0 !~ /^[=-]/ && $1 != "Port" && ($2 == "Fail" || $2 == "No-Info")) keep = 1
+    }
+    END { flush_section() }
+' "$raw_problems" > "$problems"; then
     echo "Failed to build LLDP problem report" >&2
     exit 1
 fi

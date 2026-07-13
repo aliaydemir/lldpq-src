@@ -39,6 +39,21 @@ const ICON_CHARS = {
 
 
 /**
+ * Escape a dynamic value before it is placed into innerHTML.
+ * Network/LLDP/asset-sourced strings (device names, interface names,
+ * model/version/serial) must always pass through here.
+ */
+function escapeHtml(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
  * Get link color based on status
  */
 function getLinkColor(link) {
@@ -71,7 +86,7 @@ function convertToCytoscapeFormat(topologyData) {
             data: {
                 id: 'n' + node.id,
                 label: node.name,
-                level: node.layerSortPreference || 5,
+                level: node.layerSortPreference ?? 5,
                 staggerRow: node.staggerRow,
                 icon: iconType,
                 iconChar: iconChar,
@@ -193,7 +208,7 @@ function calculateHierarchicalPositions(direction) {
     
     // Group nodes by level
     cy.nodes().forEach(node => {
-        const level = node.data('level') || 5;
+        const level = node.data('level') ?? 5;
         if (!levels[level]) levels[level] = [];
         levels[level].push(node);
     });
@@ -273,7 +288,16 @@ function getLayoutOptions(layoutType) {
                 animationDuration: 300
             };
         case 'cose':
-        default:
+        default: {
+            // Large fabrics can freeze the tab with the full iteration budget.
+            // Above this generic node-count threshold, cut iterations and
+            // dampen repulsion so the force layout still converges quickly.
+            const LARGE_FABRIC_NODE_THRESHOLD = 300;
+            const nodeCount = cy ? cy.nodes().length : 0;
+            const isLargeFabric = nodeCount > LARGE_FABRIC_NODE_THRESHOLD;
+            if (isLargeFabric) {
+                showNotification(`Large fabric (${nodeCount} nodes): using a faster Force layout.`);
+            }
             return {
                 name: 'cose',
                 idealEdgeLength: 100,
@@ -283,17 +307,18 @@ function getLayoutOptions(layoutType) {
                 padding: 5,
                 randomize: false,
                 componentSpacing: 100,
-                nodeRepulsion: 400000,
+                nodeRepulsion: isLargeFabric ? 100000 : 400000,
                 edgeElasticity: 100,
                 nestingFactor: 5,
                 gravity: 80,
-                numIter: 1000,
+                numIter: isLargeFabric ? 150 : 1000,
                 initialTemp: 200,
                 coolingFactor: 0.95,
                 minTemp: 1.0,
                 animate: 'end',
                 animationDuration: 500
             };
+        }
     }
 }
 
@@ -472,8 +497,8 @@ function searchDevice(query) {
     // Limit to 10 results
     const limitedMatches = matches.slice(0, 10);
     
-    resultsDiv.innerHTML = limitedMatches.map(node => 
-        `<div class="search-result-item" onclick="focusNode('${node.id()}')">${node.data('label')}</div>`
+    resultsDiv.innerHTML = limitedMatches.map(node =>
+        `<div class="search-result-item" data-node-id="${escapeHtml(node.id())}">${escapeHtml(node.data('label'))}</div>`
     ).join('');
     
     resultsDiv.classList.add('show');
@@ -518,6 +543,13 @@ function focusNode(nodeId) {
 
 // Close search results when clicking outside
 document.addEventListener('click', function(e) {
+    // Delegated handler for search results (node.id() is untrusted, so it is
+    // carried in a data-* attribute instead of an inline handler string).
+    const resultItem = e.target.closest ? e.target.closest('.search-result-item[data-node-id]') : null;
+    if (resultItem) {
+        focusNode(resultItem.dataset.nodeId);
+        return;
+    }
     const searchBox = document.querySelector('.search-box');
     if (searchBox && !searchBox.contains(e.target)) {
         document.getElementById('searchResults').classList.remove('show');
@@ -546,7 +578,7 @@ function showContextMenu(event, node) {
     contextMenuTarget = node;
     
     // Set current layer and icon values in dropdowns
-    const currentLayer = String(node.data('level') || 5);
+    const currentLayer = String(node.data('level') ?? 5);
     const currentIcon = node.data('icon') || 'switch';
     document.getElementById('node-layer-select').value = currentLayer;
     document.getElementById('node-icon-select').value = currentIcon;
@@ -625,11 +657,10 @@ function toggleNodeLabel() {
  */
 function hideNode() {
     if (!contextMenuTarget || !cy) return;
-    
-    contextMenuTarget.style('display', 'none');
-    contextMenuTarget.connectedEdges().style('display', 'none');
+
+    contextMenuTarget.data('_manualHidden', true);
     hideContextMenu();
-    updateIconOverlays();
+    applyFilters();
 }
 
 /**
@@ -645,18 +676,11 @@ function applyLayoutWithNode() {
  */
 function showAllHidden() {
     if (!cy) return;
-    
-    cy.batch(function() {
-        cy.nodes().style('display', 'element');
-        cy.edges().style('display', 'element');
-    });
-    
-    // Re-apply endpoint filter if endpoints are hidden
-    if (!showEndpoints) {
-        toggleEndpoints(false);
-    }
-    
-    updateIconOverlays();
+
+    // Clear manual (context-menu) hides, then recompute from the current
+    // toggle state so the endpoint filter is still honored.
+    cy.nodes().forEach(node => node.data('_manualHidden', false));
+    applyFilters();
 }
 
 /**
@@ -854,11 +878,11 @@ function contextDetails() {
     let html = `
         <div class="modal-info">
             <span class="label">Hostname:</span>
-            <span class="value">${nodeData.label || 'N/A'}</span>
+            <span class="value">${escapeHtml(nodeData.label || 'N/A')}</span>
             <span class="label">IP Address:</span>
-            <span class="value">${nodeData.primaryIP || 'N/A'}</span>
+            <span class="value">${escapeHtml(nodeData.primaryIP || 'N/A')}</span>
             <span class="label">Serial:</span>
-            <span class="value">${nodeData.serial_number || 'N/A'}</span>
+            <span class="value">${escapeHtml(nodeData.serial_number || 'N/A')}</span>
             <span class="label">Connections:</span>
             <span class="value">${connectedEdges.length}</span>
         </div>
@@ -968,11 +992,11 @@ function contextDetails() {
             
             html += `
                 <tr>
-                    <td>${localPort || 'N/A'}</td>
-                    <td class="${portStateClass}">${portStateText}</td>
-                    <td class="${speedClass}">${portSpeed}</td>
-                    <td>${remoteLabel}</td>
-                    <td>${remotePort || 'N/A'}</td>
+                    <td>${escapeHtml(localPort || 'N/A')}</td>
+                    <td class="${portStateClass}">${escapeHtml(portStateText)}</td>
+                    <td class="${speedClass}">${escapeHtml(portSpeed)}</td>
+                    <td>${escapeHtml(remoteLabel)}</td>
+                    <td>${escapeHtml(remotePort || 'N/A')}</td>
                     <td class="${statusClass}">${statusText}</td>
                 </tr>
             `;
@@ -1034,6 +1058,88 @@ function showNotification(message) {
     setTimeout(() => {
         notif.style.opacity = '0';
     }, 2000);
+}
+
+/**
+ * Export the current topology as a PNG using Cytoscape's built-in renderer.
+ */
+async function exportTopologyPng() {
+    if (!cy) return;
+    const SCALE = 2;
+    const ICON_FONT_PX = 24; // matches .node-icon-overlay base font-size
+    const BG = '#212121';
+    try {
+        // cy.png() renders only the cytoscape canvas; the device glyphs are
+        // separate HTML overlays (.node-icon-overlay), so they are missing from
+        // the raw export. Composite them back on: cy.png(full) maps model point
+        // (x,y) to image pixel ((x - bb.x1)*SCALE, (y - bb.y1)*SCALE) where bb is
+        // the same element bounding box cytoscape uses, so we can redraw each
+        // node's icon glyph at the correct spot with the same 'next-font'.
+        const dataUrl = cy.png({ output: 'base64uri', full: true, bg: BG, scale: SCALE });
+        const baseImg = await new Promise((resolve, reject) => {
+            const im = new Image();
+            im.onload = () => resolve(im);
+            im.onerror = reject;
+            im.src = dataUrl;
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = baseImg.width;
+        canvas.height = baseImg.height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(baseImg, 0, 0);
+
+        // Make sure the icon webfont is ready before measuring/drawing glyphs.
+        try {
+            if (document.fonts && document.fonts.load) {
+                await document.fonts.load(`${ICON_FONT_PX}px 'next-font'`);
+                await document.fonts.ready;
+            }
+        } catch (e) { /* fall through — glyphs may render with fallback */ }
+
+        // Derive the true model->pixel transform from the EXPORTED image size
+        // rather than assuming width == bb.w*SCALE. cy.png(full) sizes the image
+        // to the element bounding box; rounding/DPR can make the effective scale
+        // differ slightly from the requested SCALE, which otherwise shifts and
+        // compresses the overlaid glyphs. bb.x1/y1 is the image origin (full mode
+        // adds no padding), so scaleX/Y read straight off the rendered pixels.
+        const bb = cy.elements().boundingBox();
+        const scaleX = baseImg.width / bb.w;
+        const scaleY = baseImg.height / bb.h;
+        const fontPx = ICON_FONT_PX * scaleY;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        cy.nodes().forEach(node => {
+            if (!node.visible()) return;
+            const pos = node.position(); // node centre in model coordinates
+            const x = (pos.x - bb.x1) * scaleX;
+            const y = (pos.y - bb.y1) * scaleY;
+            ctx.font = `${fontPx}px 'next-font'`;
+            const bgChar = node.data('iconBgChar');
+            if (bgChar) {
+                ctx.fillStyle = '#333'; // matches .icon-bg
+                ctx.fillText(bgChar, x, y);
+            }
+            const fgChar = node.data('iconChar');
+            if (fgChar) {
+                ctx.fillStyle = node.data('color') || '#ffffff';
+                ctx.fillText(fgChar, x, y);
+            }
+        });
+
+        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'topology.png';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showNotification('Exported topology.png');
+    } catch (err) {
+        console.error('PNG export failed:', err);
+        showNotification('PNG export failed');
+    }
 }
 
 /**
@@ -1105,39 +1211,64 @@ function toggleHostnames(show) {
 }
 
 /**
+ * True for endpoint nodes (icon type 'host', 'server', 'firewall', 'unknown'),
+ * i.e. the devices hidden by the EndPoint toggle.
+ */
+function isEndpointNode(node) {
+    const iconType = node.data('icon');
+    return iconType === 'host' || iconType === 'server' || iconType === 'firewall' || iconType === 'unknown';
+}
+
+/**
+ * Single source of truth for node/edge DISPLAY. Recomputes visibility from the
+ * current filter state (EndPoint toggle, Problems Only toggle, and per-node
+ * manual 'Hide Device') each call, so toggles no longer stomp one another.
+ */
+function applyFilters() {
+    if (!cy) return;
+
+    cy.batch(function() {
+        // Base node visibility: manual hides + endpoint filter.
+        cy.nodes().forEach(node => {
+            let visible = true;
+            if (node.data('_manualHidden')) visible = false;
+            else if (!showEndpoints && isEndpointNode(node)) visible = false;
+            node.data('_baseVisible', visible);
+        });
+
+        // Edge visibility: both endpoints visible, plus the Problems Only filter.
+        cy.edges().forEach(edge => {
+            let visible = edge.source().data('_baseVisible') && edge.target().data('_baseVisible');
+            if (visible && showProblemsOnly) {
+                const isMissing = edge.data('is_missing') === 'yes';
+                const isUnexpected = edge.data('is_missing') === 'fail';
+                visible = isMissing || isUnexpected;
+            }
+            edge.style('display', visible ? 'element' : 'none');
+        });
+
+        // In Problems Only mode, drop nodes left without any visible edge.
+        cy.nodes().forEach(node => {
+            let visible = node.data('_baseVisible');
+            if (visible && showProblemsOnly) {
+                visible = node.connectedEdges().some(e => e.style('display') !== 'none');
+            }
+            node.style('display', visible ? 'element' : 'none');
+        });
+    });
+
+    updateIconOverlays();
+}
+
+/**
  * Toggle endpoint (host) nodes visibility
  * Hides/shows nodes with icon type 'host' or 'server' (from endpoint_hosts in devices.yaml)
  */
 function toggleEndpoints(show) {
     if (!cy) return;
     showEndpoints = show;
-    
-    // Debug: list all icon types
-    const iconTypes = {};
-    cy.nodes().forEach(node => {
-        const t = node.data('icon') || 'undefined';
-        iconTypes[t] = (iconTypes[t] || 0) + 1;
-    });
-    console.log('Icon types in topology:', iconTypes);
-    
-    let hiddenCount = 0;
-    cy.batch(function() {
-        cy.nodes().forEach(node => {
-            const iconType = node.data('icon');
-            // Hide 'host', 'server', 'firewall', 'unknown' types (endpoints)
-            if (iconType === 'host' || iconType === 'server' || iconType === 'firewall' || iconType === 'unknown') {
-                hiddenCount++;
-                node.style('display', show ? 'element' : 'none');
-                // Hide connected edges when hiding node
-                node.connectedEdges().style('display', show ? 'element' : 'none');
-            }
-        });
-    });
-    
-    // Update icon overlays
-    updateIconOverlays();
-    
-    console.log('Endpoint visibility:', show, '- affected nodes:', hiddenCount);
+    applyFilters();
+    console.log('Endpoint visibility:', show);
 }
 
 /**
@@ -1181,16 +1312,15 @@ function highlightLinkType(type) {
     });
     
     // Update overlay opacity for dimmed nodes
-    document.querySelectorAll('.node-overlay').forEach(overlay => {
-        const nodeId = overlay.dataset.nodeId;
-        const node = cy.getElementById(nodeId);
+    iconOverlays.forEach(overlay => {
+        const node = cy.getElementById(overlay.dataset.nodeId);
         if (node && node.hasClass('dimmed')) {
             overlay.style.opacity = '0.2';
         } else {
             overlay.style.opacity = '1';
         }
     });
-    
+
     // Show notification
     const typeLabels = { 'normal': 'Normal', 'missing': 'Missing', 'unexpected': 'Unexpected' };
     showNotification(`Highlighting ${typeLabels[type]} links. Click again to clear.`);
@@ -1205,9 +1335,7 @@ function clearLinkHighlight() {
     });
     
     // Reset overlay opacity
-    document.querySelectorAll('.node-overlay').forEach(overlay => {
-        overlay.style.opacity = '1';
-    });
+    resetOverlayOpacity();
 }
 
 /**
@@ -1216,34 +1344,9 @@ function clearLinkHighlight() {
 function toggleProblems(show) {
     if (!cy) return;
     showProblemsOnly = show;
-    
-    cy.batch(function() {
-        if (show) {
-            // Hide normal links and their connected nodes (if isolated)
-            cy.edges().forEach(edge => {
-                const isMissing = edge.data('is_missing') === 'yes';
-                const isUnexpected = edge.data('is_missing') === 'fail';
-                const isProblem = isMissing || isUnexpected;
-                
-                edge.style('display', isProblem ? 'element' : 'none');
-            });
-            
-            // Hide nodes that have no visible edges
-            cy.nodes().forEach(node => {
-                const visibleEdges = node.connectedEdges().filter(e => e.style('display') !== 'none');
-                node.style('display', visibleEdges.length > 0 ? 'element' : 'none');
-            });
-            
-            // Update icon overlays
-            updateIconOverlays();
-        } else {
-            // Show all
-            cy.edges().style('display', 'element');
-            cy.nodes().style('display', 'element');
-            updateIconOverlays();
-        }
-    });
-    
+    // Recompute from full filter state so turning this OFF restores the
+    // EndPoint filter and keeps manually hidden devices hidden.
+    applyFilters();
     console.log('Problems only:', show);
 }
 
@@ -1381,6 +1484,22 @@ function scheduleTopologyLLDPStatusPoll(token, generation, delayMs) {
     );
 }
 
+/**
+ * A session that expires mid-run returns a 401/403 or the auth-guard JSON
+ * ({success:false}). That is terminal, not transient: stop polling, re-enable
+ * the Run button, and tell the user to reload / log in again.
+ */
+function stopTopologyLLDPPollingForAuth() {
+    setStoredTopologyLLDPJob('');
+    topologyLLDPJobToken = null;
+    topologyLLDPPollGeneration += 1;
+    if (topologyLLDPPollTimer) clearTimeout(topologyLLDPPollTimer);
+    setTopologyLLDPButton('session-expired', true);
+    updateTopologyLLDPNotification('failure', 'Session Expired',
+        'Your session ended while the LLDP check was running.',
+        'Reload the page or log in again to check LLDP status.');
+}
+
 async function pollTopologyLLDPJob(token, generation) {
     if (token !== topologyLLDPJobToken || generation !== topologyLLDPPollGeneration) return;
     try {
@@ -1389,7 +1508,17 @@ async function pollTopologyLLDPJob(token, generation) {
             cache: 'no-store',
             headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache' }
         });
+        if (response.status === 401 || response.status === 403) {
+            if (token !== topologyLLDPJobToken || generation !== topologyLLDPPollGeneration) return;
+            stopTopologyLLDPPollingForAuth();
+            return;
+        }
         const data = await response.json();
+        if (data && data.success === false) {
+            if (token !== topologyLLDPJobToken || generation !== topologyLLDPPollGeneration) return;
+            stopTopologyLLDPPollingForAuth();
+            return;
+        }
         if (token !== topologyLLDPJobToken || generation !== topologyLLDPPollGeneration) {
             return; // Ignore every response belonging to an older request.
         }
@@ -1545,7 +1674,17 @@ async function readTopologyLLDPResumeStatus(token) {
         cache: 'no-store',
         headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache' }
     });
+    if (response.status === 401 || response.status === 403) {
+        const authError = new Error('Session expired');
+        authError.authFailure = true;
+        throw authError;
+    }
     const data = await response.json();
+    if (data && data.success === false) {
+        const authError = new Error('Session expired');
+        authError.authFailure = true;
+        throw authError;
+    }
     if (data.status === 'error' && data.message === 'LLDP job was not found') return null;
     if (!response.ok || data.status === 'error' || data.token !== token) {
         throw new Error(data.error || data.message || 'LLDP job status is unavailable');
@@ -1607,6 +1746,12 @@ async function resumeTopologyLLDPJob() {
     if (generation !== topologyLLDPPollGeneration || topologyLLDPJobToken !== null) return;
 
     if (results.some(result => result.status === 'rejected')) {
+        // A terminal auth failure must not retry forever.
+        if (results.some(result => result.status === 'rejected' &&
+            result.reason && result.reason.authFailure)) {
+            stopTopologyLLDPPollingForAuth();
+            return;
+        }
         setTopologyLLDPButton('reconnecting', false);
         updateTopologyLLDPNotification('warning', 'LLDP Status Unavailable',
             'Saved LLDP requests could not be compared safely.',
@@ -1933,11 +2078,11 @@ function initCytoscape() {
         
         // Show tooltip
         const content = `
-            <h4>${data.label}</h4>
-            <p><span class="label">IP:</span> ${data.primaryIP}</p>
-            <p><span class="label">Model:</span> ${data.model}</p>
-            <p><span class="label">S/N:</span> ${data.serial_number}</p>
-            <p><span class="label">Version:</span> ${data.version}</p>
+            <h4>${escapeHtml(data.label)}</h4>
+            <p><span class="label">IP:</span> ${escapeHtml(data.primaryIP)}</p>
+            <p><span class="label">Model:</span> ${escapeHtml(data.model)}</p>
+            <p><span class="label">S/N:</span> ${escapeHtml(data.serial_number)}</p>
+            <p><span class="label">Version:</span> ${escapeHtml(data.version)}</p>
         `;
         showTooltip(event, content);
         
@@ -1968,10 +2113,10 @@ function initCytoscape() {
         
         const content = `
             <h4 style="color:${statusColor}">Link</h4>
-            <p><strong>${data.srcDevice}</strong> : ${data.srcIfName}</p>
+            <p><strong>${escapeHtml(data.srcDevice)}</strong> : ${escapeHtml(data.srcIfName)}</p>
             <p>↕</p>
-            <p><strong>${data.tgtDevice}</strong> : ${data.tgtIfName}</p>
-            <p><span class="label">Status:</span> <span style="color:${statusColor}">${status}</span> &nbsp; <span class="label">BW:</span> <span style="color:${speedColor}">${speed}</span></p>
+            <p><strong>${escapeHtml(data.tgtDevice)}</strong> : ${escapeHtml(data.tgtIfName)}</p>
+            <p><span class="label">Status:</span> <span style="color:${statusColor}">${status}</span> &nbsp; <span class="label">BW:</span> <span style="color:${speedColor}">${escapeHtml(speed)}</span></p>
         `;
         showTooltip(event, content);
     });
@@ -2020,9 +2165,10 @@ function initCytoscape() {
     // Create HTML overlays for font icons
     createIconOverlays();
     
-    // Update overlays on viewport change
-    cy.on('viewport', updateIconOverlays);
-    cy.on('position', 'node', updateIconOverlays);
+    // Update overlays on viewport change (rAF-coalesced: these events fire in
+    // bursts during pan/zoom/layout and each update is O(nodes) DOM writes).
+    cy.on('viewport', scheduleIconOverlayUpdate);
+    cy.on('position', 'node', scheduleIconOverlayUpdate);
     
     console.log('✅ Cytoscape.js initialized');
     console.log(`   Nodes: ${nodeCount}, Links: ${linkCount}`);
@@ -2030,6 +2176,19 @@ function initCytoscape() {
 
 // Store overlay elements
 let iconOverlays = [];
+let iconOverlayRafId = null;
+
+/**
+ * Coalesce bursts of overlay updates into a single rAF-scheduled pass. The
+ * trailing frame guarantees a final update once the burst settles.
+ */
+function scheduleIconOverlayUpdate() {
+    if (iconOverlayRafId !== null) return;
+    iconOverlayRafId = requestAnimationFrame(() => {
+        iconOverlayRafId = null;
+        updateIconOverlays();
+    });
+}
 
 /**
  * Create HTML overlay elements for font icons

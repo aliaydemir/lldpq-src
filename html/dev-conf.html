@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <script src="/css/jszip.min.js"></script>
     <script src="/css/ui-dialogs.js"></script>
     <style>
@@ -1142,7 +1143,9 @@
         }
 
         // Initialize
-        window.onload = () => {
+        window.onload = async () => {
+            const ok = await LLDPqAuth.check();
+            if (!ok) return;
             listFiles();
             applyRoleAwareControls();
         };

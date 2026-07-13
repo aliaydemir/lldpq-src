@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <style>
         * {
             margin: 0;
@@ -40,6 +41,17 @@
             font-size: 13px;
             color: #888;
             margin-top: 4px;
+        }
+
+        .last-updated {
+            font-size: 13px;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        .stale-warning {
+            color: #ff6347;
+            font-weight: bold;
         }
         
         /* Dashboard Section */
@@ -111,6 +123,7 @@
         <div>
             <div class="page-title">LLDP Problems</div>
             <div class="page-subtitle">Raw format - showing only problematic connections</div>
+            <div class="last-updated">Last Updated: <span id="last-updated">--</span><span id="stale-warning" class="stale-warning" style="display: none;"> (stale - report is older than 1 hour)</span></div>
         </div>
     </div>
     
@@ -128,8 +141,21 @@
     </div>
 
     <script>
+        const REFRESH_INTERVAL_MS = 60000;
+        const RETRY_DELAY_MS = 5000;
+        const MAX_RETRIES = 3;
+        const STALE_THRESHOLD_MS = 60 * 60 * 1000;
+        let refreshTimer = null;
+        let retryCount = 0;
+        let hasRenderedData = false;
+
+        function scheduleNextFetch(delay) {
+            clearTimeout(refreshTimer);
+            refreshTimer = setTimeout(fetchAndDisplayLLDPResults, delay);
+        }
+
         function fetchAndDisplayLLDPResults() {
-            fetch('problems-lldp_results.ini')
+            fetch('problems-lldp_results.ini', { cache: 'no-store' })
                 .then(response => {
                     if (!response.ok) {
                         throw new Error('File not found');
@@ -137,16 +163,57 @@
                     return response.text();
                 })
                 .then(data => {
-                    if (!data.trim()) {
+                    retryCount = 0;
+                    const firstLine = data.split(/\r?\n/).find(line => line.trim())?.trim() || '';
+                    setLastUpdated(firstLine.startsWith('Created on ')
+                        ? firstLine.slice('Created on '.length)
+                        : '');
+                    if (data.includes('Good news') || !/^===/m.test(data)) {
                         showNoProblems();
                     } else {
                         displayLLDPResults(data);
                     }
+                    hasRenderedData = true;
+                    scheduleNextFetch(REFRESH_INTERVAL_MS);
                 })
                 .catch(error => {
-                    const element = document.getElementById('metinAlani-1');
-                    element.innerHTML = '<div class="error-message">No problem data available or error loading file.</div>';
+                    if (retryCount < MAX_RETRIES) {
+                        retryCount += 1;
+                        scheduleNextFetch(RETRY_DELAY_MS);
+                        return;
+                    }
+                    retryCount = 0;
+                    if (!hasRenderedData) {
+                        const element = document.getElementById('metinAlani-1');
+                        element.innerHTML = '<div class="error-message">No problem data available or error loading file.</div>';
+                    }
+                    scheduleNextFetch(REFRESH_INTERVAL_MS);
                 });
+        }
+
+        function parseReportTimestamp(value) {
+            const match = (value || '').trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2})[:-](\d{2})[:-](\d{2})/);
+            if (!match) return null;
+            const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+            const parsed = new Date(year, month - 1, day, hour, minute, second);
+            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function setLastUpdated(timestampFromFile) {
+            const output = document.getElementById('last-updated');
+            const warning = document.getElementById('stale-warning');
+            const parsed = parseReportTimestamp(timestampFromFile);
+            if (!parsed) {
+                output.textContent = 'Unavailable';
+                warning.style.display = 'none';
+                return;
+            }
+            const options = {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+            };
+            output.textContent = parsed.toLocaleString('en-US', options);
+            warning.style.display = (Date.now() - parsed.getTime() > STALE_THRESHOLD_MS) ? '' : 'none';
         }
 
         function showNoProblems() {
@@ -167,14 +234,15 @@
             const lines = results.split('\n');
             lines.forEach(line => {
                 let colorClass = 'lime';
-                if (line.startsWith('====')) {
+                if (line.startsWith('===') || line.startsWith('Created on')) {
                     colorClass = 'steelBlue';
-                } else if (line.toLowerCase().includes('fail')) {
-                    colorClass = 'tomato';
-                } else if (line.toLowerCase().includes('created') || line.toLowerCase().includes('reated')) {
-                    colorClass = 'steelBlue';
-                } else if (line.toLowerCase().includes('no-info')) {
-                    colorClass = 'red';
+                } else {
+                    const status = line.trim().split(/\s+/)[1] || '';
+                    if (status === 'Fail') {
+                        colorClass = 'tomato';
+                    } else if (status === 'No-Info') {
+                        colorClass = 'red';
+                    }
                 }
                 const span = document.createElement('span');
                 span.className = colorClass;
@@ -184,7 +252,10 @@
             });
         }
 
-        window.onload = fetchAndDisplayLLDPResults;
+        window.onload = async function () {
+            if (!await LLDPqAuth.check()) return;
+            fetchAndDisplayLLDPResults();
+        };
     </script>
 </body>
 </html>

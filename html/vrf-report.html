@@ -770,10 +770,14 @@
                 <p style="color: #ccc; margin-bottom: 10px;">Are you sure you want to delete VRF:</p>
                 <p style="color: #ce93d8; font-weight: bold; font-size: 18px; margin-bottom: 15px;" id="delete-vrf-name"></p>
                 <div id="affected-devices-list" style="margin-bottom: 15px; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 6px;"></div>
+                <div style="text-align: left; margin-bottom: 5px;">
+                    <label style="display: block; margin-bottom: 5px; color: #888; font-size: 12px;">Type the VRF name to confirm deletion from all devices:</label>
+                    <input type="text" id="delete-vrf-confirm-input" autocomplete="off" oninput="validateDeleteConfirm()" style="width: 100%; padding: 10px 12px; background: #1e1e1e; border: 1px solid #404040; border-radius: 4px; color: #fff; font-size: 14px;">
+                </div>
             </div>
             <div class="modal-footer" style="justify-content: center; gap: 15px;">
                 <button class="btn btn-secondary" onclick="closeDeleteModal()">Cancel</button>
-                <button class="btn" id="btn-confirm-delete" onclick="confirmDelete()" style="background: #dc3545; color: white;">Delete</button>
+                <button class="btn" id="btn-confirm-delete" onclick="confirmDelete()" style="background: #dc3545; color: white;" disabled>Delete</button>
             </div>
         </div>
     </div>
@@ -785,7 +789,44 @@
         let totalDeviceCount = 0;
         let infraVrfList = ['default'];  // Will be loaded from config
         let deletingBgpProfile = null;
-        
+        let bgpSubmitting = false;
+        let bgpDeleting = false;
+
+        // Escape a string for safe insertion into HTML (text, attributes, data-*)
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Delegated click handlers for dynamically-rendered tables (identifiers via data-*)
+        function setupDelegatedHandlers() {
+            document.getElementById('content-area').addEventListener('click', function(e) {
+                const el = e.target.closest('[data-action]');
+                if (!el) return;
+                const action = el.dataset.action;
+                const vrf = el.dataset.vrf;
+                const device = el.dataset.device;
+                if (action === 'toggle') toggleDeviceList(vrf);
+                else if (action === 'assign') openAssignVrfToDevices(vrf);
+                else if (action === 'delete-vrf') confirmDeleteVrf(vrf);
+                else if (action === 'open-device') openDeviceConfig(device);
+                else if (action === 'remove-device') confirmRemoveFromDevice(vrf, device);
+            });
+            document.getElementById('bgp-profiles-content').addEventListener('click', function(e) {
+                const el = e.target.closest('[data-action]');
+                if (!el) return;
+                const name = el.dataset.name;
+                if (el.dataset.action === 'view-bgp') viewBgpProfile(name);
+                else if (el.dataset.action === 'edit-bgp') openEditBgpProfileModal(name);
+                else if (el.dataset.action === 'delete-bgp') openDeleteBgpProfileModal(name);
+            });
+        }
+
         // Dynamic VRF badge colors - uses hash for consistent colors
         function getVrfBadgeClass(vrfName) {
             if (!vrfName || vrfName === 'L2 Only' || vrfName === 'default') return 'badge-gray';
@@ -814,6 +855,7 @@
                 document.body.innerHTML = '<div style="display: flex; align-items: center; justify-content: center; height: 100vh; color: #888;">Access denied. Admin only.</div>';
                 return;
             }
+            setupDelegatedHandlers();
             await loadData();
         }
         
@@ -827,18 +869,20 @@
                     const configResp = await fetch('/fabric-api.sh?action=get-bgp-profiles');
                     const configData = await configResp.json();
                     if (configData.success) {
-                        if (configData.infra_vrfs) {
+                        if (configData.infra_vrfs && configData.infra_vrfs.length > 0) {
                             infraVrfList = configData.infra_vrfs;
                         }
-                        if (configData.bgp_profiles) {
-                            bgpProfiles = configData.bgp_profiles;
-                            renderBgpProfilesTable();
-                        }
+                        bgpProfiles = configData.bgp_profiles || {};
+                        renderBgpProfilesTable();
+                    } else {
+                        bgpProfiles = {};
+                        document.getElementById('bgp-profiles-content').innerHTML = '<div class="no-data">Failed to load BGP profiles: ' + escapeHtml(configData.error || 'Unknown error') + '</div>';
                     }
                 } catch (e) {
                     // Use default if config fails
                     infraVrfList = ['default'];
                     bgpProfiles = {};
+                    document.getElementById('bgp-profiles-content').innerHTML = '<div class="no-data">Failed to load BGP profiles: ' + escapeHtml(e.message) + '</div>';
                 }
                 
                 const response = await fetch('/fabric-api.sh?action=get-vrf-report');
@@ -852,10 +896,10 @@
                     updateSummary();
                     renderTable();
                 } else {
-                    document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + (data.error || 'Unknown error') + '</div>';
+                    document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + escapeHtml(data.error || 'Unknown error') + '</div>';
                 }
             } catch (e) {
-                document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + e.message + '</div>';
+                document.getElementById('content-area').innerHTML = '<div class="no-data">Failed to load data: ' + escapeHtml(e.message) + '</div>';
             }
         }
         
@@ -878,12 +922,12 @@
             document.getElementById('tenant-vrfs').textContent = tenantCount;
             
             // Update tooltips
-            document.getElementById('infra-tooltip').innerHTML = infraCount > 0 
-                ? `<ul>${infraVrfs.map(v => `<li>${v}</li>`).join('')}</ul>`
+            document.getElementById('infra-tooltip').innerHTML = infraCount > 0
+                ? `<ul>${infraVrfs.map(v => `<li>${escapeHtml(v)}</li>`).join('')}</ul>`
                 : '<div style="color: #888; font-size: 12px;">No infra VRFs</div>';
-            
+
             document.getElementById('tenant-tooltip').innerHTML = tenantCount > 0
-                ? `<ul>${tenantVrfs.map(v => `<li>${v}</li>`).join('')}</ul>`
+                ? `<ul>${tenantVrfs.map(v => `<li>${escapeHtml(v)}</li>`).join('')}</ul>`
                 : '<div style="color: #888; font-size: 12px;">No tenant VRFs</div>';
         }
         
@@ -925,12 +969,13 @@
                 
                 const vxlanInt = vrf.vxlan_int ? `vlan${vrf.vxlan_int}_l3` : '-';
                 
+                const vrfNameAttr = escapeHtml(vrfName);
                 html += `
-                    <tr class="expandable" onclick="toggleDeviceList('${vrfName}')">
-                        <td><span class="expand-icon" id="icon-${vrfName}">›</span></td>
-                        <td><span class="badge ${getVrfBadgeClass(vrfName)}">${vrfName}</span></td>
-                        <td>${vrf.l3vni || '-'}</td>
-                        <td>${vxlanInt !== '-' ? `<span class="badge badge-gray">${vxlanInt}</span>` : '-'}</td>
+                    <tr class="expandable" data-action="toggle" data-vrf="${vrfNameAttr}">
+                        <td><span class="expand-icon" id="icon-${vrfNameAttr}">›</span></td>
+                        <td><span class="badge ${getVrfBadgeClass(vrfName)}">${escapeHtml(vrfName)}</span></td>
+                        <td>${escapeHtml(vrf.l3vni || '-')}</td>
+                        <td>${vxlanInt !== '-' ? `<span class="badge badge-gray">${escapeHtml(vxlanInt)}</span>` : '-'}</td>
                         <td>
                             <span class="badge ${deviceCount > 0 ? 'badge-green' : 'badge-gray'}">
                                 ${deviceCount} device${deviceCount !== 1 ? 's' : ''}
@@ -938,12 +983,12 @@
                         </td>
                         <td>
                             <div class="row-actions" style="display: flex; gap: 8px; justify-content: flex-end;">
-                                <button class="btn-icon" onclick="event.stopPropagation(); openAssignVrfToDevices('${vrfName}')" title="Assign to Devices" style="background: #2196f3; color: white;">
+                                <button class="btn-icon" data-action="assign" data-vrf="${vrfNameAttr}" title="Assign to Devices" style="background: #2196f3; color: white;">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/>
                                     </svg>
                                 </button>
-                                <button class="btn-icon btn-icon-delete" onclick="event.stopPropagation(); confirmDeleteVrf('${vrfName}')" title="Delete" ${vrfName === 'default' ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''}>
+                                <button class="btn-icon btn-icon-delete" data-action="delete-vrf" data-vrf="${vrfNameAttr}" title="Delete" ${vrfName === 'default' ? 'disabled style="opacity:0.3;cursor:not-allowed;"' : ''}>
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
@@ -951,11 +996,11 @@
                             </div>
                         </td>
                     </tr>
-                    <tr class="device-list-row" id="devices-${vrfName}">
+                    <tr class="device-list-row" id="devices-${vrfNameAttr}">
                         <td colspan="6">
                             ${devices.length > 0 ? `
                                 <div class="device-chips">
-                                    ${devices.map(d => `<span class="device-chip" onclick="openDeviceConfig('${d}')" title="Open ${d} config in Fabric Config"><span>${d}</span><button class="remove-btn" onclick="event.stopPropagation(); confirmRemoveFromDevice('${vrfName}', '${d}')" title="Remove from ${d}">×</button></span>`).join('')}
+                                    ${devices.map(d => `<span class="device-chip" data-action="open-device" data-device="${escapeHtml(d)}" title="Open ${escapeHtml(d)} config in Fabric Config"><span>${escapeHtml(d)}</span><button class="remove-btn" data-action="remove-device" data-vrf="${vrfNameAttr}" data-device="${escapeHtml(d)}" title="Remove from ${escapeHtml(d)}">×</button></span>`).join('')}
                                 </div>
                             ` : '<span style="color: #888;">No devices assigned</span>'}
                         </td>
@@ -993,51 +1038,82 @@
         // Delete VRF
         let deletingVrfName = '';
         
-        function confirmDeleteVrf(vrfName) {
+        async function confirmDeleteVrf(vrfName) {
             if (vrfName === 'default') {
                 alert('Cannot delete the default VRF');
                 return;
             }
-            
+
             deletingVrfName = vrfName;
             document.getElementById('delete-vrf-name').textContent = vrfName;
-            
-            const devices = vrfData[vrfName]?.devices || [];
+            document.getElementById('delete-vrf-confirm-input').value = '';
+            document.getElementById('btn-confirm-delete').disabled = true;
+
             const affectedDiv = document.getElementById('affected-devices-list');
+            affectedDiv.innerHTML = '<p style="color: #888;">Loading affected devices...</p>';
+            document.getElementById('delete-modal').classList.add('visible');
+
+            // Re-fetch a fresh report so the affected list is current
+            let devices = vrfData[vrfName]?.devices || [];
+            try {
+                const resp = await fetch('/fabric-api.sh?action=get-vrf-report');
+                const data = await resp.json();
+                if (data.success) {
+                    vrfData = data.vrfs || {};
+                    totalDeviceCount = data.device_count || 0;
+                    devices = vrfData[vrfName]?.devices || [];
+                }
+            } catch (e) {
+                // fall back to cached list
+            }
+
+            if (deletingVrfName !== vrfName) return;
+
             if (devices.length > 0) {
                 affectedDiv.innerHTML = `
                     <p style="color: #ff6b6b; margin-bottom: 8px;">Warning: This VRF is used by ${devices.length} device(s):</p>
                     <div style="display: flex; flex-wrap: wrap; gap: 5px; justify-content: center;">
-                        ${devices.map(d => `<span style="background: #444; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${d}</span>`).join('')}
+                        ${devices.map(d => `<span style="background: #444; padding: 2px 8px; border-radius: 4px; font-size: 12px;">${escapeHtml(d)}</span>`).join('')}
                     </div>
                 `;
             } else {
                 affectedDiv.innerHTML = '<p style="color: #888;">This VRF is not used by any devices.</p>';
             }
-            
-            document.getElementById('delete-modal').classList.add('visible');
         }
-        
+
+        function validateDeleteConfirm() {
+            const input = document.getElementById('delete-vrf-confirm-input');
+            document.getElementById('btn-confirm-delete').disabled = (input.value.trim() !== deletingVrfName);
+        }
+
         function closeDeleteModal() {
             document.getElementById('delete-modal').classList.remove('visible');
             deletingVrfName = '';
+            document.getElementById('delete-vrf-confirm-input').value = '';
+            document.getElementById('btn-confirm-delete').disabled = true;
         }
-        
+
         async function confirmDelete() {
             if (!deletingVrfName) return;
-            
+
+            const confirmInput = document.getElementById('delete-vrf-confirm-input');
+            if (confirmInput.value.trim() !== deletingVrfName) {
+                alert('Type the VRF name to confirm deletion.');
+                return;
+            }
+
             const vrfName = deletingVrfName;
             closeDeleteModal();
-            
+
             try {
                 const response = await fetch('/fabric-api.sh?action=delete-vrf-global', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ vrf_name: vrfName })
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     const devices = result.devices_updated || [];
                     let msg = `VRF "${vrfName}" deleted successfully!\n\n`;
@@ -1048,7 +1124,13 @@
                     alert(msg);
                     loadData();
                 } else {
-                    alert('Error: ' + (result.error || 'Unknown error'));
+                    let msg = 'Error: ' + (result.error || 'Unknown error');
+                    if (result.file_errors) {
+                        for (const [file, err] of Object.entries(result.file_errors)) {
+                            msg += `\n- ${file}: ${err}`;
+                        }
+                    }
+                    alert(msg);
                 }
             } catch (e) {
                 alert('Error: ' + e.message);
@@ -1068,8 +1150,8 @@
                 const resp = await fetch('/fabric-api.sh?action=get-bgp-profiles');
                 const data = await resp.json();
                 if (data.success && data.profiles.length > 0) {
-                    profileSelect.innerHTML = data.profiles.map(p => 
-                        `<option value="${p.name}" ${p.name === 'OVERLAY_LEAF' ? 'selected' : ''}>${p.name}</option>`
+                    profileSelect.innerHTML = data.profiles.map(p =>
+                        `<option value="${escapeHtml(p.name)}" ${p.name === 'OVERLAY_LEAF' ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
                     ).join('');
                 } else {
                     profileSelect.innerHTML = '<option value="OVERLAY_LEAF">OVERLAY_LEAF</option>';
@@ -1096,15 +1178,15 @@
                     let html = '';
                     for (const [group, devices] of Object.entries(data.devices)) {
                         const groupId = group.replace(/[^a-zA-Z0-9]/g, '_');
-                        html += `<div style="display: flex; align-items: center; gap: 6px; color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333; cursor: pointer;" onclick="toggleGroupDevices('${groupId}', 'create-vrf-devices')">
+                        html += `<div style="display: flex; align-items: center; gap: 6px; color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333; cursor: pointer;" onclick="toggleGroupHeader('${groupId}', 'create-vrf-devices')">
                             <input type="checkbox" id="group-${groupId}" style="width: 12px; height: 12px;" onclick="event.stopPropagation(); toggleGroupDevices('${groupId}', 'create-vrf-devices')">
-                            <span>${group}</span>
+                            <span>${escapeHtml(group)}</span>
                         </div>`;
                         devices.forEach(device => {
                             const hostname = device.hostname || device;
                             html += `<label style="display: flex; align-items: center; gap: 6px; padding: 4px 8px 4px 20px; cursor: pointer; font-size: 12px; color: #ccc;">
-                                <input type="checkbox" name="create-vrf-devices" data-group="${groupId}" value="${hostname}" style="width: 14px; height: 14px;" onchange="updateGroupCheckbox('${groupId}', 'create-vrf-devices')">
-                                ${hostname}
+                                <input type="checkbox" name="create-vrf-devices" data-group="${groupId}" value="${escapeHtml(hostname)}" style="width: 14px; height: 14px;" onchange="updateGroupCheckbox('${groupId}', 'create-vrf-devices')">
+                                ${escapeHtml(hostname)}
                             </label>`;
                         });
                     }
@@ -1115,6 +1197,12 @@
             }
         }
         
+        function toggleGroupHeader(groupId, inputName) {
+            const groupCb = document.getElementById('group-' + groupId);
+            if (groupCb) groupCb.checked = !groupCb.checked;
+            toggleGroupDevices(groupId, inputName);
+        }
+
         function toggleGroupDevices(groupId, inputName) {
             const groupCb = document.getElementById('group-' + groupId);
             const devices = document.querySelectorAll(`input[name="${inputName}"][data-group="${groupId}"]`);
@@ -1152,8 +1240,8 @@
                     const resp = await fetch('/fabric-api.sh?action=get-leaking-vrfs');
                     const data = await resp.json();
                     if (data.success && data.vrfs.length > 0) {
-                        leakSelect.innerHTML = '<option value="">Select VRF...</option>' + 
-                            data.vrfs.map(v => `<option value="${v.name}">${v.name}</option>`).join('');
+                        leakSelect.innerHTML = '<option value="">Select VRF...</option>' +
+                            data.vrfs.map(v => `<option value="${escapeHtml(v.name)}">${escapeHtml(v.name)}</option>`).join('');
                     } else {
                         leakSelect.innerHTML = '<option value="">No leaking VRFs found</option>';
                     }
@@ -1208,10 +1296,23 @@
                     if (result.leaking_configured) {
                         msg += `\n\nRoute leaking configured with ${result.shared_profile}`;
                     }
+                    if (result.devices_skipped && result.devices_skipped.length) {
+                        msg += `\n\nSkipped (VRF already existed): ${result.devices_skipped.join(', ')}`;
+                    }
+                    if (result.device_errors) {
+                        const de = result.device_errors;
+                        const errLines = Array.isArray(de)
+                            ? de
+                            : Object.entries(de).map(([d, m]) => `${d}: ${m}`);
+                        if (errLines.length) msg += '\n\nErrors:\n' + errLines.join('\n');
+                    }
+                    if (result.warning) {
+                        msg += `\n\n${result.warning}`;
+                    }
                     alert(msg);
                     loadData();
                 } else {
-                    alert('Error: ' + (result.error || 'Unknown error'));
+                    alert('Error: ' + (result.warning || result.error || 'Unknown error'));
                 }
             } catch (e) {
                 alert('Error: ' + e.message);
@@ -1242,13 +1343,13 @@
                 if (data.success && data.devices) {
                     let html = '';
                     for (const [group, devices] of Object.entries(data.devices)) {
-                        html += `<div style="color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333;">${group}</div>`;
+                        html += `<div style="color: #76b900; font-size: 11px; padding: 5px 0 3px 0; border-bottom: 1px solid #333;">${escapeHtml(group)}</div>`;
                         devices.forEach(device => {
                             const hostname = device.hostname || device;
                             const hasVrf = currentDevices.includes(hostname);
                             html += `<label style="display: flex; align-items: center; gap: 6px; padding: 4px 8px; cursor: pointer; font-size: 12px; color: ${hasVrf ? '#76b900' : '#ccc'};">
-                                <input type="checkbox" name="assign-vrf-devices" value="${hostname}" ${hasVrf ? 'checked' : ''} style="width: 14px; height: 14px;">
-                                ${hostname} ${hasVrf ? '✓' : ''}
+                                <input type="checkbox" name="assign-vrf-devices" value="${escapeHtml(hostname)}" ${hasVrf ? 'checked' : ''} style="width: 14px; height: 14px;">
+                                ${escapeHtml(hostname)} ${hasVrf ? '✓' : ''}
                             </label>`;
                         });
                     }
@@ -1270,9 +1371,10 @@
         
         async function assignVrfToDevices() {
             if (!assigningVrfName) return;
-            
+
+            const vrfName = assigningVrfName;
             const selectedDevices = Array.from(document.querySelectorAll('input[name="assign-vrf-devices"]:checked')).map(cb => cb.value);
-            const currentDevices = vrfData[assigningVrfName]?.devices || [];
+            const currentDevices = vrfData[vrfName]?.devices || [];
             
             // Find devices to add (newly checked)
             const toAdd = selectedDevices.filter(d => !currentDevices.includes(d));
@@ -1296,7 +1398,7 @@
                     const resp = await fetch('/fabric-api.sh?action=assign-vrfs', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ device: device, vrfs: [assigningVrfName] })
+                        body: JSON.stringify({ device: device, vrfs: [vrfName] })
                     });
                     const result = await resp.json();
                     if (!result.success) errors.push(`Add ${device}: ${result.error}`);
@@ -1311,7 +1413,7 @@
                     const resp = await fetch('/fabric-api.sh?action=unassign-vrf', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ device: device, vrf: assigningVrfName })
+                        body: JSON.stringify({ device: device, vrf: vrfName })
                     });
                     const result = await resp.json();
                     if (!result.success) errors.push(`Remove ${device}: ${result.error}`);
@@ -1325,7 +1427,7 @@
             if (errors.length > 0) {
                 alert('Some operations failed:\n' + errors.join('\n'));
             } else {
-                alert(`VRF "${assigningVrfName}" updated:\n+ Added to ${toAdd.length} device(s)\n- Removed from ${toRemove.length} device(s)`);
+                alert(`VRF "${vrfName}" updated:\n+ Added to ${toAdd.length} device(s)\n- Removed from ${toRemove.length} device(s)`);
             }
             
             loadData();
@@ -1434,29 +1536,30 @@
                 const l2vpnEvpn = l2vpn.enable_evpn ? '<span class="badge badge-cyan">Yes</span>' : '<span class="badge badge-gray">No</span>';
                 
                 const pgCount = Object.keys(peerGroups).length;
-                const pgNames = Object.keys(peerGroups).slice(0, 2).join(', ');
+                const pgNames = escapeHtml(Object.keys(peerGroups).slice(0, 2).join(', '));
                 const pgDisplay = pgCount > 0 ? `<span class="badge badge-purple">${pgCount}</span> ${pgNames}${pgCount > 2 ? '...' : ''}` : '-';
-                
+                const nameAttr = escapeHtml(name);
+
 html += `
                     <tr>
-                        <td><strong style="color: #76b900;">${name}</strong></td>
+                        <td><strong style="color: #76b900;">${escapeHtml(name)}</strong></td>
                         <td style="font-size: 12px;">${redistText}</td>
                         <td>${evpnType5}</td>
                         <td>${l2vpnEvpn}</td>
                         <td>${pgDisplay}</td>
                         <td>
                             <div style="display: flex; gap: 4px; justify-content: flex-end;">
-                                <button class="btn-icon" onclick="viewBgpProfile('${name}')" title="View Details" style="background: #404040; border: none; padding: 6px; border-radius: 4px; cursor: pointer;">
+                                <button class="btn-icon" data-action="view-bgp" data-name="${nameAttr}" title="View Details" style="background: #404040; border: none; padding: 6px; border-radius: 4px; cursor: pointer;">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="#ccc">
                                         <path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/>
                                     </svg>
                                 </button>
-                                <button class="btn-icon btn-icon-edit" onclick="openEditBgpProfileModal('${name}')" title="Edit">
+                                <button class="btn-icon btn-icon-edit" data-action="edit-bgp" data-name="${nameAttr}" title="Edit">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                     </svg>
                                 </button>
-                                <button class="btn-icon btn-icon-delete" onclick="openDeleteBgpProfileModal('${name}')" title="Delete">
+                                <button class="btn-icon btn-icon-delete" data-action="delete-bgp" data-name="${nameAttr}" title="Delete">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/>
                                     </svg>
@@ -1524,16 +1627,18 @@ html += `
                 if (enableEvpn) pg.enable_evpn = true;
                 if (description) pg.description = description;
                 
-                // Parse peers - could be interfaces (swpX) or IPs
+                // Parse peers - could be interfaces (swpX) or IPs (IPv4/IPv6)
                 if (peersText) {
                     const peers = peersText.split('\n').map(p => p.trim()).filter(Boolean);
-                    // Check if IPs (contains dots) or interfaces
-                    const isIPs = peers.some(p => p.includes('.'));
-                    if (isIPs) {
+                    const looksLikeIp = (p) => {
+                        const s = p.split('/')[0].trim();
+                        return /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(s) ||
+                               (s.includes(':') && /^[0-9a-fA-F:]+$/.test(s));
+                    };
+                    if (peers.some(looksLikeIp)) {
                         pg.peers = {};
                         peers.forEach(p => {
-                            const ip = p.split(':')[0].trim();
-                            pg.peers[ip] = {};
+                            pg.peers[p] = {};
                         });
                     } else {
                         pg.peers = peers;
@@ -1581,12 +1686,14 @@ html += `
         }
         
         async function createBgpProfile() {
+            if (bgpSubmitting) return;
+
             const name = document.getElementById('bgp-profile-name').value.trim();
             if (!name) {
                 alert('Profile name is required');
                 return;
             }
-            
+
             const data = {
                 profile_name: name,
                 redistribute_connected: document.getElementById('bgp-redistribute-connected').checked,
@@ -1595,7 +1702,11 @@ html += `
                 enable_evpn: document.getElementById('bgp-enable-evpn').checked,
                 peer_groups: getPeerGroupsFromContainer('bgp-peer-groups-container')
             };
-            
+
+            const btn = document.querySelector('#create-bgp-modal .modal-footer .btn-primary');
+            bgpSubmitting = true;
+            if (btn) { btn.disabled = true; btn.textContent = 'Creating...'; }
+
             try {
                 const response = await fetch('/fabric-api.sh?action=create-bgp-profile', {
                     method: 'POST',
@@ -1603,7 +1714,7 @@ html += `
                     body: JSON.stringify(data)
                 });
                 const result = await response.json();
-                
+
                 if (result.success) {
                     closeCreateBgpProfileModal();
                     loadData();
@@ -1613,6 +1724,9 @@ html += `
                 }
             } catch (e) {
                 alert('Error: ' + e.message);
+            } finally {
+                bgpSubmitting = false;
+                if (btn) { btn.disabled = false; btn.textContent = 'Create'; }
             }
         }
         
@@ -1654,7 +1768,7 @@ html += `
                 
                 entry.innerHTML = `
                     <div style="display: grid; grid-template-columns: 1fr 1fr auto; gap: 10px; margin-bottom: 10px;">
-                        <input type="text" class="pg-name" value="${pgName}" style="padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff;">
+                        <input type="text" class="pg-name" value="${escapeHtml(pgName)}" style="padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff;">
                         <select class="pg-type" style="padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff;">
                             <option value="external" ${pg.peer_type === 'external' ? 'selected' : ''}>External</option>
                             <option value="internal" ${pg.peer_type === 'internal' ? 'selected' : ''}>Internal</option>
@@ -1671,8 +1785,8 @@ html += `
                             Enable EVPN
                         </label>
                     </div>
-                    <input type="text" class="pg-description" value="${pg.description || ''}" placeholder="Description (optional)" style="width: 100%; padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff; margin-bottom: 10px;">
-                    <textarea class="pg-peers" placeholder="Peers (one per line)" style="width: 100%; padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff; min-height: 60px; font-family: monospace;">${peersText}</textarea>
+                    <input type="text" class="pg-description" value="${escapeHtml(pg.description || '')}" placeholder="Description (optional)" style="width: 100%; padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff; margin-bottom: 10px;">
+                    <textarea class="pg-peers" placeholder="Peers (one per line)" style="width: 100%; padding: 8px; background: #2d2d2d; border: 1px solid #404040; border-radius: 4px; color: #fff; min-height: 60px; font-family: monospace;">${escapeHtml(peersText)}</textarea>
                 `;
                 container.appendChild(entry);
             }
@@ -1735,8 +1849,12 @@ html += `
         }
         
         async function confirmDeleteBgpProfile() {
-            if (!deletingBgpProfile) return;
-            
+            if (!deletingBgpProfile || bgpDeleting) return;
+
+            const btn = document.querySelector('#delete-bgp-modal .modal-footer .btn:last-child');
+            bgpDeleting = true;
+            if (btn) btn.disabled = true;
+
             try {
                 const response = await fetch('/fabric-api.sh?action=delete-bgp-profile', {
                     method: 'POST',
@@ -1744,16 +1862,26 @@ html += `
                     body: JSON.stringify({ profile_name: deletingBgpProfile })
                 });
                 const result = await response.json();
-                
+
                 if (result.success) {
                     closeDeleteBgpProfileModal();
                     loadData();
                     alert('BGP profile deleted successfully!');
                 } else {
-                    alert('Error: ' + (result.error || 'Unknown error'));
+                    let msg = 'Error: ' + (result.error || 'Unknown error');
+                    if (result.in_use && result.in_use.length) {
+                        msg += '\n\nStill referenced by:';
+                        result.in_use.forEach(ref => {
+                            msg += `\n- ${ref.device} (vrf: ${ref.vrf})`;
+                        });
+                    }
+                    alert(msg);
                 }
             } catch (e) {
                 alert('Error: ' + e.message);
+            } finally {
+                bgpDeleting = false;
+                if (btn) btn.disabled = false;
             }
         }
         
@@ -1794,19 +1922,19 @@ html += `
                     let peersHtml = '';
                     if (pg.peers) {
                         if (Array.isArray(pg.peers)) {
-                            peersHtml = pg.peers.map(p => `<span class="badge badge-gray" style="margin: 2px;">${p}</span>`).join('');
+                            peersHtml = pg.peers.map(p => `<span class="badge badge-gray" style="margin: 2px;">${escapeHtml(p)}</span>`).join('');
                         } else {
-                            peersHtml = Object.keys(pg.peers).map(p => `<span class="badge badge-blue" style="margin: 2px;">${p}</span>`).join('');
+                            peersHtml = Object.keys(pg.peers).map(p => `<span class="badge badge-blue" style="margin: 2px;">${escapeHtml(p)}</span>`).join('');
                         }
                     }
-                    
+
                     html += `
                         <div style="background: #1e1e1e; padding: 15px; border-radius: 4px; margin-bottom: 10px;">
                             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-                                <strong style="color: #76b900;">${pgName}</strong>
-                                <span class="badge ${pg.peer_type === 'external' ? 'badge-orange' : 'badge-purple'}">${pg.peer_type || 'external'}</span>
+                                <strong style="color: #76b900;">${escapeHtml(pgName)}</strong>
+                                <span class="badge ${pg.peer_type === 'external' ? 'badge-orange' : 'badge-purple'}">${escapeHtml(pg.peer_type || 'external')}</span>
                             </div>
-                            ${pg.description ? `<div style="color: #888; font-size: 12px; margin-bottom: 10px;">${pg.description}</div>` : ''}
+                            ${pg.description ? `<div style="color: #888; font-size: 12px; margin-bottom: 10px;">${escapeHtml(pg.description)}</div>` : ''}
                             <div style="font-size: 12px; margin-bottom: 8px;">
                                 BFD: <strong>${pg.enable_bfd ? 'Yes' : 'No'}</strong> | 
                                 EVPN: <strong>${pg.enable_evpn ? 'Yes' : 'No'}</strong>

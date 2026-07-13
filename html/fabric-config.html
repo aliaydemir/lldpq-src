@@ -1132,7 +1132,39 @@
         let vlanProfiles = {};  // Global VLAN profiles
         let portProfiles = {};  // Global SW Port profiles
         let leakedSubnets = {};  // Subnet -> {target_vrf, route_map}
-        
+
+        // Helper: Escape a value for safe insertion into innerHTML / HTML attributes
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Delegated click handler for identifier-carrying dashboard actions
+        // (avoids inline onclick string interpolation of user/server data)
+        function onDashboardClick(e) {
+            const el = e.target.closest('[data-action]');
+            if (!el) return;
+            const action = el.dataset.action;
+            if (action === 'unassign-vrf') {
+                e.stopPropagation();
+                confirmUnassignVrf(el.dataset.vrf);
+            } else if (action === 'unassign-vlan') {
+                e.stopPropagation();
+                confirmUnassignVlan(el.dataset.vlan);
+            } else if (action === 'edit-breakout') {
+                openBreakoutEditModal(el.dataset.ifname, el.dataset.breakout, el.dataset.desc);
+            } else if (action === 'edit-interface') {
+                openInterfaceEditModal(el.dataset.ifname, el.dataset.profile, el.dataset.desc, el.dataset.bond, el.dataset.cfg);
+            } else if (action === 'edit-bond') {
+                openBondEditModal(el.dataset.bondname, el.dataset.profile, el.dataset.desc, el.dataset.cfg);
+            }
+        }
+
         // Helper: Get VRF badge class
         // Dynamic VRF badge colors - uses hash for consistent colors
         function getVrfBadgeClass(vrfName) {
@@ -1186,9 +1218,12 @@
                 return;
             }
             
+            // Delegated handler for identifier-carrying dashboard actions
+            document.getElementById('content-area').addEventListener('click', onDashboardClick);
+
             // Load devices
             await loadDevices();
-            
+
             // Check URL for device parameter (e.g., ?device=lsw-3na-01-28)
             const urlParams = new URLSearchParams(window.location.search);
             const deviceParam = urlParams.get('device');
@@ -1242,28 +1277,32 @@
             let html = '';
             for (const [group, groupDevices] of Object.entries(devices)) {
                 html += `
-                    <div class="device-group" data-group="${group}">
+                    <div class="device-group" data-group="${escapeHtml(group)}">
                         <div class="group-header collapsed" onclick="toggleGroup(this)">
                             <span class="arrow">▼</span>
-                            ${group} (${groupDevices.length})
+                            ${escapeHtml(group)} (${groupDevices.length})
                         </div>
                         <div class="group-devices collapsed">
                 `;
-                
+
                 for (const device of groupDevices) {
                     html += `
-                        <div class="device-item" data-hostname="${device.hostname}" onclick="selectDevice('${device.hostname}')">
+                        <div class="device-item" data-hostname="${escapeHtml(device.hostname)}">
                             <div class="device-icon"></div>
-                            <span class="device-name">${device.hostname}</span>
-                            <span class="device-ip">${device.ip || ''}</span>
+                            <span class="device-name">${escapeHtml(device.hostname)}</span>
+                            <span class="device-ip">${escapeHtml(device.ip || '')}</span>
                         </div>
                     `;
                 }
-                
+
                 html += '</div></div>';
             }
-            
+
             container.innerHTML = html;
+
+            container.querySelectorAll('.device-item').forEach(item => {
+                item.addEventListener('click', () => selectDevice(item.dataset.hostname));
+            });
         }
         
         // Toggle group collapse
@@ -1296,11 +1335,14 @@
         
         // Select device
         async function selectDevice(hostname) {
+            // Capture target locally to guard against stale async responses
+            const target = hostname;
+
             // Update selection UI
             document.querySelectorAll('.device-item').forEach(item => {
                 item.classList.toggle('selected', item.dataset.hostname === hostname);
             });
-            
+
             selectedDevice = hostname;
             
             // Show refresh button when device is selected
@@ -1322,11 +1364,14 @@
                 
                 const data = await deviceResponse.json();
                 const leakData = await leakResponse.json();
-                
+
+                // Bail if selection changed while awaiting (stale response)
+                if (selectedDevice !== target) return;
+
                 if (leakData.success) {
                     leakedSubnets = leakData.leaked_subnets || {};
                 }
-                
+
                 if (data.success) {
                     currentDeviceConfig = data.config;  // Save for VRF creation
                     currentVxlanIntMapping = data.vxlan_int_mapping || {};  // Save for DHCP relay
@@ -1335,6 +1380,7 @@
                     showError('Failed to load device: ' + data.error);
                 }
             } catch (err) {
+                if (selectedDevice !== target) return;
                 showError('Failed to load device: ' + err.message);
             }
         }
@@ -1389,8 +1435,8 @@
                             <path d="M20 5H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 12H4V7h16v10z"/>
                         </svg>
                         <h2 style="color: #808080;">No Configuration</h2>
-                        <p>This device (${selectedDevice}) does not have a host_vars configuration file.</p>
-                        <p style="font-size: 12px; color: #666;">Group: ${deviceInfo.group || 'Unknown'} | IP: ${deviceInfo.ip || 'N/A'}</p>
+                        <p>This device (${escapeHtml(selectedDevice)}) does not have a host_vars configuration file.</p>
+                        <p style="font-size: 12px; color: #666;">Group: ${escapeHtml(deviceInfo.group || 'Unknown')} | IP: ${escapeHtml(deviceInfo.ip || 'N/A')}</p>
                     </div>
                 `;
                 return;
@@ -1477,19 +1523,19 @@
                         <div class="info-grid">
                             <div class="info-item">
                                 <div class="info-label">Hostname</div>
-                                <div class="info-value">${selectedDevice}</div>
+                                <div class="info-value">${escapeHtml(selectedDevice)}</div>
                             </div>
                             <div class="info-item">
                                 <div class="info-label">Management IP</div>
-                                <div class="info-value">${config.mgmt_ip || 'N/A'}</div>
+                                <div class="info-value">${escapeHtml(config.mgmt_ip || 'N/A')}</div>
                             </div>
                             <div class="info-item">
                                 <div class="info-label">Loopback IP</div>
-                                <div class="info-value">${config.lo_ip || 'N/A'}</div>
+                                <div class="info-value">${escapeHtml(config.lo_ip || 'N/A')}</div>
                             </div>
                             <div class="info-item">
                                 <div class="info-label">BGP ASN</div>
-                                <div class="info-value">${getBgpAsn(config)}</div>
+                                <div class="info-value">${escapeHtml(getBgpAsn(config))}</div>
                             </div>
                             <div class="info-item">
                                 <div class="info-label">VTEP</div>
@@ -1501,7 +1547,7 @@
                             </div>
                             <div class="info-item">
                                 <div class="info-label">Group</div>
-                                <div class="info-value">${deviceInfo.group || 'N/A'}</div>
+                                <div class="info-value">${escapeHtml(deviceInfo.group || 'N/A')}</div>
                             </div>
                         </div>
                     </div>
@@ -1590,15 +1636,15 @@
                         <tr>
                             <td>
                                 <span class="badge ${getVrfBadgeClass(vrfName)} badge-with-delete">
-                                    ${vrfName}
-                                    ${showRemove ? `<span class="badge-delete" onclick="event.stopPropagation(); confirmUnassignVrf('${vrfName}')" title="Remove from this device">×</span>` : ''}
+                                    ${escapeHtml(vrfName)}
+                                    ${showRemove ? `<span class="badge-delete" data-action="unassign-vrf" data-vrf="${escapeHtml(vrfName)}" title="Remove from this device">×</span>` : ''}
                                 </span>
                             </td>
-                            <td>${vxlanInt !== '-' ? `<span class="badge badge-gray">${vxlanInt}</span>` : '-'}</td>
-                            <td>${vrfConfig.l3vni || '-'}</td>
-                            <td>${vrfConfig.bgp?.bgp_profile || '-'}</td>
-                            <td>${loopbackDisplay}</td>
-                            <td style="text-align: right;">${resolveJinja(vrfConfig.bgp?.asn, config) || '-'}</td>
+                            <td>${vxlanInt !== '-' ? `<span class="badge badge-gray">${escapeHtml(vxlanInt)}</span>` : '-'}</td>
+                            <td>${escapeHtml(vrfConfig.l3vni || '-')}</td>
+                            <td>${escapeHtml(vrfConfig.bgp?.bgp_profile || '-')}</td>
+                            <td>${escapeHtml(loopbackDisplay)}</td>
+                            <td style="text-align: right;">${escapeHtml(resolveJinja(vrfConfig.bgp?.asn, config) || '-')}</td>
                         </tr>
                     `;
                 }
@@ -1651,8 +1697,8 @@
                         <div style="display: flex; flex-wrap: wrap; gap: 8px;">
                             ${config.vlan_templates.map(v => `
                                 <span class="badge badge-green badge-with-delete">
-                                    ${v}
-                                    <span class="badge-delete" onclick="event.stopPropagation(); confirmUnassignVlan('${v}')" title="Remove from this device">×</span>
+                                    ${escapeHtml(v)}
+                                    <span class="badge-delete" data-action="unassign-vlan" data-vlan="${escapeHtml(v)}" title="Remove from this device">×</span>
                                 </span>
                             `).join('')}
                         </div>
@@ -1739,18 +1785,18 @@
                         let leakToDisplay = '-';
                         if (subnetForLeak && leakedSubnets[subnetForLeak]) {
                             const targetVrf = leakedSubnets[subnetForLeak].target_vrf;
-                            leakToDisplay = `<span class="badge ${getVrfBadgeClass(targetVrf)}">${targetVrf}</span>`;
+                            leakToDisplay = `<span class="badge ${getVrfBadgeClass(targetVrf)}">${escapeHtml(targetVrf)}</span>`;
                         }
-                        
+
                         html += `
                             <tr>
-                                <td><span class="badge badge-green">${templateName}</span></td>
-                                <td>${vlanIdDisplay}</td>
-                                <td>${vrrVip ? `<span class="badge badge-orange">${vrrVip}</span>` : '-'}</td>
-                                <td>${switchIp ? `<span class="badge badge-blue">${switchIp}</span>` : '-'}</td>
-                                <td><span class="badge ${vrfBadgeClass}">${vrfDisplay}</span></td>
-                                <td>${descDisplay}</td>
-                                <td>${l2vniDisplay}</td>
+                                <td><span class="badge badge-green">${escapeHtml(templateName)}</span></td>
+                                <td>${escapeHtml(vlanIdDisplay)}</td>
+                                <td>${vrrVip ? `<span class="badge badge-orange">${escapeHtml(vrrVip)}</span>` : '-'}</td>
+                                <td>${switchIp ? `<span class="badge badge-blue">${escapeHtml(switchIp)}</span>` : '-'}</td>
+                                <td><span class="badge ${vrfBadgeClass}">${escapeHtml(vrfDisplay)}</span></td>
+                                <td>${escapeHtml(descDisplay)}</td>
+                                <td>${escapeHtml(l2vniDisplay)}</td>
                                 <td style="text-align: right;">${leakToDisplay}</td>
                             </tr>
                         `;
@@ -1800,10 +1846,10 @@
                         const vrfBadgeClass = getVrfBadgeClass(relay.vrf);
                         html += `
                             <tr>
-                                <td><span class="badge ${vrfBadgeClass}">${relay.vrf}</span></td>
-                                <td>${relay.interfaces?.join(', ') || '-'}</td>
-                                <td>${relay.servers?.join(', ') || '-'}</td>
-                                <td>${relay.upstream?.join(', ') || '-'}</td>
+                                <td><span class="badge ${vrfBadgeClass}">${escapeHtml(relay.vrf)}</span></td>
+                                <td>${escapeHtml(relay.interfaces?.join(', ') || '-')}</td>
+                                <td>${escapeHtml(relay.servers?.join(', ') || '-')}</td>
+                                <td>${escapeHtml(relay.upstream?.join(', ') || '-')}</td>
                                 <td style="text-align: right;">
                                     <div style="display: flex; gap: 6px; justify-content: flex-end;">
                                         <button class="btn-icon btn-icon-edit" onclick="editDhcpRelay(${idx})" title="Edit">
@@ -1874,11 +1920,11 @@
                             <div class="info-grid">
                                 <div class="info-item">
                                     <div class="info-label">System MAC</div>
-                                    <div class="info-value">${config.evpn_mh.sysmac || 'N/A'}</div>
+                                    <div class="info-value">${escapeHtml(config.evpn_mh.sysmac || 'N/A')}</div>
                                 </div>
                                 <div class="info-item">
                                     <div class="info-label">DF Preference</div>
-                                    <div class="info-value">${config.evpn_mh.df_preference || 'N/A'}</div>
+                                    <div class="info-value">${escapeHtml(config.evpn_mh.df_preference || 'N/A')}</div>
                                 </div>
                             </div>
                         </div>
@@ -2002,7 +2048,7 @@
                         // If no actual sub-interfaces configured, show expected ones based on breakout
                         let subInterfaceText = '-';
                         if (actualSubInterfaces.length > 0) {
-                            subInterfaceText = actualSubInterfaces.join(', ');
+                            subInterfaceText = escapeHtml(actualSubInterfaces.join(', '));
                         } else {
                             // Calculate expected sub-interfaces
                             const breakoutMatch = breakoutType.match(/^(\d+)x/);
@@ -2012,22 +2058,18 @@
                                 for (let i = 0; i < subIfCount; i++) {
                                     expected.push(ifName + 's' + i);
                                 }
-                                subInterfaceText = `<span style="color: #888;">${expected.join(', ')} (not configured)</span>`;
+                                subInterfaceText = `<span style="color: #888;">${escapeHtml(expected.join(', '))} (not configured)</span>`;
                             }
                         }
 
-                        const escapedBreakoutIfName = ifName.replace(/'/g, "\\'");
-                        const escapedBreakoutDesc = (cfg.description || '').replace(/'/g, "\\'");
-                        const breakoutCfgJson = encodeURIComponent(JSON.stringify(cfg));
-                        
                         html += `
                             <tr>
-                                <td><strong>${ifName}</strong></td>
-                                <td><span class="badge badge-orange">${breakoutType}</span></td>
+                                <td><strong>${escapeHtml(ifName)}</strong></td>
+                                <td><span class="badge badge-orange">${escapeHtml(breakoutType)}</span></td>
                                 <td>${subInterfaceText}</td>
-                                <td>${cfg.description || '-'}</td>
+                                <td>${escapeHtml(cfg.description || '-')}</td>
                                 <td style="text-align: right;">
-                                    <button class="btn-icon btn-icon-edit" onclick="openBreakoutEditModal('${escapedBreakoutIfName}', '${breakoutType}', '${escapedBreakoutDesc}')" title="Edit Breakout">
+                                    <button class="btn-icon btn-icon-edit" data-action="edit-breakout" data-ifname="${escapeHtml(ifName)}" data-breakout="${escapeHtml(breakoutType)}" data-desc="${escapeHtml(cfg.description || '')}" title="Edit Breakout">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                             <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                         </svg>
@@ -2110,35 +2152,31 @@
                         if (profile && profileInfo.vlans !== '-') {
                             const isTrunk = profileInfo.mode === 'trunk';
                             const badgeColor = isTrunk ? (profileInfo.vlans === 'ALL' ? 'badge-cyan' : 'badge-purple') : 'badge-green';
-                            vlanDisplay = `<span class="badge ${badgeColor}">${profileInfo.vlans}</span>`;
+                            vlanDisplay = `<span class="badge ${badgeColor}">${escapeHtml(profileInfo.vlans)}</span>`;
                         } else if (vlan) {
-                            vlanDisplay = `<span class="badge badge-green">${vlan}</span>`;
+                            vlanDisplay = `<span class="badge badge-green">${escapeHtml(vlan)}</span>`;
                         }
-                        
+
                         // Native VLAN display
-                        const nativeDisplay = profileInfo.native !== '-' 
-                            ? `<span class="badge badge-orange">${profileInfo.native}</span>` 
+                        const nativeDisplay = profileInfo.native !== '-'
+                            ? `<span class="badge badge-orange">${escapeHtml(profileInfo.native)}</span>`
                             : '-';
-                        
-                        // Escape quotes for onclick
-                        const escapedIfName = ifName.replace(/'/g, "\\'");
-                        const escapedProfile = (profile || '').replace(/'/g, "\\'");
-                        const escapedDesc = (cfg.description || '').replace(/'/g, "\\'");
+
                         const hasBond = bondInfo ? bondInfo.bondName : '';
                         const cfgJson = encodeURIComponent(JSON.stringify(cfg));
-                        
+
                         html += `
                             <tr>
-                                <td>${ifName}</td>
-                                <td>${bondInfo ? `<span class="badge badge-orange">${bondInfo.bondName}</span>` : '-'}</td>
-                                <td>${ipAddr !== '-' ? `<span class="badge badge-blue">${ipAddr}</span>` : '-'}</td>
-                                <td>${displayProfile}</td>
+                                <td>${escapeHtml(ifName)}</td>
+                                <td>${bondInfo ? `<span class="badge badge-orange">${escapeHtml(bondInfo.bondName)}</span>` : '-'}</td>
+                                <td>${ipAddr !== '-' ? `<span class="badge badge-blue">${escapeHtml(ipAddr)}</span>` : '-'}</td>
+                                <td>${escapeHtml(displayProfile)}</td>
                                 <td>${vlanDisplay}</td>
                                 <td>${nativeDisplay}</td>
-                                <td>${displayVrf ? `<span class="badge badge-blue">${displayVrf}</span>` : '-'}</td>
-                                <td>${description}</td>
+                                <td>${displayVrf ? `<span class="badge badge-blue">${escapeHtml(displayVrf)}</span>` : '-'}</td>
+                                <td>${escapeHtml(description)}</td>
                                 <td style="text-align: right;">
-                                    <button class="btn-icon btn-icon-edit" onclick="openInterfaceEditModal('${escapedIfName}', '${escapedProfile}', '${escapedDesc}', '${hasBond}', '${cfgJson}')" title="Edit Interface">
+                                    <button class="btn-icon btn-icon-edit" data-action="edit-interface" data-ifname="${escapeHtml(ifName)}" data-profile="${escapeHtml(profile || '')}" data-desc="${escapeHtml(cfg.description || '')}" data-bond="${escapeHtml(hasBond)}" data-cfg="${cfgJson}" title="Edit Interface">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                             <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                         </svg>
@@ -2205,34 +2243,30 @@
                     if (profileInfo.vlans !== '-') {
                         const isTrunk = profileInfo.mode === 'trunk';
                         const badgeColor = isTrunk ? (profileInfo.vlans === 'ALL' ? 'badge-cyan' : 'badge-purple') : 'badge-green';
-                        vlanDisplay = `<span class="badge ${badgeColor}">${profileInfo.vlans}</span>`;
+                        vlanDisplay = `<span class="badge ${badgeColor}">${escapeHtml(profileInfo.vlans)}</span>`;
                     }
-                    
+
                     // Native VLAN display
-                    const nativeDisplay = profileInfo.native !== '-' 
-                        ? `<span class="badge badge-orange">${profileInfo.native}</span>` 
+                    const nativeDisplay = profileInfo.native !== '-'
+                        ? `<span class="badge badge-orange">${escapeHtml(profileInfo.native)}</span>`
                         : '-';
-                    
-                    // Escape quotes for onclick
-                    const escapedBondName = bondName.replace(/'/g, "\\'");
-                    const escapedBondProfile = (profile || '').replace(/'/g, "\\'");
-                    const escapedBondDesc = (cfg.description || '').replace(/'/g, "\\'");
+
                     const bondCfgJson = encodeURIComponent(JSON.stringify(cfg));
-                    
+
                     html += `
                         <tr>
-                            <td><strong>${bondName}</strong></td>
-                            <td>${members}</td>
-                            <td>${profile || '-'}</td>
+                            <td><strong>${escapeHtml(bondName)}</strong></td>
+                            <td>${escapeHtml(members)}</td>
+                            <td>${escapeHtml(profile || '-')}</td>
                             <td>${vlanDisplay}</td>
                             <td>${nativeDisplay}</td>
-                            <td>${displayVrf ? `<span class="badge badge-blue">${displayVrf}</span>` : '-'}</td>
-                            <td>${esi !== '-' ? `<span class="badge badge-orange">${esi}</span>` : '-'}</td>
+                            <td>${displayVrf ? `<span class="badge badge-blue">${escapeHtml(displayVrf)}</span>` : '-'}</td>
+                            <td>${esi !== '-' ? `<span class="badge badge-orange">${escapeHtml(esi)}</span>` : '-'}</td>
                             <td><span class="badge ${isActive ? 'badge-green' : 'badge-orange'}">${lacpMode}</span></td>
                             <td>${lacpBypass ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-red">No</span>'}</td>
-                            <td>${cfg.description || '-'}</td>
+                            <td>${escapeHtml(cfg.description || '-')}</td>
                             <td style="text-align: right;">
-                                <button class="btn-icon btn-icon-edit" onclick="openBondEditModal('${escapedBondName}', '${escapedBondProfile}', '${escapedBondDesc}', '${bondCfgJson}')" title="Edit Bond">
+                                <button class="btn-icon btn-icon-edit" data-action="edit-bond" data-bondname="${escapeHtml(bondName)}" data-profile="${escapeHtml(profile || '')}" data-desc="${escapeHtml(cfg.description || '')}" data-cfg="${bondCfgJson}" title="Edit Bond">
                                     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                                         <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34c-.39-.39-1.02-.39-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z"/>
                                     </svg>
@@ -2263,7 +2297,7 @@
                         <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
                     </svg>
                     <h2 style="color: #ff6b6b;">Error</h2>
-                    <p>${message}</p>
+                    <p>${escapeHtml(message)}</p>
                 </div>
             `;
         }
@@ -2492,16 +2526,16 @@
                     
                     filesWithIssues.forEach(file => {
                         html += `<div style="background: #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px;">`;
-                        html += `<div style="color: #4fc3f7; margin-bottom: 8px; font-weight: bold;">${file.filename}</div>`;
-                        
+                        html += `<div style="color: #4fc3f7; margin-bottom: 8px; font-weight: bold;">${escapeHtml(file.filename)}</div>`;
+
                         file.issues.forEach(issue => {
                             const sevColor = issue.severity === 'ERROR' ? '#f44336' : issue.severity === 'WARNING' ? '#ff9800' : '#4fc3f7';
                             html += `<div style="margin-left: 10px; margin-bottom: 6px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
-                            html += `<span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> `;
-                            html += `<span style="color: #888;">${issue.path}:</span> `;
-                            html += `<span style="color: #ddd;">${issue.message}</span>`;
+                            html += `<span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> `;
+                            html += `<span style="color: #888;">${escapeHtml(issue.path)}:</span> `;
+                            html += `<span style="color: #ddd;">${escapeHtml(issue.message)}</span>`;
                             if (issue.suggestion) {
-                                html += `<div style="color: #999; margin-top: 3px; font-style: italic;">→ ${issue.suggestion}</div>`;
+                                html += `<div style="color: #999; margin-top: 3px; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
                             }
                             html += '</div>';
                         });
@@ -2517,16 +2551,16 @@
                     result.topology.issues.forEach(issue => {
                         const sevColor = issue.severity === 'ERROR' ? '#f44336' : issue.severity === 'WARNING' ? '#ff9800' : '#4fc3f7';
                         html += `<div style="background: #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px; border-left: 3px solid ${sevColor};">`;
-                        html += `<div style="margin-bottom: 5px;"><span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> <span style="color: #888;">${issue.category}</span></div>`;
-                        html += `<div style="color: #ddd; margin-bottom: 5px;">${issue.message}</div>`;
+                        html += `<div style="margin-bottom: 5px;"><span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> <span style="color: #888;">${escapeHtml(issue.category)}</span></div>`;
+                        html += `<div style="color: #ddd; margin-bottom: 5px;">${escapeHtml(issue.message)}</div>`;
                         if (issue.devices && issue.devices.length > 0) {
-                            html += `<div style="color: #4fc3f7; font-size: 12px;">Devices: ${issue.devices.join(', ')}</div>`;
+                            html += `<div style="color: #4fc3f7; font-size: 12px;">Devices: ${escapeHtml(issue.devices.join(', '))}</div>`;
                         }
                         if (issue.suggestion) {
-                            html += `<div style="color: #999; margin-top: 5px; font-style: italic;">→ ${issue.suggestion}</div>`;
+                            html += `<div style="color: #999; margin-top: 5px; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
                         }
                         if (issue.details && issue.details.length > 0) {
-                            html += `<div style="color: #888; margin-top: 5px; font-size: 12px;">${issue.details.join('<br>')}</div>`;
+                            html += `<div style="color: #888; margin-top: 5px; font-size: 12px;">${issue.details.map(escapeHtml).join('<br>')}</div>`;
                         }
                         html += '</div>';
                     });
@@ -2595,7 +2629,7 @@
             // Show confirmation modal
             showConfirm(
                 'Git Reset',
-                `Are you sure you want to reset <strong>${host}.yaml</strong> to the last commit?<br><br>All uncommitted changes will be lost!`,
+                `Are you sure you want to reset <strong>${escapeHtml(host)}.yaml</strong> to the last commit?<br><br>This only reverts this device's host_vars file. Uncommitted changes to shared group_vars files (VLAN / VRF / port &amp; BGP profile definitions) are NOT affected.`,
                 async () => {
                     showLoading(true, `Resetting ${host}.yaml...`);
                     setStatus('Resetting...');
@@ -2606,7 +2640,7 @@
                         const data = await result.json();
                         
                         if (data.success) {
-                            showOutputModal('Success', `<div style="color: #76b900; font-size: 16px;">✓ ${host}.yaml has been reset to last commit</div>`, 'success', true);
+                            showOutputModal('Success', `<div style="color: #76b900; font-size: 16px;">✓ ${escapeHtml(host)}.yaml has been reset to last commit</div>`, 'success', true);
                             // Reload device config to reflect changes
                             if (selectedDevice === host) {
                                 selectDevice(host);
@@ -2954,8 +2988,8 @@
                             return `
                                 <div class="vlan-edit-item">
                                     <div class="vlan-edit-info">
-                                        <span class="vlan-name">${v}</span>
-                                        <span class="vlan-info">VLAN ${vlanId}${desc ? ' - ' + desc : ''}</span>
+                                        <span class="vlan-name">${escapeHtml(v)}</span>
+                                        <span class="vlan-info">VLAN ${escapeHtml(vlanId)}${desc ? ' - ' + escapeHtml(desc) : ''}</span>
                                     </div>
                                     <div class="vlan-edit-actions">
                                         <button class="btn-icon btn-icon-edit" onclick="editVlan('${v}')" title="Edit">
@@ -3227,38 +3261,45 @@
             }
         }
         
-        function confirmDeleteVlan(profileName) {
+        async function confirmDeleteVlan(profileName) {
             const modal = document.getElementById('delete-confirm-modal');
             document.getElementById('delete-vlan-name').textContent = profileName;
             modal.dataset.profileName = profileName;
-            
-            // Find all devices using this VLAN
-            const affectedDevices = [];
-            for (const [deviceName, deviceData] of Object.entries(devices)) {
-                if (deviceData.config && deviceData.config.vlan_templates) {
-                    if (deviceData.config.vlan_templates.includes(profileName)) {
-                        affectedDevices.push(deviceName);
-                    }
-                }
-            }
-            
-            // Update affected devices list
+
             const affectedList = document.getElementById('affected-devices-list');
+            affectedList.innerHTML = `<div style="color: #888;">Checking device usage...</div>`;
+            modal.classList.add('visible');
+
+            // Find all devices using this VLAN via the per-host vlan report
+            let affectedDevices = [];
+            try {
+                const response = await fetch('/fabric-api.sh?action=get-vlan-report');
+                const data = await response.json();
+                if (data.success && data.vlan_device_map) {
+                    affectedDevices = data.vlan_device_map[profileName] || [];
+                }
+            } catch (e) {
+                affectedList.innerHTML = `<div style="color: #888;">Unable to determine device usage.</div>`;
+                return;
+            }
+
+            // Ignore stale response if a different profile was opened meanwhile
+            if (modal.dataset.profileName !== profileName) return;
+
+            // Update affected devices list
             if (affectedDevices.length > 0) {
                 affectedList.innerHTML = `
                     <div style="color: #ff6b6b; font-weight: bold; margin-bottom: 8px;">
                         ⚠️ This VLAN is used by ${affectedDevices.length} device(s):
                     </div>
                     <div style="display: flex; flex-wrap: wrap; gap: 5px; justify-content: center;">
-                        ${affectedDevices.slice(0, 10).map(d => `<span class="badge badge-orange">${d}</span>`).join('')}
+                        ${affectedDevices.slice(0, 10).map(d => `<span class="badge badge-orange">${escapeHtml(d)}</span>`).join('')}
                         ${affectedDevices.length > 10 ? `<span class="badge badge-gray">+${affectedDevices.length - 10} more</span>` : ''}
                     </div>
                 `;
             } else {
                 affectedList.innerHTML = `<div style="color: #888;">No devices are currently using this VLAN.</div>`;
             }
-            
-            modal.classList.add('visible');
         }
         
         function closeDeleteModal() {
@@ -3275,9 +3316,8 @@
             const listContainer = document.getElementById('assign-vlan-list');
             
             // Get current device's assigned VLANs
-            const deviceData = devices[selectedDevice];
-            const assignedVlans = deviceData?.config?.vlan_templates || [];
-            
+            const assignedVlans = currentDeviceConfig?.vlan_templates || [];
+
             // Get all available VLANs from vlan_profiles
             const allVlans = Object.keys(vlanProfiles);
             
@@ -3293,7 +3333,7 @@
                 `;
             } else {
                 listContainer.innerHTML = `
-                    <div style="margin-bottom: 10px; color: #ccc;">Select VLANs to assign to <strong style="color: #76b900;">${selectedDevice}</strong>:</div>
+                    <div style="margin-bottom: 10px; color: #ccc;">Select VLANs to assign to <strong style="color: #76b900;">${escapeHtml(selectedDevice)}</strong>:</div>
                     <div class="vlan-checkbox-list">
                         ${availableVlans.map(v => {
                             const vp = vlanProfiles[v];
@@ -3301,10 +3341,10 @@
                             const desc = vp?.description || '';
                             return `
                                 <label class="vlan-checkbox-item">
-                                    <input type="checkbox" name="assign-vlan" value="${v}">
+                                    <input type="checkbox" name="assign-vlan" value="${escapeHtml(v)}">
                                     <span class="vlan-checkbox-label">
-                                        <span class="vlan-name">${v}</span>
-                                        <span class="vlan-info">VLAN ${vlanId}${desc ? ' - ' + desc : ''}</span>
+                                        <span class="vlan-name">${escapeHtml(v)}</span>
+                                        <span class="vlan-info">VLAN ${escapeHtml(vlanId)}${desc ? ' - ' + escapeHtml(desc) : ''}</span>
                                     </span>
                                 </label>
                             `;
@@ -3968,15 +4008,15 @@
                     <div class="vlan-checkbox-list">
                         ${availableVrfs.map(v => `
                             <label class="vlan-checkbox-item">
-                                <input type="checkbox" value="${v.name}" data-l3vni="${v.l3vni || ''}" data-vxlan-int="${v.vxlan_int || ''}">
-                                <span class="vlan-name">${v.name}</span>
-                                <span class="vlan-info">${v.l3vni ? 'L3VNI: ' + v.l3vni : ''}</span>
+                                <input type="checkbox" value="${escapeHtml(v.name)}" data-l3vni="${escapeHtml(v.l3vni || '')}" data-vxlan-int="${escapeHtml(v.vxlan_int || '')}">
+                                <span class="vlan-name">${escapeHtml(v.name)}</span>
+                                <span class="vlan-info">${v.l3vni ? 'L3VNI: ' + escapeHtml(v.l3vni) : ''}</span>
                             </label>
                         `).join('')}
                     </div>
                 `;
             } catch (e) {
-                listDiv.innerHTML = `<div style="color: #ff6b6b;">Error: ${e.message}</div>`;
+                listDiv.innerHTML = `<div style="color: #ff6b6b;">Error: ${escapeHtml(e.message)}</div>`;
             }
         }
         
@@ -4120,8 +4160,8 @@
                     ${deviceVrfs.map(v => `
                         <div class="vlan-edit-item">
                             <div class="vlan-edit-info">
-                                <span class="vlan-name">${v.name}</span>
-                                <span class="vlan-info">L3VNI: ${v.l3vni}</span>
+                                <span class="vlan-name">${escapeHtml(v.name)}</span>
+                                <span class="vlan-info">L3VNI: ${escapeHtml(v.l3vni)}</span>
                             </div>
                             <div class="vlan-edit-actions">
                                 <button class="btn-icon btn-icon-delete" onclick="closeEditVrfModal(); confirmUnassignVrf('${v.name}')" title="Remove from device">
@@ -4165,7 +4205,7 @@
                     if (vrfInfo && vrfInfo.devices && vrfInfo.devices.length > 0) {
                         devicesHtml = `<div style="color: #888; font-size: 13px; margin-bottom: 8px;">Affected devices (${vrfInfo.devices.length}):</div>`;
                         devicesHtml += `<div style="background: #1a1a1a; padding: 10px; border-radius: 4px; font-size: 12px; color: #4fc3f7;">`;
-                        devicesHtml += vrfInfo.devices.join(', ');
+                        devicesHtml += escapeHtml(vrfInfo.devices.join(', '));
                         devicesHtml += `</div>`;
                     } else {
                         devicesHtml = '<div style="color: #888; font-size: 13px;">No devices are currently using this VRF.</div>';
@@ -4285,13 +4325,15 @@
                 if (result.success) {
                     closeCreateBondModal();
                     await selectDevice(selectedDevice);
-                    showOutputModal('Bond Created', 
-                        `<div style="color: #76b900; margin-bottom: 15px;">✓ Bond ${bondName} created successfully</div>` +
+                    showOutputModal('Bond Created',
+                        `<div style="color: #76b900; margin-bottom: 15px;">✓ Bond ${escapeHtml(bondName)} created successfully</div>` +
                         `<div style="color: #888;">Run <strong>Deploy</strong> to apply changes. Then assign interfaces as bond members.</div>`,
                         'success', true);
                 } else {
-                    showAlert('Error: ' + (result.error || 'Failed to create bond'));
+                    showAlert('Error: ' + escapeHtml(result.error || 'Failed to create bond'));
                 }
+            } catch (e) {
+                showAlert('Error: ' + escapeHtml(e.message));
             } finally {
                 saveBtn.disabled = false;
                 saveBtn.textContent = 'Create Bond';
@@ -4679,7 +4721,29 @@
                 data.previous_bond = currentInterfaceBond;
             } else if (ifType === 'bond') {
                 data.profile = document.getElementById('interface-edit-profile').value;
-                data.bond_members = document.getElementById('interface-edit-members').value.split(',').map(s => s.trim()).filter(Boolean);
+                // Dedup members and validate names + cross-bond enslavement (aligns with backend)
+                const rawMembers = document.getElementById('interface-edit-members').value.split(',').map(s => s.trim()).filter(Boolean);
+                const members = [...new Set(rawMembers)];
+                const namePattern = /^[A-Za-z0-9_.-]+$/;
+                for (const m of members) {
+                    if (!namePattern.test(m)) {
+                        showAlert('Invalid bond member name: ' + escapeHtml(m));
+                        return;
+                    }
+                }
+                if (currentDeviceConfig && currentDeviceConfig.bonds) {
+                    for (const [otherBond, otherCfg] of Object.entries(currentDeviceConfig.bonds)) {
+                        if (otherBond === ifName) continue;
+                        const otherMembers = (otherCfg && otherCfg.bond_members) || [];
+                        for (const m of members) {
+                            if (otherMembers.includes(m)) {
+                                showAlert(`Interface ${escapeHtml(m)} is already a member of bond ${escapeHtml(otherBond)}`);
+                                return;
+                            }
+                        }
+                    }
+                }
+                data.bond_members = members;
                 data.evpn_mh_id = document.getElementById('interface-edit-mh-id').value;
                 data.bond_mode = document.getElementById('interface-edit-bond-mode').checked ? 'active' : '';
                 data.lacp_bypass = document.getElementById('interface-edit-lacp-bypass').checked;
@@ -4701,15 +4765,15 @@
                 if (result.success) {
                     closeInterfaceEditModal();
                     await selectDevice(selectedDevice);
-                    showOutputModal('Interface Updated', 
-                        `<div style="color: #76b900; margin-bottom: 15px;">✓ ${ifType === 'bond' ? 'Bond' : 'Interface'} ${ifName} updated successfully</div>` +
+                    showOutputModal('Interface Updated',
+                        `<div style="color: #76b900; margin-bottom: 15px;">✓ ${ifType === 'bond' ? 'Bond' : 'Interface'} ${escapeHtml(ifName)} updated successfully</div>` +
                         `<div style="color: #888;">Run <strong>Deploy</strong> to apply changes.</div>`,
                         'success', true);
                 } else {
-                    showAlert('Error: ' + (result.error || 'Unknown error'));
+                    showAlert('Error: ' + escapeHtml(result.error || 'Unknown error'));
                 }
             } catch (e) {
-                showAlert('Error: ' + e.message);
+                showAlert('Error: ' + escapeHtml(e.message));
             }
             
             saveBtn.disabled = false;

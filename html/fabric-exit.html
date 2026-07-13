@@ -597,7 +597,7 @@
             <div class="modal-footer">
                 <button class="btn" style="background: #c62828; color: white; margin-right: auto;" onclick="deletePeer()">Delete Peer</button>
                 <button class="btn btn-secondary" onclick="closeModal('edit-peer-modal')">Cancel</button>
-                <button class="btn btn-primary" onclick="savePeerEdit()">Save Changes</button>
+                <button class="btn btn-primary" id="edit-save-btn" onclick="savePeerEdit()">Save Changes</button>
             </div>
         </div>
     </div>
@@ -681,7 +681,7 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="closeModal('add-peer-modal')">Cancel</button>
-                <button class="btn btn-primary" onclick="saveNewPeer()">Add Peer</button>
+                <button class="btn btn-primary" id="add-save-btn" onclick="saveNewPeer()">Add Peer</button>
             </div>
         </div>
     </div>
@@ -725,7 +725,7 @@
             </div>
             <div class="modal-footer" style="justify-content: center; gap: 15px;">
                 <button class="btn btn-secondary" onclick="closeModal('delete-peer-modal')">Cancel</button>
-                <button class="btn" style="background: #c62828; color: white;" onclick="confirmDeletePeer()">Delete Peer</button>
+                <button class="btn" style="background: #c62828; color: white;" id="delete-confirm-btn" onclick="confirmDeletePeer()">Delete Peer</button>
             </div>
         </div>
     </div>
@@ -738,7 +738,57 @@
         let allLeafDevices = [];  // All leaf devices for Add Peer
         let bgpProfiles = {};
         let currentDeviceConfig = null;  // Current device config for Add Peer
-        
+        let currentFilteredPeers = [];  // Peers currently rendered in the table (for delegated edit)
+
+        // Escape any server/user string before injecting into innerHTML
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Client-side IP / prefix validation (aligns with backend normalization)
+        function isValidIPv4(ip) {
+            if (typeof ip !== 'string') return false;
+            const parts = ip.split('.');
+            if (parts.length !== 4) return false;
+            return parts.every(p => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+        }
+        function isValidIPv6(ip) {
+            return typeof ip === 'string' && ip.includes(':') && /^[0-9a-fA-F:]+$/.test(ip);
+        }
+        function isValidIp(ip) {
+            return isValidIPv4(ip) || isValidIPv6(ip);
+        }
+        function validateRemotePeer(val) {
+            val = (val || '').trim();
+            if (!val) return { ok: false, error: 'Remote Peer IP is required' };
+            if (val.includes('/')) return { ok: false, error: 'Remote Peer must be a bare IP (no prefix)' };
+            if (!isValidIp(val)) return { ok: false, error: 'Remote Peer is not a valid IP address' };
+            return { ok: true, value: val };
+        }
+        function normalizeLocalIp(val) {
+            val = (val || '').trim();
+            if (!val) return { ok: false, error: 'Local IP is required' };
+            let ip = val, prefix = null;
+            if (val.includes('/')) {
+                const parts = val.split('/');
+                if (parts.length !== 2) return { ok: false, error: 'Invalid Local IP/prefix' };
+                ip = parts[0];
+                prefix = parts[1];
+                if (!/^\d+$/.test(prefix)) return { ok: false, error: 'Invalid prefix in Local IP' };
+                const max = isValidIPv6(ip) ? 128 : 32;
+                if (Number(prefix) < 0 || Number(prefix) > max) return { ok: false, error: 'Invalid prefix in Local IP' };
+            }
+            if (!isValidIp(ip)) return { ok: false, error: 'Local IP is not a valid IP address' };
+            if (prefix === null) prefix = '31';
+            return { ok: true, value: `${ip}/${prefix}` };
+        }
+
         // Show result modal (success/error)
         function showResult(success, title, message, details = '') {
             const modal = document.getElementById('result-modal');
@@ -787,7 +837,17 @@
         }
         
         // Initialize
-        document.addEventListener('DOMContentLoaded', loadExternalPeers);
+        document.addEventListener('DOMContentLoaded', function() {
+            document.getElementById('peers-table').addEventListener('click', function(e) {
+                const btn = e.target.closest('.btn-edit');
+                if (!btn) return;
+                const idx = parseInt(btn.dataset.peerIndex, 10);
+                if (!isNaN(idx) && currentFilteredPeers[idx]) {
+                    openEditModal(currentFilteredPeers[idx]);
+                }
+            });
+            loadExternalPeers();
+        });
         
         async function loadExternalPeers() {
             try {
@@ -836,28 +896,28 @@
             const deviceSelect = document.getElementById('filter-device');
             const uniqueDevices = [...new Set(allPeers.map(p => p.device))].sort();
             uniqueDevices.forEach(d => {
-                deviceSelect.innerHTML += `<option value="${d}">${d}</option>`;
+                deviceSelect.innerHTML += `<option value="${escapeHtml(d)}">${escapeHtml(d)}</option>`;
             });
-            
+
             // VRFs
             const vrfSelect = document.getElementById('filter-vrf');
             const uniqueVrfs = [...new Set(allPeers.map(p => p.vrf))].sort();
             uniqueVrfs.forEach(v => {
-                vrfSelect.innerHTML += `<option value="${v}">${v}</option>`;
+                vrfSelect.innerHTML += `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`;
             });
-            
+
             // Profiles
             const profileSelect = document.getElementById('filter-profile');
             const uniqueProfiles = [...new Set(allPeers.map(p => p.bgp_profile))].sort();
             uniqueProfiles.forEach(p => {
-                profileSelect.innerHTML += `<option value="${p}">${p}</option>`;
+                profileSelect.innerHTML += `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`;
             });
-            
+
             // Add device dropdown
             const addDeviceSelect = document.getElementById('add-device');
             allDevices.forEach(d => {
                 const hostname = d.hostname || d;
-                addDeviceSelect.innerHTML += `<option value="${hostname}">${hostname}</option>`;
+                addDeviceSelect.innerHTML += `<option value="${escapeHtml(hostname)}">${escapeHtml(hostname)}</option>`;
             });
         }
         
@@ -886,7 +946,8 @@
         function renderTable() {
             const tbody = document.getElementById('peers-table');
             const filtered = getFilteredPeers();
-            
+            currentFilteredPeers = filtered;
+
             if (filtered.length === 0) {
                 tbody.innerHTML = `
                     <tr>
@@ -904,22 +965,22 @@
                 return;
             }
             
-            tbody.innerHTML = filtered.map(peer => `
+            tbody.innerHTML = filtered.map((peer, i) => `
                 <tr>
-                    <td class="device-name">${peer.device}</td>
-                    <td><span class="vrf-badge ${getVrfBadgeClass(peer.vrf)}">${peer.vrf}</span></td>
-                    <td class="profile-name">${peer.bgp_profile}</td>
-                    <td class="interface-name">${peer.interface || '-'}</td>
-                    <td class="ip-address">${peer.local_ip || '-'}</td>
-                    <td class="ip-address">${peer.remote_peer}</td>
+                    <td class="device-name">${escapeHtml(peer.device)}</td>
+                    <td><span class="vrf-badge ${getVrfBadgeClass(peer.vrf)}">${escapeHtml(peer.vrf)}</span></td>
+                    <td class="profile-name">${escapeHtml(peer.bgp_profile)}</td>
+                    <td class="interface-name">${escapeHtml(peer.interface || '-')}</td>
+                    <td class="ip-address">${escapeHtml(peer.local_ip || '-')}</td>
+                    <td class="ip-address">${escapeHtml(peer.remote_peer)}</td>
                     <td style="text-align: center;">
-                        ${peer.weight ? `<span class="vrf-badge badge-cyan">${peer.weight}</span>` : '-'}
+                        ${peer.weight ? `<span class="vrf-badge badge-cyan">${escapeHtml(peer.weight)}</span>` : '-'}
                     </td>
                     <td>
-                        ${peer.policy_name ? `<span class="vrf-badge badge-purple">${peer.policy_name}</span>` : '-'}
+                        ${peer.policy_name ? `<span class="vrf-badge badge-purple">${escapeHtml(peer.policy_name)}</span>` : '-'}
                     </td>
                     <td>
-                        ${peer.policy_direction ? `<span class="vrf-badge badge-orange">${peer.policy_direction}</span>` : '-'}
+                        ${peer.policy_direction ? `<span class="vrf-badge badge-orange">${escapeHtml(peer.policy_direction)}</span>` : '-'}
                     </td>
                     <td style="text-align: center;">
                         <span class="bfd-status ${peer.soft_reconfiguration ? 'bfd-enabled' : 'bfd-disabled'}">
@@ -932,7 +993,7 @@
                         </span>
                     </td>
                     <td style="text-align: right;">
-                        <button class="btn-edit" onclick="openEditModal('${encodeURIComponent(JSON.stringify(peer))}')">Edit</button>
+                        <button class="btn-edit" data-peer-index="${i}">Edit</button>
                     </td>
                 </tr>
             `).join('');
@@ -945,7 +1006,7 @@
                     <td colspan="12">
                         <div class="empty-state" style="color: #f44336;">
                             <h3>Error</h3>
-                            <p>${message}</p>
+                            <p>${escapeHtml(message)}</p>
                         </div>
                     </td>
                 </tr>
@@ -959,9 +1020,7 @@
         
         let originalBfdValue = false;
         
-        function openEditModal(peerJson) {
-            const peer = JSON.parse(decodeURIComponent(peerJson));
-            
+        function openEditModal(peer) {
             document.getElementById('edit-original-device').value = peer.device;
             document.getElementById('edit-original-vrf').value = peer.vrf;
             document.getElementById('edit-original-peer').value = peer.remote_peer;
@@ -997,7 +1056,7 @@
             
             // TODO: Populate interface dropdown
             const interfaceSelect = document.getElementById('edit-interface');
-            interfaceSelect.innerHTML = `<option value="${peer.interface}">${peer.interface}</option>`;
+            interfaceSelect.innerHTML = `<option value="${escapeHtml(peer.interface)}">${escapeHtml(peer.interface)}</option>`;
             
             document.getElementById('edit-peer-modal').classList.add('visible');
         }
@@ -1042,7 +1101,7 @@
             
             for (const device of allLeafDevices) {
                 const lastOctet = device.ip ? device.ip.split('.').pop() : '';
-                deviceSelect.innerHTML += `<option value="${device.hostname}" data-ip="${device.ip}">${device.hostname}</option>`;
+                deviceSelect.innerHTML += `<option value="${escapeHtml(device.hostname)}" data-ip="${escapeHtml(device.ip)}">${escapeHtml(device.hostname)}</option>`;
             }
             
             document.getElementById('add-peer-modal').classList.add('visible');
@@ -1068,7 +1127,7 @@
                         if (vrfName !== 'default' && vrfName !== 'mgmt' && vrfName !== 'oob') {
                             const profileName = vrfConfig.bgp?.bgp_profile || '';
                             const hasExternal = bgpProfiles[profileName]?.has_external || false;
-                            vrfSelect.innerHTML += `<option value="${vrfName}" data-profile="${profileName}" data-has-external="${hasExternal}">${vrfName}</option>`;
+                            vrfSelect.innerHTML += `<option value="${escapeHtml(vrfName)}" data-profile="${escapeHtml(profileName)}" data-has-external="${hasExternal}">${escapeHtml(vrfName)}</option>`;
                         }
                     }
                     
@@ -1116,29 +1175,41 @@
             const weightVal = document.getElementById('edit-weight').value;
             const policyName = document.getElementById('edit-policy-name').value.trim();
             const policyDirection = document.getElementById('edit-policy-direction').value;
+
+            const rp = validateRemotePeer(document.getElementById('edit-remote-peer').value);
+            if (!rp.ok) { showResult(false, 'Invalid Input', rp.error); return; }
+            let localIpVal = document.getElementById('edit-local-ip').value.trim();
+            if (localIpVal) {
+                const li = normalizeLocalIp(localIpVal);
+                if (!li.ok) { showResult(false, 'Invalid Input', li.error); return; }
+                localIpVal = li.value;
+            }
+
             const data = {
                 device: document.getElementById('edit-original-device').value,
                 vrf: document.getElementById('edit-original-vrf').value,
                 original_peer: document.getElementById('edit-original-peer').value,
                 interface: document.getElementById('edit-interface').value,
-                local_ip: document.getElementById('edit-local-ip').value,
-                remote_peer: document.getElementById('edit-remote-peer').value,
+                local_ip: localIpVal,
+                remote_peer: rp.value,
                 weight: (weightToggle && weightVal) ? parseInt(weightVal) : null,
                 policy_name: (policyToggle && policyName) ? policyName : null,
                 policy_direction: (policyToggle && policyDirection) ? policyDirection : null,
                 soft_reconfiguration: softReconfig,
                 bfd_enabled: document.getElementById('edit-bfd').value === 'true'
             };
-            
+
+            const saveBtn = document.getElementById('edit-save-btn');
+            saveBtn.disabled = true;
             try {
                 const response = await fetch('/fabric-api.sh?action=update-external-peer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     closeModal('edit-peer-modal');
                     loadExternalPeers();
@@ -1148,6 +1219,8 @@
                 }
             } catch (e) {
                 showResult(false, 'Error', e.message);
+            } finally {
+                saveBtn.disabled = false;
             }
         }
         
@@ -1172,16 +1245,18 @@
         
         async function confirmDeletePeer() {
             if (!pendingDeletePeer) return;
-            
+
+            const deleteBtn = document.getElementById('delete-confirm-btn');
+            deleteBtn.disabled = true;
             try {
                 const response = await fetch('/fabric-api.sh?action=delete-external-peer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(pendingDeletePeer)
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     closeModal('delete-peer-modal');
                     pendingDeletePeer = null;
@@ -1192,6 +1267,8 @@
                 }
             } catch (e) {
                 showResult(false, 'Error', e.message);
+            } finally {
+                deleteBtn.disabled = false;
             }
         }
         
@@ -1207,7 +1284,17 @@
                 showResult(false, 'Missing Fields', 'Please fill all required fields');
                 return;
             }
-            
+
+            const vlanNum = parseInt(vlanId, 10);
+            if (!Number.isInteger(vlanNum) || vlanNum < 1 || vlanNum > 4094) {
+                showResult(false, 'Invalid VLAN', 'VLAN ID must be between 1 and 4094');
+                return;
+            }
+            const rp = validateRemotePeer(remotePeer);
+            if (!rp.ok) { showResult(false, 'Invalid Input', rp.error); return; }
+            const li = normalizeLocalIp(localIp);
+            if (!li.ok) { showResult(false, 'Invalid Input', li.error); return; }
+
             // Check if we need to create OVERLAY_BORDER_XX profile
             const vrfSelect = document.getElementById('add-vrf');
             const selectedOption = vrfSelect.options[vrfSelect.selectedIndex];
@@ -1228,10 +1315,10 @@
             const data = {
                 device,
                 vrf,
-                interface: `${parentInterface}.${vlanId}`,
-                vlan_id: vlanId,
-                local_ip: localIp,
-                remote_peer: remotePeer,
+                interface: `${parentInterface}.${vlanNum}`,
+                vlan_id: vlanNum,
+                local_ip: li.value,
+                remote_peer: rp.value,
                 weight: (weightToggle && weightVal) ? parseInt(weightVal) : null,
                 policy_name: (policyToggle && policyName) ? policyName : null,
                 policy_direction: (policyToggle && policyDirection) ? policyDirection : null,
@@ -1239,16 +1326,18 @@
                 create_border_profile: !hasExternal,
                 border_profile_suffix: lastOctet
             };
-            
+
+            const saveBtn = document.getElementById('add-save-btn');
+            saveBtn.disabled = true;
             try {
                 const response = await fetch('/fabric-api.sh?action=add-external-peer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(data)
                 });
-                
+
                 const result = await response.json();
-                
+
                 if (result.success) {
                     closeModal('add-peer-modal');
                     loadExternalPeers();
@@ -1259,6 +1348,8 @@
                 }
             } catch (e) {
                 showResult(false, 'Error', e.message);
+            } finally {
+                saveBtn.disabled = false;
             }
         }
     </script>

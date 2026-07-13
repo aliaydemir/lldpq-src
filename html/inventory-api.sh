@@ -44,16 +44,22 @@ TOPOLOGY_CONFIG_FILE="$WEB_ROOT/topology_config.yaml"
 DEVICES_FILE="$LLDPQ_DIR/devices.yaml"
 INVENTORY_LOCK="$WEB_ROOT/.inventory.lock"
 
-# Auth: admin only, identical session guard to the rest of the appliance.
+# Auth: identical session guard to the rest of the appliance. The read-only
+# active-design fetch is available to any logged-in user (operators need it
+# when the published static copy is missing); every other action stays admin.
 source "$(dirname "$0")/auth-guard.sh"
-require_admin
+ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
+if [[ "$ACTION" == "active-design" ]]; then
+    require_auth
+else
+    require_admin
+fi
 
 echo "Content-Type: application/json"
 echo "Cache-Control: no-store"
 echo "X-Content-Type-Options: nosniff"
 echo ""
 
-ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 KIND=$(echo "$QUERY_STRING"   | grep -oP 'kind=\K[^&]*'   | head -1)
 QS_VERSION=$(echo "$QUERY_STRING" | grep -oP 'version=\K[^&]*' | head -1)
 QS_MODE=$(echo "$QUERY_STRING"    | grep -oP 'mode=\K[^&]*'    | head -1)

@@ -867,10 +867,28 @@
         let devices = {};
         let totalDeviceCount = 0;
         let modifiedDevices = new Set();
-        
+
         // Cache configuration
         const CACHE_KEY = 'fabricDeploy_scanCache';
         const CACHE_STALE_THRESHOLD = 60 * 60 * 1000; // 1 hour in ms
+
+        // Active background deploy job (survives tab close / reload)
+        const DEPLOY_JOB_KEY = 'fabricDeploy_activeJob';
+        const DEPLOY_POLL_INTERVAL = 2000;
+
+        function escapeHtml(value) {
+            if (value === null || value === undefined) return '';
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
         
         // Auto-scan configuration (git status check, not Fabric Scan)
         const AUTO_SCAN_INTERVAL = 1 * 60 * 1000;  // 1 minute - check git status periodically
@@ -880,9 +898,33 @@
         
         // Load devices on page load
         document.addEventListener('DOMContentLoaded', () => {
+            initDeviceListEvents();
             loadDevices();
             initAutoScan();
+            resumeDeployJob();
         });
+
+        // Delegated event handling for the device list (identifiers live in data-* attrs)
+        function initDeviceListEvents() {
+            const container = document.getElementById('device-list');
+            if (!container) return;
+            container.addEventListener('click', (e) => {
+                if (e.target.matches('input[type="checkbox"]')) return;
+                const header = e.target.closest('.group-header');
+                if (header && header.dataset.groupId) {
+                    toggleGroup(header.dataset.groupId);
+                }
+            });
+            container.addEventListener('change', (e) => {
+                const cb = e.target;
+                if (cb.matches('input.group-checkbox')) {
+                    toggleGroupDevices(cb.dataset.groupId);
+                } else if (cb.matches('input[name="device"]')) {
+                    syncDeviceCheckboxes(cb.dataset.hostname, cb.checked);
+                    updateCounts();
+                }
+            });
+        }
         
         // Initialize auto-scan system
         function initAutoScan() {
@@ -947,9 +989,16 @@
                     
                     // Update UI if changes detected
                     if (hasChanges) {
+                        // Snapshot user state before innerHTML is rebuilt, re-apply after
+                        const checkedSnapshot = getSelectedDevices();
+                        const searchInput = document.getElementById('device-search');
+                        const searchQuery = searchInput ? searchInput.value : '';
                         renderDeviceList();
+                        checkedSnapshot.forEach(hostname => syncDeviceCheckboxes(hostname, true));
+                        if (searchQuery) filterDevices(searchQuery);
+                        updateCounts();
                         updateSummaryCards();
-                        
+
                         // Flash the pending count to draw attention if new changes
                         if (newPendingDevices.size > previousCount) {
                             const pendingEl = document.getElementById('pending-changes');
@@ -974,10 +1023,14 @@
                 if (devicesData.success && devicesData.devices) {
                     devices = devicesData.devices;
                 }
-                
+
+                // Apply last scan result (nightly cron / local cache) for instant paint + age
+                const hadCache = await applyScanCache();
+
                 renderDeviceList();
-                updateLastUpdated();
-                
+                updateSummaryCards();
+                if (!hadCache) updateLastUpdated();
+
                 // Run git status to detect uncommitted changes in Ansible source
                 // This is fast (seconds) so no caching needed - always fresh data
                 await quickGitScan();
@@ -1013,6 +1066,23 @@
             return null;
         }
         
+        // Apply the most recent scan result (server cron cache preferred, then local cache).
+        // Provides an instant view that survives reload and shows the "last scan" age.
+        async function applyScanCache() {
+            let cache = await loadServerCache();
+            if (!cache) cache = loadScanCache();
+            if (!cache || !Array.isArray(cache.pendingDevices)) return false;
+
+            modifiedDevices = new Set(cache.pendingDevices);
+            if (cache.timestamp) {
+                showScanAge(cache.timestamp);
+                if (Date.now() - cache.timestamp > CACHE_STALE_THRESHOLD) {
+                    showStaleWarning();
+                }
+            }
+            return true;
+        }
+
         // Load server-side cache from cron job
         async function loadServerCache() {
             try {
@@ -1206,27 +1276,27 @@
                 
                 html += `
                     <div class="device-group">
-                        <div class="group-header" onclick="toggleGroup('${groupId}')">
-                            <input type="checkbox" id="group-${groupId}" onclick="event.stopPropagation(); toggleGroupDevices('${groupId}')" onchange="updateCounts()">
-                            <span class="group-name">${group}</span>
+                        <div class="group-header" data-group-id="${groupId}">
+                            <input type="checkbox" class="group-checkbox" id="group-${groupId}" data-group-id="${groupId}">
+                            <span class="group-name">${escapeHtml(group)}</span>
                             ${modifiedBadge}
                             <span class="group-count">${groupDevices.length}</span>
                         </div>
                         <div id="devices-${groupId}">
                 `;
-                
+
                 for (const device of groupDevices) {
                     const hostname = device.hostname || device;
                     const ip = device.ansible_host || device.ip || '';
                     const isModified = modifiedDevices.has(hostname);
                     const modifiedClass = isModified ? ' modified' : '';
                     const badge = isModified ? '<span class="modified-badge">modified</span>' : '';
-                    
+
                     html += `
                         <label class="device-item${modifiedClass}">
-                            <input type="checkbox" name="device" value="${hostname}" data-group="${groupId}" onchange="syncDeviceCheckboxes('${hostname}', this.checked); updateCounts()">
-                            <span class="device-name">${hostname}${badge}</span>
-                            <span class="device-ip">${ip}</span>
+                            <input type="checkbox" name="device" value="${escapeHtml(hostname)}" data-group="${groupId}" data-hostname="${escapeHtml(hostname)}">
+                            <span class="device-name">${escapeHtml(hostname)}${badge}</span>
+                            <span class="device-ip">${escapeHtml(ip)}</span>
                         </label>
                     `;
                 }
@@ -1260,7 +1330,7 @@
         
         function toggleGroup(groupId) {
             const devicesDiv = document.getElementById('devices-' + groupId);
-            devicesDiv.style.display = devicesDiv.style.display === 'none' ? 'block' : 'block';
+            devicesDiv.style.display = devicesDiv.style.display === 'none' ? 'block' : 'none';
         }
         
         function toggleGroupDevices(groupId) {
@@ -1527,7 +1597,7 @@
                     const diff = deviceDiffs[device];
                     if (diff.lines.length > 0) {
                         html += `<div style="background: #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px;">`;
-                        html += `<div style="color: #f44336; margin-bottom: 8px; font-weight: bold;">✗ ${diff.header}</div>`;
+                        html += `<div style="color: #f44336; margin-bottom: 8px; font-weight: bold;">✗ ${escapeHtml(diff.header)}</div>`;
                         html += '<div style="background: #1a1a1a; border-radius: 4px; padding: 8px; overflow-x: auto; font-family: monospace; font-size: 12px;">';
                         
                         diff.lines.forEach(line => {
@@ -1746,7 +1816,7 @@
                 showLoading(false);
                 
                 if (!data.success) {
-                    showValidateModal('Validation Error', `<div style="color: #f44336;">${data.error || 'Unknown error'}</div>`, 'error');
+                    showValidateModal('Validation Error', `<div style="color: #f44336;">${escapeHtml(data.error || 'Unknown error')}</div>`, 'error');
                     return;
                 }
                 
@@ -1777,16 +1847,16 @@
                     filesWithIssues.forEach(file => {
                         const filename = file.filename.split('/').pop();
                         html += `<div style="background: #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px;">`;
-                        html += `<div style="color: #4fc3f7; margin-bottom: 8px; font-weight: bold;">${filename}</div>`;
-                        
+                        html += `<div style="color: #4fc3f7; margin-bottom: 8px; font-weight: bold;">${escapeHtml(filename)}</div>`;
+
                         file.issues.forEach(issue => {
                             const sevColor = issue.severity === 'ERROR' ? '#f44336' : issue.severity === 'WARNING' ? '#ff9800' : '#4fc3f7';
                             html += `<div style="margin-left: 10px; margin-bottom: 6px; border-left: 2px solid ${sevColor}; padding-left: 10px;">`;
-                            html += `<span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> `;
-                            html += `<span style="color: #888;">${issue.path}:</span> `;
-                            html += `<span style="color: #ddd;">${issue.message}</span>`;
+                            html += `<span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> `;
+                            html += `<span style="color: #888;">${escapeHtml(issue.path)}:</span> `;
+                            html += `<span style="color: #ddd;">${escapeHtml(issue.message)}</span>`;
                             if (issue.suggestion) {
-                                html += `<div style="color: #999; margin-top: 3px; font-style: italic;">→ ${issue.suggestion}</div>`;
+                                html += `<div style="color: #999; margin-top: 3px; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
                             }
                             html += '</div>';
                         });
@@ -1802,13 +1872,13 @@
                     result.topology.issues.forEach(issue => {
                         const sevColor = issue.severity === 'ERROR' ? '#f44336' : issue.severity === 'WARNING' ? '#ff9800' : '#4fc3f7';
                         html += `<div style="background: #2a2a2a; border-radius: 6px; padding: 12px; margin-bottom: 10px; border-left: 3px solid ${sevColor};">`;
-                        html += `<div style="margin-bottom: 5px;"><span style="color: ${sevColor}; font-weight: bold;">[${issue.severity}]</span> <span style="color: #888;">${issue.category}</span></div>`;
-                        html += `<div style="color: #ddd; margin-bottom: 5px;">${issue.message}</div>`;
+                        html += `<div style="margin-bottom: 5px;"><span style="color: ${sevColor}; font-weight: bold;">[${escapeHtml(issue.severity)}]</span> <span style="color: #888;">${escapeHtml(issue.category)}</span></div>`;
+                        html += `<div style="color: #ddd; margin-bottom: 5px;">${escapeHtml(issue.message)}</div>`;
                         if (issue.devices && issue.devices.length > 0) {
-                            html += `<div style="color: #4fc3f7; font-size: 12px;">Devices: ${issue.devices.join(', ')}</div>`;
+                            html += `<div style="color: #4fc3f7; font-size: 12px;">Devices: ${escapeHtml(issue.devices.join(', '))}</div>`;
                         }
                         if (issue.suggestion) {
-                            html += `<div style="color: #999; margin-top: 5px; font-style: italic;">→ ${issue.suggestion}</div>`;
+                            html += `<div style="color: #999; margin-top: 5px; font-style: italic;">→ ${escapeHtml(issue.suggestion)}</div>`;
                         }
                         html += '</div>';
                     });
@@ -1825,7 +1895,7 @@
                 
             } catch (e) {
                 showLoading(false);
-                showValidateModal('Error', `<div style="color: #f44336;">Failed to run validation: ${e.message}</div>`, 'error');
+                showValidateModal('Error', `<div style="color: #f44336;">Failed to run validation: ${escapeHtml(e.message)}</div>`, 'error');
             }
         }
         
@@ -1923,7 +1993,7 @@
                         // Match: "✗ HOSTNAME: N change(s)" or "HOSTNAME: N changes"
                         // Generic pattern: any alphanumeric hostname followed by ": N change"
                         if (inChangesSection) {
-                            const match = line.match(/([A-Za-z0-9_-]+):\s*\d+\s+change/i);
+                            const match = line.match(/([A-Za-z0-9_.-]+):\s*\d+\s+change/i);
                             if (match) {
                                 const hostname = match[1];
                                 // Skip common non-device names
@@ -1993,48 +2063,191 @@
             updateLastUpdated();
         }
         
+        // Ask the validator whether the generated dir is missing/stale before deploying.
+        // Advisory only (matches the mtime-based backend gate) - returns generate_state or null.
+        async function checkGenerateState(hosts) {
+            try {
+                const response = await fetch(`/edit-config?action=validate&devices=${encodeURIComponent(hosts)}`);
+                const data = await response.json();
+                if (data && data.success) {
+                    return (data.result && data.result.generate_state) || data.generate_state || null;
+                }
+            } catch (e) {
+                console.warn('[checkGenerateState] failed:', e.message);
+            }
+            return null;
+        }
+
+        // Parse the ansible PLAY RECAP and return the set of hosts that finished
+        // with failed=0 AND unreachable=0 (the only ones safe to clear).
+        function parseRecapCleanHosts(output) {
+            const clean = new Set();
+            const cleaned = parseAnsiOutput(output || '');
+            let inRecap = false;
+            for (const line of cleaned.split('\n')) {
+                if (line.includes('PLAY RECAP')) { inRecap = true; continue; }
+                if (!inRecap) continue;
+                const m = line.match(/^\s*(\S+)\s*:\s*(.*(?:ok=|changed=|failed=).*)$/);
+                if (!m) continue;
+                const host = m[1];
+                const stats = m[2];
+                const failedMatch = stats.match(/failed=(\d+)/);
+                const unreachableMatch = stats.match(/unreachable=(\d+)/);
+                if (failedMatch && unreachableMatch &&
+                    parseInt(failedMatch[1], 10) === 0 && parseInt(unreachableMatch[1], 10) === 0) {
+                    clean.add(host);
+                }
+            }
+            return clean;
+        }
+
+        function finalizeDeploy(data, selected, fullOutput) {
+            showLoading(false);
+            const rc = data.exit_code;
+            if (data.success) {
+                appendOutput(`Deployment completed (exit code ${rc}).`, 'success');
+            } else {
+                appendOutput(`Deployment finished with errors (exit code ${rc}).`, 'error');
+                if (data.error) appendOutput(data.error, 'error');
+            }
+
+            // Per-host truth: only clear a badge when the recap proves the host is clean
+            const cleanHosts = parseRecapCleanHosts(fullOutput);
+            for (const hostname of selected) {
+                if (cleanHosts.has(hostname)) modifiedDevices.delete(hostname);
+            }
+            renderDeviceList();
+            updateSummaryCards();
+        }
+
+        // Poll deploy-status until done, streaming the growing log into the output area.
+        async function pollDeployStatus(jobId, selected) {
+            let lastLen = 0;
+            while (true) {
+                let data;
+                try {
+                    const resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
+                    data = await resp.json();
+                } catch (e) {
+                    appendOutput('Error polling deploy status: ' + e.message, 'error');
+                    await sleep(DEPLOY_POLL_INTERVAL);
+                    continue;
+                }
+
+                // Unknown/expired job (not running, not done, no success)
+                if (!data.success && !data.running && !data.done) {
+                    appendOutput(data.error || 'Unknown or expired deploy job', 'error');
+                    localStorage.removeItem(DEPLOY_JOB_KEY);
+                    showLoading(false);
+                    return;
+                }
+
+                const out = data.output || '';
+                if (out.length > lastLen) {
+                    appendFormattedOutput(out.slice(lastLen));
+                    lastLen = out.length;
+                }
+
+                if (data.done) {
+                    localStorage.removeItem(DEPLOY_JOB_KEY);
+                    finalizeDeploy(data, selected, out);
+                    return;
+                }
+
+                await sleep(DEPLOY_POLL_INTERVAL);
+            }
+        }
+
+        // Resume a background deploy after a tab close / reload / nginx timeout.
+        function resumeDeployJob() {
+            let saved = null;
+            try {
+                saved = JSON.parse(localStorage.getItem(DEPLOY_JOB_KEY));
+            } catch (e) {
+                localStorage.removeItem(DEPLOY_JOB_KEY);
+            }
+            if (!saved || !saved.job_id) return;
+
+            const selected = Array.isArray(saved.hosts) ? saved.hosts : [];
+            showLoading(true, 'Resuming deploy...');
+            clearOutput();
+            appendOutput(`=== DEPLOY (resumed): job ${saved.job_id} ===`, 'warning');
+            pollDeployStatus(saved.job_id, selected);
+        }
+
         async function runDeploy() {
             const selected = getSelectedDevices();
             if (selected.length === 0) {
                 showAlert('Please select at least one device', 'warning', 'No Selection');
                 return;
             }
-            
+
             const hosts = selected.join(',');
+
+            // Validate-gate awareness: warn (do not block) if generated configs are missing/stale
+            const genState = await checkGenerateState(hosts);
+            if (genState && genState.needs_generate) {
+                const missing = Array.isArray(genState.missing_devices) ? genState.missing_devices : [];
+                const stale = Array.isArray(genState.stale_devices) ? genState.stale_devices : [];
+                let warnMsg = 'Generated configs look out of date. Run Generate/Validate first for accurate results.\n';
+                if (missing.length > 0) warnMsg += `\nMissing generated config:\n${missing.slice(0, 10).join('\n')}`;
+                if (stale.length > 0) warnMsg += `\nStale generated config:\n${stale.slice(0, 10).join('\n')}`;
+                warnMsg += '\n\nDeploy anyway?';
+                const proceed = await confirmAsync(warnMsg, 'Generate Recommended');
+                if (!proceed) return;
+            }
+
             const confirmMsg = `Are you sure you want to deploy to ${selected.length} device(s)?\n\n` +
                 `Devices:\n${selected.slice(0, 10).join('\n')}` +
                 (selected.length > 10 ? `\n... and ${selected.length - 10} more` : '') +
                 `\n\nThis will apply changes to live network devices!`;
-            
+
             const confirmed = await confirmAsync(confirmMsg, 'Confirm Deploy');
             if (!confirmed) {
                 return;
             }
-            
+
             showLoading(true, `Deploying to ${selected.length} device(s)...`);
             clearOutput();
             appendOutput(`=== DEPLOY: ${selected.length} device(s) ===`, 'warning');
             appendOutput(`Devices: ${hosts}\n`);
-            
+
             try {
                 const result = await ansibleApiCall('deploy', hosts);
-                
+
+                // Lock held by another deploy/diff/generate
+                if (result && result.locked) {
+                    appendOutput(result.error || 'Another operation is in progress. Try again shortly.', 'error');
+                    showLoading(false);
+                    return;
+                }
+
+                // Asynchronous background job (current contract): poll deploy-status
+                if (result && result.started && result.job_id) {
+                    localStorage.setItem(DEPLOY_JOB_KEY, JSON.stringify({ job_id: result.job_id, hosts: selected }));
+                    appendOutput(`Deploy started (job ${result.job_id}). Streaming log...`, 'info');
+                    await pollDeployStatus(result.job_id, selected);
+                    return;
+                }
+
+                // Fallback: backend still returns a synchronous result. Honor rc via
+                // result.success (rc==0 only) and clear badges strictly from the recap.
+                showLoading(false);
+                const output = result.output || '';
                 if (result.success) {
                     appendOutput('Deployment completed!', 'success');
-                    appendFormattedOutput(result.output || '');
-                    
-                    // Clear modified status for deployed devices
-                    for (const hostname of selected) {
-                        modifiedDevices.delete(hostname);
-                    }
-                    renderDeviceList();
-                    updateSummaryCards();
-                    showLoading(false);
                 } else {
                     appendOutput('Deployment failed!', 'error');
-                    appendFormattedOutput(result.error || result.output || 'Unknown error');
-                    showLoading(false);
+                    if (!output) appendFormattedOutput(result.error || 'Unknown error');
                 }
+                if (output) appendFormattedOutput(output);
+
+                const cleanHosts = parseRecapCleanHosts(output);
+                for (const hostname of selected) {
+                    if (cleanHosts.has(hostname)) modifiedDevices.delete(hostname);
+                }
+                renderDeviceList();
+                updateSummaryCards();
             } catch (e) {
                 appendOutput('Error: ' + e.message, 'error');
                 showLoading(false);

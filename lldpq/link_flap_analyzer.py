@@ -614,6 +614,7 @@ class LinkFlapAnalyzer:
         .sortable {{ cursor: pointer; user-select: none; padding-right: 20px; }}
         .sortable:hover {{ background: #3c3c3c; }}
         .sort-arrow {{ font-size: 10px; color: #666; margin-left: 5px; opacity: 0.5; }}
+        .sort-arrow::before {{ content: '▲▼'; }}
         .sortable.asc .sort-arrow::before {{ content: '▲'; color: #76b900; opacity: 1; }}
         .sortable.desc .sort-arrow::before {{ content: '▼'; color: #76b900; opacity: 1; }}
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
@@ -845,16 +846,16 @@ class LinkFlapAnalyzer:
             <table class="flap-table" id="flap-table">
                 <thead>
                 <tr>
-                    <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="1" data-type="port">Interface <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="2" data-type="flap-status">Status <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="3" data-type="number">30s <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="4" data-type="number">1m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="5" data-type="number">5m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="6" data-type="number">1h <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="7" data-type="number">12h <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="8" data-type="number">24h <span class="sort-arrow">▲▼</span></th>
-                    <th class="sortable" data-column="9" data-type="number">Total <span class="info-tooltip" data-tooltip="Cumulative count since last device reboot">ⓘ</span> <span class="sort-arrow">▲▼</span></th>
+                    <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="1" data-type="port">Interface <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="2" data-type="flap-status">Status <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="3" data-type="number">30s <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="4" data-type="number">1m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="5" data-type="number">5m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="6" data-type="number">1h <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="7" data-type="number">12h <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="8" data-type="number">24h <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="9" data-type="number">Total <span class="info-tooltip" data-tooltip="Cumulative count since last device reboot">ⓘ</span> <span class="sort-arrow"></span></th>
                 </tr>
                 </thead>
                 <tbody id="flap-data">

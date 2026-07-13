@@ -128,6 +128,11 @@ def parse_lldp_output(filename, known_device_names=()):
                     if len(parts) >= 2:
                         port_name = parts[0]
                         status = parts[-1].upper()
+                        # Device output is untrusted; anything outside the
+                        # report contract would break the strict aggregate
+                        # parser in the browser for every user.
+                        if status not in ('UP', 'DOWN', 'UNKNOWN', 'N/A'):
+                            status = 'UNKNOWN'
                         port_status[port_name] = status
 
     return neighbors, port_status

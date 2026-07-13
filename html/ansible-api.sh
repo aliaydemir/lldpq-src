@@ -42,6 +42,12 @@ export ANSIBLE_CACHE_PLUGIN_CONNECTION="/tmp/ansible-cache"
 mkdir -p "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 chmod 775 "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 
+# Background deploy job state and single-runner lock for nv config apply
+DEPLOY_STATE_DIR="$ANSIBLE_HOME/deploy-jobs"
+DEPLOY_LOCK="$ANSIBLE_HOME/ansible-apply.lock"
+mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
+chmod 775 "$DEPLOY_STATE_DIR" 2>/dev/null || true
+
 # Fix git directory permissions after git operations
 fix_git_permissions() {
     if [ -d "$ANSIBLE_DIR/.git" ]; then
@@ -80,8 +86,13 @@ validate_path() {
     local realpath=$(realpath -m "$EDITOR_ROOT/$file" 2>/dev/null)
     local editor_realpath=$(realpath "$EDITOR_ROOT" 2>/dev/null)
     
-    # Check if path is within editor root directory
-    if [[ "$realpath" != "$editor_realpath"* ]]; then
+    # Check if path is within editor root directory.
+    # Require exact match OR a child under root+'/' so siblings like
+    # "<root>-backup" cannot pass a bare prefix comparison.
+    if [[ -z "$realpath" ]] || [[ -z "$editor_realpath" ]]; then
+        return 1
+    fi
+    if [[ "$realpath" != "$editor_realpath" ]] && [[ "$realpath" != "$editor_realpath"/* ]]; then
         return 1
     fi
     
@@ -209,37 +220,56 @@ write_file() {
         post_data=$(cat)
     fi
     
-    # Extract content from JSON
-    local content=$(echo "$post_data" | python3 -c '
-import sys, json
+    # Extract the content and write it atomically. The content is written
+    # straight from the parsed JSON to a same-directory temp file (exact bytes,
+    # no echo option/newline mangling) and then mv'd into place.
+    local tmp_file
+    tmp_file=$(mktemp "${full_path}.XXXXXX.tmp" 2>/dev/null) || tmp_file="${full_path}.$$.tmp"
+
+    local write_status
+    write_status=$(echo "$post_data" | TMP_TARGET="$tmp_file" python3 -c '
+import sys, json, os
 try:
     data = json.load(sys.stdin)
-    print(data.get("content", ""))
-except:
-    print("")
-' 2>/dev/null)
-
-    # Check content parameter is present (empty content is a valid save)
-    local has_content=$(echo "$post_data" | python3 -c '
-import sys, json
+except Exception:
+    print("badjson")
+    sys.exit(0)
+if not isinstance(data, dict) or "content" not in data:
+    print("nocontent")
+    sys.exit(0)
+content = data.get("content", "")
+if content is None:
+    content = ""
+elif not isinstance(content, str):
+    content = str(content)
 try:
-    data = json.load(sys.stdin)
-    print("yes" if "content" in data else "no")
-except:
-    print("no")
+    with open(os.environ["TMP_TARGET"], "w", encoding="utf-8") as f:
+        f.write(content)
+except Exception:
+    print("writeerr")
+    sys.exit(0)
+print("ok")
 ' 2>/dev/null)
 
-    if [ "$has_content" != "yes" ]; then
-        json_response '{"success": false, "error": "No content provided"}'
-        return
-    fi
-    
-    # Write new content
-    echo "$content" > "$full_path"
-    
-    if [ $? -eq 0 ]; then
+    case "$write_status" in
+        ok)
+            ;;
+        nocontent|badjson)
+            rm -f "$tmp_file" 2>/dev/null
+            json_response '{"success": false, "error": "No content provided"}'
+            return
+            ;;
+        *)
+            rm -f "$tmp_file" 2>/dev/null
+            json_response '{"success": false, "error": "Failed to write file"}'
+            return
+            ;;
+    esac
+
+    if mv -f "$tmp_file" "$full_path"; then
         json_response '{"success": true, "message": "File saved successfully"}'
     else
+        rm -f "$tmp_file" 2>/dev/null
         json_response '{"success": false, "error": "Failed to write file"}'
     fi
 }
@@ -285,54 +315,122 @@ run_diff() {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
     }
-    
+
+    # Single-runner lock: never run diff while a deploy/generate/diff is applying
+    # config on the same switches. The lock is released when this fd closes.
+    exec 9>"$DEPLOY_LOCK"
+    if ! flock -n 9; then
+        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return
+    fi
+
     # Run diff playbook (include localhost for summary play)
     local output
     output=$(ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/diff_switch_configs.yaml -l "$host,localhost" 2>&1)
     local exit_code=$?
-    
+
     # Escape output for JSON
     local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
-    # Exit codes: 0=success, 2=unreachable (but we continue with ignore_unreachable)
-    # Treat both as success since playbook completes for reachable hosts
-    if [ $exit_code -eq 0 ] || [ $exit_code -eq 2 ]; then
+
+    # Only rc=0 is success. The playbook uses ignore_unreachable, so rc=2 means
+    # real host task failures (rc=4=unreachable is already tolerated internally).
+    if [ $exit_code -eq 0 ]; then
         json_response "{\"success\": true, \"output\": $output_json}"
     else
         json_response "{\"success\": false, \"output\": $output_json, \"error\": \"Diff failed with exit code $exit_code\"}"
     fi
 }
 
-# Run ansible deploy
+# Run ansible deploy as a detached background job. Returns a job_id immediately;
+# the frontend polls action=deploy-status to tail output and read the saved rc.
+# This survives tab close and the nginx read timeout.
 run_deploy() {
     local host="$1"
-    
+
     if [ -z "$host" ]; then
         json_response '{"success": false, "error": "No host specified"}'
         return
     fi
-    
+
     # Sanitize host name
     host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
-    
-    cd "$ANSIBLE_DIR" || {
+
+    if [ ! -d "$ANSIBLE_DIR" ]; then
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
+    fi
+
+    mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
+
+    # Sweep stale job logs (older than 1 day) so state does not grow unbounded.
+    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' \) -mtime +1 -delete 2>/dev/null || true
+
+    # Single-runner lock: acquire it here so a concurrent request gets an
+    # immediate "locked" response. The backgrounded job inherits this fd and
+    # therefore keeps the lock held for its whole lifetime; the lock is released
+    # only when the job exits and its inherited fd closes.
+    exec 9>"$DEPLOY_LOCK"
+    if ! flock -n 9; then
+        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return
+    fi
+
+    local job_id="deploy-$(date +%Y%m%d-%H%M%S)-$$"
+    local log_file="$DEPLOY_STATE_DIR/$job_id.log"
+    local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
+
+    : > "$log_file" 2>/dev/null || {
+        json_response '{"success": false, "error": "Cannot create deploy log"}'
+        return
     }
-    
-    # Run deploy playbook (include localhost for summary play)
-    local output
-    output=$(ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/deploy_switch_configs.yaml -l "$host,localhost" 2>&1)
-    local exit_code=$?
-    
-    # Escape output for JSON
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
-    # Exit codes: 0=success, 2=unreachable (but we continue with ignore_unreachable)
-    if [ $exit_code -eq 0 ] || [ $exit_code -eq 2 ]; then
-        json_response "{\"success\": true, \"output\": $output_json}"
+
+    # Detach: setsid + closed stdio so the job outlives this CGI request, the
+    # nginx timeout and the browser tab. fd 9 (the lock) is intentionally left
+    # open for the child so the single-runner lock is held until it exits.
+    setsid bash -c '
+        cd "$1" || { echo "ERROR: cannot access ansible directory: $1" >> "$2"; echo 1 > "$3"; exit 1; }
+        ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/deploy_switch_configs.yaml -l "$4,localhost" >> "$2" 2>&1
+        rc=$?
+        echo "$rc" > "$3"
+        exit "$rc"
+    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$host" </dev/null >/dev/null 2>&1 &
+
+    json_response "{\"success\": true, \"started\": true, \"job_id\": \"$job_id\"}"
+}
+
+# Poll a background deploy job: tail its log and, once finished, report the
+# saved exit code (only rc=0 is success).
+deploy_status() {
+    local job_id="$1"
+
+    # Confine job id to the safe charset used when it is generated.
+    job_id=$(echo "$job_id" | tr -cd '[:alnum:]-_.')
+
+    if [ -z "$job_id" ]; then
+        json_response '{"success": false, "error": "No job id specified"}'
+        return
+    fi
+
+    local log_file="$DEPLOY_STATE_DIR/$job_id.log"
+    local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
+
+    if [ ! -f "$log_file" ]; then
+        json_response '{"success": false, "error": "Unknown or expired deploy job"}'
+        return
+    fi
+
+    local output_json=$(cat "$log_file" 2>/dev/null | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+
+    if [ -f "$rc_file" ]; then
+        local rc=$(tr -cd '0-9' < "$rc_file")
+        rc=${rc:-1}
+        if [ "$rc" -eq 0 ] 2>/dev/null; then
+            json_response "{\"success\": true, \"done\": true, \"exit_code\": $rc, \"output\": $output_json}"
+        else
+            json_response "{\"success\": false, \"done\": true, \"exit_code\": $rc, \"output\": $output_json, \"error\": \"Deploy failed with exit code $rc\"}"
+        fi
     else
-        json_response "{\"success\": false, \"output\": $output_json, \"error\": \"Deploy failed with exit code $exit_code\"}"
+        json_response "{\"success\": true, \"done\": false, \"running\": true, \"output\": $output_json}"
     fi
 }
 
@@ -344,7 +442,15 @@ run_generate() {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
     }
-    
+
+    # Single-runner lock shared with deploy/diff so generation cannot race a
+    # concurrent nv config apply. Released when this fd closes.
+    exec 9>"$DEPLOY_LOCK"
+    if ! flock -n 9; then
+        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return
+    fi
+
     # Run generate playbook
     local output
     if [ -n "$host" ] && [ "$host" != "all" ]; then
@@ -386,9 +492,17 @@ git_commit_push() {
     git config --global user.name "Ansible Editor" 2>/dev/null || true
     git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
     
-    # Stage all changes
-    git add -A 2>&1
-    
+    # Stage only editor-managed paths (the EDITOR_ROOT subtree), never the whole
+    # working tree, so unrelated changes elsewhere in the repo are not committed.
+    local editor_rel
+    editor_rel=$(realpath -m --relative-to="$ANSIBLE_DIR" "$EDITOR_ROOT" 2>/dev/null)
+    if [ -z "$editor_rel" ] || [ "$editor_rel" = "." ] || [[ "$editor_rel" == ..* ]]; then
+        # EDITOR_ROOT is the repo root itself (or outside it): stage the repo tree.
+        git add -A -- . 2>&1
+    else
+        git add -A -- "$editor_rel" 2>&1
+    fi
+
     # Check if there are changes to commit
     if git diff --cached --quiet; then
         json_response '{"success": true, "output": "Nothing to commit - working tree clean"}'
@@ -533,6 +647,10 @@ case "$ACTION" in
     deploy)
         run_deploy "$HOST"
         ;;
+    deploy-status)
+        JOB_ID=$(echo "$QUERY_STRING" | sed -n 's/.*job=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+        deploy_status "$JOB_ID"
+        ;;
     git-commit)
         git_commit_push "$MESSAGE"
         ;;
@@ -604,19 +722,35 @@ case "$ACTION" in
     grep)
         # Search in specified path (default: inventory) - like mgrep
         QUERY=$(echo "$QUERY_STRING" | sed -n 's/.*query=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        SEARCH_PATH=$(echo "$QUERY_STRING" | sed -n 's/.*path=\([^&]*\).*/\1/p')
+        SEARCH_PATH=$(echo "$QUERY_STRING" | sed -n 's/.*path=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
         SEARCH_PATH="${SEARCH_PATH:-inventory}"
-        
+
         if [ -z "$QUERY" ]; then
             json_response '{"success": false, "error": "No search query provided"}'
             exit 0
         fi
-        
+
+        # Confine the search path within EDITOR_ROOT (blocks traversal/absolute paths).
+        if ! validate_path "$SEARCH_PATH"; then
+            json_response '{"success": false, "error": "Invalid search path"}'
+            exit 0
+        fi
+
         cd "$EDITOR_ROOT" || { json_response '{"success": false, "error": "Cannot access editor directory"}'; exit 0; }
-        
+
+        # Resolve the search path to its in-root normalized location and grep it
+        # relative to the root, so an absolute/traversal SEARCH_PATH cannot escape.
+        EDITOR_REALPATH=$(realpath "$EDITOR_ROOT" 2>/dev/null)
+        SEARCH_REALPATH=$(realpath -m "$EDITOR_ROOT/$SEARCH_PATH" 2>/dev/null)
+        if [[ "$SEARCH_REALPATH" == "$EDITOR_REALPATH" ]]; then
+            REL_SEARCH_PATH="."
+        else
+            REL_SEARCH_PATH="${SEARCH_REALPATH#"$EDITOR_REALPATH"/}"
+        fi
+
         # Run grep like mgrep and properly preserve ANSI escape sequences via Python
         export GREP_QUERY="$QUERY"
-        export GREP_PATH="$SEARCH_PATH"
+        export GREP_PATH="$REL_SEARCH_PATH"
         
         # Output headers first (like json_response does)
         echo "Content-Type: application/json"
@@ -632,7 +766,7 @@ query = os.environ.get('GREP_QUERY', '')
 path = os.environ.get('GREP_PATH', 'inventory')
 
 result = subprocess.run(
-    ['grep', '-rnIi', '--color=always', query, path],
+    ['grep', '-rnIi', '--color=always', '--', query, path],
     capture_output=True,
     text=True
 )
@@ -688,18 +822,38 @@ PYEOF
         fi
         ;;
     image)
-        # Serve image file
+        # Serve image file (confined to EDITOR_ROOT, real image types only)
         FILE=$(echo "$QUERY_STRING" | sed -n 's/.*file=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+
+        if ! validate_path "$FILE"; then
+            echo "Status: 403 Forbidden"
+            echo "Content-Type: text/plain"
+            echo ""
+            echo "Forbidden"
+            exit 0
+        fi
+
+        # Only serve real image extensions.
+        EXT=$(printf '%s' "${FILE##*.}" | tr '[:upper:]' '[:lower:]')
+        case "$EXT" in
+            png) MIME="image/png" ;;
+            jpg|jpeg) MIME="image/jpeg" ;;
+            gif) MIME="image/gif" ;;
+            svg) MIME="image/svg+xml" ;;
+            webp) MIME="image/webp" ;;
+            bmp) MIME="image/bmp" ;;
+            ico) MIME="image/x-icon" ;;
+            *)
+                echo "Status: 403 Forbidden"
+                echo "Content-Type: text/plain"
+                echo ""
+                echo "Unsupported image type"
+                exit 0
+                ;;
+        esac
+
         FULL_PATH="$EDITOR_ROOT/$FILE"
         if [ -f "$FULL_PATH" ]; then
-            EXT="${FILE##*.}"
-            case "$EXT" in
-                png) MIME="image/png" ;;
-                jpg|jpeg) MIME="image/jpeg" ;;
-                gif) MIME="image/gif" ;;
-                svg) MIME="image/svg+xml" ;;
-                *) MIME="application/octet-stream" ;;
-            esac
             echo "Content-Type: $MIME"
             echo ""
             cat "$FULL_PATH"

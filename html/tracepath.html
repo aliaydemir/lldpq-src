@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>..::LLDPQ::..</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
+    <script src="/css/auth.js"></script>
     <style>
         /* Prevent browser autofill from changing input background */
         input:-webkit-autofill,
@@ -1572,6 +1573,12 @@
                 first.focus();
             }
         });
+    </script>
+
+    <script>
+        (async function() {
+            await LLDPqAuth.check();
+        })();
     </script>
 </body>
 </html>

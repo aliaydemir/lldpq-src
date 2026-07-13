@@ -213,6 +213,9 @@ server {
             fastcgi_param CONTENT_TYPE $content_type;
             fastcgi_param CONTENT_LENGTH $content_length;
             fastcgi_param HTTP_COOKIE $http_cookie;
+
+            # Longer timeout: validate can run nv-validate over many configs
+            fastcgi_read_timeout 300;
         }
         
         # Edit devices.yaml endpoint with fcgiwrap

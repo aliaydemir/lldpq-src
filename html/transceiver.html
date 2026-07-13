@@ -213,8 +213,10 @@
 
         .fw-mixed { color: #ff9800; font-weight: 600; }
 
-        .sort-arrow { font-size: 10px; margin-left: 4px; opacity: 0.5; }
+        .sort-arrow { font-size: 10px; color: #666; margin-left: 4px; opacity: 0.5; }
+        .sort-arrow::before { content: '▲▼'; }
         .sort-arrow.active { opacity: 1; color: #76b900; }
+        .sort-arrow.active::before { content: ''; }
 
         .coverage-banner {
             margin: 0 0 18px;

@@ -1120,6 +1120,7 @@ def generate_hardware_html():
         .sortable {{ cursor: pointer; user-select: none; padding-right: 20px; }}
         .sortable:hover {{ background: #3c3c3c; }}
         .sort-arrow {{ font-size: 10px; color: #666; margin-left: 5px; opacity: 0.5; }}
+        .sort-arrow::before {{ content: '▲▼'; }}
         .sortable.asc .sort-arrow::before {{ content: '▲'; color: #76b900; opacity: 1; }}
         .sortable.desc .sort-arrow::before {{ content: '▼'; color: #76b900; opacity: 1; }}
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
@@ -1253,16 +1254,16 @@ def generate_hardware_html():
             <table class="hardware-table" id="hardware-table">
                 <thead>
                     <tr>
-                        <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="1" data-type="hardware-status">Health <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="2" data-type="number">CPU <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="3" data-type="number">ASIC <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="4" data-type="number">Mem% <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="5" data-type="number" title="Shows raw 5-minute load; health is evaluated as raw load divided by logical CPU cores">Load <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="6" data-type="hardware-status">Fan <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="7" data-type="number">PSU% <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="8" data-type="power">PSU Power <span class="sort-arrow">▲▼</span></th>
-                        <th class="sortable" data-column="9" data-type="string">Model <span class="sort-arrow">▲▼</span></th>
+                        <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="1" data-type="hardware-status">Health <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="2" data-type="number">CPU <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="3" data-type="number">ASIC <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="4" data-type="number">Mem% <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="5" data-type="number" title="Shows raw 5-minute load; health is evaluated as raw load divided by logical CPU cores">Load <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="6" data-type="hardware-status">Fan <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="7" data-type="number">PSU% <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="8" data-type="power">PSU Power <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="9" data-type="string">Model <span class="sort-arrow"></span></th>
                     </tr>
                 </thead>
                 <tbody id="hardware-data">

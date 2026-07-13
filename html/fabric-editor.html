@@ -2154,6 +2154,15 @@
         window.addEventListener('focus', function() {
             loadGitModifiedFiles();
         });
+
+        // Warn before leaving if any buffer has unsaved changes
+        window.addEventListener('beforeunload', function(e) {
+            if (Object.values(state.files).some(f => f.modified)) {
+                e.preventDefault();
+                e.returnValue = '';
+                return '';
+            }
+        });
         
         // Mark git modified files in file tree
         function markGitModifiedFiles() {
@@ -2413,7 +2422,7 @@
                         <div class="folder-header" onclick="toggleFolder(this.parentElement)">
                             <span class="codicon codicon-chevron-right folder-chevron"></span>
                             <span class="codicon codicon-folder folder-icon"></span>
-                            ${folderName}
+                            ${escapeHtml(folderName)}
                         </div>
                         <div class="folder-contents"></div>
                     `;
@@ -2458,7 +2467,7 @@
                         else if (['py'].includes(ext)) iconClass = 'codicon-beaker';
                         else if (['cfg', 'conf', 'ini'].includes(ext)) iconClass = 'codicon-settings-gear';
                         
-                        fileEl.innerHTML = `<span class="codicon ${iconClass} file-icon"></span>${file.name}`;
+                        fileEl.innerHTML = `<span class="codicon ${iconClass} file-icon"></span>${escapeHtml(file.name)}`;
                         fileEl.onclick = () => {
                             // If file is already open, switch to it; otherwise open it
                             if (state.files[file.path]) {
@@ -2621,10 +2630,14 @@
         }
         
         // Open file
+        let openFileToken = 0;
         async function openFile(path) {
+            // Guard against stale reads: a newer open() invalidates older ones
+            const myToken = ++openFileToken;
             // Ensure Monaco is loaded first (lazy load)
             await ensureMonacoLoaded();
-            
+            if (myToken !== openFileToken) return;
+
             showLoading(true, 'Loading ' + path.split('/').pop() + '...');
             
             // Update lastFolder based on the file path
@@ -2640,6 +2653,8 @@
                 // Load file if not already loaded
                 if (!state.files[path]) {
                     const result = await apiCall('read', { file: path });
+                    // Ignore stale read if the user opened another file meanwhile
+                    if (myToken !== openFileToken) return;
                     if (result.success) {
                         state.files[path] = {
                             content: result.content,
@@ -2653,7 +2668,7 @@
                         return;
                     }
                 }
-                
+
                 // Save current file content before switching
                 if (state.currentFile && state.files[state.currentFile]) {
                     state.files[state.currentFile].content = state.editor.getValue();
@@ -2706,9 +2721,12 @@
                 
                 const filename = path.split('/').pop();
                 tab.innerHTML = `
-                    ${filename}
-                    <span class="tab-close" onclick="closeFile('${path}', event)">×</span>
+                    ${escapeHtml(filename)}
+                    <span class="tab-close">×</span>
                 `;
+                tab.querySelector('.tab-close').addEventListener('click', (e) => {
+                    closeFile(path, e);
+                });
                 tab.onclick = (e) => {
                     if (!e.target.classList.contains('tab-close')) {
                         switchToFile(path);
@@ -2844,7 +2862,7 @@
             
             const file = state.files[path];
             if (file.modified) {
-                const confirmed = await confirmAsync('Unsaved Changes', `<strong>${path.split('/').pop()}</strong> has unsaved changes.<br><br>Close anyway?`);
+                const confirmed = await confirmAsync('Unsaved Changes', `<strong>${escapeHtml(path.split('/').pop())}</strong> has unsaved changes.<br><br>Close anyway?`);
                 if (!confirmed) return;
             }
             
@@ -2872,7 +2890,7 @@
         async function closeAllTabs() {
             const modifiedFiles = Object.entries(state.files).filter(([_, f]) => f.modified);
             if (modifiedFiles.length > 0) {
-                const names = modifiedFiles.map(([p, _]) => p.split('/').pop()).join(', ');
+                const names = modifiedFiles.map(([p, _]) => escapeHtml(p.split('/').pop())).join(', ');
                 const confirmed = await confirmAsync('Unsaved Changes', `<strong>${modifiedFiles.length} file(s)</strong> have unsaved changes:<br><br>${names}<br><br>Close all anyway?`);
                 if (!confirmed) return;
             }
@@ -3907,7 +3925,7 @@
             
             showConfirmModal(
                 'Reset File',
-                `Are you sure you want to reset <strong>${filename}</strong> to the last commit?<br><br>All uncommitted changes will be lost!`,
+                `Are you sure you want to reset <strong>${escapeHtml(filename)}</strong> to the last commit?<br><br>All uncommitted changes will be lost!`,
                 async () => {
                     showLoading(true, 'Resetting file...');
                     try {
