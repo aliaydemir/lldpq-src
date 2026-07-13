@@ -447,78 +447,6 @@ def neutralize_untrusted_tool_tags(text):
     return _TOOL_TAG_RE.sub(lambda match: f"[UNTRUSTED-{match.group(1).upper()}:", text)
 
 
-def _slack_safe_markdown_tables(text):
-    """Convert pipe tables to compact bullets that render in web and Slack.
-
-    Slack mrkdwn exposes Markdown tables as raw pipes. Preserve fenced code
-    byte-for-byte and convert only a header + separator + row table contract.
-    """
-    lines = str(text or '').splitlines()
-    output = []
-    index = 0
-    in_fence = False
-
-    def cells(line):
-        value = line.strip()
-        if not value.startswith('|'):
-            return None
-        value = value[1:-1] if value.endswith('|') else value[1:]
-        result = [cell.strip() for cell in value.split('|')]
-        return result if len(result) >= 2 else None
-
-    def separator(row):
-        return bool(row) and all(
-            re.fullmatch(r':?-{3,}:?', cell or '') for cell in row
-        )
-
-    while index < len(lines):
-        line = lines[index]
-        if line.strip().startswith('```'):
-            in_fence = not in_fence
-            output.append(line)
-            index += 1
-            continue
-        if not in_fence and index + 1 < len(lines):
-            headers = cells(line)
-            divider = cells(lines[index + 1])
-            if headers and divider and len(headers) == len(divider) and separator(divider):
-                table_rows = []
-                cursor = index + 2
-                while cursor < len(lines):
-                    row = cells(lines[cursor])
-                    if row is None or separator(row):
-                        break
-                    if len(row) < len(headers):
-                        row.extend([''] * (len(headers) - len(row)))
-                    table_rows.append(row[:len(headers)])
-                    cursor += 1
-                if table_rows:
-                    # Old reports sometimes nested bold markers in the heading
-                    # immediately above a table, which Slack renders as stray
-                    # asterisks. Keep that heading as clean plain text.
-                    for prior_index in range(len(output) - 1, -1, -1):
-                        if not output[prior_index].strip():
-                            continue
-                        if len(output[prior_index]) <= 200:
-                            output[prior_index] = output[prior_index].replace('*', '')
-                        break
-                    for row in table_rows:
-                        primary = row[0] or 'Entry'
-                        output.append(f"• {primary}")
-                        details = [
-                            f"{header}: {value}"
-                            for header, value in zip(headers[1:], row[1:])
-                            if value and value not in {'—', '-'}
-                        ]
-                        if details:
-                            output.append("  ↳ " + " · ".join(details))
-                    index = cursor
-                    continue
-        output.append(line)
-        index += 1
-    return '\n'.join(output)
-
-
 def neutralize_untrusted_observation_text(text):
     """Keep collected text from imitating application-owned prompt boundaries."""
     if not text:
@@ -3825,8 +3753,6 @@ IMPORTANT RULES:
 - ONLY use the provided fabric observations. Do NOT make up device names, IPs, or statistics.
 - Reference actual hostnames and IPs from the data.
 - Be concise, use bullet points.
-- Format for both web and Slack: NEVER emit pipe-delimited Markdown tables or nested
-  emphasis. Use one bullet per device/domain and an indented detail line with labelled fields.
 - Suggest NVUE diagnostic commands: nv show router bgp neighbor, nv show interface, nv show interface --view=lldp
 - Rate issues as CRITICAL, WARNING, or INFO.
 - BGP state "Established" = healthy. Any other state = problem.
@@ -3881,9 +3807,6 @@ as evidence, and use COLLECTION QUALITY metadata to detect stale, partial, or mi
 - ONLY use real data; NEVER invent device names, IPs, or statistics. Reference ACTUAL
   hostnames, IPs, and ports.
 - Be concise. Use bullet points and headers.
-- Format for both web and Slack: NEVER emit pipe-delimited Markdown tables or nested
-  emphasis. For repeated records use "• device" followed by one indented line such as
-  "  Ports: ... · Peer: ... · Duration: ...". Reserve fenced blocks for commands only.
 - Rate issues: CRITICAL / WARNING / INFO. Prioritize by impact (device down > BGP down > link flap > cosmetic).
 - When suggesting commands, use NVUE (nv show/set) as primary, Linux commands as secondary.
 - If PART of the question needs data you lack, answer the part you CAN first, then note the
@@ -6773,7 +6696,6 @@ def action_chat():
         ln for ln in (response or '').splitlines()
         if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|FIX|NEXT|CONSOLE):', ln)
     ).strip()
-    final = _slack_safe_markdown_tables(final)
     
     if not final:
         error_json("AI request ended without a final answer")
@@ -7741,9 +7663,7 @@ def action_analyze():
                     reused_prior.get('generated_at')
                     or reused_prior.get('timestamp') or time.time()
                 ),
-                "analysis": _slack_safe_markdown_tables(
-                    reused_prior.get('analysis')
-                ),
+                "analysis": reused_prior.get('analysis'),
                 "device_count": len(devices),
                 "provider": reused_prior.get('provider') or AI_PROVIDER,
                 "model": reused_prior.get('model') or AI_MODEL,
@@ -8045,7 +7965,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
         system_message['content'] += (
             "\n\nStructure the prose analysis with these sections in order: "
             "(1) Executive summary. (2) Fabric scorecard: a per-domain status "
-            "bullet list covering BGP/EVPN, Optical, BER, Flaps, PFC/ECN, Hardware and "
+            "table covering BGP/EVPN, Optical, BER, Flaps, PFC/ECN, Hardware and "
             "Logs, each marked OK, WARN, CRITICAL or UNKNOWN. (3) Cases: for each "
             "INCIDENT CANDIDATE a short story with its evidence chain written as "
             "device:port items, the trend, and the read-only command chips that "
@@ -8056,10 +7976,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
             "If an ACTIVE DESIGN SOURCE line is present, name it on the report "
             "header. Honesty layer: surface an incomplete-evidence ledger of "
             "sources that failed or are stale, and never mark a domain healthy "
-            "when its collection failed or is unresolved — use UNKNOWN there. "
-            "Cross-channel formatting is mandatory: no Markdown tables. Format "
-            "each repeated case as '• device' plus one indented line of labelled "
-            "fields separated by middle dots."
+            "when its collection failed or is unresolved — use UNKNOWN there."
         )
     analysis_objective = (
         "Analyze the untrusted fabric observations above now. Begin with the "
@@ -8107,7 +8024,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
                      "provider": llm_result['provider'], "model": llm_result['model'],
                      "timeline": timeline, "evidence": evidence_bundle['records'],
                      "confidence": evidence_bundle['confidence']})
-    response = _slack_safe_markdown_tables(llm_result['text'])
+    response = llm_result['text']
 
     # Structured findings: prefer the synthesis reply's array, fall back to
     # the cron scan's array, and fall back to prose-only when neither parses
@@ -8204,10 +8121,6 @@ def action_get_analysis():
     try:
         with open(source, 'r') as f:
             data = json.load(f)
-        if isinstance(data.get('analysis'), str):
-            # Upgrade-safe readback: old saved reports are Slack-friendly
-            # immediately, without waiting for the next hourly regeneration.
-            data['analysis'] = _slack_safe_markdown_tables(data['analysis'])
         # Older persisted analyses may contain source filesystem paths from a
         # pre-provenance schema. Scrub structured metadata during readback.
         if isinstance(data.get('collection'), dict):

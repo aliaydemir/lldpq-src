@@ -44,47 +44,6 @@ def load_symbols(*names):
 
 
 class AskAiApiContractTest(unittest.TestCase):
-    def test_markdown_tables_become_cross_channel_bullet_records(self):
-        formatter = load_symbols("_slack_safe_markdown_tables")[
-            "_slack_safe_markdown_tables"
-        ]
-        source = """*EW-tier — NEW/confirmed*
-| Device | Port(s) down | Peer | Down for |
-|---|---|---|---|
-| leaf01 | swp54s0/s1 | spine01 | 4d05h |
-| leaf02 | — | — | PSU3 fault |
-
-```text
-| literal | code |
-|---|---|
-```
-"""
-        formatted = formatter(source)
-        self.assertNotIn("| Device |", formatted)
-        self.assertIn("EW-tier — NEW/confirmed", formatted)
-        self.assertNotIn("*EW-tier", formatted)
-        self.assertIn("• leaf01", formatted)
-        self.assertIn(
-            "Port(s) down: swp54s0/s1 · Peer: spine01 · Down for: 4d05h",
-            formatted,
-        )
-        self.assertIn("• leaf02\n  ↳ Down for: PSU3 fault", formatted)
-        self.assertIn("| literal | code |", formatted)
-
-    def test_ai_prompts_forbid_pipe_tables_and_nested_emphasis(self):
-        values = {}
-        for node in TREE.body:
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id in {
-                        "SYSTEM_PROMPT_COMPACT", "SYSTEM_PROMPT_FULL"
-                    }:
-                        values[target.id] = ast.literal_eval(node.value)
-        self.assertEqual(set(values), {"SYSTEM_PROMPT_COMPACT", "SYSTEM_PROMPT_FULL"})
-        for prompt in values.values():
-            self.assertIn("NEVER emit pipe-delimited Markdown tables", prompt)
-            self.assertIn("nested", prompt)
-
     def test_current_pipeline_with_unavailable_devices_is_reportable(self):
         ns = load_symbols(
             "_max_collection_age_seconds",
@@ -160,7 +119,7 @@ class AskAiApiContractTest(unittest.TestCase):
         self.assertIn("snapshot_updated = True", final_persistence)
 
     def test_current_partial_report_is_returned_as_fresh_last_analysis(self):
-        ns = load_symbols("_slack_safe_markdown_tables", "action_get_analysis")
+        ns = load_symbols("action_get_analysis")
         captured = {}
 
         def capture(payload):
