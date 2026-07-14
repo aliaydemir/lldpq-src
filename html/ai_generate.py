@@ -297,6 +297,7 @@ def validate_p2p(connections):
     warnings = list(connections.get("warnings", [])) if isinstance(connections, dict) else []
     issues = []
 
+    resolved = ai_p2p.resolve_port_map(connections)
     port_owner = {}       # (device_key, os_port) -> (sheet_name, row_number)
     edge_seen = {}        # frozenset endpoint keys -> first row_number
     unresolved = 0
@@ -308,7 +309,8 @@ def validate_p2p(connections):
         for side in ("source", "dest"):
             dev = _clean(record.get(side + "_name"))
             raw_port = _clean(record.get(side + "_port"))
-            os_port = _os_port(raw_port)
+            os_port = (ai_p2p.resolved_os_port(resolved, dev, raw_port)
+                       or _os_port(raw_port))
             endpoints.append((dev, raw_port, os_port))
             if not dev or not raw_port:
                 continue

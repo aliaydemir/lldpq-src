@@ -787,14 +787,21 @@
     async function loadDesignFacets(hosts) {
         design = null; designName = '';
         try {
-            const resp = await fetch('/fabric-api.sh?action=get-p2p-enrichment', {
-                method: 'POST', body: JSON.stringify({ devices: hosts })
-            });
-            const data = await resp.json();
-            if (!data.success) return;
-            designName = data.design || '';
+            // Backend caps one request at 500 devices; chunk large selections
+            const merged = {};
+            let name = '';
+            for (let i = 0; i < hosts.length; i += 400) {
+                const resp = await fetch('/fabric-api.sh?action=get-p2p-enrichment', {
+                    method: 'POST', body: JSON.stringify({ devices: hosts.slice(i, i + 400) })
+                });
+                const data = await resp.json();
+                if (!data.success) return; // no design uploaded (or unreadable): facets stay desc-based
+                name = data.design || name;
+                Object.assign(merged, data.devices || {});
+            }
+            designName = name;
             design = {};
-            for (const [dev, entries] of Object.entries(data.devices || {})) {
+            for (const [dev, entries] of Object.entries(merged)) {
                 const m = new Map();
                 for (const e of entries) for (const a of (e.aliases || [])) if (!m.has(a)) m.set(a, e);
                 design[dev] = m;
@@ -969,7 +976,12 @@
                     method: 'POST', body: JSON.stringify({ patterns: legacy })
                 });
                 const saved = await save.json();
-                if (saved.success) serverPatterns = saved.patterns;
+                if (saved.success) {
+                    serverPatterns = saved.patterns;
+                    // One-shot migration: drop the legacy copy so this browser
+                    // can never re-upload stale patterns over a server reset.
+                    localStorage.removeItem(PATTERNS_KEY);
+                }
             }
         } catch (e) { /* offline fallback: localStorage/defaults via getRackPatterns() */ }
     }
@@ -1769,7 +1781,7 @@
             const data = await resp.json();
             if (!data.success) { showAlert('Failed to save patterns: ' + (data.error || 'unknown'), 'Error'); return; }
             serverPatterns = data.patterns; // null after an empty save = defaults
-            localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines)); // offline fallback copy
+            localStorage.removeItem(PATTERNS_KEY); // server is authoritative now
         } catch (e) {
             // Server unreachable: keep at least the per-browser copy
             localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines));
@@ -1778,6 +1790,10 @@
         closePatternsModal();
     }
     async function resetPatterns() {
+        const ok = await confirmAsync(
+            'Reset the shared selection patterns back to the built-in defaults?\n\nThis affects ALL admins of this project.',
+            'Reset Patterns');
+        if (!ok) return;
         try {
             const resp = await fetch('/fabric-api.sh?action=save-selection-patterns', {
                 method: 'POST', body: JSON.stringify({ patterns: [] })

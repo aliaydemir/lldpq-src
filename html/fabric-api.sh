@@ -3364,11 +3364,13 @@ for dev in devices:
     for cand in candidates:
         for side, peer, record in index.get(cand, []):
             port = record.get(side + '_port', '')
-            key = ai_p2p._port_key(port)
+            os_port = ai_p2p.resolved_os_port(resolved, record.get(side + '_name', ''), port)
+            # Dedup by the group-fitted OS lane when resolved: _port_key alone
+            # collapses distinct X/Y/Z lanes (1/1/1 and 1/2/1 both -> '1/1').
+            key = os_port or ai_p2p._port_key(port)
             if key in seen:
                 continue
             seen.add(key)
-            os_port = ai_p2p.resolved_os_port(resolved, record.get(side + '_name', ''), port)
             if os_port:
                 # Three-part X/Y/Z ports: _port_aliases would emit every
                 # candidate breakout lane; the group-fitted resolution is
