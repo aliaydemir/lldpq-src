@@ -99,6 +99,15 @@ _CTYPE_LABELS = (
 _EXCLUDED_CTYPES = {"power"}
 # The management plane a scoped topology can opt back in (include_mgmt).
 _MGMT_CTYPES = {"oob", "mgmt", "ctrl"}
+# Port names that indicate an OOB/management endpoint — mirrors p2p-parser's
+# _is_bmc_or_mgmt_port + eth\d+ rule and ai_p2p's _BMC_PORT_TOKENS.
+_MGMT_PORT_RE = re.compile(
+    r"mgmt"           # any port containing 'mgmt' (mgmt, mgmt0, bf-3 mgmt…)
+    r"|bmc\d*$"       # 'bmc' suffix, optionally numbered (bf-3 bmc, bmc1…)
+    r"|^eth\d+$"      # ethN management port (eth0, eth1…)
+    r"|^ipmi$|^idrac$|^ilo$",  # IPMI / iDRAC / iLO out-of-band ports
+    re.IGNORECASE,
+)
 # OS spelling of a switch front-panel port — the sw-to-sw fallback heuristic
 # keeps a link only when BOTH normalized endpoints look like this (host ends
 # are HCA/BMC/mgmt/enP* names and rarely normalize to swpN[sM]).
@@ -160,6 +169,9 @@ def _link_in_scope(ctype, ntype, a_dev, a_port, b_dev, b_port, scope,
     if scope == "ib-only":
         return ntype == "ib"
     if scope == "sw-to-sw":
+        if not include_mgmt and (_MGMT_PORT_RE.search(a_port)
+                                 or _MGMT_PORT_RE.search(b_port)):
+            return False
         return (ntype == "eth"
                 and _is_switch_endpoint(a_dev, a_port, switch_names)
                 and _is_switch_endpoint(b_dev, b_port, switch_names))

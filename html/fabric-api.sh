@@ -2925,11 +2925,16 @@ for device, sections in changes.items():
                 fail(f'Invalid change entry for {device}/{port}')
             new = mv.get('new')
             old = mv.get('old')
-            if not isinstance(new, str) or not NAME_RE.match(new):
+            # new == ''/null removes sw_port_profile (assignment rollback)
+            if new is None:
+                new = ''
+                mv['new'] = ''
+            if new != '' and (not isinstance(new, str) or not NAME_RE.match(new)):
                 fail(f'Invalid target profile for {device}/{port}')
             if old is not None and (not isinstance(old, str) or not NAME_RE.match(old)):
                 fail(f'Invalid source profile for {device}/{port}')
-            targets.add(new)
+            if new:
+                targets.add(new)
 
 # Every target profile must exist (prevents dangling sw_port_profile refs)
 spp_file = os.path.join(inventory_base, 'group_vars', 'all', 'sw_port_profiles.yaml')
@@ -2949,6 +2954,46 @@ results = {}
 plan_changes = {}
 total_applied = 0
 total_skipped = 0
+
+# Config generators (dotfabric) emit '#    sw_port_profile: DEFINE_IT'
+# placeholders on unassigned ports; once the real key is written the stale
+# comment next to it would read as a duplicate. Scrub exactly those comment
+# lines, best-effort: comment plumbing varies across ruamel token layouts,
+# and a survivor comment is cosmetic, never wrong YAML.
+PLACEHOLDER_COMMENT_RE = re.compile(r'#\s*sw_port_profile\s*:')
+
+
+def drop_placeholder_comments(*nodes):
+    for node in nodes:
+        try:
+            items = node.ca.items
+        except AttributeError:
+            continue
+        try:
+            for key in list(items):
+                toks = items.get(key) or []
+                changed = False
+                for i, tok in enumerate(toks):
+                    group = tok if isinstance(tok, list) else [tok]
+                    for j, t in enumerate(group):
+                        val = getattr(t, 'value', None)
+                        if not val or not PLACEHOLDER_COMMENT_RE.search(val):
+                            continue
+                        kept = '\n'.join(l for l in val.split('\n')
+                                         if not PLACEHOLDER_COMMENT_RE.search(l))
+                        if kept.strip():
+                            t.value = kept if kept.endswith('\n') or not val.endswith('\n') else kept + '\n'
+                        else:
+                            group[j] = None
+                        changed = True
+                    if isinstance(tok, list):
+                        toks[i] = [t for t in group if t is not None] or None
+                    else:
+                        toks[i] = group[0]
+                if changed and not any(t for t in toks if t):
+                    del items[key]
+        except Exception:
+            pass  # cosmetic cleanup only; never block the migration
 
 for device, sections in changes.items():
     hv_file = os.path.join(inventory_base, 'host_vars', device + '.yaml')
@@ -2992,11 +3037,21 @@ for device, sections in changes.items():
                 skipped.append({'section': section, 'name': port,
                                 'reason': f'current profile is {current or "(none)"}, expected {old}'})
                 continue
+            if not new:
+                if current is None:
+                    skipped.append({'section': section, 'name': port, 'reason': 'no profile to remove'})
+                    continue
+                if not dry_run:
+                    del entry['sw_port_profile']
+                applied.append({'section': section, 'name': port, 'old': current, 'new': None})
+                continue
             if current == new:
                 skipped.append({'section': section, 'name': port, 'reason': 'already on target profile'})
                 continue
             if not dry_run:
                 entry['sw_port_profile'] = new
+                if current is None:
+                    drop_placeholder_comments(entry, node)
             applied.append({'section': section, 'name': port, 'old': current, 'new': new})
 
     if applied and not dry_run:
