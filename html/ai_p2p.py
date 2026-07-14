@@ -248,6 +248,13 @@ _FLAT_PATTERNS = (
 _NAME_TOKENS = {"name", "hostname", "nae", "device name", "host name"}
 _RACK_TOKENS = {"rack", "rack name", "rack id"}
 _RU_TOKENS = {"u", "ru", "u#", "ru#", "rack u", "unit"}
+# Superset of _NAME_TOKENS used only for re-header row detection inside
+# _parse_sheet. Kept separate so column-mapping code stays unaffected.
+_REHEADER_TOKENS = _NAME_TOKENS | {
+    "device", "switch",
+    "source name", "source", "src", "src name",
+    "dest name", "dest", "dst", "dst name", "far end",
+}
 
 
 def _is_port_header(norm):
@@ -494,8 +501,11 @@ def _parse_sheet(sheet_name, rows, section):
             continue
         record = {key: _cell(values, col_map, key) for key in BASE_FIELDS}
         src_name, dst_name = record["source_name"], record["dest_name"]
-        # Repeated header rows inside the sheet
-        if _norm_header(src_name) in _NAME_TOKENS or _norm_header(dst_name) in _NAME_TOKENS:
+        # Repeated header rows inside the sheet (e.g. a second sub-table with
+        # its own Source/Dest header). Uses the broader _REHEADER_TOKENS set so
+        # terms like "source", "dest", "switch" are caught, while _NAME_TOKENS
+        # stays narrow for column-mapping purposes.
+        if _norm_header(src_name) in _REHEADER_TOKENS or _norm_header(dst_name) in _REHEADER_TOKENS:
             continue
         src_ph, dst_ph = _is_placeholder_name(src_name), _is_placeholder_name(dst_name)
         if src_ph and dst_ph:
