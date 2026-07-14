@@ -75,6 +75,12 @@
         .input-wrapper textarea { width: 100%; padding: 10px 14px; background: #1a1a1a; border: 1px solid #555; border-radius: 8px; color: #d4d4d4; font-size: 13px; font-family: inherit; resize: none; min-height: 42px; max-height: 150px; line-height: 1.5; }
         .input-wrapper textarea:focus { outline: none; border-color: #76b900; }
         .input-wrapper textarea::placeholder { color: #666; }
+        .image-preview-bar { display: none; align-items: center; gap: 8px; padding: 6px 0 2px; }
+        .image-preview-bar.visible { display: flex; }
+        .image-preview-bar img { height: 56px; border-radius: 4px; border: 1px solid #555; object-fit: cover; }
+        .image-preview-bar button { background: none; border: none; color: #888; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 4px; }
+        .image-preview-bar button:hover { color: #d4d4d4; }
+        .msg-user img.chat-image { max-width: 280px; max-height: 200px; border-radius: 4px; display: block; margin-bottom: 6px; border: 1px solid #444; }
 
         /* Buttons */
         .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px; }
@@ -235,6 +241,11 @@
 <!-- Input area -->
 <div class="input-area">
     <div class="input-wrapper">
+        <div class="image-preview-bar" id="imagePreviewBar">
+            <img id="imagePreviewThumb" src="" alt="Attached image">
+            <button onclick="clearPendingImage()" title="Remove image" aria-label="Remove attached image">&times;</button>
+            <span style="font-size:12px;color:#888;">Image attached</span>
+        </div>
         <textarea id="chatInput" placeholder="Ask about your fabric..." aria-label="Ask AI about your fabric" rows="1" onkeydown="handleKeydown(event)" oninput="autoResize(this)"></textarea>
     </div>
     <button id="btnAttachLogs" onclick="toggleAttachLogs()" title="Attach critical/error logs to next message" aria-label="Attach critical or error logs to next message" aria-pressed="false" style="height: 42px; width: 42px; padding: 0; flex-shrink: 0; background: #333; border: 1px solid #555; border-radius: 6px; color: #888; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s;">
@@ -347,6 +358,7 @@ let isAnalysisRunning = false;
 let requestGeneration = 0;
 let chatRequestController = null;
 let analysisRequestController = null;
+let pendingImage = null; // {b64: string, type: string, dataUrl: string}
 const STORAGE_KEY = 'lldpq_ai_chat_history';
 const MAX_STORED_CHAT_CHARS = 1500000;
 // Keep these request limits in lockstep with ai-api.sh. The browser trims only
@@ -1922,8 +1934,20 @@ async function sendMessage() {
     // Conversation history (PRIOR turns only) sent to the model — role+content
     // only. The outbound copy is bounded; full UI/storage content is untouched.
     const historyPayload = buildHistoryPayload(chatHistory);
-    // Add user message (show original, send with logs)
-    addMessage('user', message);
+
+    // Capture and clear pending image before any awaits touch the DOM
+    const sentImage = pendingImage;
+    clearPendingImage();
+
+    // Add user message (show original, send with logs; show image above text if attached)
+    const userBubble = addMessage('user', message);
+    if (sentImage && userBubble) {
+        const img = document.createElement('img');
+        img.src = sentImage.dataUrl;
+        img.className = 'chat-image';
+        img.alt = 'Attached image';
+        userBubble.insertBefore(img, userBubble.firstChild);
+    }
     chatHistory.push({ role: 'user', content: message, ts: Date.now() });
     saveChatToStorage();
     input.value = '';
@@ -1937,7 +1961,8 @@ async function sendMessage() {
         // Any submit failure (older backend without chat-submit, unavailable
         // job store) falls back to the synchronous action=chat path unchanged.
         let data;
-        const submitted = await apiCall('chat-submit', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
+        const imagePayload = sentImage ? { image_b64: sentImage.b64, image_type: sentImage.type } : {};
+        const submitted = await apiCall('chat-submit', { message: finalMessage, history: historyPayload, ...imagePayload }, { signal: controller.signal });
         if (generation !== requestGeneration || controller.signal.aborted || submitted.aborted) return;
         if (submitted.success && submitted.job_id) {
             activeChatJobId = String(submitted.job_id);
@@ -1947,7 +1972,7 @@ async function sendMessage() {
             showChatProgress();
             data = await pollChatJob(activeChatJobId, generation, controller);
         } else {
-            data = await apiCall('chat', { message: finalMessage, history: historyPayload }, { signal: controller.signal });
+            data = await apiCall('chat', { message: finalMessage, history: historyPayload, ...imagePayload }, { signal: controller.signal });
         }
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
 
@@ -1985,6 +2010,7 @@ function clearChat() {
     analysisRequestController = null;
     isStreaming = false;
     isAnalysisRunning = false;
+    clearPendingImage();
     // Best-effort stop for an in-flight background job; the chat area rewrite
     // below removes the progress panel node itself.
     if (activeChatJobId) {
@@ -2021,6 +2047,71 @@ function autoResize(el) {
     el.style.height = 'auto';
     el.style.height = Math.min(el.scrollHeight, 150) + 'px';
 }
+
+function clearPendingImage() {
+    pendingImage = null;
+    const bar = document.getElementById('imagePreviewBar');
+    if (bar) bar.classList.remove('visible');
+    const thumb = document.getElementById('imagePreviewThumb');
+    if (thumb) thumb.src = '';
+}
+
+function _setPendingImage(b64, type, dataUrl) {
+    // Compress via canvas: max 1024px wide/tall, JPEG 75% — keeps POST under nginx limits
+    const tmpImg = new Image();
+    tmpImg.onload = () => {
+        const MAX = 1024;
+        let w = tmpImg.naturalWidth, h = tmpImg.naturalHeight;
+        if (w > MAX || h > MAX) {
+            if (w >= h) { h = Math.round(h * MAX / w); w = MAX; }
+            else        { w = Math.round(w * MAX / h); h = MAX; }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(tmpImg, 0, 0, w, h);
+        const compressed = canvas.toDataURL('image/jpeg', 0.75);
+        const comma = compressed.indexOf(',');
+        pendingImage = { b64: compressed.slice(comma + 1), type: 'image/jpeg', dataUrl: compressed };
+        const thumb = document.getElementById('imagePreviewThumb');
+        if (thumb) thumb.src = compressed;
+        const bar = document.getElementById('imagePreviewBar');
+        if (bar) bar.classList.add('visible');
+    };
+    tmpImg.src = dataUrl;
+}
+
+// Paste handler: capture images pasted into the chat input
+document.addEventListener('DOMContentLoaded', () => {
+    const input = document.getElementById('chatInput');
+    if (!input) return;
+    input.addEventListener('paste', (e) => {
+        const items = e.clipboardData && e.clipboardData.items;
+        if (!items) return;
+        for (let i = 0; i < items.length; i++) {
+            if (items[i].type.startsWith('image/')) {
+                e.preventDefault();
+                const file = items[i].getAsFile();
+                if (!file) continue;
+                // Limit to ~6 MB base64 (~4.5 MB image)
+                if (file.size > 4718592) {
+                    showToast('Image is too large (max ~4.5 MB)', 'error');
+                    return;
+                }
+                const reader = new FileReader();
+                reader.onload = (ev) => {
+                    const dataUrl = ev.target.result;
+                    // dataUrl = "data:<type>;base64,<data>"
+                    const comma = dataUrl.indexOf(',');
+                    const b64 = dataUrl.slice(comma + 1);
+                    const mediaType = file.type || 'image/png';
+                    _setPendingImage(b64, mediaType, dataUrl);
+                };
+                reader.readAsDataURL(file);
+                return;
+            }
+        }
+    });
+});
 
 // ===================== ANALYSIS =====================
 async function loadAnalysisBadge() {
@@ -2082,7 +2173,13 @@ async function runAnalysis() {
     }
     showToast('Running fabric health analysis...', 'info');
     try {
-        const data = await apiCall('analyze', null, { signal: controller.signal });
+        const submitted = await apiCall('analyze-submit', null, { signal: controller.signal });
+        if (generation !== requestGeneration || controller.signal.aborted || submitted.aborted) return;
+        if (!submitted.success || !submitted.job_id) {
+            showToast('Analysis failed: ' + (submitted.error || ''), 'error');
+            return;
+        }
+        const data = await pollChatJob(submitted.job_id, generation, controller);
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
         if (data.success && data.analysis) {
             // Remove suggestions if present

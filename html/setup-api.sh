@@ -1884,6 +1884,16 @@ if action == 'update-log':
                       'log': display}))
     sys.exit(0)
 
+def cron_command(parts):
+    """Command token of a system-crontab line: first token after the user
+    field that is not a NAME=value environment assignment (install.sh may
+    prefix the command with env vars, e.g. LLDPQ_MONITOR_LOCK_WAIT_SECONDS)."""
+    for tok in parts[6:]:
+        if '=' not in tok:
+            return tok
+    return ''
+
+
 # ─── Action: Read cron schedules for lldpq (auto-run) and get-conf (config collection) ───
 if action == 'get-schedules':
     ensure_configuration_lock()
@@ -1896,9 +1906,9 @@ if action == 'get-schedules':
                 if line.lstrip().startswith('#'):
                     continue
                 parts = line.split()
-                if len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq':
+                if len(parts) >= 7 and cron_command(parts) == '/usr/local/bin/lldpq':
                     lldpq_expr = ' '.join(parts[:5])
-                elif len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf':
+                elif len(parts) >= 7 and cron_command(parts) == '/usr/local/bin/get-conf':
                     getconf_expr = ' '.join(parts[:5])
     except Exception:
         pass
@@ -1950,10 +1960,10 @@ if action == 'set-schedules':
     found_getconf = False
     for line in orig:
         parts = line.split()
-        if (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/lldpq':
+        if (not line.lstrip().startswith('#')) and len(parts) >= 7 and cron_command(parts) == '/usr/local/bin/lldpq':
             out.append(lldpq_cron + ' ' + ' '.join(parts[5:]) + '\n')
             found_lldpq = True
-        elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and parts[6] == '/usr/local/bin/get-conf':
+        elif (not line.lstrip().startswith('#')) and len(parts) >= 7 and cron_command(parts) == '/usr/local/bin/get-conf':
             out.append(getconf_cron + ' ' + ' '.join(parts[5:]) + '\n')
             found_getconf = True
         else:

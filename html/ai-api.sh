@@ -37,6 +37,7 @@ AI_SEARCH_KEY="${AI_SEARCH_KEY:-}"
 # any CGI header/auth handling; the job spec under AI_STATE_DIR/jobs/<id>/
 # was written by an already-authenticated admin request.
 AI_WORKER_JOB=""
+AI_ANALYZE_WORKER_JOB=""
 if [ "${1:-}" = "--worker" ]; then
     case "${2:-}" in
         ''|*[!0-9a-f-]*)
@@ -47,9 +48,19 @@ if [ "${1:-}" = "--worker" ]; then
             AI_WORKER_JOB="$2"
             ;;
     esac
+elif [ "${1:-}" = "--analyze-worker" ]; then
+    case "${2:-}" in
+        ''|*[!0-9a-f-]*)
+            echo "ai-api.sh --analyze-worker: invalid job id" >&2
+            exit 1
+            ;;
+        *)
+            AI_ANALYZE_WORKER_JOB="$2"
+            ;;
+    esac
 fi
 
-if [ -z "$AI_WORKER_JOB" ]; then
+if [ -z "$AI_WORKER_JOB" ] && [ -z "$AI_ANALYZE_WORKER_JOB" ]; then
     # Parse query string
     ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 
@@ -89,7 +100,7 @@ export AI_PROVIDER AI_MODEL AI_API_KEY AI_API_URL OLLAMA_URL AI_PROXY_URL
 export AI_FALLBACK_MODEL AI_STATE_DIR
 export AI_CONTEXT_WINDOW_TOKENS AI_FALLBACK_CONTEXT_WINDOW_TOKENS
 export AI_SEARCH_MODEL AI_SEARCH_URL AI_SEARCH_KEY
-export POST_DATA POST_DATA_FILE ACTION AI_WORKER_JOB
+export POST_DATA POST_DATA_FILE ACTION AI_WORKER_JOB AI_ANALYZE_WORKER_JOB
 
 python3 << 'PYTHON_SCRIPT'
 import json
@@ -115,6 +126,7 @@ ACTION = os.environ.get('ACTION', '')
 # Non-empty only in the detached '--worker <job-id>' entry point (see the
 # shell wrapper); it bypasses the CGI action router entirely.
 AI_WORKER_JOB = os.environ.get('AI_WORKER_JOB', '')
+AI_ANALYZE_WORKER_JOB = os.environ.get('AI_ANALYZE_WORKER_JOB', '')
 POST_DATA = os.environ.get('POST_DATA', '')
 POST_DATA_FILE = os.environ.get('POST_DATA_FILE', '')
 if not POST_DATA and POST_DATA_FILE:
@@ -1568,7 +1580,63 @@ def build_fabric_summary():
     except Exception:
         pass
     
-    # 6. Discovery status
+    # 6. BER / interface error density summary
+    try:
+        ber_stats = (_load_json_file(_mr_path('ber_history.json')) or {}).get('current_ber_stats') or {}
+        if ber_stats:
+            _SEVERITY_ORDER = {'critical': 0, 'warning': 1, 'good': 2, 'excellent': 3, 'unknown': 4}
+            ber_by_grade = {}
+            for v in ber_stats.values():
+                g = str(v.get('status', v.get('grade', 'unknown'))).lower()
+                ber_by_grade[g] = ber_by_grade.get(g, 0) + 1
+            ber_parts = ', '.join(
+                f"{ber_by_grade[g]} {g}"
+                for g in sorted(ber_by_grade, key=lambda x: _SEVERITY_ORDER.get(x, 5))
+                if ber_by_grade[g]
+            )
+            if ber_parts:
+                summary.append(f"BER/INTERFACE-ERRORS: {sum(ber_by_grade.values())} ports monitored — {ber_parts}")
+            critical_ports = sorted(
+                (k for k, v in ber_stats.items()
+                 if str(v.get('status', v.get('grade', ''))).lower() == 'critical'),
+                key=lambda k: (k.split(':')[0], k)
+            )
+            if critical_ports:
+                summary.append(
+                    "BER CRITICAL PORTS (%d): %s" % (
+                        len(critical_ports),
+                        ', '.join(critical_ports[:40])
+                        + (' ...' if len(critical_ports) > 40 else ''),
+                    )
+                )
+    except Exception:
+        pass
+
+    # 7. Active design (P2P / IPAM) status
+    try:
+        _p2p_data, _p2p_err = _load_active_p2p()
+        if _p2p_data is not None and isinstance(_p2p_data, dict):
+            _p2p_count = _p2p_data.get('total_connections', len(_p2p_data.get('connections') or []))
+            _p2p_src = _p2p_data.get('source_file') or ''
+            _p2p_src_part = (' from %s' % _p2p_src) if _p2p_src else ''
+            summary.append("P2P DESIGN: active%s — %s connections; use [P2P: <device> <port>] to query" % (_p2p_src_part, _p2p_count))
+        else:
+            summary.append("P2P DESIGN: unavailable (%s)" % (_p2p_err or 'not uploaded'))
+    except Exception:
+        pass
+    try:
+        _ipam_data, _ipam_err = _load_active_ipam()
+        if _ipam_data is not None and isinstance(_ipam_data, dict):
+            _src = _ipam_data.get('source_file') or _ipam_data.get('_source_file') or ''
+            _recs = _ipam_data.get('total_records') or '?'
+            _src_part = (' from %s' % _src) if _src else ''
+            summary.append("IP EXCEL/IPAM DESIGN: active%s — %s total records; use [IPAM: <hostname-or-ip>] to query" % (_src_part, _recs))
+        else:
+            summary.append("IP EXCEL/IPAM DESIGN: unavailable (%s)" % (_ipam_err or 'not uploaded'))
+    except Exception:
+        pass
+
+    # 8. Discovery status
     try:
         disc_file = os.path.join(WEB_ROOT, 'discovery-cache.json')
         if os.path.exists(disc_file):
@@ -1588,7 +1656,7 @@ def build_fabric_summary():
     except Exception:
         pass
     
-    # 7. Fabric tables summary
+    # 9. Fabric tables summary
     try:
         summary_file = _mr_path('fabric-tables', 'summary.json')
         if os.path.exists(summary_file):
@@ -3292,33 +3360,46 @@ def build_optical_context(hosts=None, max_chars=9000):
     return '\n'.join(lines)[:max_chars] if len(lines) > 1 else ''
 
 
-def build_ber_context(hosts=None, max_chars=9000):
+def build_ber_context(hosts=None, max_chars=16000):
     """Per-port interface error density plus raw/effective physical BER."""
     stats = (_load_json_file(_mr_path('ber_history.json')) or {}).get('current_ber_stats') or {}
     if not stats:
         return ''
-    lines = [
+    header = (
         "INTERFACE ERROR DENSITY / PHY BER "
         "(host:port: frameDensity frameGrade rawBER effectiveBER grade "
         "rxErr txErr totalPkt dRxErr dTxErr):"
-    ]
-    for key in sorted(stats):
-        if hosts and key.split(':')[0] not in hosts:
-            continue
-        v = stats[key]
+    )
+    _SEVERITY_ORDER = {'critical': 0, 'warning': 1, 'good': 2, 'excellent': 3, 'unknown': 4}
+    def _severity_key(item):
+        grade = str(item[1].get('status', item[1].get('grade', ''))).lower()
+        return (_SEVERITY_ORDER.get(grade, 5), item[0])
+    items = sorted(
+        ((k, v) for k, v in stats.items()
+         if not hosts or k.split(':')[0] in hosts),
+        key=_severity_key,
+    )
+    lines = [header]
+    budget = max_chars - len(header) - 1
+    for key, v in items:
         frame_density = v.get('frame_error_density', v.get('ber_value', ''))
         delta_rx = v.get('delta_rx_errors')
         delta_tx = v.get('delta_tx_errors')
         if delta_rx is None and delta_tx is None and v.get('delta_errors') is not None:
             delta_rx = v.get('delta_errors')
             delta_tx = ''
-        lines.append(f"  {key}: frameDensity={frame_density} frameGrade={v.get('frame_grade','')} "
-                     f"rawBER={v.get('raw_ber','')} effectiveBER={v.get('effective_ber','')} "
-                     f"grade={v.get('status', v.get('grade',''))} "
-                     f"rxErr={v.get('rx_errors','')} txErr={v.get('tx_errors','')} "
-                     f"totalPkt={v.get('total_packets','')} dRxErr={delta_rx or 0} "
-                     f"dTxErr={delta_tx or 0}")
-    return '\n'.join(lines)[:max_chars] if len(lines) > 1 else ''
+        line = (f"  {key}: frameDensity={frame_density} frameGrade={v.get('frame_grade','')} "
+                f"rawBER={v.get('raw_ber','')} effectiveBER={v.get('effective_ber','')} "
+                f"grade={v.get('status', v.get('grade',''))} "
+                f"rxErr={v.get('rx_errors','')} txErr={v.get('tx_errors','')} "
+                f"totalPkt={v.get('total_packets','')} dRxErr={delta_rx or 0} "
+                f"dTxErr={delta_tx or 0}")
+        if budget - len(line) - 1 < 0:
+            lines.append("  ... (truncated — remaining ports omitted)")
+            break
+        lines.append(line)
+        budget -= len(line) + 1
+    return '\n'.join(lines) if len(lines) > 1 else ''
 
 
 def build_hardware_context(hosts=None, max_chars=9000):
@@ -5600,6 +5681,24 @@ def _load_active_p2p():
         return None, 'P2P lookup is unavailable (ai_p2p.py not installed)'
     path = _active_design_path('p2p')
     if not os.path.isfile(path):
+        # Published file missing (e.g. monitor-results cleared after deployment).
+        # Fall back to the inventory version store and attempt to reload.
+        try:
+            inv_pointer = os.path.join(AI_STATE_DIR, 'inventory', 'p2p', 'active.json')
+            if os.path.isfile(inv_pointer):
+                with open(inv_pointer, 'r', encoding='utf-8') as fh:
+                    pointer = json.load(fh)
+                version = str(pointer.get('active') or '')
+                if version:
+                    version_path = os.path.join(AI_STATE_DIR, 'inventory', 'p2p', version)
+                    if os.path.isfile(version_path):
+                        with open(version_path, 'r', encoding='utf-8') as fh:
+                            wrapper = json.load(fh)
+                        data = wrapper.get('data') or {}
+                        text = json.dumps(data)
+                        return _p2p_module.load_connections(text), ''
+        except Exception:
+            pass
         return None, 'no active P2P design uploaded'
     try:
         return _p2p_module.load_connections(path), ''
@@ -5613,6 +5712,20 @@ def _load_active_ipam():
         return None, 'IPAM lookup is unavailable (ai_ipam.py not installed)'
     path = _active_design_path('ipam')
     if not os.path.isfile(path):
+        try:
+            inv_pointer = os.path.join(AI_STATE_DIR, 'inventory', 'ipam', 'active.json')
+            if os.path.isfile(inv_pointer):
+                with open(inv_pointer, 'r', encoding='utf-8') as fh:
+                    pointer = json.load(fh)
+                version = str(pointer.get('active') or '')
+                if version:
+                    version_path = os.path.join(AI_STATE_DIR, 'inventory', 'ipam', version)
+                    if os.path.isfile(version_path):
+                        with open(version_path, 'r', encoding='utf-8') as fh:
+                            wrapper = json.load(fh)
+                        return wrapper.get('data') or {}, ''
+        except Exception:
+            pass
         return None, 'no active IPAM design uploaded'
     try:
         with open(path, 'r', encoding='utf-8') as handle:
@@ -5801,6 +5914,23 @@ def action_chat():
         history = validate_history(data.get('history', []))
     except ValueError as error:
         error_json(str(error))
+
+    # Optional image attachment (Claude provider only; ignored for others)
+    _img_b64 = data.get('image_b64', '') or ''
+    _img_type = data.get('image_type', '') or 'image/png'
+    if _img_b64:
+        _ALLOWED_IMG_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+        if _img_type not in _ALLOWED_IMG_TYPES:
+            _img_type = 'image/png'
+        # 6 291 456 base64 chars ≈ 4.5 MB binary — hard cap
+        if len(_img_b64) > 6291456:
+            error_json("Attached image is too large (max ~4.5 MB)")
+        import base64 as _base64_mod
+        try:
+            _base64_mod.b64decode(_img_b64, validate=True)
+        except Exception:
+            _img_b64 = ''
+
     # Sync: leave room below nginx's 300s read timeout. The detached worker
     # raises the module-level constant instead of forking the pipeline.
     deadline = time.monotonic() + CHAT_DEADLINE_SECONDS
@@ -5974,8 +6104,17 @@ def action_chat():
     history_messages = _history_context_messages(
         history, limit=MAX_HISTORY_MESSAGES
     )
+    if _img_b64 and AI_PROVIDER == 'claude':
+        _question_content = [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": _img_type, "data": _img_b64,
+            }},
+            {"type": "text", "text": question},
+        ]
+    else:
+        _question_content = question
     question_message = {
-        "role": "user", "content": question,
+        "role": "user", "content": _question_content,
         "context_pin": True, "context_kind": "question",
     }
     observation_text = _reduce_untrusted_context_if_needed(
@@ -6805,6 +6944,21 @@ def action_chat_submit():
         history = validate_history(data.get('history', []))
     except ValueError as error:
         error_json(str(error))
+    # Optional image attachment — validate same rules as action_chat
+    _img_b64 = data.get('image_b64', '') or ''
+    _img_type = data.get('image_type', '') or 'image/png'
+    if _img_b64:
+        _ALLOWED_IMG_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp'}
+        if _img_type not in _ALLOWED_IMG_TYPES:
+            _img_type = 'image/png'
+        if len(_img_b64) > 6291456:
+            error_json("Attached image is too large (max ~4.5 MB)")
+        import base64 as _base64_mod
+        try:
+            _base64_mod.b64decode(_img_b64, validate=True)
+        except Exception:
+            _img_b64 = ''
+
     try:
         _ensure_state_dir()
         os.makedirs(JOBS_DIR, mode=0o2770, exist_ok=True)
@@ -6825,6 +6979,9 @@ def action_chat_submit():
             'user': os.environ.get('LLDPQ_AUTH_USER', ''),
             'created': time.time(),
         }
+        if _img_b64:
+            spec['image_b64'] = _img_b64
+            spec['image_type'] = _img_type
         descriptor, temporary_path = tempfile.mkstemp(
             prefix='.job.json.tmp-', dir=job_dir
         )
@@ -6986,8 +7143,12 @@ def action_chat_worker(job_id):
         os.environ['HTTP_COOKIE'] = cookie
     if spec.get('user'):
         os.environ.setdefault('LLDPQ_AUTH_USER', str(spec.get('user')))
-    POST_DATA = json.dumps({'message': spec.get('message', ''),
-                            'history': spec.get('history', [])})
+    _worker_post = {'message': spec.get('message', ''),
+                    'history': spec.get('history', [])}
+    if spec.get('image_b64'):
+        _worker_post['image_b64'] = spec['image_b64']
+        _worker_post['image_type'] = spec.get('image_type', 'image/png')
+    POST_DATA = json.dumps(_worker_post)
     CHAT_DEADLINE_SECONDS = WORKER_CHAT_DEADLINE_SECONDS
     # Liveness heartbeat: lets chat-poll distinguish a slow provider call
     # from a dead worker. Daemon thread dies with the process.
@@ -8113,6 +8274,114 @@ Correlations show temporal coincidence only and do not prove causation.""")
                  **findings_fields})
 
 
+def action_analyze_submit():
+    """Submit an autonomous fabric health analysis as an async job; returns job_id
+    immediately so the browser is never blocked waiting for the LLM."""
+    import subprocess
+    try:
+        _ensure_state_dir()
+        os.makedirs(JOBS_DIR, mode=0o2770, exist_ok=True)
+    except Exception as error:
+        error_json("Async analyze jobs are unavailable: "
+                   + redact_secrets(str(error)))
+    _purge_stale_jobs()
+    job_id = '%d-%s' % (int(time.time()), os.urandom(8).hex())
+    job_dir, events_path, _cancel_path = _job_paths(job_id)
+    try:
+        os.makedirs(job_dir, mode=0o2770)
+        spec = {
+            'type': 'analyze',
+            'cookie': os.environ.get('HTTP_COOKIE', ''),
+            'user': os.environ.get('LLDPQ_AUTH_USER', ''),
+            'created': time.time(),
+        }
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix='.job.json.tmp-', dir=job_dir
+        )
+        os.fchmod(descriptor, 0o660)
+        with os.fdopen(descriptor, 'w') as spec_file:
+            spec_file.write(json.dumps(spec))
+            spec_file.flush()
+            os.fsync(spec_file.fileno())
+        os.replace(temporary_path, os.path.join(job_dir, 'job.json'))
+    except Exception as error:
+        error_json("Could not create the analyze job: "
+                   + redact_secrets(str(error)))
+    _job_emit({'event': 'queued', 'job_id': job_id}, events_path=events_path)
+    log_descriptor = None
+    try:
+        log_descriptor = os.open(
+            os.path.join(job_dir, 'worker.log'),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o660,
+        )
+    except OSError:
+        log_descriptor = None
+    worker_env = {
+        key: value for key, value in os.environ.items()
+        if key not in ('REQUEST_METHOD', 'CONTENT_LENGTH', 'CONTENT_TYPE',
+                       'QUERY_STRING', 'POST_DATA', 'POST_DATA_FILE',
+                       'HTTP_COOKIE', 'ACTION', 'GATEWAY_INTERFACE')
+    }
+    try:
+        with open(os.devnull, 'rb') as null_stdin:
+            subprocess.Popen(
+                ['bash', os.path.join(WEB_ROOT, 'ai-api.sh'),
+                 '--analyze-worker', job_id],
+                stdin=null_stdin,
+                stdout=log_descriptor if log_descriptor is not None else subprocess.DEVNULL,
+                stderr=log_descriptor if log_descriptor is not None else subprocess.DEVNULL,
+                env=worker_env, close_fds=True, start_new_session=True,
+            )
+    except Exception as error:
+        error_json("Could not start the analyze worker: "
+                   + redact_secrets(str(error)))
+    finally:
+        if log_descriptor is not None:
+            try:
+                os.close(log_descriptor)
+            except OSError:
+                pass
+    result_json({"success": True, "job_id": job_id})
+
+
+def action_analyze_worker(job_id):
+    """Detached worker: run action_analyze() and emit the result as a terminal
+    JSONL event so action=chat-poll can deliver it to the browser."""
+    global _JOB_CONTEXT
+    if not _valid_job_id(job_id):
+        sys.exit(1)
+    job_dir, events_path, cancel_path = _job_paths(job_id)
+    if not os.path.isdir(job_dir):
+        sys.exit(1)
+    _JOB_CONTEXT = {'id': job_id, 'dir': job_dir,
+                    'events': events_path, 'cancel': cancel_path}
+    spec = _load_json_file(os.path.join(job_dir, 'job.json'))
+    if not isinstance(spec, dict) or spec.get('type') != 'analyze':
+        _job_emit({'event': 'error', 'error': 'analyze job spec missing or invalid'})
+        sys.exit(1)
+    cookie = str(spec.get('cookie') or '')
+    if cookie:
+        os.environ['HTTP_COOKIE'] = cookie
+    if spec.get('user'):
+        os.environ.setdefault('LLDPQ_AUTH_USER', str(spec.get('user')))
+    import threading
+    def _heartbeat():
+        while True:
+            time.sleep(15)
+            _job_emit({'event': 'heartbeat'})
+    threading.Thread(target=_heartbeat, daemon=True).start()
+    _job_emit({'event': 'start', 'job_id': job_id})
+    try:
+        action_analyze()
+    except SystemExit:
+        raise
+    except Exception as error:
+        _job_emit({'event': 'error', 'error': redact_secrets(str(error))})
+        sys.exit(1)
+    _job_emit({'event': 'error', 'error': 'analyze pipeline ended without a result'})
+    sys.exit(1)
+
+
 def action_get_analysis():
     """Get the latest autonomous analysis."""
     source = ANALYSIS_FILE if os.path.exists(ANALYSIS_FILE) else LEGACY_ANALYSIS_FILE
@@ -8169,7 +8438,9 @@ def action_get_analysis():
 
 # ======================== ROUTER ========================
 
-if AI_WORKER_JOB:
+if AI_ANALYZE_WORKER_JOB:
+    action_analyze_worker(AI_ANALYZE_WORKER_JOB)
+elif AI_WORKER_JOB:
     # Detached job worker (argv entry point, no CGI request/session env).
     action_chat_worker(AI_WORKER_JOB)
 elif ACTION == 'chat':
@@ -8194,6 +8465,8 @@ elif ACTION == 'list-models':
     action_list_models()
 elif ACTION == 'analyze':
     action_analyze()
+elif ACTION == 'analyze-submit':
+    action_analyze_submit()
 elif ACTION == 'get-analysis':
     action_get_analysis()
 elif ACTION == 'get-log-messages':

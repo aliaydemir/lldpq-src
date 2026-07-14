@@ -24,25 +24,29 @@ const LLDPqAuth = {
     
     // Check if user is authenticated
     async check() {
+        let data = null;
         try {
             const response = await fetch('/auth-api?action=check');
-            const data = await response.json();
-            
-            if (data.authenticated) {
-                this.user = data.username;
-                this.role = data.role;
-                this.hostname = (
-                    typeof data.lldpq_hostname === 'string' &&
-                    /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(data.lldpq_hostname)
-                ) ? data.lldpq_hostname : 'lldpq';
-                try { localStorage.setItem('lldpq_role', data.role || ''); } catch (e) {}
-                return true;
-            } else {
-                this.redirectToLogin();
-                return false;
-            }
+            data = await response.json();
         } catch (e) {
+            // Network error or server busy (e.g. fcgiwrap busy with a long-running
+            // request). Do NOT redirect to login — the session may still be valid.
+            // The caller handles the false return by aborting its own action.
             console.error('Auth check failed:', e);
+            return false;
+        }
+
+        if (data && data.authenticated) {
+            this.user = data.username;
+            this.role = data.role;
+            this.hostname = (
+                typeof data.lldpq_hostname === 'string' &&
+                /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(data.lldpq_hostname)
+            ) ? data.lldpq_hostname : 'lldpq';
+            try { localStorage.setItem('lldpq_role', data.role || ''); } catch (e) {}
+            return true;
+        } else {
+            // Server explicitly returned authenticated:false — redirect to login.
             this.redirectToLogin();
             return false;
         }

@@ -251,9 +251,10 @@ _RU_TOKENS = {"u", "ru", "u#", "ru#", "rack u", "unit"}
 # Superset of _NAME_TOKENS used only for re-header row detection inside
 # _parse_sheet. Kept separate so column-mapping code stays unaffected.
 _REHEADER_TOKENS = _NAME_TOKENS | {
-    "device", "switch",
-    "source name", "source", "src", "src name",
-    "dest name", "dest", "dst", "dst name", "far end",
+    "device", "switch", "switch name",
+    "source name", "source", "src", "src name", "source hostname",
+    "dest name", "dest", "dst", "dst name", "dest hostname",
+    "far end", "far end name", "target name",
 }
 
 
@@ -504,9 +505,22 @@ def _parse_sheet(sheet_name, rows, section):
         # Repeated header rows inside the sheet (e.g. a second sub-table with
         # its own Source/Dest header). Uses the broader _REHEADER_TOKENS set so
         # terms like "source", "dest", "switch" are caught, while _NAME_TOKENS
-        # stays narrow for column-mapping purposes.
+        # stays narrow for column-mapping purposes. When the new sub-table has a
+        # different column layout, adopt it so subsequent rows parse correctly.
         if _norm_header(src_name) in _REHEADER_TOKENS or _norm_header(dst_name) in _REHEADER_TOKENS:
+            new_map = _map_flat_header(values)
+            if not _is_complete(new_map):
+                prev = rows[row_idx - 1] if row_idx > 0 else []
+                new_map = _map_split_header(values, prev)
+            if _is_complete(new_map) and new_map != col_map:
+                col_map = new_map
             continue
+        # Section banner: a row merged horizontally echoes the same text into
+        # every cell. Skip it when both name columns are identical and ports are
+        # empty (or contain the same echoed text).
+        if src_name and src_name == dst_name:
+            if {record["source_port"], record["dest_port"]} <= {"", src_name}:
+                continue
         src_ph, dst_ph = _is_placeholder_name(src_name), _is_placeholder_name(dst_name)
         if src_ph and dst_ph:
             continue  # neither endpoint usable: furniture/blank row
