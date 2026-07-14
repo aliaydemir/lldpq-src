@@ -2931,7 +2931,8 @@ for device, sections in changes.items():
                 mv['new'] = ''
             if new != '' and (not isinstance(new, str) or not NAME_RE.match(new)):
                 fail(f'Invalid target profile for {device}/{port}')
-            if old is not None and (not isinstance(old, str) or not NAME_RE.match(old)):
+            # old '' = "expect no profile" guard for first-time assignments
+            if old is not None and old != '' and (not isinstance(old, str) or not NAME_RE.match(old)):
                 fail(f'Invalid source profile for {device}/{port}')
             if new:
                 targets.add(new)
@@ -3033,9 +3034,11 @@ for device, sections in changes.items():
                 skipped.append({'section': section, 'name': port, 'reason': 'not found in host_vars'})
                 continue
             current = entry.get('sw_port_profile')
-            if old is not None and current != old:
+            # old '' = expect NO profile (first-time assignment drift guard);
+            # old None = no check (explicit escape hatch)
+            if old is not None and (current or '') != old:
                 skipped.append({'section': section, 'name': port,
-                                'reason': f'current profile is {current or "(none)"}, expected {old}'})
+                                'reason': f'current profile is {current or "(none)"}, expected {old or "(none)"}'})
                 continue
             if not new:
                 if current is None:
@@ -3115,11 +3118,14 @@ plans_dir = os.path.join(ansible_dir, '.migrations')
 plans = []
 if os.path.isdir(plans_dir):
     for fn in sorted(os.listdir(plans_dir), reverse=True):
-        if not fn.endswith('.json'):
+        # selection-patterns.json shares this directory but is not a plan
+        if not fn.endswith('.json') or fn == 'selection-patterns.json':
             continue
         try:
             with open(os.path.join(plans_dir, fn), 'r') as f:
                 p = json.load(f)
+            if not isinstance(p, dict) or 'changes' not in p:
+                continue
             plans.append({
                 'id': p.get('id') or fn[:-5],
                 'name': p.get('name'),
@@ -3143,7 +3149,7 @@ import os
 import re
 
 plan_id = os.environ.get('PLAN_ID', '')
-if not re.match(r'^[A-Za-z0-9_-]+$', plan_id):
+if not re.match(r'^[A-Za-z0-9_-]+$', plan_id) or plan_id == 'selection-patterns':
     print(json.dumps({'success': False, 'error': 'Invalid plan id'}))
     raise SystemExit(0)
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
@@ -3363,9 +3369,14 @@ for dev in devices:
                 continue
             seen.add(key)
             os_port = ai_p2p.resolved_os_port(resolved, record.get(side + '_name', ''), port)
-            aliases = sorted(ai_p2p._port_aliases(port))
-            if os_port and os_port not in aliases:
-                aliases.append(os_port)
+            if os_port:
+                # Three-part X/Y/Z ports: _port_aliases would emit every
+                # candidate breakout lane; the group-fitted resolution is
+                # authoritative, so ship only the exact spelling + os port.
+                p_clean = str(port).strip().lower().replace(' ', '')
+                aliases = sorted({p_clean, os_port})
+            else:
+                aliases = sorted(ai_p2p._port_aliases(port))
             sheet = record.get('sheet_name', '') or ''
             m = SU_RE.search(sheet)
             entries.append({

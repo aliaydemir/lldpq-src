@@ -572,9 +572,10 @@
         '^A{rack2}-',            // TOR endpoint descriptions: A14-37-S1-DGX-01-C18:BMC
         'GB300-\\d+-{rack}-',    // tray/shelf descriptions: GB300-1-14-Tray-01:M1
         '^bond_\\d+_{rack}_',    // per-tray bonds: bond_1_14_1
-        '^[a-z-]+tor-\\d+-{rack}-', // peer-TOR descriptions on aggregation leafs
-        '(^|[^0-9]){rack}([^0-9]|$)' // generic: the token itself, delimited (works for any site)
+        '^[a-z-]+tor-\\d+-{rack}-' // peer-TOR descriptions on aggregation leafs
     ];
+    // Non-numeric tokens additionally get a generic delimited fallback pattern
+    // at apply time (see applyRackFilter) so any site's rack ids work out of the box.
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const $ = (id) => document.getElementById(id);
@@ -807,12 +808,17 @@
 
     function rowsOfMode() { return portRows.filter(r => r.managed === (mode === 'migrate')); }
 
-    function setMode(m) {
+    async function setMode(m) {
         if (m === mode) return;
+        if (portRows.some(r => r.checked) || Object.keys(mappings).length) {
+            const ok = await confirmAsync('Switching modes clears your current port selection and profile mappings. Continue?', 'Switch Mode');
+            if (!ok) return;
+        }
         mode = m;
         // Clean slate per mode: mixing first-assignments and migrations in one
         // plan is valid for the backend but confusing to review.
-        for (const r of portRows) r.checked = false;
+        for (const r of portRows) { r.checked = false; r.evidence = ''; }
+        if (portFilterRe && portFilterRe.rackMode) { portFilterRe = null; $('port-filter').value = ''; }
         mappings = {};
         activeProfiles = null;
         facetShapes = facetRacks = facetSUs = null;
@@ -833,8 +839,10 @@
         }
         return m;
     }
-    const designRackOf = r => r.design ? (r.design.peer_rack || r.design.rack || '') : '';
-    const designSUOf = r => r.design ? (r.design.su || '') : '';
+    // '(none)' keeps ports without a design join visible (and toggleable) when
+    // rack/SU facets are active, instead of silently vanishing.
+    const designRackOf = r => (r.design && (r.design.peer_rack || r.design.rack)) || '(none)';
+    const designSUOf = r => (r.design && r.design.su) ? 'SU' + r.design.su : '(none)';
 
     function facetChips(label, counts, activeSet, facetKey, max = 14) {
         if (counts.size < 2 && !activeSet) return '';
@@ -855,7 +863,7 @@
         let html = facetChips('Peer group', facetCounts(rows, r => r.shape), facetShapes, 'shape');
         if (rows.some(r => r.design)) {
             html += facetChips('Endpoint rack', facetCounts(rows, designRackOf), facetRacks, 'rack', 20);
-            html += facetChips('SU', facetCounts(rows, r => designSUOf(r) ? 'SU' + r.design.su : ''), facetSUs, 'su');
+            html += facetChips('SU', facetCounts(rows, designSUOf), facetSUs, 'su');
         }
         const numFilter = (id, val, ph) =>
             `<input type="number" id="${id}" class="search-input" style="width:64px;" placeholder="${ph}" value="${val}" oninput="onFacetRange('${id}', this.value)">`;
@@ -879,7 +887,7 @@
         const conf = {
             shape: { counts: () => facetCounts(rows, r => r.shape), get: () => facetShapes, set: v => facetShapes = v },
             rack: { counts: () => facetCounts(rows, designRackOf), get: () => facetRacks, set: v => facetRacks = v },
-            su: { counts: () => facetCounts(rows, r => designSUOf(r) ? 'SU' + r.design.su : ''), get: () => facetSUs, set: v => facetSUs = v },
+            su: { counts: () => facetCounts(rows, designSUOf), get: () => facetSUs, set: v => facetSUs = v },
         }[facetKey];
         if (!conf) return;
         const counts = conf.counts();
@@ -978,27 +986,40 @@
             await loadPorts();
             if (!portRows.length) return;
         }
-        // The token is a literal (rack id, hostname, pod...), not a regex
-        const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const esc2 = /^\d+$/.test(token) ? token.padStart(2, '0') : esc;
+        // The token is a literal (rack id, hostname, pod...), not a regex.
+        // Numeric tokens are normalized like the old integer input ('014' -> '14').
+        const numeric = /^\d+$/.test(token);
+        const norm = numeric ? String(parseInt(token, 10)) : token;
+        const esc = norm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const esc2 = numeric ? norm.padStart(2, '0') : esc;
+        // Replacer functions keep '$&'-style sequences in the token literal
         const pats = getRackPatterns().map(p => p
-            .replaceAll('{rack2}', esc2)
-            .replaceAll('{rack}', esc));
+            .replaceAll('{rack2}', () => esc2)
+            .replaceAll('{rack}', () => esc));
+        // Non-numeric tokens (grid rack ids, hostnames) get a generic delimited
+        // fallback; numeric racks keep the site patterns only, as before.
+        if (!numeric) pats.push(`(^|[^0-9A-Za-z])${esc}([^0-9A-Za-z]|$)`);
         const compiled = [];
         for (const p of pats) {
             try { compiled.push({ src: p, re: new RegExp(p, 'i') }); } catch (e) { /* skip bad pattern */ }
         }
-        let matched = 0;
+        let matched = 0, otherMode = 0;
         for (const r of portRows) {
             const hit = compiled.find(c => c.re.test(r.name) || c.re.test(r.desc));
             r.evidence = hit ? hit.src : '';
-            if (hit) matched++;
+            if (hit) (r.managed === (mode === 'migrate')) ? matched++ : otherMode++;
         }
         portFilterRe = { test: () => true, rackMode: true };  // visibility driven by evidence
         $('port-filter').value = pats.join(' | ');
         $('port-filter').classList.remove('bad');
         renderPortTable();
-        if (!matched) showAlert('No ports matched the selection patterns. Check "Selection Patterns" in the header, or use the facet chips below the filter row instead.', 'Pattern Filter');
+        if (!matched) {
+            showAlert(otherMode
+                ? `No ports matched in ${mode === 'migrate' ? 'Migrate' : 'Assign'} mode, but ${otherMode} port(s) matched in ` +
+                  `${mode === 'migrate' ? 'Assign' : 'Migrate'} mode - switch modes to see them.`
+                : 'No ports matched the selection patterns. Check "Selection Patterns" in the header, or use the facet chips below the filter row instead.',
+                'Pattern Filter');
+        }
     }
 
     function rowVisible(r) {
@@ -1006,7 +1027,7 @@
         if (activeProfiles && !activeProfiles.has(r.profile)) return false;
         if (facetShapes && !facetShapes.has(r.shape)) return false;
         if (facetRacks && !facetRacks.has(designRackOf(r))) return false;
-        if (facetSUs && !facetSUs.has(designSUOf(r) ? 'SU' + r.design.su : '')) return false;
+        if (facetSUs && !facetSUs.has(designSUOf(r))) return false;
         if (facetRanges.pmin !== '' && (r.peerNum == null || r.peerNum < +facetRanges.pmin)) return false;
         if (facetRanges.pmax !== '' && (r.peerNum == null || r.peerNum > +facetRanges.pmax)) return false;
         if (facetRanges.omin !== '' && (r.portNum == null || r.portNum < +facetRanges.omin)) return false;
@@ -1195,8 +1216,8 @@
             if (!r.checked) continue;
             const tgt = mappings[r.profile];
             if (!tgt || tgt === r.profile) { unmapped++; continue; }
-            // old:null = first-time assignment (no drift check on a profile-less port)
-            entries.push({ device: r.device, section: r.section, name: r.name, old: r.profile || null, new: tgt });
+            // old:'' = first-time assignment (drift guard: the port must still have NO profile)
+            entries.push({ device: r.device, section: r.section, name: r.name, old: r.profile || '', new: tgt });
         }
         const changes = {};
         for (const e of entries) {
@@ -1535,6 +1556,18 @@
                     let livePvid = null, status, cls;
                     if (live.__error) {
                         status = 'NO DATA - ' + live.__error; cls = 'st-warn'; warn++;
+                    } else if (!e.new) {
+                        // Removal entry: pass when the old access VLAN is gone
+                        if (!live[e.name]) {
+                            status = 'REMOVED (port not in bridge)'; cls = 'st-pass'; pass++;
+                        } else {
+                            livePvid = live[e.name].pvid;
+                            if (oi.vlan != null && livePvid === oi.vlan) {
+                                status = 'STILL ON OLD VLAN (deploy pending?)'; cls = 'st-fail'; warn++;
+                            } else {
+                                status = 'REMOVED'; cls = 'st-pass'; pass++;
+                            }
+                        }
                     } else if (expected == null) {
                         status = 'SKIP (target is not an access profile)'; cls = 'st-warn'; warn++;
                     } else if (!live[e.name]) {
@@ -1599,21 +1632,29 @@
     async function rollbackPlan() {
         if (!appliedPlan) return;
         const inverse = {};
-        let n = 0, removals = 0;
+        let n = 0, removals = 0, reassigns = 0;
         for (const [dev, rec] of Object.entries(appliedPlan.changes)) {
             for (const e of (rec.applied || [])) {
-                if (!e.new) continue; // entry was itself a removal; nothing to restore to
+                if (!e.new && !e.old) continue; // no profile on either side: nothing to do
                 inverse[dev] = inverse[dev] || { interfaces: {}, bonds: {} };
-                // No original profile = first-time assignment: rollback removes the key
-                inverse[dev][e.section][e.name] = { old: e.new, new: e.old || '' };
+                if (!e.new) {
+                    // Entry was a removal: rollback re-assigns the removed profile
+                    // (old:'' = drift guard, the port must still be profile-less)
+                    inverse[dev][e.section][e.name] = { old: '', new: e.old };
+                    reassigns++;
+                } else {
+                    // No original profile = first-time assignment: rollback removes the key
+                    inverse[dev][e.section][e.name] = { old: e.new, new: e.old || '' };
+                    if (!e.old) removals++;
+                }
                 n++;
-                if (!e.old) removals++;
             }
         }
         if (!n) { showAlert('This plan has no reversible entries.', 'Rollback'); return; }
         const ok = await confirmAsync(
             `Revert ${n} port-profile change(s)?` +
             (removals ? `\n(${removals} of them were first-time assignments; rollback removes their sw_port_profile again.)` : '') +
+            (reassigns ? `\n(${reassigns} of them were removals; rollback re-assigns the removed profile.)` : '') +
             `\n\nAfter the rollback is written you still need to Diff + Deploy it.`,
             'Confirm Rollback');
         if (!ok) return;

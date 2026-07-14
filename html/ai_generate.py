@@ -297,12 +297,13 @@ def validate_p2p(connections):
     warnings = list(connections.get("warnings", [])) if isinstance(connections, dict) else []
     issues = []
 
-    port_owner = {}       # (device_key, os_port) -> first row_number using it
+    port_owner = {}       # (device_key, os_port) -> (sheet_name, row_number)
     edge_seen = {}        # frozenset endpoint keys -> first row_number
     unresolved = 0
 
     for record in records:
         row = record.get("row_number", "?")
+        sheet = record.get("sheet_name", "")
         endpoints = []
         for side in ("source", "dest"):
             dev = _clean(record.get(side + "_name"))
@@ -315,16 +316,19 @@ def validate_p2p(connections):
             # port(OS)/breakout mismatch: a breakout child port on a device whose
             # base swpN is also cabled as a whole (design inconsistency).
             key = (dev_key, os_port)
-            if key in port_owner and port_owner[key] != row:
+            if key in port_owner and port_owner[key] != (sheet, row):
+                first_sheet, first_row = port_owner[key]
+                def _loc(s, r):
+                    return ("'%s' row %s" % (s, r)) if s else ("row %s" % r)
                 issues.append({
                     "severity": "error",
                     "kind": "duplicate-port",
-                    "message": "%s port %s (%s) used by rows %s and %s"
-                    % (dev, raw_port, os_port, port_owner[key], row),
+                    "message": "%s port %s (%s) used by %s and %s"
+                    % (dev, raw_port, os_port, _loc(first_sheet, first_row), _loc(sheet, row)),
                     "device": dev, "port": raw_port, "row": row,
                 })
             else:
-                port_owner.setdefault(key, row)
+                port_owner.setdefault(key, (sheet, row))
 
         if record.get("unresolved"):
             unresolved += 1
