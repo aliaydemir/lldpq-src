@@ -220,7 +220,10 @@ def _map_assignment_blocks(values):
                 cur = None
             if cur is None:
                 cur = {}
-            cur.setdefault(kind, idx)
+            if kind == "hostname" and "hostname" in cur:
+                cur.setdefault("hostname2", idx)
+            else:
+                cur.setdefault(kind, idx)
         elif cur is not None:
             cur.setdefault(kind, idx)
     if cur is not None:
@@ -303,7 +306,8 @@ def _assignment_from_block(values, block, stats):
 
 def _assignment_row(values, blocks, hosts, sheet_name, stats):
     for block in blocks:
-        hostname = _cell(values, block, "hostname") or _cell(values, block, "device")
+        hostname = (_cell(values, block, "hostname") or _cell(values, block, "hostname2")
+                    or _cell(values, block, "device"))
         if not hostname or _is_placeholder(hostname) or _looks_like_header_repeat(hostname):
             continue
         assignment = _assignment_from_block(values, block, stats)
@@ -427,13 +431,15 @@ def _map_fabric(values):
             col_map.setdefault("customer", idx)
         elif _is_hostname_header(sq):
             col_map.setdefault("hostname", idx)
-        elif _is_device_header(sq):
+        elif _is_device_header(sq) or sq == "switch":
             col_map.setdefault("device", idx)
         elif sq == "role":
             col_map.setdefault("role", idx)
-        elif sq in ("managementip", "mgmtip"):
+        elif sq in ("managementip", "mgmtip", "mgmtipv4",
+                    "oob", "oobip", "oobmgmt", "oobmgmtip"):
             col_map.setdefault("mgmt_ip", idx)
-        elif sq in ("loopback", "loopbackip"):
+        elif (sq in ("loopback", "loopbackip")
+              or sq.startswith("loopback") or sq.startswith("looback")):
             col_map.setdefault("loopback_ip", idx)
         elif sq in ("asn", "bgpasn", "asnumber", "asnum"):
             col_map.setdefault("asn", idx)
@@ -448,7 +454,8 @@ def _map_fabric(values):
 
 
 def _fabric_row(values, col_map, records, sheet_name, stats):
-    hostname = _cell(values, col_map, "hostname") or _cell(values, col_map, "device")
+    hostname = (_cell(values, col_map, "hostname") or _cell(values, col_map, "device")
+                or _cell(values, col_map, "customer"))
     if not hostname or _is_placeholder(hostname) or _looks_like_header_repeat(hostname):
         return
     record = {"hostname": hostname, "sheet": sheet_name}
@@ -552,7 +559,7 @@ _RAIL_RE = re.compile(r"^rail\d+$")
 
 
 def _map_wide_host(values):
-    host_col = device_col = global_mask = None
+    host_col = device_col = host_fallback_col = global_mask = None
     ip_cols = []       # [(idx, header_text, stem)]
     mask_cols = {}     # stem -> idx
     for idx, raw in enumerate(values):
@@ -563,6 +570,8 @@ def _map_wide_host(values):
         if _is_hostname_header(sq):
             if host_col is None:
                 host_col = idx
+            elif host_fallback_col is None:
+                host_fallback_col = idx
         elif _is_device_header(sq):
             if device_col is None:
                 device_col = idx
@@ -580,19 +589,26 @@ def _map_wide_host(values):
         host_col = device_col
     if host_col is None or not ip_cols:
         return {}
-    return {"host": host_col, "ips": ip_cols, "masks": mask_cols,
-            "global_mask": global_mask}
+    result = {"host": host_col, "ips": ip_cols, "masks": mask_cols,
+              "global_mask": global_mask}
+    if host_fallback_col is not None:
+        result["host_fallback"] = host_fallback_col
+    return result
 
 
 def _parse_wide_host_sheet(sheet_name, rows, header_idx, wide_map):
     hosts = {}
     stats = _SheetStats(sheet_name)
     host_col = wide_map["host"]
+    host_fallback_col = wide_map.get("host_fallback")
     for row_idx in range(header_idx + 1, len(rows)):
         values = rows[row_idx]
         if not values or host_col >= len(values):
             continue
         hostname = _clean_value(values[host_col])
+        if (not hostname or _is_placeholder(hostname)) and host_fallback_col is not None:
+            if host_fallback_col < len(values):
+                hostname = _clean_value(values[host_fallback_col])
         if not hostname or _is_placeholder(hostname) or _looks_like_header_repeat(hostname):
             continue
         assignments = []

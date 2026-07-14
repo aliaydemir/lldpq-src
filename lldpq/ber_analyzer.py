@@ -29,6 +29,12 @@ except Exception:
     def canonical(_n):
         return _n
 
+try:
+    from lldp_report import parse_lldp_report
+    _HAVE_LLDP_REPORT = True
+except Exception:
+    _HAVE_LLDP_REPORT = False
+
 class BERGrade(Enum):
     """BER quality grades"""
     EXCELLENT = "excellent"
@@ -1170,6 +1176,20 @@ class BERAnalyzer:
             summary = self.get_ber_summary()
         if anomalies is None:
             anomalies = self.detect_ber_anomalies(summary)
+
+        lldp_neighbor: Dict[tuple, tuple] = {}
+        lldp_ini = os.path.join(self.data_dir, ".pipeline-inputs", "lldp_results.ini")
+        if _HAVE_LLDP_REPORT and os.path.exists(lldp_ini):
+            try:
+                with open(lldp_ini, encoding="utf-8") as _f:
+                    _report = parse_lldp_report(_f.read())
+                for _row in _report.rows:
+                    lldp_neighbor[(_row.local_device, _row.local_port)] = (
+                        _row.actual_device,
+                        _row.actual_port,
+                    )
+            except Exception:
+                pass
         expected_hosts = getattr(self, 'coverage_expected_hosts', None)
         current_hosts = getattr(self, 'coverage_current_hosts', None)
         coverage_attrs = ''
@@ -1424,15 +1444,17 @@ class BERAnalyzer:
                     <tr>
                         <th class="sortable" data-column="0" data-type="string">Device <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="1" data-type="port">Interface <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="2" data-type="ber-status">Status <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="3" data-type="ber-value">Frame Error Density <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="4" data-type="ber-value">Physical BER <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="5" data-type="ber-value">Effective BER <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="6" data-type="number">PHY Symbol Δ / Total <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="7" data-type="number">Δ Pkt <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="8" data-type="number">Δ RX Err <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="9" data-type="number">Δ TX Err <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="10" data-type="time">Updated / Window <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="2" data-type="string">Neighbor Device <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="3" data-type="port">Neighbor Port <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="4" data-type="ber-status">Status <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="5" data-type="ber-value">Frame Error Density <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="6" data-type="ber-value">Physical BER <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="7" data-type="ber-value">Effective BER <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="8" data-type="number">PHY Symbol Δ / Total <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="9" data-type="number">Δ Pkt <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="10" data-type="number">Δ RX Err <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="11" data-type="number">Δ TX Err <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="12" data-type="time">Updated / Window <span class="sort-arrow"></span></th>
                     </tr>
                 </thead>
                 <tbody id="ber-data">
@@ -1523,6 +1545,10 @@ class BERAnalyzer:
             device_key = html.escape(str(device), quote=True)
             port_key = html.escape(str(port_name), quote=True)
 
+            nbr = lldp_neighbor.get((device, interface))
+            nbr_device_display = canonical(nbr[0]) if nbr else "—"
+            nbr_port_display = nbr[1] if nbr else "—"
+
             # Numeric sort keys so composite/text cells sort correctly.
             sym_sort = str(sym_delta) if isinstance(sym_delta, int) else ''
             try:
@@ -1549,6 +1575,8 @@ class BERAnalyzer:
                 <tr class="ber-row" data-device-key="{device_key}" data-status="{status.lower()}" data-port="{port_key}" onclick="toggleBerDetails(this)">
                     <td>{canonical(device)}</td>
                     <td>{interface}</td>
+                    <td>{nbr_device_display}</td>
+                    <td>{nbr_port_display}</td>
                     <td><span class="{badge_class}">{status}</span></td>
                     <td>{ber_display}</td>
                     <td>{raw_phy_display}</td>
@@ -1573,7 +1601,7 @@ class BERAnalyzer:
                     "collection."
                 )
             html_content += f"""
-                <tr class="empty-row"><td colspan="11">{empty_message}</td></tr>
+                <tr class="empty-row"><td colspan="13">{empty_message}</td></tr>
 """
 
         html_content += f"""
