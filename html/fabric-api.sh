@@ -3160,6 +3160,234 @@ except Exception as e:
 PYTHON
 }
 
+# Shared selection patterns for the Fabric Migration wizard. Stored next to
+# the migration plans so they are per-project (per ANSIBLE_DIR) and shared
+# across operators, instead of the old per-browser localStorage copy.
+get_selection_patterns() {
+    python3 << 'PYTHON'
+import json
+import os
+
+ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+path = os.path.join(ansible_dir, '.migrations', 'selection-patterns.json')
+patterns = None
+try:
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = data.get('patterns')
+    if isinstance(data, list):
+        patterns = [str(p) for p in data if isinstance(p, str) and p.strip()]
+except (OSError, ValueError):
+    pass
+print(json.dumps({'success': True, 'patterns': patterns}))
+PYTHON
+}
+
+save_selection_patterns() {
+    acquire_lock
+    read -r POST_DATA
+    export POST_DATA
+    python3 << 'PYTHON'
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+
+def fail(msg):
+    print(json.dumps({'success': False, 'error': msg}))
+    sys.exit(0)
+
+
+try:
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
+except ValueError:
+    fail('Invalid JSON payload')
+
+patterns = data.get('patterns')
+if not isinstance(patterns, list):
+    fail('patterns must be a list')
+clean = []
+for p in patterns:
+    if not isinstance(p, str):
+        fail('patterns must be strings')
+    p = p.strip()
+    if not p:
+        continue
+    if len(p) > 300:
+        fail('pattern too long (max 300 chars)')
+    clean.append(p)
+if len(clean) > 100:
+    fail('too many patterns (max 100)')
+
+ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+mig_dir = os.path.join(ansible_dir, '.migrations')
+path = os.path.join(mig_dir, 'selection-patterns.json')
+try:
+    if not clean:
+        # Empty list = reset to built-in defaults
+        if os.path.exists(path):
+            os.unlink(path)
+        print(json.dumps({'success': True, 'patterns': None}))
+        sys.exit(0)
+    os.makedirs(mig_dir, exist_ok=True)
+    _fd, _path = tempfile.mkstemp(dir=mig_dir, suffix='.tmp')
+    os.fchmod(_fd, 0o644)  # mkstemp defaults to 0600
+    with os.fdopen(_fd, 'w') as f:
+        json.dump({'patterns': clean}, f, indent=2)
+    shutil.move(_path, path)
+except OSError as e:
+    fail(f'Cannot write patterns: {e}')
+print(json.dumps({'success': True, 'patterns': clean}))
+PYTHON
+}
+
+# Port -> design-metadata join for the Fabric Migration facet filters.
+# Reads the published active P2P design (active-p2p.json, uploaded via the
+# Ask-AI design flow) and returns per-device port entries carrying
+# rack / RU / SU / peer straight from the cabling workbook, so ports can be
+# grouped by physical location instead of description regexes. Best-effort:
+# devices without design rows simply return empty lists.
+get_p2p_enrichment() {
+    read -r POST_DATA
+    export POST_DATA
+    WEB_ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
+    export WEB_ROOT_DIR
+    python3 << 'PYTHON'
+import json
+import os
+import re
+import sys
+
+
+def fail(msg, **extra):
+    out = {'success': False, 'error': msg}
+    out.update(extra)
+    print(json.dumps(out))
+    sys.exit(0)
+
+
+try:
+    data = json.loads(os.environ.get('POST_DATA') or '{}')
+except ValueError:
+    fail('Invalid JSON payload')
+
+devices = data.get('devices')
+if not isinstance(devices, list) or not devices:
+    fail('No devices provided')
+if len(devices) > 500:
+    fail('Too many devices')
+NAME_RE = re.compile(r'^[A-Za-z0-9_.-]+$')
+devices = [str(d) for d in devices]
+for d in devices:
+    if not NAME_RE.match(d):
+        fail(f'Invalid device name: {d}')
+
+web_root = os.environ.get('WEB_ROOT_DIR', '')
+if web_root and web_root not in sys.path:
+    sys.path.insert(0, web_root)
+try:
+    import ai_p2p
+except Exception as e:
+    fail(f'P2P module unavailable: {e}')
+
+lldpq_dir = ''
+try:
+    with open('/etc/lldpq.conf') as f:
+        for line in f:
+            if line.startswith('LLDPQ_DIR='):
+                lldpq_dir = line.strip().split('=', 1)[1]
+                break
+except OSError:
+    pass
+lldpq_dir = lldpq_dir or '/home/lldpq/lldpq'
+
+design_path = None
+for base in (os.path.join(lldpq_dir, 'monitor-results'),
+             os.path.join(web_root, 'monitor-results')):
+    p = os.path.join(base, 'active-p2p.json')
+    if os.path.isfile(p):
+        design_path = p
+        break
+if not design_path:
+    fail('no active P2P design uploaded', no_design=True)
+
+try:
+    conns = ai_p2p.load_connections(design_path)
+except Exception as e:
+    fail(f'active P2P design could not be read: {e}')
+
+# Device aliases (design name <-> live name), both directions, same file the
+# Ask-AI lookups use.
+alias_fwd = {}
+alias_rev = {}
+try:
+    with open(os.path.join(web_root, 'display-aliases.json')) as fh:
+        _al = (json.load(fh) or {}).get('devices') or {}
+    for k, v in _al.items():
+        if k and v:
+            alias_fwd[str(k).strip().lower()] = str(v).strip()
+            alias_rev[str(v).strip().lower()] = str(k).strip()
+except Exception:
+    pass
+
+# One pass over the design: device_key -> [(side, peer_side, record)]
+index = {}
+for record in ai_p2p._records_of(conns):
+    for side, peer in (('source', 'dest'), ('dest', 'source')):
+        name = record.get(side + '_name', '')
+        if not name:
+            continue
+        for k in ai_p2p._device_keys(name):
+            index.setdefault(k, []).append((side, peer, record))
+
+resolved = ai_p2p.resolve_port_map(conns)
+SU_RE = re.compile(r'\bSU\s*[-_]?(\d+)', re.IGNORECASE)
+
+out = {}
+for dev in devices:
+    low = dev.strip().lower()
+    candidates = {low}
+    for alt in (alias_fwd.get(low), alias_rev.get(low)):
+        if alt:
+            candidates.add(alt.strip().lower())
+    entries = []
+    seen = set()
+    for cand in candidates:
+        for side, peer, record in index.get(cand, []):
+            port = record.get(side + '_port', '')
+            key = ai_p2p._port_key(port)
+            if key in seen:
+                continue
+            seen.add(key)
+            os_port = ai_p2p.resolved_os_port(resolved, record.get(side + '_name', ''), port)
+            aliases = sorted(ai_p2p._port_aliases(port))
+            if os_port and os_port not in aliases:
+                aliases.append(os_port)
+            sheet = record.get('sheet_name', '') or ''
+            m = SU_RE.search(sheet)
+            entries.append({
+                'port': port,
+                'os_port': os_port,
+                'aliases': aliases,
+                'rack': record.get(side + '_rack', ''),
+                'ru': record.get(side + '_ru', ''),
+                'peer': record.get(peer + '_name', ''),
+                'peer_port': record.get(peer + '_port', ''),
+                'peer_rack': record.get(peer + '_rack', ''),
+                'peer_ru': record.get(peer + '_ru', ''),
+                'su': m.group(1) if m else '',
+                'sheet': sheet,
+            })
+    out[dev] = entries
+
+print(json.dumps({'success': True, 'devices': out,
+                  'design': os.path.basename(design_path)}))
+PYTHON
+}
+
 # Per-device live-state table (ARP/MAC/routes per VRF) collected by
 # fabric-scan.sh into $LLDPQ_DIR/monitor-results/fabric-tables — that tree is
 # not under WEB_ROOT, so the Fabric Migration verify step reads it through
@@ -3235,6 +3463,15 @@ case "$ACTION" in
         ;;
     "get-fabric-table")
         get_fabric_table
+        ;;
+    "get-selection-patterns")
+        get_selection_patterns
+        ;;
+    "save-selection-patterns")
+        save_selection_patterns
+        ;;
+    "get-p2p-enrichment")
+        get_p2p_enrichment
         ;;
     "get-bgp-profiles")
         get_bgp_profiles

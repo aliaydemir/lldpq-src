@@ -342,20 +342,25 @@
 
         <div class="panel">
             <div class="panel-header">
-                <span class="panel-title">Ports &amp; Bonds (with a port profile)</span>
+                <span class="panel-title">Ports &amp; Bonds</span>
+                <div style="display:flex; gap:6px; align-items:center;">
+                    <span class="chip on" id="mode-migrate" onclick="setMode('migrate')" title="Ports that already carry a sw_port_profile">Migrate</span>
+                    <span class="chip" id="mode-assign" onclick="setMode('assign')" title="Ports without a sw_port_profile - set their first profile">Assign</span>
+                </div>
                 <div class="select-actions">
                     <a onclick="setFilteredChecked(true)">Select filtered</a>
                     <a onclick="setFilteredChecked(false)">Clear filtered</a>
                 </div>
             </div>
             <div class="filter-row">
-                <label>Rack:</label>
-                <input type="text" id="rack-input" class="search-input" placeholder="e.g. 14" style="width:70px;">
-                <button class="btn btn-secondary" onclick="applyRackFilter()">Apply rack patterns</button>
+                <label>Rack / token:</label>
+                <input type="text" id="rack-input" class="search-input" placeholder="e.g. 14 or S120-AE-2" style="width:130px;">
+                <button class="btn btn-secondary" onclick="applyRackFilter()">Apply patterns</button>
                 <label>Name/description filter (regex):</label>
                 <input type="text" id="port-filter" class="search-input" placeholder="e.g. ^A14-|bond_1_14_" style="flex:1; min-width:180px;" oninput="onPortFilterInput()">
                 <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearPortFilter()">clear</a>
             </div>
+            <div id="facet-box" style="display:none;"></div>
             <div class="filter-row" id="profile-chips"></div>
             <div class="panel-body" style="max-height: 420px;">
                 <table class="tbl">
@@ -373,7 +378,7 @@
     </div>
 
     <div class="step-foot">
-        <span class="foot-note">Only interfaces/bonds carrying a <span class="mono">sw_port_profile</span> can be migrated. L3 ports, bond members and unmanaged ports are excluded.</span>
+        <span class="foot-note"><b>Migrate</b> lists ports already carrying a <span class="mono">sw_port_profile</span>; <b>Assign</b> lists ports without one (first-time assignment). L3 ports, bond members and breakout parents are excluded.</span>
         <button class="btn btn-primary" onclick="goStep(2)">Next: Profile Mapping &rarr;</button>
     </div>
 </div>
@@ -519,12 +524,13 @@
 <!-- Rack patterns modal -->
 <div class="modal-overlay" id="patterns-modal" onclick="if(event.target===this) closePatternsModal()">
     <div class="modal">
-        <div class="modal-header">Rack Match Patterns</div>
+        <div class="modal-header">Selection Patterns <span style="font-size:11px; color:#888; font-weight:normal;">(shared per project)</span></div>
         <div class="modal-body" style="white-space:normal;">
             <p style="color:#888; font-size:12px; margin-bottom:10px;">
                 One regex per line, applied to interface/bond <b>names and descriptions</b>.
-                Placeholders: <span class="mono">{rack}</span> = rack number, <span class="mono">{rack2}</span> = zero-padded 2 digits.
-                These are site-specific naming conventions; adjust for your fabric.
+                Placeholders: <span class="mono">{rack}</span> = the token as typed (regex-escaped, so
+                <span class="mono">S120-AE-2</span> works), <span class="mono">{rack2}</span> = zero-padded to 2 digits
+                when the token is numeric. Patterns are saved on the server and shared by all admins of this project.
             </p>
             <textarea id="patterns-text" spellcheck="false"></textarea>
         </div>
@@ -543,22 +549,31 @@
     let deviceData = {};        // hostname -> get-device response
     let portProfiles = {};      // sw_port_profiles.yaml content (global)
     let vlanProfilesData = {};  // VLAN profile name -> summary (global)
-    let portRows = [];          // {device, section, name, desc, profile, checked, evidence}
+    let portRows = [];          // {device, section, name, desc, profile, managed, checked, evidence, peer, shape, peerNum, portNum, design}
     let activeProfiles = null;  // Set of profiles enabled via chips (null = all)
-    let mappings = {};          // source profile -> target profile
+    let mappings = {};          // source profile -> target profile ('' = no profile yet)
     let currentPlan = null;     // {name, changes:{dev:{interfaces:{},bonds:{}}}, entries:[...]}
     let appliedPlan = null;     // plan record after successful apply (or loaded plan)
-    let unmanagedCount = 0;
+    let excludedCount = 0;      // L3 / bond members / breakout parents (never listed)
+    let mode = 'migrate';       // 'migrate' (has profile) | 'assign' (no profile yet)
+    let serverPatterns = null;  // shared selection patterns from the server (null = defaults)
+    let design = null;          // P2P enrichment: hostname -> Map(port alias -> design entry)
+    let designName = '';        // active design file label
+    let facetShapes = null;     // Set of peer shapes enabled via chips (null = all)
+    let facetRacks = null;      // Set of endpoint racks (design) enabled via chips
+    let facetSUs = null;        // Set of SUs (design) enabled via chips
+    const facetRanges = { pmin: '', pmax: '', omin: '', omax: '' }; // peer# / port# bounds
 
     const DEPLOY_JOB_KEY = 'fabricMigration_activeJob';
-    const PATTERNS_KEY = 'fabricMigration_rackPatterns';
+    const PATTERNS_KEY = 'fabricMigration_rackPatterns'; // legacy per-browser copy, auto-migrated to the server
     const DEPLOY_POLL_INTERVAL = 2000;
     const DEPLOY_POLL_MAX_ERRORS = 5;
     const DEFAULT_RACK_PATTERNS = [
         '^A{rack2}-',            // TOR endpoint descriptions: A14-37-S1-DGX-01-C18:BMC
         'GB300-\\d+-{rack}-',    // tray/shelf descriptions: GB300-1-14-Tray-01:M1
         '^bond_\\d+_{rack}_',    // per-tray bonds: bond_1_14_1
-        '^[a-z-]+tor-\\d+-{rack}-' // peer-TOR descriptions on aggregation leafs
+        '^[a-z-]+tor-\\d+-{rack}-', // peer-TOR descriptions on aggregation leafs
+        '(^|[^0-9]){rack}([^0-9]|$)' // generic: the token itself, delimited (works for any site)
     ];
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -674,6 +689,25 @@
         return results;
     }
 
+    // ---------- Description tokenizer (generic, convention-tolerant) ----------
+    // Splits "peer:port" (dotfabric), "A14-37-S1-DGX-01-C18:BMC" (sferical) on
+    // the first ':'; otherwise strips a recognizable trailing port token
+    // ("g001-p9/1", "swloob01-49", "ufm01-bmc", "to-spine-s01-swp1s0").
+    function peerOf(desc) {
+        const d = String(desc || '').trim();
+        if (!d) return { peer: '', pport: '' };
+        const ci = d.indexOf(':');
+        if (ci > 0) return { peer: d.slice(0, ci).trim(), pport: d.slice(ci + 1).trim() };
+        const m = d.match(/^(.*?)[-_ ](p?\d+(?:\/\d+)*|swp\S+|eth\d\S*|bmc|mgmt\d*|ipmi|idrac|ilo)$/i);
+        if (m && m[1]) return { peer: m[1].trim(), pport: m[2] };
+        return { peer: d, pport: '' };
+    }
+    // Canonical endpoint shape: digit runs collapsed, so g001/g072 -> "g#",
+    // GB300-1-14-Tray-01 -> "GB#-#-#-Tray-#". Groups like endpoints together
+    // regardless of the site's naming convention.
+    function peerShape(peer) { return peer ? peer.replace(/\d+/g, '#') : '(no description)'; }
+    function firstNum(s) { const m = String(s || '').match(/\d+/); return m ? parseInt(m[0], 10) : null; }
+
     async function loadPorts() {
         const hosts = [...selectedDevices];
         if (!hosts.length) { showAlert('Select at least one device.', 'No Selection'); return; }
@@ -686,35 +720,175 @@
                 } catch (e) { return [h, { success: false, error: e.message }]; }
             });
             portRows = [];
-            unmanagedCount = 0;
+            excludedCount = 0;
             const failed = [];
             for (const [h, data] of results) {
                 if (!data.success) { failed.push(h); continue; }
                 deviceData[h] = data;
                 if (data.port_profiles && Object.keys(data.port_profiles).length) portProfiles = data.port_profiles;
                 if (data.vlan_profiles && Object.keys(data.vlan_profiles).length) vlanProfilesData = data.vlan_profiles;
+                const cfgAll = data.config || {};
+                // Not assignable: bond members, BGP-unnumbered peer ports, breakout parents
+                const bondMembers = new Set();
+                for (const bcfg of Object.values(cfgAll.bonds || {})) {
+                    if (!bcfg || typeof bcfg !== 'object') continue;
+                    for (const mName of (bcfg.bond_members || bcfg.members || [])) bondMembers.add(String(mName));
+                }
+                const bgpPeers = new Set();
+                for (const vrf of Object.values(cfgAll.vrfs || {})) {
+                    for (const p of (((vrf || {}).bgp || {}).peers || [])) bgpPeers.add(String(p));
+                }
                 for (const section of ['interfaces', 'bonds']) {
-                    const node = (data.config || {})[section] || {};
+                    const node = cfgAll[section] || {};
                     for (const [name, cfg] of Object.entries(node)) {
                         if (!cfg || typeof cfg !== 'object') continue;
+                        let managed;
                         if (typeof cfg.sw_port_profile === 'string' && cfg.sw_port_profile) {
-                            portRows.push({ device: h, section, name, desc: cfg.description || '',
-                                            profile: cfg.sw_port_profile, checked: false, evidence: '' });
+                            managed = true;
+                        } else if (cfg.ip || cfg.vrf ||
+                                   (section === 'interfaces' && (cfg.breakout ||
+                                        bondMembers.has(name) || bgpPeers.has(name) ||
+                                        /^(lo$|eth\d|mgmt)/.test(name)))) {
+                            excludedCount++; // L3 / member / breakout parent / mgmt: not profile material
+                            continue;
                         } else {
-                            unmanagedCount++;
+                            managed = false; // assignable: no profile yet
                         }
+                        const t = peerOf(cfg.description || '');
+                        portRows.push({ device: h, section, name, desc: cfg.description || '',
+                                        profile: managed ? cfg.sw_port_profile : '', managed,
+                                        checked: false, evidence: '',
+                                        peer: t.peer, shape: peerShape(t.peer),
+                                        peerNum: firstNum(t.peer), portNum: firstNum(name),
+                                        design: null });
                     }
                 }
             }
             portRows.sort((a, b) => a.device.localeCompare(b.device) ||
                 a.name.localeCompare(b.name, undefined, { numeric: true }));
             activeProfiles = null;
+            facetShapes = facetRacks = facetSUs = null;
+            facetRanges.pmin = facetRanges.pmax = facetRanges.omin = facetRanges.omax = '';
+            await loadDesignFacets(hosts);
             renderProfileChips();
+            renderFacets();
             renderPortTable();
             if (failed.length) showAlert('Failed to load: ' + failed.join(', '), 'Partial Load');
         } finally {
             showLoading(false);
         }
+    }
+
+    // ---------- P2P design enrichment (optional) ----------
+    // Joins loaded ports against the published active P2P design so ports can
+    // be faceted by physical rack / SU / peer even when descriptions carry no
+    // usable token. Silent no-op when no design is uploaded.
+    async function loadDesignFacets(hosts) {
+        design = null; designName = '';
+        try {
+            const resp = await fetch('/fabric-api.sh?action=get-p2p-enrichment', {
+                method: 'POST', body: JSON.stringify({ devices: hosts })
+            });
+            const data = await resp.json();
+            if (!data.success) return;
+            designName = data.design || '';
+            design = {};
+            for (const [dev, entries] of Object.entries(data.devices || {})) {
+                const m = new Map();
+                for (const e of entries) for (const a of (e.aliases || [])) if (!m.has(a)) m.set(a, e);
+                design[dev] = m;
+            }
+            for (const r of portRows) {
+                const m = design[r.device];
+                if (m) r.design = m.get(r.name.toLowerCase()) || null;
+            }
+        } catch (e) { design = null; /* enrichment is best-effort */ }
+    }
+
+    function rowsOfMode() { return portRows.filter(r => r.managed === (mode === 'migrate')); }
+
+    function setMode(m) {
+        if (m === mode) return;
+        mode = m;
+        // Clean slate per mode: mixing first-assignments and migrations in one
+        // plan is valid for the backend but confusing to review.
+        for (const r of portRows) r.checked = false;
+        mappings = {};
+        activeProfiles = null;
+        facetShapes = facetRacks = facetSUs = null;
+        $('mode-migrate').classList.toggle('on', mode === 'migrate');
+        $('mode-assign').classList.toggle('on', mode === 'assign');
+        renderProfileChips();
+        renderFacets();
+        renderPortTable();
+        goStepRefresh();
+    }
+
+    // ---------- Facets (derived from data, not site conventions) ----------
+    function facetCounts(rows, keyFn) {
+        const m = new Map();
+        for (const r of rows) {
+            const k = keyFn(r);
+            if (k) m.set(k, (m.get(k) || 0) + 1);
+        }
+        return m;
+    }
+    const designRackOf = r => r.design ? (r.design.peer_rack || r.design.rack || '') : '';
+    const designSUOf = r => r.design ? (r.design.su || '') : '';
+
+    function facetChips(label, counts, activeSet, facetKey, max = 14) {
+        if (counts.size < 2 && !activeSet) return '';
+        let html = `<label>${label}:</label>`;
+        const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        for (const [v, n] of sorted.slice(0, max)) {
+            const on = !activeSet || activeSet.has(v);
+            html += `<span class="chip ${on ? 'on' : ''}" data-facet="${facetKey}" data-value="${escapeHtml(v)}">${escapeHtml(v)} (${n})</span>`;
+        }
+        if (sorted.length > max) html += `<span class="muted" style="font-size:11px;">+${sorted.length - max} more</span>`;
+        return `<div class="filter-row">${html}</div>`;
+    }
+
+    function renderFacets() {
+        const rows = rowsOfMode();
+        const box = $('facet-box');
+        if (!rows.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+        let html = facetChips('Peer group', facetCounts(rows, r => r.shape), facetShapes, 'shape');
+        if (rows.some(r => r.design)) {
+            html += facetChips('Endpoint rack', facetCounts(rows, designRackOf), facetRacks, 'rack', 20);
+            html += facetChips('SU', facetCounts(rows, r => designSUOf(r) ? 'SU' + r.design.su : ''), facetSUs, 'su');
+        }
+        const numFilter = (id, val, ph) =>
+            `<input type="number" id="${id}" class="search-input" style="width:64px;" placeholder="${ph}" value="${val}" oninput="onFacetRange('${id}', this.value)">`;
+        html += `<div class="filter-row">
+            <label>Peer #:</label>${numFilter('peer-num-min', facetRanges.pmin, 'min')} &ndash; ${numFilter('peer-num-max', facetRanges.pmax, 'max')}
+            <label style="margin-left:10px;">Port #:</label>${numFilter('port-num-min', facetRanges.omin, 'min')} &ndash; ${numFilter('port-num-max', facetRanges.omax, 'max')}
+            ${designName ? `<span class="muted" style="font-size:11px; margin-left:auto;">P2P design: ${escapeHtml(designName)} &middot; ${rows.filter(r => r.design).length}/${rows.length} ports matched</span>` : ''}
+        </div>`;
+        box.innerHTML = html;
+        box.style.display = 'block';
+    }
+
+    function onFacetRange(id, value) {
+        const key = { 'peer-num-min': 'pmin', 'peer-num-max': 'pmax', 'port-num-min': 'omin', 'port-num-max': 'omax' }[id];
+        facetRanges[key] = value.trim();
+        renderPortTable();
+    }
+
+    function toggleFacetChip(facetKey, value) {
+        const rows = rowsOfMode();
+        const conf = {
+            shape: { counts: () => facetCounts(rows, r => r.shape), get: () => facetShapes, set: v => facetShapes = v },
+            rack: { counts: () => facetCounts(rows, designRackOf), get: () => facetRacks, set: v => facetRacks = v },
+            su: { counts: () => facetCounts(rows, r => designSUOf(r) ? 'SU' + r.design.su : ''), get: () => facetSUs, set: v => facetSUs = v },
+        }[facetKey];
+        if (!conf) return;
+        const counts = conf.counts();
+        let active = conf.get();
+        if (!active) active = new Set(counts.keys());
+        active.has(value) ? active.delete(value) : active.add(value);
+        conf.set(active.size === counts.size ? null : active);
+        renderFacets();
+        renderPortTable();
     }
 
     function distinctProfiles(rows) {
@@ -724,7 +898,8 @@
     }
 
     function renderProfileChips() {
-        const counts = distinctProfiles(portRows);
+        const counts = distinctProfiles(rowsOfMode());
+        counts.delete(''); // assign-mode rows all share the empty profile
         let html = '<label>Current profile:</label>';
         for (const [p, n] of [...counts.entries()].sort()) {
             const on = !activeProfiles || activeProfiles.has(p);
@@ -734,7 +909,8 @@
     }
 
     function toggleProfileChip(p) {
-        const counts = distinctProfiles(portRows);
+        const counts = distinctProfiles(rowsOfMode());
+        counts.delete('');
         if (!activeProfiles) activeProfiles = new Set(counts.keys());
         activeProfiles.has(p) ? activeProfiles.delete(p) : activeProfiles.add(p);
         if (activeProfiles.size === counts.size) activeProfiles = null;
@@ -759,6 +935,7 @@
     function clearPortFilter() { $('port-filter').value = ''; onPortFilterInput(); }
 
     function getRackPatterns() {
+        if (Array.isArray(serverPatterns) && serverPatterns.length) return serverPatterns.slice();
         try {
             const saved = JSON.parse(localStorage.getItem(PATTERNS_KEY));
             if (Array.isArray(saved) && saved.length) return saved;
@@ -766,21 +943,47 @@
         return DEFAULT_RACK_PATTERNS.slice();
     }
 
+    // Load shared patterns from the server; one-time-migrate a legacy
+    // localStorage copy so existing installs keep their custom patterns.
+    async function loadSelectionPatterns() {
+        try {
+            const resp = await fetch('/fabric-api.sh?action=get-selection-patterns');
+            const data = await resp.json();
+            if (!data.success) return;
+            if (Array.isArray(data.patterns) && data.patterns.length) {
+                serverPatterns = data.patterns;
+                return;
+            }
+            let legacy = null;
+            try { legacy = JSON.parse(localStorage.getItem(PATTERNS_KEY)); } catch (e) { /* ignore */ }
+            if (Array.isArray(legacy) && legacy.length) {
+                const save = await fetch('/fabric-api.sh?action=save-selection-patterns', {
+                    method: 'POST', body: JSON.stringify({ patterns: legacy })
+                });
+                const saved = await save.json();
+                if (saved.success) serverPatterns = saved.patterns;
+            }
+        } catch (e) { /* offline fallback: localStorage/defaults via getRackPatterns() */ }
+    }
+
     async function applyRackFilter() {
-        const rack = parseInt($('rack-input').value, 10);
-        if (!rack && rack !== 0) { showAlert('Enter a rack number first.', 'Rack Filter'); return; }
-        // Convenience: auto-load ports if the user jumped straight to the rack filter
+        const token = $('rack-input').value.trim();
+        if (!token) { showAlert('Enter a rack number / token first (e.g. 14, S120-AE-2, g001).', 'Pattern Filter'); return; }
+        // Convenience: auto-load ports if the user jumped straight to the pattern filter
         if (!portRows.length) {
             if (!selectedDevices.size) {
-                showAlert('Select devices on the left first (the rack filter runs on their loaded ports).', 'Rack Filter');
+                showAlert('Select devices on the left first (the pattern filter runs on their loaded ports).', 'Pattern Filter');
                 return;
             }
             await loadPorts();
             if (!portRows.length) return;
         }
+        // The token is a literal (rack id, hostname, pod...), not a regex
+        const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const esc2 = /^\d+$/.test(token) ? token.padStart(2, '0') : esc;
         const pats = getRackPatterns().map(p => p
-            .replaceAll('{rack2}', String(rack).padStart(2, '0'))
-            .replaceAll('{rack}', String(rack)));
+            .replaceAll('{rack2}', esc2)
+            .replaceAll('{rack}', esc));
         const compiled = [];
         for (const p of pats) {
             try { compiled.push({ src: p, re: new RegExp(p, 'i') }); } catch (e) { /* skip bad pattern */ }
@@ -795,14 +998,33 @@
         $('port-filter').value = pats.join(' | ');
         $('port-filter').classList.remove('bad');
         renderPortTable();
-        if (!matched) showAlert('No ports matched the rack patterns. Check "Rack Patterns" in the header for your site conventions.', 'Rack Filter');
+        if (!matched) showAlert('No ports matched the selection patterns. Check "Selection Patterns" in the header, or use the facet chips below the filter row instead.', 'Pattern Filter');
     }
 
     function rowVisible(r) {
+        if (r.managed !== (mode === 'migrate')) return false;
         if (activeProfiles && !activeProfiles.has(r.profile)) return false;
+        if (facetShapes && !facetShapes.has(r.shape)) return false;
+        if (facetRacks && !facetRacks.has(designRackOf(r))) return false;
+        if (facetSUs && !facetSUs.has(designSUOf(r) ? 'SU' + r.design.su : '')) return false;
+        if (facetRanges.pmin !== '' && (r.peerNum == null || r.peerNum < +facetRanges.pmin)) return false;
+        if (facetRanges.pmax !== '' && (r.peerNum == null || r.peerNum > +facetRanges.pmax)) return false;
+        if (facetRanges.omin !== '' && (r.portNum == null || r.portNum < +facetRanges.omin)) return false;
+        if (facetRanges.omax !== '' && (r.portNum == null || r.portNum > +facetRanges.omax)) return false;
         if (portFilterRe && portFilterRe.rackMode) return !!r.evidence;
         if (portFilterRe) return portFilterRe.test(r.name) || portFilterRe.test(r.desc);
         return true;
+    }
+
+    function matchCellHtml(r) {
+        if (r.evidence) return escapeHtml(r.evidence);
+        if (!r.design) return '';
+        const d = r.design;
+        const parts = [];
+        if (d.peer_rack) parts.push(d.peer_rack + (d.peer_ru ? '/U' + d.peer_ru : ''));
+        if (d.su) parts.push('SU' + d.su);
+        if (!r.desc && d.peer) parts.unshift(d.peer + (d.peer_port ? ':' + d.peer_port : ''));
+        return escapeHtml(parts.join(' · '));
     }
 
     function renderPortTable() {
@@ -815,14 +1037,32 @@
                 <td>${escapeHtml(r.device)}</td>
                 <td class="mono">${escapeHtml(r.name)}${r.section === 'bonds' ? ' <span class="muted">(bond)</span>' : ''}</td>
                 <td class="mono muted">${escapeHtml(r.desc)}</td>
-                <td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>
-                <td class="mono muted" style="font-size:10.5px;">${escapeHtml(r.evidence)}</td>
+                <td>${r.managed ? `<span class="pbadge p-cur">${escapeHtml(r.profile)}</span>` : '<span class="muted" style="font-size:11px;">(none)</span>'}</td>
+                <td class="mono muted" style="font-size:10.5px;">${matchCellHtml(r)}</td>
             </tr>`;
         }
+        const modeRows = rowsOfMode();
+        const otherCount = portRows.length - modeRows.length;
+        let empty;
+        if (!portRows.length) {
+            empty = 'Select devices on the left and click "Load Ports".';
+        } else if (!modeRows.length) {
+            empty = mode === 'migrate'
+                ? `No ports carry a <span class="mono">sw_port_profile</span> yet on the selected devices.` +
+                  (otherCount ? ` ${otherCount} unassigned port(s) are waiting for their first profile &mdash; ` +
+                  `<a style="color:#4fc3f7; cursor:pointer;" onclick="setMode('assign')">switch to Assign mode</a>.` : '')
+                : 'Every port on the selected devices already carries a profile. Use Migrate mode to change them.';
+        } else {
+            empty = 'No ports match the current filters.';
+        }
         $('port-table-body').innerHTML = html ||
-            `<tr><td colspan="6" class="muted" style="padding:20px;">${portRows.length ? 'No ports match the current filters.' : 'Select devices on the left and click "Load Ports".'}</td></tr>`;
-        $('unmanaged-note').textContent = unmanagedCount
-            ? `${unmanagedCount} interface(s)/bond(s) without sw_port_profile (L3 / bond members / unmanaged) are not shown.` : '';
+            `<tr><td colspan="6" class="muted" style="padding:20px;">${empty}</td></tr>`;
+        const notes = [];
+        if (otherCount) notes.push(mode === 'migrate'
+            ? `${otherCount} port(s) without sw_port_profile are in Assign mode.`
+            : `${otherCount} port(s) already carrying a profile are in Migrate mode.`);
+        if (excludedCount) notes.push(`${excludedCount} interface(s)/bond(s) excluded (L3 / bond members / breakout parents / mgmt).`);
+        $('unmanaged-note').textContent = notes.join('  ');
         updateStep1Cards();
     }
 
@@ -833,7 +1073,7 @@
 
     function updateStep1Cards() {
         $('c1-devices').textContent = selectedDevices.size;
-        $('c1-ports').textContent = portRows.length;
+        $('c1-ports').textContent = rowsOfMode().length;
         const checked = portRows.filter(r => r.checked);
         $('c1-checked').textContent = checked.length;
         $('c1-profiles').textContent = distinctProfiles(checked).size;
@@ -872,15 +1112,15 @@
         for (const [src, n] of [...counts.entries()].sort()) {
             const si = profileInfo(src);
             const devs = new Set(checked.filter(r => r.profile === src).map(r => r.device));
-            let opts = '<option value="">(keep unchanged)</option>';
+            let opts = `<option value="">${src ? '(keep unchanged)' : '(no profile)'}</option>`;
             for (const p of allProfiles) {
                 if (p === src) continue;
                 opts += `<option value="${escapeHtml(p)}" ${mappings[src] === p ? 'selected' : ''}>${escapeHtml(p)}</option>`;
             }
             const tgt = mappings[src];
             html += `<div class="map-row">
-                <span class="pbadge p-old">${escapeHtml(src)}</span>
-                <span class="muted" style="font-size:11px;">${si.vlan != null ? 'vlan ' + si.vlan + ' &middot; ' + escapeHtml(si.vrf || '') : escapeHtml(si.mode)}</span>
+                <span class="pbadge ${src ? 'p-old' : 'p-cur'}">${src ? escapeHtml(src) : '(no profile)'}</span>
+                <span class="muted" style="font-size:11px;">${src ? (si.vlan != null ? 'vlan ' + si.vlan + ' &middot; ' + escapeHtml(si.vrf || '') : escapeHtml(si.mode)) : 'first-time assignment'}</span>
                 <span class="arrow">&rarr;</span>
                 <select data-src="${escapeHtml(src)}">${opts}</select>
                 <span class="map-info" id="mapinfo-${escapeHtml(src)}">${tgt ? targetInfoHtml(tgt) : ''}</span>
@@ -955,7 +1195,8 @@
             if (!r.checked) continue;
             const tgt = mappings[r.profile];
             if (!tgt || tgt === r.profile) { unmapped++; continue; }
-            entries.push({ device: r.device, section: r.section, name: r.name, old: r.profile, new: tgt });
+            // old:null = first-time assignment (no drift check on a profile-less port)
+            entries.push({ device: r.device, section: r.section, name: r.name, old: r.profile || null, new: tgt });
         }
         const changes = {};
         for (const e of entries) {
@@ -974,7 +1215,7 @@
         // group by device+old+new
         const groups = new Map();
         for (const e of currentPlan.entries) {
-            const k = `${e.device}|${e.old}|${e.new}`;
+            const k = `${e.device}|${e.old || ''}|${e.new}`;
             if (!groups.has(k)) groups.set(k, []);
             groups.get(k).push(e.name);
         }
@@ -982,10 +1223,13 @@
         for (const [k, names] of groups) {
             const [dev, oldP, newP] = k.split('|');
             const shown = names.slice(0, 8).map(escapeHtml).join(', ') + (names.length > 8 ? ` &hellip; +${names.length - 8} more` : '');
+            const oldBadge = oldP
+                ? `<span class="pbadge p-old">${escapeHtml(oldP)}</span>`
+                : '<span class="pbadge p-cur">(none)</span>';
             html += `<tr>
                 <td>${escapeHtml(dev)}</td>
                 <td class="mono" title="${escapeHtml(names.join(', '))}">${shown} <span class="muted">(${names.length})</span></td>
-                <td><span class="pbadge p-old">${escapeHtml(oldP)}</span><span class="arrow">&rarr;</span><span class="pbadge p-new">${escapeHtml(newP)}</span></td>
+                <td>${oldBadge}<span class="arrow">&rarr;</span><span class="pbadge p-new">${escapeHtml(newP)}</span></td>
             </tr>`;
         }
         $('preview-table-body').innerHTML = html || '<tr><td colspan="3" class="muted" style="padding:20px;">Nothing to change: no selected port has a mapping.</td></tr>';
@@ -1035,7 +1279,7 @@
                 for (const [dev, res] of Object.entries(appliedPlan.changes)) {
                     for (const a of res.applied) {
                         const row = portRows.find(r => r.device === dev && r.name === a.name && r.section === a.section);
-                        if (row) { row.profile = a.new; row.checked = false; }
+                        if (row) { row.profile = a.new; row.managed = true; row.checked = false; }
                     }
                 }
                 $('to-step4-btn').disabled = false;
@@ -1355,19 +1599,21 @@
     async function rollbackPlan() {
         if (!appliedPlan) return;
         const inverse = {};
-        let n = 0, noOld = 0;
+        let n = 0, removals = 0;
         for (const [dev, rec] of Object.entries(appliedPlan.changes)) {
             for (const e of (rec.applied || [])) {
-                if (!e.old) { noOld++; continue; }
+                if (!e.new) continue; // entry was itself a removal; nothing to restore to
                 inverse[dev] = inverse[dev] || { interfaces: {}, bonds: {} };
-                inverse[dev][e.section][e.name] = { old: e.new, new: e.old };
+                // No original profile = first-time assignment: rollback removes the key
+                inverse[dev][e.section][e.name] = { old: e.new, new: e.old || '' };
                 n++;
+                if (!e.old) removals++;
             }
         }
         if (!n) { showAlert('This plan has no reversible entries.', 'Rollback'); return; }
         const ok = await confirmAsync(
-            `Revert ${n} port-profile change(s) back to their original profiles?` +
-            (noOld ? `\n(${noOld} entries had no recorded original profile and will be left as-is.)` : '') +
+            `Revert ${n} port-profile change(s)?` +
+            (removals ? `\n(${removals} of them were first-time assignments; rollback removes their sw_port_profile again.)` : '') +
             `\n\nAfter the rollback is written you still need to Diff + Deploy it.`,
             'Confirm Rollback');
         if (!ok) return;
@@ -1473,12 +1719,31 @@
         $('patterns-modal').classList.add('visible');
     }
     function closePatternsModal() { $('patterns-modal').classList.remove('visible'); }
-    function savePatterns() {
+    async function savePatterns() {
         const lines = $('patterns-text').value.split('\n').map(l => l.trim()).filter(Boolean);
-        localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines));
+        try {
+            const resp = await fetch('/fabric-api.sh?action=save-selection-patterns', {
+                method: 'POST', body: JSON.stringify({ patterns: lines })
+            });
+            const data = await resp.json();
+            if (!data.success) { showAlert('Failed to save patterns: ' + (data.error || 'unknown'), 'Error'); return; }
+            serverPatterns = data.patterns; // null after an empty save = defaults
+            localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines)); // offline fallback copy
+        } catch (e) {
+            // Server unreachable: keep at least the per-browser copy
+            localStorage.setItem(PATTERNS_KEY, JSON.stringify(lines));
+            showAlert('Patterns saved in this browser only (server unreachable): ' + e.message, 'Warning');
+        }
         closePatternsModal();
     }
-    function resetPatterns() {
+    async function resetPatterns() {
+        try {
+            const resp = await fetch('/fabric-api.sh?action=save-selection-patterns', {
+                method: 'POST', body: JSON.stringify({ patterns: [] })
+            });
+            const data = await resp.json();
+            if (data.success) serverPatterns = null;
+        } catch (e) { /* fall through to local reset */ }
         localStorage.removeItem(PATTERNS_KEY);
         $('patterns-text').value = DEFAULT_RACK_PATTERNS.join('\n');
     }
@@ -1503,6 +1768,10 @@
             const el = e.target.closest('.chip');
             if (el) toggleProfileChip(el.dataset.profile);
         });
+        $('facet-box').addEventListener('click', e => {
+            const el = e.target.closest('.chip');
+            if (el && el.dataset.facet) toggleFacetChip(el.dataset.facet, el.dataset.value);
+        });
         $('mapping-rows').addEventListener('change', e => {
             const sel = e.target;
             if (sel.tagName === 'SELECT' && sel.dataset.src !== undefined) setMapping(sel.dataset.src, sel.value);
@@ -1511,7 +1780,7 @@
             const a = e.target.closest('a[data-plan]');
             if (a) loadPlan(a.dataset.plan);
         });
-        await loadDevices();
+        await Promise.all([loadDevices(), loadSelectionPatterns()]);
         goStep(1);
         resumeDeployJob();
     }
