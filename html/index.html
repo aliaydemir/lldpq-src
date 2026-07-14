@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en">
 <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="shortcut icon" href="/png/favicon.ico">
     <title>..::LLDPQ::..</title>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
@@ -539,8 +540,68 @@
             justify-content: center;
         }
         #sidebar.collapsed .tracking-trigger-copy { display: none; }
-        
+
+        /* Mobile: sidebar becomes an off-canvas overlay, iframe takes full width */
+        .mobile-menu-btn { display: none; }
+        #mobile-overlay { display: none; }
+
+        @media (max-width: 768px) {
+            #sidebar,
+            #sidebar.collapsed {
+                width: 280px;
+                padding: 20px;
+                align-items: stretch;
+                transform: translateX(-100%);
+                transition: transform 0.3s ease;
+            }
+            #sidebar.mobile-open {
+                transform: translateX(0);
+            }
+            /* Neutralize collapsed-state visuals on mobile */
+            #sidebar.collapsed .menu-item .menu-text,
+            #sidebar.collapsed .group-title,
+            #sidebar.collapsed .footer,
+            #sidebar.collapsed #user-menu-container { display: block; }
+            #sidebar.collapsed .menu-item { justify-content: flex-start; }
+            #sidebar.collapsed .logo-section .logo-full { display: block; }
+            #sidebar.collapsed .logo-section .logo-icon { display: none; }
+            .sidebar-toggle, .sidebar-toggle-bottom { display: none; }
+
+            #content-iframe,
+            #sidebar.collapsed ~ #content-iframe {
+                margin-left: 0;
+                width: 100%;
+            }
+
+            .mobile-menu-btn {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                position: fixed;
+                bottom: 12px;
+                left: 12px;
+                z-index: 150;
+                width: 44px;
+                height: 44px;
+                border: none;
+                border-radius: 8px;
+                background: rgba(45, 45, 45, 0.85);
+                color: #76b900;
+                cursor: pointer;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+            }
+            .mobile-menu-btn svg { width: 24px; height: 24px; fill: currentColor; }
+
+            #mobile-overlay.visible {
+                display: block;
+                position: fixed;
+                inset: 0;
+                background: rgba(0,0,0,0.5);
+                z-index: 90;
+            }
+        }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div id="sidebar">
@@ -743,6 +804,11 @@
         </div>
     </div>
     
+    <button class="mobile-menu-btn" onclick="toggleMobileSidebar()" title="Menu">
+        <svg viewBox="0 0 24 24"><path d="M3 6h18v2H3V6m0 5h18v2H3v-2m0 5h18v2H3v-2z"/></svg>
+    </button>
+    <div id="mobile-overlay" onclick="toggleMobileSidebar()"></div>
+
     <iframe id="content-iframe" name="content-iframe" src="start.html"></iframe>
     
     <script>
@@ -764,6 +830,26 @@
         
         // Initialize sidebar state
         document.addEventListener('DOMContentLoaded', restoreSidebarState);
+
+        // Mobile off-canvas sidebar
+        function toggleMobileSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.remove('collapsed');
+            const open = sidebar.classList.toggle('mobile-open');
+            document.getElementById('mobile-overlay').classList.toggle('visible', open);
+        }
+
+        // Close mobile sidebar after navigating
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('#sidebar a[target="content-iframe"]').forEach(function(link) {
+                link.addEventListener('click', function() {
+                    const sidebar = document.getElementById('sidebar');
+                    if (window.innerWidth <= 768 && sidebar.classList.contains('mobile-open')) {
+                        toggleMobileSidebar();
+                    }
+                });
+            });
+        });
 
         const TRACKING_VIEW_STORAGE_KEY = 'lldpq_tracking_view';
         const TRACKING_VIEWS = new Set(['all', 'commissioning', 'handed_over']);

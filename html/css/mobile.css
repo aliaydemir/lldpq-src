@@ -1,0 +1,22 @@
+/* Mobile-only adjustments — desktop rendering is untouched (all rules gated by media query) */
+@media (max-width: 768px) {
+    /* Wide tables scroll horizontally instead of overflowing the page */
+    table {
+        display: block;
+        max-width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Long code/log blocks scroll instead of overflowing */
+    pre {
+        max-width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* Slightly larger touch targets for form controls */
+    input, select, button {
+        min-height: 32px;
+    }
+}

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="shortcut icon" href="/png/favicon.ico">
     <title>..::LLDPQ:: Inventory</title>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
@@ -103,6 +104,7 @@
         .adv-input textarea { flex:1; min-height:42px; max-height:140px; background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:6px; padding:10px 12px; font-size:13px; resize:vertical; }
         .adv-input textarea:focus { outline:none; border-color:#76b900; }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div class="su-header">
@@ -612,7 +614,14 @@ async function probeAdvisor() {
     } catch (e) { /* keep hidden */ }
 }
 
-document.addEventListener('DOMContentLoaded', function () {
+document.addEventListener('DOMContentLoaded', async function () {
+    // Admin-only page: the server (nginx admin-page gate) already enforces this,
+    // but check on the client too for a graceful redirect instead of a raw 403.
+    if (!await LLDPqAuth.check()) return;  // redirects to login
+    if (!LLDPqAuth.isAdmin()) {
+        LLDPqAuth.redirectToLogin();
+        return;
+    }
     loadVersions();
     probeAdvisor();
 });

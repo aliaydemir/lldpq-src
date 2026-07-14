@@ -156,7 +156,9 @@ collect_fw() {
     local first_line
     local detail
 
-    rm -f "$outfile"
+    # Do not delete prior data up front: on a transient SSH timeout we return
+    # without writing, and the last good collection must survive. The success
+    # and skip branches below overwrite $outfile explicitly.
 
     output=$(timeout "$TRANSCEIVER_FW_SSH_TIMEOUT" ssh "${SSH_OPTS[@]}" -q "$user@$device" bash -s -- "$SKIP_MODEL_PATTERN" "$TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY" "$known_model" <<'REMOTE_SCRIPT' 2>/dev/null
         skip_model_pattern=${1:-2010,2201,2210}

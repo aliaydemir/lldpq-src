@@ -997,6 +997,7 @@
             background: #555;
         }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div class="container">
@@ -2231,11 +2232,12 @@
                     const displayVrf = vrf || (vlan ? 'default' : null);
                     const members = cfg.bond_members?.join(', ') || '-';
                     const esi = cfg.evpn_mh_id ? `ES-${cfg.evpn_mh_id}` : '-';
-                    // bond_mode can be 'lacp', 'static', or 'active'/'passive' (which means lacp mode)
-                    // If bond_mode is 'active' or 'passive', it's actually the LACP mode
-                    const bondMode = cfg.bond_mode || '';
-                    const isActive = bondMode === 'active';
-                    const lacpMode = isActive ? 'ACTIVE' : 'PASSIVE';
+                    // Protocol mode lives under 'mode' (sferical template key);
+                    // legacy files may still carry 'bond_mode: static'. The
+                    // active/passive checkbox is stored separately in bond_mode.
+                    const isStatic = cfg.mode === 'static' || cfg.bond_mode === 'static';
+                    const isActive = !isStatic && cfg.bond_mode === 'active';
+                    const lacpMode = isStatic ? 'STATIC' : (isActive ? 'ACTIVE' : 'PASSIVE');
                     const lacpBypass = cfg.lacp_bypass ? true : false;
                     
                     // Format VLAN(s) display based on mode
@@ -2262,7 +2264,7 @@
                             <td>${nativeDisplay}</td>
                             <td>${displayVrf ? `<span class="badge badge-blue">${escapeHtml(displayVrf)}</span>` : '-'}</td>
                             <td>${esi !== '-' ? `<span class="badge badge-orange">${escapeHtml(esi)}</span>` : '-'}</td>
-                            <td><span class="badge ${isActive ? 'badge-green' : 'badge-orange'}">${lacpMode}</span></td>
+                            <td><span class="badge ${isStatic ? 'badge-blue' : (isActive ? 'badge-green' : 'badge-orange')}">${lacpMode}</span></td>
                             <td>${lacpBypass ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-red">No</span>'}</td>
                             <td>${escapeHtml(cfg.description || '-')}</td>
                             <td style="text-align: right;">
@@ -2790,29 +2792,81 @@
         async function executeDeployment(host) {
             showLoading(true, `Deploying to ${host}...`);
             setStatus('Deploying...');
-            
+
             try {
                 const result = await ansibleApiCall('deploy', { host });
-                
-                if (result.success) {
-                    showOutputModal(
-                        `Deploy Complete - ${host}`,
-                        result.output || 'Configuration deployed successfully',
-                        'success'
-                    );
+
+                // Lock held by another deploy/diff/generate
+                if (result && result.locked) {
+                    showOutputModal('Busy', result.error || 'Another operation is in progress. Try again shortly.', 'warning');
+                    return;
+                }
+
+                // Current contract: run_deploy detaches a background job and returns
+                // {started, job_id} immediately. Poll deploy-status until it finishes
+                // instead of reporting success the instant the job is spawned.
+                if (result && result.started && result.job_id) {
+                    await pollDeployStatusModal(result.job_id, host);
+                    return;
+                }
+
+                // Fallback: older backend returned a synchronous result.
+                if (result && result.success) {
+                    showOutputModal(`Deploy Complete - ${host}`, result.output || 'Configuration deployed successfully', 'success');
                 } else {
-                    showOutputModal(
-                        `Deploy Failed - ${host}`,
-                        result.error || result.output || 'Unknown error',
-                        'error'
-                    );
+                    showOutputModal(`Deploy Failed - ${host}`, (result && (result.error || result.output)) || 'Unknown error', 'error');
                 }
             } catch (err) {
                 showOutputModal('Error', 'Failed to deploy: ' + err.message, 'error');
+            } finally {
+                showLoading(false);
+                setStatus('Ready');
             }
-            
-            showLoading(false);
-            setStatus('Ready');
+        }
+
+        // Tail a detached deploy job to completion and report the real result.
+        async function pollDeployStatusModal(jobId, host) {
+            const sleep = ms => new Promise(r => setTimeout(r, ms));
+            let pollErrors = 0;
+            while (true) {
+                let resp, data;
+                try {
+                    resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
+                    data = await resp.json();
+                    pollErrors = 0;
+                } catch (e) {
+                    // Transient blip: retry a few times, then stop watching (the
+                    // deploy keeps running in the background regardless).
+                    if (++pollErrors >= 5) {
+                        showOutputModal('Error', `Stopped watching the deploy after repeated errors. It keeps running in the background on ${host}.`, 'error');
+                        return;
+                    }
+                    await sleep(3000);
+                    continue;
+                }
+
+                if (resp.status === 401 || resp.status === 403) {
+                    showOutputModal('Session expired', 'Log in again to see the deploy result (it keeps running in the background).', 'error');
+                    return;
+                }
+
+                // Unknown/expired job: not running, not done, no success
+                if (!data.success && !data.running && !data.done) {
+                    showOutputModal(`Deploy Failed - ${host}`, data.error || 'Unknown or expired deploy job', 'error');
+                    return;
+                }
+
+                if (data.done) {
+                    if (data.success) {
+                        showOutputModal(`Deploy Complete - ${host}`, data.output || 'Configuration deployed successfully', 'success');
+                    } else {
+                        showOutputModal(`Deploy Failed - ${host}`, data.error || data.output || `Deploy failed (exit ${data.exit_code})`, 'error');
+                    }
+                    return;
+                }
+
+                await sleep(3000);
+            }
         }
         
         function setStatus(text) {

@@ -800,6 +800,7 @@
         .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow { opacity: 1; }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
 
@@ -4740,6 +4741,8 @@ let upgradeImages = [];
 let upgradeJobId = null;
 let upgradePollTimer = null;
 let upgradePollGeneration = 0;
+let upgradePollErrors = 0;
+const UPGRADE_POLL_MAX_ERRORS = 4;
 let upgradeDetectedServerIP = '';
 
 function rowIdFromIp(ip) {
@@ -5042,12 +5045,28 @@ async function pollUpgradeStatus() {
     const generation = ++upgradePollGeneration;
     if (upgradePollTimer) clearTimeout(upgradePollTimer);
     upgradePollTimer = null;
+    upgradePollErrors = 0;
     const poll = async () => {
-        const data = await apiCall('upgrade-status', { job_id: jobId });
+        let data;
+        try {
+            data = await apiCall('upgrade-status', { job_id: jobId });
+        } catch (e) {
+            data = { success: false, error: (e && e.message) || 'request failed' };
+        }
         if (generation !== upgradePollGeneration || jobId !== upgradeJobId) return;
-        if (data.success) {
+        if (data && data.success) {
+            upgradePollErrors = 0;
             renderUpgradeJob(data.job);
             if (data.job && data.job.complete) return;
+        } else {
+            // Don't poll a broken/expired job forever: surface the error, stop
+            // the loop and drop the live Cancel button after a few failures.
+            if (++upgradePollErrors >= UPGRADE_POLL_MAX_ERRORS) {
+                showToast(`Lost contact with the upgrade job (${(data && data.error) || 'error'}). Stopped polling.`, 'error');
+                const cancelBtn = document.getElementById('btnCancelUpgrade');
+                if (cancelBtn) cancelBtn.style.display = 'none';
+                return;
+            }
         }
         if (generation === upgradePollGeneration && jobId === upgradeJobId) {
             upgradePollTimer = setTimeout(poll, 15000);

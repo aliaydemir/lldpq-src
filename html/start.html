@@ -315,6 +315,7 @@
             background: #555;
         }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div class="dashboard-container">
@@ -870,7 +871,7 @@
             return marker;
         }
 
-        function validateDashboardManifest(manifest) {
+        function validateDashboardManifest(manifest, nowMs) {
             if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) ||
                 manifest.status !== 'current' || manifest.pipeline_complete !== true ||
                 typeof manifest.pipeline_id !== 'string' || !manifest.pipeline_id.trim() ||
@@ -897,7 +898,10 @@
             const maxAgeSeconds = Number.isFinite(configuredMaxAge) && configuredMaxAge >= 0
                 ? configuredMaxAge
                 : DASHBOARD_DEFAULT_MAX_AGE_SECONDS;
-            const ageMilliseconds = Date.now() - completedEpoch;
+            // Prefer the server clock (manifest response Date header) so browser/
+            // appliance clock skew cannot blank an otherwise-fresh dashboard.
+            const referenceNow = Number.isFinite(nowMs) ? nowMs : Date.now();
+            const ageMilliseconds = referenceNow - completedEpoch;
             if (!Number.isFinite(completedEpoch) || ageMilliseconds < -300000 ||
                 ageMilliseconds > maxAgeSeconds * 1000) {
                 return null;
@@ -989,8 +993,12 @@
             const markerState = await readDashboardMarkerState();
             let manifest = null;
             let manifestReadSuccessful = false;
+            let serverNowMs = null;
             try {
                 const response = await fetch(noCacheUrl('monitor-results/.lldpq-current.json'), { cache: 'no-store' });
+                // Reference the server clock, not the viewer's, for the freshness check.
+                const serverDate = Date.parse(response.headers.get('Date') || '');
+                if (Number.isFinite(serverDate)) serverNowMs = serverDate;
                 if (response.status === 404) {
                     // A missing manifest is a valid state on a fresh install:
                     // no report has been published yet. renderLastUpdated
@@ -1001,7 +1009,7 @@
                     manifestReadSuccessful = true;
                 }
             } catch (error) {}
-            const validation = validateDashboardManifest(manifest);
+            const validation = validateDashboardManifest(manifest, serverNowMs);
             dashboardPipelineState = {
                 marker: markerState.marker,
                 manifest,

@@ -1002,11 +1002,28 @@ for hf in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.j
     except:
         pass
 
-# Get this device's own BGP ASN (same derivation as create_vrf_bulk)
-device_asn = None
-bgp_config = host_data.get('bgp', {})
-if isinstance(bgp_config, dict):
-    device_asn = bgp_config.get('asn')
+# Get this device's own BGP ASN. sferical stores it as a top-level 'bgp_asn'
+# key and references it inside vrfs as the portable '{{ bgp_asn }}' string,
+# so read that key first (with a legacy nested bgp.asn fallback).
+device_asn = host_data.get('bgp_asn')
+if device_asn is None:
+    bgp_config = host_data.get('bgp', {})
+    if isinstance(bgp_config, dict):
+        device_asn = bgp_config.get('asn')
+
+def _normalize_copied_asn(container, key):
+    # Keep the portable '{{ bgp_asn }}' reference verbatim (it resolves to this
+    # device's own bgp_asn); substitute a concrete ASN for a copied literal;
+    # drop it only when this device has no ASN so the template's
+    # 'asn is defined' gate stays false instead of inheriting the source's ASN.
+    cur = container.get(key)
+    if isinstance(cur, str) and 'bgp_asn' in cur and '{{' in cur:
+        if device_asn is None:
+            del container[key]
+    elif device_asn is not None:
+        container[key] = device_asn
+    else:
+        del container[key]
 
 # Add VRFs
 added = []
@@ -1016,16 +1033,10 @@ for vrf_name in vrf_names:
             vrf_config = copy.deepcopy(all_vrf_configs[vrf_name])
             # Don't copy the source device's ASN; use this device's own or omit
             if 'bgp_asn' in vrf_config:
-                if device_asn:
-                    vrf_config['bgp_asn'] = device_asn
-                else:
-                    del vrf_config['bgp_asn']
+                _normalize_copied_asn(vrf_config, 'bgp_asn')
             vrf_bgp = vrf_config.get('bgp')
             if isinstance(vrf_bgp, dict) and 'asn' in vrf_bgp:
-                if device_asn:
-                    vrf_bgp['asn'] = device_asn
-                else:
-                    del vrf_bgp['asn']
+                _normalize_copied_asn(vrf_bgp, 'asn')
             host_data['vrfs'][vrf_name] = vrf_config
             added.append(vrf_name)
         else:
@@ -2024,9 +2035,13 @@ if sw_port_mode == 'access':
     profile_entry['stp_portadminedge'] = True if stp_portadminedge is None else stp_portadminedge
     profile_entry['stp_portautoedgedisable'] = True if stp_portautoedgedisable is None else stp_portautoedgedisable
     # Access profiles carry no trunk keys
-    for k in ('trunk_untagged', 'trunk_allowed_vlan_all', 'trunk_allowed_vlan_list'):
+    for k in ('trunk_untagged', 'trunk_allowed_vlan_all', 'trunk_allowed_vlan_list', 'trunk_allowed_vlan_range'):
         profile_entry.pop(k, None)
 elif sw_port_mode == 'trunk':
+    # The modal expresses membership as trunk_allowed_vlan_list/_all only, so
+    # drop any pre-existing trunk_allowed_vlan_range: template precedence is
+    # all > range > list (swp_ports.j2), and a stale range would shadow the edit.
+    profile_entry.pop('trunk_allowed_vlan_range', None)
     if native_vlan:
         profile_entry['trunk_untagged'] = int(native_vlan)
     else:
@@ -3909,7 +3924,9 @@ try:
         bond_entry['evpn_mh_id'] = int(mh_id)
     
     if bond_mode and bond_mode != 'lacp':
-        bond_entry['bond_mode'] = bond_mode
+        # sferical's bonding_ports.j2 reads bonds[<bond>].mode (== "static"),
+        # so persist the protocol mode under 'mode', not 'bond_mode'.
+        bond_entry['mode'] = bond_mode
     
     if lacp_bypass:
         bond_entry['lacp_bypass'] = True
@@ -4544,7 +4561,16 @@ try:
     vrf_config = vrfs[vrf]
     bgp_profile = vrf_config.get('bgp', {}).get('bgp_profile', '')
     profile_created = False
-    
+
+    # Refuse to overwrite an existing subinterface: it may carry another VRF's
+    # external link, and this check must run before any file is written below.
+    _existing_ifaces = host_data.get('interfaces', {}) or {}
+    _parent_cfg = _existing_ifaces.get(parent_if, {}) if hasattr(_existing_ifaces, 'get') else {}
+    _existing_subs = _parent_cfg.get('subinterfaces', {}) if hasattr(_parent_cfg, 'get') else {}
+    if _existing_subs and (int(sub_id) in _existing_subs or str(sub_id) in _existing_subs):
+        print(json.dumps({'success': False, 'error': f'Subinterface {parent_if}.{sub_id} already exists on {device}'}))
+        exit(0)
+
     # Load BGP profiles
     bgp_profiles_file = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all', 'bgp_profiles.yaml')
     with open(bgp_profiles_file, 'r') as f:
@@ -4576,7 +4602,14 @@ try:
     # If no External and create_border_profile requested, create new OVERLAY_BORDER_XX profile
     if not has_external and create_border_profile:
         new_profile_name = f'OVERLAY_BORDER_{border_profile_suffix}'
-        
+
+        # bgp_profiles are shared across devices/VRFs; the suffix is only the
+        # mgmt IP's last octet, so two devices can collide. Never clobber an
+        # existing profile (that would silently drop another device's peers).
+        if new_profile_name in profiles:
+            print(json.dumps({'success': False, 'error': f'BGP profile {new_profile_name} already exists; select it for this VRF or choose a different suffix'}))
+            exit(0)
+
         # Create new profile with External peer group (template from OVERLAY_BORDER_XX)
         profiles[new_profile_name] = {
             'ipv4_unicast_af': {

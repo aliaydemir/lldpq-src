@@ -801,6 +801,7 @@
             position: relative;
         }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div class="container">
@@ -4042,6 +4043,17 @@
         async function generateClSupport() {
             const requestContext = getDeviceRequestContext();
             if (!requestContext.device) return false;
+            // Generation first deletes existing cl-support bundles on the device;
+            // confirm before that destructive step.
+            showConfirmModal(
+                'Generate cl-support',
+                `Generating a new cl-support removes any existing cl-support bundles on ${requestContext.device}. Continue?`,
+                () => executeGenerateClSupport(requestContext)
+            );
+        }
+
+        async function executeGenerateClSupport(requestContext) {
+            if (!requestContext || !requestContext.device) return false;
             const operationId = ++clsupportOperationId;
             const statusEl = document.getElementById('clsupportStatus');
             const progressEl = document.getElementById('clsupportProgress');

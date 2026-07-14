@@ -1258,6 +1258,7 @@
             font-size: 11px;
         }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <div class="header">
@@ -3901,7 +3902,11 @@
                 showOutput('New file discarded', 'success');
                 return;
             }
-            
+
+            const confirmed = await confirmAsync('Delete File',
+                `Delete <strong>${escapeHtml(state.currentFile.split('/').pop())}</strong> from disk?<br><br>This cannot be undone.`);
+            if (!confirmed) return;
+
             showLoading(true, 'Deleting file...');
             try {
                 const result = await apiCall('delete', { file: state.currentFile });

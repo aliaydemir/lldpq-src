@@ -846,6 +846,7 @@
             display: none;
         }
     </style>
+    <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
     <!-- Placeholder for unconfigured telemetry -->
@@ -1730,9 +1731,19 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ query: 'up' })
                 });
-                
+
+                // Session expired mid-session: stop the auto-refresh so the
+                // dashboard does not keep looking live, and return to login.
+                if (response.status === 401 || response.status === 403) {
+                    stopAutoRefresh();
+                    statusEl.className = 'connection-status disconnected';
+                    statusEl.innerHTML = '<span class="dot"></span><span>Session expired</span>';
+                    LLDPqAuth.redirectToLogin();
+                    return;
+                }
+
                 const data = await response.json();
-                
+
                 if (data.success) {
                     statusEl.className = 'connection-status connected';
                     statusEl.innerHTML = '<span class="dot"></span><span>Prometheus: Connected</span>';
@@ -1747,14 +1758,21 @@
             }
         }
         
-        function startAutoRefresh() {
+        function stopAutoRefresh() {
             if (refreshInterval) clearInterval(refreshInterval);
-            refreshInterval = setInterval(() => {
+            refreshInterval = null;
+        }
+
+        function startAutoRefresh() {
+            stopAutoRefresh();
+            refreshInterval = setInterval(async () => {
                 const refreshEl = document.getElementById('refreshIndicator');
                 refreshEl.classList.add('active');
-                updateDashboard().then(() => {
-                    setTimeout(() => refreshEl.classList.remove('active'), 1000);
-                });
+                // checkPrometheusConnection() refreshes the dashboard when up,
+                // flips the status dot to Disconnected when Prometheus is gone,
+                // and stops this loop + redirects on session expiry (401/403).
+                await checkPrometheusConnection();
+                setTimeout(() => refreshEl.classList.remove('active'), 1000);
             }, 10000);  // 10 second refresh
         }
         
