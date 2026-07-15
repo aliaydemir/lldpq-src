@@ -155,6 +155,7 @@
                     <option value="ipam">IP allocation</option>
                 </select>
                 <button class="btn secondary" id="btn-validate" onclick="runValidate()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Validate</button>
+                <button class="btn secondary sm" id="btn-clear-val" onclick="clearValidate()" style="display:none">Clear</button>
             </div>
             <div class="status info" id="st-val"></div>
             <div id="val-report"></div>
@@ -176,6 +177,7 @@
                 </label>
                 <button class="btn secondary" id="btn-prev-topology" onclick="preview('topology')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-topology" style="margin:0"></span>
+                <button class="btn secondary sm" id="btn-clear-topology" onclick="clearArtifact('topology')" style="display:none">Clear</button>
             </div>
             <div class="status info" id="st-topology"></div>
             <div class="preview-wrap" id="pw-topology">
@@ -194,6 +196,7 @@
             <div class="p-toolbar">
                 <button class="btn secondary" id="btn-prev-devices" onclick="preview('devices')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-devices" style="margin:0"></span>
+                <button class="btn secondary sm" id="btn-clear-devices" onclick="clearArtifact('devices')" style="display:none">Clear</button>
             </div>
             <div class="status info" id="st-devices"></div>
             <div class="preview-wrap" id="pw-devices">
@@ -213,6 +216,7 @@
             <div class="p-toolbar">
                 <button class="btn secondary" id="btn-prev-topology-config" onclick="preview('topology-config')"><svg viewBox="0 0 24 24"><path d="M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9M12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17M12,4.5C7,4.5 2.73,7.61 1,12C2.73,16.39 7,19.5 12,19.5C17,19.5 21.27,16.39 23,12C21.27,7.61 17,4.5 12,4.5Z"/></svg>Preview</button>
                 <span class="status info" id="stat-topology-config" style="margin:0"></span>
+                <button class="btn secondary sm" id="btn-clear-topology-config" onclick="clearArtifact('topology-config')" style="display:none">Clear</button>
             </div>
             <div class="status info" id="st-topology-config"></div>
             <div class="preview-wrap" id="pw-topology-config">
@@ -444,6 +448,12 @@ async function runValidate() {
     document.getElementById('val-report').innerHTML = html;
     const errs = issues.filter(i => i.severity === 'error').length;
     setStatus('st-val', errs ? (errs + ' error(s) found') : (issues.length + ' issue(s)'), errs ? 'err' : 'ok');
+    document.getElementById('btn-clear-val').style.display = '';
+}
+function clearValidate() {
+    document.getElementById('val-report').innerHTML = '';
+    setStatus('st-val', '', 'info');
+    document.getElementById('btn-clear-val').style.display = 'none';
 }
 
 // ---- Artifact preview / apply -----------------------------------------
@@ -487,6 +497,7 @@ function onTopoScopeChange() {
     TOKENS['topology'] = null;
     document.getElementById(ART['topology'].pw).classList.remove('show');
     setStatus(ART['topology'].st, '', 'info');
+    document.getElementById('btn-clear-topology').style.display = 'none';
 }
 
 async function preview(artifact) {
@@ -520,6 +531,19 @@ async function preview(artifact) {
     document.getElementById(ui.stat).textContent = stat;
     document.getElementById(ui.pw).classList.add('show');
     setStatus(ui.st, 'Preview ready. Review, then confirm to write ' + ui.file + '.', 'ok');
+    const clearBtn = document.getElementById('btn-clear-' + artifact);
+    if (clearBtn) clearBtn.style.display = '';
+}
+function clearArtifact(artifact) {
+    const ui = ART[artifact];
+    TOKENS[artifact] = null;
+    document.getElementById(ui.ta).value = '';
+    if (artifact === 'devices') document.getElementById('diff-devices').innerHTML = '';
+    document.getElementById(ui.stat).textContent = '';
+    document.getElementById(ui.pw).classList.remove('show');
+    setStatus(ui.st, '', 'info');
+    const clearBtn = document.getElementById('btn-clear-' + artifact);
+    if (clearBtn) clearBtn.style.display = 'none';
 }
 
 async function applyArtifact(artifact) {

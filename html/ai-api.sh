@@ -1238,7 +1238,15 @@ def build_collection_metadata(devices, device_health):
         'flap_snapshot': _multi_file_source_freshness(
             os.path.join(_mr_path('flap-data'), '*.txt'), required=False
         ),
-        'pfc_ecn': _source_freshness(_mr_path('pfc_ecn_history.json'), required=False),
+        # Sharded per-device history directory; the monolith fallback covers
+        # installations whose analyzer has not produced shards yet.
+        'pfc_ecn': (
+            _multi_file_source_freshness(
+                os.path.join(_mr_path('pfc-ecn-history'), '*.json'), required=False
+            )
+            if os.path.isdir(_mr_path('pfc-ecn-history'))
+            else _source_freshness(_mr_path('pfc_ecn_history.json'), required=False)
+        ),
         'hardware': _multi_file_source_freshness(
             os.path.join(_mr_path('hardware-data'), '*_hardware.txt'), required=False
         ),

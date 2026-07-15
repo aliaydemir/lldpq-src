@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -99,6 +100,65 @@ class SetupSafetyWriteTests(unittest.TestCase):
         self.assertEqual(info, {"atomic": True, "write_mode": "atomic-replace"})
         self.assertEqual(Path(str(self.target) + ".bak").read_bytes(), self.original)
         self.assertFalse(self.journal.exists())
+
+    def test_lldpq_dir_save_preserves_restrictive_mode(self):
+        # devices.yaml (0o640) is not web-served and may hold secrets, so a save
+        # must not floor its group/other read bits on.
+        SAFETY.atomic_write_text(
+            str(self.target),
+            self.candidate,
+            expected_revision=SAFETY.revision_bytes(self.original),
+            managed_roots=[str(self.root)],
+        )
+        self.assertEqual(self.target.stat().st_mode & 0o777, 0o640)
+
+    def test_web_served_save_floors_world_read(self):
+        # A web-served file that drifted to owner-only must regain world read on
+        # save, or nginx keeps returning 403 while the wizard reports success.
+        web_file = self.root / "display-aliases.json"
+        web_file.write_bytes(b'{"devices":{}}\n')
+        web_file.chmod(0o600)
+        SAFETY.atomic_write_text(
+            str(web_file),
+            '{"devices":{"tan-spine-01":"SPINE-01"}}\n',
+            expected_revision=SAFETY.revision_bytes(b'{"devices":{}}\n'),
+            managed_roots=[str(self.root)],
+        )
+        mode = web_file.stat().st_mode & 0o777
+        self.assertEqual(mode & 0o644, 0o644, oct(mode))
+
+    def test_new_web_file_defaults_group_and_world_readable(self):
+        web_file = self.root / "topology.dot"
+        SAFETY.atomic_write_text(
+            str(web_file),
+            "graph {}\n",
+            managed_roots=[str(self.root)],
+        )
+        self.assertEqual(web_file.stat().st_mode & 0o777, 0o664)
+
+    def test_stale_revision_conflicts_on_default_path(self):
+        stale = SAFETY.revision_bytes(self.original)
+        external = b"devices:\n  leaf01:\n    ip: 203.0.113.9\n"
+        self.target.write_bytes(external)
+        with self.assertRaises(SAFETY.RevisionConflict):
+            SAFETY.atomic_write_text(
+                str(self.target),
+                self.candidate,
+                expected_revision=stale,
+                managed_roots=[str(self.root)],
+            )
+        self.assertEqual(self.target.read_bytes(), external)
+
+    def test_oversized_existing_target_is_rejected_before_write(self):
+        big = self.root / "topology_config.yaml"
+        big.write_bytes(b"x" * (SAFETY.MAX_CONFIG_BYTES + 1))
+        with self.assertRaises(SAFETY.SetupSafetyError):
+            SAFETY.atomic_write_text(
+                str(big),
+                "layout: spine-leaf\n",
+                managed_roots=[str(self.root)],
+            )
+        self.assertEqual(big.stat().st_size, SAFETY.MAX_CONFIG_BYTES + 1)
 
     def test_exact_direct_mount_ebusy_uses_journaled_pinned_inode_write(self):
         old_inode = self.target.stat().st_ino
@@ -579,13 +639,23 @@ class SetupSafetyRecoverAllTests(unittest.TestCase):
             os.fsync(handle.fileno())
 
         with mock.patch.object(SAFETY, "_is_direct_mount", return_value=True):
+            recover_info = {}
             recovered = SAFETY.recover_all_managed_writes(
-                str(self.lldpq_dir), str(self.web_root)
+                str(self.lldpq_dir), str(self.web_root), result_info=recover_info
             )
 
         self.assertEqual(recovered, [str(target)])
         self.assertEqual(target.read_bytes(), original)
-        self.assertEqual(list(self.journal_root.iterdir()), [])
+        # The divergent (torn) bytes are preserved aside before the restore.
+        aside = self.journal_root / (
+            SAFETY._direct_mount_journal_name(str(target)) + ".divergent"
+        )
+        self.assertEqual(list(self.journal_root.iterdir()), [aside])
+        self.assertEqual(aside.read_bytes(), b"part")
+        self.assertEqual(
+            recover_info,
+            {"divergent_preserved": [{"target": str(target), "preserved": str(aside)}]},
+        )
 
     def test_recover_all_rejects_unknown_hashed_journal(self):
         unknown = self.journal_root / ("f" * 64 + ".json")
@@ -621,7 +691,7 @@ class SetupSafetyRecoverAllTests(unittest.TestCase):
             events.append("inventory")
             return os.open(os.devnull, os.O_RDONLY)
 
-        def recover(_lldpq_dir, _web_root):
+        def recover(_lldpq_dir, _web_root, result_info=None):
             events.append("file-recovery")
             return []
 
@@ -707,6 +777,92 @@ os.close(fd)
                 if waiter.poll() is None:
                     waiter.kill()
                     waiter.communicate()
+
+
+class SetupCronScheduleContractTests(unittest.TestCase):
+    """Guards the renderer→parser contract that the env-prefix bug slipped past:
+    install.sh renders the lldpq cron line with an env-var prefix, and the
+    schedule parsers must locate the command past that prefix (not at a fixed
+    field position)."""
+
+    def _backup_import(self):
+        path = ROOT / "lldpq" / "backup_import.py"
+        spec = importlib.util.spec_from_file_location("test_lldpq_backup_import", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_env_prefixed_cron_lines_resolve_to_their_command(self):
+        backup_import = self._backup_import()
+        lldpq_line = (
+            "*/10 * * * * lldpq LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq"
+        )
+        getconf_line = "0 */12 * * * lldpq /usr/local/bin/get-conf"
+        self.assertEqual(
+            backup_import._cron_command(lldpq_line.split()), "/usr/local/bin/lldpq"
+        )
+        self.assertEqual(
+            backup_import._cron_command(getconf_line.split()), "/usr/local/bin/get-conf"
+        )
+
+    def test_installer_still_renders_the_env_prefixed_line(self):
+        # Fixture honesty: if install.sh stops emitting this exact shape, the
+        # parser contract above is testing a stale format and must be revisited.
+        install_sh = (ROOT / "install.sh").read_text()
+        self.assertIn(
+            "LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq", install_sh
+        )
+        self.assertIn("/usr/local/bin/get-conf", install_sh)
+
+    def test_setup_api_parser_skips_env_tokens_not_fixed_position(self):
+        setup_api = (ROOT / "html" / "setup-api.sh").read_text()
+        self.assertIn("cron_command(parts)", setup_api)
+        # The original fixed-position match that missed the env prefix must be gone.
+        self.assertNotIn("parts[6] == '/usr/local/bin/lldpq'", setup_api)
+        self.assertNotIn("parts[6] == '/usr/local/bin/get-conf'", setup_api)
+
+
+class SetupSafetyGlobalLockTests(unittest.TestCase):
+    """Every Setup save funnels through the global configuration lock, so its
+    fail-closed branches must stay covered."""
+
+    def test_missing_global_lock_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "absent.lock"
+            with self.assertRaises(SAFETY.SetupSafetyError):
+                SAFETY.acquire_global_configuration_lock(str(missing))
+
+    def test_unsafe_owner_global_lock_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "lldpq.conf.lock"
+            lock.write_bytes(b"")
+            # The test process is not root, so the real lstat already reports a
+            # non-root owner; assert the ownership branch rejects it.
+            with self.assertRaises(SAFETY.SetupSafetyError):
+                SAFETY.acquire_global_configuration_lock(str(lock))
+
+    def test_world_writable_global_lock_fails_closed(self):
+        real_lstat = os.lstat
+
+        class FakeStat:
+            def __init__(self, base):
+                self.st_mode = stat.S_IFREG | 0o666
+                self.st_uid = 0
+                self.st_gid = 0
+                self.st_dev = base.st_dev
+                self.st_ino = base.st_ino
+
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "lldpq.conf.lock"
+            lock.write_bytes(b"")
+            base = real_lstat(str(lock))
+            with mock.patch.object(
+                SAFETY.os, "lstat",
+                side_effect=lambda p, *a, **k: FakeStat(base) if str(p) == str(lock) else real_lstat(p, *a, **k),
+            ):
+                with self.assertRaises(SAFETY.SetupSafetyError):
+                    SAFETY.acquire_global_configuration_lock(str(lock))
 
 
 class SetupEditorRecoveryContractTests(unittest.TestCase):

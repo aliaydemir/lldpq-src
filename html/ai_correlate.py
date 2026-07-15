@@ -295,9 +295,30 @@ def _collect_flaps(mr_dir):
     return anomalies
 
 
-def _collect_pfc_ecn(mr_dir):
+def _load_pfc_history(mr_dir):
+    """Merge the per-device shard directory; fall back to the monolith.
+
+    The fallback keeps correlation working across the one-run migration
+    window and on installations whose analyzer has not produced shards yet.
+    """
+    shard_dir = os.path.join(mr_dir, "pfc-ecn-history")
+    if os.path.isdir(shard_dir):
+        merged = {}
+        for name in sorted(os.listdir(shard_dir)):
+            if not name.endswith(".json"):
+                continue
+            document = _load_json(os.path.join(shard_dir, name))
+            history = (document or {}).get("history")
+            if isinstance(history, dict):
+                merged.update(history)
+        return merged
     document = _load_json(os.path.join(mr_dir, "pfc_ecn_history.json"))
     history = (document or {}).get("history")
+    return history if isinstance(history, dict) else {}
+
+
+def _collect_pfc_ecn(mr_dir):
+    history = _load_pfc_history(mr_dir)
     anomalies = []
     for key in sorted(history if isinstance(history, dict) else {}):
         series = history[key]

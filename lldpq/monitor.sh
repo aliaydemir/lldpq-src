@@ -204,6 +204,18 @@ apply_monitor_tuning() {
         ''|*[!0-9]*|0) MAX_PARALLEL=100 ;;
     esac
 
+    # Hosts that fail the ICMP probe still get an authoritative SSH attempt,
+    # but with a tighter connect bound: a silent host holding a dispatch slot
+    # for the full SSH_TIMEOUT dominated collection wall time on fabrics with
+    # many unreachable members.
+    MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS="${MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS:-10}"
+    case "$MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS" in
+        ''|*[!0-9]*|0) MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS=10 ;;
+    esac
+    if (( MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS > SSH_TIMEOUT )); then
+        MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS=$SSH_TIMEOUT
+    fi
+
     PFC_ECN_COLLECTION_BUDGET_SECONDS="${PFC_ECN_COLLECTION_BUDGET_SECONDS:-60}"
     PFC_ECN_PORT_TIMEOUT_SECONDS="${PFC_ECN_PORT_TIMEOUT_SECONDS:-5}"
     PFC_ECN_MAX_PARALLEL="${PFC_ECN_MAX_PARALLEL:-4}"
@@ -274,6 +286,10 @@ analysis_backup_dir=""
 analysis_transaction_active=false
 recovery_bundle_must_be_preserved=false
 
+# Entries with a trailing slash are whole directories (currently the
+# per-device PFC/ECN history shards); snapshot/rollback treat them as one
+# atomic tree.  pfc_ecn_history.json stays listed so the one-time migration
+# that splits it into shards remains covered by the same transaction.
 analysis_artifacts=(
     .lldpq-current.json
     .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
@@ -284,6 +300,7 @@ analysis_artifacts=(
     optical-analysis.html optical_history.json
     ber-analysis.html ber_history.json ber_baseline.json
     pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+    pfc-ecn-history/
     hardware-analysis.html
     log-analysis.html log_summary.json
     duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
@@ -339,16 +356,52 @@ analysis_artifacts_legacy_v3=(
     duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
 )
 
+# Snapshot schema used before the PFC/ECN history was sharded per device.
+analysis_artifacts_legacy_v4=(
+    .lldpq-current.json
+    .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    .pipeline-inputs/collection_status.json
+    bgp-analysis.html bgp_history.json
+    evpn-mh-analysis.html
+    link-flap-analysis.html flap_history.json
+    optical-analysis.html optical_history.json
+    ber-analysis.html ber_history.json ber_baseline.json
+    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+    hardware-analysis.html
+    log-analysis.html log_summary.json
+    duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+    summary/bgp-summary.json summary/evpn-summary.json
+    summary/evpn-mh-summary.json summary/flap-summary.json
+    summary/optical-summary.json summary/ber-summary.json
+    summary/pfc-ecn-summary.json summary/hardware-summary.json
+    summary/duplicate-summary.json
+)
+
 snapshot_analysis_state() {
     local relative source backup status
     analysis_backup_dir="$bundle_root/analysis-backup"
     mkdir -p "$analysis_backup_dir/files" || return 1
     : > "$analysis_backup_dir/manifest" || return 1
     for relative in "${analysis_artifacts[@]}"; do
-        source="$SCRIPT_DIR/monitor-results/$relative"
-        backup="$analysis_backup_dir/files/$relative"
+        source="$SCRIPT_DIR/monitor-results/${relative%/}"
+        backup="$analysis_backup_dir/files/${relative%/}"
         status=missing
-        if [[ -e "$source" || -L "$source" ]]; then
+        if [[ "$relative" == */ ]]; then
+            # Directory artifact: snapshot the whole tree as one unit.
+            if [[ -e "$source" || -L "$source" ]]; then
+                [[ -d "$source" && ! -L "$source" ]] || {
+                    echo "Refusing non-directory analysis artifact: $source" >&2
+                    return 1
+                }
+                mkdir -p "$(dirname "$backup")" || return 1
+                cp -a "${CP_REFLINK_ARGS[@]}" -- "$source" "$backup" || return 1
+                [[ -d "$backup" && ! -L "$backup" ]] || {
+                    echo "Analyzer backup is not a directory: $backup" >&2
+                    return 1
+                }
+                status=present
+            fi
+        elif [[ -e "$source" || -L "$source" ]]; then
             [[ -f "$source" && ! -L "$source" ]] || {
                 echo "Refusing non-file analysis artifact: $source" >&2
                 return 1
@@ -426,8 +479,30 @@ rollback_analysis_state() {
     fi
     while IFS=$'\t' read -r status relative; do
         [[ -n "$relative" ]] || continue
-        destination="$SCRIPT_DIR/monitor-results/$relative"
-        backup="$analysis_backup_dir/files/$relative"
+        destination="$SCRIPT_DIR/monitor-results/${relative%/}"
+        backup="$analysis_backup_dir/files/${relative%/}"
+        if [[ "$relative" == */ ]]; then
+            # Directory artifact: restore the complete backup tree beside the
+            # destination first; the live tree is only removed once its full
+            # replacement is ready, so a copy failure cannot destroy either.
+            if [[ "$status" == "present" ]]; then
+                mkdir -p "$(dirname "$destination")" || { failed=true; continue; }
+                restore_temp=$(mktemp -d \
+                    "$(dirname "$destination")/.$(basename "$destination").rollback.XXXXXXXXXX") || {
+                    failed=true
+                    continue
+                }
+                if ! cp -a "${CP_REFLINK_ARGS[@]}" -- "$backup/." "$restore_temp/" ||
+                   ! rm -rf -- "$destination" ||
+                   ! mv -f -- "$restore_temp" "$destination"; then
+                    rm -rf -- "$restore_temp" 2>/dev/null || true
+                    failed=true
+                fi
+            else
+                rm -rf -- "$destination" || failed=true
+            fi
+            continue
+        fi
         if [[ -d "$destination" && ! -L "$destination" ]]; then
             echo "Could not restore analysis artifact over directory: $destination" >&2
             failed=true
@@ -470,7 +545,8 @@ def lexists(path):
 
 for line in open(manifest, "r", encoding="utf-8"):
     status, relative = line.rstrip("\n").split("\t", 1)
-    destination = os.path.join(results_root, relative)
+    is_directory = relative.endswith("/")
+    destination = os.path.join(results_root, relative.rstrip("/"))
     directory = os.path.dirname(destination)
     while not os.path.isdir(directory):
         if lexists(directory) or directory == results_root:
@@ -482,7 +558,17 @@ for line in open(manifest, "r", encoding="utf-8"):
     if os.path.islink(directory):
         raise SystemExit(f"analyzer destination directory is a symlink: {directory}")
     directories.add(directory)
-    if status == "present":
+    if status == "present" and is_directory:
+        if not os.path.isdir(destination) or os.path.islink(destination):
+            raise SystemExit(f"restored analyzer artifact is unsafe: {destination}")
+        for walk_root, _walk_dirs, walk_files in os.walk(destination):
+            directories.add(walk_root)
+            for name in walk_files:
+                walk_path = os.path.join(walk_root, name)
+                if stat.S_ISREG(os.lstat(walk_path).st_mode):
+                    with open(walk_path, "rb") as handle:
+                        os.fsync(handle.fileno())
+    elif status == "present":
         mode = os.lstat(destination).st_mode
         if not stat.S_ISREG(mode) or os.path.islink(destination):
             raise SystemExit(f"restored analyzer artifact is unsafe: {destination}")
@@ -515,7 +601,7 @@ validate_analysis_backup_manifest() {
     local manifest="$analysis_backup_dir/manifest"
     local status relative extra expected expected_artifact backup count=0 valid=true
     local current_schema=true legacy_schema_v1=true legacy_schema_v2=true
-    local legacy_schema_v3=true
+    local legacy_schema_v3=true legacy_schema_v4=true
     local -A seen=()
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
 
@@ -537,8 +623,14 @@ validate_analysis_backup_manifest() {
         fi
         seen["$relative"]=1
         ((count++))
-        backup="$analysis_backup_dir/files/$relative"
-        if [[ "$status" == "present" && ( ! -f "$backup" || -L "$backup" ) ]]; then
+        backup="$analysis_backup_dir/files/${relative%/}"
+        if [[ "$relative" == */ ]]; then
+            if [[ "$status" == "present" && ( ! -d "$backup" || -L "$backup" ) ]]; then
+                valid=false
+            elif [[ "$status" == "missing" && ( -e "$backup" || -L "$backup" ) ]]; then
+                valid=false
+            fi
+        elif [[ "$status" == "present" && ( ! -f "$backup" || -L "$backup" ) ]]; then
             valid=false
         elif [[ "$status" == "missing" && ( -e "$backup" || -L "$backup" ) ]]; then
             valid=false
@@ -562,8 +654,13 @@ validate_analysis_backup_manifest() {
     for expected_artifact in "${analysis_artifacts_legacy_v3[@]}"; do
         [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v3=false
     done
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v4[@]}" ]] || legacy_schema_v4=false
+    for expected_artifact in "${analysis_artifacts_legacy_v4[@]}"; do
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v4=false
+    done
     [[ "$current_schema" == "true" || "$legacy_schema_v1" == "true" ||
-       "$legacy_schema_v2" == "true" || "$legacy_schema_v3" == "true" ]]
+       "$legacy_schema_v2" == "true" || "$legacy_schema_v3" == "true" ||
+       "$legacy_schema_v4" == "true" ]]
 }
 
 commit_analysis_state() {
@@ -2256,7 +2353,12 @@ execute_commands_optimized() {
     local device=$1
     local user=$2
     local hostname=$3
+    local ping_reachable=${4:-true}
+    local connect_timeout=$SSH_TIMEOUT
     local bundle_stage html_temp raw_file carrier_body optical_body ssh_error_file
+    if [[ "$ping_reachable" == "false" ]]; then
+        connect_timeout=$MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS
+    fi
     # process_device runs in its own subshell, so this result classification is
     # private to one device.  process_device owns the dynamically-scoped local;
     # assigning it here lets the caller distinguish an actual SSH failure from
@@ -2344,7 +2446,9 @@ EOF
     # margin for the unbudgeted sections (defaults: 60 + 120 + 120 = 300).
     local ssh_umbrella_timeout=$((PFC_ECN_COLLECTION_BUDGET_SECONDS + OPTICAL_COLLECTION_BUDGET_SECONDS + 120))
 
-    timeout "$ssh_umbrella_timeout" ssh $SSH_OPTS "$user@$device" '
+    # The leading -o wins over the ConnectTimeout inside SSH_OPTS (OpenSSH
+    # uses the first obtained value), so ping-failed hosts get the short bound.
+    timeout "$ssh_umbrella_timeout" ssh -o ConnectTimeout="$connect_timeout" $SSH_OPTS "$user@$device" '
         # Emit an immediate transport handshake before snapshots or analysis
         # commands run.  ICMP is only a hint; this marker is the authoritative
         # distinction between "SSH never established a remote shell" and
@@ -3693,7 +3797,7 @@ process_device() {
     # valid SSH collection; the existing 300-second collection timeout remains
     # the authoritative reachability bound.
     ping_test "$device" || ping_reachable=false
-    if execute_commands_optimized "$device" "$user" "$hostname"; then
+    if execute_commands_optimized "$device" "$user" "$hostname" "$ping_reachable"; then
         record_collection_status "$hostname" current 0 ok || return 1
         return 0
     else
@@ -3868,23 +3972,37 @@ collection_phase_start=$(date +%s)
 startup_recovery_duration=$((collection_phase_start - START_TIME))
 
 # Simple parallel execution without animation (animation causes hangs)
-declare -a collection_pids=()
+# collection_labels stays authoritative for the fail-closed completeness check
+# in build_collection_status_manifest: a worker killed before it could record
+# any status (or append a failure) still fails the run.
 declare -a collection_labels=()
-declare -a collection_failures=()
-next_collection_wait=0
 active_collection_jobs=0
 device_count=0
 
-wait_for_collection_job() {
-    local index=$1
-    local status
-    if wait "${collection_pids[$index]}"; then
-        status=0
-    else
-        status=$?
-        collection_failures+=("${collection_labels[$index]}:${status}")
+# Free a dispatch slot as soon as ANY collector exits instead of waiting for
+# jobs in launch order: FIFO waits let a single slow or timing-out device
+# block the launch pipeline behind it (head-of-line blocking), which made
+# collection wall time track the stragglers rather than aggregate throughput.
+# Failure details are recorded by the workers themselves under flock, so
+# per-pid exit statuses are not needed for slot management.
+collection_supports_wait_n=true
+if ! ( : & wait -n ) 2>/dev/null; then
+    collection_supports_wait_n=false
+fi
+
+collection_failures_file="$bundle_root/collection-failures.tsv"
+: > "$collection_failures_file" || exit 1
+
+run_collection_job() {
+    local status=0
+    process_device "$1" "$2" "$3" || status=$?
+    if (( status != 0 )); then
+        (
+            flock -x 202
+            printf '%s\t%s\n' "$3" "$status" >> "$collection_failures_file"
+        ) 202>"$collection_failures_file.lock"
     fi
-    return 0
+    return "$status"
 }
 
 for device in "${!devices[@]}"; do
@@ -3894,25 +4012,26 @@ for device in "${!devices[@]}"; do
         continue
     fi
 
-    process_device "$device" "$user" "$hostname" 9>&- &
-    collection_pids+=("$!")
+    run_collection_job "$device" "$user" "$hostname" 9>&- &
     collection_labels+=("$hostname")
     ((active_collection_jobs++))
     ((device_count++))
 
     # Wait if we hit the parallel limit
     if [ "$active_collection_jobs" -ge "$MAX_PARALLEL" ]; then
-        wait_for_collection_job "$next_collection_wait"
-        ((next_collection_wait++))
-        ((active_collection_jobs--))
+        if [[ "$collection_supports_wait_n" == "true" ]]; then
+            wait -n 2>/dev/null || true
+            ((active_collection_jobs--)) || true
+        else
+            # Bash without wait -n: drain the whole batch before refilling.
+            wait || true
+            active_collection_jobs=0
+        fi
     fi
 done
 
 # Wait for all remaining jobs
-while [ "$next_collection_wait" -lt "${#collection_pids[@]}" ]; do
-    wait_for_collection_job "$next_collection_wait"
-    ((next_collection_wait++))
-done
+wait || true
 echo "Collected $device_count devices"
 data_collection_end=$(date +%s)
 data_collection_duration=$((data_collection_end - START_TIME))
@@ -3924,8 +4043,8 @@ if ! build_collection_status_manifest; then
 fi
 export LLDPQ_COLLECTION_STATUS_FILE="$collection_status_manifest"
 
-if [ "${#collection_failures[@]}" -gt 0 ]; then
-    failure_text="collection jobs failed: ${collection_failures[*]}"
+if [[ -s "$collection_failures_file" ]]; then
+    failure_text="collection jobs failed: $(tr '\t' ':' < "$collection_failures_file" | paste -sd' ' -)"
     mark_reports_stale "$failure_text"
     exit 1
 fi
@@ -4001,7 +4120,7 @@ validate_analysis_outputs() {
                 evpn-mh-analysis.html
                 link-flap-analysis.html flap_history.json
                 ber-analysis.html ber_history.json ber_baseline.json
-                pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+                pfc-ecn-analysis.html pfc_ecn_baseline.json pfc-ecn-history/
                 hardware-analysis.html
                 log-analysis.html log_summary.json
                 duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
@@ -4012,7 +4131,7 @@ validate_analysis_outputs() {
             )
             json_files=(
                 bgp_history.json flap_history.json ber_history.json ber_baseline.json
-                pfc_ecn_baseline.json pfc_ecn_history.json
+                pfc_ecn_baseline.json pfc-ecn-history/
                 log_summary.json dup-data/dup_seq_state.json dup-data/dup_ip_state.json
                 summary/bgp-summary.json summary/evpn-summary.json
                 summary/evpn-mh-summary.json summary/flap-summary.json
@@ -4077,11 +4196,11 @@ validate_analysis_outputs() {
             ;;
         pfc-ecn)
             required=(
-                pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+                pfc-ecn-analysis.html pfc_ecn_baseline.json pfc-ecn-history/
                 summary/pfc-ecn-summary.json
             )
             json_files=(
-                pfc_ecn_baseline.json pfc_ecn_history.json
+                pfc_ecn_baseline.json pfc-ecn-history/
                 summary/pfc-ecn-summary.json
             )
             ;;
@@ -4100,7 +4219,17 @@ validate_analysis_outputs() {
     esac
 
     for relative in "${required[@]}"; do
-        path="$SCRIPT_DIR/monitor-results/$relative"
+        path="$SCRIPT_DIR/monitor-results/${relative%/}"
+        if [[ "$relative" == */ ]]; then
+            # Directory artifact: shards of devices that were unavailable this
+            # run legitimately keep their old mtimes, so only existence is
+            # contractual here; per-shard integrity is checked below.
+            if [[ ! -d "$path" || -L "$path" ]]; then
+                echo "Analysis output directory missing: $relative" >&2
+                return 1
+            fi
+            continue
+        fi
         if [[ ! -f "$path" || ! -s "$path" || "$path" -ot "$marker" ]]; then
             echo "Analysis output missing, empty, or not refreshed: $relative" >&2
             return 1

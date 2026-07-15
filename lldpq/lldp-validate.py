@@ -10,6 +10,7 @@ PURPOSE:
 Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
+import json
 import os
 import re
 import stat
@@ -184,6 +185,54 @@ def _group_neighbors(neighbors, resolver):
     for candidates in grouped.values():
         candidates.sort(key=lambda item: _neighbor_sort_key(item, resolver))
     return grouped
+
+
+def write_neighbors_sidecar(destination_path, device_neighbors, resolver, created_at):
+    """Serialize every observed LLDP neighbor for display enrichment.
+
+    The wiring aggregate intentionally omits ports whose neighbor is an
+    unmanaged endpoint host, so analysis pages (BER neighbor columns) consume
+    this sidecar instead.  Best-effort artifact: it is not part of the
+    rollback-capable wiring report transaction.
+    """
+    neighbors = {}
+    for device in sorted(device_neighbors, key=str.casefold):
+        grouped = _group_neighbors(device_neighbors[device], resolver)
+        ports = {}
+        for local_port in sorted(grouped, key=port_key):
+            chosen = next(
+                (candidate for candidate in grouped[local_port]
+                 if candidate.device and candidate.device != 'Unknown'
+                 and candidate.remote_port and candidate.remote_port != 'Unknown'),
+                None,
+            )
+            if chosen is not None:
+                ports[local_port] = {
+                    'device': chosen.device,
+                    'port': chosen.remote_port,
+                }
+        if ports:
+            neighbors[device] = ports
+    payload = {'version': 1, 'created': created_at, 'neighbors': neighbors}
+    directory = os.path.dirname(os.path.abspath(destination_path))
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix='.lldp_neighbors.json.', dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            # Analysis cron jobs and the web service read this without going
+            # through the publisher's chmod, so keep the readable floor here.
+            os.fchmod(handle.fileno(), 0o644)
+            json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination_path)
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def check_connections(
@@ -447,6 +496,13 @@ def main():
             staged_topology = os.path.join(input_folder, "topology.js")
             os.replace(temp_output_path, staged_report)
             temp_output_path = None
+            try:
+                write_neighbors_sidecar(
+                    os.path.join(input_folder, "lldp_neighbors.json"),
+                    device_neighbors, resolver, date_str,
+                )
+            except Exception as sidecar_exc:
+                print(f"Warning: could not stage LLDP neighbor sidecar: {sidecar_exc}")
             subprocess.run(
                 [sys.executable, generate_topology_script, input_folder,
                  staged_topology, '--topology-file', topology_snapshot_path],
@@ -483,6 +539,13 @@ def main():
         if previous_output_path:
             os.unlink(previous_output_path)
             previous_output_path = None
+        try:
+            write_neighbors_sidecar(
+                os.path.join(lldp_results_folder, "lldp_neighbors.json"),
+                device_neighbors, resolver, date_str,
+            )
+        except Exception as sidecar_exc:
+            print(f"Warning: could not write LLDP neighbor sidecar: {sidecar_exc}")
 
         # The caller owns the private collection directory and removes it as a
         # unit.  Do not perform fallible per-file cleanup after both the report

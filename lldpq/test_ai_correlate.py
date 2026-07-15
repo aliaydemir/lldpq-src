@@ -138,6 +138,34 @@ class CollectAnomaliesTest(FixtureCase):
         missing = os.path.join(self.root, "does-not-exist")
         self.assertEqual(ai_correlate.collect_anomalies(missing), [])
 
+    def test_pfc_ecn_shard_directory_takes_precedence_over_monolith(self):
+        # A leftover monolith must be ignored once the shard store exists.
+        write_json(self.mr_dir, "pfc_ecn_history.json", {
+            "version": 1,
+            "history": {
+                "Stale1:swp9": [
+                    {"sample_status": "analyzed", "signal": "loss",
+                     "loss_delta": 5, "timestamp": NOW - 60},
+                ],
+            },
+        })
+        shard_dir = os.path.join(self.mr_dir, "pfc-ecn-history")
+        os.makedirs(shard_dir)
+        write_json(shard_dir, "Leaf2.json", {
+            "version": 1,
+            "host": "Leaf2",
+            "history": {
+                "Leaf2:swp5": [
+                    {"sample_status": "analyzed", "signal": "loss",
+                     "loss_delta": 12, "timestamp": NOW - 60},
+                ],
+            },
+        })
+        anomalies = ai_correlate.collect_anomalies(self.mr_dir)
+        domains = {(item["domain"], item["device"], item["port"]) for item in anomalies}
+        self.assertIn(("pfc_ecn", "Leaf2", "swp5"), domains)
+        self.assertNotIn(("pfc_ecn", "Stale1", "swp9"), domains)
+
     def test_partial_and_malformed_files_do_not_hide_other_domains(self):
         self.populate_default()
         with open(os.path.join(self.mr_dir, "optical_history.json"), "w",

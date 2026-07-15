@@ -29,7 +29,10 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
         cls.source = MONITOR.read_text(encoding="utf-8")
 
     def _interpolate_remote(self, root: Path, scope: str):
-        start = self.source.index('    timeout "$ssh_umbrella_timeout" ssh $SSH_OPTS')
+        start = self.source.index(
+            '    timeout "$ssh_umbrella_timeout" ssh -o ConnectTimeout='
+            '"$connect_timeout" $SSH_OPTS'
+        )
         end = self.source.index("\n    local ssh_status=$?", start)
         command = textwrap.dedent(self.source[start:end])
         capture = root / "remote.sh"

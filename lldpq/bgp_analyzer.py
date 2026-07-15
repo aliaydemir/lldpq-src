@@ -8,12 +8,15 @@ Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
 
+import hashlib
 import os
 import re
 import json
 import time
 import html
 import tempfile
+
+import analysis_sidecar
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
@@ -74,6 +77,12 @@ def _atomic_write(path: str, content: str) -> None:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+        if path.endswith(".json"):
+            # Validation handshake: lets the post-run JSON validator prove
+            # these bytes intact by hash instead of re-parsing the document.
+            analysis_sidecar.publish_digest(
+                path, hashlib.sha256(content.encode("utf-8")).hexdigest()
+            )
     except BaseException:
         try:
             os.unlink(temporary_name)
@@ -1170,7 +1179,14 @@ class BGPAnalyzer:
         }}
         .section-content {{ padding: 16px; }}
         .section-content-table {{ padding: 0; }}
-        
+
+        /* Collapsible sections (default collapsed) */
+        .collapsible > .section-header {{ cursor: pointer; user-select: none; }}
+        .collapsible > .section-header:hover {{ background: #3a3a3a; }}
+        .collapsible .collapse-chevron {{ margin-left: auto; flex-shrink: 0; color: #888; transition: transform 0.2s ease; }}
+        .collapsible:not(.collapsed) .collapse-chevron {{ transform: rotate(90deg); }}
+        .collapsible.collapsed > .section-content {{ display: none; }}
+
         /* Summary Grid */
         .summary-grid {{
             display: grid;
@@ -1336,10 +1352,18 @@ class BGPAnalyzer:
             background: #252526;
             border-radius: 6px;
             border-left: 3px solid #f44336;
+            cursor: pointer;
+            transition: background 0.15s ease;
         }}
+        .anomaly-card:hover {{ background: #2f2f30; }}
         .anomaly-card.warning {{ border-left-color: #ff9800; }}
         .anomaly-card h4 {{ color: #d4d4d4; margin-bottom: 8px; font-size: 14px; }}
         .anomaly-card p {{ font-size: 13px; color: #888; margin: 4px 0; }}
+        .anomaly-card .anomaly-meta {{ font-size: 12px; color: #9e9e9e; margin: 2px 0 6px; }}
+        .anomaly-card .anomaly-shared {{ font-size: 12px; color: #ffb74d; margin-top: 6px; }}
+        .sev-badge {{ font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }}
+        .sev-badge.sev-crit {{ background: rgba(244,67,54,0.15); color: #ff8a80; border: 1px solid #7a2a24; }}
+        .sev-badge.sev-warn {{ background: rgba(255,152,0,0.15); color: #ffb74d; border: 1px solid #6d511d; }}
         
         /* Buttons */
         .btn {{
@@ -1566,14 +1590,35 @@ class BGPAnalyzer:
         
         # Add anomalies section if any exist
         if anomalies:
+            anomalies = sorted(
+                anomalies,
+                key=lambda a: 0 if str(a.get('severity')) == 'critical' else 1
+            )
+            critical_count = sum(1 for a in anomalies if str(a.get('severity')) == 'critical')
+            warning_count = sum(1 for a in anomalies if str(a.get('severity')) == 'warning')
+            severity_badges = ""
+            if critical_count:
+                severity_badges += f'<span class="sev-badge sev-crit">{critical_count} critical</span>'
+            if warning_count:
+                severity_badges += f'<span class="sev-badge sev-warn">{warning_count} warning</span>'
+
+            # Cross-device context: the same neighbor failing on several devices.
+            neighbor_devices = {}
+            for a in anomalies:
+                nbr_name = str(a.get('neighbor') or '')
+                if nbr_name and nbr_name != 'collection':
+                    neighbor_devices.setdefault(nbr_name, set()).add(str(a.get('device')))
+
             html_content += f"""
     <!-- Issues Section -->
-    <div class="dashboard-section">
-        <div class="section-header">
+    <div class="dashboard-section collapsible collapsed">
+        <div class="section-header" onclick="this.parentElement.classList.toggle('collapsed')" title="Click to expand/collapse">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
             </svg>
             Detailed Issue Analysis ({len(anomalies)})
+            {severity_badges}
+            <svg class="collapse-chevron" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"/></svg>
         </div>
         <div class="section-content">
 """
@@ -1584,11 +1629,58 @@ class BGPAnalyzer:
                 anomaly_neighbor = html.escape(str(anomaly['neighbor']))
                 anomaly_message = html.escape(str(anomaly['message']))
                 anomaly_action = html.escape(str(anomaly['action']))
+
+                # Compact evidence row from the already-collected details dict.
+                details = anomaly.get('details') or {}
+                state_txt = str(details.get('state') or '')
+                uptime_txt = str(details.get('uptime') or '')
+                meta_bits = []
+                if details.get('vrf'):
+                    meta_bits.append(f"VRF {details['vrf']}")
+                address_family = str(details.get('address_family') or '')
+                if address_family and address_family != 'unknown':
+                    meta_bits.append(address_family)
+                if details.get('interface'):
+                    meta_bits.append(f"via {details['interface']}")
+                if details.get('asn'):
+                    meta_bits.append(f"AS {details['asn']}")
+                if uptime_txt:
+                    if state_txt in ('', 'established'):
+                        meta_bits.append(f"uptime {uptime_txt}")
+                    elif uptime_txt == 'never':
+                        meta_bits.append("never established")
+                    else:
+                        meta_bits.append(f"down for {uptime_txt}")
+                if details.get('last_update'):
+                    meta_bits.append(f"last update {details['last_update']}")
+                if details.get('collection_error'):
+                    meta_bits.append(f"error: {details['collection_error']}")
+                meta_html = ""
+                if meta_bits:
+                    meta_html = (
+                        '<p class="anomaly-meta">'
+                        + " &middot; ".join(html.escape(str(bit)) for bit in meta_bits)
+                        + '</p>'
+                    )
+
+                other_devices = sorted(
+                    neighbor_devices.get(str(anomaly.get('neighbor') or ''), set())
+                    - {str(anomaly.get('device'))}
+                )
+                shared_html = ""
+                if other_devices:
+                    shown = ", ".join(html.escape(d) for d in other_devices[:4])
+                    if len(other_devices) > 4:
+                        shown += f" +{len(other_devices) - 4} more"
+                    shared_html = f'<p class="anomaly-shared">Same neighbor also has issues on: {shown}</p>'
+
                 html_content += f"""
-            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}">
+            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}" onclick="filterFromAnomaly(this)" title="Click to show this device in the table below">
                 <h4>{anomaly_device} - {anomaly_neighbor}</h4>
+                {meta_html}
                 <p><strong>Issue:</strong> {anomaly_message}</p>
                 <p><strong>Recommended Action:</strong> {anomaly_action}</p>
+                {shared_html}
             </div>
 """
             html_content += """
@@ -2252,7 +2344,41 @@ class BGPAnalyzer:
             allRows.forEach(row => row.style.display = '');
         }
 
-        // Generic table sorting functionality  
+        // Filter the table from an anomaly card. Matches on data-device-key so
+        // it keeps working when p2p-alias rewrites the displayed device names.
+        function filterFromAnomaly(card) {
+            const deviceKey = card && card.dataset ? card.dataset.deviceKey : '';
+            if (!deviceKey) return;
+            clearBgpDetailRows();
+
+            selectedDevice = deviceKey;
+            deviceSearchActive = true;
+
+            // Clear card-based filter
+            currentFilter = 'ALL';
+            document.querySelectorAll('.summary-card').forEach(c => c.classList.remove('active'));
+
+            let matchCount = 0;
+            let displayName = deviceKey;
+            allRows.forEach(row => {
+                if (row.dataset.deviceKey === deviceKey) {
+                    if (matchCount === 0) displayName = row.cells[0]?.textContent?.trim() || deviceKey;
+                    row.style.display = '';
+                    matchCount++;
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+
+            document.getElementById('filter-info').style.display = 'block';
+            document.getElementById('filter-text').textContent = 'Showing neighbors for device: ' + displayName + ' (' + matchCount + ' neighbors)';
+            const clearBtn = document.getElementById('clearSearchBtn');
+            if (clearBtn) clearBtn.style.display = 'inline-block';
+            const table = document.getElementById('bgp-table');
+            if (table) table.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+
+        // Generic table sorting functionality
         let tableSortState = { column: -1, direction: 'asc' };
         
         function initTableSorting() {

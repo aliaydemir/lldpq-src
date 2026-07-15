@@ -172,6 +172,25 @@ _CONFIG_LOCK_HANDLE = None
 _INVENTORY_LOCK_HANDLE = None
 _SSH_KEY_LOCK_HANDLE = None
 
+
+def _emit_uncaught_json(exc_type, exc, tb):
+    """Last-resort guard: the bash header already emitted the JSON Content-Type,
+    so any exception that escapes an action handler would otherwise reach the
+    browser as HTTP 200 with an empty body (an opaque JSON-parse failure in the
+    UI). Convert it to a JSON error instead. SystemExit is never routed here, so
+    the normal `print(...); sys.exit(0)` per-action path is unaffected."""
+    try:
+        sys.stdout.write(json.dumps({
+            'success': False,
+            'error': 'Setup request failed: ' + (str(exc) or exc_type.__name__)[:300],
+        }))
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+sys.excepthook = _emit_uncaught_json
+
 def load_setup_safety():
     """Load the helper shipped beside this CGI (pure validation/read helpers)."""
     if not SETUP_SAFETY or not os.path.isfile(SETUP_SAFETY):
@@ -389,7 +408,10 @@ def ensure_configuration_lock():
     if _CONFIG_LOCK_HANDLE is not None:
         return
     path = '/etc/lldpq.conf.lock'
-    metadata = os.lstat(path)
+    try:
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError('Global configuration lock is missing; run install.sh to repair this installation.') from exc
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
             or metadata.st_mode & stat.S_IWOTH):
         raise RuntimeError('Global configuration lock has unsafe ownership, type, or permissions.')
@@ -415,6 +437,12 @@ def ensure_inventory_lock():
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IWOTH:
             raise RuntimeError('Inventory lock has unsafe type or permissions.')
+        # umask 077 (set before this heredoc) strips the group bits at O_CREAT,
+        # so a lock we created ourselves would be 0600 and lock out the service
+        # user (member of the www-data group) on the devices.yaml side. Floor the
+        # group bits back on when we own the inode, mirroring provision-api.sh.
+        if metadata.st_uid == os.geteuid() and (stat.S_IMODE(metadata.st_mode) & 0o660) != 0o660:
+            os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode) | 0o660)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
     except Exception:
         os.close(descriptor)
@@ -518,6 +546,45 @@ def cleanup_uploaded_tarball(path):
         return False
     except OSError:
         return False
+
+PENDING_UPLOAD_MARKER = '/tmp/lldpq-upload-src.pending'
+
+def record_pending_upload(path):
+    """Remember an upload buffer so it can be deleted once the offline update
+    finishes. The runner executes as the service user and cannot unlink this
+    www-data-owned file from sticky /tmp, so the CGI principal cleans it up on
+    the update-log 'done' poll instead of leaking it until the 24h sweeper."""
+    if not isinstance(path, str) or not re.fullmatch(
+            r'/tmp/lldpq-upload-src\.[A-Za-z0-9]{6}\.tar\.gz', path):
+        return
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        descriptor = os.open(PENDING_UPLOAD_MARKER, flags, 0o600)
+        try:
+            os.write(descriptor, path.encode('ascii'))
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+def cleanup_pending_upload():
+    """Delete the upload buffer recorded at launch, after the update completed."""
+    try:
+        descriptor = os.open(PENDING_UPLOAD_MARKER, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except OSError:
+        return
+    try:
+        marker = os.fstat(descriptor)
+        if not stat.S_ISREG(marker.st_mode) or marker.st_uid != os.geteuid():
+            return
+        recorded = os.read(descriptor, 4096).decode('ascii', 'replace').strip()
+    finally:
+        os.close(descriptor)
+    cleanup_uploaded_tarball(recorded)
+    try:
+        os.unlink(PENDING_UPLOAD_MARKER)
+    except OSError:
+        pass
 
 def _public_key_identity(value):
     parts = (value or '').strip().split()
@@ -802,7 +869,13 @@ def install_text_as_root(content, target, temp_name, mode='644', owner='root:roo
         return False
 
 def write_conf(pairs):
-    """Update allowlisted key=value pairs without nested sudo shells."""
+    """Update allowlisted key=value pairs without nested sudo shells.
+
+    Returns True on success, False on failure with /etc/lldpq.conf safely
+    restored to its original bytes, or None on failure where the rollback ALSO
+    failed and the file may now hold the new values (diverged). Callers that
+    also mutate a paired artifact (e.g. cron) must not roll that artifact back
+    on a None result, or the two would diverge."""
     if not pairs:
         return True
     ensure_configuration_lock()
@@ -827,11 +900,11 @@ def write_conf(pairs):
         return True
     # A copy can succeed before a later chmod/chown failure. Restore the exact
     # original bytes before reporting failure so callers get a transaction.
-    install_text_as_root(
+    rolled_back = install_text_as_root(
         original, '/etc/lldpq.conf', '.lldpq.conf.setup.rollback.tmp',
         '660', config_owner
     )
-    return False
+    return False if rolled_back else None
 
 def reserve_background_job(state_dir, kind, log_path):
     """Atomically reserve one service-user job slot and return a unique id."""
@@ -1308,7 +1381,11 @@ if action == 'run':
         f'trap {shlex.quote(cleanup)} EXIT; '
         f'cd {shlex.quote(lldpq_dir)} || {{ echo "ERROR: LLDPq directory is unavailable" >> {shlex.quote(log_path)}; '
         f'printf "__LLDPQ_DONE__:10\\n" >> {shlex.quote(log_path)}; exit 10; }}; '
-        f'/usr/local/bin/lldpq - >> {shlex.quote(log_path)} 2>&1; '
+        # Wait up to 300s for the shared pipeline lock, matching the cron entry
+        # install.sh renders (install.sh render_lldpq_cron_file). Without this a
+        # manual run collides with the minute-interval fabric-scan/collection,
+        # defaults to a non-blocking flock, and exits 75 as a spurious failure.
+        f'LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq - >> {shlex.quote(log_path)} 2>&1; '
         f'rc=$?; printf "__LLDPQ_DONE__:%s\\n" "$rc" >> {shlex.quote(log_path)}; '
         f'exit "$rc"'
     )
@@ -1483,9 +1560,11 @@ if action == 'get-parallel':
                       'getconfigs': _pint('GET_CONFIGS_MAX_PARALLEL', 100)}))
     sys.exit(0)
 
-# ─── Action: set collection parallelism (presets only) ───
+# ─── Action: set collection parallelism ───
 if action == 'set-parallel':
-    ALLOWED = {50, 100, 150, 200, 250, 300, 500}
+    # Accept any integer in the same 1-1000 range the backup importer allows
+    # (lldpq/backup_import.py _PORTABLE_INTEGER_RANGES) so a persisted custom
+    # value the UI shows as the current option can always be saved back.
     keymap = {'monitor': 'MONITOR_MAX_PARALLEL', 'lldp': 'LLDP_MAX_PARALLEL',
               'assets': 'ASSETS_MAX_PARALLEL', 'getconfigs': 'GET_CONFIGS_MAX_PARALLEL'}
     pairs = {}
@@ -1495,8 +1574,8 @@ if action == 'set-parallel':
         except Exception:
             print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
             sys.exit(0)
-        if v not in ALLOWED:
-            print(json.dumps({'success': False, 'error': 'Unsupported value for ' + fk}))
+        if not 1 <= v <= 1000:
+            print(json.dumps({'success': False, 'error': 'Value for ' + fk + ' must be between 1 and 1000'}))
             sys.exit(0)
         pairs[ck] = v
     if write_conf(pairs):
@@ -1852,6 +1931,9 @@ exit "$rc"
             cleanup_uploaded_tarball(tarball)
             print(json.dumps({'success': False, 'error': 'Detached offline update launch failed immediately'}))
             sys.exit(0)
+        # The service-user runner cannot delete this www-data-owned tarball from
+        # sticky /tmp; record it so update-log removes it once the update ends.
+        record_pending_upload(tarball)
         print(json.dumps({'success': True, 'message': 'Offline update started', 'job_id': job_id}))
     except Exception as e:
         release_background_job(state_dir, 'update', job_id)
@@ -1875,6 +1957,10 @@ if action == 'update-log':
         content = ''
     display, raw_done, exit_code, ok, log_job_id = parse_completion_log(content)
     status = background_job_status(state_dir, 'update', raw_done, log_job_id)
+    if status['done'] and not status['running']:
+        # The service-user runner could not unlink a browser-uploaded tarball
+        # (www-data-owned, sticky /tmp); reap it now that the update has ended.
+        cleanup_pending_upload()
     print(json.dumps({'success': True, 'done': status['done'],
                       'ok': ok and status['done'],
                       'running': status['running'], 'job_id': status['job_id'],
@@ -1991,17 +2077,28 @@ if action == 'set-schedules':
                      'Could not update cron file and automatic cron rollback failed')
             print(json.dumps({'success': False, 'error': error}))
             sys.exit(0)
-        if not write_conf({
+        conf_status = write_conf({
             'LLDPQ_CRON': '"' + lldpq_cron + '"',
             'GETCONF_CRON': '"' + getconf_cron + '"',
-        }):
-            # Keep the live cron and persisted configuration in sync.
-            rolled_back = install_text_as_root(
-                ''.join(orig), cron_file, '.cron.rollback.tmp', '644'
-            )
-            error = ('Cron updated but config persistence failed; cron was rolled back'
-                     if rolled_back else
-                     'Cron updated but config persistence failed, and automatic cron rollback failed')
+        })
+        if conf_status is not True:
+            if conf_status is False:
+                # /etc/lldpq.conf was safely restored to the old schedule, so
+                # roll the live cron back too to keep the two in sync.
+                rolled_back = install_text_as_root(
+                    ''.join(orig), cron_file, '.cron.rollback.tmp', '644'
+                )
+                error = ('Cron updated but config persistence failed; cron was rolled back'
+                         if rolled_back else
+                         'Cron updated but config persistence failed, and automatic cron rollback failed')
+            else:
+                # conf_status is None: /etc/lldpq.conf may already hold the NEW
+                # schedule. Leave the live cron on the new schedule so the two
+                # stay consistent instead of re-introducing a cron/conf split
+                # that the next install.sh would silently resolve toward conf.
+                error = ('Schedule applied to cron but config persistence was uncertain; '
+                         'the live cron was left on the new schedule to match /etc/lldpq.conf. '
+                         'Run install.sh to reconcile if needed.')
             print(json.dumps({'success': False, 'error': error}))
             sys.exit(0)
         print(json.dumps({'success': True, 'lldpq_cron': lldpq_cron, 'getconf_cron': getconf_cron}))
@@ -2070,7 +2167,7 @@ if action == 'get-notifications':
             'flap_crit': net.get('link_flaps_critical', 20),
             'optical': net.get('optical_power_margin', 3),
             'cpu': hw.get('cpu_temp_critical', 85),
-            'asic': hw.get('asic_temp_critical', 90),
+            'asic': hw.get('asic_temp_critical', 105),
             'disk': sysd.get('disk_usage_critical', 90),
         },
     }
@@ -2214,6 +2311,13 @@ if action == 'backup-export':
                         )
                         added.append('ssh/%s.pub' % key_name)
                         break
+                if not has_key:
+                    # The key was explicitly requested; a silent keyless bundle
+                    # only surfaces on the destination host when the collector
+                    # cannot reach any switch. Fail loudly with an actionable hint.
+                    raise RuntimeError(
+                        'No collector private key (id_ed25519 or id_rsa) was found to '
+                        'include; generate or import a key in the SSH Keys step first.')
             # Portable preferences from /etc/lldpq.conf: ONLY tunable knobs (schedules, parallelism,
             # toggles, AI provider/model). Deliberately excludes host paths/identity (LLDPQ_DIR,
             # LLDPQ_USER, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE) and secrets (AI_API_KEY).
@@ -2299,14 +2403,24 @@ if action == 'purge-data':
     if post_data.get('target') != 'update_backups':
         print(json.dumps({'success': False, 'error': 'Unknown purge target'}))
         sys.exit(0)
-    r = subprocess.run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
-                        'set -o pipefail; state="$HOME/.lldpq-state"; if [ -d "$state/update.active" ]; then '
-                        'echo "ACTIVE"; exit 75; fi; shopt -s nullglob; f=(); '
-                        'for d in ~/lldpq-backup-*; do [ -d "$d" ] && [ -s "$d/COMPLETE" ] && f+=("$d"); done; '
-                        'n=${#f[@]}; m=0; if [ $n -gt 0 ]; then '
-                        'm=$(du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1) || exit 2; '
-                        'rm -rf -- "${f[@]}" || exit 3; fi; echo "$n ${m:-0}"'],
-                       capture_output=True, text=True, timeout=120)
+    try:
+        r = subprocess.run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
+                            'set -o pipefail; state="$HOME/.lldpq-state"; if [ -d "$state/update.active" ]; then '
+                            'echo "ACTIVE"; exit 75; fi; shopt -s nullglob; f=(); '
+                            'for d in ~/lldpq-backup-*; do [ -d "$d" ] && [ -s "$d/COMPLETE" ] && f+=("$d"); done; '
+                            'n=${#f[@]}; m=0; if [ $n -gt 0 ]; then '
+                            'm=$(du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1) || exit 2; '
+                            'rm -rf -- "${f[@]}" || exit 3; fi; echo "$n ${m:-0}"'],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # du + rm over several multi-GB backups can exceed 120s on slow disks.
+        # subprocess only SIGKILLs the direct child (sudo), which does not relay
+        # the signal, so the rm -rf keeps running detached. Report that instead
+        # of dying with a traceback (which would send an empty body).
+        print(json.dumps({'success': False, 'error':
+                          'Purge is taking longer than 120s and is continuing in the background; '
+                          'refresh Maintenance in a moment to see the remaining size.'}))
+        sys.exit(0)
     if r.returncode == 75:
         print(json.dumps({'success': False, 'error': 'An update is active; completed backups were not removed.'}))
         sys.exit(0)

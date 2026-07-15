@@ -9,6 +9,7 @@ artifacts under ``monitor-results``.  Missing or failed counters are kept as
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import math
@@ -17,10 +18,13 @@ import re
 import sys
 import tempfile
 import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
 
+import analysis_sidecar
 from collection_freshness import (
     asset_snapshot_is_authoritative,
     asset_snapshot_is_valid,
@@ -580,6 +584,18 @@ def _atomic_write(path: Path, content: str) -> None:
         raise
 
 
+class _HashingHandle:
+    """Tee text writes into a sha256 so the sidecar digest costs no re-read."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+        self.digest = hashlib.sha256()
+
+    def write(self, piece: str) -> int:
+        self.digest.update(piece.encode("utf-8"))
+        return self._handle.write(piece)
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
     """Stream compact JSON to the atomic stage without duplicating it in RAM."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,8 +608,9 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
         os.fchmod(descriptor, mode | 0o644)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             descriptor = -1
-            _write_chunked_json(handle, value)
-            handle.write("\n")
+            hashing = _HashingHandle(handle)
+            _write_chunked_json(hashing, value)
+            hashing.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -603,6 +620,9 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+        # Validation handshake: lets the post-run JSON validator prove these
+        # bytes intact by hash instead of re-parsing the whole document.
+        analysis_sidecar.publish_digest(path, hashing.digest.hexdigest())
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -611,6 +631,94 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+
+HISTORY_DIR_NAME = "pfc-ecn-history"
+# Shard files are named after inventory hostnames; refuse anything that could
+# escape the shard directory or hide as a dotfile.
+SHARD_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _shard_path(history_dir: Path, hostname: str) -> Path:
+    return history_dir / f"{hostname}.json"
+
+
+def _process_history_shard(
+    history_dir_text: str,
+    hostname: str,
+    new_slims: Dict[str, List[Dict[str, Any]]],
+    legacy_seed: Optional[Dict[str, Any]],
+    cutoff: float,
+    now: float,
+) -> Tuple[str, Optional[str], Dict[str, List[Dict[str, Any]]]]:
+    """Merge, prune and persist one device's 24h history shard.
+
+    Sharding the history per device keeps every run's IO proportional to the
+    devices actually collected and lets shards load/prune/write in parallel
+    worker processes; the monolithic document forced a full single-threaded
+    read-modify-rewrite of the entire fabric's history every run.
+
+    ``legacy_seed`` is only passed while migrating from the monolithic
+    ``pfc_ecn_history.json``; it then replaces any shard content, which is
+    safe because the analyzer transaction in monitor.sh rolls the monolith
+    and the shard directory back together on failure.
+
+    Returns ``(hostname, error, detail_samples)`` where ``detail_samples``
+    maps each port key with new data to its bounded recent sample trail for
+    the report's expandable detail panels.
+    """
+    try:
+        shard = _shard_path(Path(history_dir_text), hostname)
+        if legacy_seed is not None:
+            histories: Dict[str, Any] = dict(legacy_seed)
+        else:
+            state = _read_state(shard, {"version": 1, "history": {}})
+            histories = state.get("history", {})
+            if not isinstance(histories, dict):
+                histories = {}
+        for key, slims in new_slims.items():
+            port_history = histories.setdefault(key, [])
+            if not isinstance(port_history, list):
+                port_history = histories[key] = []
+            port_history.extend(slims)
+        for key in list(histories):
+            values = histories[key]
+            if not isinstance(values, list):
+                histories[key] = []
+                continue
+            histories[key] = [
+                # Migrate pre-slim records (recognizable by their embedded
+                # absolute counters) on the fly, so the file-size win applies
+                # immediately instead of phasing in over the 24h retention.
+                _history_record(value) if "counters" in value or "rates" in value
+                else value
+                for value in values
+                if isinstance(value, Mapping)
+                and isinstance(value.get("timestamp"), (int, float))
+                and value["timestamp"] >= cutoff
+            ][-HISTORY_MAX_RECORDS_PER_PORT:]
+        _atomic_json(shard, {
+            "version": 1,
+            "updated_at": _iso(now),
+            "host": hostname,
+            "history": histories,
+        })
+        detail = {
+            key: histories.get(key, [])[-HISTORY_DETAIL_SAMPLES:]
+            for key in new_slims
+        }
+        return hostname, None, detail
+    except Exception as exc:
+        return hostname, f"{type(exc).__name__}: {exc}", {}
+
+
+def _shard_worker_limit(task_count: int) -> int:
+    raw = os.environ.get("PFC_ECN_SHARD_MAX_PARALLEL", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = min(8, os.cpu_count() or 2)
+    return max(1, min(value, 8, task_count)) if task_count else 1
 
 
 def _fmt_total(value: Optional[int]) -> str:
@@ -1428,29 +1536,37 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     all_devices_unavailable = snapshot_valid and not expected_hosts
 
     baseline_path = result_dir / "pfc_ecn_baseline.json"
-    history_path = result_dir / "pfc_ecn_history.json"
+    legacy_history_path = result_dir / "pfc_ecn_history.json"
+    history_dir = result_dir / HISTORY_DIR_NAME
     report_path = result_dir / "pfc-ecn-analysis.html"
     baseline_state = _read_state(baseline_path, {"version": 1, "ports": {}})
-    history_state = _read_state(history_path, {"version": 1, "history": {}})
     baselines = baseline_state.get("ports", {})
-    histories = history_state.get("history", {})
     if not isinstance(baselines, dict):
         baselines = {}
-    if not isinstance(histories, dict):
-        histories = {}
+    # One-time migration source: history now lives in per-device shards under
+    # history_dir.  The monolith is only parsed while it still exists, then
+    # split into shards and removed within the same analyzer transaction.
+    legacy_histories: Optional[Dict[str, Any]] = None
+    if legacy_history_path.exists():
+        legacy_state = _read_state(legacy_history_path, {"version": 1, "history": {}})
+        legacy_histories = legacy_state.get("history", {})
+        if not isinstance(legacy_histories, dict):
+            legacy_histories = {}
     if authoritative:
         baselines = {
             key: value for key, value in baselines.items()
             if key.split(":", 1)[0] in statuses
         }
-        histories = {
-            key: value for key, value in histories.items()
-            if key.split(":", 1)[0] in statuses
-        }
+        if legacy_histories is not None:
+            legacy_histories = {
+                key: value for key, value in legacy_histories.items()
+                if key.split(":", 1)[0] in statuses
+            }
     finish_phase("load")
 
     records: List[Dict[str, Any]] = []
     hosts_with_ports = set()
+    new_history_by_host: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for raw_file in sorted(current_files):
         hostname = raw_file.name.removesuffix("_pfc_ecn.txt")
         try:
@@ -1511,10 +1627,9 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
                         name: value for name, value in counters.items() if value is not None
                     },
                 }
-            port_history = histories.setdefault(key, [])
-            if not isinstance(port_history, list):
-                port_history = histories[key] = []
-            port_history.append(_history_record(record))
+            new_history_by_host.setdefault(hostname, {}).setdefault(
+                key, []
+            ).append(_history_record(record))
 
     hosts_without_ports = expected_hosts - hosts_with_ports
     if hosts_without_ports:
@@ -1530,31 +1645,110 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         return False
     finish_phase("parse_records")
 
-    cutoff = time.time() - HISTORY_SECONDS
-    for key in list(histories):
-        values = histories[key]
-        if not isinstance(values, list):
-            histories[key] = []
-            continue
-        histories[key] = [
-            # Migrate pre-slim records (recognizable by their embedded absolute
-            # counters) on the fly, so the file-size win applies on the first
-            # run instead of phasing in over the 24h retention window.
-            _history_record(value) if "counters" in value or "rates" in value
-            else value
-            for value in values
-            if isinstance(value, Mapping)
-            and isinstance(value.get("timestamp"), (int, float))
-            and value["timestamp"] >= cutoff
-        ][-HISTORY_MAX_RECORDS_PER_PORT:]
-
     now = time.time()
+    cutoff = now - HISTORY_SECONDS
+
+    # Fan the per-device shard merge/prune/write out to worker processes.
+    # Every shard is written through _atomic_json (with its sha256 sidecar),
+    # so a torn write can never replace a previous complete shard.
+    shard_hosts = set(new_history_by_host)
+    legacy_by_host: Dict[str, Dict[str, Any]] = {}
+    if legacy_histories is not None:
+        for key, values in legacy_histories.items():
+            legacy_by_host.setdefault(key.split(":", 1)[0], {})[key] = values
+        shard_hosts.update(legacy_by_host)
+    unsafe_hosts = sorted(
+        host for host in shard_hosts if not SHARD_HOST_RE.fullmatch(host)
+    )
+    if unsafe_hosts:
+        print(
+            "Refusing unsafe PFC/ECN shard hostnames: " + ", ".join(unsafe_hosts),
+            file=sys.stderr,
+        )
+        return False
+    shard_tasks = [
+        (
+            host,
+            new_history_by_host.get(host, {}),
+            legacy_by_host.get(host, {}) if legacy_histories is not None else None,
+        )
+        for host in sorted(shard_hosts)
+    ]
+    detail_history: Dict[str, List[Dict[str, Any]]] = {}
+    shard_errors: List[str] = []
+    # The directory itself is contractual (validated after every run) even
+    # when no device produced new history this run.
+    history_dir.mkdir(parents=True, exist_ok=True)
+    if shard_tasks:
+        shard_results: List[Tuple[str, Optional[str], Dict[str, Any]]] = []
+        workers = _shard_worker_limit(len(shard_tasks))
+        if workers > 1:
+            try:
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    futures = [
+                        executor.submit(
+                            _process_history_shard,
+                            str(history_dir), host, new_slims, seed, cutoff, now,
+                        )
+                        for host, new_slims, seed in shard_tasks
+                    ]
+                    shard_results = [future.result() for future in futures]
+            except (OSError, PermissionError, BrokenProcessPool):
+                # Constrained containers can deny multiprocessing primitives.
+                # Fall back to the same complete sequential pass.
+                shard_results = []
+        if not shard_results:
+            shard_results = [
+                _process_history_shard(
+                    str(history_dir), host, new_slims, seed, cutoff, now
+                )
+                for host, new_slims, seed in shard_tasks
+            ]
+        for host, error, detail in shard_results:
+            if error is not None:
+                shard_errors.append(f"{host}: {error}")
+                continue
+            detail_history.update(detail)
+    if shard_errors:
+        print(
+            "PFC/ECN history shard writes failed: " + "; ".join(shard_errors),
+            file=sys.stderr,
+        )
+        return False
+    if legacy_histories is not None:
+        # Every shard from the monolith is durably written; retire the legacy
+        # document (monitor.sh's analyzer transaction restores both sides
+        # together if anything later in this run fails).
+        try:
+            legacy_history_path.unlink()
+        except OSError as exc:
+            print(f"Could not retire legacy PFC/ECN history: {exc}", file=sys.stderr)
+            return False
+        try:
+            analysis_sidecar.sidecar_path(legacy_history_path).unlink()
+        except OSError:
+            pass
+    if authoritative and history_dir.is_dir():
+        for shard_file in history_dir.glob("*.json"):
+            if shard_file.stem not in statuses:
+                try:
+                    shard_file.unlink()
+                except OSError as exc:
+                    print(
+                        f"Could not prune retired PFC/ECN shard: {exc}",
+                        file=sys.stderr,
+                    )
+                    return False
+                try:
+                    analysis_sidecar.sidecar_path(shard_file).unlink()
+                except OSError:
+                    pass
+
     baseline_output = {"version": 1, "updated_at": _iso(now), "ports": baselines}
-    history_output = {"version": 1, "updated_at": _iso(now), "history": histories}
     finish_phase("history_prune")
     report = render_report(
         records,
-        histories,
+        detail_history,
         # Coverage is measured against the hosts we actually expect a current
         # collection from (asset status OK), not the whole inventory.  Down or
         # excluded devices are reported as coverage failures instead of
@@ -1566,7 +1760,6 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     )
     finish_phase("render")
     _atomic_json(baseline_path, baseline_output)
-    _atomic_json(history_path, history_output)
     _atomic_write(report_path, report)
     # Machine-readable dashboard summary. Additive to the HTML report and
     # carrying the same headline numbers/collection status the report embeds.

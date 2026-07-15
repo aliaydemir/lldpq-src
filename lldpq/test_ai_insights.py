@@ -215,6 +215,53 @@ class AskAiInsightsTest(unittest.TestCase):
             [NOW - 495, NOW - 493, NOW - 491],
         )
 
+    def test_pfc_shard_directory_is_preferred_and_merged(self):
+        # A leftover monolith must be ignored once the shard store exists;
+        # events from every shard land in the same timeline.
+        self.write_monitor("pfc_ecn_history.json", {"history": {
+            "stale01:swp9": [{
+                "timestamp": NOW - 100,
+                "sample_status": "analyzed",
+                "signal": "loss",
+                "loss_delta": 9,
+            }],
+        }})
+        shard_dir = self.monitor / "pfc-ecn-history"
+        shard_dir.mkdir()
+        for host, port in (("leaf01", "swp1"), ("leaf02", "swp2")):
+            (shard_dir / f"{host}.json").write_text(json.dumps({
+                "version": 1,
+                "host": host,
+                "history": {f"{host}:{port}": [
+                    {
+                        "timestamp": NOW - 200,
+                        "sample_status": "analyzed",
+                        "signal": "quiet",
+                        "loss_delta": 0,
+                    },
+                    {
+                        "timestamp": NOW - 100,
+                        "sample_status": "analyzed",
+                        "signal": "loss",
+                        "loss_delta": 7,
+                    },
+                ]},
+            }), encoding="utf-8")
+        timeline = build_timeline(
+            monitor_dir=self.monitor,
+            web_root=self.web,
+            window="1h",
+            now=NOW,
+        )
+        subjects = {
+            (event["device"], event["subject"])
+            for event in timeline["events"]
+            if event["category"] == "pfc_ecn"
+        }
+        self.assertIn(("leaf01", "swp1"), subjects)
+        self.assertIn(("leaf02", "swp2"), subjects)
+        self.assertNotIn(("stale01", "swp9"), subjects)
+
     def test_modern_ber_schema_detects_combined_grade_and_error_onset(self):
         self.write_monitor("ber_history.json", {
             "ber_history": {

@@ -55,8 +55,8 @@ thresholds:
   hardware:
     cpu_temp_critical: 85      # °C - Critical CPU temperature
     cpu_temp_warning: 75       # °C - Warning CPU temperature
-    asic_temp_critical: 90     # °C - Critical ASIC temperature  
-    asic_temp_warning: 80      # °C - Warning ASIC temperature
+    asic_temp_critical: 105    # °C - Critical ASIC temperature (Spectrum firmware warning level; shutdown at 120°C)
+    asic_temp_warning: 95      # °C - Warning ASIC temperature (83-86°C is normal under load)
     fan_rpm_critical: 3000     # RPM - Minimum fan speed (critical)
     fan_rpm_warning: 4000      # RPM - Minimum fan speed (warning)
     memory_usage_critical: 90  # % - Critical memory usage
@@ -100,7 +100,7 @@ alert_strategy:
   # ⚠️ NOT IMPLEMENTED YET - critical issues are currently batched into the summary
   always_immediate:
     - "cpu_temp_critical"            # CPU over 85°C (hardware failure risk)
-    - "asic_temp_critical"           # ASIC over 90°C (switch could fail)
+    - "asic_temp_critical"           # ASIC over 105°C (switch could fail)
     - "bgp_neighbors_down"           # BGP down (network connectivity lost)
     - "fan_critical_failure"         # Fan stopped (cooling failure)
   # Note: These would bypass summary mode and send individual device alerts (not implemented yet)

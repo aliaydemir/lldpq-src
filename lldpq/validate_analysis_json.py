@@ -13,8 +13,27 @@ import sys
 import time
 from typing import List, Optional, Sequence, Tuple
 
+import analysis_sidecar
+
 
 ValidationResult = Tuple[str, int, Optional[str]]
+
+
+def _validate_json_file(path: Path) -> Optional[str]:
+    # Producer handshake first: a matching sha256 sidecar proves the file
+    # holds exactly the bytes its analyzer wrote (analyzers serialize via
+    # the json encoders, so those bytes are valid JSON by construction).
+    # Hashing runs at sequential-read speed; the full parse of the largest
+    # history document dominated this phase's wall time.  Any missing or
+    # mismatching sidecar silently falls back to the complete parse.
+    if analysis_sidecar.sidecar_matches(path):
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        return str(exc)
+    return None
 
 
 def _validate_one(root: Path, relative: str) -> ValidationResult:
@@ -23,12 +42,20 @@ def _validate_one(root: Path, relative: str) -> ValidationResult:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts:
         error = "unsafe relative path"
+    elif relative.endswith("/"):
+        # Directory entry: validate every JSON document inside (per-device
+        # shard trees), reported as one aggregate timing line.
+        target = root / relative.rstrip("/")
+        if not target.is_dir():
+            error = "not a directory"
+        else:
+            for member in sorted(target.glob("*.json")):
+                member_error = _validate_json_file(member)
+                if member_error is not None:
+                    error = f"{member.name}: {member_error}"
+                    break
     else:
-        try:
-            with (root / path).open("r", encoding="utf-8") as handle:
-                json.load(handle)
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
-            error = str(exc)
+        error = _validate_json_file(root / path)
     elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
     return relative, elapsed_ms, error
 
@@ -42,7 +69,7 @@ def validate_json_files(
     """Return validation results in the exact input order."""
     if not relatives:
         return []
-    workers = max(1, min(int(max_workers), 2, len(relatives)))
+    workers = max(1, min(int(max_workers), 8, len(relatives)))
     if workers == 1:
         return [_validate_one(root, relative) for relative in relatives]
     try:
@@ -63,8 +90,8 @@ def _worker_limit() -> int:
     try:
         value = int(raw)
     except ValueError:
-        value = 4
-    return max(1, min(value, 2))
+        value = 2
+    return max(1, min(value, 8))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -80,6 +80,40 @@ json_response() {
     echo "$1"
 }
 
+# Acquire the shared single-runner lock (same lock held by deploy/diff/generate)
+# before any working-tree/.git mutation, so file and git changes can never
+# overlap a running deploy or each other. Emits the "locked" JSON response and
+# returns 1 if the lock is busy. The lock is released when fd 9 closes on exit.
+acquire_deploy_lock() {
+    exec 9>"$DEPLOY_LOCK"
+    if ! flock -n 9; then
+        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return 1
+    fi
+    return 0
+}
+
+# Restore mode+owner on files rewritten via mktemp+mv so web edits never
+# downgrade repo files to the temp file's 0600 www-data. Preserves the target's
+# prior mode/owner when it exists (with a 0644 read floor), else floors to 0644
+# owned by the editor-root owner (mirroring fix_git_permissions).
+restore_file_mode() {
+    local tmp="$1" target="$2"
+    local mode="" owner=""
+    if [ -e "$target" ]; then
+        mode=$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null)
+        owner=$(stat -c '%U:%G' "$target" 2>/dev/null || stat -f '%Su:%Sg' "$target" 2>/dev/null)
+    else
+        local root_owner=$(stat -c '%U' "$EDITOR_ROOT" 2>/dev/null || stat -f '%Su' "$EDITOR_ROOT" 2>/dev/null)
+        [ -n "$root_owner" ] && owner="$root_owner:www-data"
+    fi
+    [ -n "$mode" ] && chmod "$mode" "$tmp" 2>/dev/null
+    # 0644 floor: never leave a web-written file unreadable to non-www-data.
+    chmod u+rw,g+r,o+r "$tmp" 2>/dev/null || true
+    [ -n "$owner" ] && sudo -n chown "$owner" "$tmp" 2>/dev/null
+    return 0
+}
+
 # Security: validate file path is within allowed directories
 validate_path() {
     local file="$1"
@@ -95,14 +129,19 @@ validate_path() {
     if [[ "$realpath" != "$editor_realpath" ]] && [[ "$realpath" != "$editor_realpath"/* ]]; then
         return 1
     fi
-    
+
+    # Check the remaining rules against the RESOLVED path relative to the editor
+    # root, so path-equivalent forms (./, a/../, //) cannot bypass the blocklist.
+    local rel="${realpath#"$editor_realpath"/}"
+    [[ "$realpath" == "$editor_realpath" ]] && rel=""
+
     # Block dangerous/binary file types
-    if [[ "$file" =~ \.(pyc|so|exe|dll|bin|class)$ ]]; then
+    if [[ "$rel" =~ \.(pyc|so|exe|dll|bin|class)$ ]]; then
         return 1
     fi
-    
+
     # Block system files
-    if [[ "$file" =~ ^\.git/ ]] || [[ "$file" =~ ^\.vscode/ ]] || [[ "$file" =~ ^\.crossnote/ ]] || [[ "$file" =~ __pycache__/ ]]; then
+    if [[ "$rel" =~ ^\.git(/|$) ]] || [[ "$rel" =~ ^\.vscode(/|$) ]] || [[ "$rel" =~ ^\.crossnote(/|$) ]] || [[ "$rel" =~ (^|/)__pycache__(/|$) ]]; then
         return 1
     fi
     
@@ -211,7 +250,13 @@ write_file() {
     fi
     
     local full_path="$EDITOR_ROOT/$file"
-    
+
+    # Working-tree mutation: must not overlap a running deploy/diff/generate or
+    # another git/file mutation.
+    if ! acquire_deploy_lock; then
+        return
+    fi
+
     # Read POST data
     local post_data
     if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
@@ -266,6 +311,10 @@ print("ok")
             ;;
     esac
 
+    # Keep the target's prior mode/owner (0644 floor) instead of mktemp's 0600,
+    # so the mv below does not downgrade the file for non-www-data users.
+    restore_file_mode "$tmp_file" "$full_path"
+
     if mv -f "$tmp_file" "$full_path"; then
         json_response '{"success": true, "message": "File saved successfully"}'
     else
@@ -289,7 +338,12 @@ delete_file() {
         json_response '{"success": false, "error": "File not found"}'
         return
     fi
-    
+
+    # Working-tree mutation: must not overlap a running deploy/diff/generate.
+    if ! acquire_deploy_lock; then
+        return
+    fi
+
     rm -f "$full_path" 2>/dev/null
     
     if [ $? -eq 0 ]; then
@@ -511,7 +565,12 @@ git_commit_push() {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
     }
-    
+
+    # Working-tree/.git mutation: must not overlap a running deploy/diff/generate.
+    if ! acquire_deploy_lock; then
+        return
+    fi
+
     # Fix ownership and add safe directory
     export HOME="$ANSIBLE_HOME"
     git config --global user.email "ansible-editor@lldpq.local" 2>/dev/null || true
@@ -574,7 +633,12 @@ git_pull() {
     
     export GIT_CONFIG_GLOBAL=/tmp/ansible-gitconfig
     git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-    
+
+    # Working-tree/.git mutation: must not overlap a running deploy/diff/generate.
+    if ! acquire_deploy_lock; then
+        return
+    fi
+
     local output
     output=$(git pull 2>&1)
     local exit_code=$?
@@ -695,9 +759,19 @@ case "$ACTION" in
     git-reset)
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
         git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-        
-        # Reset all changes (discard uncommitted changes)
-        output=$(git checkout . 2>&1)
+
+        # Working-tree mutation: must not overlap a running deploy/diff/generate.
+        acquire_deploy_lock || exit 0
+
+        # Discard uncommitted changes only within the editor-managed subtree
+        # (like git-commit staging), never the whole repo working tree.
+        editor_rel=$(realpath -m --relative-to="$ANSIBLE_DIR" "$EDITOR_ROOT" 2>/dev/null)
+        if [ -z "$editor_rel" ] || [ "$editor_rel" = "." ] || [[ "$editor_rel" == ..* ]]; then
+            # EDITOR_ROOT is the repo root itself (or outside it): reset the repo tree.
+            output=$(git checkout -- . 2>&1)
+        else
+            output=$(git checkout -- "$editor_rel" 2>&1)
+        fi
         reset_code=$?
         
         # Fix git permissions after reset
@@ -717,10 +791,24 @@ case "$ACTION" in
             json_response '{"success": false, "error": "No file specified"}'
             exit 0
         fi
-        
+
+        # Confine the reset target within EDITOR_ROOT (the path is repo-relative
+        # for git checkout): apply the editor path rules AND require the resolved
+        # repo path to sit under EDITOR_ROOT, rejecting traversal/.git internals.
+        RESET_REALPATH=$(realpath -m "$ANSIBLE_DIR/$FILE" 2>/dev/null)
+        EDITOR_REALPATH=$(realpath "$EDITOR_ROOT" 2>/dev/null)
+        if ! validate_path "$FILE" || [ -z "$RESET_REALPATH" ] || [ -z "$EDITOR_REALPATH" ] || \
+           { [ "$RESET_REALPATH" != "$EDITOR_REALPATH" ] && [[ "$RESET_REALPATH" != "$EDITOR_REALPATH"/* ]]; }; then
+            json_response '{"success": false, "error": "Invalid file path"}'
+            exit 0
+        fi
+
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
         git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-        
+
+        # Working-tree mutation: must not overlap a running deploy/diff/generate.
+        acquire_deploy_lock || exit 0
+
         # Check if file exists in git
         if ! git ls-files --error-unmatch "$FILE" >/dev/null 2>&1; then
             # File not tracked, check if it's a new file

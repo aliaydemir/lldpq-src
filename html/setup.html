@@ -38,7 +38,11 @@
         .su-step .lbl { color:#e0e0e0; font-weight:600; font-size:14px; }
         .su-step .desc { color:#8f8f8f; font-size:11.5px; margin-top:2px; line-height:1.4; }
         .su-step.active .lbl { color:#fff; }
-        .su-danger-separator { margin:18px 14px 8px; color:#8f8f8f; font-size:10px; font-weight:700; letter-spacing:.11em; text-transform:uppercase; }
+        .su-step .lbl .badge { margin-left:6px; font-size:9px; padding:1px 6px; vertical-align:1px; }
+        .su-step .num { position:relative; }
+        .su-step.dirty .num::after { content:''; position:absolute; top:-3px; right:-3px; width:9px; height:9px; border-radius:50%; background:#ffb74d; border:2px solid #252526; }
+        .su-sep { margin:18px 14px 8px; color:#8f8f8f; font-size:10px; font-weight:700; letter-spacing:.11em; text-transform:uppercase; }
+        .su-sep:first-child { margin-top:6px; }
         .su-step.danger .num { background:rgba(244,67,54,.14); color:#ef7770; }
         .su-step.danger .lbl { color:#ef9a94; }
         .su-step.danger:hover { background:#302222; }
@@ -62,6 +66,7 @@
         textarea.su-ta { width:100%; min-height:360px; background:#111; color:#d4d4d4; border:1px solid #333; border-radius:6px;
             padding:14px; font-family:'Cascadia Code',Consolas,monospace; font-size:12.5px; line-height:1.55; resize:vertical; }
         textarea.su-ta:focus { outline:none; border-color:#76b900; }
+        .ta-meta { color:#6f6f6f; font-size:11px; text-align:right; margin-top:4px; font-family:'Cascadia Code',Consolas,monospace; }
         .run-output { background:#0d0d0d; color:#cfe9a0; border:1px solid #333; border-radius:6px; padding:14px; height:380px; overflow:auto; margin:10px 0 0; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
         .sched-card { background:#202020; border:1px solid #333; border-radius:8px; padding:12px 16px; margin-bottom:16px; }
         .sched-sel { background:#1a1a1a; color:#d4d4d4; border:1px solid #404040; border-radius:5px; padding:6px 10px; font-size:13px; min-width:170px; }
@@ -76,6 +81,7 @@
         .btn.danger { background:#c9362d; color:#fff; }
         .btn.danger:hover { background:#e0443a; }
         .btn:disabled { opacity:.5; cursor:not-allowed; }
+        .btn.attn { box-shadow:0 0 0 2px rgba(255,183,77,.55); }
 
         .status { font-size:12.5px; margin-top:10px; min-height:18px; }
         .status.ok { color:#76b900; }
@@ -131,6 +137,14 @@
     <link rel="stylesheet" type="text/css" href="/css/mobile.css">
 </head>
 <body>
+    <!-- Shared icon sprite: the repeated toolbar icons live here once; buttons reference them via <use>. -->
+    <svg style="display:none" aria-hidden="true">
+        <symbol id="i-upload" viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></symbol>
+        <symbol id="i-reload" viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></symbol>
+        <symbol id="i-download" viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></symbol>
+        <symbol id="i-save" viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></symbol>
+        <symbol id="i-trash" viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></symbol>
+    </svg>
     <div class="su-header">
         <div class="su-title">
             <svg viewBox="0 0 24 24"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
@@ -149,14 +163,15 @@
                     <h2>1. Inventory <span class="p-file">devices.yaml</span></h2>
                     <p class="p-desc">Define every switch LLDPq should reach: management IPs (or hostnames), the default login username, and optional roles/groups. This is the source for collection, assets, key distribution and analysis.</p>
                     <div class="p-toolbar">
-                        <button class="btn secondary" onclick="document.getElementById('up-devices').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <button class="btn secondary" onclick="document.getElementById('up-devices').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg>Upload</button>
                         <input type="file" id="up-devices" style="display:none" onchange="uploadFile('devices', this)">
-                        <button class="btn secondary" onclick="loadFile('devices', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
-                        <button class="btn secondary" onclick="downloadFile('devices')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <button class="btn secondary" onclick="loadFile('devices', true)"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('devices')"><svg viewBox="0 0 24 24"><use href="#i-download"/></svg>Download</button>
                         <div class="spacer"></div>
-                        <button class="btn primary" onclick="saveFile('devices')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save devices.yaml</button>
+                        <button class="btn primary" id="save-devices" onclick="saveFile('devices')"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save devices.yaml</button>
                     </div>
                     <textarea class="su-ta" id="ta-devices" spellcheck="false" placeholder="Loading devices.yaml..."></textarea>
+                    <div class="ta-meta" id="tm-devices"></div>
                     <div class="status info" id="st-devices"></div>
                 </div>
 
@@ -190,7 +205,7 @@
                         <input type="password" id="key-pw" placeholder="switch admin password (only needed to push the key)" autocomplete="new-password">
                         <button class="btn secondary" id="verify-btn" onclick="verifyKeys()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Verify (no password)</button>
                         <button class="btn primary" id="key-btn" onclick="distributeKeys()"><svg viewBox="0 0 24 24"><path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/></svg>Distribute to all</button>
-                        <button class="btn secondary" id="key-retry-btn" style="display:none" onclick="retryFailedKeys()" title="Push the key / fix sudo again only on the devices that failed in the last distribution"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Retry failed devices</button>
+                        <button class="btn secondary" id="key-retry-btn" style="display:none" onclick="retryFailedKeys()" title="Push the key / fix sudo again only on the devices that failed in the last distribution"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Retry failed devices</button>
                     </div>
                     <div class="status info" id="key-progress"></div>
                     <div class="summary" id="key-summary"></div>
@@ -205,14 +220,15 @@
                     <h2>3. Topology <span class="p-file">topology.dot</span></h2>
                     <p class="p-desc">Describe the expected cabling as a Graphviz <code>.dot</code> graph (<code>"deviceA":"port" -- "deviceB":"port"</code>). LLDP results are validated against this expected wiring.</p>
                     <div class="p-toolbar">
-                        <button class="btn secondary" onclick="document.getElementById('up-topology').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <button class="btn secondary" onclick="document.getElementById('up-topology').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg>Upload</button>
                         <input type="file" id="up-topology" style="display:none" onchange="uploadFile('topology', this)">
-                        <button class="btn secondary" onclick="loadFile('topology', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
-                        <button class="btn secondary" onclick="downloadFile('topology')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <button class="btn secondary" onclick="loadFile('topology', true)"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('topology')"><svg viewBox="0 0 24 24"><use href="#i-download"/></svg>Download</button>
                         <div class="spacer"></div>
-                        <button class="btn primary" onclick="saveFile('topology')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save topology.dot</button>
+                        <button class="btn primary" id="save-topology" onclick="saveFile('topology')"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save topology.dot</button>
                     </div>
                     <textarea class="su-ta" id="ta-topology" spellcheck="false" placeholder="Loading topology.dot..."></textarea>
+                    <div class="ta-meta" id="tm-topology"></div>
                     <div class="status info" id="st-topology"></div>
                 </div>
 
@@ -221,14 +237,15 @@
                     <h2>4. Topology Config <span class="p-file">topology_config.yaml</span></h2>
                     <p class="p-desc">Tune how the topology is rendered &mdash; tier ordering, layer/icon rules and special layout rules (e.g. staggered compute racks). Endpoint hosts are defined in <code>devices.yaml</code>. Optional, but improves the Topology view.</p>
                     <div class="p-toolbar">
-                        <button class="btn secondary" onclick="document.getElementById('up-config').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <button class="btn secondary" onclick="document.getElementById('up-config').click()" title="Upload from your computer"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg>Upload</button>
                         <input type="file" id="up-config" style="display:none" onchange="uploadFile('config', this)">
-                        <button class="btn secondary" onclick="loadFile('config', true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
-                        <button class="btn secondary" onclick="downloadFile('config')"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <button class="btn secondary" onclick="loadFile('config', true)"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="downloadFile('config')"><svg viewBox="0 0 24 24"><use href="#i-download"/></svg>Download</button>
                         <div class="spacer"></div>
-                        <button class="btn primary" onclick="saveFile('config')"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save topology_config.yaml</button>
+                        <button class="btn primary" id="save-config" onclick="saveFile('config')"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save topology_config.yaml</button>
                     </div>
                     <textarea class="su-ta" id="ta-config" spellcheck="false" placeholder="Loading topology_config.yaml..."></textarea>
+                    <div class="ta-meta" id="tm-config"></div>
                     <div class="status info" id="st-config"></div>
                 </div>
 
@@ -237,12 +254,12 @@
                     <h2>5. Display Aliases <span class="p-file">display-aliases.json</span></h2>
                     <p class="p-desc">Map canonical device and interface names to the P2P / field labels shown in LLDPq. Aliases are display-only: collected source data and topology validation are not changed. This step is optional and can be revisited after discovery.</p>
                     <div class="p-toolbar">
-                        <button class="btn secondary" type="button" onclick="document.getElementById('up-aliases').click()" title="Upload display-aliases.json from your computer"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload</button>
+                        <button class="btn secondary" type="button" onclick="document.getElementById('up-aliases').click()" title="Upload display-aliases.json from your computer"><svg viewBox="0 0 24 24"><use href="#i-upload"/></svg>Upload</button>
                         <input type="file" id="up-aliases" accept=".json,application/json" style="display:none" onchange="uploadAliases(this)">
-                        <button class="btn secondary" type="button" onclick="loadAliases(true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
-                        <button class="btn secondary" type="button" onclick="downloadAliases()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download</button>
+                        <button class="btn secondary" type="button" onclick="loadAliases(true)"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Reload</button>
+                        <button class="btn secondary" type="button" onclick="downloadAliases()"><svg viewBox="0 0 24 24"><use href="#i-download"/></svg>Download</button>
                         <div class="spacer"></div>
-                        <button class="btn primary" type="button" id="aliases-save" onclick="saveAliases()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save aliases</button>
+                        <button class="btn primary" type="button" id="aliases-save" onclick="saveAliases()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save aliases</button>
                     </div>
                     <div class="sched-card">
                         <div class="key-row"><span class="k">Device names</span><span class="mono">canonical &rarr; display label</span></div>
@@ -250,8 +267,8 @@
                         <div class="p-toolbar">
                             <button class="btn secondary" type="button" onclick="addAliasRow('devices')">+ Add device</button>
                         </div>
-                        <label class="key-lbl" for="alias-device-bulk">Bulk paste: one <code>display label &lt;tab&gt; canonical name</code> pair per line. Import replaces the device rows.</label>
-                        <textarea class="su-ta alias-bulk" id="alias-device-bulk" spellcheck="false" placeholder="SPINE-01&#9;tan-spine-01"></textarea>
+                        <label class="key-lbl" for="alias-device-bulk">Bulk paste: one <code>canonical name &lt;tab&gt; display label</code> pair per line (same order as the rows above). Import replaces the device rows.</label>
+                        <textarea class="su-ta alias-bulk" id="alias-device-bulk" spellcheck="false" placeholder="tan-spine-01&#9;SPINE-01"></textarea>
                         <div class="p-toolbar"><button class="btn secondary" type="button" onclick="importAliasBulk('devices')">Import device rows</button></div>
                     </div>
                     <div class="sched-card">
@@ -260,8 +277,8 @@
                         <div class="p-toolbar">
                             <button class="btn secondary" type="button" onclick="addAliasRow('interfaces')">+ Add interface</button>
                         </div>
-                        <label class="key-lbl" for="alias-interface-bulk">Bulk paste: one <code>display label &lt;tab&gt; canonical name</code> pair per line. Import replaces the interface rows.</label>
-                        <textarea class="su-ta alias-bulk" id="alias-interface-bulk" spellcheck="false" placeholder="M1&#9;enP22p3s0f0np0"></textarea>
+                        <label class="key-lbl" for="alias-interface-bulk">Bulk paste: one <code>canonical name &lt;tab&gt; display label</code> pair per line (same order as the rows above). Import replaces the interface rows.</label>
+                        <textarea class="su-ta alias-bulk" id="alias-interface-bulk" spellcheck="false" placeholder="enP22p3s0f0np0&#9;M1"></textarea>
                         <div class="p-toolbar"><button class="btn secondary" type="button" onclick="importAliasBulk('interfaces')">Import interface rows</button></div>
                     </div>
                     <div class="status info" id="aliases-status" role="status" aria-live="polite"></div>
@@ -278,7 +295,7 @@
                         <input type="text" id="ans-input" class="sched-sel" style="width:100%; min-width:0;" placeholder="/home/USER/ansible" autocomplete="off" spellcheck="false">
                         <div id="ans-candidates" class="p-desc" style="margin:8px 0 0;"></div>
                         <div class="p-toolbar">
-                            <button class="btn primary" onclick="saveAnsible()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Use this directory</button>
+                            <button class="btn primary" onclick="saveAnsible()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Use this directory</button>
                             <button class="btn secondary" onclick="disableAnsible()">I don't use Ansible (disable)</button>
                             <button class="btn secondary" onclick="loadAnsible(true)">Refresh</button>
                         </div>
@@ -292,7 +309,15 @@
                     <h2>8. Run LLDPq</h2>
                     <p class="p-desc">Run the full collection pipeline now (<code>lldpq -</code>: assets &rarr; LLDP check &rarr; monitor &rarr; fabric scan &rarr; alerts) and watch the live output. When it finishes, the Fabric, LLDP and Analysis pages are populated. It also runs automatically on the schedule below.</p>
 
-                    <div class="sched-card">
+                    <div class="p-toolbar">
+                        <button class="btn primary" id="run-btn" onclick="runLLDPq()"><svg viewBox="0 0 24 24"><path d="M8,5.14V19.14L19,12.14L8,5.14Z"/></svg>Run LLDPq</button>
+                        <div class="spacer"></div>
+                        <button class="btn secondary" onclick="location.href='start.html'">Open Fabric</button>
+                    </div>
+                    <div class="status info" id="run-status"></div>
+                    <pre id="run-output" class="run-output">Click "Run LLDPq" to start a collection and stream the output here&hellip;</pre>
+
+                    <div class="sched-card" style="margin-top:16px;">
                         <div class="key-row"><span class="k">Dashboard instance name</span></div>
                         <label class="key-lbl" for="lldpq-hostname">Displayed above the main dashboard logo (does not change the operating-system hostname):</label>
                         <input type="text" id="lldpq-hostname" class="sched-sel"
@@ -301,7 +326,7 @@
                                pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,63}"
                                onkeydown="if(event.key==='Enter'){event.preventDefault();saveHostname();}">
                         <div class="p-toolbar" style="margin-top:10px;">
-                            <button class="btn secondary" onclick="saveHostname()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save dashboard name</button>
+                            <button class="btn secondary" id="save-hostname-btn" onclick="saveHostname()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save dashboard name</button>
                             <span class="status info" id="hostname-status" style="margin-top:0;"></span>
                         </div>
                     </div>
@@ -311,7 +336,7 @@
                             <span class="k">Auto-run LLDPq (collection)</span>
                             <select id="sched-lldpq" class="sched-sel">
                                 <option value="5">every 5 minutes</option>
-                                <option value="10">every 10 minutes</option>
+                                <option value="10" selected>every 10 minutes</option>
                                 <option value="15">every 15 minutes</option>
                                 <option value="20">every 20 minutes</option>
                                 <option value="30">every 30 minutes</option>
@@ -321,12 +346,12 @@
                             <span class="k">Collect device configs (get-conf)</span>
                             <select id="sched-getconf" class="sched-sel">
                                 <option value="6">every 6 hours</option>
-                                <option value="12">every 12 hours</option>
+                                <option value="12" selected>every 12 hours</option>
                                 <option value="24">every 24 hours</option>
                             </select>
                         </div>
                         <div class="p-toolbar" style="margin-top:8px;">
-                            <button class="btn secondary" onclick="saveSchedules()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save schedules</button>
+                            <button class="btn secondary" id="save-sched-btn" onclick="saveSchedules()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save schedules</button>
                             <span class="status info" id="sched-status" style="margin-top:0;"></span>
                         </div>
                     </div>
@@ -340,18 +365,11 @@
                             <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Get configs <select id="par-getconfigs" class="sched-sel" style="min-width:90px;"></select></label>
                         </div>
                         <div class="p-toolbar" style="margin-top:10px;">
-                            <button class="btn secondary" onclick="saveParallel()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save parallelism</button>
+                            <button class="btn secondary" id="save-parallel-btn" onclick="saveParallel()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save parallelism</button>
                             <span class="status info" id="par-status" style="margin-top:0;"></span>
                         </div>
                     </div>
 
-                    <div class="p-toolbar">
-                        <button class="btn primary" id="run-btn" onclick="runLLDPq()"><svg viewBox="0 0 24 24"><path d="M8,5.14V19.14L19,12.14L8,5.14Z"/></svg>Run LLDPq</button>
-                        <div class="spacer"></div>
-                        <button class="btn secondary" onclick="location.href='start.html'">Open Fabric</button>
-                    </div>
-                    <div class="status info" id="run-status"></div>
-                    <pre id="run-output" class="run-output">Click "Run LLDPq" to start a collection and stream the output here&hellip;</pre>
                 </div>
 
                 <!-- Step 11: Update LLDPq -->
@@ -459,9 +477,9 @@
                     </div>
 
                     <div class="p-toolbar">
-                        <button class="btn secondary" onclick="loadNotifications(true)"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Reload</button>
+                        <button class="btn secondary" onclick="loadNotifications(true)"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Reload</button>
                         <div class="spacer"></div>
-                        <button class="btn primary" onclick="saveNotifications()"><svg viewBox="0 0 24 24"><path d="M15,9H5V5H15M12,19A3,3 0 0,1 9,16A3,3 0 0,1 12,13A3,3 0 0,1 15,16A3,3 0 0,1 12,19M17,3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V7L17,3Z"/></svg>Save notifications.yaml</button>
+                        <button class="btn primary" id="nf-save" onclick="saveNotifications()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save notifications.yaml</button>
                     </div>
                     <div class="status info" id="nf-status"></div>
                 </div>
@@ -473,7 +491,7 @@
                     <div class="sched-card">
                         <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(adds the private key)</strong></label>
                         <div class="p-toolbar">
-                            <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>Download bundle</button>
+                            <button class="btn primary" onclick="backupExport()"><svg viewBox="0 0 24 24"><use href="#i-download"/></svg>Download bundle</button>
                             <span class="status info" id="bk-export-msg"></span>
                         </div>
                     </div>
@@ -497,9 +515,9 @@
                         <div class="key-row"><span class="k">Monitoring data (monitor-results)</span><span id="mt-monitor" class="mono">&mdash;</span></div>
                         <div class="key-row"><span class="k">Old update backups</span><span id="mt-backups" class="mono">&mdash;</span></div>
                         <div class="p-toolbar">
-                            <button class="btn secondary" onclick="loadMaintenance()"><svg viewBox="0 0 24 24"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>Refresh</button>
+                            <button class="btn secondary" onclick="loadMaintenance()"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Refresh</button>
                             <div class="spacer"></div>
-                            <button class="btn primary" id="mt-purge-btn" onclick="purgeBackups()"><svg viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></svg>Remove old update backups</button>
+                            <button class="btn danger" id="mt-purge-btn" onclick="purgeBackups()"><svg viewBox="0 0 24 24"><use href="#i-trash"/></svg>Remove old update backups</button>
                         </div>
                         <div class="status info" id="mt-status"></div>
                     </div>
@@ -584,7 +602,7 @@
                                 <label class="key-lbl" for="uninstall-confirm-text">Type <code>UNINSTALL</code> exactly to enable the final action:</label>
                                 <div class="key-input">
                                     <input type="text" id="uninstall-confirm-text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="UNINSTALL">
-                                    <button class="btn danger" type="button" id="uninstall-start-btn" onclick="startUninstall()" disabled><svg viewBox="0 0 24 24"><path d="M19,4H15.5L14.5,3H9.5L8.5,4H5V6H19M6,19A2,2 0 0,0 8,21H16A2,2 0 0,0 18,19V7H6V19Z"/></svg>Permanently uninstall LLDPq</button>
+                                    <button class="btn danger" type="button" id="uninstall-start-btn" onclick="startUninstall()" disabled><svg viewBox="0 0 24 24"><use href="#i-trash"/></svg>Permanently uninstall LLDPq</button>
                                 </div>
                                 <div class="status info" id="uninstall-launch-status"></div>
                             </div>
@@ -604,14 +622,14 @@
 
 <script>
 const STEPS = [
-    { key:'devices',  label:'Inventory',        desc:'devices.yaml — switches & credentials' },
+    { key:'devices',  label:'Inventory',        desc:'devices.yaml — switches & credentials', group:'Configure' },
     { key:'keys',     label:'SSH Keys',         desc:'Authorize collector key + sudo' },
     { key:'topology', label:'Topology',         desc:'topology.dot — expected cabling' },
     { key:'config',   label:'Topology Config',  desc:'topology_config.yaml — layout rules' },
-    { key:'aliases',  label:'Display Aliases',  desc:'Optional — P2P / field display names' },
-    { key:'ansible',  label:'Integrate Ansible', desc:'Optional — VLAN/VRF/Fabric reports' },
-    { key:'notifications', label:'Notifications', desc:'Slack alerts — webhook, types, thresholds' },
-    { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)' },
+    { key:'aliases',  label:'Display Aliases',  desc:'P2P / field display names', group:'Optional', optional:true },
+    { key:'ansible',  label:'Integrate Ansible', desc:'VLAN/VRF/Fabric reports', optional:true },
+    { key:'notifications', label:'Notifications', desc:'Slack alerts — webhook, types, thresholds', optional:true },
+    { key:'run',      label:'Run LLDPq',        desc:'Collect data & validate (live output)', group:'Operate' },
     { key:'backup',      label:'Backup & Restore', desc:'Export / import config bundle' },
     { key:'maintenance', label:'Maintenance',      desc:'Disk usage & safe cleanup' },
     { key:'update',   label:'Update LLDPq',     desc:'git pull + reinstall (live output)' },
@@ -626,6 +644,8 @@ const done = {};   // stepKey -> true
 let notifLoaded = false;     // notifications panel loaded once
 let maintLoaded = false;     // maintenance panel loaded once
 let purgeArmed = false;      // two-click guard before deleting update backups
+let purgeArmedAt = 0;        // arm timestamp — a fast double-click must not satisfy the guard
+let purgeCountdownTimer = null;
 let keyInfoLoaded = false;   // SSH key panel loaded once
 let keyExists = false;       // a collector key currently exists
 let genArmed = false;        // two-click guard before replacing an existing key
@@ -638,6 +658,7 @@ let runPollEpoch = 0;
 let schedLoaded = false;     // cron schedules fetched once on entering the run step
 let parallelLoaded = false;  // parallelism fetched once on entering the run step
 let hostnameLoaded = false;  // dashboard instance name fetched once on entering run
+let runSettingsDirty = false; // unsaved edits in the Run-step cards (name/schedules/parallelism)
 let ansibleLoaded = false;   // ansible status fetched once on entering its step
 let ansibleDirty = false;
 let ansibleEditVersion = 0;
@@ -726,6 +747,12 @@ function renderSteps() {
     const c = document.getElementById('steps');
     c.replaceChildren();
     STEPS.forEach(function (s, i) {
+        if (s.group) {
+            const sep = document.createElement('div');
+            sep.className = 'su-sep';
+            sep.textContent = s.group;
+            c.appendChild(sep);
+        }
         const step = document.createElement('div');
         step.className = 'su-step';
         step.id = 'step-' + i;
@@ -739,12 +766,17 @@ function renderSteps() {
         num.className = 'num'; num.id = 'num-' + i; num.textContent = String(i + 1);
         const copy = document.createElement('div');
         const label = document.createElement('div'); label.className = 'lbl'; label.textContent = s.label;
+        if (s.optional) {
+            const badge = document.createElement('span');
+            badge.className = 'badge gray'; badge.textContent = 'optional';
+            label.appendChild(badge);
+        }
         const desc = document.createElement('div'); desc.className = 'desc'; desc.textContent = s.desc;
         copy.append(label, desc); step.append(num, copy); c.appendChild(step);
     });
 
     const separator = document.createElement('div');
-    separator.className = 'su-danger-separator';
+    separator.className = 'su-sep';
     separator.textContent = 'Danger Zone';
     const danger = document.createElement('div');
     danger.className = 'su-step danger';
@@ -783,7 +815,10 @@ function goStep(i) {
     if (key === 'aliases' && !aliasesLoaded) loadAliases(false);
     if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
     if (key === 'ansible' && !ansibleLoaded) { ansibleLoaded = true; loadAnsible(); }
-    if (key === 'run' && !runLogShown) { runLogShown = true; showRunLog(); }
+    // Re-attach to the current/most-recent run whenever the step is re-entered
+    // and nothing is actively polling (mirrors the Update step), so a replaced
+    // job or a transient failure never strands the log behind a page reload.
+    if (key === 'run' && (!runLogShown || (!runActive && !runPollTimer))) { runLogShown = true; showRunLog(); }
     if (key === 'run' && !hostnameLoaded) { hostnameLoaded = true; loadHostname(); }
     if (key === 'run' && !schedLoaded) { schedLoaded = true; loadSchedules(); }
     if (key === 'run' && !parallelLoaded) { parallelLoaded = true; loadParallel(); }
@@ -835,7 +870,19 @@ function initDirtyGuards() {
         const ta = document.getElementById(cfg.ta);
         if (!ta) return;
         ta.addEventListener('input', function () { cfg.dirty = true; cfg.editVersion++; });
+        // Tab indents (two spaces) instead of leaving the editor; Shift+Tab still moves focus out.
+        ta.addEventListener('keydown', function (e) {
+            if (e.key !== 'Tab' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+            e.preventDefault();
+            ta.setRangeText('  ', ta.selectionStart, ta.selectionEnd, 'end');
+            cfg.dirty = true; cfg.editVersion++;
+            refreshDirtyMarkers();
+        });
     });
+    // Keep the rail's unsaved-change dots in sync with any form edit; per-field
+    // dirty handlers run first, the microtask reads the settled flags.
+    document.addEventListener('input', function () { queueMicrotask(refreshDirtyMarkers); }, true);
+    document.addEventListener('change', function () { queueMicrotask(refreshDirtyMarkers); }, true);
     const nfPanel = document.querySelector('[data-step-key="notifications"]');
     if (nfPanel) nfPanel.querySelectorAll('input,select,textarea').forEach(function (el) {
         const dirty = function () { if (!suppressNotifDirty) { notifDirty = true; notifEditVersion++; } };
@@ -843,6 +890,17 @@ function initDirtyGuards() {
     });
     const ansInput = document.getElementById('ans-input');
     if (ansInput) ansInput.addEventListener('input', function () { ansibleDirty = true; ansibleEditVersion++; });
+    // Run-step cards save via explicit buttons, so their edits are unsaved DOM
+    // state the navigation guard would otherwise ignore and silently discard.
+    ['lldpq-hostname', 'sched-lldpq', 'sched-getconf',
+     'par-monitor', 'par-lldp', 'par-assets', 'par-getconfigs'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) {
+            const mark = function () { runSettingsDirty = true; };
+            el.addEventListener('input', mark);
+            el.addEventListener('change', mark);
+        }
+    });
     ['uninstall-keep-data', 'uninstall-remove-data', 'uninstall-remove-source', 'uninstall-remove-nginx',
      'uninstall-remove-dhcp', 'uninstall-remove-docker'].forEach(function (id) {
         const el = document.getElementById(id);
@@ -870,7 +928,7 @@ function initDirtyGuards() {
 }
 
 function hasUnsavedSetupChanges() {
-    return aliasesDirty || notifDirty || ansibleDirty || Object.keys(FILES).some(function (key) { return FILES[key].dirty; });
+    return aliasesDirty || notifDirty || ansibleDirty || runSettingsDirty || Object.keys(FILES).some(function (key) { return FILES[key].dirty; });
 }
 
 function markDone(stepKey, isDone) {
@@ -879,11 +937,50 @@ function markDone(stepKey, isDone) {
     done[stepKey] = isDone;
 }
 
+// Unsaved-change indicators: an orange dot on the step number in the rail plus a
+// highlight on the panel's Save button. Unlike the old auto-"done" state this only
+// reflects real unsaved edits, so it cannot mislead.
+const STEP_DIRTY = {
+    devices:       function () { return FILES.devices.dirty; },
+    topology:      function () { return FILES.topology.dirty; },
+    config:        function () { return FILES.config.dirty; },
+    aliases:       function () { return aliasesDirty; },
+    ansible:       function () { return ansibleDirty; },
+    notifications: function () { return notifDirty; },
+    run:           function () { return runSettingsDirty; },
+};
+const STEP_SAVE_BTN = { devices:'save-devices', topology:'save-topology', config:'save-config', aliases:'aliases-save', notifications:'nf-save' };
+
+function refreshDirtyMarkers() {
+    STEPS.forEach(function (s, i) {
+        const isDirty = STEP_DIRTY[s.key] ? !!STEP_DIRTY[s.key]() : false;
+        const el = document.getElementById('step-' + i);
+        if (el) {
+            el.classList.toggle('dirty', isDirty);
+            const num = document.getElementById('num-' + i);
+            if (num) num.title = isDirty ? 'Unsaved changes' : '';
+        }
+        const btn = STEP_SAVE_BTN[s.key] && document.getElementById(STEP_SAVE_BTN[s.key]);
+        if (btn) btn.classList.toggle('attn', isDirty);
+    });
+    Object.keys(FILES).forEach(updateTaMeta);
+}
+
+function updateTaMeta(key) {
+    const meta = document.getElementById('tm-' + key);
+    const ta = document.getElementById(FILES[key].ta);
+    if (!meta || !ta) return;
+    meta.textContent = ta.value ? (ta.value.split('\n').length + ' lines') : '';
+}
+
 function setStatus(id, msg, cls) {
     const el = document.getElementById(id);
     if (!el) return;
     el.className = 'status ' + (cls || 'info');
     el.textContent = msg || '';
+    // Every load/save/import path reports through here right after it settles the
+    // dirty flags, so this is the one chokepoint that keeps the markers fresh.
+    refreshDirtyMarkers();
 }
 
 async function loadFile(key, force) {
@@ -913,18 +1010,26 @@ async function loadFile(key, force) {
             cfg.loaded = true;
             cfg.dirty = false;
             cfg.revision = data.revision || null;
+            // A missing/empty managed file still returns a valid revision, so
+            // Save works; replace the stale "Loading…" placeholder with a hint.
+            if (!ta.value.trim()) ta.placeholder = cfg.file + ' is empty — type its contents here, then Save.';
             setStatus(cfg.st, ta.value.trim() ? ('Loaded ' + cfg.file) : (cfg.file + ' is empty — fill it in below.'), 'info');
             markDone(key, !!ta.value.trim());
         } else {
+            // success:false is a real read error (a missing file comes back
+            // success:true with a revision), so there is no revision to save
+            // against. Don't promise a create-and-Save that saveFile blocks.
             ta.value = '';
-            cfg.loaded = true;   // file may not exist yet; let the admin create it
+            cfg.loaded = false;
             cfg.dirty = false;
-            cfg.revision = data.revision || null;
-            setStatus(cfg.st, (data.error || 'Not found') + ' — you can create it here and Save.', 'info');
+            cfg.revision = null;
+            ta.placeholder = 'Load failed — click Reload to retry.';
+            setStatus(cfg.st, 'Load failed: ' + (data.error || ('could not read ' + cfg.file)) + ' — click Reload to retry.', 'err');
             markDone(key, false);
         }
     } catch (e) {
         if (op !== cfg.opSeq) return;
+        ta.placeholder = 'Load failed — click Reload to retry.';
         setStatus(cfg.st, 'Load failed: ' + e.message, 'err');
     }
 }
@@ -932,11 +1037,16 @@ async function loadFile(key, force) {
 async function saveFile(key) {
     const cfg = FILES[key];
     if (!cfg) return;
-    if (!cfg.loaded || typeof cfg.revision !== 'string') { setStatus(cfg.st, 'Wait for the current server revision to load before saving.', 'err'); return; }
+    if (!cfg.loaded || typeof cfg.revision !== 'string') { setStatus(cfg.st, 'Load ' + cfg.file + ' (click Reload) before saving.', 'err'); return; }
     const ta = document.getElementById(cfg.ta);
     const content = ta.value;
     const startedVersion = cfg.editVersion;
     const op = ++cfg.opSeq;
+    // Disable Save in-flight so a double-click cannot fire two writes with the
+    // same expected_revision — the second would spuriously conflict and strand
+    // the panel on a false "changed on disk" until a manual Reload.
+    const saveBtn = document.getElementById('save-' + key);
+    if (saveBtn) saveBtn.disabled = true;
     setStatus(cfg.st, 'Saving…', 'info');
     try {
         const payload = { content: content };
@@ -968,6 +1078,8 @@ async function saveFile(key) {
     } catch (e) {
         if (op !== cfg.opSeq) return;
         setStatus(cfg.st, 'Save failed: ' + e.message, 'err');
+    } finally {
+        if (saveBtn) saveBtn.disabled = false;
     }
 }
 
@@ -1011,6 +1123,8 @@ function markAliasesDirty() {
     if (suppressAliasDirty) return;
     aliasesDirty = true;
     aliasesEditVersion++;
+    // Row add/remove buttons reach here via click, which the input/change refresh misses.
+    refreshDirtyMarkers();
 }
 
 function createAliasRow(section, real, label) {
@@ -1193,9 +1307,12 @@ function splitAliasBulkLine(line) {
     else sep = /\s+/;
     const m = sep.exec(line);
     if (!m) return null;
-    const label = line.slice(0, m.index).trim();
-    const real = line.slice(m.index + m[0].length).trim();
-    if (!label || !real) return null;
+    // Canonical name first, matching the row editor above (canonical → label),
+    // so pasting rows in the order they are displayed cannot silently swap the
+    // mapping.
+    const real = line.slice(0, m.index).trim();
+    const label = line.slice(m.index + m[0].length).trim();
+    if (!real || !label) return null;
     return [real, label];
 }
 
@@ -1212,7 +1329,7 @@ function importAliasBulk(section) {
     });
     if (malformed.length) {
         const shown = malformed.slice(0, 5).join(', ') + (malformed.length > 5 ? ', …' : '');
-        setStatus('aliases-status', malformed.length + ' malformed bulk line(s) (line ' + shown + ') — each line needs a display label and canonical name. Nothing was imported.', 'err');
+        setStatus('aliases-status', malformed.length + ' malformed bulk line(s) (line ' + shown + ') — each line needs a canonical name and a display label. Nothing was imported.', 'err');
         return;
     }
     if (!rows.length) { setStatus('aliases-status', 'Paste at least one alias pair first.', 'err'); return; }
@@ -1597,10 +1714,13 @@ async function pollRunLog(epoch = runPollEpoch) {
         // Only an explicitly DIFFERENT id means another job really replaced it.
         if (runJobId && !d.job_id) throw new Error('Run job identity is temporarily unavailable');
         if (runJobId && d.job_id && d.job_id !== runJobId) {
-            runActive = false;
-            document.getElementById('run-btn').disabled = !!d.running;
-            setStatus('run-status', 'This run\u2019s status was replaced by another job; use Show Log to inspect the current job.', 'info');
-            return;
+            // A rerun or another admin tab replaced the job we were following;
+            // adopt the new job and keep streaming instead of dead-ending on a
+            // control that does not exist.
+            runJobId = d.job_id;
+            runActive = !d.done && !!d.running;
+            document.getElementById('run-btn').disabled = runActive;
+            setStatus('run-status', 'Following the current run job\u2026', 'info');
         }
         const out = document.getElementById('run-output');
         if (d.success) {
@@ -1854,10 +1974,12 @@ async function pollUpdateLog(epoch = updatePollEpoch) {
         // Only an explicit different id means another job really replaced it.
         if (updateJobId && !d.job_id) throw new Error('Update job identity is temporarily unavailable');
         if (updateJobId && d.job_id && d.job_id !== updateJobId) {
-            updateActive = false;
-            setUpdateButtons(!!d.running);
-            setStatus('update-status', 'This update\u2019s status was replaced by another job; use Show Log to inspect the current job.', 'info');
-            return;
+            // Adopt the replacing job and keep streaming rather than pointing at
+            // a control that does not exist.
+            updateJobId = d.job_id;
+            updateActive = !d.done && !!d.running;
+            setUpdateButtons(updateActive);
+            setStatus('update-status', 'Following the current update job\u2026', 'info');
         }
         const out = document.getElementById('update-output');
         if (d.success) {
@@ -1950,6 +2072,7 @@ async function showUpdateLog(retryEpoch) {
 
 /* ---- Schedules (cron) for the Run step ---- */
 async function loadHostname() {
+    const save = document.getElementById('save-hostname-btn');
     try {
         const r = await fetch('/setup-api.sh', {
             method: 'POST',
@@ -1957,14 +2080,27 @@ async function loadHostname() {
             body: JSON.stringify({ action: 'get-hostname' })
         });
         const d = await r.json().catch(() => ({}));
-        if (d.success && d.hostname) {
-            document.getElementById('lldpq-hostname').value = d.hostname;
-        }
-    } catch (e) { /* keep the safe default */ }
+        if (!d.success) throw new Error(d.error || 'could not read the current name');
+        if (d.hostname) document.getElementById('lldpq-hostname').value = d.hostname;
+        runSettingsDirty = false;
+        if (save) save.disabled = false;
+        setStatus('hostname-status', '', 'info');
+    } catch (e) {
+        // Don't let the hardcoded 'lldpq' default be saved over a real configured
+        // name: block Save and let re-entering the step retry the load.
+        hostnameLoaded = false;
+        if (save) save.disabled = true;
+        setStatus('hostname-status', 'Could not read the current dashboard name (' + e.message + '). Reopen this step to retry.', 'err');
+    }
 }
 
 async function saveHostname() {
     const input = document.getElementById('lldpq-hostname');
+    const save = document.getElementById('save-hostname-btn');
+    if (save && save.disabled) {
+        setStatus('hostname-status', 'Reopen this step to load the current name before saving.', 'err');
+        return;
+    }
     const hostname = (input.value || '').trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(hostname)) {
         setStatus('hostname-status', 'Use 1-64 letters, numbers, dots, underscores or hyphens.', 'err');
@@ -1980,6 +2116,7 @@ async function saveHostname() {
         const d = await r.json().catch(() => ({}));
         if (d.success) {
             input.value = d.hostname;
+            runSettingsDirty = false;
             setStatus('hostname-status', 'Saved \u2713 \u2014 reopen the dashboard to see the new name.', 'ok');
         } else {
             setStatus('hostname-status', d.error || 'Save failed', 'err');
@@ -1990,26 +2127,44 @@ async function saveHostname() {
 }
 
 async function loadSchedules() {
+    const save = document.getElementById('save-sched-btn');
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-schedules' }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success) {
-            const sl = document.getElementById('sched-lldpq');
-            const sg = document.getElementById('sched-getconf');
-            if (d.lldpq_minutes && sl && [...sl.options].some(o => +o.value === d.lldpq_minutes)) sl.value = String(d.lldpq_minutes);
-            if (d.getconf_hours && sg && [...sg.options].some(o => +o.value === d.getconf_hours)) sg.value = String(d.getconf_hours);
-        }
-    } catch (e) { /* ignore */ }
+        if (!d.success) throw new Error(d.error || 'could not read the schedule');
+        const sl = document.getElementById('sched-lldpq');
+        const sg = document.getElementById('sched-getconf');
+        const custom = [];
+        if (d.lldpq_minutes && sl && [...sl.options].some(o => +o.value === d.lldpq_minutes)) sl.value = String(d.lldpq_minutes);
+        else if (d.lldpq_cron) custom.push('collection "' + d.lldpq_cron + '"');
+        if (d.getconf_hours && sg && [...sg.options].some(o => +o.value === d.getconf_hours)) sg.value = String(d.getconf_hours);
+        else if (d.getconf_cron) custom.push('get-conf "' + d.getconf_cron + '"');
+        runSettingsDirty = false;
+        if (save) save.disabled = false;
+        // A non-preset cron the dropdowns cannot represent must not masquerade as
+        // the shown preset: warn (with the real expression) that saving replaces it.
+        if (custom.length) setStatus('sched-status', 'Current ' + custom.join(' and ') + ' is not one of the presets; saving replaces it with the selected value.', 'info');
+        else setStatus('sched-status', '', 'info');
+    } catch (e) {
+        schedLoaded = false;
+        if (save) save.disabled = true;
+        setStatus('sched-status', 'Could not read the current schedule (' + e.message + '). Reopen this step to retry.', 'err');
+    }
 }
 
 async function saveSchedules() {
+    const save = document.getElementById('save-sched-btn');
+    if (save && save.disabled) {
+        setStatus('sched-status', 'Reopen this step to load the current schedule before saving.', 'err');
+        return;
+    }
     const mins = parseInt(document.getElementById('sched-lldpq').value, 10);
     const hours = parseInt(document.getElementById('sched-getconf').value, 10);
     setStatus('sched-status', 'Saving\u2026', 'info');
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'set-schedules', lldpq_minutes: mins, getconf_hours: hours }) });
         const d = await r.json().catch(() => ({}));
-        if (d.success) setStatus('sched-status', 'Saved \u2713  (lldpq: ' + d.lldpq_cron + ', get-conf: ' + d.getconf_cron + ')', 'ok');
+        if (d.success) { runSettingsDirty = false; setStatus('sched-status', 'Saved \u2713  (lldpq: ' + d.lldpq_cron + ', get-conf: ' + d.getconf_cron + ')', 'ok'); }
         else setStatus('sched-status', d.error || 'Save failed', 'err');
     } catch (e) { setStatus('sched-status', 'Save failed: ' + e.message, 'err'); }
 }
@@ -2054,7 +2209,13 @@ async function loadAnsible(force) {
         const d = await r.json().catch(() => ({}));
         if (seq !== ansibleLoadSeq || op !== ansibleOpSeq) return;
         if (ansibleEditVersion !== startedVersion) { setStatus('ans-status', 'Server setting arrived, but the directory field changed while loading; your edit was kept.', 'info'); return; }
-        if (!d.success) return;
+        if (!d.success) {
+            // Don't leave the badge stuck on 'checking…' forever with no message.
+            const st = document.getElementById('ans-state');
+            if (st) { st.textContent = 'error'; st.className = 'badge gray'; }
+            setStatus('ans-status', d.error || 'Could not read the Ansible setting.', 'err');
+            return;
+        }
         const st = document.getElementById('ans-state');
         if (d.disabled) { st.textContent = 'disabled'; st.className = 'badge gray'; }
         else if (d.ready) { st.textContent = 'integrated'; st.className = 'badge green'; }
@@ -2083,7 +2244,12 @@ async function loadAnsible(force) {
         } else if (force) {
             setStatus('ans-status', 'Ansible setting refreshed.', 'info');
         }
-    } catch (e) { if (op !== ansibleOpSeq) return; }
+    } catch (e) {
+        if (op !== ansibleOpSeq) return;
+        const st = document.getElementById('ans-state');
+        if (st) { st.textContent = 'error'; st.className = 'badge gray'; }
+        setStatus('ans-status', 'Could not read the Ansible setting: ' + e.message, 'err');
+    }
     finally { if (op === ansibleOpSeq) ansibleBusy = false; }
 }
 async function saveAnsible() {
@@ -2144,13 +2310,15 @@ async function disableAnsible() {
 async function loadParallel() {
     const opts = [50, 100, 150, 200, 250, 300, 500];
     const sels = { monitor: 'par-monitor', lldp: 'par-lldp', assets: 'par-assets', getconfigs: 'par-getconfigs' };
+    const save = document.getElementById('save-parallel-btn');
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-parallel' }) });
         const d = await r.json().catch(() => ({}));
+        if (!d.success) throw new Error(d.error || 'could not read current values');
         Object.keys(sels).forEach(function (k) {
             const s = document.getElementById(sels[k]);
             if (!s) return;
-            const cur = (d && d[k]) ? d[k] : 100;
+            const cur = Number.isInteger(d[k]) ? d[k] : 100;
             let list = opts.slice();
             if (list.indexOf(cur) < 0) list.push(cur);
             list.sort(function (a, b) { return a - b; });
@@ -2160,9 +2328,23 @@ async function loadParallel() {
                 option.value = String(v); option.textContent = String(v); option.selected = v === cur; s.appendChild(option);
             });
         });
-    } catch (e) { /* ignore */ }
+        runSettingsDirty = false;
+        if (save) save.disabled = false;
+        setStatus('par-status', '', 'info');
+    } catch (e) {
+        // Leave the selects unpopulated rather than filled with a wrong default,
+        // block Save (empty selects would post NaN), and retry on re-entry.
+        parallelLoaded = false;
+        if (save) save.disabled = true;
+        setStatus('par-status', 'Could not read the current parallelism (' + e.message + '). Reopen this step to retry.', 'err');
+    }
 }
 async function saveParallel() {
+    const save = document.getElementById('save-parallel-btn');
+    if (save && save.disabled) {
+        setStatus('par-status', 'Reopen this step to load the current values before saving.', 'err');
+        return;
+    }
     const body = {
         action: 'set-parallel',
         monitor: parseInt(document.getElementById('par-monitor').value, 10),
@@ -2170,11 +2352,15 @@ async function saveParallel() {
         assets: parseInt(document.getElementById('par-assets').value, 10),
         getconfigs: parseInt(document.getElementById('par-getconfigs').value, 10)
     };
+    if (![body.monitor, body.lldp, body.assets, body.getconfigs].every(Number.isInteger)) {
+        setStatus('par-status', 'Reopen this step to reload the parallelism values before saving.', 'err');
+        return;
+    }
     setStatus('par-status', 'Saving\u2026', 'info');
     try {
         const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
         const d = await r.json().catch(() => ({}));
-        if (d.success) setStatus('par-status', 'Saved \u2713 \u2014 applies on the next collection.', 'ok');
+        if (d.success) { runSettingsDirty = false; setStatus('par-status', 'Saved \u2713 \u2014 applies on the next collection.', 'ok'); }
         else setStatus('par-status', d.error || 'Save failed', 'err');
     } catch (e) { setStatus('par-status', 'Save failed: ' + e.message, 'err'); }
 }
@@ -2223,6 +2409,10 @@ function nfPayload(){
 async function saveNotifications(){
     if(!notificationsReady||typeof notifRevision!=='string'){ setStatus('nf-status','Load the current notification settings before saving.','err'); return; }
     const startedVersion=notifEditVersion; const op=++notifOpSeq;
+    // Disable Save in-flight so a double-click cannot fire two writes with the
+    // same expected_revision and strand the form on a false conflict.
+    const saveBtn=document.getElementById('nf-save');
+    if(saveBtn) saveBtn.disabled=true;
     setStatus('nf-status','Saving\u2026','info');
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(nfPayload())});
@@ -2234,6 +2424,7 @@ async function saveNotifications(){
             else setStatus('nf-status','Saved the submitted notification settings, but newer form changes remain unsaved.','info');
         } else setStatus('nf-status', d.conflict ? ((d.error||'notifications.yaml changed on disk.')+' Your form was kept; reload to review.') : (d.error||'Save failed'),'err');
     }catch(e){ if(op!==notifOpSeq) return; setStatus('nf-status','Save failed: '+e.message,'err'); }
+    finally{ if(saveBtn) saveBtn.disabled=false; }
 }
 
 async function testAlert(){
@@ -2805,9 +2996,32 @@ async function loadMaintenance(){
     }catch(e){ setStatus('mt-status','Failed: '+e.message,'err'); }
 }
 
-async function purgeBackups(){
-    if(!purgeArmed){ purgeArmed=true; setStatus('mt-status','This permanently deletes all ~/lldpq-backup-* directories. Click \u201cRemove old update backups\u201d again within 5s to confirm.','err'); setTimeout(()=>{purgeArmed=false;},5000); return; }
+function purgeButtonLabel(text){
+    const btn=document.getElementById('mt-purge-btn');
+    if(btn && btn.lastChild) btn.lastChild.textContent=text;
+}
+function disarmPurge(){
     purgeArmed=false;
+    if(purgeCountdownTimer){ clearInterval(purgeCountdownTimer); purgeCountdownTimer=null; }
+    purgeButtonLabel('Remove old update backups');
+}
+async function purgeBackups(){
+    if(!purgeArmed){
+        purgeArmed=true; purgeArmedAt=Date.now();
+        setStatus('mt-status','This permanently deletes all ~/lldpq-backup-* directories. Click \u201cConfirm delete\u201d again within 5s to confirm.','err');
+        let left=5;
+        purgeButtonLabel('Confirm delete ('+left+'s)');
+        purgeCountdownTimer=setInterval(function(){
+            left-=1;
+            if(left<=0){ disarmPurge(); setStatus('mt-status','Deletion window expired; nothing was removed.','info'); }
+            else purgeButtonLabel('Confirm delete ('+left+'s)');
+        },1000);
+        return;
+    }
+    // Ignore a second click that lands too fast to be a deliberate confirmation
+    // (a double-click on the green-looking button must not delete silently).
+    if(Date.now()-purgeArmedAt < 500) return;
+    disarmPurge();
     setStatus('mt-status','Removing\u2026','info');
     try{
         const r=await fetch('/setup-api.sh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'purge-data',target:'update_backups'})});

@@ -20,12 +20,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Mapping, Optional
 
 
 DEFAULT_CONFIG_PATH = "/etc/lldpq.conf"
 DEFAULT_LOCK_PATH = "/etc/lldpq.conf.lock"
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
+ORPHAN_STAGE_GRACE_SECONDS = 3600
 _KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
 
@@ -291,6 +293,40 @@ def _set_stage_owner(
         )
 
 
+def _stage_prefix(target: str) -> str:
+    return f".{os.path.basename(target)}.lldpq-"
+
+
+_STAGE_SUFFIX = ".tmp"
+
+
+def _sweep_orphaned_stages(
+    target: str, *, grace_seconds: int = ORPHAN_STAGE_GRACE_SECONDS
+) -> None:
+    """Best-effort removal of stale stage files left by killed writers.
+
+    Must only be called while holding the shared configuration lock, which
+    guarantees that no live writer owns a stage older than the grace period.
+    """
+    directory = os.path.dirname(target) or "."
+    prefix = _stage_prefix(target)
+    cutoff = time.time() - grace_seconds
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return
+    for name in entries:
+        if not (name.startswith(prefix) and name.endswith(_STAGE_SUFFIX)):
+            continue
+        stale = os.path.join(directory, name)
+        try:
+            info = os.lstat(stale)
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                os.unlink(stale)
+        except OSError:
+            continue
+
+
 def _durable_same_directory_stage(
     logical_path: str,
     target: str,
@@ -303,7 +339,7 @@ def _durable_same_directory_stage(
     stage: Optional[str] = None
     try:
         descriptor, stage = tempfile.mkstemp(
-            prefix=f".{os.path.basename(target)}.lldpq-", suffix=".tmp", dir=directory
+            prefix=_stage_prefix(target), suffix=_STAGE_SUFFIX, dir=directory
         )
         os.fchmod(descriptor, stat.S_IMODE(metadata.st_mode))
         with os.fdopen(descriptor, "wb", closefd=False) as handle:
@@ -635,6 +671,7 @@ def update_lldpq_config(
     logical_path = os.path.abspath(config_path)
     with _configuration_lock(lock_path):
         target = _resolve_target(logical_path)
+        _sweep_orphaned_stages(target)
         original, metadata = _snapshot_target(target)
         old_revision = _revision(original)
         if expected_revision is not None and expected_revision != old_revision:

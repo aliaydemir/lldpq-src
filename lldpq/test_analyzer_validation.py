@@ -82,7 +82,12 @@ class AnalyzerValidationTests(unittest.TestCase):
             results = validate_analysis_json.validate_json_files(
                 Path("/tmp"), ["a.json", "b.json", "c.json"], max_workers=8
             )
-        self.assertEqual(worker_counts, [2])
+            many = [f"file{index}.json" for index in range(12)]
+            validate_analysis_json.validate_json_files(
+                Path("/tmp"), many, max_workers=32
+            )
+        # Bounded by the file count first, then by the hard cap of 8.
+        self.assertEqual(worker_counts, [3, 8])
         self.assertEqual([item[0] for item in results], [
             "a.json", "b.json", "c.json"
         ])

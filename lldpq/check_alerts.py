@@ -637,8 +637,8 @@ class LLDPqAlerts:
             )
         if asic_temperatures:
             asic_temp = max(asic_temperatures)
-            asic_critical = thresholds.get('asic_temp_critical', 90)
-            asic_warning = thresholds.get('asic_temp_warning', 80)
+            asic_critical = thresholds.get('asic_temp_critical', 105)
+            asic_warning = thresholds.get('asic_temp_warning', 95)
             
             if asic_temp >= asic_critical:
                 current_state = "CRITICAL"

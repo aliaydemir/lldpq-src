@@ -589,6 +589,11 @@ class LinkFlapAnalyzer:
         .section-header {{ padding: 12px 16px; background: #333; font-weight: 600; font-size: 14px; color: #76b900; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #404040; }}
         .section-content {{ padding: 16px; }}
         .section-content-table {{ padding: 0; }}
+        .collapsible > .section-header {{ cursor: pointer; user-select: none; }}
+        .collapsible > .section-header:hover {{ background: #3a3a3a; }}
+        .collapsible .collapse-chevron {{ margin-left: auto; flex-shrink: 0; color: #888; transition: transform 0.2s ease; }}
+        .collapsible:not(.collapsed) .collapse-chevron {{ transform: rotate(90deg); }}
+        .collapsible.collapsed > .section-content {{ display: none; }}
         .summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }}
         .summary-card {{ background: #252526; padding: 15px; border-radius: 6px; border-left: 3px solid #76b900; cursor: pointer; transition: all 0.2s ease; }}
         .summary-card:hover {{ background: #2d2d2d; transform: translateY(-1px); }}
@@ -624,10 +629,16 @@ class LinkFlapAnalyzer:
         .sortable.asc .sort-arrow, .sortable.desc .sort-arrow {{ opacity: 1; }}
         .filter-info {{ text-align: center; padding: 10px 15px; margin: 15px 16px; background: rgba(118, 185, 0, 0.1); border: 1px solid rgba(118, 185, 0, 0.3); border-radius: 6px; color: #76b900; display: none; font-size: 13px; }}
         .filter-info button {{ margin-left: 10px; padding: 4px 10px; background: #76b900; color: #000; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }}
-        .anomaly-card {{ margin: 10px 0; padding: 12px 15px; background: #252526; border-radius: 6px; border-left: 3px solid #f44336; }}
+        .anomaly-card {{ margin: 10px 0; padding: 12px 15px; background: #252526; border-radius: 6px; border-left: 3px solid #f44336; cursor: pointer; transition: background 0.15s ease; }}
+        .anomaly-card:hover {{ background: #2f2f30; }}
         .anomaly-card.warning {{ border-left-color: #ff9800; }}
         .anomaly-card h4 {{ color: #d4d4d4; margin-bottom: 8px; font-size: 14px; }}
         .anomaly-card p {{ font-size: 13px; color: #888; margin: 4px 0; }}
+        .anomaly-card .anomaly-meta {{ font-size: 12px; color: #9e9e9e; margin: 2px 0 6px; }}
+        .anomaly-card .anomaly-recent {{ font-size: 12px; color: #9e9e9e; margin-top: 6px; }}
+        .sev-badge {{ font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }}
+        .sev-badge.sev-crit {{ background: rgba(244,67,54,0.15); color: #ff8a80; border: 1px solid #7a2a24; }}
+        .sev-badge.sev-warn {{ background: rgba(255,152,0,0.15); color: #ffb74d; border: 1px solid #6d511d; }}
         .btn {{ padding: 8px 14px; border: none; border-radius: 4px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 6px; }}
         .btn-primary {{ background: linear-gradient(0deg, #76b900 0%, #5a8c00 100%); color: white; }}
         .btn-primary:hover {{ background: linear-gradient(0deg, #8bd400 0%, #6ba000 100%); }}
@@ -759,22 +770,92 @@ class LinkFlapAnalyzer:
         
         # Add anomalies section if any exist
         if anomalies:
+            anomalies = sorted(
+                anomalies,
+                key=lambda a: 0 if str(a.get('severity')) == 'critical' else 1
+            )
+            critical_count = sum(1 for a in anomalies if str(a.get('severity')) == 'critical')
+            warning_count = sum(1 for a in anomalies if str(a.get('severity')) == 'warning')
+            severity_badges = ""
+            if critical_count:
+                severity_badges += f'<span class="sev-badge sev-crit">{critical_count} critical</span>'
+            if warning_count:
+                severity_badges += f'<span class="sev-badge sev-warn">{warning_count} warning</span>'
+
             html_content += f"""
-    <div class="dashboard-section">
-        <div class="section-header">
+    <div class="dashboard-section collapsible collapsed">
+        <div class="section-header" onclick="this.parentElement.classList.toggle('collapsed')" title="Click to expand/collapse">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
             Detailed Issue Analysis ({len(anomalies)})
+            {severity_badges}
+            <svg class="collapse-chevron" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8.59,16.58L13.17,12L8.59,7.41L10,6L16,12L10,18L8.59,16.58Z"/></svg>
         </div>
         <div class="section-content">
 """
             for anomaly in anomalies:
                 severity_class = "warning" if anomaly['severity'] == 'warning' else ""
                 anomaly_device_key = html.escape(str(anomaly['device']), quote=True)
+
+                # Compact evidence row from the already-collected details dict.
+                details = anomaly.get('details') or {}
+                meta_bits = []
+                flaps_1hr = details.get('flap_count_1hr')
+                threshold = details.get('critical_threshold') or details.get('warning_threshold')
+                if flaps_1hr is not None:
+                    if threshold:
+                        meta_bits.append(f"{flaps_1hr} flaps/1h (threshold {threshold})")
+                    else:
+                        meta_bits.append(f"{flaps_1hr} flaps/1h")
+                lifetime_transitions = details.get('current_transitions')
+                if lifetime_transitions:
+                    meta_bits.append(f"lifetime transitions {int(lifetime_transitions):,}")
+
+                # Most recent flap events from the persisted history (newest first).
+                port_name = f"{anomaly['device']}:{anomaly['interface']}"
+                recent_events = []
+                last_flap_ts = None
+                for event in reversed(self.flapping_hist.get(port_name, [])):
+                    if len(event) < 3:
+                        continue
+                    try:
+                        event_time = float(event[0])
+                        event_count = int(event[2])
+                    except (TypeError, ValueError):
+                        continue
+                    if last_flap_ts is None:
+                        last_flap_ts = event_time
+                    recent_events.append(
+                        f"{datetime.fromtimestamp(event_time).strftime('%H:%M:%S')} +{event_count}"
+                    )
+                    if len(recent_events) >= 3:
+                        break
+                if last_flap_ts is not None:
+                    meta_bits.append(
+                        "last flap "
+                        + datetime.fromtimestamp(last_flap_ts).strftime('%Y-%m-%d %H:%M:%S')
+                    )
+                meta_html = ""
+                if meta_bits:
+                    meta_html = (
+                        '<p class="anomaly-meta">'
+                        + " &middot; ".join(html.escape(str(bit)) for bit in meta_bits)
+                        + '</p>'
+                    )
+                recent_html = ""
+                if len(recent_events) > 1:
+                    recent_html = (
+                        '<p class="anomaly-recent">Recent events: '
+                        + html.escape(" · ".join(recent_events))
+                        + '</p>'
+                    )
+
                 html_content += f"""
-            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}">
+            <div class="anomaly-card {severity_class}" data-device-key="{anomaly_device_key}" onclick="filterFromAnomaly(this)" title="Click to show this device in the table below">
                 <h4>{anomaly['device']} - {anomaly['interface']}</h4>
+                {meta_html}
                 <p><strong>Issue:</strong> {anomaly['message']}</p>
                 <p><strong>Recommended Action:</strong> {anomaly['action']}</p>
+                {recent_html}
             </div>
 """
             html_content += """
@@ -1264,6 +1345,40 @@ class LinkFlapAnalyzer:
             document.getElementById('clearSearchBtn').style.display = 'none';
             document.getElementById('filter-info').style.display = 'none';
             allRows.forEach(row => row.style.display = '');
+        }
+
+        // Filter the table from an anomaly card. Matches on data-device-key so
+        // it keeps working when p2p-alias rewrites the displayed device names.
+        function filterFromAnomaly(card) {
+            const deviceKey = card && card.dataset ? card.dataset.deviceKey : '';
+            if (!deviceKey) return;
+            removeFlapDetailRows();
+
+            selectedDevice = deviceKey;
+            deviceSearchActive = true;
+
+            // Clear card-based filter
+            currentFilter = 'ALL';
+            document.querySelectorAll('.summary-card').forEach(c => c.classList.remove('active'));
+
+            let matchCount = 0;
+            let displayName = deviceKey;
+            allRows.forEach(row => {
+                if (row.dataset.deviceKey === deviceKey) {
+                    if (matchCount === 0) displayName = row.cells[0]?.textContent?.trim() || deviceKey;
+                    row.style.display = '';
+                    matchCount++;
+                } else {
+                    row.style.display = 'none';
+                }
+            });
+
+            document.getElementById('filter-info').style.display = 'block';
+            document.getElementById('filter-text').textContent = 'Showing interfaces for device: ' + displayName + ' (' + matchCount + ' interfaces)';
+            const clearBtn = document.getElementById('clearSearchBtn');
+            if (clearBtn) clearBtn.style.display = 'inline-block';
+            const table = document.getElementById('flap-table');
+            if (table) table.scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
         
         // Generic table sorting functionality

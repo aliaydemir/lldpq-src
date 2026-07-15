@@ -849,6 +849,18 @@ def _source_path(monitor_dir: Path, web_root: Optional[Path], filename: str) -> 
     return monitor_dir / filename
 
 
+def _pfc_history_source(monitor_dir: Path, web_root: Optional[Path]) -> Path:
+    """Prefer the per-device shard directory; fall back to the monolith.
+
+    The fallback keeps insights working across the one-run migration window
+    and on installations whose analyzer has not produced shards yet.
+    """
+    shard_dir = _source_path(monitor_dir, web_root, "pfc-ecn-history")
+    if shard_dir.is_dir():
+        return shard_dir
+    return _source_path(monitor_dir, web_root, "pfc_ecn_history.json")
+
+
 def _mark_stream_limits(
     record: Dict[str, Any], state: _HistoryStreamState
 ) -> Dict[str, Any]:
@@ -1560,9 +1572,28 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
             ))
             previous_signal = signal
 
-    load_status, stream_state = _stream_history(
-        path, "history", (), consume_series
-    )
+    # The PFC/ECN history is sharded per device (one JSON document per host
+    # under pfc-ecn-history/); a plain file is the pre-shard monolith.
+    if path.is_dir():
+        stream_state = _HistoryStreamState()
+        load_status = "loaded"
+        for shard in sorted(path.glob("*.json")):
+            shard_status, shard_state = _stream_history(
+                shard, "history", (), consume_series
+            )
+            for flag in (
+                "truncated", "invalid_series", "oversized_series",
+                "series_truncated", "samples_truncated", "decode_limit_reached",
+            ):
+                if getattr(shard_state, flag, False):
+                    setattr(stream_state, flag, True)
+            if shard_status != "loaded":
+                load_status = shard_status
+                break
+    else:
+        load_status, stream_state = _stream_history(
+            path, "history", (), consume_series
+        )
     if load_status != "loaded":
         failure = _coverage(
             "pfc_ecn", load_status, 0, 0, None, start,
@@ -1747,7 +1778,7 @@ def build_timeline(
         ("optical", _extract_optical, _source_path(monitor, web, "optical_history.json")),
         ("ber", _extract_ber, _source_path(monitor, web, "ber_history.json")),
         ("flaps", _extract_flaps, _source_path(monitor, web, "flap_history.json")),
-        ("pfc_ecn", _extract_congestion, _source_path(monitor, web, "pfc_ecn_history.json")),
+        ("pfc_ecn", _extract_congestion, _pfc_history_source(monitor, web)),
     ]
     all_events: List[Dict[str, Any]] = []
     coverage: List[Dict[str, Any]] = []

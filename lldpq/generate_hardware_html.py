@@ -39,7 +39,7 @@ except Exception:
 # conservative defaults unless explicitly configured.
 DEFAULT_HARDWARE_THRESHOLDS = {
     "cpu_temp_c": (60.0, 75.0, 85.0),
-    "asic_temp_c": (70.0, 80.0, 90.0),
+    "asic_temp_c": (70.0, 95.0, 105.0),
     "memory_percent": (60.0, 80.0, 90.0),
     "load_per_core": (0.7, 1.0, 1.5),
     # Low values are bad for fan speed and PSU efficiency.  These tuples are
@@ -127,7 +127,7 @@ def load_hardware_thresholds():
         return values if 0 <= critical < warning < excellent else defaults[key]
 
     cpu_warning = _finite_number(configured, "cpu_temp_warning", 75.0)
-    asic_warning = _finite_number(configured, "asic_temp_warning", 80.0)
+    asic_warning = _finite_number(configured, "asic_temp_warning", 95.0)
     memory_warning = _finite_number(configured, "memory_usage_warning", 80.0)
     fan_warning = _finite_number(configured, "fan_rpm_warning", 4000.0)
     psu_warning = _finite_number(configured, "psu_efficiency_warning", 80.0)

@@ -41,6 +41,14 @@ except Exception:
     read_asset_snapshot = None
 
 MAC_RE = re.compile(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}')
+# Well-known virtual first-hop gateway MAC prefixes: seeing one of these on
+# several switches is anycast/VRR by design, not two devices colliding.
+#   00:00:5e:00:01/02 = VRRP v4/v6, 00:00:0c:07:ac + 00:00:0c:9f:f = HSRP v1/v2,
+#   00:07:b4 = GLBP, 44:38:39:ff:00 = Cumulus VRR reserved range
+VIRTUAL_GW_MAC_RE = re.compile(
+    r'^(?:00:00:5e:00:0[12]:|00:00:0c:07:ac:|00:00:0c:9f:f|00:07:b4:|44:38:39:ff:00:)',
+    re.I,
+)
 IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
 SEQ_RE = re.compile(r'(\d+)\s*/\s*(\d+)\s*$')
 LOG_RE = re.compile(
@@ -1393,12 +1401,21 @@ class DuplicateAnalyzer:
             vteps = self._vtep_cell(r["vteps"], r["local_hosts"], ip_ports)
             vlanvni = "vlan %s<br><span class='dim'>VNI %s</span>" % (html.escape(r["vlan"]), html.escape(r["vni"]))
             devs = set(r["local_hosts"]) | set(p.split(":")[0] for p in r["ports"])
+            # The contender switches (Conflict VTEP column) must be searchable too.
+            for v in r["vteps"]:
+                h = self.vtep2host.get(v)
+                if h:
+                    devs.add(h)
             all_devices |= devs
+            kind = "arp-observed" if self._is_arp_observed_ip(r) else "confirmed"
             if self._is_arp_observed_ip(r):
                 # Cross-device ARP saw >=2 MACs for this IP, but no current FRR
                 # DAD row confirms it: report it distinctly, without claiming
                 # an authoritative finding.
                 note = "Observed &mdash; cross-device ARP (not FRR-confirmed)"
+                if any(VIRTUAL_GW_MAC_RE.match(m) for m in r["macs"]):
+                    note += (" <span class='dim'>(virtual gateway MAC &mdash; "
+                             "likely anycast/VRR, expected on multiple switches)</span>")
             elif len(r["macs"]) >= 2:
                 note = "Confirmed &mdash; IP conflict"
                 if r["severity"] != "CRITICAL":
@@ -1420,12 +1437,14 @@ class DuplicateAnalyzer:
                 note += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
             rowcls = " class='stale-row'" if r.get("stale") else ""
             ip_html.append(
-                "<tr data-sev='%d' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
-                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td>%s</td><td data-sort='%d'>%s</td><td>%s</td></tr>" % (
-                    sev_rank.get(r["severity"], 3), html.escape(" ".join(sorted(devs))), rowcls,
+                "<tr data-sev='%d' data-kind='%s' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td>%s</td></tr>" % (
+                    sev_rank.get(r["severity"], 3), kind,
+                    html.escape(" ".join(sorted(devs))), rowcls,
                     sev_rank.get(r["severity"], 3), self._sev_badge(r["severity"]), vlanvni,
                     html.escape(r["ip"]), macs, owner, vteps,
                     r["seq"] or 0, self._seq_cell(r["seq"], r["delta"]),
+                    int(r["recency"]) if r["recency"] is not None else 2**31,
                     self._ago(r["recency"]),
                     r["events"] or 0, r["events"] or "&mdash;", note))
         if not ip_html:
@@ -1487,6 +1506,10 @@ class DuplicateAnalyzer:
                 note_html += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
             rowcls = " class='stale-row'" if r.get("stale") else ""
             devs = set(r["local"].keys())
+            for v in r["vteps"]:
+                h = self.vtep2host.get(v)
+                if h:
+                    devs.add(h)
             all_devices |= devs
             if r.get("confirmed_conflict"):
                 kind = "confirmed"
@@ -1559,7 +1582,7 @@ class DuplicateAnalyzer:
             "<div class='summary-card %s%s'%s><div class='metric'>%s</div><div class='metric-label'>%s</div></div>" % (
                 c, ("" if act else " noclick"),
                 (" onclick=\"cardFilter('%s', this)\"" % act) if act else "",
-                v, l)
+                "{:,}".format(v) if isinstance(v, int) else v, l)
             for c, v, l, act in cards)
 
         stale_count = sum(1 for r in self.ip_dups.values()
@@ -1869,6 +1892,9 @@ __COVERAGE_BANNER__
       mobility sequence is very high: the same endpoint is rapidly re-registering between locations (e.g. a
       BMC dual-pathed / not bonded), NOT two devices sharing an address. "active" = climbing now, "settled" =
       high but flat. A flapping endpoint often also shows an APIPA (169.254) address because the churn breaks DHCP.
+      An <i>Observed</i> row whose MAC matches a well-known virtual gateway prefix (VRRP <code>00:00:5e:00:01/02</code>,
+      HSRP, GLBP, Cumulus VRR <code>44:38:39:ff:00:xx</code>) is annotated as a likely anycast/VRR gateway &mdash;
+      the same virtual MAC on multiple switches is expected there, not a conflict.
       <h4>MAC finding types</h4>
       <b>Confirmed MAC conflict</b> requires the same MAC to be simultaneously LOCAL on at least two
       physical switch ports. <b>FRR MAC DAD</b> is a current/latched DAD finding but does not by itself
@@ -1903,7 +1929,7 @@ function sortTable(tid, col, numeric) {
 ['ipt','mact','apt'].forEach(function(tid){
   var t=document.getElementById(tid); if(!t) return;
   Array.prototype.forEach.call(t.tHead.rows[0].cells, function(th, i){
-    var num = /Count|Seq|Events|Severity/i.test(th.innerText);
+    var num = /Count|Seq|Event|Severity/i.test(th.innerText);
     th.addEventListener('click', function(){ sortTable(tid, i, num); });
   });
 });
@@ -1921,19 +1947,32 @@ function showAllDup(){
   var cs=document.getElementById('clearSearchBtn'); if(cs) cs.style.display='none';
   if(window.jQuery && jQuery('#deviceSearch').data('select2')) jQuery('#deviceSearch').val('').trigger('change.select2');
 }
+function revealAgedIfNeeded(rows){
+  // A summary-card count includes aged (stale) rows, which are collapsed by
+  // default; reveal them so the filtered view matches the number on the card.
+  if(document.body.classList.contains('show-aged')) return;
+  if(rows.some(function(r){ return r.classList.contains('stale-row'); })) toggleAged();
+}
 function cardFilter(kind, card){
   document.querySelectorAll('.summary-card').forEach(function(c){ c.classList.remove('active'); });
   if(kind==='active'||kind==='quiesced'){
     if(card) card.classList.add('active');
     var sev = (kind==='active') ? '0' : '1';
+    var matched=[];
     Array.prototype.slice.call(document.querySelectorAll('#ipt tbody tr')).forEach(function(r){
       if(r.querySelector('.empty')) return;
-      r.style.display = (r.getAttribute('data-sev')===sev) ? '' : 'none';
+      // The card counts only FRR-confirmed findings; cross-device ARP
+      // observations share the WARNING severity but are a distinct class.
+      var m=(r.getAttribute('data-sev')===sev && r.getAttribute('data-kind')==='confirmed');
+      r.style.display = m ? '' : 'none';
+      if(m) matched.push(r);
     });
+    revealAgedIfNeeded(matched);
     document.getElementById('ipt').scrollIntoView({behavior:'smooth', block:'start'});
     setFilterInfo((kind==='active'?'Active':'Quiesced')+' IP duplicates');
   } else if(kind==='mac'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
     if(card) card.classList.add('active');
+    var matched=[];
     Array.prototype.slice.call(document.querySelectorAll('#mact tbody tr')).forEach(function(r){
       if(r.querySelector('.empty')) return;
       var rowKind=r.getAttribute('data-kind');
@@ -1942,7 +1981,9 @@ function cardFilter(kind, card){
         (kind==='mobility'&&rowKind==='mobility') ||
         (kind==='mobility-active'&&rowKind==='mobility'&&r.getAttribute('data-mobility-active')==='true');
       r.style.display=matches?'':'none';
+      if(matches) matched.push(r);
     });
+    revealAgedIfNeeded(matched);
     document.getElementById('mact').scrollIntoView({behavior:'smooth', block:'start'});
     var labels={mac:'Confirmed MAC conflicts',dad:'MAC DAD findings',mobility:'MAC mobility signals','mobility-active':'Active MAC mobility'};
     setFilterInfo(labels[kind]);
@@ -1954,11 +1995,15 @@ function filterByDevice(dev){
   if(!dev) return;
   dev = String(dev).toLowerCase();
   document.querySelectorAll('.summary-card').forEach(function(c){ c.classList.remove('active'); });
+  var matched=[];
   allDupRows().forEach(function(r){
     if(r.querySelector('.empty')) return;
     var d=(r.getAttribute('data-devices')||'').toLowerCase().split(' ');
-    r.style.display = (d.indexOf(dev)>-1) ? '' : 'none';
+    var m=(d.indexOf(dev)>-1);
+    r.style.display = m ? '' : 'none';
+    if(m) matched.push(r);
   });
+  revealAgedIfNeeded(matched);
   var cs=document.getElementById('clearSearchBtn'); if(cs) cs.style.display='inline-block';
   setFilterInfo('Device: '+dev);
 }
@@ -2011,14 +2056,16 @@ function downloadCSV(){
     out.push([]);
   });
   var csv=out.map(function(r){ return r.map(csvEsc).join(','); }).join('\\n');
-  var ts=new Date().toISOString().slice(0,16).replace('T','_').replace(/:/g,'-');
+  var d=new Date(), pad=function(n){ return (n<10?'0':'')+n; };
+  var ts=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'_'+pad(d.getHours())+'-'+pad(d.getMinutes());
   var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); var a=document.createElement('a');
   a.href=URL.createObjectURL(blob); a.download='Duplicate_Analysis_'+ts+'.csv'; document.body.appendChild(a); a.click(); a.remove();
 }
 document.addEventListener('DOMContentLoaded', function(){
   if(window.jQuery){
     var $s=jQuery('#deviceSearch'); var opts='<option value=""></option>';
-    DUP_DEVICES.forEach(function(dv){ opts+='<option value="'+dv+'">'+dv+'</option>'; });
+    var escHtml=function(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); };
+    DUP_DEVICES.forEach(function(dv){ opts+='<option value="'+escHtml(dv)+'">'+escHtml(dv)+'</option>'; });
     $s.html(opts);
     $s.select2({placeholder:'Search Device...', allowClear:true, width:'200px', dropdownAutoWidth:true});
     $s.on('select2:select', function(e){ filterByDevice(e.params.data.id); });

@@ -1306,6 +1306,17 @@ def _render_conf(original, values):
     return "\n".join(output) + "\n"
 
 
+def _cron_command(parts):
+    """Command token of a system-crontab line: the first token after the user
+    field that is not a NAME=value environment assignment. install.sh renders
+    the lldpq entry with an env-var prefix (LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300)
+    before /usr/local/bin/lldpq, so a fixed parts[6] match would miss it."""
+    for token in parts[6:]:
+        if "=" not in token:
+            return token
+    return ""
+
+
 def _render_cron(values, original, validate_cron):
     def clean(value):
         return value.strip().strip('"').strip("'") if value else None
@@ -1329,7 +1340,7 @@ def _render_cron(values, original, validate_cron):
         if (
             not line.lstrip().startswith("#")
             and len(parts) >= 7
-            and parts[6] == "/usr/local/bin/lldpq"
+            and _cron_command(parts) == "/usr/local/bin/lldpq"
             and lldpq_cron
         ):
             output.append(lldpq_cron + " " + " ".join(parts[5:]) + "\n")
@@ -1337,7 +1348,7 @@ def _render_cron(values, original, validate_cron):
         elif (
             not line.lstrip().startswith("#")
             and len(parts) >= 7
-            and parts[6] == "/usr/local/bin/get-conf"
+            and _cron_command(parts) == "/usr/local/bin/get-conf"
             and getconf_cron
         ):
             output.append(getconf_cron + " " + " ".join(parts[5:]) + "\n")

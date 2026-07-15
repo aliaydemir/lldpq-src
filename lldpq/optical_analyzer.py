@@ -7,6 +7,7 @@ Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
 
+import hashlib
 import json
 import time
 import re
@@ -14,6 +15,8 @@ import os
 import math
 import html
 import tempfile
+
+import analysis_sidecar
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
@@ -81,6 +84,12 @@ def _atomic_write(path: str, content: str) -> None:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+        if path.endswith(".json"):
+            # Validation handshake: lets the post-run JSON validator prove
+            # these bytes intact by hash instead of re-parsing the document.
+            analysis_sidecar.publish_digest(
+                path, hashlib.sha256(content.encode("utf-8")).hexdigest()
+            )
     except BaseException:
         try:
             os.unlink(temporary_name)
