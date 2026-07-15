@@ -27,7 +27,8 @@ def main():
     print("  MAC DAD findings       : %d" % summary["mac_dad_total"])
     print("  Active MAC mobility    : %d" % summary["mac_mobility_active"])
     print("  MAC mobility signals   : %d" % summary["mac_mobility_total"])
-    print("  APIPA addresses      : %d" % summary["apipa_total"])
+    print("  APIPA endpoints      : %d (%d sightings)" % (
+        summary["apipa_total"], summary["apipa_sightings"]))
     print("  VLANs with findings  : %d" % summary["vlans"])
     print("  Coverage              : %d/%d devices%s" % (
         summary["coverage_current"], summary["coverage_expected"],
