@@ -332,6 +332,13 @@ if [[ -z "${WEB_ROOT:-}" ]]; then
 fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
+# The tuning defaults near the top of this script were computed before the
+# runtime configuration was loaded, so LLDP_MAX_PARALLEL from /etc/lldpq.conf
+# never took effect. Re-derive the dispatch width now that it is available.
+MAX_PARALLEL="${LLDP_MAX_PARALLEL:-$MAX_PARALLEL}"
+case "$MAX_PARALLEL" in
+    ''|*[!0-9]*|0) MAX_PARALLEL=100 ;;
+esac
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
 
 unreachable_hosts_file=$(mktemp)
