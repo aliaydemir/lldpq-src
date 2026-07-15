@@ -1039,7 +1039,12 @@
             if (state.marker && state.marker.status === 'collecting') {
                 formattedDate += ' — collection in progress; showing previous report';
             } else if (state.marker && state.marker.status === 'stale') {
-                formattedDate += ' — latest collection failed; showing previous report';
+                if (String(state.marker.reason || '').startsWith('disk_full')) {
+                    formattedDate += ' — publish blocked: server disk full ('
+                        + state.marker.reason + '); showing previous report';
+                } else {
+                    formattedDate += ' — latest collection failed; showing previous report';
+                }
             }
             document.getElementById('last-updated-time').textContent = formattedDate;
         }

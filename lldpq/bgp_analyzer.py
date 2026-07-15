@@ -239,7 +239,16 @@ class BGPAnalyzer:
                 saved_coverage = data.get("collection_coverage")
                 if isinstance(saved_coverage, dict):
                     self.collection_coverage.update(saved_coverage)
-                
+
+                # One-time trim of the legacy schema, which embedded the full
+                # neighbor list in every history snapshot: drop it so the next
+                # save rewrites the file at counter scale.
+                for entries in self.bgp_history.values():
+                    if isinstance(entries, list):
+                        for entry in entries:
+                            if isinstance(entry, dict):
+                                entry.pop("neighbors", None)
+
                 # Clean old data (older than retention period)
                 self.cleanup_old_history()
         except (FileNotFoundError, json.JSONDecodeError):
@@ -648,6 +657,10 @@ class BGPAnalyzer:
         if hostname not in self.bgp_history:
             self.bgp_history[hostname] = []
         
+        # Counters only: full neighbor dicts live solely in current_bgp_stats.
+        # Embedding them per snapshot grew the fabric-wide history file to GB
+        # scale (devices x 50 entries x full neighbor lists) and OOM-killed
+        # the analyzer; every trend consumer only reads these counters.
         history_entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "total_neighbors": len(neighbors),
@@ -655,7 +668,6 @@ class BGPAnalyzer:
             "down_count": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
             "warning_neighbors": warning_neighbors,
             "critical_neighbors": critical_neighbors,
-            "neighbors": neighbor_dicts  # Use the same serialized data
         }
         
         self.bgp_history[hostname].append(history_entry)

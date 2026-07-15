@@ -828,6 +828,39 @@ mark_reports_in_progress() {
     publish_web_report_marker "$stale_marker"
 }
 
+estimate_publish_requirement_kb() {
+    # A full publish stages a complete sibling copy of monitor-results inside
+    # WEB_ROOT before the atomic swap, so the filesystem transiently needs the
+    # whole tree again. 10% headroom covers growth during this run.
+    local tree_kb
+    tree_kb=$(du -sk "$SCRIPT_DIR/monitor-results" 2>/dev/null | awk '{print $1}')
+    [[ "$tree_kb" =~ ^[0-9]+$ ]] || return 1
+    echo $(( tree_kb + tree_kb / 10 ))
+}
+
+available_kb_for_path() {
+    local avail
+    avail=$(df -Pk -- "$1" 2>/dev/null | awk 'NR==2 {print $4}')
+    [[ "$avail" =~ ^[0-9]+$ ]] || return 1
+    echo "$avail"
+}
+
+preflight_publish_disk_space() {
+    # An undersized filesystem otherwise wastes the entire collection: the run
+    # would only fail minutes later, at the publish staging copy. Refuse up
+    # front with an explicit machine-readable reason for the dashboard. A
+    # failed estimate never blocks monitoring (fail-open): the publish path
+    # still fails closed on real ENOSPC.
+    local required_kb available_kb
+    required_kb=$(estimate_publish_requirement_kb) || return 0
+    available_kb=$(available_kb_for_path "$WEB_ROOT") || return 0
+    if (( available_kb < required_kb )); then
+        mark_reports_stale "disk_full: publish staging needs ~$(( required_kb / 1024 ))MB on $WEB_ROOT, $(( available_kb / 1024 ))MB available"
+        return 1
+    fi
+    return 0
+}
+
 complete_report_state() {
     local completed_at
     if [[ "$scoped_run" == "true" ]]; then
@@ -1199,9 +1232,12 @@ select_scope_web_overlays() {
             )
             ;;
         pfc-ecn)
+            # History lives in per-device shards; the legacy monolith is
+            # deleted by the one-time migration, and a missing artifact fails
+            # the scoped publish outright.
             SCOPE_WEB_OVERLAYS=(
                 pfc-ecn-analysis.html pfc_ecn_baseline.json
-                pfc_ecn_history.json pfc-ecn-data
+                pfc-ecn-history pfc-ecn-data
                 summary/pfc-ecn-summary.json
             )
             ;;
@@ -3931,6 +3967,11 @@ collection_status_manifest="$bundle_root/collection-status.json"
 chmod 600 "$collection_status_file" || exit 1
 
 monitor_run_started=true
+# Scoped runs publish only small overlays; the full-tree staging requirement
+# applies to complete pipeline runs alone.
+if [[ "$scoped_run" != "true" ]] && ! preflight_publish_disk_space; then
+    exit 1
+fi
 if ! mark_reports_in_progress; then
     echo "Could not mark monitoring reports as in-progress" >&2
     exit 1
