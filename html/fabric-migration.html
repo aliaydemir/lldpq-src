@@ -1198,7 +1198,7 @@
             if (ti.vlan == null) continue; // trunk or L2-only target: nothing to check here
             const cfg = (deviceData[r.device] || {}).config || {};
             const templates = cfg.vlan_templates || [];
-            const sviOk = ti.sviProfile && templates.includes(ti.sviProfile);
+            const sviOk = ti.sviProfile && (templates.includes(ti.sviProfile) || templates.includes(ti.sviProfile + '_L2'));
             let relayOk = false;
             for (const rel of (cfg.dhcp_relay || [])) {
                 if ((rel.interfaces || []).includes('vlan' + ti.vlan)) { relayOk = true; break; }
