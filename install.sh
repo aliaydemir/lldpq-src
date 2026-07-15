@@ -853,7 +853,7 @@ render_runtime_tuning_config() {
     local scan_interval="${11:-300}" getconfigs_ssh_timeout="${12:-60}"
     local pfc_parallel="${13:-4}" pfc_budget="${14:-60}"
     local pfc_port_timeout="${15:-5}" optical_budget="${16:-120}"
-    local optical_port_timeout="${17:-10}" monitor_timing="${18:-false}"
+    local optical_port_timeout="${17:-5}" monitor_timing="${18:-false}"
     local monitor_command_timeout="${19:-20}"
     case "$scan_interval" in
         ''|*[!0-9]*) scan_interval=300 ;;
@@ -5522,7 +5522,7 @@ render_runtime_tuning_config \
     "${PFC_ECN_COLLECTION_BUDGET_SECONDS:-60}" \
     "${PFC_ECN_PORT_TIMEOUT_SECONDS:-5}" \
     "${OPTICAL_COLLECTION_BUDGET_SECONDS:-120}" \
-    "${OPTICAL_PORT_TIMEOUT_SECONDS:-10}" \
+    "${OPTICAL_PORT_TIMEOUT_SECONDS:-5}" \
     "${MONITOR_TIMING:-false}" \
     "${MONITOR_COMMAND_TIMEOUT_SECONDS:-20}" | \
     sudo tee -a /etc/lldpq.conf > /dev/null

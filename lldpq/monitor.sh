@@ -220,7 +220,12 @@ apply_monitor_tuning() {
     PFC_ECN_PORT_TIMEOUT_SECONDS="${PFC_ECN_PORT_TIMEOUT_SECONDS:-5}"
     PFC_ECN_MAX_PARALLEL="${PFC_ECN_MAX_PARALLEL:-4}"
     OPTICAL_COLLECTION_BUDGET_SECONDS="${OPTICAL_COLLECTION_BUDGET_SECONDS:-120}"
-    OPTICAL_PORT_TIMEOUT_SECONDS="${OPTICAL_PORT_TIMEOUT_SECONDS:-10}"
+    # 5s is ~15-50x a healthy DOM read; reads that run longer are hung
+    # EEPROM/firmware states. A tighter ceiling stops one sick module from
+    # holding a port slot (and one sick device from setting the collection
+    # wall) while costing nothing on healthy optics. Matches the PFC/ECN
+    # per-port ceiling.
+    OPTICAL_PORT_TIMEOUT_SECONDS="${OPTICAL_PORT_TIMEOUT_SECONDS:-5}"
     MONITOR_COMMAND_TIMEOUT_SECONDS="${MONITOR_COMMAND_TIMEOUT_SECONDS:-20}"
     case "$PFC_ECN_COLLECTION_BUDGET_SECONDS" in
         ''|*[!0-9]*|0) PFC_ECN_COLLECTION_BUDGET_SECONDS=60 ;;
@@ -237,7 +242,7 @@ apply_monitor_tuning() {
         ''|*[!0-9]*|0) OPTICAL_COLLECTION_BUDGET_SECONDS=120 ;;
     esac
     case "$OPTICAL_PORT_TIMEOUT_SECONDS" in
-        ''|*[!0-9]*|0) OPTICAL_PORT_TIMEOUT_SECONDS=10 ;;
+        ''|*[!0-9]*|0) OPTICAL_PORT_TIMEOUT_SECONDS=5 ;;
     esac
     case "$MONITOR_COMMAND_TIMEOUT_SECONDS" in
         ''|*[!0-9]*|????*) MONITOR_COMMAND_TIMEOUT_SECONDS=20 ;;
