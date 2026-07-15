@@ -9691,6 +9691,9 @@ def lock_device_key(value):
     return f'{component[:48]}_{digest}'
 
 
+_using_secure_lock_dir = bool(os.environ.get('FABRIC_LOCK_DIR'))
+
+
 def open_owned_lock(path):
     if not hasattr(os, 'O_NOFOLLOW'):
         raise RuntimeError('Secure lock files are not supported on this host')
@@ -9699,7 +9702,10 @@ def open_owned_lock(path):
         flags |= os.O_CLOEXEC
     descriptor = os.open(path, flags, 0o600)
     metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+    # In the private secure lock dir (FABRIC_LOCK_DIR, chmod 700/770) directory
+    # permissions prevent squatting; O_NOFOLLOW blocks symlinks — uid check is
+    # redundant and breaks cross-user sharing (www-data CGI vs aaydemir CLI).
+    if not stat.S_ISREG(metadata.st_mode) or (not _using_secure_lock_dir and metadata.st_uid != os.geteuid()):
         os.close(descriptor)
         raise PermissionError('Unsafe command lock file')
     os.fchmod(descriptor, 0o600)
@@ -10457,6 +10463,9 @@ def lock_device_key(value):
     return f'{component[:48]}_{digest}'
 
 
+_using_secure_lock_dir = bool(os.environ.get('FABRIC_LOCK_DIR'))
+
+
 def open_owned_lock(path):
     if not hasattr(os, 'O_NOFOLLOW'):
         raise RuntimeError('Secure lock files are not supported on this host')
@@ -10465,7 +10474,7 @@ def open_owned_lock(path):
         flags |= os.O_CLOEXEC
     descriptor = os.open(path, flags, 0o600)
     metadata = os.fstat(descriptor)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+    if not stat.S_ISREG(metadata.st_mode) or (not _using_secure_lock_dir and metadata.st_uid != os.geteuid()):
         os.close(descriptor)
         raise PermissionError('Unsafe command lock file')
     os.fchmod(descriptor, 0o600)
