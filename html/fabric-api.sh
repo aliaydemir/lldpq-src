@@ -9700,7 +9700,10 @@ def open_owned_lock(path):
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, 'O_CLOEXEC'):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(path, flags, 0o600)
+    # Locks in the private secure dir must be group-shared (0660): the CGI
+    # (www-data) and CLI/admin users serialize on the same per-device file.
+    mode = 0o660 if _using_secure_lock_dir else 0o600
+    descriptor = os.open(path, flags, mode)
     metadata = os.fstat(descriptor)
     # In the private secure lock dir (FABRIC_LOCK_DIR, chmod 700/770) directory
     # permissions prevent squatting; O_NOFOLLOW blocks symlinks — uid check is
@@ -9708,7 +9711,9 @@ def open_owned_lock(path):
     if not stat.S_ISREG(metadata.st_mode) or (not _using_secure_lock_dir and metadata.st_uid != os.geteuid()):
         os.close(descriptor)
         raise PermissionError('Unsafe command lock file')
-    os.fchmod(descriptor, 0o600)
+    # Only the owner may fchmod; a non-owner sharing the lock must not fail.
+    if metadata.st_uid == os.geteuid():
+        os.fchmod(descriptor, mode)
     return os.fdopen(descriptor, 'w')
 
 
@@ -10472,12 +10477,14 @@ def open_owned_lock(path):
     flags = os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
     if hasattr(os, 'O_CLOEXEC'):
         flags |= os.O_CLOEXEC
-    descriptor = os.open(path, flags, 0o600)
+    mode = 0o660 if _using_secure_lock_dir else 0o600
+    descriptor = os.open(path, flags, mode)
     metadata = os.fstat(descriptor)
     if not stat.S_ISREG(metadata.st_mode) or (not _using_secure_lock_dir and metadata.st_uid != os.geteuid()):
         os.close(descriptor)
         raise PermissionError('Unsafe command lock file')
-    os.fchmod(descriptor, 0o600)
+    if metadata.st_uid == os.geteuid():
+        os.fchmod(descriptor, mode)
     return os.fdopen(descriptor, 'w')
 
 
