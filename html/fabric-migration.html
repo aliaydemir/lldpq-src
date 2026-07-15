@@ -1489,7 +1489,7 @@
     async function bouncePorts() {
         const devs = planDevices();
         if (!devs.length) return;
-        termAppend('deploy-term', '=== PORT BOUNCE: ifdown → 5s → ifup ===', 'hdr');
+        termAppend('deploy-term', '=== PORT BOUNCE: ifdown → 7s → ifup ===', 'hdr');
         await Promise.all(devs.map(async dev => {
             const ports = (appliedPlan.changes[dev].applied || []).map(e => e.name);
             if (!ports.length) return;

@@ -9544,6 +9544,9 @@ ALLOWED_PATTERNS = [
     r'^find /tmp -name "(?:capture_\*\.pcap|live_\*\.txt|tail_\*\.txt)"(?: -mmin \+[0-9]+ -delete)?$',
     # Packet capture
     r'^sudo timeout ([1-9]|[1-9][0-9]|[12][0-9]{2}|300) tcpdump -U -i [A-Za-z0-9_.:-]+ -nnnn -w /tmp/capture_[A-Za-z0-9_.:-]+\.pcap( -c [1-9][0-9]{0,5})?( [A-Za-z0-9_.:/ -]+)?$',
+    # Port bounce (Fabric Migration)
+    r'^sudo /usr/sbin/ifdown( [A-Za-z0-9_.:-]+)+$',
+    r'^sudo /usr/sbin/ifup( [A-Za-z0-9_.:-]+)+$',
     # Diagnostic bundle
     # Delete cl-support files only
     r'^sudo rm -f "/var/support/cl_support[A-Za-z0-9_.:-]+\.(?:txz|tar\.xz|tar\.gz)"$',
