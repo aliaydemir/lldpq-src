@@ -186,6 +186,142 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
                 destinations["BGP_DATA"].read_text(encoding="utf-8"),
             )
 
+    def test_stuck_dom_aborts_optical_section_early(self):
+        """A device whose every DOM read times out must not burn the budget.
+
+        With zero successful reads, the first port gets the transient-retry,
+        the next consecutive timeouts skip the retry, and after four
+        consecutive timeouts the whole section aborts: every remaining port
+        is published as the same explicit OPTICAL_BUDGET partial-coverage
+        marker a budget exhaustion would produce.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, timeout_stub, env = self._interpolate_remote(root, "optical")
+
+            net_root = root / "sys-class-net"
+            for index in range(1, 13):
+                port_root = net_root / f"swp{index}"
+                port_root.mkdir(parents=True)
+                (port_root / "operstate").write_text("up\n", encoding="utf-8")
+            remote = remote.replace(
+                "_lldpq_net_class_root=/sys/class/net",
+                f'_lldpq_net_class_root="{net_root}"',
+            )
+
+            # Selective stub: DOM reads hang (timeout kills them, status 124);
+            # every other bounded command runs unbounded. `ip` is absent from
+            # the restricted PATH, so the sysfs interface fallback is used.
+            timeout_stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in *ethtool*) exit 124 ;; esac\n"
+                "while [ $# -gt 0 ]; do\n"
+                "    case \"$1\" in\n"
+                "        -k) shift 2 ;;\n"
+                "        [0-9]*s) shift ;;\n"
+                "        *) break ;;\n"
+                "    esac\n"
+                "done\n"
+                "exec \"$@\"\n",
+                encoding="utf-8",
+            )
+            timeout_stub.chmod(0o755)
+            sort_stub = root / "sort"
+            sort_stub.write_text(
+                "#!/bin/sh\n[ \"$1\" = -V ] && shift\nexec /usr/bin/sort \"$@\"\n",
+                encoding="utf-8",
+            )
+            sort_stub.chmod(0o755)
+            env["PATH"] = str(root) + os.pathsep + "/usr/bin:/bin"
+
+            collected = subprocess.run(
+                ["/bin/sh"],
+                input=remote,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(collected.returncode, 0, collected.stderr)
+            self.assertEqual(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:"),
+                4,
+                collected.stdout,
+            )
+            self.assertEqual(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:"),
+                8,
+                collected.stdout,
+            )
+            self.assertIn("===OPTICAL_DATA_END===", collected.stdout)
+
+    def test_recovering_dom_resets_the_abort_counter(self):
+        """One successful read must veto the device-wide abort heuristic."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, timeout_stub, env = self._interpolate_remote(root, "optical")
+
+            net_root = root / "sys-class-net"
+            for index in range(1, 9):
+                port_root = net_root / f"swp{index}"
+                port_root.mkdir(parents=True)
+                (port_root / "operstate").write_text("up\n", encoding="utf-8")
+            remote = remote.replace(
+                "_lldpq_net_class_root=/sys/class/net",
+                f'_lldpq_net_class_root="{net_root}"',
+            )
+
+            # Third visited port answers; every other DOM read times out.
+            # The success resets the consecutive counter, so all remaining
+            # ports must still be visited (no OPTICAL_BUDGET abort markers).
+            timeout_stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "    *'ethtool -m swp2'*) echo 'Identifier: 0x18 (QSFP-DD)'; exit 0 ;;\n"
+                "    *ethtool*) exit 124 ;;\n"
+                "esac\n"
+                "while [ $# -gt 0 ]; do\n"
+                "    case \"$1\" in\n"
+                "        -k) shift 2 ;;\n"
+                "        [0-9]*s) shift ;;\n"
+                "        *) break ;;\n"
+                "    esac\n"
+                "done\n"
+                "exec \"$@\"\n",
+                encoding="utf-8",
+            )
+            timeout_stub.chmod(0o755)
+            sort_stub = root / "sort"
+            sort_stub.write_text(
+                "#!/bin/sh\n[ \"$1\" = -V ] && shift\nexec /usr/bin/sort \"$@\"\n",
+                encoding="utf-8",
+            )
+            sort_stub.chmod(0o755)
+            env["PATH"] = str(root) + os.pathsep + "/usr/bin:/bin"
+
+            collected = subprocess.run(
+                ["/bin/sh"],
+                input=remote,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(collected.returncode, 0, collected.stderr)
+            self.assertIn("Identifier: 0x18 (QSFP-DD)", collected.stdout)
+            self.assertEqual(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:"),
+                0,
+                collected.stdout,
+            )
+            self.assertEqual(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:"),
+                7,
+                collected.stdout,
+            )
+
     def test_timeoutless_remote_never_runs_ethtool_and_publishes_partial_optical(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -3148,6 +3148,16 @@ EOF
                 _optical_deadline=$(($(date +%s) + OPTICAL_COLLECTION_BUDGET_SECONDS))
                 _optical_has_timeout=true
                 command -v timeout >/dev/null 2>&1 || _optical_has_timeout=false
+                # Device-level DOM hang detection: when every read so far has
+                # timed out and none succeeded, the EEPROM/DOM subsystem is
+                # stuck device-wide (observed in production: one sick switch
+                # burned the whole optical budget and set the fabric-wide
+                # collection wall). Abort the section early instead of
+                # spending the full budget; unvisited ports keep the same
+                # explicit partial-coverage marker as a budget exhaustion.
+                _optical_success_count=0
+                _optical_consecutive_timeouts=0
+                _optical_abort=false
                 while IFS= read -r interface; do
                     [ -n "$interface" ] || continue
                     echo "--- Interface: $interface"
@@ -3161,10 +3171,12 @@ EOF
                     if [ "$state" = "up" ]; then
                         if [ "$_optical_has_timeout" = "true" ]; then
                             _optical_remaining=$((_optical_deadline - $(date +%s)))
-                            if [ "$_optical_remaining" -le 0 ]; then
+                            if [ "$_optical_abort" = "true" ] || [ "$_optical_remaining" -le 0 ]; then
                                 # A current report must never silently omit
                                 # the unvisited tail.  Keep every unvisited
-                                # port as explicit partial optical coverage.
+                                # port as explicit partial optical coverage,
+                                # whether the budget ran out or the section
+                                # was abandoned as device-wide DOM hang.
                                 echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:${interface}"
                                 ethtool_output=""
                             else
@@ -3180,9 +3192,16 @@ EOF
                                     # CMIS/EEPROM access can transiently collide
                                     # even while the link stays up. Retry once,
                                     # but never exceed the per-switch budget.
+                                    # While no read has succeeded yet and the
+                                    # previous read also timed out, skip the
+                                    # retry: repeating it against a stuck DOM
+                                    # bus only burns budget.
                                     ethtool_output=""
                                     _optical_remaining=$((_optical_deadline - $(date +%s)))
-                                    if [ "$_optical_remaining" -gt 1 ]; then
+                                    if [ "$_optical_remaining" -gt 1 ] && {
+                                        [ "$_optical_success_count" -gt 0 ] ||
+                                        [ "$_optical_consecutive_timeouts" -eq 0 ]
+                                    }; then
                                         sleep 1
                                         _optical_remaining=$((_optical_deadline - $(date +%s)))
                                         _optical_retry_limit=$OPTICAL_PORT_TIMEOUT_SECONDS
@@ -3199,6 +3218,17 @@ EOF
                                     if [ "$_optical_status" -ne 0 ]; then
                                         echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
                                     fi
+                                fi
+                                if [ "$_optical_status" -eq 124 ] || \
+                                   [ "$_optical_status" -eq 137 ]; then
+                                    _optical_consecutive_timeouts=$((_optical_consecutive_timeouts + 1))
+                                    if [ "$_optical_success_count" -eq 0 ] && \
+                                       [ "$_optical_consecutive_timeouts" -ge 4 ]; then
+                                        _optical_abort=true
+                                    fi
+                                elif [ "$_optical_status" -eq 0 ] && [ -n "$ethtool_output" ]; then
+                                    _optical_success_count=$((_optical_success_count + 1))
+                                    _optical_consecutive_timeouts=0
                                 fi
                             fi
                         else
