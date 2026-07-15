@@ -139,9 +139,10 @@ class DuplicateAnalyzer:
         self.authoritative_ip_pairs = {}  # (vni, ip) -> hosts reporting current FRR duplicate
         self.mac_dups = {}             # (vni, mac) -> record
         self.apipa = {}                # host -> {'total': int, 'per_vlan': {vlan: count}}  (per-observer sightings)
-        self.apipa_ips = set()         # (vlan-or-dev, ip): unique DHCP-failed endpoints fabric-wide
-                                       # (EVPN syncs each neighbour to ~every VTEP, so raw sightings
-                                       #  overcount devices by the observer count)
+        self.apipa_ips = set()         # unique DHCP-failed endpoint IPs fabric-wide.  Keyed by IP
+                                       # only: the same endpoint surfaces under many devs (vlan SVI,
+                                       # VRR sub-if, physical/breakout ports) and EVPN syncs it to
+                                       # ~every VTEP, so any dev-qualified key overcounts devices.
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}   (kernel view: VLAN only)
         self.if_desc = {}              # (host, port) -> interface description (ifalias)
         self.arp_pairs = {}            # (vlan, ip) -> {mac -> set(hosts)}   (kernel view: VLAN only)
@@ -738,7 +739,7 @@ class DuplicateAnalyzer:
             vlan = vm.group(1) if vm else None
             if ip.startswith("169.254."):
                 ap["total"] += 1
-                self.apipa_ips.add((vlan or dev, ip))
+                self.apipa_ips.add(ip)
                 if vlan:
                     ap["per_vlan"][vlan] = ap["per_vlan"].get(vlan, 0) + 1
                 continue

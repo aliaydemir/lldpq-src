@@ -762,6 +762,18 @@ class ApipaCountTests(unittest.TestCase):
         report = output.read_text(encoding="utf-8")
         self.assertIn("2 unique endpoint(s), 6 sighting(s)", report)
 
+    def test_same_endpoint_on_many_devs_counts_once(self):
+        # The same 169.254 endpoint surfaces on the vlan SVI, the VRR sub-if
+        # and physical/breakout ports across switches: still ONE endpoint.
+        for host, dev in (("tor-a", "vlan8"), ("tor-a", "vlan8-v0"),
+                          ("tor-b", "swp51"), ("tor-c", "swp43s1")):
+            self.analyzer._parse_neigh(host,
+                "169.254.10.1 dev %s lladdr aa:bb:cc:dd:ee:01 REACHABLE" % dev)
+
+        summary = self.analyzer.summary()
+        self.assertEqual(1, summary["apipa_total"])
+        self.assertEqual(4, summary["apipa_sightings"])
+
 
 if __name__ == "__main__":
     unittest.main()
