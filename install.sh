@@ -4967,12 +4967,15 @@ sudo find "$WEB_ROOT" -type d -exec chmod 775 {} \;
 sudo find "$WEB_ROOT" -type f -exec chmod 664 {} \;
 sudo find "$WEB_ROOT" -name '*.sh' -exec chmod 775 {} \;
 sudo mkdir -p "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
-    "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
+    "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" \
+    "$WEB_ROOT/.locks"
 sudo chown -R "$LLDPQ_USER:www-data" "$WEB_ROOT/hstr" "$WEB_ROOT/configs" \
     "$WEB_ROOT/monitor-results" "$WEB_ROOT/topology" \
-    "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
+    "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" \
+    "$WEB_ROOT/.locks"
 sudo chmod 775 "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
     "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
+sudo chmod 770 "$WEB_ROOT/.locks"
 
 # Keep native installs at parity with Docker: display aliases are persistent
 # operator configuration and must exist before either Setup or LLDP first uses it.
