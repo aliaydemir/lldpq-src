@@ -449,11 +449,17 @@
     </div>
     <div class="step-foot">
         <button class="btn btn-secondary" onclick="goStep(3)">&larr; Back</button>
-        <div style="display:flex; gap:10px;">
-            <button class="btn btn-secondary" onclick="runGenerate()">Generate</button>
-            <button class="btn btn-secondary" onclick="runDiff()">Diff</button>
-            <button class="btn btn-warning" onclick="runDeploy()">Deploy</button>
-            <button class="btn btn-primary" onclick="goStep(5)">Next: Verify &rarr;</button>
+        <div style="display:flex; align-items:center; gap:16px;">
+            <label style="display:flex; align-items:center; gap:6px; font-size:13px; cursor:pointer; user-select:none;">
+                <input type="checkbox" id="bounce-ports-cb">
+                Bounce migrated ports after deploy (ifdown → 7s → ifup)
+            </label>
+            <div style="display:flex; gap:10px;">
+                <button class="btn btn-secondary" onclick="runGenerate()">Generate</button>
+                <button class="btn btn-secondary" onclick="runDiff()">Diff</button>
+                <button class="btn btn-warning" onclick="runDeploy()">Deploy</button>
+                <button class="btn btn-primary" onclick="goStep(5)">Next: Verify &rarr;</button>
+            </div>
         </div>
     </div>
 </div>
@@ -1425,7 +1431,7 @@
         } finally { showLoading(false); }
     }
 
-    async function pollDeployStatus(jobId) {
+    async function pollDeployStatus(jobId, onSuccess) {
         let lastLen = 0, pollErrors = 0;
         while (true) {
             let resp, data;
@@ -1462,6 +1468,7 @@
                 localStorage.removeItem(DEPLOY_JOB_KEY);
                 showLoading(false);
                 termAppend('deploy-term', `Deploy finished (exit code ${data.exit_code}).`, data.success ? 'ok' : 'err');
+                if (data.success && onSuccess) await onSuccess();
                 return;
             }
             await sleep(DEPLOY_POLL_INTERVAL);
@@ -1477,6 +1484,50 @@
         goStep(4);
         termAppend('deploy-term', `=== DEPLOY (resumed): job ${saved.job_id} ===`, 'hdr');
         pollDeployStatus(saved.job_id);
+    }
+
+    async function bouncePorts() {
+        const devs = planDevices();
+        if (!devs.length) return;
+        termAppend('deploy-term', '=== PORT BOUNCE: ifdown → 5s → ifup ===', 'hdr');
+        await Promise.all(devs.map(async dev => {
+            const ports = (appliedPlan.changes[dev].applied || []).map(e => e.name);
+            if (!ports.length) return;
+            termAppend('deploy-term', `[${dev}] ifdown ${ports.join(' ')}`, 'ok');
+            try {
+                const r = await fetch('/fabric-api.sh?action=run-device-command', {
+                    method: 'POST',
+                    body: JSON.stringify({ device: dev, command: `sudo /usr/sbin/ifdown ${ports.join(' ')}` })
+                });
+                const d = await r.json();
+                if (!d.success) termAppend('deploy-term', `[${dev}] ifdown error: ${d.error || ''}`, 'err');
+            } catch (e) {
+                termAppend('deploy-term', `[${dev}] ifdown error: ${e.message}`, 'err');
+            }
+        }));
+        termAppend('deploy-term', 'Waiting 7 seconds...', 'hdr');
+        await sleep(7000);
+        await Promise.all(devs.map(async dev => {
+            const ports = (appliedPlan.changes[dev].applied || []).map(e => e.name);
+            if (!ports.length) return;
+            termAppend('deploy-term', `[${dev}] ifup ${ports.join(' ')}`, 'ok');
+            try {
+                const r = await fetch('/fabric-api.sh?action=run-device-command', {
+                    method: 'POST',
+                    body: JSON.stringify({ device: dev, command: `sudo /usr/sbin/ifup ${ports.join(' ')}` })
+                });
+                const d = await r.json();
+                if (!d.success) termAppend('deploy-term', `[${dev}] ifup error: ${d.error || ''}`, 'err');
+            } catch (e) {
+                termAppend('deploy-term', `[${dev}] ifup error: ${e.message}`, 'err');
+            }
+        }));
+        termAppend('deploy-term', 'Port bounce complete.', 'ok');
+    }
+
+    async function bounceIfChecked() {
+        const cb = $('bounce-ports-cb');
+        if (cb && cb.checked) await bouncePorts();
     }
 
     async function runDeploy() {
@@ -1502,13 +1553,14 @@
                 // user can read the streamed log while it polls.
                 showLoading(false);
                 termAppend('deploy-term', `Deploy started (job ${result.job_id}). Streaming log...`, 'hdr');
-                await pollDeployStatus(result.job_id);
+                await pollDeployStatus(result.job_id, bounceIfChecked);
                 return;
             }
             // synchronous fallback
             showLoading(false);
             termAppendAnsible('deploy-term', result.output || result.error || '');
             termAppend('deploy-term', result.success ? 'Deployment completed.' : 'Deployment failed.', result.success ? 'ok' : 'err');
+            if (result.success) await bounceIfChecked();
         } catch (e) {
             termAppend('deploy-term', 'Error: ' + e.message, 'err');
             showLoading(false);
