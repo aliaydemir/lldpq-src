@@ -1153,7 +1153,7 @@
             const tgt = mappings[src];
             html += `<div class="map-row">
                 <span class="pbadge ${src ? 'p-old' : 'p-cur'}">${src ? escapeHtml(src) : '(no profile)'}</span>
-                <span class="muted" style="font-size:11px;">${src ? (si.vlan != null ? 'vlan ' + si.vlan + ' &middot; ' + escapeHtml(si.vrf || '') : escapeHtml(si.mode)) : 'first-time assignment'}</span>
+                <span class="muted" style="font-size:11px;">${src ? (si.vlan != null ? 'vlan ' + si.vlan + ' &middot; ' + escapeHtml(si.vrf || '') + (si.gw ? ' &middot; gw ' + escapeHtml(si.gw) : '') + (si.desc ? ' &middot; ' + escapeHtml(si.desc) : '') : escapeHtml(si.mode)) : 'first-time assignment'}</span>
                 <span class="arrow">&rarr;</span>
                 <select data-src="${escapeHtml(src)}">${opts}</select>
                 <span class="map-info" id="mapinfo-${escapeHtml(src)}">${tgt ? targetInfoHtml(tgt) : ''}</span>
