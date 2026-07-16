@@ -619,6 +619,16 @@ for dir in "$MONITOR_SOURCE_DIR" \
     chmod 775 "$dir"
 done
 
+# Device-command and Fabric API locks are shared by the lldpq CLI/AI process
+# and the www-data CGI worker. setgid preserves www-data on newly created lock
+# inodes; normalize legacy 0600/0640 files on every container start.
+FABRIC_LOCK_DIR=/var/www/html/.locks
+install -d -o lldpq -g www-data -m 2770 "$FABRIC_LOCK_DIR"
+find "$FABRIC_LOCK_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.lock' \
+    -exec chown lldpq:www-data {} +
+find "$FABRIC_LOCK_DIR" -mindepth 1 -maxdepth 1 -type f -name '*.lock' \
+    -exec chmod 660 {} +
+
 # ─── Persistent provisioning artifacts ───
 GENERATED_CONFIGS_DIR=/var/www/html/generated_config_folder
 PROVISION_UPLOAD_DIR=/var/www/html/provision-uploads

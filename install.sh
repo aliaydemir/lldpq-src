@@ -4967,15 +4967,19 @@ sudo find "$WEB_ROOT" -type d -exec chmod 775 {} \;
 sudo find "$WEB_ROOT" -type f -exec chmod 664 {} \;
 sudo find "$WEB_ROOT" -name '*.sh' -exec chmod 775 {} \;
 sudo mkdir -p "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
-    "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" \
-    "$WEB_ROOT/.locks"
+    "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 "$WEB_ROOT/.locks"
 sudo chown -R "$LLDPQ_USER:www-data" "$WEB_ROOT/hstr" "$WEB_ROOT/configs" \
     "$WEB_ROOT/monitor-results" "$WEB_ROOT/topology" \
-    "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" \
-    "$WEB_ROOT/.locks"
+    "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
 sudo chmod 775 "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
     "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
-sudo chmod 770 "$WEB_ROOT/.locks"
+# Migrate locks created by older releases as 0600/0640. The setgid directory
+# keeps future CLI/AI and www-data lock inodes in the same shared group.
+sudo find "$WEB_ROOT/.locks" -mindepth 1 -maxdepth 1 -type f -name '*.lock' \
+    -exec chown "$LLDPQ_USER:www-data" {} +
+sudo find "$WEB_ROOT/.locks" -mindepth 1 -maxdepth 1 -type f -name '*.lock' \
+    -exec chmod 660 {} +
 
 # Keep native installs at parity with Docker: display aliases are persistent
 # operator configuration and must exist before either Setup or LLDP first uses it.

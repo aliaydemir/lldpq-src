@@ -1147,6 +1147,16 @@
         for (const k of Object.keys(mappings)) if (!counts.has(k)) delete mappings[k];
 
         const allProfiles = Object.keys(portProfiles).sort();
+        // Cache profileInfo per profile so option labels are cheap across all rows.
+        const infoCache = {};
+        const optionLabel = (name) => {
+            if (infoCache[name] === undefined) infoCache[name] = profileInfo(name);
+            const pi = infoCache[name];
+            let extra = '';
+            if (pi.vlan != null) extra = ' — vlan ' + pi.vlan + (pi.desc ? ' · ' + pi.desc : '');
+            else if (pi.mode && pi.mode !== '?') extra = ' — ' + pi.mode;
+            return name + extra;   // name stays first so keyboard typeahead still matches
+        };
         let html = '';
         for (const [src, n] of [...counts.entries()].sort()) {
             const si = profileInfo(src);
@@ -1154,7 +1164,7 @@
             let opts = `<option value="">${src ? '(keep unchanged)' : '(no profile)'}</option>`;
             for (const p of allProfiles) {
                 if (p === src) continue;
-                opts += `<option value="${escapeHtml(p)}" ${mappings[src] === p ? 'selected' : ''}>${escapeHtml(p)}</option>`;
+                opts += `<option value="${escapeHtml(p)}" ${mappings[src] === p ? 'selected' : ''}>${escapeHtml(optionLabel(p))}</option>`;
             }
             const tgt = mappings[src];
             html += `<div class="map-row">

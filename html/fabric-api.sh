@@ -271,15 +271,26 @@ export ANSIBLE_DIR
 # A single process-wide advisory lock (held on fd 9 until this CGI process
 # exits) protects bgp_profiles.yaml / vlan_profiles.yaml / sw_port_profiles.yaml
 # and host_vars/*.yaml from lost-update races between concurrent admins.
-# Lock files live in a private service-owned dir instead of world-writable
-# /tmp (same idea as $WEB_ROOT/.inventory.lock), so other local users cannot
-# pre-create/squat the paths. Acquisition fails CLOSED: proceeding without
-# the lock would silently re-enable the races it exists to prevent.
+# Lock files live in a private setgid directory instead of world-writable /tmp
+# (same idea as $WEB_ROOT/.inventory.lock). Both the LLDPq CLI/AI user and the
+# www-data CGI worker execute this API, so the directory must retain group
+# traversal/write access and every lock must inherit the shared web group.
+# Acquisition fails CLOSED: proceeding without the lock would silently
+# re-enable the races it exists to prevent.
 FABRIC_LOCK_DIR="${FABRIC_LOCK_DIR:-$(dirname "$0")/.locks}"
-mkdir -p "$FABRIC_LOCK_DIR" 2>/dev/null
-chmod 700 "$FABRIC_LOCK_DIR" 2>/dev/null
+FABRIC_LOCK_GROUP="${FABRIC_LOCK_GROUP:-www-data}"
+if mkdir -p "$FABRIC_LOCK_DIR" 2>/dev/null; then
+    chgrp "$FABRIC_LOCK_GROUP" "$FABRIC_LOCK_DIR" 2>/dev/null || true
+    chmod 2770 "$FABRIC_LOCK_DIR" 2>/dev/null || true
+fi
 export FABRIC_LOCK_DIR
 FABRIC_LOCK_FILE="${FABRIC_LOCK_FILE:-$FABRIC_LOCK_DIR/fabric-api.lock}"
+# The shell redirection in acquire_lock otherwise applies the caller's umask
+# and can create a 0640/0644 inode that the other runtime identity cannot open.
+# Pre-create/fix it while its creator owns it; setgid supplies the shared group.
+if (umask 0007; : >>"$FABRIC_LOCK_FILE") 2>/dev/null; then
+    chmod 660 "$FABRIC_LOCK_FILE" 2>/dev/null || true
+fi
 acquire_lock() {
     if ! exec 9>>"$FABRIC_LOCK_FILE" 2>/dev/null; then
         echo '{"success": false, "error": "Could not open config lock file"}'
