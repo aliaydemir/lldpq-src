@@ -19,6 +19,7 @@ import statistics
 import tempfile
 import time
 from datetime import datetime, timezone
+import export_artifacts
 from collection_freshness import (
     is_current_collection,
     read_asset_snapshot,
@@ -1076,6 +1077,7 @@ def generate_hardware_html():
     <title>Hardware Health Analysis</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #d4d4d4; padding: 20px; min-height: 100vh; }}
@@ -2152,6 +2154,7 @@ def generate_hardware_html():
         })();
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
     <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""
@@ -2162,22 +2165,60 @@ def generate_hardware_html():
 
     # Machine-readable dashboard summary. Additive to the HTML report and
     # carrying the same headline numbers/collection status the report embeds.
+    generated_at = int(time.time())
+    summary_counts = {
+        "coverage_expected": expected_devices,
+        "coverage_current": current_device_count,
+        "coverage_partial": coverage_partial,
+        "total_devices": total_devices,
+        "excellent": len(summary['excellent_devices']),
+        "good": len(summary['good_devices']),
+        "warning": len(summary['warning_devices']),
+        "critical": len(summary['critical_devices']),
+        "unknown": unknown_device_count,
+    }
     _atomic_write(
         "monitor-results/summary/hardware-summary.json",
         json.dumps({
             "domain": "hardware",
-            "generated_at": int(time.time()),
+            "generated_at": generated_at,
             "collection_status": coverage_status,
-            "coverage_expected": expected_devices,
-            "coverage_current": current_device_count,
-            "coverage_partial": coverage_partial,
-            "total_devices": total_devices,
-            "excellent": len(summary['excellent_devices']),
-            "good": len(summary['good_devices']),
-            "warning": len(summary['warning_devices']),
-            "critical": len(summary['critical_devices']),
-            "unknown": unknown_device_count,
+            **summary_counts,
         }) + "\n",
+    )
+
+    # Public machine-readable export: the same per-device rows the HTML table
+    # and detail embed render (problems-first ordering preserved), plus the
+    # model column the table shows, with the summary's headline counts and
+    # collection status. I/O errors must propagate so the analyzer run fails
+    # and the monitor transaction rolls back.
+    export_artifacts.write_export(
+        "monitor-results",
+        "hardware",
+        [
+            {
+                "device": details["device"],
+                "model": str(assets_data.get(name, {}).get("model", "N/A")),
+                "health": details["health"],
+                "cpu_temp_c": details["cpu_temp"],
+                "asic_temp_c": details["asic_temp"],
+                "memory_pct": details["memory"],
+                "load_raw": details["load_raw"],
+                "load_per_core": details["load_per_core"],
+                "cores": details["cores"],
+                "psu_efficiency": details["psu_efficiency"],
+                "psu_in_w": details["psu_in"],
+                "psu_out_w": details["psu_out"],
+                "fans": " ".join(
+                    f"{fan['name']}={fan['grade'] or 'N/A'}"
+                    for fan in details["fans"]
+                ) or None,
+            }
+            for name, details in device_details.items()
+        ],
+        summary_counts,
+        coverage_status,
+        generated_at=generated_at,
     )
 
     print(f"Hardware analysis HTML generated with {total_devices} devices!")

@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
+import export_artifacts
 from optical_analyzer import OpticalAnalyzer, _atomic_write
 from collection_freshness import (
     asset_snapshot_is_valid,
@@ -478,28 +479,40 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
         )
     else:
         collection_status = None
+    generated_at = int(time.time())
+    summary_counts = {
+        "coverage_expected": coverage_expected,
+        "coverage_current": coverage_current,
+        "coverage_collected": coverage_collected,
+        "total_devices": len({
+            port.split(':', 1)[0]
+            for port in optical_analyzer.current_optical_stats
+        }),
+        "total_ports": summary["total_ports"],
+        "excellent": len(summary["excellent_ports"]),
+        "good": len(summary["good_ports"]),
+        "warning": len(summary["warning_ports"]),
+        "critical": len(summary["critical_ports"]),
+        "down": len(summary["down_ports"]),
+        "unplugged": len(summary["unplugged_ports"]),
+        "unknown": len(summary["unknown_ports"]),
+    }
     _atomic_write(
         os.path.join(result_dir, "summary", "optical-summary.json"),
         json.dumps({
             "domain": "optical",
-            "generated_at": int(time.time()),
+            "generated_at": generated_at,
             "collection_status": collection_status,
-            "coverage_expected": coverage_expected,
-            "coverage_current": coverage_current,
-            "coverage_collected": coverage_collected,
-            "total_devices": len({
-                port.split(':', 1)[0]
-                for port in optical_analyzer.current_optical_stats
-            }),
-            "total_ports": summary["total_ports"],
-            "excellent": len(summary["excellent_ports"]),
-            "good": len(summary["good_ports"]),
-            "warning": len(summary["warning_ports"]),
-            "critical": len(summary["critical_ports"]),
-            "down": len(summary["down_ports"]),
-            "unplugged": len(summary["unplugged_ports"]),
-            "unknown": len(summary["unknown_ports"]),
+            **summary_counts,
         }) + "\n",
+    )
+    export_artifacts.write_export(
+        result_dir,
+        "optical",
+        optical_analyzer.build_export_rows(summary, anomalies),
+        summary_counts,
+        collection_status,
+        generated_at=generated_at,
     )
     finish_phase("write_summary")
     print(f"Summary stats: {len(optical_analyzer.current_optical_stats)} total ports analyzed")

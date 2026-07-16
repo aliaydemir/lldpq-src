@@ -5,6 +5,20 @@ streaming telemetry, updates, rollback boundaries, and removal with Docker.
 For native Linux installation and application features, see the
 [main README](README.md).
 
+## Contents
+
+- [Quick start](#quick-start)
+- [Host-network monitoring with host-managed config](#host-network-monitoring-with-host-managed-config-advanced)
+- [Persistent deployment](#persistent-deployment)
+- [First-time setup](#first-time-setup)
+- [DHCP/ONIE provisioning](#dhcponie-provisioning)
+- [Ansible integration](#ansible-integration)
+- [Updating](#updating)
+- [Streaming telemetry](#streaming-telemetry)
+- [Removing LLDPq completely](#removing-lldpq-completely)
+- [File transfer and shell access](#file-transfer-and-shell-access)
+- [Useful Docker commands](#useful-docker-commands)
+
 ## Quick start
 
 No installation needed. Download the pre-built Docker image and run:
@@ -77,6 +91,121 @@ results. Use a persistent deployment below before entering real inventory or
 device credentials. DHCP/ONIE provisioning is disabled unless the explicit
 Linux host-network mode is selected.
 
+## Host-network monitoring with host-managed config (advanced)
+
+The following normalized example documents a pattern used in an existing
+deployment: the container uses the host network, keeps monitoring/AI/Provision
+state in named volumes, and treats individual files under a host config
+directory as the configuration source of truth.
+
+Use this only with Linux Docker Engine, when direct host-network reachability
+is required and the host firewall/ACL restricts access. `network_mode: host`
+exposes the LLDPq web service on host TCP/80 and the container SSH service on
+TCP/2033; there is no Docker port-publishing boundary, and both host ports must
+be free. This monitoring example explicitly keeps DHCP disabled—use the
+dedicated provisioning Compose file for physical-L2 DHCP/ONIE.
+
+Set the host config directory and create the two externally managed volumes
+before the first start:
+
+```bash
+export LLDPQ_CONFIG_DIR=/home/ubuntu/lldpq/configs
+
+for file in id_ed25519 id_ed25519.pub devices.yaml topology.dot \
+            topology_config.yaml lldpq-users.conf lldpq.conf; do
+  test -f "$LLDPQ_CONFIG_DIR/$file" || {
+    echo "Missing $LLDPQ_CONFIG_DIR/$file" >&2
+    exit 1
+  }
+done
+
+chmod 600 "$LLDPQ_CONFIG_DIR/id_ed25519"
+chmod 644 "$LLDPQ_CONFIG_DIR/id_ed25519.pub"
+sudo docker volume create lldpq-data
+sudo docker volume create lldpq-provision-state
+```
+
+`compose.yaml`:
+
+```yaml
+services:
+  lldpq:
+    image: lldpq:latest
+    container_name: lldpq
+    network_mode: host
+    privileged: true
+    restart: unless-stopped
+    environment:
+      TZ: "${TZ:-UTC}"
+      LLDPQ_DHCP_MODE: disabled
+      DHCP_AUTOSTART: "false"
+    volumes:
+      - lldpq-data:/home/lldpq/lldpq/monitor-results
+      - lldpq-provision-state:/var/lib/lldpq/provision-state
+      - lldpq-ai-state:/var/lib/lldpq/ai
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/id_ed25519:/home/lldpq/.ssh/id_ed25519"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/id_ed25519.pub:/home/lldpq/.ssh/id_ed25519.pub"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/devices.yaml:/home/lldpq/lldpq/devices.yaml"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/topology.dot:/var/www/html/topology.dot"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/topology_config.yaml:/var/www/html/topology_config.yaml"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/lldpq-users.conf:/etc/lldpq-users.conf"
+      - "${LLDPQ_CONFIG_DIR:?Set LLDPQ_CONFIG_DIR}/lldpq.conf:/etc/lldpq.conf"
+
+volumes:
+  lldpq-data:
+    external: true
+    name: lldpq-data
+  lldpq-ai-state:
+    name: lldpq-ai-state
+  lldpq-provision-state:
+    external: true
+    name: lldpq-provision-state
+```
+
+Start and inspect:
+
+```bash
+sudo env LLDPQ_CONFIG_DIR="$LLDPQ_CONFIG_DIR" TZ="${TZ:-UTC}" \
+  docker compose -f compose.yaml up -d
+sudo env LLDPQ_CONFIG_DIR="$LLDPQ_CONFIG_DIR" \
+  docker compose -f compose.yaml ps
+sudo docker logs --tail 100 lldpq
+```
+
+Important boundaries of this reduced layout:
+
+- all host files are writable bind mounts; startup normalizes several
+  ownership/mode values (especially SSH keys and user/config files), which can
+  change numeric ownership or permissions on the host
+- `devices.yaml` and topology direct mounts retain the journaled compatibility
+  path because `lldpq-provision-state` is a real volume
+- direct `/etc/lldpq.conf` and `/etc/lldpq-users.conf` mounts are legacy
+  host-managed files; atomic UI changes to runtime settings/users may be
+  refused. Use `lldpq-system-config` and `lldpq-app-config` from the recommended
+  persistent deployment when the web UI should own those files
+- the mounted `lldpq.conf` must already contain valid `LLDPQ_DIR`,
+  `LLDPQ_USER`, and `WEB_ROOT` assignments; startup fails closed rather than
+  replacing an incomplete host-owned file
+- only monitor results, AI state and Provision recovery state survive
+  recreation here. Active login sessions, LLDP results, alert deduplication,
+  job queues, collected configs/history, uploaded images and generated files
+  are not persisted
+- Compose external volumes must already exist; a missing bind source must not
+  be allowed to become a host directory accidentally
+
+Use the same `compose.yaml` and `LLDPQ_CONFIG_DIR` for every update, rollback
+and removal. `docker compose down -v` does not remove the two external volumes
+(`lldpq-data`, `lldpq-provision-state`); delete them explicitly only after
+backing up anything that must survive.
+
+When adapting the rollback-safe [Compose update procedure](#compose-deployments),
+set `compose_file=compose.yaml` and include
+`"LLDPQ_CONFIG_DIR=$LLDPQ_CONFIG_DIR"` in its `compose_env` array. Do not
+switch this deployment to the stock Compose file during an update.
+
+For a new deployment where LLDPq should manage configuration and all runtime
+state, prefer the complete named-volume Compose stack below.
+
 ## Persistent deployment
 
 
@@ -128,6 +257,11 @@ The LLDP/Assets/Provision job volumes retain queued and resumable work,
 `lldpq-ai-state` retains private Ask-AI memory/analysis snapshots, and
 `lldpq-provision-state` retains discovery cache, DHCP desired state, scheduler
 state and legacy direct-file editor recovery journals.
+On first start, current images clear the inherited setgid bit on the private
+`config-write-journals` child and verify it as `lldpq:www-data:700`. An
+immediate restart loop reporting
+`could not secure persistent config-write journal directory` indicates an old
+image or an incompatible bind/volume filesystem.
 `lldpq-dhcp-state` retains the DHCP lease database. Generated NVUE ZTP files
 and uploaded OS images/ONIE aliases live in `lldpq-generated-configs` and
 `lldpq-provision-files` respectively.
@@ -165,10 +299,12 @@ checkout directory and optional Compose project name for later operations.
 Complete these steps through the loopback/SSH-tunnel path above, or through a
 TLS reverse proxy restricted to trusted management sources:
 
-1. Login as admin and go to **Assets**.
-2. Click **Edit Devices** and add switch hostnames and management IPs (see the
-  [devices.yaml format](README.md#devicesyaml-format)).
-3. Click the orange **SSH Setup** button.
+1. Login as admin.
+2. Either upload/activate the P2P/IPAM design on **Inventory** and preview the
+   generated `devices.yaml`, or open **Assets → Edit Devices** and enter switch
+   hostnames/management IPs manually (see the
+   [devices.yaml format](README.md#devicesyaml-format)).
+3. Open **Assets → SSH Setup**.
 4. Enter the device password twice to confirm it.
 5. Click **Run Setup** to generate and distribute SSH keys.
 6. Retry failed devices with the appropriate password.
@@ -245,7 +381,8 @@ monitoring only.
 
 Ansible, ansible-lint, and the required collections are installed in the
 image, but integration is disabled by default with `ANSIBLE_DIR=NoNe`. A mount
-or file copy alone does not enable the VLAN/VRF reports or Fabric tools.
+or file copy alone does not enable the VLAN/VRF reports or Fabric
+Config/Editor/Migration/Deploy tools.
 
 For a new persistent direct deployment, keep the `lldpq-ansible` named volume
 and add `ANSIBLE_DIR` to the `docker run` command:
@@ -279,7 +416,12 @@ project structure.
 
 ## Updating
 
-
+> The public export endpoints (`/export_json`, `/<domain>/export_json|csv`,
+> `/lldp_results/export_json|csv`, `/ai/export_json` — see
+> [README machine-readable exports](README.md#02j-machine-readable-exports-public-api))
+> ship inside the image (html CGIs + nginx site + lldpq modules are COPY'd at
+> build time), so picking them up requires an image rebuild/update — there is
+> no html bind mount to hot-patch.
 
 ### Compose deployments
 

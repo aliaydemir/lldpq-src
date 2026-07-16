@@ -90,6 +90,7 @@ class LinkFlapAnalyzer:
         self.prev_sample_time = {}  # port -> timestamp of persisted baseline
         self.flapping_counters = {}  # port -> {period: count}
         self._port_cache = {}  # Cache for calculated port status/counters
+        self._export_rows = None  # Cache for get_export_rows()
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
         self.collection_coverage = {
             "expected_devices": 0,
@@ -306,6 +307,7 @@ class LinkFlapAnalyzer:
         always 0 while the raw Total counter still showed a value.)"""
         curr_time = time.time()
         self._port_cache = {}
+        self._export_rows = None
 
         # Initialize if new port
         if port_name not in self.carrier_transitions_lookback:
@@ -400,6 +402,7 @@ class LinkFlapAnalyzer:
     def _build_port_cache(self):
         """Build cache of all port statuses and counters - call once before bulk operations"""
         self._port_cache = {}
+        self._export_rows = None
         for port_name in self.carrier_transitions_stats.keys():
             counters = self.calculate_flapping_rate(port_name)
             status = self._status_for_counters(counters)
@@ -513,7 +516,40 @@ class LinkFlapAnalyzer:
             "current_devices": len(current),
             "unavailable_devices": sorted(expected - current),
         }
-    
+
+    def get_export_rows(self) -> List[Dict[str, Any]]:
+        """Flat per-port rows (export_artifacts "flap" schema) built from the
+        same cached port objects the HTML table renders, in the same
+        problems-first order. Single source for the HTML table and the
+        public machine-readable export. Built once per cache generation and
+        reused across the HTML render and write_export calls."""
+        if self._export_rows is not None:
+            return self._export_rows
+        if not self._port_cache:
+            self._build_port_cache()
+        rows = []
+        for port_name, cached in self._port_cache.items():
+            counters = cached['counters']
+            rows.append({
+                'device': port_name.split(':', 1)[0] if ':' in port_name else "unknown",
+                'interface': port_name.split(':', 1)[1] if ':' in port_name else port_name,
+                'status': cached['status'].value,
+                'flaps_30s': counters['flap_30_sec'],
+                'flaps_1m': counters['flap_1_min'],
+                'flaps_5m': counters['flap_5_min'],
+                'flaps_1h': counters['flap_1_hr'],
+                'flaps_12h': counters['flap_12_hrs'],
+                'flaps_24h': counters['flap_24_hrs'],
+                'total_transitions': self.carrier_transitions_stats.get(port_name, 0),
+            })
+        # Sort by severity (problems first, like BGP)
+        rows.sort(key=lambda row: (
+            0 if row['status'] == FlapStatus.CRITICAL.value else
+            1 if row['status'] == FlapStatus.WARNING.value else 2
+        ))
+        self._export_rows = rows
+        return rows
+
     def export_flap_data_for_web(self, output_file: str):
         """Export flap data for web display - optimized with caching"""
         # Build cache once at the start
@@ -579,6 +615,7 @@ class LinkFlapAnalyzer:
     <title>Link Flap Detection Results</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #d4d4d4; padding: 20px; min-height: 100vh; }}
@@ -863,20 +900,9 @@ class LinkFlapAnalyzer:
     </div>
 """
         
-        # Collect all ports for display - using cache
-        all_ports = []
-        for port_name, cached in self._port_cache.items():
-            device = port_name.split(':', 1)[0] if ':' in port_name else "unknown"
-            interface = port_name.split(':', 1)[1] if ':' in port_name else port_name
-            
-            port_info = {
-                'device': device,
-                'interface': interface,
-                'status': cached['status'],
-                'counters': cached['counters'],
-                'total_transitions': self.carrier_transitions_stats.get(port_name, 0)
-            }
-            all_ports.append(port_info)
+        # Collect all ports for display - the same flat rows (and problems-first
+        # order) the public machine-readable export publishes.
+        all_ports = self.get_export_rows()
 
         # Per-row detail evidence (recent flap timeline) surfaced through an
         # expandable panel, mirroring the EVPN-MH gold standard. This reuses the
@@ -946,18 +972,11 @@ class LinkFlapAnalyzer:
                 <tbody id="flap-data">
 """
         
-        # Sort by severity (problems first, like BGP)
-        sorted_ports = sorted(all_ports, key=lambda x: (
-            0 if x['status'] == FlapStatus.CRITICAL else
-            1 if x['status'] == FlapStatus.WARNING else 2
-        ))
-        
         # Build table rows using list for O(n) performance instead of O(n²) string concat
         table_rows = []
-        for port in sorted_ports:
-            counters = port['counters']
+        for port in all_ports:
             # Badge class based on status
-            status_val = port['status'].value
+            status_val = port['status']
             if status_val == 'ok':
                 badge_class = 'badge badge-green'
             elif status_val == 'critical':
@@ -984,12 +1003,12 @@ class LinkFlapAnalyzer:
             <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
             <td><span class="{badge_class}">{status_val.upper()}</span></td>
-            <td data-value="{counters['flap_30_sec']}">{_short_window_cell(counters['flap_30_sec'])}</td>
-            <td data-value="{counters['flap_1_min']}">{_short_window_cell(counters['flap_1_min'])}</td>
-            <td data-value="{counters['flap_5_min']}">{_short_window_cell(counters['flap_5_min'])}</td>
-            <td data-value="{counters['flap_1_hr']}">{counters['flap_1_hr']}</td>
-            <td data-value="{counters['flap_12_hrs']}">{counters['flap_12_hrs']}</td>
-            <td data-value="{counters['flap_24_hrs']}">{counters['flap_24_hrs']}</td>
+            <td data-value="{port['flaps_30s']}">{_short_window_cell(port['flaps_30s'])}</td>
+            <td data-value="{port['flaps_1m']}">{_short_window_cell(port['flaps_1m'])}</td>
+            <td data-value="{port['flaps_5m']}">{_short_window_cell(port['flaps_5m'])}</td>
+            <td data-value="{port['flaps_1h']}">{port['flaps_1h']}</td>
+            <td data-value="{port['flaps_12h']}">{port['flaps_12h']}</td>
+            <td data-value="{port['flaps_24h']}">{port['flaps_24h']}</td>
             <td data-value="{port['total_transitions']}"><span class="{transition_class}">{port['total_transitions']}</span></td>
         </tr>""")
         
@@ -1708,6 +1727,7 @@ class LinkFlapAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
     <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""

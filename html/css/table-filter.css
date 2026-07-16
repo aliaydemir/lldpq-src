@@ -1,0 +1,107 @@
+/* table-filter.css - styles for the shared column filter (table-filter.js) */
+
+tr.tf-hidden { display: none !important; }
+
+/* Header cell hosting a filter button: button is absolutely positioned so it
+   adds no inline width and never wraps to a second line in narrow columns. */
+th.tf-th {
+    position: relative !important;
+    padding-right: 18px !important;
+}
+
+.tf-btn {
+    position: absolute;
+    right: 3px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: none;
+    border: none;
+    padding: 1px;
+    cursor: pointer;
+    color: #888;
+    opacity: 0.55;
+    line-height: 1;
+}
+.tf-btn:hover { color: #ccc; opacity: 1; }
+.tf-btn.tf-active { color: #76b900; opacity: 1; }
+
+.tf-popup {
+    position: fixed;
+    z-index: 10000;
+    min-width: 200px;
+    max-width: 320px;
+    background: #252525;
+    border: 1px solid #404040;
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    padding: 8px;
+    font-size: 13px;
+    font-weight: normal;
+    text-transform: none;
+    letter-spacing: normal;
+    color: #ccc;
+    text-align: left;
+    white-space: normal;
+}
+
+.tf-popup .tf-search {
+    width: 100%;
+    box-sizing: border-box;
+    background: #1e1e1e;
+    border: 1px solid #404040;
+    border-radius: 4px;
+    color: #ccc;
+    padding: 5px 8px;
+    font-size: 13px;
+    outline: none;
+}
+.tf-popup .tf-search:focus { border-color: #76b900; }
+
+.tf-popup .tf-actions {
+    display: flex;
+    justify-content: space-between;
+    margin: 6px 2px 4px;
+    font-size: 12px;
+}
+.tf-popup .tf-actions a {
+    color: #76b900;
+    text-decoration: none;
+}
+.tf-popup .tf-actions a:hover { text-decoration: underline; }
+
+.tf-popup .tf-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border-top: 1px solid #333;
+    padding-top: 4px;
+}
+
+.tf-popup .tf-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    overflow: hidden;
+}
+.tf-popup .tf-item:hover { background: #2f2f2f; }
+.tf-popup .tf-item input[type="checkbox"] {
+    accent-color: #76b900;
+    margin: 0;
+    flex: none;
+}
+.tf-popup .tf-item span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tf-popup .tf-note {
+    color: #888;
+    font-size: 12px;
+    padding: 4px 2px;
+}

@@ -255,6 +255,7 @@
         .detail-kv .v.mono { font-family: monospace; font-size: 12px; }
     </style>
     <link rel="stylesheet" type="text/css" href="/css/mobile.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
 </head>
 <body>
     <div class="page-header">
@@ -336,7 +337,7 @@
     </div>
 
     <div class="table-container">
-        <table class="data-table">
+        <table class="data-table" data-filterable>
             <thead>
                 <tr>
                     <!-- Table renders pre-sorted by device asc, so show the active indicator from the start -->
@@ -747,5 +748,6 @@
 </script>
 <script src="/p2p-alias.js"></script>
 <script src="/css/analysis-guard.js"></script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 </body>
 </html>

@@ -513,6 +513,7 @@
         }
     </style>
     <link rel="stylesheet" type="text/css" href="/css/mobile.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
 </head>
 <body>
     <!-- Page Header -->
@@ -1374,7 +1375,7 @@
             const sortCls = (col) => 'sortable' + (sortState.column === col ? ' ' + sortState.dir : '');
 
             let html = `
-                <table class="data-table">
+                <table class="data-table" id="vlan-table">
                     <thead>
                         <tr>
                             <th style="width: 30px;"></th>
@@ -2797,5 +2798,6 @@
 
         document.addEventListener('DOMContentLoaded', init);
     </script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 </body>
 </html>

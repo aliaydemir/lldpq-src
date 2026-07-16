@@ -16,6 +16,14 @@ import json
 import tempfile
 from datetime import datetime
 
+import export_artifacts
+
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
+
 
 def parse_optical_vendor_info(filepath):
     """Parse vendor/model info from ethtool -m output (optical-data/*.txt)"""
@@ -262,6 +270,13 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
         except OSError:
             pass
         raise
+
+    # Public machine-readable export, published to the web tree by
+    # collect-transceiver-fw.sh alongside the inventory it derives from.
+    export_rows = [dict(m, device=canonical(m['device'])) for m in all_modules]
+    export_artifacts.write_export(
+        output_dir, 'transceiver', export_rows, result['summary'], None,
+        subdir=None, basename='transceiver-export')
 
     print(f"Transceiver inventory: {len(all_modules)} modules across "
           f"{len(devices_with_modules)} devices, {len(unique_models)} unique models"

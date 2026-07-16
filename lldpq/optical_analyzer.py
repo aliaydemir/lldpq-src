@@ -861,6 +861,58 @@ class OpticalAnalyzer:
 
         return "Check optical diagnostics availability"
 
+    def _ordered_ports(self, summary: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Problems-first port order shared by the HTML table and export rows."""
+        return (summary['critical_ports'] + summary['down_ports'] +
+                summary['warning_ports'] + summary['unplugged_ports'] +
+                summary['unknown_ports'] + summary['good_ports'] +
+                summary['excellent_ports'])
+
+    def build_export_rows(self, summary: Dict[str, Any],
+                          anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Flat export rows in the same problems-first order as the HTML table."""
+        anomalies_by_port: Dict[str, List[Dict[str, Any]]] = {}
+        for anomaly in anomalies:
+            anomalies_by_port.setdefault(anomaly.get('port', ''), []).append(anomaly)
+
+        all_ports = self._ordered_ports(summary)
+
+        rows = []
+        for port in all_ports:
+            port_name = port['port']
+            if ':' in port_name:
+                device_name = port_name.split(':')[0]
+                interface_name = port_name.split(':')[1]
+            else:
+                device_name = "unknown"
+                interface_name = port_name
+            stats = self.current_optical_stats.get(port_name, {})
+            rows.append({
+                'device': canonical(device_name),
+                'interface': interface_name,
+                'health': port.get('health'),
+                'rx_power_dbm': port.get('rx_power_dbm'),
+                'tx_power_dbm': port.get('tx_power_dbm'),
+                'temperature_c': port.get('temperature_c'),
+                'link_margin_db': port.get('link_margin_db'),
+                'voltage_v': port.get('voltage_v'),
+                'bias_current_ma': port.get('bias_current_ma'),
+                'rx_lanes': ' '.join(
+                    str(value) for value in (stats.get('rx_power_lanes_dbm') or [])
+                ),
+                'tx_lanes': ' '.join(
+                    str(value) for value in (stats.get('tx_power_lanes_dbm') or [])
+                ),
+                'bias_lanes': ' '.join(
+                    str(value) for value in (stats.get('bias_current_lanes_ma') or [])
+                ),
+                'anomalies': '; '.join(
+                    f"{str(item.get('severity', '')).upper()}: {item.get('message', '')}"
+                    for item in anomalies_by_port.get(port_name, [])
+                ),
+            })
+        return rows
+
     def export_optical_data_for_web(self, output_file: str):
         """Export optical data for web display - EXACT same styling as BGP/Link Flap"""
         summary = self.get_optical_summary()
@@ -947,6 +999,7 @@ class OpticalAnalyzer:
     <title>Optical Diagnostics Analysis</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #d4d4d4; padding: 20px; min-height: 100vh; }}
@@ -1119,10 +1172,7 @@ class OpticalAnalyzer:
 
         # Create one unified table for all monitored ports.  UNKNOWN rows are
         # retained so missing diagnostics cannot improve the visible coverage.
-        all_ports = (summary['critical_ports'] + summary['down_ports'] +
-                     summary['warning_ports'] + summary['unplugged_ports'] +
-                     summary['unknown_ports'] + summary['good_ports'] +
-                     summary['excellent_ports'])
+        all_ports = self._ordered_ports(summary)
 
         # Per-row evidence for the expandable detail panel.  Surfaces the
         # already-computed anomaly messages/actions and the raw per-lane arrays
@@ -1955,6 +2005,7 @@ class OpticalAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
     <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""

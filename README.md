@@ -27,11 +27,57 @@ For Docker installation, persistent volumes, DHCP/ONIE provisioning, updates,
 streaming telemetry, rollback boundaries, and removal, see the
 [Docker deployment guide](DOCKER.md).
 
+Current images normalize the private Provision/config-write journal to
+`lldpq:www-data:700` on first start and preserve that ownership across volume
+recreation. An immediate restart loop with
+`could not secure persistent config-write journal directory` indicates an
+older image or an incompatible host bind mount; update the image and use the
+documented `lldpq-provision-state` volume.
+
 ## Requirements (non-Docker install)
 
 - **Ubuntu Server** 22.04+ (tested on 22.04, 24.04) — Python 3.9+ required
-- SSH key-based access to Cumulus switches
-- Sudo privileges on target switches
+- **NVIDIA Cumulus Linux 5.x switches** reachable through their management IPs
+- SSH key authentication to all switches (Setup can distribute the key)
+- passwordless sudo for the LLDPq service account and the switch login account
+
+`install.sh` installs the normal runtime services and OS packages. Air-gapped
+package details are covered under
+[dependency management](#06-dependency-management).
+
+## Contents
+
+- [Docker](#docker)
+- [Requirements (non-Docker install)](#requirements-non-docker-install)
+- [00 · Quick start](#00-quick-start)
+- [01 · What it does](#01-what-it-does)
+- [02 · Analysis coverage](#02-analysis-coverage)
+  - [02a · EVPN multi-homing](#02a-evpn-multi-homing-analysis)
+  - [02b · Fabric search](#02b-fabric-search-live-queries)
+  - [02c · Device details](#02c-device-details-command-runner)
+  - [02d · Tracepath](#02d-tracepath)
+  - [02e · Duplicate detection](#02e-duplicate-address-detection)
+  - [02f · Ask-AI](#02f-ask-ai-admin-only)
+  - [02g · Lifecycle and Analysis Scope](#02g-switch-lifecycle-and-analysis-scope)
+  - [02h · Console](#02h-interactive-console-admin-only)
+  - [02i · Fleet Commands](#02i-fleet-commands-admin-only)
+  - [02j · Machine-readable exports](#02j-machine-readable-exports-public-api)
+- [03 · Configuration files](#03-configuration-files)
+  - [03a · Inventory & Bootstrap](#03a-inventory-bootstrap-admin-only)
+  - [03b · Guided Setup](#03b-guided-web-setup-setup-page)
+- [04 · Cron jobs](#04-cron-jobs-auto-setup)
+- [05 · Update](#05-update)
+- [06 · Dependency management](#06-dependency-management)
+- [07 · Disk usage](#07-disk-usage)
+- [08 · SSH setup](#08-ssh-setup)
+- [09 · CLI tools](#09-cli-tools)
+- [10 · Authentication](#10-authentication)
+- [11 · Alerts & notifications](#11-alerts-notifications)
+- [12 · Streaming telemetry](#12-streaming-telemetry)
+- [13 · Troubleshooting](#13-troubleshooting)
+- [14 · Provision](#14-provision-ztp-device-management)
+- [15 · Ansible Integration](#15-ansible-integration)
+- [16 · License](#16-license)
 
 ## [00] quick start  
 
@@ -44,19 +90,25 @@ cd lldpq-src
 ## [01] what it does
 
 - validates LLDP and monitors switches every 10 minutes
-- collects bgp, optical, ber, link flap, hardware health data
+- collects BGP/EVPN, EVPN multi-homing, optical, BER, PFC/ECN, link-flap,
+  hardware-health and system-log data
 - shows network topology with lldp
 - auto-refreshing, generation-consistent web dashboard snapshots
 - live network tables (MAC, ARP, VTEP, Routes, LLDP neighbors)
+- imports versioned P2P/IPAM design workbooks and generates LLDPq bootstrap files
 - tracepath: visual path tracing between any two IPs (intra-VRF, inter-VRF, external)
 - device details page with command runner
+- responsive web UI with an off-canvas mobile navigation sidebar
 
 ## [02] analysis coverage
 
 - **bgp neighbors**: state, uptime, prefix counts, health status
 - **evpn summary**: VNI counts (L2/L3), Type-2/Type-5 route analysis
+- **evpn multi-homing**: ESI correlation across PEs, DF/non-DF election,
+  bond/LACP member state, bypass activity, VNI consistency and BGP ES state
 - **duplicate address detection**: duplicate IP/MAC detection via EVPN DAD + MAC-mobility sequences, with severity, quiesced/aged lifecycle, and per-port interface descriptions (see [02e])
-- **optical diagnostics**: power levels, temperature, bias current, link margins  
+- **optical diagnostics**: power levels, temperature, bias current, link
+  margins, unplugged modules and ports whose diagnostics are unavailable
 - **link flap detection**: carrier transitions on all interfaces (including breakouts), with time-windowed flap counts (1h / 12h / 24h)
 - **Link error / BER**: directional frame-error density from interface counters, plus separately graded raw/effective PHY BER and PHY symbol-error deltas
 - **PFC/ECN**: telemetry-free per-port analysis of traffic-class 3 ECN
@@ -66,7 +118,10 @@ cd lldpq-src
   percentage, and combined discard delta. Missing counters remain unavailable
   rather than becoming zero, and the page applies no arbitrary
   warning/critical thresholds.
-- **hardware health**: cpu/asic temperatures, memory usage, fan speeds, psu efficiency
+- **hardware health**: cpu/asic temperatures, memory usage, fan speeds, psu
+  efficiency, plus explicit Unknown coverage for unreachable/uncollected devices
+- **system logs**: critical/error/warning/info counts with current-device
+  coverage and per-device findings
 - **topology validation**: lldp neighbor verification against expected topology
 
 ### PFC/ECN report
@@ -75,6 +130,31 @@ The report distinguishes quiet, ECN, PFC, combined ECN+PFC, discard,
 baseline, reset, missing-data, and collection-failure states. It includes a
 Metric Guide, device/status/text filters, clickable summary filters, sortable
 columns, and CSV export of the visible rows.
+
+## [02a] EVPN multi-homing analysis
+
+Access via the **EVPN-MH** menu
+(`/monitor-results/evpn-mh-analysis.html`).
+
+The analyzer correlates Ethernet Segment Identifiers across local PEs using
+NVUE, FRR/BGP ES-EVI state, Linux bond/link details and per-member LACP state.
+It reports:
+
+- **Healthy** — both PEs and bonds are operational, LACP is synchronized,
+  remote ES state is present and exactly one PE is DF
+- **Bypass** — LACP bypass is actively forwarding; dual-DF behavior is treated
+  according to bypass semantics rather than reported as an ordinary conflict
+- **Inactive** — one or more local ES bonds are down
+- **Warning** — orphan ESI, missing remote ES, unsynchronized LACP, VNI
+  mismatch or missing BGP ES state
+- **Critical** — ESI collision, inconsistent BGP VNI state, or dual/no DF
+  while both remote PEs are active and bypass is not active
+
+Summary cards filter the device-first table by health, bypass, inactive,
+inconsistent and orphan state. Expanding a row shows both PE attachments and
+member-level MII/synchronization/bypass evidence. Missing device collections
+remain visible through a partial-coverage banner and are never converted into
+healthy zeros.
 
 ## [02b] fabric search (live queries)
 
@@ -108,7 +188,7 @@ access via web UI: `http://<server>/search.html`
 - sortable table columns (click headers)
 - search/filter support
 - CSV export for MAC/ARP tables
-- parallel queries for "All Devices" mode
+- "All Devices" mode serves results from the fabric-scan cache; single-device queries run live over SSH
 - **fast subnet search**: cached-only queries for subnet patterns (e.g. `192.168.64`)
 
 ## [02c] device details & command runner
@@ -118,7 +198,7 @@ access via web UI: `http://<server>/device.html`
 ### tabs
 | Tab | Description |
 |-----|-------------|
-| **Overview** | Device info, uptime, model, serial, OS version |
+| **Overview** | Optical port health and log alert summary cards |
 | **Ports** | Interface status with speed, state, neighbors |
 | **Optical** | SFP/QSFP diagnostics with power levels, temperature |
 | **NVT** | Runs the read-only `nvt` helper with a 45-second timeout and displays a colorized interface summary: admin/oper state, speed, MTU, type, VLANs, VRF, LLDP neighbor/port, description, and IP addresses. It is loaded on first use and can be refreshed independently. |
@@ -160,8 +240,9 @@ access via web UI: `http://<server>/device.html`
 - **page exit warning**: prevents accidental navigation during generation
 
 ### security
-- commands are allowlisted diagnostics, with tightly scoped packet-capture and
-  capture/bundle cleanup operations
+- commands are allowlisted diagnostics, with tightly scoped packet-capture,
+  capture/bundle cleanup, and interface up/down (port bounce) operations used
+  by Fabric Migration
 - switch configuration commands are blocked
 
 > **Authorization:** Device Details—including NVT, Config, and Command
@@ -205,7 +286,7 @@ all path discovery is based on graph analysis — no hardcoded hostnames, IPs, o
 | **core detection** | cross-pod spine tier-2 neighbor bridging |
 | **link health** | LLDP bidirectional link status counting |
 
-works with any Clos topology: 2-tier (leaf-spine), 3-tier (leaf-spine-core), or N-tier.
+works with 2-tier (leaf-spine) and 3-tier (leaf-spine-core) Clos topologies.
 
 ## [02e] duplicate address detection
 
@@ -213,12 +294,12 @@ access via web UI: **Duplicate** menu (`/monitor-results/duplicate-analysis.html
 
 The report correlates current FRR EVPN duplicate-address-detection (DAD)
 output, EVPN mobility sequences, local FDB entries, IPv4 neighbor data,
-interface descriptions, and recent FRR duplicate logs. IP/MAC findings are
-grouped by their resolved VLAN identity and show the VNI when it is resolved.
-If a VLAN mapping is unavailable, the analyzer can use the available VNI as
-the grouping fallback; for an FDB-only MAC with no known VNI, the VLAN value
-is also used as the VNI display fallback. APIPA findings are grouped only by
-switch and VLAN.
+interface descriptions, and recent FRR duplicate logs. EVPN-derived IP/MAC
+findings are keyed by VNI—the fabric-wide L2 domain—so different per-observer
+VLAN views cannot split one conflict into duplicate rows. The resolved access
+VLAN is displayed when available. Kernel-only FDB/ARP evidence can fall back
+to VLAN grouping, but an unknown VNI is displayed as `—` rather than being
+fabricated from the VLAN number.
 
 ### finding types
 
@@ -231,7 +312,7 @@ switch and VLAN.
 | **Active MAC mobility** | A per-observer sequence delta meets the switch's configured DAD moves/window policy; the fallback policy is 5 moves / 180 seconds |
 | **Historical mobility** | Below-threshold movement or an extreme but currently flat mobility sequence; shown separately and not counted as a confirmed MAC conflict |
 | **Possible loop** | A MAC that is not currently DAD-flagged, is not a confirmed MAC conflict, and does not participate in a current authoritative IP-DAD finding is classified as a loop candidate when it spans at least two endpoints and ten active-mobility or confirmed-conflict signals share that VLAN and endpoint set |
-| **APIPA / DHCP-failed** | IPv4 link-local (`169.254.0.0/16`) neighbors grouped per switch and VLAN; 50 or more in one switch/VLAN is critical |
+| **APIPA / DHCP-failed** | IPv4 link-local (`169.254.0.0/16`) endpoints; the headline counts unique IPs fabric-wide while the table shows EVPN-synchronized sightings per switch/VLAN; 50 or more sightings in one switch/VLAN is critical |
 
 ### features
 
@@ -239,9 +320,13 @@ switch and VLAN.
 - keeps current IP DAD, confirmed MAC conflicts, MAC DAD evidence, and MAC mobility as separate summary counters
 - calculates MAC mobility deltas per observing switch and normalizes them against the configured moves/window policy
 - treats counter resets and newly established baselines without creating negative deltas
+- treats DAD disabled by FRR during EVPN multi-homing as an informational
+  platform restriction, not as a standalone warning
+- keeps a recent FRR DAD event visible but settled when its EVPN sequence is
+  proven flat in the current cycle
 - preserves short-lived IP owner-port context so fast-moving conflicts can still show both locations
 - filters by summary card or device and hides aged findings by default
-- the current **Download CSV** action exports the currently visible rows from the IP duplicate table
+- the current **Download CSV** action exports the currently visible rows from all three tables (IP duplicates, MAC findings, APIPA) into one file
 - the Thresholds dialog documents data sources, grading, EVPN-MH behavior, and targeted FRR DAD-clear commands
 
 ## [02f] Ask-AI (admin only)
@@ -256,6 +341,10 @@ correlations, and the checks performed by the agent.
 - Suggested fixes open **Commands** prefilled for administrator review; Ask-AI never executes them automatically.
 - Console suggestions can open the interactive Console for the selected device.
 - `[AUDIT: <pack> <device|@role>]` runs a named read-only audit pack (`bgp`, `evpn`, `optical`, `mtu-path`, `pfc`, `hardware`) in one SSH session per device and prepends a deterministic verdict block to the evidence.
+- `[P2P: <device>[:<port>]]` looks up the intended peer, rack/RU,
+  transceiver and cable/bundle metadata from the active P2P design.
+- `[IPAM: <ip>|<hostname>]` looks up intended address/subnet ownership and
+  expected host BGP loopback/ASN data from the active IPAM design.
 - Analysis findings carry **NEW** / **ONGOING** / **RESOLVED** badges (plus worsened/reopened) tracked across runs; a device missing from the current collection is never marked resolved.
 - Known-benign findings can be acknowledged with `suppress: <device|*|@role> [CATEGORY] <regex> [ttl=7d] [because ...]` and removed with `unsuppress: <id or fragment>`. Suppressions expire on TTL and auto-reopen when the finding's severity worsens past the acknowledged level.
 - Recent fabric changes (24h git log of the Ansible directory plus running-config drift) are correlated into analysis and change-related chat questions.
@@ -282,18 +371,26 @@ requiring a second model. AI memory, analyses, and snapshots are stored under
 `/var/lib/lldpq/ai`; Docker deployments should persist the
 `lldpq-ai-state` volume.
 
+The active P2P/IPAM design selected on the admin **Inventory** page is also
+used to enrich autonomous incident candidates with intended physical
+location, expected peer/cable/transceiver data and design-vs-live IP/BGP
+context. A transactionally current report can be saved when some devices are
+explicitly unavailable; those devices stay `UNKNOWN`, and the trusted
+comparison snapshot advances only after complete coverage.
+
 Additional AI settings are read from `/etc/lldpq.conf` (the settings UI does
 not expose them):
 
 | Key | Purpose |
 |-----|---------|
-| `AI_FALLBACK_MODEL` | Secondary model tried automatically when the primary model call fails; also preferred for the hourly scan stage when set |
 | `AI_CONTEXT_WINDOW_TOKENS` | Override the assumed context window (tokens) of the primary model |
 | `AI_FALLBACK_CONTEXT_WINDOW_TOKENS` | Same override for the fallback model |
 | `AI_SEARCH_URL` / `AI_SEARCH_KEY` | Separate endpoint and API key for the optional search model; they default to the main endpoint and its key when unset |
 
 `AI_SEARCH_MODEL` and `AI_PROXY_URL` are also stored in `/etc/lldpq.conf` and
 correspond to the search model and proxy fields in the settings UI.
+`AI_ANALYSIS_MIN_INTERVAL_SECONDS=3600` is an environment-only override for
+the post-pipeline autonomous attempt throttle.
 
 Local/air-gapped deployments can use the Ollama provider fully offline: run a
 current tool-capable local model and ensure its context length is large enough
@@ -310,7 +407,8 @@ Every authenticated user has an **Analysis Scope** selector with **All
 Switches**, **Commissioning**, and **Handed Over** choices. The selection is
 stored per browser tab. The Fabric dashboard always remains global. Scope
 filtering applies to LLDP, BGP, Duplicate, Link Flap, Optical, BER, PFC/ECN,
-Hardware, Logs, Assets, and Transceiver views; it does not narrow collection.
+EVPN-MH, Hardware, Logs, Assets, and Transceiver views; it does not narrow
+collection.
 For LLDP, only the current `lldp.html` report is scoped; LLDP Problems and
 Archive remain global.
 
@@ -337,12 +435,431 @@ selected output to Ask-AI. A device can be opened directly with
 
 > **Broadcast warning:** Broadcast sends the entered text and Enter
 > immediately to every connected session, without a confirmation dialog. An
-> empty value sends Enter. Disconnected sessions are skipped and reported.
+> empty value is rejected with a warning and nothing is sent. Disconnected
+> sessions are skipped and reported.
 
 > **Privilege warning:** Console is an unrestricted interactive shell, not the
 > allowlisted Device Details command runner. Input is forwarded directly to a
 > login shell or switch SSH PTY and can change the LLDPq host or a device with
 > the connected account's privileges.
+
+## [02i] fleet Commands (admin only)
+
+The **Commands** page (`/commands.html`) runs one reviewed, allowlisted
+diagnostic command across one or more selected inventory devices. Targets are
+grouped by role and support search, per-group selection and select-all.
+Command presets mirror Device Details (system, interfaces, L2, routing,
+EVPN/VXLAN, EVPN-MH, config and logs); a custom command can also be entered.
+
+Runs use a bounded four-device client pool, per-device output cards, Stop, and
+short retries when another command owns a device lock. Ask-AI can prefill the
+targets and command through **Run in Commands**, but it never auto-executes:
+the administrator must review and click **Run**.
+
+## [02j] machine-readable exports (public API)
+
+LLDPq publishes a versioned, machine-first view of every current analysis
+domain, plus LLDP wiring, transceiver inventory and the latest Ask-AI report.
+These endpoints are designed for `curl`, `jq`, scripts and external monitoring
+systems; no browser session is required.
+
+> **Public-data boundary:** every endpoint in this section is deliberately
+> unauthenticated. Exports can contain device names, neighbors, addresses,
+> interfaces, serial numbers, log messages and AI-generated operational
+> analysis. Restrict the LLDPq web service with network ACLs/TLS, or remove the
+> export nginx locations if this disclosure is not acceptable. No CORS headers
+> are added, so cross-origin browser JavaScript is not enabled by default.
+
+### Discover available exports
+
+Start with the index rather than hardcoding availability:
+
+```bash
+base=http://<host>
+
+# Complete discovery document
+curl -fsS "$base/export_json" | jq .
+
+# Pipeline freshness
+curl -fsS "$base/export_json" | jq '.monitor'
+
+# Available reports and their URLs
+curl -fsS "$base/export_json" |
+  jq '.reports[] | select(.available) |
+      {report, updated, row_count, export_json, export_csv}'
+
+# Compact TSV inventory for shell automation
+curl -fsS "$base/export_json" |
+  jq -r '.reports[] |
+         [.report, .available, (.updated // "N/A"),
+          (.row_count // "N/A"), .export_json, (.export_csv // "N/A")] | @tsv'
+```
+
+The index payload is:
+
+| Field | Meaning |
+|---|---|
+| `success` | `true` when the discovery document was generated |
+| `schema_version` | Index schema version (currently `1`) |
+| `service` | `lldpq-export` |
+| `generated_at` | UTC ISO-8601 time when the index request was served |
+| `monitor.status` | Current monitor manifest status |
+| `monitor.completed_at` | Time of the last published full monitor generation |
+| `monitor.pipeline_complete` | Whether that generation completed its full publish contract |
+| `monitor.max_age_seconds` | Freshness window recorded by the monitor manifest |
+| `monitor.analyses` / `monitor.skipped` | Analysis domains included or deliberately skipped |
+| `monitor.stale` | `true` when a stale marker exists or the manifest exceeded its freshness window |
+| `reports[]` | One discovery record per LLDP, monitor domain, transceiver and AI export |
+| `reports[].available` | Whether that endpoint currently has a published artifact |
+| `reports[].updated` | Report-generation time, UTC ISO-8601 when known |
+| `reports[].collection_status` | Domain collection status when the common export supplies it |
+| `reports[].counts` | Domain-specific headline counts |
+| `reports[].row_count` | Number of exported table rows |
+
+An unavailable report remains in the index with `available: false`. Static
+monitor/transceiver URLs return nginx `404` until their first successful
+publish; use the index when that state is expected.
+
+### Endpoint matrix
+
+| Endpoint | Format | Production model | Notes |
+|---|---|---|---|
+| `/export_json` | JSON | Generated on request | Discovery/freshness index; no CSV form |
+| `/lldp_results/export_json` | JSON | Generated on request from published `lldp_results.ini` | Counts and classified wiring rows |
+| `/lldp_results/export_csv` | CSV | Generated on request | Byte-equivalent to the LLDP page's default problems-first Download CSV |
+| `/bgp/export_json`, `/bgp/export_csv` | JSON / CSV | Atomic monitor artifact | BGP rows; JSON `extra.evpn` contains the EVPN VNI/route summary |
+| `/evpn-mh/export_json`, `/evpn-mh/export_csv` | JSON / CSV | Atomic monitor artifact | Ethernet Segment/PE/LACP/DF findings |
+| `/duplicate/export_json`, `/duplicate/export_csv` | JSON / CSV | Atomic monitor artifact | IP, MAC and APIPA findings |
+| `/flap/export_json`, `/flap/export_csv` | JSON / CSV | Atomic monitor artifact | Per-port carrier-transition windows |
+| `/optical/export_json`, `/optical/export_csv` | JSON / CSV | Atomic monitor artifact | Per-port DOM/health/lane data |
+| `/ber/export_json`, `/ber/export_csv` | JSON / CSV | Atomic monitor artifact | BER, frame-error density and counter deltas |
+| `/pfc-ecn/export_json`, `/pfc-ecn/export_csv` | JSON / CSV | Atomic monitor artifact | Per-port traffic signal/delta/rate data |
+| `/hardware/export_json`, `/hardware/export_csv` | JSON / CSV | Atomic monitor artifact | Per-device platform health |
+| `/log/export_json`, `/log/export_csv` | JSON / CSV | Atomic monitor artifact | Current normalized log findings |
+| `/transceiver/export_json`, `/transceiver/export_csv` | JSON / CSV | Atomic transceiver-scan artifact | Firmware/vendor/part/serial inventory |
+| `/ai/export_json` | JSON only | Verbatim current `analysis.json` | Latest autonomous/manual persisted report; `analysis` is Markdown and must be checked for a non-empty value |
+
+There is no separate public EVPN-summary endpoint: it is carried in the BGP
+JSON export under `extra.evpn`. Assets, raw configs, topology source files,
+packet captures and historical AI conversations are not part of this public
+export contract.
+
+### LLDP results JSON example
+
+`/lldp_results/export_json` is rendered from the same published
+`lldp_results.ini` consumed by the LLDP page. Rows use the page's default
+problems-first order (`FAILED`, `NO INFO`, `WARNING`, `SUCCESS`):
+
+```json
+{
+  "schema_version": 1,
+  "domain": "lldp_results",
+  "generated_at": 1784198403,
+  "collection_status": null,
+  "counts": {
+    "successful": 1,
+    "failed": 1,
+    "warnings": 1,
+    "no_info": 1,
+    "total": 4
+  },
+  "columns": [
+    "local_device",
+    "local_port",
+    "port_status",
+    "expected_device",
+    "expected_port",
+    "actual_device",
+    "actual_port",
+    "lldp_status",
+    "status",
+    "connection_health"
+  ],
+  "rows": [
+    {
+      "local_device": "leaf-01",
+      "local_port": "swp4",
+      "port_status": "DOWN",
+      "expected_device": "spine-01",
+      "expected_port": "swp13",
+      "actual_device": null,
+      "actual_port": null,
+      "lldp_status": "Fail",
+      "status": "FAILED",
+      "connection_health": "Local Port is DOWN"
+    },
+    {
+      "local_device": "leaf-01",
+      "local_port": "swp2",
+      "port_status": "UP",
+      "expected_device": "spine-01",
+      "expected_port": "swp11",
+      "actual_device": null,
+      "actual_port": null,
+      "lldp_status": "No-Info",
+      "status": "NO INFO",
+      "connection_health": "No LLDP Response Received"
+    },
+    {
+      "local_device": "leaf-01",
+      "local_port": "swp6",
+      "port_status": "UP",
+      "expected_device": "spine-01",
+      "expected_port": "swp16",
+      "actual_device": "spine-02",
+      "actual_port": "swp16",
+      "lldp_status": "Fail",
+      "status": "WARNING",
+      "connection_health": "Wrong Device: Expected spine-01, Got spine-02"
+    },
+    {
+      "local_device": "leaf-01",
+      "local_port": "swp1",
+      "port_status": "UP",
+      "expected_device": "spine-01",
+      "expected_port": "swp10",
+      "actual_device": "spine-01",
+      "actual_port": "swp10",
+      "lldp_status": "Pass",
+      "status": "SUCCESS",
+      "connection_health": "LLDP Connection Verified"
+    }
+  ],
+  "created": "2026-07-16 10-40-03"
+}
+```
+
+`created` is the original timezone-less local `Created on ...` value retained
+for page compatibility; `generated_at` is that value interpreted in the LLDPq
+process timezone and converted to Unix epoch (the example assumes UTC).
+Missing expected/actual values are `null` in JSON and render as `N/A` in CSV.
+
+### Common monitor-domain JSON contract
+
+Monitor domains and the transceiver export use schema version `1`:
+
+```json
+{
+  "schema_version": 1,
+  "domain": "ber",
+  "generated_at": 1784188800,
+  "collection_status": "current",
+  "counts": {"total_ports": 128, "critical": 2},
+  "columns": ["device", "interface", "status"],
+  "rows": [
+    {"device": "leaf-01", "interface": "swp1", "status": "CRITICAL"}
+  ]
+}
+```
+
+- `generated_at` is a Unix epoch integer; the discovery index exposes
+  human-friendly UTC ISO timestamps.
+- `collection_status` preserves the analyzer's current/partial/unavailable
+  state instead of turning missing evidence into a healthy zero.
+- `counts` is domain-specific and matches the report's summary contract.
+- `columns` is the canonical ordered registry for that domain and exactly
+  matches CSV column order.
+- `rows` contains flat JSON-safe scalar values. Missing values are `null`;
+  non-finite numbers become `null`; list/set values are space-joined.
+- Status-like values keep each report's native vocabulary and casing:
+  uppercase for BGP `state`/`health`, BER `status`, duplicate `severity`,
+  hardware `health` and LLDP `status`; lowercase for optical `health` and
+  EVPN-MH/flap/PFC-ECN `status`. Match the exact strings shown by a live
+  export when writing filters.
+- `extra` is optional and omitted when empty. It currently carries the EVPN
+  summary for BGP.
+- `schema_version` governs compatibility. Columns are append-only within a
+  schema version; consumers should access fields by name and tolerate new
+  trailing columns.
+
+For BGP, `extra.evpn` contains `domain`, `generated_at`,
+`collection_status`, `coverage_expected`, `coverage_current`, `total_vnis`,
+`l2_vnis`, `l3_vnis`, `type2_routes`, `type5_routes`, and
+`route_coverage`.
+
+Unknown row keys are rejected during analysis publication. A schema mismatch
+therefore fails/rolls back the analyzer transaction rather than silently
+changing the public API.
+
+### AI JSON special contract
+
+`/ai/export_json` is intentionally a verbatim view of the latest private
+`analysis.json`, not the flat monitor-domain schema. Its stable primary
+consumer field is:
+
+```bash
+curl -fsS http://<host>/ai/export_json |
+  jq -er '.analysis | select(type == "string" and length > 0)'
+```
+
+The object can additionally contain `timestamp`, `generated_at`,
+`device_count`, `provider`, `model`, `fallback_used`, `changes`, `collection`,
+`timeline`, `evidence`, `confidence`, `findings`, `findings_summary`,
+`baseline`, `reused`, `stages`, `design_source`, and
+`audit_verifications`. Optional fields depend on whether the report was
+reused, whether collection coverage was complete, and which design/audit
+enrichment was available. Consumers should tolerate absent additive fields.
+There is no AI CSV endpoint.
+
+### Ordered row columns
+
+The complete version-1 registry is:
+
+- **BGP:** `device`, `neighbor`, `neighbor_ip`, `vrf`, `address_family`,
+  `interface`, `state`, `health`, `asn`, `uptime`, `down_since`,
+  `prefixes_received`, `prefixes_sent`, `messages_received`, `messages_sent`,
+  `in_queue`, `out_queue`, `table_version`, `version`, `description`
+- **EVPN-MH:** `esi`, `status`, `reason`, `device_a`, `bond_a`, `df_a`,
+  `lacp_a`, `device_b`, `bond_b`, `df_b`, `lacp_b`, `vnis`, `orphan`,
+  `inconsistent`, `bypass_active`
+- **Duplicate:** `finding_type`, `severity`, `kind`, `vlan`, `vni`, `address`,
+  `macs`, `hosts`, `local_ports`, `vteps`, `sequence`, `delta`, `events`,
+  `stale`, `count`, `note`
+- **Flap:** `device`, `interface`, `status`, `flaps_30s`, `flaps_1m`,
+  `flaps_5m`, `flaps_1h`, `flaps_12h`, `flaps_24h`, `total_transitions`
+- **Optical:** `device`, `interface`, `health`, `rx_power_dbm`,
+  `tx_power_dbm`, `temperature_c`, `link_margin_db`, `voltage_v`,
+  `bias_current_ma`, `rx_lanes`, `tx_lanes`, `bias_lanes`, `anomalies`
+- **BER:** `device`, `interface`, `neighbor_device`, `neighbor_port`, `status`,
+  `sample_status`, `raw_ber`, `effective_ber`, `frame_error_density`,
+  `symbol_errors`, `symbol_error_delta`, `delta_packets`, `delta_rx_errors`,
+  `delta_tx_errors`, `sample_window`, `severity_reasons`
+- **PFC/ECN:** `device`, `interface`, `status`, `signal`,
+  `ecn_marked_delta`, `ecn_marked_rate`, `rx_pause_delta`, `rx_pause_rate`,
+  `tx_pause_delta`, `tx_pause_rate`, `loss_delta`, `sample_status`
+- **Hardware:** `device`, `model`, `health`, `cpu_temp_c`, `asic_temp_c`,
+  `memory_pct`, `load_raw`, `load_per_core`, `cores`, `psu_efficiency`,
+  `psu_in_w`, `psu_out_w`, `fans`
+- **Log:** `device`, `severity`, `original_severity`, `timestamp`, `section`,
+  `message`
+- **Transceiver:** `device`, `port`, `identifier`, `vendor`, `part_number`,
+  `serial`, `vendor_rev`, `connector`, `fw_version`, `cable_byte130`,
+  `fw_status`, `fw_status_detail`
+- **LLDP results:** `local_device`, `local_port`, `port_status`,
+  `expected_device`, `expected_port`, `actual_device`, `actual_port`,
+  `lldp_status`, `status`, `connection_health`
+
+### CSV contract
+
+- CSV rows and order match the corresponding JSON `rows` and `columns`.
+- LLDP CSV uses the UI's display headers and default order:
+  `FAILED`, `NO INFO`, `WARNING`, then `SUCCESS`.
+- Missing/empty/`none`/`n/a` values render as `N/A`.
+- Fields use RFC-4180 quoting, CRLF line endings and a trailing CRLF.
+- Text values beginning (after trimming) with `=`, `+`, `-`, or `@` are
+  prefixed with `'` to prevent spreadsheet-formula execution. Numeric cells
+  are never guarded, so negative telemetry (optical dBm, counter deltas)
+  stays machine-parseable.
+- Monitor CSV downloads use `lldpq_<domain>_export.csv`; transceiver uses
+  `lldpq_transceiver_export.csv`; LLDP uses
+  `LLDP_Report_<report-created>.csv`.
+
+```bash
+base=http://<host>
+
+# Save using the server-provided filename
+curl -fSJO "$base/ber/export_csv"
+curl -fSJO "$base/lldp_results/export_csv"
+
+# Or choose the filename explicitly
+curl -fsS "$base/pfc-ecn/export_csv" -o pfc-ecn.csv
+```
+
+### Querying and automation examples
+
+Exports are full current snapshots. There are no server-side query parameters
+for filtering, pagination, lifecycle scope, time range, or format selection;
+JSON vs CSV is selected by the path. Apply filters client-side:
+
+```bash
+base=http://<host>
+
+# Refuse automation when the full monitor generation is stale
+curl -fsS "$base/export_json" |
+  jq -e '.monitor.pipeline_complete == true and .monitor.stale == false'
+
+# All non-established/down BGP rows (state/health are uppercase in BGP rows)
+curl -fsS "$base/bgp/export_json" |
+  jq '.rows[] | select((.state // "") != "ESTABLISHED")'
+
+# Critical/warning EVPN-MH segments
+curl -fsS "$base/evpn-mh/export_json" |
+  jq '.rows[] | select(.status == "critical" or .status == "warning")'
+
+# Active/non-aged duplicate findings
+curl -fsS "$base/duplicate/export_json" |
+  jq '.rows[] | select(.stale != true and
+      (.severity == "CRITICAL" or .severity == "WARNING"))'
+
+# Optical ports with unavailable/poor health
+curl -fsS "$base/optical/export_json" |
+  jq '.rows[] | select(.health == "critical" or .health == "warning" or
+      .health == "unknown" or .health == "unplugged")'
+
+# BER findings and their neighbor context (BER status grades are uppercase)
+curl -fsS "$base/ber/export_json" |
+  jq '.rows[] | select(.status == "CRITICAL" or .status == "WARNING") |
+      {device, interface, neighbor_device, neighbor_port, status,
+       raw_ber, effective_ber, severity_reasons}'
+
+# LLDP rows needing attention
+curl -fsS "$base/lldp_results/export_json" |
+  jq '.rows[] | select(.status != "SUCCESS")'
+
+# Latest AI report body (fails if the seeded state has no report yet)
+curl -fsS "$base/ai/export_json" |
+  jq -er '.analysis | select(type == "string" and length > 0)'
+
+# Download every currently available CSV export
+curl -fsS "$base/export_json" |
+  jq -r '.reports[] | select(.available and .export_csv != null) |
+         .export_csv' |
+  while IFS= read -r path; do
+    curl -fSJO "$base$path"
+  done
+```
+
+Browser Analysis Scope and client-side table filters do not alter these
+exports; they always describe the globally published current generation.
+
+### Freshness, HTTP and atomicity
+
+- All defined export routes, including dynamic JSON errors and nginx-generated
+  `404` responses for not-yet-published static artifacts, use `Cache-Control:
+  no-store, no-cache, must-revalidate, max-age=0`.
+- Monitor-domain JSON/CSV pairs are generated from the same row objects as the
+  HTML tables, validated as required pipeline artifacts, and published in the
+  same rollback-safe monitor transaction.
+- Transceiver JSON/CSV is produced with `transceiver_inventory.json` and copied
+  to the web tree under the transceiver scan lock.
+- LLDP JSON/CSV is generated on request from the exact published
+  `lldp_results.ini`; it does not initiate collection.
+- AI JSON streams the atomically replaced latest `analysis.json`; it does not
+  run a new model request.
+- LLDP and AI responses carry `X-LLDPQ-Report-Created`. Static monitor-domain
+  and transceiver responses expose freshness through JSON `generated_at` and
+  the discovery index's `updated` value.
+- JSON/CSV artifacts are mode `0664` and have SHA256 sidecars internally for
+  pipeline validation. Sidecars are not public API endpoints.
+
+| Condition | Result |
+|---|---|
+| Successful GET/HEAD | `200` with JSON or CSV |
+| Unsupported method on dynamic index/LLDP/AI endpoints | `405` JSON error with `Allow: GET, HEAD` |
+| Monitor/transceiver artifact not published yet | nginx `404`; index reports `available: false` |
+| LLDP report not published yet | `503` JSON error with `Retry-After: 60` |
+| AI state file absent | `404` JSON error |
+| Runtime configuration/export parser failure | `500` JSON error |
+
+Use `curl -f`/`-fS` so non-2xx responses fail automation, and consult
+`/export_json` before polling optional/skipped reports such as Optical. HEAD is
+supported for discovery, LLDP and AI; static nginx exports also support normal
+HTTP HEAD handling.
+
+Fresh installations seed `analysis.json` with `{}`. Until the first persisted
+analysis, `/ai/export_json` can therefore return an empty JSON object and the
+index can report the file as available; automation must require a non-empty
+string `.analysis`, as in the example above.
 
 ## [03] configuration files
 
@@ -410,6 +927,27 @@ endpoint_hosts:
 
 patterns are matched against devices found in LLDP neighbor data.
 
+## [03a] Inventory & Bootstrap (admin only)
+
+The standalone **Inventory** page (`/inventory.html`) is a design-import and
+bootstrap workspace; it is different from the operational device table under
+**Provision → Inventory**.
+
+- upload P2P cabling and IP allocation workbooks (`.xlsx` / `.xlsm`) or parsed
+  P2P JSON
+- retain recoverable versions and explicitly choose which version is the
+  active design
+- run deterministic duplicate-port, breakout, blank/TBD endpoint, duplicate
+  cable/record and allocation checks without AI
+- preview and confirm generation of `topology.dot`, `devices.yaml`, and
+  `topology_config.yaml`
+- choose switch-to-switch, full-fabric, or Ethernet-only topology scope
+
+Generated files are never applied silently: every candidate is previewed
+(including a diff where applicable) and requires confirmation. The active
+design is published as `active-p2p.json` / `active-ipam.json` for Ask-AI and
+Fabric Migration enrichment.
+
 ## [03b] guided web setup (Setup page)
 
 Admin-only **Setup** page (`http://<server>/setup.html`) — a guided, 11-step wizard that walks you through the whole lifecycle, from a fresh install to day-2 maintenance. A numbered rail shows the current step. Every step is also reachable directly with `setup.html?step=<name>`, while Next/Back follows the recommended order.
@@ -421,7 +959,7 @@ Admin-only **Setup** page (`http://<server>/setup.html`) — a guided, 11-step w
 | 3 | Topology | Edit `topology.dot` — expected cabling |
 | 4 | Topology Config | Edit `topology_config.yaml` — layout / layer / icon rules |
 | 5 | Display Aliases | Optional — edit device/interface P2P and field display names |
-| 6 | Integrate Ansible | Optional — point to the Ansible dir for VLAN/VRF/Fabric features |
+| 6 | Integrate Ansible | Optional — point to the Ansible dir for VLAN/VRF reports, Fabric Config/Editor/Migration/Deploy and Fabric Exit |
 | 7 | Notifications | Slack alerts — webhook, channel, alert types, thresholds, Test button |
 | 8 | Run LLDPq | Collect data & validate, with live streaming output |
 | 9 | Backup & Restore | Export / import a portable Setup configuration bundle |
@@ -434,9 +972,25 @@ it does not modify the operating-system hostname. The value is stored in
 `/etc/lldpq.conf`, survives native and Docker updates, and is included in the
 portable Setup preferences.
 
+The same step edits collection/get-config schedules and the Monitor, LLDP,
+Assets and Get Configs SSH parallelism. Presets cover 5–30 minute collection,
+6–24 hour config backup, and parallel widths up to 1000. If an existing custom
+cron expression is not representable by a preset, Setup shows the real
+expression and warns that saving will replace it.
+
+Managed editors use revision-checked writes: loading establishes the expected
+revision, concurrent external changes cause a review/reload prompt, and Save
+is disabled while a request is in flight. The step rail and Save buttons mark
+real unsaved changes instead of treating a visited step as complete.
+
 ### Display Aliases (step 5)
 
-Edit `display-aliases.json` without leaving Setup. Device names and interface/port names are separate maps from canonical names to display labels. The editor supports structured rows, bulk paste (`display-label<TAB>canonical-name`), and JSON upload/download. Aliases affect presentation only; collected source data and topology validation remain unchanged.
+Edit `display-aliases.json` without leaving Setup. Device names and
+interface/port names are separate maps from canonical names to display labels.
+The editor supports structured rows, bulk paste
+(`canonical-name<TAB>display-label`), and JSON upload/download. Aliases affect
+presentation only; collected source data and topology validation remain
+unchanged.
 
 The same alias editor remains available from the LLDP page. Saving either editor reloads the server-normalized mapping and notifies other open LLDPq tabs.
 
@@ -459,7 +1013,8 @@ an installed LLDPq host. This is a configuration-migration bundle, not a
 complete runtime or bare-metal backup.
 
 - **Included:** `devices.yaml`, `tracking.yaml`, `topology.dot`, `topology_config.yaml`, `notifications.yaml`, `display-aliases.json`, and a whitelist of **portable** `/etc/lldpq.conf` preferences (schedules, parallelism, feature toggles, AI settings)
-- **Excluded from portable prefs:** host-specific paths and secrets (e.g. the AI API key)
+- **Excluded from portable prefs:** host-specific paths and secrets (e.g. the
+  AI API key), plus host-bound telemetry collector IP/port/VRF settings
 - **SSH key** (optional checkbox, on by default): includes the collector key pair so the restored install can reach devices immediately. Bundles can already contain notification webhooks; always store them securely, especially when the private key is included.
 - **Not included:** monitoring/config history, DHCP leases and full DHCP configuration, uploaded OS images, generated provisioning files, LLDPq users/sessions, private Ask-AI analysis/learnings, or active job state.
 - **Import** restores every file to the right location, merges the portable prefs into `/etc/lldpq.conf`, and applies any schedule changes to cron.
@@ -475,6 +1030,9 @@ complete runtime or bare-metal backup.
   explicitly selected; ordinary updates do not create a permanent backup.
   The automatic update rollback snapshot is temporary and is removed after a
   successful update.
+- deletion requires a deliberate second click within a five-second confirmation
+  window; a slow multi-GB purge may continue in the background after the web
+  request timeout and can be checked with **Refresh**
 
 ### Online and offline update (step 11)
 
@@ -596,7 +1154,6 @@ schedule is:
 | `* * * * *` | `lldpq-provision-scheduler` | discovery scheduling and upgrade resume |
 | `* * * * *` + 30s | `fabric-scan.sh` | cached topology/search data; delayed so the full collector has lock priority |
 | `0 0 * * *` | Git auto-commit | daily configuration-history commit |
-| Post full collection, max hourly | `lldpq-ai-analyze --if-due` | autonomous AI analysis of the generation that just published |
 | `33 3 * * *` | `fabric-scan-cron.sh` | optional Ansible diff check when Ansible is configured |
 
 `LLDPQ_CRON` and `GETCONF_CRON` can override the first two schedules. Docker
@@ -609,6 +1166,17 @@ Scheduled full collectors wait up to five minutes for an active cache-only
 Fabric Scan, while manual duplicate invocations remain non-blocking. If an
 older full collector publishes during that wait, the queued schedule is
 discarded instead of starting a back-to-back duplicate generation.
+
+Ask-AI analysis is not a separate fixed-time cron entry. After a full
+generation and its Fabric Scan publish successfully, `lldpq` launches
+`lldpq-ai-analyze --if-due` in the background. Attempts are throttled to at
+most one per hour by default; a recent manual Analyze report also suppresses
+an immediate duplicate autonomous call.
+
+A standalone scheduled Fabric Scan uses the same global pipeline lock and
+exits `75` without waiting when a full collection owns it. The Fabric Scan
+invoked inside `lldpq` inherits the already-held lock and runs sequentially
+after report publication.
 
 The `lldpq-trigger` daemon processes token-specific LLDP validation and Assets
 refresh jobs, full or page-scoped monitoring analysis, configuration
@@ -685,24 +1253,46 @@ without recursively deleting an unrecognized install directory. After
 verifying that guarded path manually, `./uninstall.sh --force-partial` also
 removes the remaining partial tree.
 
-## [06] requirements
+## [06] dependency management
 
-- **Linux server** (Ubuntu 22.04+ recommended, tested on 22.04 and 24.04) — Python 3.9+ required
-- **NVIDIA Cumulus Linux 5.x switches** with management IP access
-- **SSH key auth** to all switches (setup via web UI — see [SSH Setup](#08-ssh-setup))
-- All other dependencies (nginx, fcgiwrap, python3 ≥ 3.9, etc.) are installed automatically by `install.sh`
-- **Python packages**: `python3-yaml` (PyYAML), `python3-ruamel.yaml` and `python3-requests` are required by the fabric/ansible backends — `install.sh` checks and installs them; on air-gapped systems install the OS packages manually before running it
+`install.sh` checks and installs nginx, fcgiwrap, ISC DHCP components and the
+other native runtime dependencies. The fabric/Ansible backends require the OS
+packages `python3-yaml` (PyYAML), `python3-ruamel.yaml`, and
+`python3-requests`; the installer deliberately uses distro packages rather
+than `pip --user`.
+
+On an air-gapped host, install those packages and the standard runtime
+dependencies from the local OS repository before running the offline update.
+The offline updater does not contact apt, pip, or GitHub.
 
 ## [07] disk usage
 
-Monitor data grows ~50MB/day per fabric. Automatic cleanup keeps last 24 hours.
+Disk growth depends strongly on fabric size, polling interval and enabled
+analyzers; do not assume one fixed MB/day value. There is no global job that
+deletes every `monitor-results/` artifact after 24 hours. Retention is owned by
+each analyzer: for example BGP keeps bounded counter-only snapshots, flap and
+PFC/ECN prune time-windowed history, while current HTML reports remain until a
+new generation replaces them.
 
 ```
-~/lldpq/monitor-results/     # ~50MB   analysis results (HTML reports)
-~/lldpq/lldp-results/        # ~10MB   LLDP topology data
+~/lldpq/monitor-results/     # analysis reports, current data and bounded histories
+~/lldpq/lldp-results/        # LLDP topology data + observed-neighbor sidecar
 /var/www/html/configs/        # varies  device config backups (get-conf)
 /var/www/html/hstr/          # ~5MB    historical data
 ```
+
+PFC/ECN history is stored as per-device JSON shards under
+`monitor-results/pfc-ecn-history/` (24 hours, bounded samples per port);
+upgrades migrate the legacy monolithic history automatically. Large analyzer
+JSON files can carry `.sha256` sidecars so validation proves the exact bytes
+without re-parsing hundreds of MB; a missing/mismatched sidecar falls back to
+the full JSON parse.
+
+Before a full monitor run spends time collecting, it estimates the temporary
+space needed to stage a rollback-safe web publication. Insufficient space
+marks the pipeline stale with a `disk_full:` reason and preserves the
+last-known-good reports. **Setup → Maintenance** reports current usage and
+safely removes only completed update backups.
 
 ## [08] ssh setup
 
@@ -771,6 +1361,7 @@ lldpq - -s                         # visible output + skip periodic optical DOM 
 # direct/scoped monitoring
 cd ~/lldpq && ./monitor.sh --help
 cd ~/lldpq && ./monitor.sh --only bgp
+cd ~/lldpq && ./monitor.sh --only evpn-mh
 cd ~/lldpq && ./monitor.sh --only duplicate
 cd ~/lldpq && ./monitor.sh --only flap
 cd ~/lldpq && ./monitor.sh --only optical
@@ -818,20 +1409,48 @@ Failure handling depends on the failure type:
 - malformed or truncated bundles are not activated; the previous valid device artifacts remain in place and the run is marked stale
 - typed category-command failures publish explicit partial/unavailable coverage for that category while complete sections from the same device generation remain usable
 - optical DOM port or collection-budget timeouts publish explicit unknown/partial optical coverage instead of silently omitting ports
-- during a full run, if both SSH and the reachability check fail, old raw measurements are removed from the current generation and an explicit **Current collection unavailable** device page is produced; a scoped run preserves unrelated prior artifacts
+- during a full run, an SSH attempt that never emits the remote collection
+  handshake is recorded as `unavailable` even when ICMP happened to answer;
+  old raw measurements are removed from the current generation and an
+  explicit **Current collection unavailable** device page is produced. A
+  scoped run preserves unrelated prior artifacts
 - PFC/ECN port timeouts are represented in the new report as **Collection failed** or **Data missing**; unavailable counters are never shown as zero
 - analyzer, validation, or web-publication failures roll analyzer state back and preserve the previous published reports
+- a generation-bound `collection_status.json` records every inventory device
+  as `current`, `unavailable`, or `failed`; unavailable devices produce honest
+  partial Hardware/Logs/other coverage without aborting reports for reachable
+  devices, while real `failed` outcomes keep the pipeline fail-closed
 
 The following optional values tune bounded collection:
 
 - `MONITOR_MAX_PARALLEL=100` — concurrent per-device collection workers
+- `LLDP_MAX_PARALLEL=100` — concurrent LLDP SSH workers
+- `ASSETS_MAX_PARALLEL=100` — concurrent asset-discovery SSH workers
+- `GET_CONFIGS_MAX_PARALLEL=100` — concurrent config-backup workers
+- `LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300` — scheduled full-pipeline lock wait
+  injected by cron; direct/manual runs default to non-blocking (`0`), and the
+  wrapper caps explicit waits at 600 seconds
 - `MONITOR_COMMAND_TIMEOUT_SECONDS=20` — timeout for otherwise-unbounded remote category commands (`1..120`)
+- `MONITOR_UNREACHABLE_CONNECT_TIMEOUT_SECONDS=10` — environment-only
+  shortened monitor SSH
+  connect bound after an ICMP failure (still performs the authoritative SSH
+  attempt)
+- `LLDP_UNREACHABLE_CONNECT_TIMEOUT=10` — environment-only equivalent
+  shortened connect bound for `check-lldp.sh`
 - `PFC_ECN_MAX_PARALLEL=4` — concurrent per-port NVUE QoS reads on each switch (`1..8`)
 - `PFC_ECN_COLLECTION_BUDGET_SECONDS=60` — QoS collection budget per switch
 - `PFC_ECN_PORT_TIMEOUT_SECONDS=5` — timeout for one QoS read
+- `PFC_ECN_SHARD_MAX_PARALLEL=<cpu-bounded>` — environment-only worker count
+  for per-device history shard merge/prune/write (defaults to up to 8)
 - `OPTICAL_COLLECTION_BUDGET_SECONDS=120` — DOM collection budget per switch
-- `OPTICAL_PORT_TIMEOUT_SECONDS=10` — timeout for one DOM read
+- `OPTICAL_PORT_TIMEOUT_SECONDS=5` — timeout for one DOM read
 - `MONITOR_TIMING=true` — emit per-device section timings
+
+Optical collection retries the first timeout in a streak while staying inside
+the per-switch budget. Four consecutive full timeouts, or roughly 40 seconds
+spent in unsuccessful DOM reads, stop further EEPROM access on that device;
+unvisited ports are still emitted as explicit partial/Unknown coverage rather
+than disappearing from the report.
 
 Verbose `lldpq -` runs also print one lightweight **Analyzer timings
 (parallel)** block with the elapsed time of every analyzer. This is always
@@ -841,19 +1460,19 @@ bundle parsing, and individual collection-section timings.
 
 The PFC/ECN analyzer additionally reports its load, record parsing, history
 pruning, HTML rendering, and atomic-write subphases. Analyzer JSON artifacts
-are fully parsed with a bounded parallel validator (two processes by default);
-verbose output lists deterministic per-file validation timings. Any malformed,
-missing, empty, or stale artifact remains fail-closed and rolls the analyzer
-transaction back exactly as before.
+are validated with a bounded parallel validator (two processes by default).
+Producer-authored SHA256 sidecars allow large files to use an exact-byte hash
+check; older or unmatched artifacts are fully parsed. Verbose output lists
+deterministic per-file validation timings. Any malformed, missing, empty, or
+stale artifact remains fail-closed and rolls the analyzer transaction back.
 
 The separate transceiver firmware scan uses
 `TRANSCEIVER_FW_MIN_INTERVAL=1800`, `TRANSCEIVER_FW_MAX_PARALLEL=10`,
 `TRANSCEIVER_FW_SSH_TIMEOUT=300`, and
 `TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=skip` by default.
 
-Bulk CLI defaults can be tuned with `SEND_CMD_MAX_PARALLEL=25`,
-`GET_CONFIGS_MAX_PARALLEL=100` (the script fallback is 50 when the installed
-setting is absent), and `GET_CONFIGS_SSH_TIMEOUT=60`.
+Bulk CLI defaults can also be tuned with `SEND_CMD_MAX_PARALLEL=25`,
+`GET_CONFIGS_SSH_TIMEOUT=60`, and `TELEMETRY_MAX_PARALLEL=25`.
 
 ## [10] authentication
 
@@ -878,6 +1497,7 @@ operator / operator   # limited access
 |---|:---:|:---:|
 | View Fabric, LLDP, analysis, Assets, Configs, Logs, Search, Tracepath, Telemetry, and Topology | ✓ | ✓ |
 | Select Analysis Scope | ✓ | ✓ |
+| Refresh Assets or run the shared LLDP check | ✓ | ✓ |
 | Run per-report analysis/collection actions | ✓ | — |
 | Open Ask-AI, Device Details, Commands, or Console | ✓ | — |
 | Use Setup, SSH Setup, Provision, or Handover changes | ✓ | — |
@@ -1091,16 +1711,25 @@ when disabling via CLI (`--disable-telemetry`):
 cat /etc/cron.d/lldpq
 
 # check if trigger daemon is running
-ps aux | grep lldpq-trigger
+pgrep -af lldpq-trigger
 
-# manual run
-cd ~/lldpq && ./assets.sh && ./check-lldp.sh && ./monitor.sh
+# run the complete pipeline with diagnostics
+/usr/local/bin/lldpq -
 
-# check logs  
+# check current/stale generation metadata and failure reasons
+ls -la ~/lldpq/monitor-results/.lldpq-current.json \
+       ~/lldpq/monitor-results/.lldpq-stale \
+       ~/lldpq/monitor-results/.pipeline-inputs/collection_status.json
+tail -50 ~/lldpq/monitor-failures.log
+
+# check published reports
 ls -la /var/www/html/monitor-results/
 
 # check trigger logs
 cat /tmp/lldpq-trigger.log
+
+# check the most recent autonomous AI attempt/result
+tail -50 /var/lib/lldpq/ai/lldpq-ai-analyze.log
 
 # check telemetry stack
 cd telemetry && ./start.sh status
@@ -1108,6 +1737,14 @@ cd telemetry && ./start.sh status
 # test prometheus connection
 curl 'http://localhost:9090/api/v1/query?query=up'
 ```
+
+Exit status `75` means another compatible collector currently owns the shared
+pipeline lock (or a queued scheduled run was superseded by a newer completed
+generation); it is not an analyzer failure. A stale marker reason beginning
+with `disk_full:` means publication staging was refused before collection due
+to insufficient web-filesystem space. In Docker, run the same checks with
+`sudo docker exec -u lldpq lldpq ...`; persistent-volume and fresh-start
+permission guidance is in [DOCKER.md](DOCKER.md).
 
 ## [14] Provision (ZTP & Device Management)
 
@@ -1139,10 +1776,13 @@ The subnet scanner uses ping and SSH probes to classify devices:
 Additional indicators identify MAC mismatches and reachable addresses with no
 inventory binding. Results load from a persistent cache; **Scan** starts an
 immediate full scan. Automatic scanning is configurable as Off, 3, 5, 10, or
-15 minutes, with 5 minutes as the default.
+15 minutes, with 5 minutes (`SCAN_INTERVAL=300`) as the default.
 
 The Discover tab also owns the discovery IP range and the independent
 post-provision toggles for Base Config, ZTP disable, and hostname assignment.
+Their persisted defaults are `AUTO_BASE_CONFIG=true`,
+`AUTO_ZTP_DISABLE=true`, and `AUTO_SET_HOSTNAME=true`; each action still
+requires the identity and completion checks described below.
 
 ### Post-Provision Automation
 
@@ -1266,8 +1906,9 @@ New switch powers on
 
 ## [15] Ansible Integration
 
-LLDPq's Ansible features (Fabric Editor, Fabric Config, Fabric Deploy) are designed for a
-specific **Cumulus Linux NVUE automation structure**. They are not a generic Ansible UI.
+LLDPq's Ansible features (Fabric Editor, Fabric Config, Fabric Migration,
+Fabric Deploy, VLAN/VRF reports and Fabric Exit) are designed for a specific
+**Cumulus Linux NVUE automation structure**. They are not a generic Ansible UI.
 The Ansible menu is automatically hidden when `$ANSIBLE_DIR` is not configured.
 
 **Core LLDPq features (LLDP, monitoring, search, tracepath, telemetry, provisioning) work without Ansible.**
@@ -1302,10 +1943,33 @@ $ANSIBLE_DIR/
 | Fabric Config (edit device configs) | `inventory/host_vars/{device}.yaml` | Standard Ansible layout |
 | VLAN/Port profile management | `group_vars/all/vlan_profiles.yaml`, `sw_port_profiles.yaml` | See YAML key requirements below |
 | BGP profile management + route leaking | `group_vars/all/bgp_profiles.yaml` | See YAML key requirements below |
+| Fabric Migration (bulk assign/migrate profiles) | `inventory/host_vars/`, `sw_port_profiles.yaml`, generate/diff/deploy playbooks | Edits intent first; switch changes occur only in Deploy |
 | Diff (compare running vs intended) | `playbooks/diff_switch_configs.yaml` | Playbook name is hardcoded |
 | Deploy (push config to device) | `playbooks/deploy_switch_configs.yaml` | Playbook name is hardcoded |
 | Generate (create host_vars from templates) | `playbooks/generate_switch_nvue_yaml_configs.yaml` | Playbook name is hardcoded |
 | VLAN/VRF/BGP reports | `group_vars/all/*.yaml` + `host_vars/` | Read-only analysis |
+
+### Fabric Migration
+
+The admin-only **Fabric Migration** page bulk-assigns a first
+`sw_port_profile` or migrates existing profile assignments across selected
+devices:
+
+1. select devices and load eligible ports/bonds
+2. filter by current profile, description pattern, peer shape, rack/SU and
+   optional active P2P-design facets
+3. map source profiles (or unassigned ports) to target profiles
+4. run a server dry-run, review the plan, and write only the guarded
+   `host_vars` intent
+5. Generate, Diff and Deploy through the configured Ansible playbooks, then
+   verify live bridge VLAN/fabric-table state
+
+L3 interfaces, bond members, breakout parents and management interfaces are
+excluded from profile migration. Plans are saved for audit/rollback; rollback
+uses drift guards and reverses both migrations and first-time assignments.
+An optional post-deploy bounce performs `ifdown`, waits seven seconds, then
+performs `ifup` only on the ports in the applied plan. Selection patterns are
+stored server-side and shared by project administrators.
 
 ### YAML Key Requirements
 

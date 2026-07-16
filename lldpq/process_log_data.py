@@ -21,6 +21,7 @@ from collection_freshness import (
     read_asset_snapshot,
     read_collection_outcomes,
 )
+import export_artifacts
 
 try:
     from device_names import canonical
@@ -445,7 +446,11 @@ class LogAnalyzer:
             'partial_devices': partial_devices,
             'unsupported_sources': unsupported_sources,
         }
-    
+
+    def _devices_by_total_logs(self):
+        return sorted(self.log_counts.items(),
+                      key=lambda x: sum(x[1].values()), reverse=True)
+
     def generate_html_report(self):
         """Generate HTML report for log analysis"""
         print("Generating log analysis HTML report...")
@@ -501,6 +506,7 @@ class LogAnalyzer:
     <title>Log Analysis Results</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e1e; color: #d4d4d4; padding: 20px; min-height: 100vh; }}
@@ -668,8 +674,7 @@ class LogAnalyzer:
                 <tbody>"""
         
         # Sort devices by total log count (descending)
-        sorted_devices = sorted(self.log_counts.items(), 
-                              key=lambda x: sum(x[1].values()), reverse=True)
+        sorted_devices = self._devices_by_total_logs()
         
         for device_name, counts in sorted_devices:
             total_count = sum(counts.values())
@@ -1436,6 +1441,7 @@ class LogAnalyzer:
         }
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
     <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""
@@ -1462,8 +1468,9 @@ class LogAnalyzer:
             if msgs:
                 recent_messages[device] = msgs
         
+        generated_at = datetime.now(timezone.utc)
         summary_data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": generated_at.isoformat(),
             "collection_status": self.collection_status,
             "coverage": coverage,
             "source_status": {
@@ -1484,6 +1491,37 @@ class LogAnalyzer:
         
         summary_file = os.path.join(self.data_dir, "log_summary.json")
         _atomic_write(summary_file, json.dumps(summary_data, indent=2))
+
+        # Public machine-readable export: same log entries the HTML report
+        # embeds, in display order (devices by total log count descending,
+        # severities critical -> error -> warning -> info), with the same
+        # headline totals as log_summary.json. I/O errors must propagate so
+        # the monitor transaction rolls back.
+        sorted_devices = self._devices_by_total_logs()
+        export_rows = []
+        for device_name, _counts in sorted_devices:
+            categories = self.log_analysis.get(device_name, {})
+            for severity in ("critical", "error", "warning", "info"):
+                for entry in categories.get(severity, []):
+                    if not isinstance(entry, dict):
+                        continue
+                    export_rows.append({
+                        "device": str(canonical(device_name)),
+                        "severity": entry.get("severity", severity),
+                        "original_severity": entry.get("original_severity"),
+                        "timestamp": entry.get("timestamp"),
+                        "section": entry.get("section"),
+                        "message": entry.get("message"),
+                    })
+        export_artifacts.write_export(
+            self.data_dir,
+            "log",
+            export_rows,
+            {**summary_data["totals"],
+             "total_devices": summary_data["total_devices"]},
+            summary_data["collection_status"],
+            generated_at=generated_at.timestamp(),
+        )
 
         print(f"Log summary data saved: {summary_file}")
     

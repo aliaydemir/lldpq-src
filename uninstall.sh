@@ -3008,6 +3008,8 @@ WEB_TARGETS=(
     "$WEB_ROOT/lifecycle-scope.js"
     "$WEB_ROOT/handover.html" "$WEB_ROOT/tracking-api.sh"
     "$WEB_ROOT/search.html" "$WEB_ROOT/search-api.sh"
+    "$WEB_ROOT/export-api.sh" "$WEB_ROOT/lldp-export-api.sh"
+    "$WEB_ROOT/ai-export-api.sh"
     "$WEB_ROOT/setup-api.sh" "$WEB_ROOT/telemetry.html"
     "$WEB_ROOT/tracepath.html" "$WEB_ROOT/transceiver.html"
     "$WEB_ROOT/vlan-report.html" "$WEB_ROOT/vrf-report.html"

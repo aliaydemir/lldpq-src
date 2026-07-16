@@ -28,6 +28,8 @@ import time
 import tempfile
 from datetime import datetime, timezone
 
+import export_artifacts
+
 try:
     from device_names import canonical
 except Exception:
@@ -107,6 +109,16 @@ def _atomic_write(path, content):
         except FileNotFoundError:
             pass
         raise
+
+
+_NOTE_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _export_note(note):
+    """Plain-text twin of a table note cell for the machine export: strips the
+    dim/emphasis markup and the '&mdash;' entity (a dash-only note -> None)."""
+    plain = _NOTE_TAG_RE.sub("", note).replace("&mdash;", "-").strip()
+    return None if plain in ("", "-") else plain
 
 
 def _parse_ts(s):
@@ -1204,9 +1216,9 @@ class DuplicateAnalyzer:
                 rec["classification"] = "ip-conflict-participant"
             elif (not rec.get("confirmed_conflict") and not rec.get("dad_flagged")
                   and len(ep) >= 2
-                  and pair_count.get((vlan, ep), 0) >= LOOP_MIN_MACS):
+                  and pair_count.get((rec["vlan"], ep), 0) >= LOOP_MIN_MACS):
                 rec["classification"] = "loop"
-                rec["loop_count"] = pair_count[(vlan, ep)]
+                rec["loop_count"] = pair_count[(rec["vlan"], ep)]
 
         # Age-out: a quiesced (WARNING) duplicate whose EVPN sequence has not moved for a long time
         # AND has no recent log event is "stale" -- still real, just historical (e.g. storage VIPs
@@ -1408,11 +1420,40 @@ class DuplicateAnalyzer:
                 seen.append(label)
         return "<br>".join(seen) or "&mdash;"
 
+    def _vni_export(self, rec):
+        """Machine twin of _vlan_vni_cell: None when the VNI field is just the
+        VLAN echoed back on a kernel-only finding (no real EVPN mapping)."""
+        vni = rec["vni"]
+        if vni == rec["vlan"] and vni not in self.vni_to_vlan:
+            return None
+        return vni
+
+    def _vtep_export(self, vteps, owner_hosts, port_map=None):
+        """Plain-text twin of _vtep_cell for the machine export: same
+        owner-drop / vtep2host resolution semantics, 'host:port' where the
+        conflicting entry was also captured LOCAL, space-joined."""
+        seen = []
+        for v in sorted(vteps):
+            h = self.vtep2host.get(v)
+            if h and h in owner_hosts:
+                continue
+            if h:
+                label = "%s:%s" % (canonical(h), port_map[h]) if (port_map and port_map.get(h)) else canonical(h)
+            else:
+                label = v
+            if label not in seen:
+                seen.append(label)
+        return " ".join(seen) or None
+
     def export_html(self, output_file):
         s = self.summary()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         sev_rank = {"CRITICAL": 0, "WARNING": 1, "OK": 2}
         all_devices = set()
+        # Public machine export rows, built from the same record objects the
+        # HTML cells below are rendered from (IP section, then MAC, then APIPA
+        # -- the same problems-first order each table shows).
+        export_rows = []
 
         # Freshness/coverage gate.  Computed up front so the empty-state rows can
         # avoid reading as a healthy fabric when the sample is missing or partial
@@ -1498,6 +1539,26 @@ class DuplicateAnalyzer:
             if r.get("stale"):
                 note += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
             rowcls = " class='stale-row'" if r.get("stale") else ""
+            export_rows.append({
+                "finding_type": "ip",
+                "severity": r["severity"],
+                "kind": kind,
+                "vlan": r["vlan"],
+                "vni": self._vni_export(r),
+                "address": r["ip"],
+                "macs": " ".join(sorted(r["macs"])) or None,
+                "hosts": " ".join(sorted(canonical(h) for h in r["local_hosts"])) or None,
+                "local_ports": " ".join(sorted(
+                    "%s:%s" % (canonical(p.split(":", 1)[0]), p.split(":", 1)[1])
+                    if ":" in p else canonical(p)
+                    for p in r["ports"])) or None,
+                "vteps": self._vtep_export(r["vteps"], r["local_hosts"], ip_ports),
+                "sequence": r["seq"] or None,
+                "delta": r["delta"],
+                "events": r["events"] or None,
+                "stale": bool(r.get("stale")),
+                "note": _export_note(note),
+            })
             ip_html.append(
                 "<tr data-sev='%d' data-kind='%s' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
                 "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td>%s</td></tr>" % (
@@ -1583,6 +1644,26 @@ class DuplicateAnalyzer:
                 kind = "mobility"
             else:
                 kind = "context"
+            export_note = note
+            if r.get("stale"):
+                export_note = ("%s (aged %dd)" % (
+                    export_note, int((r.get("quiet_age") or 0) // 86400))).strip()
+            export_rows.append({
+                "finding_type": "mac",
+                "severity": r["severity"],
+                "kind": kind,
+                "vlan": r["vlan"],
+                "vni": self._vni_export(r),
+                "address": r["mac"],
+                "hosts": " ".join(sorted(canonical(h) for h in r["local"])) or None,
+                "local_ports": " ".join(sorted(
+                    "%s:%s" % (canonical(h), p) for h, p in r["local"].items())) or None,
+                "vteps": self._vtep_export(r["vteps"], set(r["local"].keys()), cport),
+                "sequence": r["seq"] or None,
+                "delta": r.get("delta"),
+                "stale": bool(r.get("stale")),
+                "note": export_note or None,
+            })
             mac_html.append(
                 "<tr data-sev='%d' data-kind='%s' data-mobility-active='%s' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
                 "<td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td>%s</td></tr>" % (
@@ -1607,6 +1688,13 @@ class DuplicateAnalyzer:
         apipa_html = []
         for rank, sev, host, vlan, cnt in apipa_rows:
             all_devices.add(host)
+            export_rows.append({
+                "finding_type": "apipa",
+                "severity": sev,
+                "vlan": vlan,
+                "hosts": canonical(host),
+                "count": cnt,
+            })
             apipa_html.append("<tr data-devices='%s'><td data-sort='%d'>%s</td><td class='mono'>%s</td><td>vlan %s</td><td class='mono'>%d</td></tr>" % (
                 html.escape(host), rank, self._sev_badge(sev), html.escape(host), html.escape(vlan), cnt))
         if not apipa_html:
@@ -1746,10 +1834,8 @@ class DuplicateAnalyzer:
             os.path.dirname(os.path.abspath(output_file)),
             "summary", "duplicate-summary.json",
         )
-        _atomic_write(summary_path, json.dumps({
-            "domain": "duplicate",
-            "generated_at": int(time.time()),
-            "collection_status": collection_status,
+        generated_at = int(time.time())
+        summary_counts = {
             "confirmed_ip_active": s["confirmed_ip_active"],
             "ip_quiesced": s["ip_quiesced"],
             "ip_arp_observed": s["ip_arp_observed"],
@@ -1764,7 +1850,22 @@ class DuplicateAnalyzer:
             "coverage_mac_evidence_current": s["coverage_mac_evidence_current"],
             "coverage_failures": s["coverage_failures"],
             "coverage_partial": bool(s["coverage_partial"]),
+        }
+        _atomic_write(summary_path, json.dumps({
+            "domain": "duplicate",
+            "generated_at": generated_at,
+            "collection_status": collection_status,
+            **summary_counts,
         }) + "\n")
+
+        # Public machine export: the same rows the tables above rendered, the
+        # same headline counts/status as the summary JSON. I/O errors must
+        # propagate so the analyzer run fails and monitor.sh rolls back.
+        export_artifacts.write_export(
+            os.path.dirname(os.path.abspath(output_file)),
+            "duplicate", export_rows, summary_counts, collection_status,
+            generated_at=generated_at,
+        )
 
 
 _PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -1775,6 +1876,7 @@ _PAGE_TEMPLATE = """<!DOCTYPE html>
 <title>Duplicate IP / MAC Analysis</title>
 <link rel="shortcut icon" href="/png/favicon.ico">
 <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+<link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 body { font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; background:#1e1e1e; color:#d4d4d4; padding:20px; min-height:100vh; }
@@ -1887,7 +1989,7 @@ __COVERAGE_BANNER__
 <div class="dashboard-section">
   <div class="section-header">Duplicate IPs (per VLAN / VNI)</div>
   <div class="section-content">
-    <table class="dup-table" id="ipt">
+    <table class="dup-table" id="ipt" data-filterable>
       <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
       <tbody>__IP_ROWS__</tbody>
     </table>
@@ -1896,7 +1998,7 @@ __COVERAGE_BANNER__
 <div class="dashboard-section">
   <div class="section-header">MAC Findings &mdash; Confirmed Conflicts / DAD / Mobility (per VLAN / VNI)</div>
   <div class="section-content">
-    <table class="dup-table" id="mact">
+    <table class="dup-table" id="mact" data-filterable>
       <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>MAC</th><th>Local On (switch:port)</th><th>Conflict / Observed VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Meaning</th></tr></thead>
       <tbody>__MAC_ROWS__</tbody>
     </table>
@@ -1905,7 +2007,7 @@ __COVERAGE_BANNER__
 <div class="dashboard-section">
   <div class="section-header">APIPA / DHCP-failed (169.254.0.0/16) per switch &amp; VLAN &mdash; __APIPA_UNIQUE__ unique endpoint(s), __APIPA_SIGHTINGS__ sighting(s)</div>
   <div class="section-content">
-    <table class="dup-table" id="apt">
+    <table class="dup-table" id="apt" data-filterable>
       <thead><tr><th>Severity</th><th>Switch</th><th>VLAN</th><th>Sightings on switch</th></tr></thead>
       <tbody>__APIPA_ROWS__</tbody>
     </table>
@@ -2144,6 +2246,7 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>"""

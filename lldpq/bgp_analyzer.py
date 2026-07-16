@@ -17,6 +17,7 @@ import html
 import tempfile
 
 import analysis_sidecar
+import export_artifacts
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
@@ -1149,6 +1150,7 @@ class BGPAnalyzer:
     <title>BGP Neighbor Analysis</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -2785,6 +2787,7 @@ class BGPAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
+    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
     <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body>
 </html>
@@ -2825,40 +2828,59 @@ class BGPAnalyzer:
             round(summary["health_ratio"], 1)
             if summary["health_ratio"] is not None else None
         )
+        bgp_summary_payload = {
+            "domain": "bgp",
+            "generated_at": generated_at,
+            "collection_status": coverage_status,
+            "coverage_expected": expected_devices,
+            "coverage_current": current_bgp_devices,
+            "total_devices": summary["total_devices"],
+            "total_neighbors": summary["total_neighbors"],
+            "established_neighbors": summary["established_neighbors"],
+            "problem_neighbors": problem_neighbors,
+            "warning_neighbors": summary["warning_neighbors"],
+            "critical_neighbors": summary["critical_neighbors"],
+            "stale_devices": summary["stale_devices"],
+            "unknown_devices": summary["unknown_devices"],
+            "health_percent": health_percent,
+        }
+        evpn_summary_payload = {
+            "domain": "evpn",
+            "generated_at": generated_at,
+            "collection_status": coverage_status,
+            "coverage_expected": expected_devices,
+            "coverage_current": current_evpn_devices,
+            "total_vnis": evpn_summary["total_vnis"],
+            "l2_vnis": evpn_summary["l2_vnis"],
+            "l3_vnis": evpn_summary["l3_vnis"],
+            "type2_routes": evpn_summary["type2_routes"],
+            "type5_routes": evpn_summary["type5_routes"],
+            "route_coverage": route_coverage,
+        }
         _atomic_write(
             os.path.join(summary_dir, "bgp-summary.json"),
-            json.dumps({
-                "domain": "bgp",
-                "generated_at": generated_at,
-                "collection_status": coverage_status,
-                "coverage_expected": expected_devices,
-                "coverage_current": current_bgp_devices,
-                "total_devices": summary["total_devices"],
-                "total_neighbors": summary["total_neighbors"],
-                "established_neighbors": summary["established_neighbors"],
-                "problem_neighbors": problem_neighbors,
-                "warning_neighbors": summary["warning_neighbors"],
-                "critical_neighbors": summary["critical_neighbors"],
-                "stale_devices": summary["stale_devices"],
-                "unknown_devices": summary["unknown_devices"],
-                "health_percent": health_percent,
-            }) + "\n",
+            json.dumps(bgp_summary_payload) + "\n",
         )
         _atomic_write(
             os.path.join(summary_dir, "evpn-summary.json"),
-            json.dumps({
-                "domain": "evpn",
-                "generated_at": generated_at,
-                "collection_status": coverage_status,
-                "coverage_expected": expected_devices,
-                "coverage_current": current_evpn_devices,
-                "total_vnis": evpn_summary["total_vnis"],
-                "l2_vnis": evpn_summary["l2_vnis"],
-                "l3_vnis": evpn_summary["l3_vnis"],
-                "type2_routes": evpn_summary["type2_routes"],
-                "type5_routes": evpn_summary["type5_routes"],
-                "route_coverage": route_coverage,
-            }) + "\n",
+            json.dumps(evpn_summary_payload) + "\n",
+        )
+
+        # Public machine-readable export: same rows the HTML table embeds
+        # (problems-first order), same headline counts as bgp-summary.json.
+        # I/O errors must propagate so the monitor transaction rolls back.
+        export_counts = {
+            key: value for key, value in bgp_summary_payload.items()
+            if key not in ("domain", "generated_at", "collection_status")
+        }
+        export_artifacts.write_export(
+            os.path.dirname(os.path.abspath(output_file)),
+            "bgp",
+            list(row_details.values()),
+            export_counts,
+            coverage_status,
+            generated_at=generated_at,
+            extra={"evpn": evpn_summary_payload},
         )
 
 if __name__ == "__main__":

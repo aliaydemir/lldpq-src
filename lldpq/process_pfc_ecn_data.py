@@ -31,6 +31,13 @@ from collection_freshness import (
     is_current_collection,
     read_asset_snapshot,
 )
+import export_artifacts
+
+try:
+    from device_names import canonical
+except Exception:
+    def canonical(_n):
+        return _n
 
 
 PORT_RE = re.compile(r"^swp[0-9]+(?:s[0-9]+)?$")
@@ -1048,6 +1055,7 @@ def render_report(
 <title>PFC/ECN Analysis</title>
 <link rel="shortcut icon" href="/png/favicon.ico">
 <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+<link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
 <meta name="totalPorts" content="{total}"><meta name="exactPorts" content="{exact}">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
@@ -1461,6 +1469,7 @@ async function runAnalysis() {{
 }}
 </script>
 <script src="/p2p-alias.js"></script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 <script src="/css/analysis-guard.js?v=20260707-scoped-runner-2"></script>
 </body></html>'''
 
@@ -1789,6 +1798,32 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         },
     )
     finish_phase("write_state")
+    # Public machine-readable export: the same per-port records the report
+    # table renders, in the same (hostname, interface) order, with the same
+    # status key (traffic signal for analyzed samples, sample status otherwise).
+    export_rows = []
+    for row in sorted(records, key=lambda entry: (entry["hostname"], entry["interface"])):
+        deltas, rates = row["deltas"], row["rates"]
+        status = str(row["sample_status"])
+        export_rows.append({
+            "device": canonical(row["hostname"]),
+            "interface": row["interface"],
+            "status": str(row.get("signal", "quiet")) if status == "analyzed" else status,
+            "signal": row.get("signal"),
+            "ecn_marked_delta": deltas.get("ecn_marked_frames"),
+            "ecn_marked_rate": rates.get("ecn_marked_frames"),
+            "rx_pause_delta": deltas.get("rx_pause_frames"),
+            "rx_pause_rate": rates.get("rx_pause_frames"),
+            "tx_pause_delta": deltas.get("tx_pause_frames"),
+            "tx_pause_rate": rates.get("tx_pause_frames"),
+            "loss_delta": row.get("loss_delta"),
+            "sample_status": status,
+        })
+    export_artifacts.write_export(
+        result_dir, "pfc-ecn", export_rows, metrics,
+        metrics["collection_status"], generated_at=now,
+    )
+    finish_phase("export")
     print(f"PFC/ECN analysis report generated: {report_path}")
     return True
 

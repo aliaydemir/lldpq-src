@@ -12,6 +12,7 @@ import re
 import sys
 import time
 from datetime import datetime
+import export_artifacts
 from ber_analyzer import BERAnalyzer
 from collection_freshness import (
     asset_snapshot_is_authoritative,
@@ -464,21 +465,36 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
         )
     else:
         collection_status = None
+    generated_at = int(time.time())
+    counts = {
+        "coverage_expected": coverage_expected,
+        "coverage_current": coverage_current,
+        "total_ports": summary["total_ports"],
+        "excellent": len(summary["excellent_ports"]),
+        "good": len(summary["good_ports"]),
+        "warning": len(summary["warning_ports"]),
+        "critical": len(summary["critical_ports"]),
+        "unknown": len(summary["unknown_ports"]),
+    }
     ber_analyzer._atomic_json_write(
         os.path.join(result_dir, "summary", "ber-summary.json"),
         {
             "domain": "ber",
-            "generated_at": int(time.time()),
+            "generated_at": generated_at,
             "collection_status": collection_status,
-            "coverage_expected": coverage_expected,
-            "coverage_current": coverage_current,
-            "total_ports": summary["total_ports"],
-            "excellent": len(summary["excellent_ports"]),
-            "good": len(summary["good_ports"]),
-            "warning": len(summary["warning_ports"]),
-            "critical": len(summary["critical_ports"]),
-            "unknown": len(summary["unknown_ports"]),
+            **counts,
         },
+    )
+    # Public machine-readable export: same rows the HTML table renders
+    # (built in export_ber_data_for_web), same headline counts/status as
+    # ber-summary.json.  I/O failures propagate so monitor.sh rolls back.
+    export_artifacts.write_export(
+        result_dir,
+        "ber",
+        ber_analyzer.export_rows,
+        counts,
+        collection_status,
+        generated_at=generated_at,
     )
     
     # Final summary

@@ -7,6 +7,7 @@
     <link rel="shortcut icon" href="/png/favicon.ico">
     <script src="/css/auth.js"></script>
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <link rel="stylesheet" type="text/css" href="/css/codemirror.min.css">
     <link rel="stylesheet" type="text/css" href="/css/codemirror-theme.min.css">
     <link rel="stylesheet" type="text/css" href="/css/codemirror-dialog.min.css">
@@ -427,7 +428,6 @@
                 </select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
-            <input type="text" id="tableFilter" aria-label="Filter LLDP connections" placeholder="Filter Device..." oninput="debouncedFilterTable()" style="height:34px;padding:0 10px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;font-size:13px;width:220px;outline:none;" autocomplete="off">
             <button id="run-lldp" onclick="runLLDPCheck()" class="btn btn-secondary">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M8,5.14V19.14L19,12.14L8,5.14Z"/>
@@ -991,7 +991,8 @@
             selectedDevices = [];
             deviceSearchActive = false;
             updateSummaryCardSelection();
-            document.getElementById('tableFilter').value = '';
+            const tableFilterInput = document.getElementById('tableFilter');
+            if (tableFilterInput) tableFilterInput.value = '';
             _suppressDeviceChange = true;
             $('#deviceSearch').val(null).trigger('change');
             _suppressDeviceChange = false;
@@ -2340,7 +2341,7 @@
                 const dateStr = now.toISOString().slice(0, 10);
                 const timeStr = now.toTimeString().slice(0, 5).replace(':', '-');
                 const filterSuffix = (currentFilter && currentFilter !== 'ALL') ? `_${currentFilter}` : '';
-                const textFilter = document.getElementById('tableFilter').value.trim();
+                const textFilter = (document.getElementById('tableFilter')?.value || '').trim();
                 const textSuffix = textFilter ? `_${textFilter.replace(/[^a-zA-Z0-9-]/g, '')}` : '';
                 const filename = `LLDP_Report${filterSuffix}${textSuffix}_${dateStr}_${timeStr}.csv`;
                 const csvContent = buildLLDPCSV(renderedConnectionsInTableOrder());
@@ -2774,5 +2775,6 @@
             }
         })();
     </script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 </body>
 </html>

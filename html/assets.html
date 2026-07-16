@@ -6,6 +6,7 @@
     <title>..::LLDPQ::..</title>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
     <link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <link rel="stylesheet" type="text/css" href="/css/codemirror.min.css">
     <link rel="stylesheet" type="text/css" href="/css/codemirror-theme.min.css">
     <style>
@@ -1295,7 +1296,7 @@
         const records = [headers];
         const tbody = document.getElementById('assets-table').querySelector('tbody');
         tbody.querySelectorAll('tr').forEach(row => {
-            if (row.style.display === 'none' || row.cells.length < headers.length) return;
+            if (row.style.display === 'none' || row.classList.contains('tf-hidden') || row.cells.length < headers.length) return;
             records.push(Array.from(row.cells, (cell, index) => index === 0
                 ? (row.dataset.canonicalDevice || canonicalAssetCellText(cell))
                 : canonicalAssetCellText(cell)));
@@ -2088,5 +2089,6 @@ function retrySSHSetup() {
 </div>
 
 <script src="/p2p-alias.js"></script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
 </body>
 </html>

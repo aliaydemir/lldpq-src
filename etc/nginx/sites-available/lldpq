@@ -370,4 +370,73 @@ server {
             fastcgi_param CONTENT_LENGTH $content_length;
             fastcgi_param HTTP_COOKIE $http_cookie;
         }
+
+        # ── Public machine-readable exports ─────────────────────────────
+        # DELIBERATELY UNAUTHENTICATED (external automation: curl | jq).
+        # The monitor-domain exports are static files written inside the
+        # monitor publish transaction; index/LLDP/AI render via fcgiwrap.
+        # A missing static export (pre-first-run) returns the nginx 404;
+        # /export_json reports it as "available": false.
+
+        # Export discovery index
+        location = /export_json {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/export-api.sh;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+        }
+
+        # LLDP wiring results (exact URLs requested by external consumers)
+        location = /lldp_results/export_json {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/lldp-export-api.sh;
+            fastcgi_param LLDPQ_EXPORT_FORMAT json;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+        }
+        location = /lldp_results/export_csv {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/lldp-export-api.sh;
+            fastcgi_param LLDPQ_EXPORT_FORMAT csv;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+        }
+
+        # Latest AI analysis (JSON passthrough of the AI state file)
+        location = /ai/export_json {
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/ai-export-api.sh;
+            fastcgi_param QUERY_STRING $query_string;
+            fastcgi_param REQUEST_METHOD $request_method;
+        }
+
+        # Monitor-domain exports (static, published atomically by monitor.sh)
+        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_json$ {
+            alias /var/www/html/monitor-results/export/$lldpq_export_domain.json;
+            types { }
+            default_type "application/json; charset=utf-8";
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+        }
+        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_csv$ {
+            alias /var/www/html/monitor-results/export/$lldpq_export_domain.csv;
+            types { }
+            default_type "text/csv; charset=utf-8";
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+            add_header Content-Disposition 'attachment; filename="lldpq_${lldpq_export_domain}_export.csv"';
+        }
+
+        # Transceiver inventory export (published by collect-transceiver-fw.sh)
+        location = /transceiver/export_json {
+            alias /var/www/html/monitor-results/transceiver-export.json;
+            types { }
+            default_type "application/json; charset=utf-8";
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+        }
+        location = /transceiver/export_csv {
+            alias /var/www/html/monitor-results/transceiver-export.csv;
+            types { }
+            default_type "text/csv; charset=utf-8";
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+            add_header Content-Disposition 'attachment; filename="lldpq_transceiver_export.csv"';
+        }
 }
