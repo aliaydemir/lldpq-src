@@ -346,10 +346,10 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
             )
             # Each hung read costs one real second in this fixture; shrink the
             # guard so the test stays fast while exercising the same logic.
-            self.assertIn("_optical_timeout_spent_limit=40", remote)
+            self.assertIn("_optical_failed_spent_limit=40", remote)
             remote = remote.replace(
-                "_optical_timeout_spent_limit=40",
-                "_optical_timeout_spent_limit=6",
+                "_optical_failed_spent_limit=40",
+                "_optical_failed_spent_limit=6",
             )
 
             # Ports whose name ends in an odd digit hang (1s then killed) and
@@ -402,6 +402,82 @@ class MonitorCommandTimeoutContractTests(unittest.TestCase):
             self.assertIn("Identifier: 0x18 (QSFP-DD)", collected.stdout)
             self.assertIn(
                 "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:", collected.stdout
+            )
+
+    def test_slow_erroring_dom_reads_abort_via_cumulative_guard(self):
+        """Reads that crawl and then fail with an ordinary error (never a
+        timeout status) must still trip the cumulative failed-read guard.
+
+        This is the production pattern that evaded both timeout-based guards:
+        every DOM read took seconds and exited nonzero with empty output, so
+        no OPTICAL_TIMEOUT marker was ever produced and the section burned
+        its whole budget port by port.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            remote, timeout_stub, env = self._interpolate_remote(root, "optical")
+
+            net_root = root / "sys-class-net"
+            for index in range(1, 13):
+                port_root = net_root / f"swp{index}"
+                port_root.mkdir(parents=True)
+                (port_root / "operstate").write_text("up\n", encoding="utf-8")
+            remote = remote.replace(
+                "_lldpq_net_class_root=/sys/class/net",
+                f'_lldpq_net_class_root="{net_root}"',
+            )
+            self.assertIn("_optical_failed_spent_limit=40", remote)
+            remote = remote.replace(
+                "_optical_failed_spent_limit=40",
+                "_optical_failed_spent_limit=3",
+            )
+
+            # Every DOM read crawls for a second, then fails with a plain
+            # ethtool error: exit status 1, no timeout status, no output.
+            timeout_stub.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in *ethtool*) sleep 1; exit 1 ;; esac\n"
+                "while [ $# -gt 0 ]; do\n"
+                "    case \"$1\" in\n"
+                "        -k) shift 2 ;;\n"
+                "        [0-9]*s) shift ;;\n"
+                "        *) break ;;\n"
+                "    esac\n"
+                "done\n"
+                "exec \"$@\"\n",
+                encoding="utf-8",
+            )
+            timeout_stub.chmod(0o755)
+            sort_stub = root / "sort"
+            sort_stub.write_text(
+                "#!/bin/sh\n[ \"$1\" = -V ] && shift\nexec /usr/bin/sort \"$@\"\n",
+                encoding="utf-8",
+            )
+            sort_stub.chmod(0o755)
+            env["PATH"] = str(root) + os.pathsep + "/usr/bin:/bin"
+
+            collected = subprocess.run(
+                ["/bin/sh"],
+                input=remote,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(collected.returncode, 0, collected.stderr)
+            # No timeout statuses -> no OPTICAL_TIMEOUT markers, but the
+            # cumulative guard must still abandon the section and publish the
+            # tail as explicit unvisited coverage.
+            self.assertEqual(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:"),
+                0,
+                collected.stdout,
+            )
+            self.assertGreater(
+                collected.stdout.count("__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:"),
+                0,
+                collected.stdout,
             )
 
     def test_timeoutless_remote_never_runs_ethtool_and_publishes_partial_optical(self):

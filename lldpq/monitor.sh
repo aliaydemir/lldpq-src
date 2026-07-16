@@ -3148,22 +3148,25 @@ EOF
                 _optical_deadline=$(($(date +%s) + OPTICAL_COLLECTION_BUDGET_SECONDS))
                 _optical_has_timeout=true
                 command -v timeout >/dev/null 2>&1 || _optical_has_timeout=false
-                # Stuck-DOM detection: a streak of consecutive full timeouts
-                # (the first of which was already retried) means the EEPROM
-                # bus is hung from that region onward — device-wide or as a
-                # contiguous block. Hung ports interleaved with healthy ones
-                # never form a streak, so a second, pattern-independent guard
-                # bounds the total wall time spent inside timed-out reads.
-                # Observed in production: one sick switch burned the whole
-                # optical budget every run and set the fabric-wide collection
-                # wall, and the budget always died inside the hung region, so
-                # the tail was never visited anyway. Aborting the section
-                # early therefore costs no coverage; unvisited ports keep the
-                # same explicit partial-coverage marker a budget exhaustion
-                # produces.
+                # Sick-DOM detection, two guards. (a) A streak of consecutive
+                # full timeouts (the first of which was already retried)
+                # means the EEPROM bus is hung from that region onward.
+                # (b) The cumulative wall time of every UNSUCCESSFUL read
+                # bounds all the other sick patterns: reads that crawl for
+                # seconds and then fail with an ordinary ethtool error never
+                # hit the timeout status at all, and hung ports interleaved
+                # with healthy ones never form a streak. Instant benign
+                # errors (DAC/copper ports) add only milliseconds, so healthy
+                # devices never approach the limit. Observed in production:
+                # one sick switch burned the whole optical budget every run
+                # and set the fabric-wide collection wall, and the budget
+                # always died inside the sick region, so the tail was never
+                # visited anyway. Aborting the section early therefore costs
+                # no coverage; unvisited ports keep the same explicit
+                # partial-coverage marker a budget exhaustion produces.
                 _optical_consecutive_timeouts=0
-                _optical_timeout_spent=0
-                _optical_timeout_spent_limit=40
+                _optical_failed_spent=0
+                _optical_failed_spent_limit=40
                 _optical_abort=false
                 while IFS= read -r interface; do
                     [ -n "$interface" ] || continue
@@ -3224,16 +3227,18 @@ EOF
                                         echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
                                     fi
                                 fi
-                                if [ "$_optical_status" -eq 124 ] || \
-                                   [ "$_optical_status" -eq 137 ]; then
-                                    _optical_consecutive_timeouts=$((_optical_consecutive_timeouts + 1))
-                                    _optical_timeout_spent=$((_optical_timeout_spent + $(date +%s) - _optical_read_started))
+                                if [ "$_optical_status" -eq 0 ] && [ -n "$ethtool_output" ]; then
+                                    _optical_consecutive_timeouts=0
+                                else
+                                    _optical_failed_spent=$((_optical_failed_spent + $(date +%s) - _optical_read_started))
+                                    if [ "$_optical_status" -eq 124 ] || \
+                                       [ "$_optical_status" -eq 137 ]; then
+                                        _optical_consecutive_timeouts=$((_optical_consecutive_timeouts + 1))
+                                    fi
                                     if [ "$_optical_consecutive_timeouts" -ge 4 ] ||
-                                       [ "$_optical_timeout_spent" -ge "$_optical_timeout_spent_limit" ]; then
+                                       [ "$_optical_failed_spent" -ge "$_optical_failed_spent_limit" ]; then
                                         _optical_abort=true
                                     fi
-                                elif [ "$_optical_status" -eq 0 ] && [ -n "$ethtool_output" ]; then
-                                    _optical_consecutive_timeouts=0
                                 fi
                             fi
                         else
