@@ -1617,10 +1617,10 @@ class BERAnalyzer:
                         <th class="sortable" data-column="2" data-type="string">Neighbor Device <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="3" data-type="port">Neighbor Port <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="4" data-type="ber-status">Status <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="5" data-type="ber-value">Frame Error Density <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="5" data-type="ber-value" title="Frame Error Density">Frame Err Dens <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="6" data-type="ber-value">Physical BER <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="7" data-type="ber-value">Effective BER <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="8" data-type="number">PHY Symbol Δ / Total <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="8" data-type="number" title="PHY symbol errors: Δ since last sample / lifetime total">PHY Symbol Δ <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="9" data-type="number">Δ Pkt <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="10" data-type="number">Δ Err (RX/TX) <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="11" data-type="number">Δ Drop (RX/TX) <span class="sort-arrow"></span></th>
