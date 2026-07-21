@@ -555,10 +555,13 @@ class BERAnalyzer:
         def remember(delta_rx_errors=0, delta_tx_errors=0,
                      delta_rx_bytes=0, delta_tx_bytes=0,
                      delta_rx_packets=0, delta_tx_packets=0,
-                     sample_seconds=0.0, reset=False):
+                     sample_seconds=0.0, reset=False,
+                     delta_rx_dropped=0, delta_tx_dropped=0):
             self._last_delta_details[port_key] = {
                 'delta_rx_errors': delta_rx_errors,
                 'delta_tx_errors': delta_tx_errors,
+                'delta_rx_dropped': delta_rx_dropped,
+                'delta_tx_dropped': delta_tx_dropped,
                 'delta_rx_bytes': delta_rx_bytes,
                 'delta_tx_bytes': delta_tx_bytes,
                 'delta_rx_packets': delta_rx_packets,
@@ -566,7 +569,7 @@ class BERAnalyzer:
                 'sample_duration_seconds': max(0.0, sample_seconds),
                 'counter_reset': reset,
             }
-        
+
         # Extract current values
         current_rx_errors = current_stats.get('rx_errors', 0)
         current_tx_errors = current_stats.get('tx_errors', 0)
@@ -574,6 +577,8 @@ class BERAnalyzer:
         current_tx_bytes = current_stats.get('tx_bytes', 0)
         current_rx_packets = current_stats.get('rx_packets', 0)
         current_tx_packets = current_stats.get('tx_packets', 0)
+        current_rx_dropped = current_stats.get('rx_dropped', 0)
+        current_tx_dropped = current_stats.get('tx_dropped', 0)
         
         # Check if we have baseline data for this interface
         if hostname not in self.baseline_data:
@@ -588,6 +593,8 @@ class BERAnalyzer:
                 'tx_bytes': current_tx_bytes,
                 'rx_packets': current_rx_packets,
                 'tx_packets': current_tx_packets,
+                'rx_dropped': current_rx_dropped,
+                'tx_dropped': current_tx_dropped,
                 'timestamp': current_time
             }
             remember()
@@ -600,13 +607,19 @@ class BERAnalyzer:
             sample_seconds = current_time - float(baseline.get('timestamp', current_time))
         except (TypeError, ValueError):
             sample_seconds = 0.0
+        # Older baselines predate drop tracking: default to the current value
+        # so the first post-upgrade sample reads +0 instead of a false spike.
+        baseline_rx_dropped = baseline.get('rx_dropped', current_rx_dropped)
+        baseline_tx_dropped = baseline.get('tx_dropped', current_tx_dropped)
         current_counters = (
             current_rx_errors, current_tx_errors, current_rx_bytes,
             current_tx_bytes, current_rx_packets, current_tx_packets,
+            current_rx_dropped, current_tx_dropped,
         )
         baseline_counters = (
             baseline['rx_errors'], baseline['tx_errors'], baseline['rx_bytes'],
             baseline['tx_bytes'], baseline['rx_packets'], baseline['tx_packets'],
+            baseline_rx_dropped, baseline_tx_dropped,
         )
         if any(current < previous for current, previous in
                zip(current_counters, baseline_counters)):
@@ -619,6 +632,8 @@ class BERAnalyzer:
                 'tx_bytes': current_tx_bytes,
                 'rx_packets': current_rx_packets,
                 'tx_packets': current_tx_packets,
+                'rx_dropped': current_rx_dropped,
+                'tx_dropped': current_tx_dropped,
                 'timestamp': current_time,
             }
             remember(sample_seconds=sample_seconds, reset=True)
@@ -630,7 +645,9 @@ class BERAnalyzer:
         delta_tx_bytes = current_tx_bytes - baseline['tx_bytes']
         delta_rx_packets = current_rx_packets - baseline['rx_packets']
         delta_tx_packets = current_tx_packets - baseline['tx_packets']
-        
+        delta_rx_dropped = current_rx_dropped - baseline_rx_dropped
+        delta_tx_dropped = current_tx_dropped - baseline_tx_dropped
+
         total_delta_errors = delta_rx_errors + delta_tx_errors
         total_delta_bytes = delta_rx_bytes + delta_tx_bytes
         total_delta_packets = delta_rx_packets + delta_tx_packets
@@ -640,6 +657,8 @@ class BERAnalyzer:
             delta_rx_bytes, delta_tx_bytes,
             delta_rx_packets, delta_tx_packets,
             sample_seconds,
+            delta_rx_dropped=delta_rx_dropped,
+            delta_tx_dropped=delta_tx_dropped,
         )
         
         # Calculate the observed directional event density before applying the
@@ -682,6 +701,8 @@ class BERAnalyzer:
             'tx_bytes': current_tx_bytes,
             'rx_packets': current_rx_packets,
             'tx_packets': current_tx_packets,
+            'rx_dropped': current_rx_dropped,
+            'tx_dropped': current_tx_dropped,
             'timestamp': current_time
         }
         # Note: save_baseline_data() called once after all interfaces processed
@@ -1040,6 +1061,8 @@ class BERAnalyzer:
             "delta_packets": stats.get('delta_packets', 0),
             "delta_rx_errors": stats.get('delta_rx_errors', 0),
             "delta_tx_errors": stats.get('delta_tx_errors', 0),
+            "delta_rx_dropped": stats.get('delta_rx_dropped', 0),
+            "delta_tx_dropped": stats.get('delta_tx_dropped', 0),
             "total_packets": stats.get('total_packets', 0),
             "rx_errors": stats.get('rx_errors', 0),
             "tx_errors": stats.get('tx_errors', 0),
@@ -1120,6 +1143,8 @@ class BERAnalyzer:
                         ],
                         "delta_rx_errors": port_info.get('delta_rx_errors', 0),
                         "delta_tx_errors": port_info.get('delta_tx_errors', 0),
+                        "delta_rx_dropped": port_info.get('delta_rx_dropped', 0),
+                        "delta_tx_dropped": port_info.get('delta_tx_dropped', 0),
                     },
                     "action": f"Immediate attention required - check cable and transceivers for {port_name}"
                 })
@@ -1150,6 +1175,8 @@ class BERAnalyzer:
                         ],
                         "delta_rx_errors": port_info.get('delta_rx_errors', 0),
                         "delta_tx_errors": port_info.get('delta_tx_errors', 0),
+                        "delta_rx_dropped": port_info.get('delta_rx_dropped', 0),
+                        "delta_tx_dropped": port_info.get('delta_tx_dropped', 0),
                     },
                     "action": f"Monitor {port_name} closely and consider preventive maintenance"
                 })
@@ -1595,8 +1622,8 @@ class BERAnalyzer:
                         <th class="sortable" data-column="7" data-type="ber-value">Effective BER <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="8" data-type="number">PHY Symbol Δ / Total <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="9" data-type="number">Δ Pkt <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="10" data-type="number">Δ RX Err <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="11" data-type="number">Δ TX Err <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="10" data-type="number">Δ Err (RX/TX) <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="11" data-type="number">Δ Drop (RX/TX) <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="12" data-type="time">Updated / Window <span class="sort-arrow"></span></th>
                     </tr>
                 </thead>
@@ -1704,6 +1731,17 @@ class BERAnalyzer:
             except (TypeError, ValueError):
                 ts_sort = 0.0
 
+            # Composite RX/TX cells keep the table at 13 columns; the sort key
+            # is the worse direction.
+            delta_rx_err = port_info.get('delta_rx_errors', 0)
+            delta_tx_err = port_info.get('delta_tx_errors', 0)
+            delta_rx_drop = port_info.get('delta_rx_dropped', 0)
+            delta_tx_drop = port_info.get('delta_tx_dropped', 0)
+            err_display = f"{delta_rx_err:,} / {delta_tx_err:,}"
+            err_sort = max(delta_rx_err, delta_tx_err)
+            drop_display = f"{delta_rx_drop:,} / {delta_tx_drop:,}"
+            drop_sort = max(delta_rx_drop, delta_tx_drop)
+
             detail = {
                 'status': status,
                 'severity_reasons': port_info.get('severity_reasons') or [],
@@ -1716,6 +1754,8 @@ class BERAnalyzer:
                 'delta_packets': port_info.get('delta_packets', 0),
                 'delta_rx_errors': port_info.get('delta_rx_errors', 0),
                 'delta_tx_errors': port_info.get('delta_tx_errors', 0),
+                'delta_rx_dropped': port_info.get('delta_rx_dropped', 0),
+                'delta_tx_dropped': port_info.get('delta_tx_dropped', 0),
                 'sample_window': sample_window,
             }
             port_details[port_name] = detail
@@ -1735,6 +1775,8 @@ class BERAnalyzer:
                 'delta_packets': detail['delta_packets'],
                 'delta_rx_errors': detail['delta_rx_errors'],
                 'delta_tx_errors': detail['delta_tx_errors'],
+                'delta_rx_dropped': detail['delta_rx_dropped'],
+                'delta_tx_dropped': detail['delta_tx_dropped'],
                 'sample_window': detail['sample_window'],
                 'severity_reasons': '; '.join(
                     str(reason) for reason in detail['severity_reasons']
@@ -1753,8 +1795,8 @@ class BERAnalyzer:
                     <td>{eff_display}</td>
                     <td data-sort="{sym_sort}">{sym_display}</td>
                     <td>{port_info['delta_packets']:,}</td>
-                    <td>{port_info['delta_rx_errors']:,}</td>
-                    <td>{port_info['delta_tx_errors']:,}</td>
+                    <td data-sort="{err_sort}">{err_display}</td>
+                    <td data-sort="{drop_sort}">{drop_display}</td>
                     <td data-sort="{ts_sort}">{timestamp} / {sample_window}</td>
                 </tr>
 """
@@ -2309,6 +2351,7 @@ class BERAnalyzer:
                 + '<span>Effective BER (post-FEC)</span><span>' + berFmtBer(details.effective_ber) + '</span>'
                 + '<span>PHY Symbol Errors</span><span>' + berEsc(symText) + '</span>'
                 + '<span>&Delta; Packets / RX Err / TX Err</span><span>' + berFmtInt(details.delta_packets) + ' / ' + berFmtInt(details.delta_rx_errors) + ' / ' + berFmtInt(details.delta_tx_errors) + '</span>'
+                + '<span>&Delta; RX Drop / TX Drop</span><span>' + berFmtInt(details.delta_rx_dropped) + ' / ' + berFmtInt(details.delta_tx_dropped) + '</span>'
                 + '<span>Sample Window</span><span>' + berEsc(String(details.sample_window || 'N/A')) + '</span>'
                 + '</div>'
                 + '<div><strong style="color:#d4d4d4;">Severity evidence:</strong></div>'

@@ -77,7 +77,8 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "device", "interface", "neighbor_device", "neighbor_port", "status",
         "sample_status", "raw_ber", "effective_ber", "frame_error_density",
         "symbol_errors", "symbol_error_delta", "delta_packets",
-        "delta_rx_errors", "delta_tx_errors", "sample_window",
+        "delta_rx_errors", "delta_tx_errors",
+        "delta_rx_dropped", "delta_tx_dropped", "sample_window",
         "severity_reasons",
     ),
     "pfc-ecn": (

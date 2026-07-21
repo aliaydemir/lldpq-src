@@ -277,6 +277,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                             'delta_packets': 0,
                             'delta_rx_errors': 0,
                             'delta_tx_errors': 0,
+                            'delta_rx_dropped': 0,
+                            'delta_tx_dropped': 0,
                             'sample_duration_seconds': delta_details.get(
                                 'sample_duration_seconds', 0
                             ),
@@ -313,6 +315,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                             'delta_packets': delta_packets,
                             'delta_rx_errors': delta_details.get('delta_rx_errors', 0),
                             'delta_tx_errors': delta_details.get('delta_tx_errors', 0),
+                            'delta_rx_dropped': delta_details.get('delta_rx_dropped', 0),
+                            'delta_tx_dropped': delta_details.get('delta_tx_dropped', 0),
                             'sample_duration_seconds': delta_details.get(
                                 'sample_duration_seconds', 0
                             ),
@@ -342,6 +346,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                         'delta_packets': delta_packets,
                         'delta_rx_errors': delta_details.get('delta_rx_errors', 0),
                         'delta_tx_errors': delta_details.get('delta_tx_errors', 0),
+                        'delta_rx_dropped': delta_details.get('delta_rx_dropped', 0),
+                        'delta_tx_dropped': delta_details.get('delta_tx_dropped', 0),
                         'sample_duration_seconds': delta_details.get(
                             'sample_duration_seconds', 0
                         ),
