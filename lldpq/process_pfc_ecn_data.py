@@ -769,6 +769,14 @@ def _fmt_sample_time(timestamp: float) -> str:
 # per-device history shard it fetches on demand when a row is expanded.
 HISTORY_DETAIL_SAMPLES = 24
 
+# At fabric scale (60k+ ports) a single synchronous <tbody> freezes the tab
+# for minutes, so only rows that need eyes render inline; quiet rows ship in
+# an inert text/html block the page hydrates in chunks after first paint.
+# The sentinel joins deferred rows; every dynamic value inside a row is
+# HTML-escaped, so the sentinel can never occur within row content.
+DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
+INLINE_ROW_CAP = 5000
+
 
 def summarize_records(
     records: List[Mapping[str, Any]],
@@ -891,7 +899,8 @@ def render_report(
         f' data-discard-active-ports="{loss_active}"></div>'
     )
 
-    rows = []
+    inline_rows: List[str] = []
+    deferred_rows: List[str] = []
     for row in records:
         counters, deltas, rates = row["counters"], row["deltas"], row["rates"]
         status = str(row["sample_status"])
@@ -946,7 +955,7 @@ def render_report(
             for name, value in row_flags.items()
         )
         port_key = html.escape(str(row.get("port_key") or f"{hostname}:{interface}"), quote=True)
-        rows.append(f'''<tr class="port-row" data-search="{search}" data-status="{html.escape(status_key, quote=True)}" data-device="{html.escape(hostname, quote=True)}" data-port-key="{port_key}" {flag_attrs} onclick="togglePfcDetails(this)">
+        (deferred_rows if status_key == "quiet" else inline_rows).append(f'''<tr class="port-row" data-search="{search}" data-status="{html.escape(status_key, quote=True)}" data-device="{html.escape(hostname, quote=True)}" data-port-key="{port_key}" {flag_attrs} onclick="togglePfcDetails(this)">
 <td data-sort="{html.escape(hostname, quote=True)}" data-csv-value="{html.escape(hostname, quote=True)}" data-p2p-namespace="devices"><span data-p2p-key="{html.escape(hostname, quote=True)}" data-p2p-namespace="devices">{html.escape(hostname)}</span></td>
 <td data-sort="{html.escape(interface, quote=True)}" data-csv-value="{html.escape(interface, quote=True)}" data-p2p-namespace="interfaces"><code data-p2p-key="{html.escape(interface, quote=True)}" data-p2p-namespace="interfaces">{html.escape(interface)}</code></td>
 <td data-sort="{html.escape(status_label, quote=True)}"><span class="badge {status_class}">{html.escape(status_label)}</span></td>
@@ -1003,7 +1012,23 @@ def render_report(
         + html.escape(empty_message)
         + '</td></tr>'
     )
-    table_body = "".join(rows) if rows else empty_row
+    # A fabric-wide incident could push every port row inline; cap the
+    # synchronous render and hydrate the overflow first (it precedes the
+    # quiet rows in the deferred payload).
+    if len(inline_rows) > INLINE_ROW_CAP:
+        deferred_rows = inline_rows[INLINE_ROW_CAP:] + deferred_rows
+        inline_rows = inline_rows[:INLINE_ROW_CAP]
+    table_body = "".join(inline_rows) if records else empty_row
+    deferred_count = len(deferred_rows)
+    deferred_script = (
+        '<script type="text/html" id="pfc-deferred-rows">'
+        + DEFERRED_ROW_SENTINEL.join(deferred_rows)
+        + '</script>'
+    ) if deferred_rows else ''
+    device_list_json = json.dumps(
+        sorted({str(row["hostname"]) for row in records}),
+        separators=(",", ":"), ensure_ascii=True,
+    ).replace("</", "<\\/")
     return f'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>PFC/ECN Analysis</title>
@@ -1067,6 +1092,7 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
 <section class="dashboard-section"><div class="section-header">Port Details</div><div class="section-content-table">
 <div class="toolbar"><input id="search" type="search" placeholder="Search device, port, or status..." aria-label="Search ports"><select id="statusFilter" aria-label="Filter status"><option value="">All statuses</option><option value="quiet">No ECN/PFC activity</option><option value="ecn">ECN marking</option><option value="pfc">PFC activity</option><option value="combined">ECN + PFC</option><option value="loss">Discards</option><option value="missing">Data missing</option><option value="first_sample">Baseline set</option><option value="counter_reset">Counter reset</option><option value="collection_error">Collection failed</option></select></div>
 <div id="summary-filter-info" class="filter-info" hidden><span id="summary-filter-text"></span><button id="clear-summary-filter" type="button">Clear card filter</button></div>
+<div id="hydration-progress" class="filter-info" hidden><span id="hydration-progress-text"></span></div>
 <div class="table-wrap"><table id="ports"><thead><tr>
 <th class="sortable" data-type="string" aria-sort="none" title="Switch hostname">Device <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="string" aria-sort="none" title="Physical switch interface">Port <span class="sort-arrow">▲▼</span></th>
@@ -1082,6 +1108,8 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
 <th class="sortable" data-type="number" aria-sort="none" title="Combined TC3 unicast-buffer and WRED discard change">Discard Δ <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="number" aria-sort="none" title="Latest sample time and elapsed comparison window">Sample / Window <span class="sort-arrow">▲▼</span></th>
 </tr></thead><tbody>{table_body}</tbody></table></div></div></section>
+<script type="application/json" id="pfc-device-list">{device_list_json}</script>
+{deferred_script}
 <div id="metricGuideModal" class="guide-modal" role="dialog" aria-modal="true" aria-labelledby="metricGuideTitle" aria-hidden="true">
   <div class="guide-modal-box"><div class="guide-modal-head"><h2 id="metricGuideTitle">PFC/ECN Metric Guide</h2><button type="button" class="guide-modal-close" onclick="closeMetricGuide()" title="Close" aria-label="Close metric guide">&times;</button></div>
   <div class="guide-modal-body"><div class="guide-intro">This report compares the latest switch counters with the previous successful collection. It monitors traffic class 3 (TC3) and switch priority 3 (SP3). Totals are cumulative hardware counters; “since last sample” values show what changed during the comparison window.</div>
@@ -1130,19 +1158,38 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
     body.querySelectorAll('tr.detail-row').forEach(row => row.remove());
   }}
 
+  function currentFilterState() {{
+    return {{
+      query: search.value.trim().toLowerCase(),
+      status: statusFilter.value,
+      device: deviceSearch.value
+    }};
+  }}
+
+  function anyFilterActive(state) {{
+    return Boolean(state.query || state.status || state.device ||
+      (activeCardFilter && activeCardFilter !== 'all'));
+  }}
+
+  function rowHidden(row, state) {{
+    if (state.query) {{
+      // textContent aggregation is the expensive part; only pay it while a
+      // free-text query is active.
+      const searchable = (row.dataset.search + ' ' + row.textContent).toLowerCase();
+      if (!searchable.includes(state.query)) return true;
+    }}
+    return Boolean(
+      (state.status && row.dataset.status !== state.status) ||
+      (state.device && row.dataset.device !== state.device) ||
+      !matchesCardFilter(row)
+    );
+  }}
+
   function applyFilters() {{
-    const query = search.value.trim().toLowerCase();
-    const status = statusFilter.value;
-    const device = deviceSearch.value;
+    const state = currentFilterState();
     removeDetailRows();
     dataRows().forEach(row => {{
-      const searchable = (row.dataset.search + ' ' + row.textContent).toLowerCase();
-      row.hidden = Boolean(
-        (query && !searchable.includes(query)) ||
-        (status && row.dataset.status !== status) ||
-        (device && row.dataset.device !== device) ||
-        !matchesCardFilter(row)
-      );
+      row.hidden = rowHidden(row, state);
     }});
   }}
 
@@ -1187,9 +1234,17 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
   }}
 
   function populateDevices() {{
-    const devices = [...new Set(
-      dataRows().map(row => row.dataset.device).filter(Boolean)
-    )].sort((a, b) => a.localeCompare(b, undefined, {{numeric: true, sensitivity: 'base'}}));
+    // Deferred rows are not in the DOM yet at init; the server emits the
+    // complete device list so the dropdown never misses hydrating devices.
+    let listed = [];
+    const listEl = document.getElementById('pfc-device-list');
+    if (listEl) {{
+      try {{ listed = JSON.parse(listEl.textContent) || []; }} catch (error) {{ listed = []; }}
+    }}
+    if (!Array.isArray(listed) || !listed.length) {{
+      listed = dataRows().map(row => row.dataset.device).filter(Boolean);
+    }}
+    const devices = [...new Set(listed)].sort((a, b) => a.localeCompare(b, undefined, {{numeric: true, sensitivity: 'base'}}));
     devices.forEach(device => {{
       const option = document.createElement('option');
       option.value = device;
@@ -1260,6 +1315,27 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
       }}
     }});
   }});
+  let rowsAppendedSinceSort = false;
+  function sortRows(index, dir) {{
+    const numeric = headers[index].dataset.type === 'number';
+    rowsAppendedSinceSort = false;
+    removeDetailRows();
+    const sorted = dataRows().sort((a, b) => {{
+      let first = a.cells[index].dataset.sort ?? '';
+      let second = b.cells[index].dataset.sort ?? '';
+      if (first === '' && second === '') return 0;
+      if (first === '') return 1;
+      if (second === '') return -1;
+      if (numeric) return (Number(first) - Number(second)) * dir;
+      return first.localeCompare(second, undefined, {{numeric: true, sensitivity: 'base'}}) * dir;
+    }});
+    // One fragment = one mutation and one reflow instead of a re-append (and
+    // style invalidation) per row — the difference is seconds at 60k rows.
+    const fragment = document.createDocumentFragment();
+    sorted.forEach(row => fragment.appendChild(row));
+    body.appendChild(fragment);
+  }}
+
   headers.forEach((header, index) => header.addEventListener('click', () => {{
     direction = lastColumn === index ? -direction : 1;
     lastColumn = index;
@@ -1268,17 +1344,7 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
     header.setAttribute('aria-sort', direction === 1 ? 'ascending' : 'descending');
     const arrow = header.querySelector('.sort-arrow');
     if (arrow) arrow.textContent = direction === 1 ? '▲' : '▼';
-    const numeric = header.dataset.type === 'number';
-    removeDetailRows();
-    dataRows().sort((a, b) => {{
-      let first = a.cells[index].dataset.sort ?? '';
-      let second = b.cells[index].dataset.sort ?? '';
-      if (first === '' && second === '') return 0;
-      if (first === '') return 1;
-      if (second === '') return -1;
-      if (numeric) return (Number(first) - Number(second)) * direction;
-      return first.localeCompare(second, undefined, {{numeric: true, sensitivity: 'base'}}) * direction;
-    }}).forEach(row => body.appendChild(row));
+    sortRows(index, direction);
   }}));
 
   document.querySelector('#download-csv').addEventListener('click', () => {{
@@ -1290,7 +1356,10 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
       }}
       return cell.textContent.trim().replace(/\\s+/g, ' ');
     }};
-    const visibleRows = dataRows().filter(row => !row.hidden);
+    // table-filter.js funnels hide rows via the tf-hidden class, never via
+    // row.hidden; the export must honor both so it matches the visible table.
+    const visibleRows = dataRows().filter(
+      row => !row.hidden && !row.classList.contains('tf-hidden'));
     const lines = [
       headers.map(cleanHeader),
       ...visibleRows.map(row => [...row.cells].map(canonicalCell))
@@ -1306,9 +1375,80 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }});
 
+  // Chunked hydration of the deferred quiet rows. The inline table carries
+  // only rows that need attention, so first paint is instant; the remaining
+  // rows stream into the tbody in small batches that never block input.
+  const HYDRATION_CHUNK_ROWS = 1500;
+  const DEFERRED_ROW_SENTINEL = '{DEFERRED_ROW_SENTINEL}';
+  const hydrationTotal = {deferred_count};
+  let hydrationDone = 0;
+  const hydrationProgress = document.querySelector('#hydration-progress');
+  const hydrationProgressText = document.querySelector('#hydration-progress-text');
+
+  function updateHydrationProgress(finished) {{
+    if (!hydrationProgress) return;
+    if (finished) {{ hydrationProgress.hidden = true; return; }}
+    hydrationProgress.hidden = false;
+    hydrationProgressText.textContent = 'Loading port rows: '
+      + hydrationDone.toLocaleString() + ' / ' + hydrationTotal.toLocaleString()
+      + ' — search, sort and CSV cover loaded rows until this finishes.';
+  }}
+
+  function hydrateDeferredRows() {{
+    const el = document.getElementById('pfc-deferred-rows');
+    if (!el) {{ updateHydrationProgress(true); return; }}
+    const raw = el.textContent;
+    el.remove();
+    let pos = 0;
+
+    function nextChunk() {{
+      if (pos >= raw.length) {{
+        hydrationDone = hydrationTotal;
+        updateHydrationProgress(true);
+        // Restore the user's chosen order in one pass, but only when chunks
+        // actually landed after the sort — a needless re-sort would close an
+        // open detail panel and reorder the table under the cursor.
+        if (lastColumn >= 0 && rowsAppendedSinceSort) sortRows(lastColumn, direction);
+        return;
+      }}
+      let end = pos;
+      let count = 0;
+      while (count < HYDRATION_CHUNK_ROWS && end < raw.length) {{
+        const i = raw.indexOf(DEFERRED_ROW_SENTINEL, end);
+        end = i === -1 ? raw.length : i + DEFERRED_ROW_SENTINEL.length;
+        count++;
+      }}
+      // Strip the join sentinels before insertion: leaving 63k comment
+      // nodes interleaved with the rows makes later row moves (sorting)
+      // pathologically slow in Blink.
+      body.insertAdjacentHTML(
+        'beforeend', raw.slice(pos, end).replaceAll(DEFERRED_ROW_SENTINEL, ''));
+      pos = end;
+      rowsAppendedSinceSort = true;
+      hydrationDone = Math.min(hydrationTotal, hydrationDone + count);
+      const state = currentFilterState();
+      if (anyFilterActive(state)) {{
+        // Rows already in the table were evaluated when the filter was set;
+        // only the freshly appended tail needs a pass.
+        const kids = body.children;
+        for (let i = kids.length - count; i < kids.length; i++) {{
+          kids[i].hidden = rowHidden(kids[i], state);
+        }}
+      }}
+      updateHydrationProgress(false);
+      setTimeout(nextChunk, 30);
+    }}
+
+    updateHydrationProgress(false);
+    // Give first paint and the rest of DOMContentLoaded room to finish
+    // before the background build starts.
+    setTimeout(nextChunk, 80);
+  }}
+
   populateDevices();
   initDeviceSearch();
   applyRequestedCardFilter();
+  hydrateDeferredRows();
 }})();
 
 // Detail history is no longer embedded in the page (at fabric scale the

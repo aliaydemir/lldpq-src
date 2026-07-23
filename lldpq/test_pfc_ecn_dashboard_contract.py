@@ -181,6 +181,65 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         # alone made the page unloadable.
         self.assertNotIn("pfc-history-data", report)
 
+    def test_quiet_rows_defer_and_attention_rows_render_inline(self):
+        quiet = analyzer.build_port_record(
+            "leaf1", "swp1", BASE_COUNTERS,
+            {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
+        )
+        self.assertEqual(quiet.get("signal"), "quiet")
+        reset_counters = dict(BASE_COUNTERS)
+        reset_counters["ecn_marked_frames"] = 1
+        reset = analyzer.build_port_record(
+            "leaf2", "swp2", reset_counters,
+            {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
+        )
+        self.assertNotEqual(reset["sample_status"], "analyzed")
+        report = analyzer.render_report(
+            [quiet, reset], expected_hosts=2, current_hosts=2
+        )
+        tbody = report.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        deferred = report.split('id="pfc-deferred-rows">', 1)[1].split(
+            "</script>", 1
+        )[0]
+        # Quiet rows must not cost synchronous parse/layout; rows needing
+        # attention must be visible before hydration.
+        self.assertNotIn('data-port-key="leaf1:swp1"', tbody)
+        self.assertIn('data-port-key="leaf1:swp1"', deferred)
+        self.assertIn('data-port-key="leaf2:swp2"', tbody)
+        self.assertNotIn('data-port-key="leaf2:swp2"', deferred)
+        # The hydrator needs the row count and the exact join sentinel.
+        self.assertIn("const hydrationTotal = 1;", report)
+        self.assertIn(
+            f"const DEFERRED_ROW_SENTINEL = '{analyzer.DEFERRED_ROW_SENTINEL}';",
+            report,
+        )
+        # The device dropdown is fed server-side so deferred devices appear
+        # before their rows hydrate.
+        device_list = report.split('id="pfc-device-list">', 1)[1].split(
+            "</script>", 1
+        )[0]
+        self.assertIn('"leaf1"', device_list)
+        self.assertIn('"leaf2"', device_list)
+
+    def test_inline_row_cap_overflows_into_deferred_payload(self):
+        counters = dict(BASE_COUNTERS)
+        counters["ecn_marked_frames"] = 1
+        records = []
+        for index in range(analyzer.INLINE_ROW_CAP + 3):
+            record = analyzer.build_port_record(
+                f"leaf{index}", "swp1", counters,
+                {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
+            )
+            self.assertNotEqual(record["sample_status"], "analyzed")
+            records.append(record)
+        report = analyzer.render_report(
+            records,
+            expected_hosts=len(records), current_hosts=len(records),
+        )
+        tbody = report.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
+        self.assertEqual(tbody.count("port-row"), analyzer.INLINE_ROW_CAP)
+        self.assertIn("const hydrationTotal = 3;", report)
+
 
 if __name__ == "__main__":
     unittest.main()
