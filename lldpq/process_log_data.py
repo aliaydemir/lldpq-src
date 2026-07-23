@@ -31,9 +31,13 @@ except Exception:
 
 
 def json_for_inline_script(value):
-    """Serialize JSON without allowing data to terminate the script element."""
+    """Serialize JSON without allowing data to terminate the script element.
+
+    Compact separators: this blob embeds the whole log corpus into the page,
+    so indentation would roughly double the document size at fabric scale.
+    """
     return (
-        json.dumps(value, indent=2)
+        json.dumps(value, separators=(",", ":"))
         .replace('&', r'\u0026')
         .replace('<', r'\u003c')
         .replace('>', r'\u003e')
@@ -603,7 +607,7 @@ class LogAnalyzer:
             <div class="last-updated">Last Updated: {data_timestamp}</div>
         </div>
         <div class="action-buttons">
-            <input id="messageSearch" class="message-search" type="text" placeholder="Search log text..." oninput="filterByMessage(this.value)">
+            <input id="messageSearch" class="message-search" type="text" placeholder="Search log text..." oninput="debouncedFilterByMessage()">
             <div class="device-search-container">
                 <select id="deviceSearch" style="width: 200px;"><option value="">Search Device...</option></select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
@@ -781,8 +785,12 @@ class LogAnalyzer:
         let deviceSearchActive = false;
         let selectedDevice = '';
         let messageSearchActive = false;
+        let messageSearchDebounceTimer = null;
 
         function resetMessageSearch() {
+            // Also drop any pending debounced text-filter run: it would fire
+            // after the caller applies its own card/device filter and stomp it.
+            clearTimeout(messageSearchDebounceTimer);
             const input = document.getElementById('messageSearch');
             if (input) input.value = '';
             messageSearchActive = false;
@@ -1037,6 +1045,17 @@ class LogAnalyzer:
 
         // Free-text grep over collected log messages (all severities) — the
         // field operators most want to search across the fabric.
+        function debouncedFilterByMessage() {
+            clearTimeout(messageSearchDebounceTimer);
+            // Re-read the input at fire time: a card/device filter click may
+            // clear the field (resetMessageSearch) inside the debounce window
+            // and a captured keystroke value would resurrect the old search.
+            messageSearchDebounceTimer = setTimeout(() => {
+                const input = document.getElementById('messageSearch');
+                filterByMessage(input ? input.value : '');
+            }, 200);
+        }
+
         function filterByMessage(rawText) {
             const text = (rawText || '').trim().toLowerCase();
             const table = document.querySelector('.log-table');

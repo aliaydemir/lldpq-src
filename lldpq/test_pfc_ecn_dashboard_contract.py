@@ -58,7 +58,7 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
             {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
         )
         report = analyzer.render_report(
-            [record], {}, expected_hosts=1, current_hosts=1
+            [record], expected_hosts=1, current_hosts=1
         )
         summary = summary_metadata(report)
 
@@ -87,7 +87,7 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         self.assertEqual(reset["sample_status"], "counter_reset")
 
         report = analyzer.render_report(
-            [reset], {}, expected_hosts=1, current_hosts=1
+            [reset], expected_hosts=1, current_hosts=1
         )
         summary = summary_metadata(report)
         self.assertEqual(summary["data-ready-ports"], "0")
@@ -108,12 +108,12 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
             {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
         )
         partial = summary_metadata(analyzer.render_report(
-            [record], {}, expected_hosts=2, current_hosts=1
+            [record], expected_hosts=2, current_hosts=1
         ))
         self.assertEqual(partial["data-coverage-status"], "partial")
         self.assertEqual(partial["data-interval-status"], "partial")
 
-        unknown = summary_metadata(analyzer.render_report([record], {}))
+        unknown = summary_metadata(analyzer.render_report([record]))
         self.assertEqual(unknown["data-collection-status"], "partial")
         self.assertEqual(unknown["data-coverage-status"], "partial")
         self.assertEqual(unknown["data-interval-status"], "partial")
@@ -130,7 +130,7 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         self.assertEqual(record["sample_status"], "analyzed")
         self.assertIsNone(record["loss_delta"])
         summary = summary_metadata(analyzer.render_report(
-            [record], {}, expected_hosts=1, current_hosts=1
+            [record], expected_hosts=1, current_hosts=1
         ))
         self.assertEqual(summary["data-ready-ports"], "1")
         self.assertEqual(summary["data-discard-ready-ports"], "0")
@@ -138,7 +138,7 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
 
     def test_unavailable_collection_preserves_coverage_diagnostics(self):
         report = analyzer.render_report(
-            [], {}, expected_hosts=2, current_hosts=0,
+            [], expected_hosts=2, current_hosts=0,
             collection_unavailable=True,
         )
         summary = summary_metadata(report)
@@ -151,10 +151,35 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         self.assertIn('data-collection-status="unavailable"', report)
 
     def test_detail_report_accepts_dashboard_filter_links(self):
-        report = analyzer.render_report([], {})
+        report = analyzer.render_report([])
         self.assertIn("new URLSearchParams(window.location.search)", report)
         self.assertIn("item.dataset.cardFilter === requested", report)
         self.assertIn("applyRequestedCardFilter();", report)
+
+    def test_detail_panels_fetch_per_device_history_shards(self):
+        record = analyzer.build_port_record(
+            "leaf1", "swp1", BASE_COUNTERS,
+            {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
+        )
+        report = analyzer.render_report(
+            [record], expected_hosts=1, current_hosts=1
+        )
+        # The browser resolves the shard URL relative to the report, which the
+        # analyzer writes next to the shard directory under monitor-results/.
+        # The path must come from the same constant the shard writer uses.
+        self.assertIn(f"fetch('{analyzer.HISTORY_DIR_NAME}/'", report)
+        self.assertIn(
+            f"const PFC_DETAIL_SAMPLES = {analyzer.HISTORY_DETAIL_SAMPLES};",
+            report,
+        )
+        # Rows must stay wired to the async panel loader: the device attribute
+        # selects the shard, the port key selects the trail inside it.
+        self.assertIn('data-device="leaf1"', report)
+        self.assertIn('data-port-key="leaf1:swp1"', report)
+        self.assertIn('onclick="togglePfcDetails(this)"', report)
+        # The fabric-wide inline history blob must not come back; at scale it
+        # alone made the page unloadable.
+        self.assertNotIn("pfc-history-data", report)
 
 
 if __name__ == "__main__":

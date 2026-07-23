@@ -489,7 +489,8 @@ def _history_record(record: Mapping[str, Any]) -> Dict[str, Any]:
     The history file is rewritten (and re-read, and re-validated) every run,
     so its size directly drives the analyzer's load/write wall time on large
     fabrics. Only the fields the downstream consumers actually read are kept
-    — the detail panels (_detail_history), ai_correlate and ai_insights —
+    — the report's detail panels (fetching shards over HTTP), ai_correlate
+    and ai_insights —
     while absolute counters live in the baseline file, rates are recomputable
     as delta/duration, and hostname/interface repeat the series key.
     """
@@ -657,7 +658,7 @@ def _process_history_shard(
     legacy_seed: Optional[Dict[str, Any]],
     cutoff: float,
     now: float,
-) -> Tuple[str, Optional[str], Dict[str, List[Dict[str, Any]]]]:
+) -> Tuple[str, Optional[str]]:
     """Merge, prune and persist one device's 24h history shard.
 
     Sharding the history per device keeps every run's IO proportional to the
@@ -670,9 +671,9 @@ def _process_history_shard(
     safe because the analyzer transaction in monitor.sh rolls the monolith
     and the shard directory back together on failure.
 
-    Returns ``(hostname, error, detail_samples)`` where ``detail_samples``
-    maps each port key with new data to its bounded recent sample trail for
-    the report's expandable detail panels.
+    Returns ``(hostname, error)``. The report's expandable detail panels read
+    the shard files directly over HTTP, so no sample trail travels back to
+    the parent process.
     """
     try:
         shard = _shard_path(Path(history_dir_text), hostname)
@@ -710,13 +711,9 @@ def _process_history_shard(
             "host": hostname,
             "history": histories,
         })
-        detail = {
-            key: histories.get(key, [])[-HISTORY_DETAIL_SAMPLES:]
-            for key in new_slims
-        }
-        return hostname, None, detail
+        return hostname, None
     except Exception as exc:
-        return hostname, f"{type(exc).__name__}: {exc}", {}
+        return hostname, f"{type(exc).__name__}: {exc}"
 
 
 def _shard_worker_limit(task_count: int) -> int:
@@ -768,48 +765,9 @@ def _fmt_sample_time(timestamp: float) -> str:
     return f"{value.day} {value:%b %Y, %H:%M:%S} UTC"
 
 
+# Newest samples a detail panel shows; the browser slices this bound from the
+# per-device history shard it fetches on demand when a row is expanded.
 HISTORY_DETAIL_SAMPLES = 24
-
-
-def _detail_history(
-    history: Mapping[str, Any], records: Iterable[Mapping[str, Any]]
-) -> Dict[str, List[Dict[str, Any]]]:
-    """Build a compact per-port sample trail for the expandable detail panels.
-
-    Only the fields the panel renders are kept, and each port is bounded to the
-    most recent ``HISTORY_DETAIL_SAMPLES`` entries so the embedded JSON stays
-    small regardless of the persisted 24h retention.
-    """
-    detail: Dict[str, List[Dict[str, Any]]] = {}
-    if not isinstance(history, Mapping):
-        return detail
-    for row in records:
-        key = str(row.get("port_key") or f"{row.get('hostname')}:{row.get('interface')}")
-        samples = history.get(key)
-        trail: List[Dict[str, Any]] = []
-        if isinstance(samples, list):
-            for entry in samples[-HISTORY_DETAIL_SAMPLES:]:
-                if not isinstance(entry, Mapping):
-                    continue
-                deltas = entry.get("deltas") if isinstance(entry.get("deltas"), Mapping) else {}
-                stamp = entry.get("timestamp")
-                trail.append({
-                    # Slim history records store only the epoch timestamp; the
-                    # ISO form survives here for records persisted before that.
-                    "t": entry.get("timestamp_iso") or (
-                        _iso(stamp) if isinstance(stamp, (int, float)) else None
-                    ),
-                    "status": entry.get("sample_status"),
-                    "signal": entry.get("signal"),
-                    "ecn": deltas.get("ecn_marked_frames"),
-                    "rx": deltas.get("rx_pause_frames"),
-                    "tx": deltas.get("tx_pause_frames"),
-                    "loss": entry.get("loss_delta"),
-                    "share": entry.get("ecn_share_percent"),
-                    "dur": entry.get("sample_duration_seconds"),
-                })
-        detail[key] = trail
-    return detail
 
 
 def summarize_records(
@@ -872,7 +830,6 @@ def summarize_records(
 
 def render_report(
     records: List[Mapping[str, Any]],
-    history: Mapping[str, Any],
     expected_hosts: Optional[int] = None,
     current_hosts: Optional[int] = None,
     collection_unavailable: bool = False,
@@ -1047,9 +1004,6 @@ def render_report(
         + '</td></tr>'
     )
     table_body = "".join(rows) if rows else empty_row
-    detail_json = json.dumps(
-        _detail_history(history, records), separators=(",", ":"), ensure_ascii=True
-    ).replace("</", "<\\/")
     return f'''<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>PFC/ECN Analysis</title>
@@ -1076,7 +1030,7 @@ body{{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#1e1e1e
 .metric{{font-size:22px;font-weight:bold;color:#d4d4d4}}.card-info .metric{{color:#4fc3f7}}.card-good .metric{{color:#8bc34a}}.card-warning .metric{{color:#ff9800}}.card-critical .metric{{color:#f44336}}.metric-label{{font-size:12px;color:#aaa;margin-top:4px}}.metric-caption{{font-size:10px;color:#777;margin-top:3px}}
 .toolbar{{display:flex;gap:10px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid #404040}}.toolbar input,.toolbar select{{height:34px;background:#3c3c3c;color:#d4d4d4;border:1px solid #555;border-radius:4px;padding:0 10px;font-size:13px}}.toolbar input{{min-width:260px;flex:1}}
 .filter-info{{margin:10px 16px;padding:8px 12px;background:rgba(118,185,0,.1);border:1px solid rgba(118,185,0,.3);border-radius:5px;color:#9ccc65;font-size:12px}}.filter-info[hidden]{{display:none}}.filter-info button{{margin-left:8px;padding:3px 9px;background:#76b900;color:#000;border:0;border-radius:4px;cursor:pointer;font-size:11px}}
-.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:1200px;font-size:13px}}th,td{{border:1px solid #404040;padding:9px 10px;text-align:left;white-space:nowrap}}th{{background:#333;color:#76b900;font-weight:600;font-size:12px;position:sticky;top:0;z-index:1}}tbody tr{{background:#252526}}tbody tr:hover{{background:#2d2d2d}}td:nth-child(n+4){{text-align:right}}td small{{display:block;color:#888;margin-top:2px}}code{{color:#9cdcfe}}
+.table-wrap{{overflow:auto}}table{{border-collapse:collapse;width:100%;min-width:1200px;font-size:13px}}#ports{{table-layout:fixed}}#ports th:nth-child(1){{width:15%}}#ports th:nth-child(2){{width:7%}}#ports th:nth-child(3){{width:10%}}th,td{{border:1px solid #404040;padding:9px 10px;text-align:left;word-wrap:break-word}}th{{background:#333;color:#76b900;font-weight:600;font-size:12px;position:sticky;top:0;z-index:1}}tbody tr{{background:#252526}}tbody tr:hover{{background:#2d2d2d}}td:nth-child(n+4){{text-align:right}}td small{{display:block;color:#888;margin-top:2px}}code{{color:#9cdcfe}}
 .sortable{{cursor:pointer;user-select:none;padding-right:16px}}.sortable:hover{{background:#3c3c3c}}.sort-arrow{{font-size:10px;color:#666;margin-left:3px;opacity:.65}}.sortable.asc .sort-arrow,.sortable.desc .sort-arrow{{color:#76b900;opacity:1}}
 .badge{{display:inline-block;padding:3px 10px;border-radius:4px;font-size:11px;font-weight:600;text-transform:uppercase}}.badge.ok{{background:rgba(118,185,0,.2);color:#76b900}}.badge.info{{background:rgba(79,195,247,.2);color:#4fc3f7}}.badge.warn{{background:rgba(255,152,0,.2);color:#ffb74d}}.badge.danger{{background:rgba(244,67,54,.2);color:#ff6b6b}}.badge.muted{{background:rgba(158,158,158,.2);color:#aaa}}
 tr.port-row{{cursor:pointer}}tr.empty-row td{{text-align:center;color:#888;padding:18px;white-space:normal}}
@@ -1128,7 +1082,6 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
 <th class="sortable" data-type="number" aria-sort="none" title="Combined TC3 unicast-buffer and WRED discard change">Discard Δ <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="number" aria-sort="none" title="Latest sample time and elapsed comparison window">Sample / Window <span class="sort-arrow">▲▼</span></th>
 </tr></thead><tbody>{table_body}</tbody></table></div></div></section>
-<script id="pfc-history-data" type="application/json">{detail_json}</script>
 <div id="metricGuideModal" class="guide-modal" role="dialog" aria-modal="true" aria-labelledby="metricGuideTitle" aria-hidden="true">
   <div class="guide-modal-box"><div class="guide-modal-head"><h2 id="metricGuideTitle">PFC/ECN Metric Guide</h2><button type="button" class="guide-modal-close" onclick="closeMetricGuide()" title="Close" aria-label="Close metric guide">&times;</button></div>
   <div class="guide-modal-body"><div class="guide-intro">This report compares the latest switch counters with the previous successful collection. It monitors traffic class 3 (TC3) and switch priority 3 (SP3). Totals are cumulative hardware counters; “since last sample” values show what changed during the comparison window.</div>
@@ -1290,7 +1243,11 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
     }});
   }}
 
-  search.addEventListener('input', applyFilters);
+  let searchDebounceTimer = null;
+  search.addEventListener('input', () => {{
+    clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(applyFilters, 200);
+  }});
   statusFilter.addEventListener('change', applyFilters);
   deviceSearch.addEventListener('change', applyFilters);
   document.querySelector('#clear-summary-filter').addEventListener('click', clearCardFilter);
@@ -1354,14 +1311,51 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
   applyRequestedCardFilter();
 }})();
 
-const PFC_HISTORY = (function() {{
-  try {{
-    const el = document.getElementById('pfc-history-data');
-    return el ? JSON.parse(el.textContent) : {{}};
-  }} catch (error) {{
-    return {{}};
+// Detail history is no longer embedded in the page (at fabric scale the
+// inline blob alone reached tens of MB). Each device's 24h shard is fetched
+// on first row expand and cached as a promise to dedupe concurrent clicks.
+const PFC_DETAIL_SAMPLES = {HISTORY_DETAIL_SAMPLES};
+const pfcHistoryCache = new Map();
+function pfcDeviceHistory(device) {{
+  if (!device) return Promise.resolve(null);
+  if (pfcHistoryCache.has(device)) return pfcHistoryCache.get(device);
+  const request = fetch('{HISTORY_DIR_NAME}/' + encodeURIComponent(device) + '.json', {{cache: 'no-store'}})
+    .then(response => {{
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    }})
+    .then(state => (state && typeof state === 'object' &&
+      state.history && typeof state.history === 'object') ? state.history : {{}})
+    .catch(() => {{
+      pfcHistoryCache.delete(device);
+      return null;
+    }});
+  pfcHistoryCache.set(device, request);
+  return request;
+}}
+function pfcTrail(samples) {{
+  // Mirror of the retired server-side _detail_history projection: slim shard
+  // records store epoch timestamps; pre-slim records may carry timestamp_iso.
+  if (!Array.isArray(samples)) return [];
+  const trail = [];
+  for (const entry of samples.slice(-PFC_DETAIL_SAMPLES)) {{
+    if (!entry || typeof entry !== 'object') continue;
+    const deltas = (entry.deltas && typeof entry.deltas === 'object') ? entry.deltas : {{}};
+    const stamp = Number(entry.timestamp);
+    trail.push({{
+      t: entry.timestamp_iso || (Number.isFinite(stamp) ? new Date(stamp * 1000).toISOString() : null),
+      status: entry.sample_status,
+      signal: entry.signal,
+      ecn: deltas.ecn_marked_frames,
+      rx: deltas.rx_pause_frames,
+      tx: deltas.tx_pause_frames,
+      loss: entry.loss_delta,
+      share: entry.ecn_share_percent,
+      dur: entry.sample_duration_seconds
+    }});
   }}
-}})();
+  return trail;
+}}
 function pfcEsc(value) {{
   return String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({{
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -1384,30 +1378,37 @@ function pfcTime(value) {{
     ? pfcEsc(value)
     : d.toISOString().replace('T', ' ').replace(/\\.\\d+Z$/, ' UTC').replace('Z', ' UTC');
 }}
-function togglePfcDetails(row) {{
+async function togglePfcDetails(row) {{
   const next = row.nextElementSibling;
   if (next && next.classList.contains('detail-row')) {{ next.remove(); return; }}
   document.querySelectorAll('tr.detail-row').forEach(r => r.remove());
   const key = row.dataset.portKey || '';
-  const samples = (PFC_HISTORY[key] || []).slice().reverse();
-  let panel;
-  if (!samples.length) {{
-    panel = '<div class="detail-empty">No retained 24-hour sample history for this port yet.</div>';
+  const detail = document.createElement('tr');
+  detail.className = 'detail-row';
+  detail.innerHTML = `<td colspan="13"><div class="detail-panel">`
+    + `<div class="detail-title">Recent 24-hour samples — ${{pfcEsc(key)}}</div>`
+    + `<div class="detail-body detail-empty">Loading sample history…</div></div></td>`;
+  row.after(detail);
+  const history = await pfcDeviceHistory(row.dataset.device || '');
+  // The panel may have been closed (or replaced) while the shard loaded.
+  const body = detail.isConnected && detail.querySelector('.detail-body');
+  if (!body) return;
+  const samples = history === null ? [] : pfcTrail(history[key]).reverse();
+  if (history === null) {{
+    body.textContent = 'Sample history could not be loaded.';
+  }} else if (!samples.length) {{
+    body.textContent = 'No retained 24-hour sample history for this port yet.';
   }} else {{
+    body.classList.remove('detail-empty');
     const rowsHtml = samples.map(s =>
       `<tr><td>${{pfcTime(s.t)}}</td><td>${{pfcEsc(String(s.signal || s.status || '').replace(/_/g, ' '))}}</td>`
       + `<td>${{pfcNum(s.ecn)}}</td><td>${{pfcPct(s.share)}}</td><td>${{pfcNum(s.rx)}}</td>`
       + `<td>${{pfcNum(s.tx)}}</td><td>${{pfcNum(s.loss)}}</td></tr>`
     ).join('');
-    panel = `<table class="detail-table"><thead><tr><th>Sample (UTC)</th><th>Signal</th>`
+    body.innerHTML = `<table class="detail-table"><thead><tr><th>Sample (UTC)</th><th>Signal</th>`
       + `<th>ECN Δ</th><th>ECN %</th><th>PFC RX Δ</th><th>PFC TX Δ</th><th>Discard Δ</th></tr></thead>`
       + `<tbody>${{rowsHtml}}</tbody></table>`;
   }}
-  const detail = document.createElement('tr');
-  detail.className = 'detail-row';
-  detail.innerHTML = `<td colspan="13"><div class="detail-panel">`
-    + `<div class="detail-title">Recent 24-hour samples — ${{pfcEsc(key)}}</div>${{panel}}</div></td>`;
-  row.after(detail);
 }}
 
 let metricGuideReturnFocus = null;
@@ -1683,13 +1684,12 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         )
         for host in sorted(shard_hosts)
     ]
-    detail_history: Dict[str, List[Dict[str, Any]]] = {}
     shard_errors: List[str] = []
     # The directory itself is contractual (validated after every run) even
     # when no device produced new history this run.
     history_dir.mkdir(parents=True, exist_ok=True)
     if shard_tasks:
-        shard_results: List[Tuple[str, Optional[str], Dict[str, Any]]] = []
+        shard_results: List[Tuple[str, Optional[str]]] = []
         workers = _shard_worker_limit(len(shard_tasks))
         if workers > 1:
             try:
@@ -1713,11 +1713,9 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
                 )
                 for host, new_slims, seed in shard_tasks
             ]
-        for host, error, detail in shard_results:
+        for host, error in shard_results:
             if error is not None:
                 shard_errors.append(f"{host}: {error}")
-                continue
-            detail_history.update(detail)
     if shard_errors:
         print(
             "PFC/ECN history shard writes failed: " + "; ".join(shard_errors),
@@ -1757,7 +1755,6 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     finish_phase("history_prune")
     report = render_report(
         records,
-        detail_history,
         # Coverage is measured against the hosts we actually expect a current
         # collection from (asset status OK), not the whole inventory.  Down or
         # excluded devices are reported as coverage failures instead of

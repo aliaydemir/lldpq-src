@@ -332,7 +332,7 @@
         </div>
         <div class="filter-group">
             <label>Search</label>
-            <input type="text" id="filter-search" value="" placeholder="vendor, serial, port..." oninput="renderTable()">
+            <input type="text" id="filter-search" value="" placeholder="vendor, serial, port..." oninput="debouncedRenderTable()">
         </div>
     </div>
 
@@ -550,6 +550,12 @@
             arrow.classList.add('active');
         }
         renderTable();
+    }
+
+    let renderDebounceTimer = null;
+    function debouncedRenderTable() {
+        clearTimeout(renderDebounceTimer);
+        renderDebounceTimer = setTimeout(renderTable, 200);
     }
 
     function renderTable() {

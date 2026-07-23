@@ -147,6 +147,33 @@ class HttpExportContractTests(unittest.TestCase):
         # monitor JSON/CSV + transceiver JSON/CSV
         self.assertEqual(export_section.count(cache_line), 4)
 
+    def test_gzip_covers_reports_and_exports_but_not_binary_fallback(self):
+        source = NGINX_SITE.read_text(encoding="utf-8")
+        self.assertIn("gzip on;", source)
+        gzip_types_line = next(
+            line.strip() for line in source.splitlines()
+            if line.strip().startswith("gzip_types ")
+        )
+        for mime in ("text/plain", "text/csv", "application/json"):
+            self.assertIn(mime, gzip_types_line)
+        # Provisioning serves multi-GB OS images (*.bin/*.img/*.iso and the
+        # extensionless onie-installer aliases) statically as octet-stream;
+        # on-the-fly gzip would throttle those downloads to compression speed
+        # and break byte-range resume. Never compress the fallback type.
+        self.assertNotIn("application/octet-stream", gzip_types_line)
+        # .ini reports (lldp_results.ini, hstr/) have no mime.types mapping;
+        # they only compress because this location maps them to text/plain.
+        self.assertIn(r"location ~* \.ini$", source)
+        # nginx matches gzip_types against the exact content-type string, so
+        # a parameterized default_type would silently disable compression for
+        # the fabric-scale exports; charset must come from the directive.
+        self.assertNotIn('default_type "application/json; charset=utf-8";', source)
+        self.assertNotIn('default_type "text/csv; charset=utf-8";', source)
+        export_section = source.split(
+            "# ── Public machine-readable exports", 1
+        )[1]
+        self.assertEqual(export_section.count("charset utf-8;"), 4)
+
 
 class WriteExportTests(unittest.TestCase):
     def test_writes_payload_csv_mode_and_sidecars(self):

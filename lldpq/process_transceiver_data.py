@@ -260,7 +260,9 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
         # Web-served output: nginx must always retain read access.
         os.fchmod(fd, mode | 0o644)
         with os.fdopen(fd, 'w') as f:
-            json.dump(result, f, indent=2)
+            # Compact separators: the inventory carries one record per module
+            # across the fabric, indentation nearly doubles the payload.
+            json.dump(result, f, separators=(',', ':'))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, output_path)

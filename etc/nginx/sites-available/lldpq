@@ -7,6 +7,20 @@ server {
 
         server_name _;
 
+        # Analysis reports and their JSON payloads reach tens of MB at fabric
+        # scale, and every response below is no-store; compression is the only
+        # transfer-size lever. text/html is always included when gzip is on.
+        # octet-stream stays OUT of this list: provisioning serves multi-GB
+        # OS images (*.bin/*.img/*.iso, onie-installer aliases) statically and
+        # on-the-fly gzip would throttle them and break byte-range resume.
+        # The .ini reports are mapped to text/plain below instead.
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 1024;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_types text/plain text/css text/csv application/json application/javascript text/javascript image/svg+xml;
+
         location / {
             # Optional: Uncomment lines below to enable authentication
             # auth_basic "LLDPq Network Monitoring";
@@ -85,6 +99,17 @@ server {
             autoindex on;
             autoindex_exact_size off;
             autoindex_localtime on;
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+            add_header Pragma "no-cache";
+            add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+        }
+
+        # .ini has no mime.types mapping and would fall back to octet-stream,
+        # skipping gzip. The multi-MB text reports (lldp_results.ini, hstr/
+        # Problems-*.ini) are monitoring data: text/plain, compressed, never
+        # cached. Exact-match guards above (e.g. /assets.ini) still win.
+        location ~* \.ini$ {
+            default_type text/plain;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
             add_header Pragma "no-cache";
             add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
@@ -411,16 +436,24 @@ server {
         }
 
         # Monitor-domain exports (static, published atomically by monitor.sh)
+        # Bare default_type + the charset directive (not a parameterized
+        # "type; charset=..." string): gzip_types matches the content type
+        # string exactly, so an embedded charset would silently disable
+        # compression for these fabric-scale exports.
         location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_json$ {
             alias /var/www/html/monitor-results/export/$lldpq_export_domain.json;
             types { }
-            default_type "application/json; charset=utf-8";
+            default_type application/json;
+            charset utf-8;
+            charset_types application/json;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
         }
         location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_csv$ {
             alias /var/www/html/monitor-results/export/$lldpq_export_domain.csv;
             types { }
-            default_type "text/csv; charset=utf-8";
+            default_type text/csv;
+            charset utf-8;
+            charset_types text/csv;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
             add_header Content-Disposition 'attachment; filename="lldpq_${lldpq_export_domain}_export.csv"';
         }
@@ -429,13 +462,17 @@ server {
         location = /transceiver/export_json {
             alias /var/www/html/monitor-results/transceiver-export.json;
             types { }
-            default_type "application/json; charset=utf-8";
+            default_type application/json;
+            charset utf-8;
+            charset_types application/json;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
         }
         location = /transceiver/export_csv {
             alias /var/www/html/monitor-results/transceiver-export.csv;
             types { }
-            default_type "text/csv; charset=utf-8";
+            default_type text/csv;
+            charset utf-8;
+            charset_types text/csv;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
             add_header Content-Disposition 'attachment; filename="lldpq_transceiver_export.csv"';
         }
