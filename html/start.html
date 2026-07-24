@@ -884,11 +884,15 @@
                 return null;
             }
             const requiredAnalyses = [
-                'bgp', 'evpn-mh', 'flap', 'ber', 'pfc-ecn', 'hardware',
-                'log', 'duplicate'
+                'bgp', 'flap', 'ber', 'hardware', 'log'
             ];
+            // These analyzers can be disabled per-run via lldpq.conf skip
+            // toggles; a manifest is valid when each is either completed or
+            // recorded as skipped.
+            const skippableAnalyses = ['optical', 'duplicate', 'evpn-mh', 'pfc-ecn'];
             if (requiredAnalyses.some(name => !manifest.analyses.includes(name)) ||
-                (!manifest.skipped.includes('optical') && !manifest.analyses.includes('optical'))) {
+                skippableAnalyses.some(name =>
+                    !manifest.skipped.includes(name) && !manifest.analyses.includes(name))) {
                 return null;
             }
 
@@ -1966,6 +1970,9 @@
                     }
                     
                 } else if (dataType === 'duplicate') {
+                    if (pipelineState.manifest.skipped.includes('duplicate')) {
+                        return { skipped: true, unavailable: false, coveragePartial: false };
+                    }
                     // Duplicate exposes only the two IP states needed by the dashboard.
                     // MAC/APIPA diagnostics remain available on the analysis page.
                     const jsonSummary = await fetchDashboardSummaryJson(dataType);
@@ -1988,6 +1995,13 @@
                     // BGP, EVPN-MH, BER, PFC/ECN and Link Flap expose report-level
                     // summary contracts. Re-counting rendered rows loses unavailable,
                     // baseline, reset and status-precedence semantics.
+                    // EVPN-MH and PFC/ECN can be disabled per-run via lldpq.conf;
+                    // the card dataType 'pfc' maps to the manifest label 'pfc-ecn'.
+                    const manifestSkipName = { 'evpn-mh': 'evpn-mh', 'pfc': 'pfc-ecn' }[dataType];
+                    if (manifestSkipName &&
+                        pipelineState.manifest.skipped.includes(manifestSkipName)) {
+                        return { skipped: true, unavailable: false, coveragePartial: false };
+                    }
                     const jsonSummary = await fetchDashboardSummaryJson(dataType);
                     if (jsonSummary) return jsonSummary;
                     const pageMap = {

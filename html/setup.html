@@ -370,6 +370,55 @@
                         </div>
                     </div>
 
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Collection options (skip toggles)</span></div>
+                        <label class="key-lbl">Monitor sub-collections &mdash; skip individual data types inside the monitor stage:</label>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:6px 16px;">
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-optical" style="width:15px;height:15px;accent-color:#76b900;"> Skip optical diagnostics</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-l1" style="width:15px;height:15px;accent-color:#76b900;"> Skip L1 / BER data</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-duplicate" style="width:15px;height:15px;accent-color:#76b900;"> Skip duplicate detection</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-evpn-mh" style="width:15px;height:15px;accent-color:#76b900;"> Skip EVPN-MH</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-pfc-ecn" style="width:15px;height:15px;accent-color:#76b900;"> Skip PFC/ECN</label>
+                        </div>
+                        <label class="key-lbl" style="margin-top:12px;">Pipeline stages &mdash; skip whole steps of the scheduled lldpq run:</label>
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:6px 16px;">
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-assets" style="width:15px;height:15px;accent-color:#76b900;"> Skip assets</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#ffb74d;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-lldp" style="width:15px;height:15px;accent-color:#f44336;"> Skip LLDP check</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#ffb74d;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-monitor" style="width:15px;height:15px;accent-color:#f44336;"> Skip monitor</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-fabric-scan" style="width:15px;height:15px;accent-color:#76b900;"> Skip fabric scan</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-alerts" style="width:15px;height:15px;accent-color:#76b900;"> Skip alerts</label>
+                        </div>
+                        <div class="note danger-note" id="co-core-warn" style="display:none; margin:10px 0 0;">
+                            Skipping <strong>LLDP check</strong> or <strong>monitor</strong> stops refreshing the Fabric, LLDP and Analysis pages &mdash; the whole dashboard goes stale until re-enabled. These are maintenance switches, not steady-state modes.
+                        </div>
+                        <div class="p-toolbar" style="margin-top:10px;">
+                            <button class="btn secondary" id="save-collect-btn" onclick="saveCollectionOptions()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save collection options</button>
+                            <span class="status info" id="co-status" style="margin-top:0;"></span>
+                        </div>
+                    </div>
+
+                    <div class="sched-card">
+                        <div class="key-row"><span class="k">Transceiver firmware collection</span></div>
+                        <label class="key-lbl" for="tfw-skip-models">Extra transceiver models to skip (space-separated IDs, e.g. "2410 2700"). SN2010 / SN2100 / SN2201 / SN2210 are always skipped:</label>
+                        <input type="text" id="tfw-skip-models" class="sched-sel"
+                               style="width:100%; min-width:0;" maxlength="512"
+                               autocomplete="off" spellcheck="false">
+                        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:6px 16px; margin-top:8px;">
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Unknown model policy
+                                <select id="tfw-policy" class="sched-sel" style="min-width:130px;">
+                                    <option value="skip">skip (safe default)</option>
+                                    <option value="run">collect anyway</option>
+                                </select></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Max parallel <input type="number" id="tfw-max-parallel" class="sched-sel" style="min-width:90px;" min="1" max="1000" step="1"></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">Min interval (s) <input type="number" id="tfw-min-interval" class="sched-sel" style="min-width:90px;" min="0" max="604800" step="1"></label>
+                            <label class="key-lbl" style="margin:0; display:flex; align-items:center; gap:8px;">SSH timeout (s) <input type="number" id="tfw-ssh-timeout" class="sched-sel" style="min-width:90px;" min="1" max="86400" step="1"></label>
+                        </div>
+                        <div class="p-toolbar" style="margin-top:10px;">
+                            <button class="btn secondary" id="save-tfw-btn" onclick="saveTransceiverFw()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Save transceiver settings</button>
+                            <span class="status info" id="tfw-status" style="margin-top:0;"></span>
+                        </div>
+                    </div>
+
                 </div>
 
                 <!-- Step 11: Update LLDPq -->
@@ -658,7 +707,9 @@ let runPollEpoch = 0;
 let schedLoaded = false;     // cron schedules fetched once on entering the run step
 let parallelLoaded = false;  // parallelism fetched once on entering the run step
 let hostnameLoaded = false;  // dashboard instance name fetched once on entering run
-let runSettingsDirty = false; // unsaved edits in the Run-step cards (name/schedules/parallelism)
+let collectOptsLoaded = false;   // skip toggles fetched once on entering run
+let transceiverFwLoaded = false; // transceiver-FW settings fetched once on entering run
+let runSettingsDirty = false; // unsaved edits in the Run-step cards (name/schedules/parallelism/skips/transceiver)
 let ansibleLoaded = false;   // ansible status fetched once on entering its step
 let ansibleDirty = false;
 let ansibleEditVersion = 0;
@@ -822,6 +873,8 @@ function goStep(i) {
     if (key === 'run' && !hostnameLoaded) { hostnameLoaded = true; loadHostname(); }
     if (key === 'run' && !schedLoaded) { schedLoaded = true; loadSchedules(); }
     if (key === 'run' && !parallelLoaded) { parallelLoaded = true; loadParallel(); }
+    if (key === 'run' && !collectOptsLoaded) { collectOptsLoaded = true; loadCollectionOptions(); }
+    if (key === 'run' && !transceiverFwLoaded) { transceiverFwLoaded = true; loadTransceiverFw(); }
     if (key === 'update') {
         checkDockerForUpdate();
         if (!updateLogShown || (!updateActive && !updatePollTimer && !updatePollController)) {
@@ -893,13 +946,24 @@ function initDirtyGuards() {
     // Run-step cards save via explicit buttons, so their edits are unsaved DOM
     // state the navigation guard would otherwise ignore and silently discard.
     ['lldpq-hostname', 'sched-lldpq', 'sched-getconf',
-     'par-monitor', 'par-lldp', 'par-assets', 'par-getconfigs'].forEach(function (id) {
+     'par-monitor', 'par-lldp', 'par-assets', 'par-getconfigs',
+     'co-skip-optical', 'co-skip-l1', 'co-skip-duplicate', 'co-skip-evpn-mh',
+     'co-skip-pfc-ecn', 'co-skip-assets', 'co-skip-lldp', 'co-skip-monitor',
+     'co-skip-fabric-scan', 'co-skip-alerts',
+     'tfw-skip-models', 'tfw-policy', 'tfw-max-parallel', 'tfw-min-interval',
+     'tfw-ssh-timeout'].forEach(function (id) {
         const el = document.getElementById(id);
         if (el) {
             const mark = function () { runSettingsDirty = true; };
             el.addEventListener('input', mark);
             el.addEventListener('change', mark);
         }
+    });
+    // The staleness warning must react the moment a core-stage skip is
+    // toggled, not only after save.
+    ['co-skip-lldp', 'co-skip-monitor'].forEach(function (id) {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', updateCoreSkipWarning);
     });
     ['uninstall-keep-data', 'uninstall-remove-data', 'uninstall-remove-source', 'uninstall-remove-nginx',
      'uninstall-remove-dhcp', 'uninstall-remove-docker'].forEach(function (id) {
@@ -2365,6 +2429,136 @@ async function saveParallel() {
     } catch (e) { setStatus('par-status', 'Save failed: ' + e.message, 'err'); }
 }
 
+/* ---- Collection options: skip toggles (Run step) ---- */
+const COLLECTION_SKIP_IDS = {
+    skip_optical: 'co-skip-optical',
+    skip_l1: 'co-skip-l1',
+    skip_duplicate: 'co-skip-duplicate',
+    skip_evpn_mh: 'co-skip-evpn-mh',
+    skip_pfc_ecn: 'co-skip-pfc-ecn',
+    skip_assets: 'co-skip-assets',
+    skip_lldp: 'co-skip-lldp',
+    skip_monitor: 'co-skip-monitor',
+    skip_fabric_scan: 'co-skip-fabric-scan',
+    skip_alerts: 'co-skip-alerts'
+};
+function updateCoreSkipWarning() {
+    const warn = document.getElementById('co-core-warn');
+    if (!warn) return;
+    const lldp = document.getElementById('co-skip-lldp');
+    const monitor = document.getElementById('co-skip-monitor');
+    warn.style.display = ((lldp && lldp.checked) || (monitor && monitor.checked)) ? '' : 'none';
+}
+async function loadCollectionOptions() {
+    const save = document.getElementById('save-collect-btn');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-collection-options' }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) throw new Error(d.error || 'could not read current values');
+        Object.keys(COLLECTION_SKIP_IDS).forEach(function (field) {
+            const el = document.getElementById(COLLECTION_SKIP_IDS[field]);
+            if (el) el.checked = d[field] === true;
+        });
+        updateCoreSkipWarning();
+        runSettingsDirty = false;
+        if (save) save.disabled = false;
+        setStatus('co-status', '', 'info');
+    } catch (e) {
+        // Never save over good config from an unknown state; retry on re-entry.
+        collectOptsLoaded = false;
+        if (save) save.disabled = true;
+        setStatus('co-status', 'Could not read the current options (' + e.message + '). Reopen this step to retry.', 'err');
+    }
+}
+async function saveCollectionOptions() {
+    const save = document.getElementById('save-collect-btn');
+    if (save && save.disabled) {
+        setStatus('co-status', 'Reopen this step to load the current options before saving.', 'err');
+        return;
+    }
+    const body = { action: 'set-collection-options' };
+    Object.keys(COLLECTION_SKIP_IDS).forEach(function (field) {
+        const el = document.getElementById(COLLECTION_SKIP_IDS[field]);
+        body[field] = Boolean(el && el.checked);
+    });
+    setStatus('co-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) {
+            runSettingsDirty = false;
+            let text = 'Saved \u2713 \u2014 applies on the next collection.';
+            if (body.skip_lldp || body.skip_monitor) {
+                text += ' Dashboard pages will go stale while LLDP/monitor stay skipped.';
+            }
+            setStatus('co-status', text, 'ok');
+        } else setStatus('co-status', d.error || 'Save failed', 'err');
+    } catch (e) { setStatus('co-status', 'Save failed: ' + e.message, 'err'); }
+}
+
+/* ---- Transceiver firmware collection (Run step) ---- */
+async function loadTransceiverFw() {
+    const save = document.getElementById('save-tfw-btn');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'get-transceiver-fw' }) });
+        const d = await r.json().catch(() => ({}));
+        if (!d.success) throw new Error(d.error || 'could not read current values');
+        document.getElementById('tfw-skip-models').value = typeof d.skip_models === 'string' ? d.skip_models : '';
+        document.getElementById('tfw-policy').value = d.unknown_model_policy === 'run' ? 'run' : 'skip';
+        document.getElementById('tfw-max-parallel').value = Number.isInteger(d.max_parallel) ? d.max_parallel : 10;
+        document.getElementById('tfw-min-interval').value = Number.isInteger(d.min_interval) ? d.min_interval : 1800;
+        document.getElementById('tfw-ssh-timeout').value = Number.isInteger(d.ssh_timeout) ? d.ssh_timeout : 300;
+        runSettingsDirty = false;
+        if (save) save.disabled = false;
+        setStatus('tfw-status', '', 'info');
+    } catch (e) {
+        transceiverFwLoaded = false;
+        if (save) save.disabled = true;
+        setStatus('tfw-status', 'Could not read the current settings (' + e.message + '). Reopen this step to retry.', 'err');
+    }
+}
+async function saveTransceiverFw() {
+    const save = document.getElementById('save-tfw-btn');
+    if (save && save.disabled) {
+        setStatus('tfw-status', 'Reopen this step to load the current settings before saving.', 'err');
+        return;
+    }
+    const skipModels = document.getElementById('tfw-skip-models').value.trim();
+    // Space/comma separated model tokens; the server normalizes commas away
+    // because the collector only splits on whitespace.
+    if (skipModels.length > 512 ||
+        (skipModels && !/^[A-Za-z0-9_.\-]+(?:[\s,]+[A-Za-z0-9_.\-]+)*$/.test(skipModels))) {
+        setStatus('tfw-status', 'Skip models must be model IDs separated by spaces or commas.', 'err');
+        return;
+    }
+    const body = {
+        action: 'set-transceiver-fw',
+        skip_models: skipModels,
+        unknown_model_policy: document.getElementById('tfw-policy').value,
+        max_parallel: parseInt(document.getElementById('tfw-max-parallel').value, 10),
+        min_interval: parseInt(document.getElementById('tfw-min-interval').value, 10),
+        ssh_timeout: parseInt(document.getElementById('tfw-ssh-timeout').value, 10)
+    };
+    if (!Number.isInteger(body.max_parallel) || body.max_parallel < 1 || body.max_parallel > 1000 ||
+        !Number.isInteger(body.min_interval) || body.min_interval < 0 || body.min_interval > 604800 ||
+        !Number.isInteger(body.ssh_timeout) || body.ssh_timeout < 1 || body.ssh_timeout > 86400) {
+        setStatus('tfw-status', 'Max parallel 1\u20131000, min interval 0\u2013604800 s, SSH timeout 1\u201386400 s.', 'err');
+        return;
+    }
+    setStatus('tfw-status', 'Saving\u2026', 'info');
+    try {
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) {
+            runSettingsDirty = false;
+            if (typeof d.skip_models === 'string') {
+                document.getElementById('tfw-skip-models').value = d.skip_models;
+            }
+            setStatus('tfw-status', 'Saved \u2713 \u2014 applies on the next collection.', 'ok');
+        } else setStatus('tfw-status', d.error || 'Save failed', 'err');
+    } catch (e) { setStatus('tfw-status', 'Save failed: ' + e.message, 'err'); }
+}
+
 /* ---- Step 7: Notifications & Alerting (notifications.yaml) ---- */
 function nfChk(id){ var e=document.getElementById(id); return !!(e && e.checked); }
 function nfSet(id,v){ var e=document.getElementById(id); if(e) e.checked=!!v; }
@@ -2489,7 +2683,7 @@ function invalidateSetupCachesAfterRestore(){
     aliasesLoadSeq++; aliasesOpSeq++; aliasesLoaded=false; aliasesDirty=false; aliasesRevision=null;
     notifLoadSeq++; notifOpSeq++; notifLoaded=false; notifDirty=false; notificationsReady=false; notifRevision=null;
     ansibleLoadSeq++; ansibleOpSeq++; ansibleLoaded=false; ansibleDirty=false; ansibleBusy=false;
-    keyInfoLoaded=false; hostnameLoaded=false; schedLoaded=false; parallelLoaded=false; maintLoaded=false;
+    keyInfoLoaded=false; hostnameLoaded=false; schedLoaded=false; parallelLoaded=false; collectOptsLoaded=false; transceiverFwLoaded=false; maintLoaded=false;
     publishAliasUpdate(null);
 }
 

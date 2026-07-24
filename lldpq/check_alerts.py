@@ -229,9 +229,10 @@ class LLDPqAlerts:
                 raise ValueError("manifest device_count must be a non-negative integer")
 
             skipped_set = set(skipped)
-            required_analyses = {"bgp", "flap", "ber", "hardware", "log", "duplicate"}
-            if "optical" not in skipped_set:
-                required_analyses.add("optical")
+            required_analyses = {"bgp", "flap", "ber", "hardware", "log"}
+            for optional_analysis in ("optical", "duplicate", "evpn-mh", "pfc-ecn"):
+                if optional_analysis not in skipped_set:
+                    required_analyses.add(optional_analysis)
             missing_analyses = sorted(required_analyses.difference(analyses))
             if missing_analyses:
                 raise ValueError(
@@ -1349,7 +1350,14 @@ class LLDPqAlerts:
                 continue
         if not self.check_lldp_alerts():
             self.had_error = True
-        if not self.check_duplicate_alerts():
+        run_manifest = getattr(self, "run_manifest", None)
+        manifest_skipped = (
+            set(run_manifest.get("skipped", []))
+            if isinstance(run_manifest, dict) else set()
+        )
+        if "duplicate" in manifest_skipped:
+            print("Duplicate detection skipped by configuration; no duplicate alerts.")
+        elif not self.check_duplicate_alerts():
             self.had_error = True
 
     def send_summary_alert(self, devices, *, include_schedule=True):
@@ -1372,7 +1380,6 @@ class LLDPqAlerts:
         ber_stats = self.get_stats_from_html("ber-analysis.html")
         flap_stats = self.get_stats_from_html("link-flap-analysis.html")
         lldp_stats = self.get_lldp_stats_from_ini()
-        duplicate_stats = self.get_duplicate_stats()
 
         skipped = set()
         if isinstance(self.run_manifest, dict):
@@ -1381,6 +1388,10 @@ class LLDPqAlerts:
         optical_stats = (
             None if optical_skipped
             else self.get_stats_from_html("optical-analysis.html")
+        )
+        duplicate_skipped = "duplicate" in skipped
+        duplicate_stats = (
+            None if duplicate_skipped else self.get_duplicate_stats()
         )
 
         required_sources = {
@@ -1391,10 +1402,11 @@ class LLDPqAlerts:
             "ber-analysis.html": ber_stats,
             "link-flap-analysis.html": flap_stats,
             "lldp_results.ini": lldp_stats,
-            "duplicate-analysis.html": duplicate_stats,
         }
         if not optical_skipped:
             required_sources["optical-analysis.html"] = optical_stats
+        if not duplicate_skipped:
+            required_sources["duplicate-analysis.html"] = duplicate_stats
         missing_sources = [
             name for name, stats in required_sources.items() if not stats
         ]
@@ -1502,14 +1514,15 @@ class LLDPqAlerts:
                 f"LLDP Topology: {lldp_stats['no_info']} connections without current information"
             )
 
-        if duplicate_stats['active'] > 0:
-            critical_issues.append(
-                f"Duplicate IP: {duplicate_stats['active']} active conflicts"
-            )
-        if duplicate_stats['quiesced'] > 0:
-            warning_issues.append(
-                f"Duplicate IP: {duplicate_stats['quiesced']} quiesced conflicts"
-            )
+        if not duplicate_skipped:
+            if duplicate_stats['active'] > 0:
+                critical_issues.append(
+                    f"Duplicate IP: {duplicate_stats['active']} active conflicts"
+                )
+            if duplicate_stats['quiesced'] > 0:
+                warning_issues.append(
+                    f"Duplicate IP: {duplicate_stats['quiesced']} quiesced conflicts"
+                )
 
         report_stats = {
             "Hardware": hardware_stats,
@@ -1517,10 +1530,11 @@ class LLDPqAlerts:
             "BGP": bgp_stats,
             "BER": ber_stats,
             "Link Flap": flap_stats,
-            "Duplicate IP": duplicate_stats,
         }
         if optical_stats:
             report_stats["Optical"] = optical_stats
+        if duplicate_stats:
+            report_stats["Duplicate IP"] = duplicate_stats
         for label, report in report_stats.items():
             if report.get("coverage_partial"):
                 expected = report.get("coverage_expected")
@@ -1540,6 +1554,14 @@ class LLDPqAlerts:
             f"{optical_stats.get('unplugged', 0)}:"
             f"{optical_stats.get('unknown', 0)}:"
             f"{int(bool(optical_stats.get('coverage_partial')))}"
+        )
+        duplicate_signature = (
+            "skipped" if duplicate_skipped else
+            f"{duplicate_stats['active']}:{duplicate_stats['quiesced']}:"
+            f"{duplicate_stats.get('coverage_expected')}:"
+            f"{duplicate_stats.get('coverage_current')}:"
+            f"{duplicate_stats.get('coverage_failures', 0)}:"
+            f"{int(bool(duplicate_stats.get('coverage_partial')))}"
         )
         summary_signature = "_".join(map(str, (
             total_devices,
@@ -1563,11 +1585,7 @@ class LLDPqAlerts:
             int(bool(flap_stats.get('coverage_partial'))), optical_signature,
             lldp_stats['successful'], lldp_stats['failed'],
             lldp_stats['warnings'], lldp_stats['no_info'],
-            duplicate_stats['active'], duplicate_stats['quiesced'],
-            duplicate_stats.get('coverage_expected'),
-            duplicate_stats.get('coverage_current'),
-            duplicate_stats.get('coverage_failures', 0),
-            int(bool(duplicate_stats.get('coverage_partial'))),
+            duplicate_signature,
         )))
         
         # Check if summary changed or it's scheduled time (critical issues don't force immediate send in summary mode)
@@ -1587,7 +1605,19 @@ class LLDPqAlerts:
                     f"Unknown: {optical_stats.get('unknown', 0)}     "
                     f"Critical: {optical_stats['critical']}"
                 )
-            
+            if duplicate_skipped:
+                duplicate_section = (
+                    "Duplicate IP Analysis Results:\n\nSkipped by configuration"
+                )
+            else:
+                duplicate_section = (
+                    "Duplicate IP Analysis Results:\n\n\n"
+                    f"Active: {duplicate_stats['active']}     "
+                    f"Quiesced: {duplicate_stats['quiesced']}     "
+                    f"Coverage: {duplicate_stats.get('coverage_current')}"
+                    f"/{duplicate_stats.get('coverage_expected')}"
+                )
+
             # Create clean dashboard-style message with spacing
             title = "Network Health Summary"
             message = f"""
@@ -1656,10 +1686,7 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
 
-Duplicate IP Analysis Results:
-
-
-Active: {duplicate_stats['active']}     Quiesced: {duplicate_stats['quiesced']}     Coverage: {duplicate_stats.get('coverage_current')}/{duplicate_stats.get('coverage_expected')}
+{duplicate_section}
 
 """
             open_issues = (

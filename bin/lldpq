@@ -37,6 +37,26 @@ for arg in "$@"; do
     esac
 done
 
+# Stage skip toggles arrive from lldpq.conf via the config helper. Anything
+# but true/1/yes/on means false — collection stays fail-safe on.
+normalize_bool() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|y|on) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+SKIP_ASSETS="$(normalize_bool "${SKIP_ASSETS:-false}")"
+SKIP_LLDP="$(normalize_bool "${SKIP_LLDP:-false}")"
+SKIP_MONITOR="$(normalize_bool "${SKIP_MONITOR:-false}")"
+SKIP_FABRIC_SCAN="$(normalize_bool "${SKIP_FABRIC_SCAN:-false}")"
+SKIP_ALERTS="$(normalize_bool "${SKIP_ALERTS:-false}")"
+
+# Skip notices are informational and verbose-only: the scheduled cron line has
+# no output redirect, so unconditional stdout would become recurring cron mail.
+log_notice() {
+    [[ "$QUIET" == "true" ]] || echo "$1"
+}
+
 cd "$LLDPQ_DIR" || exit 1
 
 # One lock covers asset discovery, LLDP validation, monitoring, and report
@@ -83,8 +103,16 @@ export LLDPQ_MONITOR_LOCK_HELD=1
 
 # Bind assets, LLDP and monitor outputs to one pipeline identity. monitor.sh
 # records exact source fingerprints; alert summaries reject mixed-run inputs.
-export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
-export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
+# When assets or LLDP collection is skipped by configuration this run cannot
+# claim a complete pipeline: its sources predate the run and the manifest
+# mtime check would (correctly) fail. Withhold the identity so monitor.sh
+# publishes under its fallback id with pipeline_complete=false instead.
+if [[ "$SKIP_ASSETS" == "true" || "$SKIP_LLDP" == "true" ]]; then
+    unset LLDPQ_PIPELINE_ID LLDPQ_PIPELINE_STARTED_AT
+else
+    export LLDPQ_PIPELINE_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$-$RANDOM"
+    export LLDPQ_PIPELINE_STARTED_AT="$(date +%s)"
+fi
 
 # The monitor owns the final current manifest and clears this marker only after
 # a complete web publication.  The wrapper starts the same state contract
@@ -182,72 +210,113 @@ wait_until_not_running() {
 
 # Mark the complete generation as collecting before its first mutable input is
 # gathered.  monitor.sh replaces this marker with its own in-progress state and
-# clears it only after a successful, atomic report publication.
-PIPELINE_REPORT_STATE=collecting
-if ! write_pipeline_report_marker collecting pipeline_collection_in_progress; then
-    mark_pipeline_reports_stale "could not mark pipeline reports as in-progress" || true
-    echo "Could not mark monitoring reports as in-progress." >&2
-    exit 1
+# clears it only after a successful, atomic report publication.  With the
+# monitor stage skipped no report generation happens in this run: the marker
+# stays untouched so the exit guard cannot stale last-known-good reports.
+if [[ "$SKIP_MONITOR" != "true" ]]; then
+    PIPELINE_REPORT_STATE=collecting
+    if ! write_pipeline_report_marker collecting pipeline_collection_in_progress; then
+        mark_pipeline_reports_stale "could not mark pipeline reports as in-progress" || true
+        echo "Could not mark monitoring reports as in-progress." >&2
+        exit 1
+    fi
 fi
 
-# Run asset discovery and LLDP checks
-wait_until_not_running "assets.sh"
-if ! run_command ./assets.sh; then
-    mark_pipeline_reports_stale "asset discovery failed before monitoring" || true
-    echo "Asset discovery failed; monitoring was not published." >&2
-    exit 1
+# Run asset discovery and LLDP checks. A pre-monitor collection failure only
+# invalidates the published reports when this run would have replaced them;
+# with SKIP_MONITOR the reports belong to an older generation whose validity
+# is unaffected, so the stage fails without staling them.
+if [[ "$SKIP_ASSETS" == "true" ]]; then
+    log_notice "Asset discovery skipped by configuration (SKIP_ASSETS=true)."
+else
+    wait_until_not_running "assets.sh"
+    if ! run_command ./assets.sh; then
+        if [[ "$SKIP_MONITOR" != "true" ]]; then
+            mark_pipeline_reports_stale "asset discovery failed before monitoring" || true
+        fi
+        echo "Asset discovery failed; monitoring was not published." >&2
+        exit 1
+    fi
 fi
 # Total-fabric loss must be alertable even when LLDP/monitor analyzers cannot
 # produce a new aggregate bundle. This path is stateful and silent for the
 # normal/partial case; it emits only total-outage and recovery transitions.
-run_command python3 ./check_alerts.py --assets-only || \
-    echo "⚠️  Fabric availability pre-check failed (non-critical)" >&2
-wait_until_not_running "check-lldp.sh"
-if ! run_command ./check-lldp.sh; then
-    mark_pipeline_reports_stale "LLDP collection failed before monitoring" || true
-    echo "LLDP collection failed; monitoring was not published." >&2
-    exit 1
+# It is delivered through the alert machinery, so SKIP_ALERTS silences it too.
+if [[ "$SKIP_ALERTS" == "true" ]]; then
+    log_notice "Fabric availability pre-check skipped by configuration (SKIP_ALERTS=true)."
+else
+    run_command python3 ./check_alerts.py --assets-only || \
+        echo "⚠️  Fabric availability pre-check failed (non-critical)" >&2
 fi
-# lldp-validate.py intentionally leaves raw inputs in place on a topology
-# generation failure. check-lldp.sh predates strict exit propagation, so use
-# that invariant to prevent the rest of the run from looking successful.
-if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
-    mark_pipeline_reports_stale \
-        "LLDP validation/topology generation did not complete" || true
-    echo "LLDP validation/topology generation did not complete; raw inputs were preserved." >&2
-    exit 1
-fi
-run_command ./monitor.sh "${MONITOR_FLAGS[@]}"
-status=$?
-if [[ $status -ne 0 ]]; then
-    if grep -q '^status=stale$' "$STALE_MARKER" 2>/dev/null; then
-        PIPELINE_REPORT_STATE=stale
-    else
-        mark_pipeline_reports_stale \
-            "monitoring analysis failed with status $status" || true
+if [[ "$SKIP_LLDP" == "true" ]]; then
+    # The raw-inputs invariant below validates this run's collection; with the
+    # stage skipped there is nothing to validate and leftovers from an older
+    # failed run must not fail a run that never touched LLDP.
+    log_notice "LLDP collection skipped by configuration (SKIP_LLDP=true)."
+else
+    wait_until_not_running "check-lldp.sh"
+    if ! run_command ./check-lldp.sh; then
+        if [[ "$SKIP_MONITOR" != "true" ]]; then
+            mark_pipeline_reports_stale "LLDP collection failed before monitoring" || true
+        fi
+        echo "LLDP collection failed; monitoring was not published." >&2
+        exit 1
     fi
-    echo "Monitoring analysis failed; last-known-good reports were preserved." >&2
-    exit "$status"
+    # lldp-validate.py intentionally leaves raw inputs in place on a topology
+    # generation failure. check-lldp.sh predates strict exit propagation, so use
+    # that invariant to prevent the rest of the run from looking successful.
+    if compgen -G "lldp-results/*_lldp_result.ini" >/dev/null; then
+        if [[ "$SKIP_MONITOR" != "true" ]]; then
+            mark_pipeline_reports_stale \
+                "LLDP validation/topology generation did not complete" || true
+        fi
+        echo "LLDP validation/topology generation did not complete; raw inputs were preserved." >&2
+        exit 1
+    fi
 fi
-if [[ -e "$STALE_MARKER" ]]; then
-    mark_pipeline_reports_stale \
-        "monitor returned success without clearing the report state marker" || true
-    echo "Monitoring returned success but report state is not current." >&2
-    exit 1
+if [[ "$SKIP_MONITOR" == "true" ]]; then
+    log_notice "Monitoring analysis skipped by configuration (SKIP_MONITOR=true)."
+else
+    run_command ./monitor.sh "${MONITOR_FLAGS[@]}"
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        if grep -q '^status=stale$' "$STALE_MARKER" 2>/dev/null; then
+            PIPELINE_REPORT_STATE=stale
+        else
+            mark_pipeline_reports_stale \
+                "monitoring analysis failed with status $status" || true
+        fi
+        echo "Monitoring analysis failed; last-known-good reports were preserved." >&2
+        exit "$status"
+    fi
+    if [[ -e "$STALE_MARKER" ]]; then
+        mark_pipeline_reports_stale \
+            "monitor returned success without clearing the report state marker" || true
+        echo "Monitoring returned success but report state is not current." >&2
+        exit 1
+    fi
+    PIPELINE_REPORT_STATE=current
 fi
-PIPELINE_REPORT_STATE=current
 
 # Fabric table scan for search. A partial scan must not suppress availability
-# alerts from the already-published monitor/assets snapshot.
-wait_until_not_running "fabric-scan.sh"
-run_command ./fabric-scan.sh
-fabric_status=$?
-if [[ $fabric_status -ne 0 ]]; then
-    echo "Fabric scan failed." >&2
+# alerts from the already-published monitor/assets snapshot. A configured skip
+# is a success: it must not block the AI launch nor fail the pipeline.
+if [[ "$SKIP_FABRIC_SCAN" == "true" ]]; then
+    fabric_status=0
+    log_notice "Fabric scan skipped by configuration (SKIP_FABRIC_SCAN=true)."
+else
+    wait_until_not_running "fabric-scan.sh"
+    run_command ./fabric-scan.sh
+    fabric_status=$?
+    if [[ $fabric_status -ne 0 ]]; then
+        echo "Fabric scan failed." >&2
+    fi
 fi
 
 # Check for network alerts (only if monitoring data exists)
-if [[ -d "monitor-results" ]] && [[ -f "notifications.yaml" ]]; then
+if [[ "$SKIP_ALERTS" == "true" ]]; then
+    log_notice "Alert checks skipped by configuration (SKIP_ALERTS=true)."
+elif [[ -d "monitor-results" ]] && [[ -f "notifications.yaml" ]]; then
     run_command python3 ./check_alerts.py || echo "⚠️  Alert check failed (non-critical)"
 fi
 

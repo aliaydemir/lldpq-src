@@ -1313,9 +1313,10 @@ run_fabric_scan() {
         return
     fi
     
-    # Run scan in background
+    # Run scan in background. The explicit operator action overrides a
+    # configured SKIP_FABRIC_SCAN (the script self-gates on the toggle).
     cd "$lldpq_dir"
-    sudo -u "$LLDPQ_USER" nohup bash "$scan_script" > /tmp/fabric-scan.log 2>&1 &
+    sudo -u "$LLDPQ_USER" nohup env LLDPQ_FABRIC_SCAN_FORCE=1 bash "$scan_script" > /tmp/fabric-scan.log 2>&1 &
     
     echo '{"success": true, "message": "Fabric scan started"}'
 }

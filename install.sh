@@ -354,7 +354,9 @@ load_lldpq_config() {
             LLDPQ_DIR|LLDPQ_USER|LLDPQ_SRC|LLDPQ_HOSTNAME|LLDPQ_CRON|GETCONF_CRON|WEB_ROOT|\
             ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR|DHCP_HOSTS_FILE|DHCP_CONF_FILE|\
             DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
-            AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|MONITOR_TIMING|\
+            AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|SKIP_DUPLICATE|\
+            SKIP_EVPN_MH|SKIP_PFC_ECN|SKIP_ASSETS|SKIP_LLDP|SKIP_MONITOR|\
+            SKIP_FABRIC_SCAN|SKIP_ALERTS|MONITOR_TIMING|\
             MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
             OPTICAL_COLLECTION_BUDGET_SECONDS|OPTICAL_PORT_TIMEOUT_SECONDS|\
@@ -876,6 +878,16 @@ render_runtime_tuning_config() {
     printf 'GETCONF_CRON="%s"\n' "$getconf_cron"
     printf 'SKIP_OPTICAL=%s\n' "$skip_optical"
     printf 'SKIP_L1=%s\n' "$skip_l1"
+    # Collection skip toggles read from the ambient environment: preserved
+    # values arrive via load_lldpq_config on update, caller overrides via env.
+    # Anything but exactly "true" renders as false (fail-safe).
+    local _skip_name _skip_value
+    for _skip_name in SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN SKIP_ASSETS \
+        SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS; do
+        _skip_value="${!_skip_name:-false}"
+        [[ "$_skip_value" == "true" ]] || _skip_value=false
+        printf '%s=%s\n' "$_skip_name" "$_skip_value"
+    done
     printf 'MONITOR_MAX_PARALLEL=%s\n' "$monitor_parallel"
     printf 'MONITOR_COMMAND_TIMEOUT_SECONDS=%s\n' "$monitor_command_timeout"
     printf 'PFC_ECN_MAX_PARALLEL=%s\n' "$pfc_parallel"
@@ -4086,14 +4098,19 @@ REPLACE_DHCP_CONFIG=false
 LLDPQ_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # Keep caller intent separate from values loaded from an existing config. A
-# clean install must not carry an old SKIP_L1 preference into the new config,
-# but an explicit environment override remains supported.
-_CALLER_SKIP_L1_WAS_SET=false
-_CALLER_SKIP_L1_VALUE=""
-if [[ -n "${SKIP_L1+x}" ]]; then
-    _CALLER_SKIP_L1_WAS_SET=true
-    _CALLER_SKIP_L1_VALUE="$SKIP_L1"
-fi
+# clean install must not carry old skip preferences into the new config,
+# but explicit environment overrides remain supported.
+_CALLER_SKIP_KEYS=(SKIP_L1 SKIP_OPTICAL SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN \
+    SKIP_ASSETS SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS)
+declare -A _CALLER_SKIP_WAS_SET=()
+declare -A _CALLER_SKIP_VALUE=()
+for _skip_key in "${_CALLER_SKIP_KEYS[@]}"; do
+    if [[ -n "${!_skip_key+x}" ]]; then
+        _CALLER_SKIP_WAS_SET[$_skip_key]=true
+        _CALLER_SKIP_VALUE[$_skip_key]="${!_skip_key}"
+    fi
+done
+unset _skip_key
 
 for arg in "$@"; do
     case $arg in
@@ -4446,11 +4463,14 @@ if [[ -f /etc/lldpq.conf ]] || [[ -f /etc/lldpq-users.conf ]] || [[ -d /var/lib/
             sudo rm -rf "$LLDPQ_INSTALL_DIR/telemetry"
             echo "  Old installation files removed"
             INSTALL_MODE="fresh"
-            if [[ "$_CALLER_SKIP_L1_WAS_SET" == "true" ]]; then
-                SKIP_L1="$_CALLER_SKIP_L1_VALUE"
-            else
-                unset SKIP_L1
-            fi
+            for _skip_key in "${_CALLER_SKIP_KEYS[@]}"; do
+                if [[ "${_CALLER_SKIP_WAS_SET[$_skip_key]:-false}" == "true" ]]; then
+                    printf -v "$_skip_key" '%s' "${_CALLER_SKIP_VALUE[$_skip_key]}"
+                else
+                    unset "$_skip_key"
+                fi
+            done
+            unset _skip_key
         else
             INSTALL_MODE="update"
         fi

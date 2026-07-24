@@ -33,7 +33,13 @@ class StartDashboardPfcEcnTests(unittest.TestCase):
         self.assertIn("pfc-ecn-analysis.html?filter=loss", self.source)
 
     def test_manifest_and_fetch_batch_require_current_pfc_report(self):
-        self.assertIn("'ber', 'pfc-ecn', 'hardware'", self.source)
+        # PFC/ECN moved to the skippable set: a manifest is valid when the
+        # analysis either completed or is recorded as skipped (SKIP_PFC_ECN).
+        self.assertIn(
+            "const skippableAnalyses = "
+            "['optical', 'duplicate', 'evpn-mh', 'pfc-ecn'];",
+            self.source,
+        )
         self.assertIn("'pfc': 'monitor-results/pfc-ecn-analysis.html'", self.source)
         self.assertIn("pfcData, flapData, hardwareData", self.source)
         self.assertIn("fetchRawDataSummary('pfc', pipelineState)", self.source)

@@ -20,6 +20,19 @@ elif [[ -z "${LLDPQ_DIR:-}" ]]; then
     exit 1
 fi
 [[ -n "${LLDPQ_DIR:-}" ]] || exit 1
+
+# fabric-scan also runs on its own one-minute cron, so the conf toggle must
+# gate the script itself, not only the bin/lldpq pipeline. The explicit web
+# "scan now" trigger bypasses the toggle via LLDPQ_FABRIC_SCAN_FORCE=1.
+case "$(printf '%s' "${SKIP_FABRIC_SCAN:-false}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes|y|on)
+        if [[ "${LLDPQ_FABRIC_SCAN_FORCE:-0}" != "1" ]]; then
+            echo "fabric scan disabled by configuration (SKIP_FABRIC_SCAN)" >&2
+            exit 0
+        fi
+        ;;
+esac
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$LLDPQ_DIR" || exit 1
 

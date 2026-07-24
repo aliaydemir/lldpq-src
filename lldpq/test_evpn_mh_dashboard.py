@@ -23,7 +23,13 @@ class EvpnMhDashboardTests(unittest.TestCase):
             self.assertEqual(SOURCE.count(f'id="{element_id}"'), 1)
 
     def test_manifest_fetch_and_cards_use_report_contract(self):
-        self.assertIn("'bgp', 'evpn-mh', 'flap'", SOURCE)
+        # EVPN-MH moved to the skippable set: a manifest is valid when the
+        # analysis either completed or is recorded as skipped (SKIP_EVPN_MH).
+        self.assertIn(
+            "const skippableAnalyses = "
+            "['optical', 'duplicate', 'evpn-mh', 'pfc-ecn'];",
+            SOURCE,
+        )
         self.assertIn(
             "'evpn-mh': 'monitor-results/evpn-mh-analysis.html'", SOURCE
         )

@@ -1399,6 +1399,29 @@ Set `SKIP_L1=true` only when intentionally trading those fields for a faster
 collection cycle. The affected BER columns also show `N/A` when `l1-show` is
 unavailable or its collection fails.
 
+**Analyzer skip toggles:** `SKIP_DUPLICATE=true`, `SKIP_EVPN_MH=true` and
+`SKIP_PFC_ECN=true` disable the corresponding monitor sub-collection and
+analyzer the same way `SKIP_OPTICAL` does. The run manifest records them under
+`skipped`, the dashboard card shows the analysis as skipped, the report page
+is replaced by a "skipped" placeholder, and alert summaries state "Skipped by
+configuration". Scoped re-runs (`monitor.sh --only <name>`) refuse a disabled
+analyzer with exit code 2. All of these are editable from **Setup → Run
+LLDPq → Collection options**.
+
+**Pipeline stage skip toggles:** `SKIP_ASSETS`, `SKIP_LLDP`, `SKIP_MONITOR`,
+`SKIP_FABRIC_SCAN` and `SKIP_ALERTS` (all `false` by default) skip whole
+stages of the scheduled `lldpq` pipeline. `SKIP_FABRIC_SCAN` also stops the
+one-minute standalone fabric-scan cron; the Search page's explicit "scan now"
+button still works. `SKIP_ALERTS` silences both the fabric-availability
+pre-check and the post-run alert checks. **`SKIP_ASSETS`, `SKIP_LLDP` and
+`SKIP_MONITOR` are maintenance switches, not steady-state modes:** while they
+are enabled the run publishes under the incomplete-pipeline contract (or not
+at all), so dashboard pages go stale, aggregate alert summaries refuse to
+send, and autonomous AI reports pause until the stage is re-enabled. The
+toggles are orthogonal — skipping monitor does not imply skipping alerts.
+The web **Run Now** button (`lldpq-trigger`) intentionally ignores stage
+skips: an explicit operator action always runs the full pipeline.
+
 **Collection consistency and timeout behavior:** each switch's selected
 monitoring data is collected through one SSH stream, validated as one complete
 marker-delimited bundle, and staged before any per-device artifact is

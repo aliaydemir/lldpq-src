@@ -819,7 +819,8 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 # (LLDPQ_DIR/USER/SRC, WEB_ROOT, *_DIR, DHCP_*, DISCOVERY_RANGE) or secrets.
 LLDPQ_PREF_KEYS = (
     'LLDPQ_HOSTNAME', 'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL',
-    'SKIP_OPTICAL', 'SKIP_L1',
+    'SKIP_OPTICAL', 'SKIP_L1', 'SKIP_DUPLICATE', 'SKIP_EVPN_MH', 'SKIP_PFC_ECN',
+    'SKIP_ASSETS', 'SKIP_LLDP', 'SKIP_MONITOR', 'SKIP_FABRIC_SCAN', 'SKIP_ALERTS',
     'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'MONITOR_COMMAND_TIMEOUT_SECONDS',
     'PFC_ECN_MAX_PARALLEL',
     'PFC_ECN_COLLECTION_BUDGET_SECONDS', 'PFC_ECN_PORT_TIMEOUT_SECONDS',
@@ -1580,6 +1581,113 @@ if action == 'set-parallel':
         pairs[ck] = v
     if write_conf(pairs):
         print(json.dumps({'success': True}))
+    else:
+        print(json.dumps({'success': False, 'error': 'Failed to write config'}))
+    sys.exit(0)
+
+# ─── Actions: collection skip toggles (Run step) ───
+# field name -> conf key; every toggle defaults to false (collection on).
+COLLECTION_SKIP_KEYS = {
+    'skip_optical': 'SKIP_OPTICAL',
+    'skip_l1': 'SKIP_L1',
+    'skip_duplicate': 'SKIP_DUPLICATE',
+    'skip_evpn_mh': 'SKIP_EVPN_MH',
+    'skip_pfc_ecn': 'SKIP_PFC_ECN',
+    'skip_assets': 'SKIP_ASSETS',
+    'skip_lldp': 'SKIP_LLDP',
+    'skip_monitor': 'SKIP_MONITOR',
+    'skip_fabric_scan': 'SKIP_FABRIC_SCAN',
+    'skip_alerts': 'SKIP_ALERTS',
+}
+
+if action == 'get-collection-options':
+    conf = read_conf()
+    out = {
+        fk: conf.get(ck, 'false').strip().casefold() == 'true'
+        for fk, ck in COLLECTION_SKIP_KEYS.items()
+    }
+    print(json.dumps({'success': True, **out}))
+    sys.exit(0)
+
+if action == 'set-collection-options':
+    pairs = {}
+    for fk, ck in COLLECTION_SKIP_KEYS.items():
+        v = post_data.get(fk)
+        if not isinstance(v, bool):
+            print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
+            sys.exit(0)
+        pairs[ck] = 'true' if v else 'false'
+    if write_conf(pairs):
+        print(json.dumps({'success': True}))
+    else:
+        print(json.dumps({'success': False, 'error': 'Failed to write config'}))
+    sys.exit(0)
+
+# ─── Actions: transceiver firmware collection settings (Run step) ───
+if action == 'get-transceiver-fw':
+    conf = read_conf()
+
+    def _tfw_int(key, fallback):
+        try:
+            return int(str(conf.get(key, fallback)).strip())
+        except (TypeError, ValueError):
+            return fallback
+
+    policy = str(conf.get('TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY', 'skip')).strip().casefold()
+    if policy not in ('skip', 'run'):
+        policy = 'skip'
+    print(json.dumps({
+        'success': True,
+        'skip_models': str(conf.get('TRANSCEIVER_FW_SKIP_MODELS', '')),
+        'unknown_model_policy': policy,
+        'max_parallel': _tfw_int('TRANSCEIVER_FW_MAX_PARALLEL', 10),
+        'min_interval': _tfw_int('TRANSCEIVER_FW_MIN_INTERVAL', 1800),
+        'ssh_timeout': _tfw_int('TRANSCEIVER_FW_SSH_TIMEOUT', 300),
+    }))
+    sys.exit(0)
+
+if action == 'set-transceiver-fw':
+    # Ranges mirror lldpq/backup_import.py _PORTABLE_INTEGER_RANGES so a saved
+    # value always round-trips through backup export/import unchanged.
+    skip_models = post_data.get('skip_models')
+    if not isinstance(skip_models, str) or len(skip_models) > 512:
+        print(json.dumps({'success': False, 'error': 'Invalid value for skip_models'}))
+        sys.exit(0)
+    skip_models = skip_models.strip()
+    if skip_models and not re.fullmatch(
+            r'[A-Za-z0-9_.\-]+(?:[\s,]+[A-Za-z0-9_.\-]+)*', skip_models):
+        print(json.dumps({'success': False,
+                          'error': 'Skip models must be model IDs separated by spaces or commas'}))
+        sys.exit(0)
+    # The collector splits the list on whitespace only; normalize commas away.
+    skip_models = ' '.join(re.split(r'[\s,]+', skip_models)) if skip_models else ''
+    policy = str(post_data.get('unknown_model_policy', '')).strip().casefold()
+    if policy not in ('skip', 'run'):
+        print(json.dumps({'success': False,
+                          'error': 'Unknown model policy must be "skip" or "run"'}))
+        sys.exit(0)
+    tfw_ranges = {
+        'max_parallel': ('TRANSCEIVER_FW_MAX_PARALLEL', 1, 1000),
+        'min_interval': ('TRANSCEIVER_FW_MIN_INTERVAL', 0, 604800),
+        'ssh_timeout': ('TRANSCEIVER_FW_SSH_TIMEOUT', 1, 86400),
+    }
+    pairs = {
+        'TRANSCEIVER_FW_SKIP_MODELS': '"' + skip_models + '"',
+        'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY': policy,
+    }
+    for fk, (ck, low, high) in tfw_ranges.items():
+        try:
+            v = int(post_data.get(fk))
+        except Exception:
+            print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
+            sys.exit(0)
+        if not low <= v <= high:
+            print(json.dumps({'success': False,
+                              'error': f'Value for {fk} must be between {low} and {high}'}))
+            sys.exit(0)
+        pairs[ck] = v
+    if write_conf(pairs):
+        print(json.dumps({'success': True, 'skip_models': skip_models}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)

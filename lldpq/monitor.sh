@@ -180,6 +180,9 @@ normalize_bool() {
 # Runtime flags
 SKIP_OPTICAL="${SKIP_OPTICAL:-false}"
 SKIP_L1="${SKIP_L1:-false}"
+SKIP_DUPLICATE="${SKIP_DUPLICATE:-false}"
+SKIP_EVPN_MH="${SKIP_EVPN_MH:-false}"
+SKIP_PFC_ECN="${SKIP_PFC_ECN:-false}"
 
 # Use copy-on-write clones when GNU cp and the backing filesystem support
 # them.  --reflink=auto transparently falls back to an ordinary copy on ext4;
@@ -197,6 +200,9 @@ apply_monitor_tuning() {
         SKIP_OPTICAL=true
     fi
     SKIP_L1="$(normalize_bool "${SKIP_L1:-false}")"
+    SKIP_DUPLICATE="$(normalize_bool "${SKIP_DUPLICATE:-false}")"
+    SKIP_EVPN_MH="$(normalize_bool "${SKIP_EVPN_MH:-false}")"
+    SKIP_PFC_ECN="$(normalize_bool "${SKIP_PFC_ECN:-false}")"
     MONITOR_TIMING="$(normalize_bool "${MONITOR_TIMING:-false}")"
 
     MAX_PARALLEL="${MONITOR_MAX_PARALLEL:-${MAX_PARALLEL:-100}}"
@@ -259,6 +265,18 @@ apply_monitor_tuning() {
 apply_monitor_tuning
 if [[ "$MONITOR_SCOPE" == "optical" && "$SKIP_OPTICAL" == "true" ]]; then
     echo "Error: optical collection is disabled by SKIP_OPTICAL" >&2
+    exit 2
+fi
+if [[ "$MONITOR_SCOPE" == "duplicate" && "$SKIP_DUPLICATE" == "true" ]]; then
+    echo "Error: duplicate collection is disabled by SKIP_DUPLICATE" >&2
+    exit 2
+fi
+if [[ "$MONITOR_SCOPE" == "evpn-mh" && "$SKIP_EVPN_MH" == "true" ]]; then
+    echo "Error: EVPN-MH collection is disabled by SKIP_EVPN_MH" >&2
+    exit 2
+fi
+if [[ "$MONITOR_SCOPE" == "pfc-ecn" && "$SKIP_PFC_ECN" == "true" ]]; then
+    echo "Error: PFC/ECN collection is disabled by SKIP_PFC_ECN" >&2
     exit 2
 fi
 
@@ -939,8 +957,15 @@ write_current_manifest() {
         pipeline_started_at=""
     fi
     completed_at=$(date -Is) || return 1
+    # Comma-joined list of skipped analyzers; argv[4] keeps its position so
+    # every manifest consumer sees the same JSON shape as before.
+    local skipped_list=""
+    [[ "$SKIP_OPTICAL" == "true" ]] && skipped_list+="optical,"
+    [[ "$SKIP_DUPLICATE" == "true" ]] && skipped_list+="duplicate,"
+    [[ "$SKIP_EVPN_MH" == "true" ]] && skipped_list+="evpn-mh,"
+    [[ "$SKIP_PFC_ECN" == "true" ]] && skipped_list+="pfc-ecn,"
     python3 - "$manifest" "$completed_at" "$device_count" \
-        "$SKIP_OPTICAL" "$pipeline_id" \
+        "$skipped_list" "$pipeline_id" \
         "$pipeline_started_at" \
         "${LLDPQ_ASSETS_FILE:-$SCRIPT_DIR/assets.ini}" \
         "$SCRIPT_DIR/lldp-results/lldp_results.ini" \
@@ -1062,7 +1087,7 @@ payload = {
     "completed_at": sys.argv[2],
     "device_count": int(sys.argv[3]),
     "analyses": sys.argv[10:],
-    "skipped": ["optical"] if sys.argv[4] == "true" else [],
+    "skipped": [item for item in sys.argv[4].split(",") if item],
     "pipeline_complete": pipeline_complete,
     "pipeline_id": pipeline_id or None,
     "pipeline_started_at": started_epoch,
@@ -1223,6 +1248,77 @@ publish_full_monitor_results() {
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
 <body data-analysis-status="skipped"><h1>Optical Diagnostics</h1>
 <p style="color:#ff9800;font-weight:bold">Optical collection was skipped for this monitoring run.</p>
+</body></html>
+EOF
+        then
+            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    if [[ "$SKIP_DUPLICATE" == "true" ]]; then
+        # Analyzer state (dup-data/) stays private for a future enabled run;
+        # never republish an old aggregate as though it belonged to this run.
+        if ! sudo rm -f "$stage_dir/duplicate-analysis.html" \
+                "$stage_dir/dup-data/dup_seq_state.json" \
+                "$stage_dir/dup-data/dup_ip_state.json" \
+                "$stage_dir/summary/duplicate-summary.json" \
+                "$stage_dir/export/duplicate.json" \
+                "$stage_dir/export/duplicate.json.sha256" \
+                "$stage_dir/export/duplicate.csv" \
+                "$stage_dir/export/duplicate.csv.sha256" ||
+           ! sudo tee "$stage_dir/duplicate-analysis.html" >/dev/null <<'EOF'
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Duplicate IP/MAC Analysis - Skipped</title>
+<link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
+<body data-analysis-status="skipped"><h1>Duplicate IP/MAC Detection</h1>
+<p style="color:#ff9800;font-weight:bold">Duplicate detection was skipped for this monitoring run.</p>
+</body></html>
+EOF
+        then
+            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    if [[ "$SKIP_EVPN_MH" == "true" ]]; then
+        if ! sudo rm -f "$stage_dir/evpn-mh-analysis.html" \
+                "$stage_dir/summary/evpn-mh-summary.json" \
+                "$stage_dir/export/evpn-mh.json" \
+                "$stage_dir/export/evpn-mh.json.sha256" \
+                "$stage_dir/export/evpn-mh.csv" \
+                "$stage_dir/export/evpn-mh.csv.sha256" ||
+           ! sudo tee "$stage_dir/evpn-mh-analysis.html" >/dev/null <<'EOF'
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>EVPN Multihoming Analysis - Skipped</title>
+<link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
+<body data-analysis-status="skipped"><h1>EVPN Multihoming</h1>
+<p style="color:#ff9800;font-weight:bold">EVPN-MH collection was skipped for this monitoring run.</p>
+</body></html>
+EOF
+        then
+            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
+    if [[ "$SKIP_PFC_ECN" == "true" ]]; then
+        # pfc_ecn_baseline.json and pfc-ecn-history/ stay private so a future
+        # enabled run resumes its deltas; the web stage must not carry them.
+        if ! sudo rm -rf "$stage_dir/pfc-ecn-analysis.html" \
+                "$stage_dir/pfc_ecn_baseline.json" \
+                "$stage_dir/pfc-ecn-history" \
+                "$stage_dir/summary/pfc-ecn-summary.json" \
+                "$stage_dir/export/pfc-ecn.json" \
+                "$stage_dir/export/pfc-ecn.json.sha256" \
+                "$stage_dir/export/pfc-ecn.csv" \
+                "$stage_dir/export/pfc-ecn.csv.sha256" ||
+           ! sudo tee "$stage_dir/pfc-ecn-analysis.html" >/dev/null <<'EOF'
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>PFC/ECN Analysis - Skipped</title>
+<link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
+<body data-analysis-status="skipped"><h1>PFC/ECN Analysis</h1>
+<p style="color:#ff9800;font-weight:bold">PFC/ECN collection was skipped for this monitoring run.</p>
 </body></html>
 EOF
         then
@@ -2555,6 +2651,9 @@ EOF
         HOSTNAME_VAR="'"$hostname"'"
         SKIP_OPTICAL="'"$SKIP_OPTICAL"'"
         SKIP_L1="'"$SKIP_L1"'"
+        SKIP_DUPLICATE="'"$SKIP_DUPLICATE"'"
+        SKIP_EVPN_MH="'"$SKIP_EVPN_MH"'"
+        SKIP_PFC_ECN="'"$SKIP_PFC_ECN"'"
         PFC_ECN_COLLECTION_BUDGET_SECONDS="'"$PFC_ECN_COLLECTION_BUDGET_SECONDS"'"
         PFC_ECN_PORT_TIMEOUT_SECONDS="'"$PFC_ECN_PORT_TIMEOUT_SECONDS"'"
         PFC_ECN_MAX_PARALLEL="'"$PFC_ECN_MAX_PARALLEL"'"
@@ -2891,6 +2990,7 @@ EOF
         # =====================================================================
         echo "===EVPN_MH_DATA_START==="
         if _lldpq_scope_selected evpn-mh; then
+        if [ "$SKIP_EVPN_MH" != "true" ]; then
         _evpn_mh_collection_utc=$(date -u "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
         echo "__LLDPQ_EVPN_MH_COLLECTION_UTC__:${_evpn_mh_collection_utc:-UNKNOWN}"
         echo "__LLDPQ_EVPN_MH_FORMAT__:1"
@@ -2996,6 +3096,7 @@ EOF
             echo "__LLDPQ_EVPN_MH_COVERAGE__:DETAIL:SKIPPED_NO_LOCAL_ESI"
         fi
         fi
+        fi
         echo "===EVPN_MH_DATA_END==="
         _lldpq_timing_end EVPN_MH_DATA
 
@@ -3004,6 +3105,7 @@ EOF
         # =====================================================================
         echo "===DUP_DATA_START==="
         if _lldpq_scope_selected duplicate; then
+        if [ "$SKIP_DUPLICATE" != "true" ]; then
         _dup_collection_utc=$(date -u "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
         if [ -n "$_dup_collection_utc" ]; then
             echo "__LLDPQ_DUP_COLLECTION_UTC__:${_dup_collection_utc}"
@@ -3148,15 +3250,18 @@ EOF
         echo "__LLDPQ_DUP_COVERAGE__:IFALIAS:OK"
         unset -f _dup_run _dup_filter 2>/dev/null || true
         fi
+        fi
         echo "===DUP_DATA_END==="
         _lldpq_timing_end DUP_DATA
 
         echo "===FDB_DATA_START==="
         if _lldpq_scope_selected duplicate; then
+        if [ "$SKIP_DUPLICATE" != "true" ]; then
         if [ "$_lldpq_fdb_status" -ne 0 ]; then
             echo "__LLDPQ_COLLECTION_ERROR__:FDB"
         else
             grep -E -v "00:00:00:00:00:00" "$_lldpq_snapshot_dir/fdb" || true
+        fi
         fi
         fi
         echo "===FDB_DATA_END==="
@@ -3164,11 +3269,13 @@ EOF
 
         echo "===NEIGH_DATA_START==="
         if _lldpq_scope_selected duplicate; then
+        if [ "$SKIP_DUPLICATE" != "true" ]; then
         if [ "$_lldpq_neigh_status" -ne 0 ]; then
             echo "__LLDPQ_COLLECTION_ERROR__:NEIGH"
         else
             awk '\''$1 ~ /^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$/ { print }'\'' \
                 "$_lldpq_snapshot_dir/neigh"
+        fi
         fi
         fi
         echo "===NEIGH_DATA_END==="
@@ -3354,6 +3461,7 @@ EOF
         # =====================================================================
         echo "===PFC_ECN_DATA_START==="
         if _lldpq_scope_selected pfc-ecn; then
+        if [ "$SKIP_PFC_ECN" != "true" ]; then
         _pfc_ecn_collection_utc=$(date -u "+%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || true)
         echo "__LLDPQ_PFC_ECN_COLLECTION_UTC__:${_pfc_ecn_collection_utc:-UNKNOWN}"
         _pfc_ecn_inventory=$(cat "$_lldpq_snapshot_dir/pfc-interfaces")
@@ -3439,6 +3547,7 @@ EOF
             _pfc_ecn_port_count _pfc_ecn_port _pfc_ecn_status \
             _pfc_ecn_deadline _pfc_ecn_has_nv _pfc_ecn_has_timeout
         unset _pfc_ecn_batch_pids _pfc_ecn_batch_count _pfc_ecn_pid
+        fi
         fi
         echo "===PFC_ECN_DATA_END==="
         _lldpq_timing_end PFC_ECN_DATA
@@ -4058,6 +4167,18 @@ if [[ "$MONITOR_SCOPE" == "optical" && "$SKIP_OPTICAL" == "true" ]]; then
     echo "Error: optical collection is disabled by SKIP_OPTICAL" >&2
     exit 2
 fi
+if [[ "$MONITOR_SCOPE" == "duplicate" && "$SKIP_DUPLICATE" == "true" ]]; then
+    echo "Error: duplicate collection is disabled by SKIP_DUPLICATE" >&2
+    exit 2
+fi
+if [[ "$MONITOR_SCOPE" == "evpn-mh" && "$SKIP_EVPN_MH" == "true" ]]; then
+    echo "Error: EVPN-MH collection is disabled by SKIP_EVPN_MH" >&2
+    exit 2
+fi
+if [[ "$MONITOR_SCOPE" == "pfc-ecn" && "$SKIP_PFC_ECN" == "true" ]]; then
+    echo "Error: PFC/ECN collection is disabled by SKIP_PFC_ECN" >&2
+    exit 2
+fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
@@ -4260,36 +4381,29 @@ validate_analysis_outputs() {
         all)
             required=(
                 bgp-analysis.html bgp_history.json
-                evpn-mh-analysis.html
                 link-flap-analysis.html flap_history.json
                 ber-analysis.html ber_history.json ber_baseline.json
-                pfc-ecn-analysis.html pfc_ecn_baseline.json pfc-ecn-history/
                 hardware-analysis.html
                 log-analysis.html log_summary.json
-                duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
                 summary/bgp-summary.json summary/evpn-summary.json
-                summary/evpn-mh-summary.json summary/flap-summary.json
-                summary/ber-summary.json summary/pfc-ecn-summary.json
-                summary/hardware-summary.json summary/duplicate-summary.json
+                summary/flap-summary.json
+                summary/ber-summary.json
+                summary/hardware-summary.json
                 export/bgp.json export/bgp.csv
-                export/evpn-mh.json export/evpn-mh.csv
-                export/duplicate.json export/duplicate.csv
                 export/flap.json export/flap.csv
                 export/ber.json export/ber.csv
-                export/pfc-ecn.json export/pfc-ecn.csv
                 export/hardware.json export/hardware.csv
                 export/log.json export/log.csv
             )
             json_files=(
                 bgp_history.json flap_history.json ber_history.json ber_baseline.json
-                pfc_ecn_baseline.json pfc-ecn-history/
-                log_summary.json dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                log_summary.json
                 summary/bgp-summary.json summary/evpn-summary.json
-                summary/evpn-mh-summary.json summary/flap-summary.json
-                summary/ber-summary.json summary/pfc-ecn-summary.json
-                summary/hardware-summary.json summary/duplicate-summary.json
-                export/bgp.json export/evpn-mh.json export/duplicate.json
-                export/flap.json export/ber.json export/pfc-ecn.json
+                summary/flap-summary.json
+                summary/ber-summary.json
+                summary/hardware-summary.json
+                export/bgp.json
+                export/flap.json export/ber.json
                 export/hardware.json export/log.json
             )
             if [[ "$SKIP_OPTICAL" != "true" ]]; then
@@ -4301,6 +4415,38 @@ validate_analysis_outputs() {
                 json_files+=(
                     optical_history.json summary/optical-summary.json
                     export/optical.json
+                )
+            fi
+            if [[ "$SKIP_DUPLICATE" != "true" ]]; then
+                required+=(
+                    duplicate-analysis.html
+                    dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                    summary/duplicate-summary.json
+                    export/duplicate.json export/duplicate.csv
+                )
+                json_files+=(
+                    dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+                    summary/duplicate-summary.json export/duplicate.json
+                )
+            fi
+            if [[ "$SKIP_EVPN_MH" != "true" ]]; then
+                required+=(
+                    evpn-mh-analysis.html summary/evpn-mh-summary.json
+                    export/evpn-mh.json export/evpn-mh.csv
+                )
+                json_files+=(
+                    summary/evpn-mh-summary.json export/evpn-mh.json
+                )
+            fi
+            if [[ "$SKIP_PFC_ECN" != "true" ]]; then
+                required+=(
+                    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc-ecn-history/
+                    summary/pfc-ecn-summary.json
+                    export/pfc-ecn.json export/pfc-ecn.csv
+                )
+                json_files+=(
+                    pfc_ecn_baseline.json pfc-ecn-history/
+                    summary/pfc-ecn-summary.json export/pfc-ecn.json
                 )
             fi
             ;;
@@ -4430,7 +4576,7 @@ analyzer_jobs_start=$(date +%s)
 if scope_selected bgp; then
     start_analysis bgp python3 process_bgp_data.py
 fi
-if scope_selected evpn-mh; then
+if scope_selected evpn-mh && [[ "$SKIP_EVPN_MH" != "true" ]]; then
     start_analysis evpn-mh python3 process_evpn_mh_data.py
 fi
 if scope_selected flap; then
@@ -4442,7 +4588,7 @@ fi
 if scope_selected ber; then
     start_analysis ber python3 process_ber_data.py
 fi
-if scope_selected pfc-ecn; then
+if scope_selected pfc-ecn && [[ "$SKIP_PFC_ECN" != "true" ]]; then
     start_analysis pfc-ecn python3 process_pfc_ecn_data.py
 fi
 if scope_selected hardware; then
@@ -4451,7 +4597,7 @@ fi
 if scope_selected logs; then
     start_analysis log python3 process_log_data.py
 fi
-if scope_selected duplicate; then
+if scope_selected duplicate && [[ "$SKIP_DUPLICATE" != "true" ]]; then
     start_analysis duplicate python3 process_duplicate_data.py
 fi
 
