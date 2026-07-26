@@ -109,6 +109,7 @@ def _catalog_context_window(model: str, provider: Optional[str]) -> int:
     if any(
         name in route
         for name in (
+            "claude-opus-5",
             "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
@@ -131,6 +132,13 @@ def _catalog_context_window(model: str, provider: Optional[str]) -> int:
 
     # Current GPT-5 catalog aliases.  Match specific variants before the
     # generic family fallback because their deployed windows differ.
+    # GPT-5.6 (Sol/Terra/Luna) publishes a 1.05M window, but any prompt above
+    # 272K input tokens re-prices the entire session at 2x input / 1.5x output.
+    # Budget to that billing line instead of the raw spec; set
+    # AI_CONTEXT_WINDOW_TOKENS (or the fallback variant) to opt into the full
+    # window when the surcharge is acceptable.
+    if "gpt-5.6" in route:
+        return 272_000
     if "gpt-5.5" in route:
         return 1_100_000 if "openai" in provider_name or route.startswith("openai/") else 1_000_000
     if "gpt-5.4-mini" in route:

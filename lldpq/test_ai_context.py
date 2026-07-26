@@ -27,6 +27,8 @@ from ai_context import (  # noqa: E402
 class ContextWindowTest(unittest.TestCase):
     def test_primary_model_windows_and_conservative_fallbacks(self):
         cases = {
+            "aws/anthropic/bedrock-claude-opus-5": 1_000_000,
+            "claude/claude-opus-5": 1_000_000,
             "aws/bedrock-claude-opus-4-8": 1_000_000,
             "aws/bedrock-claude-opus-4-7": 1_000_000,
             "claude/claude-opus-4-8": 1_000_000,
@@ -40,6 +42,9 @@ class ContextWindowTest(unittest.TestCase):
             "gcp/google/gemini-2.5-pro": 1_000_000,
             "gcp/google/gemini-3.5-flash": 1_000_000,
             "openai/openai/gpt-4o": 128_000,
+            # Budgeted to the 272K surcharge line, not the published 1.05M spec.
+            "openai/openai/gpt-5.6-sol": 272_000,
+            "openai/openai/gpt-5.6": 272_000,
             "openai/openai/gpt-5.5": 1_100_000,
             "azure/openai/gpt-5.5": 1_000_000,
             "openai/openai/gpt-5.4": 1_000_000,
