@@ -57,7 +57,7 @@ show_usage() {
     echo -e "  Uses \e[33m$LLDPQ_DIR/devices.yaml\e[0m (fallback: ~/lldpq/devices.yaml)"
     echo ""
     echo -e "\e[96mIP RANGE:\e[0m"
-    echo -e "  Ping all IPs in a range:  \e[33mpping 192.168.58.10 192.168.58.240\e[0m"
+    echo -e "  Ping all IPs in a range:  \e[33mpping 192.168.100.10 192.168.100.240\e[0m"
     echo -e "  With VRF:                 \e[33mpping -v mgmt 10.0.0.1 10.0.0.50\e[0m"
     echo ""
     echo -e "\e[96mROLES:\e[0m"
@@ -111,7 +111,7 @@ generate_ip_range() {
        [[ "${start_octets[1]}" != "${end_octets[1]}" ]] || \
        [[ "${start_octets[2]}" != "${end_octets[2]}" ]]; then
         echo -e "\e[91mError: Start and end IPs must be in the same /24 subnet\e[0m"
-        echo -e "\e[91mExample: 192.168.58.10 192.168.58.240\e[0m"
+        echo -e "\e[91mExample: 192.168.100.10 192.168.100.240\e[0m"
         exit 1
     fi
     
