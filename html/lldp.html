@@ -424,7 +424,7 @@
         </div>
         <div class="action-buttons">
             <div class="device-search-container">
-                <select id="deviceSearch" multiple aria-label="Filter by local device" style="min-width: 220px;">
+                <select id="deviceSearch" multiple aria-label="Filter by device or host" style="min-width: 220px;">
                 </select>
                 <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">✕</button>
             </div>
@@ -904,6 +904,11 @@
             NO_INFO: { status: 'NO INFO', label: 'No Information' }
         });
 
+        // Devices that own a report section.  Anything appearing only in the
+        // neighbour columns is an endpoint the collector never polls, so it has
+        // no section of its own.  Rebuilt by populateDeviceList().
+        let localDeviceNames = new Set();
+
         function connectionSearchTerms(connection) {
             const status = determineLLDPStatus(connection);
             const terms = [connection.portStatus, connection.lldpStatus, status.status, status.health];
@@ -921,13 +926,25 @@
             return terms.map(value => normalizedValue(value).toLowerCase());
         }
 
+        // Selecting a switch keeps filtering the Local Device column exactly as
+        // before.  A host is never a Local Device, so it can only be matched on
+        // the neighbour columns; limiting that to non-local names prevents a
+        // switch selection from also dragging in rows where it merely appears
+        // as somebody else's neighbour.
+        function connectionMatchesDevices(connection, selected) {
+            if (connection.localDevice && selected.has(connection.localDevice)) return true;
+            return [connection.expectedDevice, connection.actualDevice].some(
+                name => name && !localDeviceNames.has(name) && selected.has(name)
+            );
+        }
+
         function filterConnectionsByState(connections, statusFilter, devices, query) {
             const statusDefinition = STATUS_FILTERS[statusFilter];
             const selected = new Set((devices || []).filter(Boolean));
             const normalizedQuery = normalizedValue(query).toLowerCase();
             return connections.filter(connection => {
                 if (statusDefinition && determineLLDPStatus(connection).status !== statusDefinition.status) return false;
-                if (selected.size > 0 && !selected.has(connection.localDevice)) return false;
+                if (selected.size > 0 && !connectionMatchesDevices(connection, selected)) return false;
                 return !normalizedQuery || connectionSearchTerms(connection).some(term => term.includes(normalizedQuery));
             });
         }
@@ -1946,9 +1963,13 @@
                         autoHideLLDPNotification();
                         return;
                     }
-                    // populateDeviceList() cleared the Select2 selection;
-                    // restore the devices that still exist in the new report.
-                    const available = new Set(localDeviceOptions(allConnections));
+                    // populateDeviceList() cleared the Select2 selection; restore
+                    // the devices that still exist in the new report.  Reading the
+                    // rebuilt options covers hosts as well as switches.
+                    const available = new Set(
+                        Array.from(document.querySelectorAll('#deviceSearch option'),
+                                   option => option.value)
+                    );
                     const kept = preservedDevices.filter(device => available.has(device));
                     selectedDevices = kept;
                     deviceSearchActive = kept.length > 0;
@@ -2403,14 +2424,29 @@
             });
         }
         
+        function byDeviceName(a, b) {
+            return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+        }
+
         function localDeviceOptions(connections) {
             const deviceSet = new Set();
             connections.forEach(conn => {
                 if (conn.localDevice) deviceSet.add(conn.localDevice);
             });
-            return Array.from(deviceSet).sort((a, b) =>
-                a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
-            );
+            return Array.from(deviceSet).sort(byDeviceName);
+        }
+
+        // Names that only ever show up as a neighbour: hosts and any other
+        // endpoint that advertises LLDP without being polled by the collector.
+        function neighborOnlyDeviceOptions(connections, localNames) {
+            const deviceSet = new Set();
+            connections.forEach(conn => {
+                [conn.expectedDevice, conn.actualDevice].forEach(name => {
+                    if (!name || isMissingValue(name) || localNames.has(name)) return;
+                    deviceSet.add(normalizedValue(name));
+                });
+            });
+            return Array.from(deviceSet).sort(byDeviceName);
         }
 
         function updateDeviceOptionAliases() {
@@ -2422,22 +2458,38 @@
         }
 
         function populateDeviceList() {
-            // This selector filters the Local Device column, so expose only local devices.
-            const sortedDevices = localDeviceOptions(allConnections);
-            
+            const localDevices = localDeviceOptions(allConnections);
+            localDeviceNames = new Set(localDevices);
+            const hostDevices = neighborOnlyDeviceOptions(allConnections, localDeviceNames);
+
             // Clear existing options and populate
             const select = document.getElementById('deviceSearch');
             select.innerHTML = '';   // multi-select: no empty placeholder option
-            
-            sortedDevices.forEach(device => {
-                const option = document.createElement('option');
-                option.value = device;
-                option.textContent = device;
-                const alias = aliasForValue(device, deviceAliasLc);
-                if (alias) option.dataset.alias = alias;
-                select.appendChild(option);
-            });
-            
+
+            const appendOptions = (names, groupLabel) => {
+                if (!names.length) return;
+                const parent = groupLabel ? document.createElement('optgroup') : select;
+                if (groupLabel) parent.label = groupLabel;
+                names.forEach(device => {
+                    const option = document.createElement('option');
+                    option.value = device;
+                    option.textContent = device;
+                    const alias = aliasForValue(device, deviceAliasLc);
+                    if (alias) option.dataset.alias = alias;
+                    parent.appendChild(option);
+                });
+                if (groupLabel) select.appendChild(parent);
+            };
+
+            // Group only when both kinds are present, so a fabric without host
+            // neighbours keeps the previous flat list.
+            if (hostDevices.length) {
+                appendOptions(localDevices, 'Switches');
+                appendOptions(hostDevices, 'Hosts');
+            } else {
+                appendOptions(localDevices, '');
+            }
+
             // Refresh Select2 without triggering the filter (nothing selected yet)
             _suppressDeviceChange = true;
             $('#deviceSearch').val(null).trigger('change');
