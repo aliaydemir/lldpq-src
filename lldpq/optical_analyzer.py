@@ -207,8 +207,10 @@ class OpticalAnalyzer:
                 f"{self.data_dir}/optical_history.json",
                 json.dumps(data, separators=(",", ":")),
             )
+            return True
         except Exception as e:
             print(f"Error saving optical history: {e}")
+            return False
 
     def parse_optical_data(self, optical_data: str) -> Optional[Dict[str, Any]]:
         """Parse optical output (NVUE transceiver commands) for optical parameters

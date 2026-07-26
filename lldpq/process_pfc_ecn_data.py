@@ -520,7 +520,12 @@ def _read_state(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
         return value if isinstance(value, dict) else default
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return default
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        # A corrupt or unreadable shard silently drops this device's 24h
+        # PFC/ECN history and restarts its deltas from zero.
+        print(f"Error reading PFC/ECN state {path}: {e}")
         return default
 
 

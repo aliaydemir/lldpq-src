@@ -187,25 +187,34 @@ class DuplicateAnalyzer:
         try:
             with open(self.state_file) as f:
                 return json.load(f)
-        except Exception:
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"Error reading duplicate sequence state: {e}")
             return {}
 
     def _load_ip_state(self):
         try:
             with open(self.ip_state_file) as f:
                 return json.load(f)
-        except Exception:
+        except FileNotFoundError:
+            return {}
+        except Exception as e:
+            print(f"Error reading duplicate IP state: {e}")
             return {}
 
     def _save_state(self):
+        # A dropped write is not cosmetic: the next run reloads empty state and
+        # reclassifies a still-active duplicate as quiesced, so the failure has
+        # to be visible in the collection log.
         try:
             _atomic_write(self.state_file, json.dumps(self.new_state))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error saving duplicate sequence state: {e}")
         try:
             _atomic_write(self.ip_state_file, json.dumps(self.new_ip_state))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error saving duplicate IP state: {e}")
 
     # ------------------------------------------------------------------ parse
     def _hosts(self):

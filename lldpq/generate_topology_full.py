@@ -177,8 +177,30 @@ def append_creation_time_to_html(html_file_path):
         if insert_point != -1:
             new_div = f'        <button onclick="time()">{timestamp}</button>\n'
             new_content = content[:insert_point] + new_div + content[insert_point:]
-            with open(html_file_path, "w") as f:
-                f.write(new_content)
+            # Stage and rename. nginx serves this page while it is rewritten, so
+            # a truncated in-place write would hand the browser a broken
+            # document; the mode carries over so it stays world-readable.
+            try:
+                html_mode = stat.S_IMODE(os.stat(html_file_path).st_mode)
+            except FileNotFoundError:
+                html_mode = 0o664
+            staged_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=os.path.dirname(html_file_path) or ".",
+                    prefix=".lldp_html.",
+                    delete=False,
+                ) as staged:
+                    staged_path = staged.name
+                    os.fchmod(staged.fileno(), html_mode | 0o644)
+                    staged.write(new_content)
+                os.replace(staged_path, html_file_path)
+                staged_path = None
+            finally:
+                if staged_path and os.path.exists(staged_path):
+                    os.unlink(staged_path)
     except Exception as e:
         print(f"[ERROR] Failed to modify HTML: {e}")
 
@@ -327,8 +349,10 @@ def parse_port_status(filepath):
                 if len(parts) == 2:
                     port_name, status = parts
                     port_status[port_name] = status  # UP, DOWN, or UNKNOWN
-    except Exception:
-        pass
+    except Exception as e:
+        # Returning empty renders every port of this device as unknown, so the
+        # cause has to reach the collection log.
+        print(f"[WARN] Could not parse port status from {filepath}: {e}")
     return port_status
 
 def parse_port_speed(filepath):
@@ -350,8 +374,8 @@ def parse_port_speed(filepath):
                         port_speed[port_name] = int(speed)  # Speed in Mbps
                     except ValueError:
                         pass
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[WARN] Could not parse port speed from {filepath}: {e}")
     return port_speed
 
 def lldp_collection_is_available(filepath):

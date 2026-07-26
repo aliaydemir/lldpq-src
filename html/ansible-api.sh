@@ -988,13 +988,13 @@ PYEOF
         
         # 1. Scan .j2 templates for {{ variable }} patterns
         if [ -d "templates" ] || [ -d "roles" ]; then
-            template_vars=$(find . -name "*.j2" -type f 2>/dev/null | xargs grep -ohE '\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)' 2>/dev/null | sed 's/{{[[:space:]]*//' | sort -u || true)
+            template_vars=$(find . -name "*.j2" -type f -print0 2>/dev/null | xargs -0 -r grep -ohE '\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)' 2>/dev/null | sed 's/{{[[:space:]]*//' | sort -u || true)
             all_vars="${all_vars}${template_vars}"$'\n'
         fi
         
         # 2. Scan group_vars YAML files for top-level keys
         if [ -d "inventory/group_vars" ]; then
-            group_vars=$(find inventory/group_vars -name "*.yaml" -o -name "*.yml" 2>/dev/null | xargs grep -ohE '^[a-zA-Z_][a-zA-Z0-9_]*:' 2>/dev/null | sed 's/://' | sort -u || true)
+            group_vars=$(find inventory/group_vars \( -name "*.yaml" -o -name "*.yml" \) -print0 2>/dev/null | xargs -0 -r grep -ohE '^[a-zA-Z_][a-zA-Z0-9_]*:' 2>/dev/null | sed 's/://' | sort -u || true)
             all_vars="${all_vars}${group_vars}"$'\n'
         fi
         
@@ -1009,7 +1009,7 @@ PYEOF
         
         # 4. Scan roles defaults and vars
         if [ -d "roles" ]; then
-            role_vars=$(find roles -path "*/defaults/*.yml" -o -path "*/defaults/*.yaml" -o -path "*/vars/*.yml" -o -path "*/vars/*.yaml" 2>/dev/null | xargs grep -ohE '^[a-zA-Z_][a-zA-Z0-9_]*:' 2>/dev/null | sed 's/://' | sort -u || true)
+            role_vars=$(find roles \( -path "*/defaults/*.yml" -o -path "*/defaults/*.yaml" -o -path "*/vars/*.yml" -o -path "*/vars/*.yaml" \) -print0 2>/dev/null | xargs -0 -r grep -ohE '^[a-zA-Z_][a-zA-Z0-9_]*:' 2>/dev/null | sed 's/://' | sort -u || true)
             all_vars="${all_vars}${role_vars}"$'\n'
         fi
         

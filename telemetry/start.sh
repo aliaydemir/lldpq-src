@@ -3,7 +3,7 @@
 # Usage: ./start.sh [start|stop|restart|status|logs]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
 
 # Prefer compose v2 plugin ('docker compose'), fall back to legacy v1 binary
 if docker compose version >/dev/null 2>&1; then

@@ -103,8 +103,13 @@ def main():
     # Generate the BER-style HTML from the current collection plus history.
     try:
         print("Generating BER-style hardware analysis HTML...")
-        result = subprocess.run([sys.executable, "generate_hardware_html.py"], 
-                              capture_output=True, text=True, cwd=".")
+        # Anchor to this script's own directory: a relative cwd only resolves
+        # when the caller happens to run from the install tree.
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run([sys.executable,
+                               os.path.join(script_dir, "generate_hardware_html.py")],
+                              capture_output=True, text=True, cwd=script_dir,
+                              timeout=300)
         if result.returncode == 0:
             print("BER-style hardware analysis HTML generated successfully!")
             print(result.stdout.strip())

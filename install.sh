@@ -321,6 +321,10 @@ finally:
     fi
 }
 
+# Every key this loader exports, so a clean install can drop the values it
+# inherited from the configuration it just deleted.
+declare -A LLDPQ_CONFIG_LOADED_KEYS=()
+
 # Read legacy KEY=value configuration without executing it as shell code.  The
 # file is intentionally writable by the shared web/CLI group, so `source` would
 # turn a configuration write into arbitrary code execution during install.
@@ -360,7 +364,7 @@ load_lldpq_config() {
             MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
             OPTICAL_COLLECTION_BUDGET_SECONDS|OPTICAL_PORT_TIMEOUT_SECONDS|\
-            LLDP_MAX_PARALLEL|ASSETS_MAX_PARALLEL|\
+            LLDP_MAX_PARALLEL|ASSETS_MAX_PARALLEL|FABRIC_SCAN_MAX_PARALLEL|\
             GET_CONFIGS_MAX_PARALLEL|GET_CONFIGS_SSH_TIMEOUT|SEND_CMD_MAX_PARALLEL|TELEMETRY_MAX_PARALLEL|\
             TRANSCEIVER_FW_SKIP_MODELS|TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY|\
             TRANSCEIVER_FW_MAX_PARALLEL|TRANSCEIVER_FW_MIN_INTERVAL|\
@@ -387,6 +391,7 @@ load_lldpq_config() {
             fi
         fi
         printf -v "$key" '%s' "$value"
+        LLDPQ_CONFIG_LOADED_KEYS["$key"]=1
     done < "$config_file"
     if [[ -n "$config_lock_fd" ]]; then
         flock -u "$config_lock_fd" || true
@@ -863,6 +868,13 @@ render_runtime_tuning_config() {
     case "$getconfigs_ssh_timeout" in
         ''|*[!0-9]*|0) getconfigs_ssh_timeout=60 ;;
     esac
+    # Fleet-wide like the other collectors, but read from the environment
+    # instead of a 20th positional: preserved on update by load_lldpq_config,
+    # reset to the default by a clean install.
+    local fabric_scan_parallel="${FABRIC_SCAN_MAX_PARALLEL:-100}"
+    case "$fabric_scan_parallel" in
+        ''|*[!0-9]*|0) fabric_scan_parallel=100 ;;
+    esac
     case "$monitor_command_timeout" in
         ''|*[!0-9]*|????*) monitor_command_timeout=20 ;;
         *)
@@ -902,6 +914,7 @@ render_runtime_tuning_config() {
     printf 'GET_CONFIGS_SSH_TIMEOUT=%s\n' "$getconfigs_ssh_timeout"
     printf 'SEND_CMD_MAX_PARALLEL=%s\n' "$send_parallel"
     printf 'TELEMETRY_MAX_PARALLEL=%s\n' "$telemetry_parallel"
+    printf 'FABRIC_SCAN_MAX_PARALLEL=%s\n' "$fabric_scan_parallel"
     printf 'SCAN_INTERVAL=%s\n' "$scan_interval"
 }
 
@@ -4463,6 +4476,18 @@ if [[ -f /etc/lldpq.conf ]] || [[ -f /etc/lldpq-users.conf ]] || [[ -d /var/lib/
             sudo rm -rf "$LLDPQ_INSTALL_DIR/telemetry"
             echo "  Old installation files removed"
             INSTALL_MODE="fresh"
+            # The deleted configuration is still live in this shell, so its
+            # tuning values would be rendered straight back into the new file
+            # and silently undo the reset.  Keep only where the install lives;
+            # the caller's own SKIP_* overrides are restored by the loop below.
+            for _loaded_key in "${!LLDPQ_CONFIG_LOADED_KEYS[@]}"; do
+                case "$_loaded_key" in
+                    LLDPQ_DIR|LLDPQ_USER|LLDPQ_SRC|LLDPQ_HOSTNAME|WEB_ROOT|\
+                    ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR) ;;
+                    *) unset "$_loaded_key" ;;
+                esac
+            done
+            unset _loaded_key
             for _skip_key in "${_CALLER_SKIP_KEYS[@]}"; do
                 if [[ "${_CALLER_SKIP_WAS_SET[$_skip_key]:-false}" == "true" ]]; then
                     printf -v "$_skip_key" '%s' "${_CALLER_SKIP_VALUE[$_skip_key]}"
@@ -6077,6 +6102,12 @@ prepare_shared_lock_files /var/lib/lldpq/ssh-key.lock
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/lldp-jobs
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/assets-jobs
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/provision-jobs
+# Config-write recovery authority, mirroring the Docker entrypoint. setup_safety
+# falls back to this fixed path when LLDPQ_DIRECT_WRITE_STATE_DIR is unset, so
+# direct-write recovery only works once the journal root exists. The leading
+# zero keeps the journal child from inheriting the setgid bit of its parent.
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/provision-state
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 00700 /var/lib/lldpq/provision-state/config-write-journals
 # Migrate legacy Ask-AI state out of the nginx document root without replacing
 # a newer private copy. Existing updates therefore retain memory and analysis.
 for ai_state_mapping in \

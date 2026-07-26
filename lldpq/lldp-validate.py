@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import yaml
+from datetime import datetime
 
 try:
     from topology_edges import (
@@ -463,7 +464,7 @@ def main():
             managed_devices=managed_devices,
             resolver=resolver,
         )
-        date_str = subprocess.getoutput("date '+%Y-%m-%d %H-%M-%S'")
+        date_str = datetime.now().strftime('%Y-%m-%d %H-%M-%S')
         script_name = get_topology_script_name(
             os.path.join(script_dir, 'topology_config.yaml')
         )
@@ -503,11 +504,15 @@ def main():
                 )
             except Exception as sidecar_exc:
                 print(f"Warning: could not stage LLDP neighbor sidecar: {sidecar_exc}")
+            # Generation scales with fabric size, so the ceiling is generous; it
+            # exists only so a wedged generator cannot stall the LLDP pipeline
+            # indefinitely and block every later collection cycle.
             subprocess.run(
                 [sys.executable, generate_topology_script, input_folder,
                  staged_topology, '--topology-file', topology_snapshot_path],
                 check=True,
                 cwd=script_dir,
+                timeout=600,
             )
             if not os.path.isfile(staged_topology) or os.path.getsize(staged_topology) == 0:
                 raise RuntimeError("topology generator did not create a staged output")
@@ -535,6 +540,7 @@ def main():
              '--topology-file', topology_snapshot_path],
             check=True,
             cwd=script_dir,
+            timeout=600,
         )
         if previous_output_path:
             os.unlink(previous_output_path)

@@ -429,8 +429,8 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     finish_phase("parse_records")
 
     # Save updated optical history
-    optical_analyzer.save_optical_history()
-    print("Optical history saved")
+    if optical_analyzer.save_optical_history():
+        print("Optical history saved")
     finish_phase("write_history")
 
     # Generate web report

@@ -579,8 +579,12 @@ def _install_bytes_as_collector(content, target, mode, uid, gid, *, user):
         if stage is not None:
             try:
                 _as_collector(user, ["rm", "-f", "--", stage])
-            except Exception:
-                pass
+            except Exception as exc:
+                # Must not raise: this runs while a real failure is already
+                # propagating.  stderr keeps the CGI JSON body intact while
+                # still naming the stage file that was left behind.
+                print(f"backup-import stage cleanup failed for {stage}: {exc}",
+                      file=sys.stderr)
 
 
 def _activate_collector_file(entry, user):

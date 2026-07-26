@@ -349,8 +349,10 @@ class BERAnalyzer:
             if os.path.exists(l1_path):
                 with open(l1_path, "r") as f:
                     parse_content(f.read())
-        except Exception:
-            pass
+        except Exception as e:
+            # The file is present but unreadable, so report why before the
+            # legacy fallback quietly takes over.
+            print(f"Error reading L1 show data for {hostname}: {e}")
 
         # 2) Fallback to legacy detailed counters
         if not result:
@@ -429,8 +431,10 @@ class BERAnalyzer:
             if os.path.exists(l1_path):
                 with open(l1_path, "r") as f:
                     parse_content(f.read())
-        except Exception:
-            pass
+        except Exception as e:
+            # No fallback here: an unreported failure leaves this device with
+            # empty L1 extras and its ports rendered as unknown.
+            print(f"Error reading L1 extras for {hostname}: {e}")
 
         self._l1_extras_cache[hostname] = result
         return result

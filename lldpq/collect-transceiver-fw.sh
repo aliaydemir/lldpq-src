@@ -7,7 +7,7 @@
 # Licensed under MIT License - see LICENSE file for details
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR" || exit 1
 
 if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true

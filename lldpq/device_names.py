@@ -21,6 +21,7 @@ matching, sorting, filtering or data keys.
 
 import os
 import re
+import sys
 
 _CMAP = None  # lower(name) -> canonical spelling (per-process cache)
 
@@ -56,8 +57,12 @@ def _load():
                     m.setdefault(node.group(1).lower(), node.group(1))
             if m:
                 break
-        except Exception:
-            pass
+        except Exception as e:
+            # Reported on stderr only: importers include CGI handlers whose
+            # stdout is the HTTP response body.  Falling through leaves names
+            # spelled inconsistently across pages, so it must not be silent.
+            print(f"Warning: could not read device names from {path}: {e}",
+                  file=sys.stderr)
     _CMAP = m
     return m
 

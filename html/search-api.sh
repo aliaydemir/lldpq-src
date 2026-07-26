@@ -1315,7 +1315,10 @@ run_fabric_scan() {
     
     # Run scan in background. The explicit operator action overrides a
     # configured SKIP_FABRIC_SCAN (the script self-gates on the toggle).
-    cd "$lldpq_dir"
+    if ! cd "$lldpq_dir"; then
+        echo '{"success": false, "error": "LLDPq directory is unavailable"}'
+        return
+    fi
     sudo -u "$LLDPQ_USER" nohup env LLDPQ_FABRIC_SCAN_FORCE=1 bash "$scan_script" > /tmp/fabric-scan.log 2>&1 &
     
     echo '{"success": true, "message": "Fabric scan started"}'

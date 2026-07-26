@@ -1060,7 +1060,10 @@ fi
 # Archive the previous problem report before activation. An archive copy is
 # additive; a later transaction failure still leaves every served LKG file.
 echo "Publishing LLDP generation..."
-sudo mkdir -p "$WEB_ROOT/hstr" || exit 1
+# Match the installer's ownership for this web-served archive. A plain mkdir
+# leaves a recreated directory as root:root, which locks both the collector and
+# the web UI out of it; install -d also repairs an already-wrong mode in place.
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 775 "$WEB_ROOT/hstr" || exit 1
 if [[ -f "$WEB_ROOT/problems-lldp_results.ini" ]]; then
     # Name the archive after the archived report's own "Created on" header so
     # the label archive.html renders matches the content; fall back to the
@@ -1105,24 +1108,25 @@ find "$SCRIPT_DIR/lldp-results" -maxdepth 1 -type f \
 # Cleanup old history files (keep 1 per day for last 30 days)
 folder_path="$WEB_ROOT/hstr"
 cd "$folder_path" || exit 1
-declare -a keep_files
+# Keyed by exact filename. The previous flattened-array membership test split
+# names on whitespace and expanded globs, so an archive holding a wildcard kept
+# stale reports alive forever. NUL-delimited reads preserve names verbatim.
+declare -A keep_files
 for i in {1..30}; do
     start_date=$(date -d "$i days ago" '+%Y-%m-%d 00:00:00')
     end_date=$(date -d "$((i - 1)) days ago" '+%Y-%m-%d 00:00:00')
     file=$(find . -type f -name "*.ini" -newermt "$start_date" ! -newermt "$end_date" | sort | head -n 1)
     if [ -n "$file" ]; then
-        keep_files+=("$file")
+        keep_files["$file"]=1
     fi
 done
-recent_files=$(find . -type f -name "*.ini" -mtime -1)
-for file in $recent_files; do
-    keep_files+=("$file")
-done
-find . -type f -name "*.ini" | while read file; do
-    if [[ ! " ${keep_files[@]} " =~ " ${file} " ]]; then
-        sudo rm "$file"
-    fi
-done
+while IFS= read -r -d '' file; do
+    keep_files["$file"]=1
+done < <(find . -type f -name "*.ini" -mtime -1 -print0)
+while IFS= read -r -d '' file; do
+    [[ -n "${keep_files[$file]:-}" ]] && continue
+    sudo rm -- "$file"
+done < <(find . -type f -name "*.ini" -print0)
 
 # Show timing
 END_TIME=$(date +%s)
