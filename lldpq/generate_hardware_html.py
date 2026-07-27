@@ -359,6 +359,10 @@ def parse_temperature_from_hardware_file(device_name):
                     pattern, content, re.MULTILINE | re.IGNORECASE
                 )
             )
+        # A sensor that cannot be read reports 0.0, which would otherwise be
+        # graded EXCELLENT. No powered switch component sits at or below 0 C,
+        # so treat those readings as absent rather than as good news.
+        asic_temperatures = [value for value in asic_temperatures if value > 0]
         if asic_temperatures:
             asic_temp = max(asic_temperatures)
 
@@ -377,6 +381,7 @@ def parse_temperature_from_hardware_file(device_name):
                     pattern, content, re.MULTILINE | re.IGNORECASE
                 )
             )
+        cpu_temperatures = [value for value in cpu_temperatures if value > 0]
         if cpu_temperatures:
             cpu_temp = max(cpu_temperatures)
         
@@ -755,9 +760,12 @@ def grade_fans_relative(fans):
         baseline = baselines.get(cohort)
         ratio = None
         if rpm <= 0:
-            # A stopped fan only matters while other fans still spin; an
-            # all-zero reading is usually an empty slot, not a live failure.
-            grade = "CRITICAL" if any_spinning else None
+            # An empty slot is not reported as a fan at all, so a fan that is
+            # reported and reads zero has stopped. Treating an all-zero set as
+            # missing telemetry filed a switch whose entire fan tray had
+            # failed under "Unknown", alongside boxes that merely lack
+            # lm-sensors, and kept it out of the Critical count.
+            grade = "CRITICAL"
         elif baseline and baseline > 0:
             ratio = rpm / baseline
             if ratio < critical_ratio:

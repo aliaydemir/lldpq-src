@@ -66,6 +66,19 @@ def _atomic_write(path, content):
         raise
 
 class LogAnalyzer:
+    # An explicit priority is only trustworthy as a structured field.
+    _PRIORITY_FIELD_RE = re.compile(r'(?:^|\s)PRIORITY=([0-7])(?=\s|$)')
+    _SYSLOG_PRI_RE = re.compile(r'^<(\d{1,3})>')
+
+    SEVERITY_RANK = {'info': 0, 'warning': 1, 'error': 2, 'critical': 3}
+    # Sections the collector gathers with journalctl --priority=0..3.
+    SEVERITY_FLOOR_BY_SECTION = {
+        'SYSTEM_CRITICAL_LOGS': 'error',
+        'JOURNALCTL_PRIORITY_LOGS': 'error',
+    }
+    AGE_RECENT_MINUTES = 30
+    AGE_AGING_MINUTES = 120
+
     def __init__(self, data_dir="monitor-results"):
         self.data_dir = data_dir
         self.log_data_dir = os.path.join(data_dir, "log-data")
@@ -165,13 +178,28 @@ class LogAnalyzer:
             'NETWORK_INTERFACE_LOGS',
         )
 
-    @staticmethod
-    def _syslog_priority_severity(line):
-        """Return RFC 5424 severity for an explicit PRIORITY value."""
-        match = re.search(r'\bpriority\s*[:=]\s*([0-7])\b', line, re.IGNORECASE)
-        if not match:
-            return None
-        priority = int(match.group(1))
+    @classmethod
+    def _syslog_priority_severity(cls, line):
+        """Return RFC 5424 severity for an explicit priority field.
+
+        A real priority arrives as structured data: journald's ``PRIORITY=N``
+        or the ``<PRI>`` prefix of a syslog frame.  Matching the word
+        "priority" anywhere in the message classified ordinary text such as
+        ``local-priority: 1`` or ``port swp5 priority=0`` as Critical, and did
+        so before the critical patterns ran, which also let a genuine kernel
+        panic carrying "priority = 7" fall through to Info.
+        """
+        match = cls._PRIORITY_FIELD_RE.search(line)
+        if match:
+            priority = int(match.group(1))
+        else:
+            match = cls._SYSLOG_PRI_RE.match(line)
+            if not match:
+                return None
+            pri = int(match.group(1))
+            if pri > 191:  # facility 23 is the highest valid value
+                return None
+            priority = pri % 8
         if priority <= 2:
             return 'critical'
         if priority == 3:
@@ -179,8 +207,23 @@ class LogAnalyzer:
         if priority == 4:
             return 'warning'
         return 'info'
-    
-    def categorize_log_line(self, line):
+
+    def _apply_section_floor(self, severity, section):
+        """Raise severity to the floor guaranteed by the collecting command.
+
+        ``journalctl --priority=0..3`` has already filtered these sections to
+        err-or-worse.  The collector emits short-format output, which drops the
+        numeric priority, so this is the only place that judgement survives —
+        without it a line matching no keyword is filed as Info.
+        """
+        floor = self.SEVERITY_FLOOR_BY_SECTION.get(section)
+        if not floor:
+            return severity
+        if self.SEVERITY_RANK[severity] < self.SEVERITY_RANK[floor]:
+            return floor
+        return severity
+
+    def categorize_log_line(self, line, section=None):
         """Categorize a log line by severity"""
         line_lower = line.lower()
         
@@ -208,16 +251,18 @@ class LogAnalyzer:
         
         # Error outranks Warning.  Checking Warning first caused strings such
         # as "error ... warning threshold" to be understated.
+        matched = 'info'
         for pattern in self.severity_patterns['error']:
             if re.search(pattern, line_lower):
-                return 'error'
+                matched = 'error'
+                break
+        else:
+            for pattern in self.severity_patterns['warning']:
+                if re.search(pattern, line_lower):
+                    matched = 'warning'
+                    break
 
-        for pattern in self.severity_patterns['warning']:
-            if re.search(pattern, line_lower):
-                return 'warning'
-        
-        # Default to info if no specific pattern matches
-        return 'info'
+        return self._apply_section_floor(matched, section)
     
     def parse_timestamp(self, line):
         """Extract timestamp from log line if available"""
@@ -313,38 +358,29 @@ class LogAnalyzer:
             normalized,
         ))
     
-    def adjust_severity_by_age(self, severity, log_datetime):
-        """Adjust severity based on log age - older logs are less critical"""
-        if log_datetime is None:
-            return severity  # Can't determine age, keep original
-        
-        if log_datetime.tzinfo is None:
-            return severity
+    def age_bucket(self, log_datetime):
+        """Classify how old an event is.
 
-        now = datetime.now(timezone.utc)
-        age = now - log_datetime.astimezone(timezone.utc)
-        age_minutes = age.total_seconds() / 60
+        Age is reported next to severity instead of being folded into it.
+        Demoting by age moved a real incident out of the Critical count an
+        operator filters on — a kernel panic two hours old is still a kernel
+        panic.  It was also applied inconsistently: only switches whose
+        journal timestamps carry a timezone were ever demoted, so identical
+        events on two switches were classified differently.
+        """
+        if log_datetime is None or log_datetime.tzinfo is None:
+            return 'unknown'
 
-        # Clock skew or a future-dated event must never make an incident look
-        # less severe.
-        if age_minutes < 0:
-            return severity
-        
-        # Time-based severity adjustment:
-        # - Last 30 minutes: Keep original severity
-        # - 30 min to 2 hours: Demote critical → warning
-        # - Over 2 hours: Demote critical/warning → info
-        
-        if age_minutes < 30:
-            return severity  # Fresh log, keep original
-        elif age_minutes < 120:  # 30 min - 2 hours
-            if severity in ('critical', 'error'):
-                return 'warning'  # Demote critical to warning
-            return severity
-        else:  # Over 2 hours
-            if severity in ('critical', 'error', 'warning'):
-                return 'info'  # Demote to info (historical)
-            return severity
+        age_minutes = (
+            datetime.now(timezone.utc) - log_datetime.astimezone(timezone.utc)
+        ).total_seconds() / 60
+        # Clock skew can date an event in the future; treat it as current
+        # rather than inventing a bucket for it.
+        if age_minutes < self.AGE_RECENT_MINUTES:
+            return 'recent'
+        if age_minutes < self.AGE_AGING_MINUTES:
+            return 'aging'
+        return 'historical'
     
     def process_device_logs(self, device_name, log_file_path):
         """Process logs for a single device"""
@@ -390,7 +426,7 @@ class LogAnalyzer:
                     if len(line.strip()) < 5:  # Skip very short lines
                         continue
                     
-                    severity = self.categorize_log_line(line)
+                    severity = self.categorize_log_line(line, section_name)
                     
                     # Skip if severity is None (monitoring noise)
                     if severity is None:
@@ -402,18 +438,14 @@ class LogAnalyzer:
                     self.seen_events[device_name].add(normalized_line)
                     
                     timestamp = self.parse_timestamp(line)
-                    
-                    # Adjust severity based on log age (older logs are less critical)
                     log_datetime = self.parse_timestamp_to_datetime(line)
-                    original_severity = severity
-                    severity = self.adjust_severity_by_age(severity, log_datetime)
                     
                     log_entry = {
                         'timestamp': timestamp,
                         'section': section_name,
                         'message': line.strip(),
                         'severity': severity,
-                        'original_severity': original_severity,
+                        'age': self.age_bucket(log_datetime),
                     }
                     
                     self.log_analysis[device_name][severity].append(log_entry)
@@ -781,6 +813,13 @@ class LogAnalyzer:
         // Log data embedded in the page
         const logData = """ + json_for_inline_script(dict(self.log_analysis)) + """;
         
+        const AGE_LABELS = {
+            recent: 'LAST 30 MIN',
+            aging: '30 MIN - 2 H',
+            historical: 'OVER 2 H',
+            unknown: 'AGE UNKNOWN',
+        };
+
         // Initialize page functionality
         let deviceSearchActive = false;
         let selectedDevice = '';
@@ -1157,12 +1196,15 @@ class LogAnalyzer:
 
                     const severityTrace = document.createElement('span');
                     severityTrace.className = 'log-section';
-                    const originalSeverity = String(log.original_severity ?? log.severity ?? severity).toUpperCase();
-                    const effectiveSeverity = String(log.severity ?? severity).toUpperCase();
-                    severityTrace.textContent = originalSeverity === effectiveSeverity
-                        ? effectiveSeverity
-                        : `${originalSeverity} → ${effectiveSeverity}`;
+                    severityTrace.textContent = String(log.severity ?? severity).toUpperCase();
                     entry.appendChild(severityTrace);
+
+                    // Age is shown, not applied: severity reflects the event,
+                    // this says how long ago it happened.
+                    const ageBadge = document.createElement('span');
+                    ageBadge.className = 'log-section';
+                    ageBadge.textContent = AGE_LABELS[String(log.age ?? 'unknown')] || AGE_LABELS.unknown;
+                    entry.appendChild(ageBadge);
 
                     const message = document.createElement('span');
                     message.className = 'log-message';
@@ -1414,11 +1456,12 @@ class LogAnalyzer:
                     }
                 });
 
-                // Preserve event-level provenance, including age demotion.
+                // Preserve event-level provenance: severity and age are
+                // independent, so both are exported.
                 csvContent += '\\n' + [
                     'Device',
-                    'Effective Severity',
-                    'Original Severity',
+                    'Severity',
+                    'Age',
                     'Timestamp',
                     'Section',
                     'Message'
@@ -1430,7 +1473,7 @@ class LogAnalyzer:
                             csvContent += [
                                 device.label,
                                 entry.severity || severity,
-                                entry.original_severity || entry.severity || severity,
+                                entry.age || 'unknown',
                                 entry.timestamp || '',
                                 entry.section || '',
                                 entry.message || ''
@@ -1527,7 +1570,7 @@ class LogAnalyzer:
                     export_rows.append({
                         "device": str(canonical(device_name)),
                         "severity": entry.get("severity", severity),
-                        "original_severity": entry.get("original_severity"),
+                        "age": entry.get("age", "unknown"),
                         "timestamp": entry.get("timestamp"),
                         "section": entry.get("section"),
                         "message": entry.get("message"),

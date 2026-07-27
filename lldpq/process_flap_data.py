@@ -148,6 +148,17 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
             interface, transitions_str = line.split(":", 1)
             interface = interface.strip()
             transitions_str = transitions_str.strip()
+            if transitions_str == "unavailable":
+                # The switch could not read this port's counter. Skipping the
+                # sample keeps the persisted baseline intact; treating it as 0
+                # would look like a counter reset and turn the next successful
+                # read into a burst of flaps that never happened.
+                print(
+                    f"Carrier counter unavailable for {hostname}:{interface}; "
+                    "keeping the previous baseline"
+                )
+                processing_errors += 1
+                continue
             try:
                 transitions = int(transitions_str)
             except ValueError:

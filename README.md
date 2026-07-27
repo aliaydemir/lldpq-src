@@ -1463,6 +1463,9 @@ The following optional values tune bounded collection:
 - `PFC_ECN_MAX_PARALLEL=4` — concurrent per-port NVUE QoS reads on each switch (`1..8`)
 - `PFC_ECN_COLLECTION_BUDGET_SECONDS=60` — QoS collection budget per switch
 - `PFC_ECN_PORT_TIMEOUT_SECONDS=5` — timeout for one QoS read
+- `PFC_ECN_PRIORITY=3` — lossless priority the report reads (`0..7`). Set this to
+  the priority your RoCE traffic uses; if the counters are on another priority the
+  page reports every port as "Data missing"
 - `PFC_ECN_SHARD_MAX_PARALLEL=<cpu-bounded>` — environment-only worker count
   for per-device history shard merge/prune/write (defaults to up to 8)
 - `OPTICAL_COLLECTION_BUDGET_SECONDS=120` — DOM collection budget per switch

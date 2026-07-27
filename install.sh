@@ -363,6 +363,7 @@ load_lldpq_config() {
             SKIP_FABRIC_SCAN|SKIP_ALERTS|MONITOR_TIMING|\
             MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
+            PFC_ECN_PRIORITY|\
             OPTICAL_COLLECTION_BUDGET_SECONDS|OPTICAL_PORT_TIMEOUT_SECONDS|\
             LLDP_MAX_PARALLEL|ASSETS_MAX_PARALLEL|FABRIC_SCAN_MAX_PARALLEL|\
             GET_CONFIGS_MAX_PARALLEL|GET_CONFIGS_SSH_TIMEOUT|SEND_CMD_MAX_PARALLEL|TELEMETRY_MAX_PARALLEL|\
@@ -875,6 +876,13 @@ render_runtime_tuning_config() {
     case "$fabric_scan_parallel" in
         ''|*[!0-9]*|0) fabric_scan_parallel=100 ;;
     esac
+    # Lossless priority the PFC/ECN report reads. 3 is the common RoCE choice,
+    # not a universal one, so it has to survive as an operator setting.
+    local pfc_priority="${PFC_ECN_PRIORITY:-3}"
+    case "$pfc_priority" in
+        0|1|2|3|4|5|6|7) ;;
+        *) pfc_priority=3 ;;
+    esac
     case "$monitor_command_timeout" in
         ''|*[!0-9]*|????*) monitor_command_timeout=20 ;;
         *)
@@ -905,6 +913,7 @@ render_runtime_tuning_config() {
     printf 'PFC_ECN_MAX_PARALLEL=%s\n' "$pfc_parallel"
     printf 'PFC_ECN_COLLECTION_BUDGET_SECONDS=%s\n' "$pfc_budget"
     printf 'PFC_ECN_PORT_TIMEOUT_SECONDS=%s\n' "$pfc_port_timeout"
+    printf 'PFC_ECN_PRIORITY=%s\n' "$pfc_priority"
     printf 'OPTICAL_COLLECTION_BUDGET_SECONDS=%s\n' "$optical_budget"
     printf 'OPTICAL_PORT_TIMEOUT_SECONDS=%s\n' "$optical_port_timeout"
     printf 'MONITOR_TIMING=%s\n' "$monitor_timing"

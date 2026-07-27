@@ -22,7 +22,17 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Tuple
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import analysis_sidecar
 from collection_freshness import (
@@ -61,6 +71,9 @@ INVENTORY_STATUS_RE = re.compile(
 INVENTORY_COUNT_RE = re.compile(
     r"^__LLDPQ_PFC_ECN_INVENTORY_COUNT__:([0-9]+)$"
 )
+
+PRIORITY_RE = re.compile(r"[0-7]")
+DEFAULT_LOSSLESS_PRIORITY = "3"
 
 COUNTER_PATHS = {
     "ecn_marked_frames": ("egress-queue-stats", "ecn-marked-frames"),
@@ -295,6 +308,27 @@ def validate_inventory_contract(
     return True, None
 
 
+def configured_priority() -> str:
+    """Lossless priority this report analyzes.
+
+    RoCE deployments do not all place their lossless class on priority 3.
+    Without this override, a fabric using any other priority reads every
+    counter as absent and the page shows "data missing" on every port —
+    including during a real PFC storm.
+    """
+    raw = os.environ.get("PFC_ECN_PRIORITY", "").strip()
+    if not raw:
+        return DEFAULT_LOSSLESS_PRIORITY
+    if PRIORITY_RE.fullmatch(raw):
+        return raw
+    print(
+        f"Ignoring invalid PFC_ECN_PRIORITY={raw!r}; using priority "
+        f"{DEFAULT_LOSSLESS_PRIORITY}",
+        file=sys.stderr,
+    )
+    return DEFAULT_LOSSLESS_PRIORITY
+
+
 def _find_group(value: Any, key: str) -> Optional[Any]:
     """Recursively locate the first NVUE object holding ``key`` and return it.
 
@@ -318,9 +352,9 @@ def _find_group(value: Any, key: str) -> Optional[Any]:
     return None
 
 
-def _priority_three(group: Any) -> Optional[Mapping[str, Any]]:
+def _priority_group(group: Any, priority: str) -> Optional[Mapping[str, Any]]:
     if isinstance(group, Mapping):
-        candidate = group.get("3")
+        candidate = group.get(priority)
         if isinstance(candidate, Mapping):
             return candidate
     if isinstance(group, list):
@@ -330,9 +364,40 @@ def _priority_three(group: Any) -> Optional[Mapping[str, Any]]:
             selector = candidate.get(
                 "traffic-class", candidate.get("switch-priority", candidate.get("id"))
             )
-            if str(selector) == "3":
+            if str(selector) == priority:
                 return candidate
     return None
+
+
+def _group_priorities(group: Any) -> Set[str]:
+    """Priority keys one counter group actually exposes."""
+    found: Set[str] = set()
+    if isinstance(group, Mapping):
+        for key, value in group.items():
+            if isinstance(value, Mapping) and PRIORITY_RE.fullmatch(str(key)):
+                found.add(str(key))
+    elif isinstance(group, list):
+        for candidate in group:
+            if not isinstance(candidate, Mapping):
+                continue
+            selector = candidate.get(
+                "traffic-class", candidate.get("switch-priority", candidate.get("id"))
+            )
+            if PRIORITY_RE.fullmatch(str(selector)):
+                found.add(str(selector))
+    return found
+
+
+def observed_priorities(payload: Mapping[str, Any]) -> Set[str]:
+    """Priorities present in either counter group of a single port payload.
+
+    Used to tell "this fabric marks a different priority" apart from "this
+    port reports nothing", which are otherwise identical empty readings.
+    """
+    result: Set[str] = set()
+    for group_name in ("egress-queue-stats", "pfc-stats"):
+        result |= _group_priorities(_find_group(payload, group_name))
+    return result
 
 
 def _counter_number(value: Any) -> Optional[int]:
@@ -353,13 +418,17 @@ def _counter_number(value: Any) -> Optional[int]:
     return None
 
 
-def extract_counters(payload: Mapping[str, Any]) -> Dict[str, Optional[int]]:
+def extract_counters(
+    payload: Mapping[str, Any], priority: Optional[str] = None
+) -> Dict[str, Optional[int]]:
+    if priority is None:
+        priority = configured_priority()
     result: Dict[str, Optional[int]] = {name: None for name in COUNTER_PATHS}
     groups = {
-        "egress-queue-stats": _priority_three(
-            _find_group(payload, "egress-queue-stats")
+        "egress-queue-stats": _priority_group(
+            _find_group(payload, "egress-queue-stats"), priority
         ),
-        "pfc-stats": _priority_three(_find_group(payload, "pfc-stats")),
+        "pfc-stats": _priority_group(_find_group(payload, "pfc-stats"), priority),
     }
     for name, (group_name, field) in COUNTER_PATHS.items():
         group = groups[group_name]
@@ -433,7 +502,8 @@ def build_port_record(
     discard_values = [
         deltas.get("tx_uc_buffer_discards"), deltas.get("wred_discards")
     ]
-    # The table labels this as the combined TC3 discard delta.  Showing a
+    # The table labels this as the combined discard delta for the configured
+    # lossless traffic class.  Showing a
     # partial sum as zero would hide an unavailable constituent counter.
     loss_delta = (
         sum(discard_values) if all(value is not None for value in discard_values)
@@ -847,6 +917,8 @@ def render_report(
     current_hosts: Optional[int] = None,
     collection_unavailable: bool = False,
     coverage_failures: Optional[Mapping[str, str]] = None,
+    lossless_priority: str = DEFAULT_LOSSLESS_PRIORITY,
+    unmatched_priorities: Optional[Iterable[str]] = None,
 ) -> str:
     records = sorted(records, key=lambda row: (row["hostname"], row["interface"]))
     metrics = summarize_records(
@@ -990,6 +1062,23 @@ def render_report(
         'the table intentionally shows no current counters.</div>'
         if collection_unavailable else ""
     )
+    # An empty page is ambiguous on its own: it looks the same whether the
+    # fabric is quiet or the analyzer is reading the wrong priority.  Name the
+    # priorities the switches actually reported so the fix is obvious.
+    other_priorities = sorted(
+        str(item) for item in (unmatched_priorities or ())
+        if str(item) != lossless_priority
+    )
+    priority_banner = ""
+    if other_priorities and not collection_unavailable:
+        priority_banner = (
+            '<div class="notice">No priority '
+            + html.escape(lossless_priority)
+            + ' counters were found, but ports reported priority '
+            + html.escape(", ".join(other_priorities))
+            + '. Set <code>PFC_ECN_PRIORITY</code> in /etc/lldpq.conf to the '
+            'lossless priority this fabric uses.</div>'
+        )
     partial_banner = ""
     if coverage_failures and not collection_unavailable:
         failure_text = "; ".join(
@@ -1083,6 +1172,7 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
   </div>
 </div>
 {unavailable_banner}
+{priority_banner}
 {partial_banner}
 <section class="dashboard-section"><div class="section-header">PFC/ECN Summary</div><div class="section-content"><div class="summary-grid">
 <div id="devices-card" class="summary-card card-info" data-card-filter="all" data-filter-label="All reporting devices" role="button" tabindex="0" aria-pressed="false"><div class="metric">{device_coverage}</div><div class="metric-label">Devices reporting</div></div>
@@ -1102,24 +1192,24 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
 <th class="sortable" data-type="string" aria-sort="none" title="Switch hostname">Device <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="string" aria-sort="none" title="Physical switch interface">Port <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="string" aria-sort="none" title="Highest-priority signal in this sample window">Status <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="Cumulative TC3 ECN-marked frames">ECN Total <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="TC3 ECN-marked change and average rate">ECN Δ / Rate <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="ECN-marked share of TC3 transmitted frames">ECN % <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="Cumulative SP3 pause frames received">PFC RX Total <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="SP3 received pause-frame change and average rate">PFC RX Δ / Rate <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="Cumulative SP3 pause frames transmitted">PFC TX Total <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="SP3 transmitted pause-frame change and average rate">PFC TX Δ / Rate <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="TC3 transmitted frames since the previous sample">TC3 TX Δ <span class="sort-arrow">▲▼</span></th>
-<th class="sortable" data-type="number" aria-sort="none" title="Combined TC3 unicast-buffer and WRED discard change">Discard Δ <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="Cumulative TC{lossless_priority} ECN-marked frames">ECN Total <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="TC{lossless_priority} ECN-marked change and average rate">ECN Δ / Rate <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="ECN-marked share of TC{lossless_priority} transmitted frames">ECN % <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="Cumulative SP{lossless_priority} pause frames received">PFC RX Total <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="SP{lossless_priority} received pause-frame change and average rate">PFC RX Δ / Rate <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="Cumulative SP{lossless_priority} pause frames transmitted">PFC TX Total <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="SP{lossless_priority} transmitted pause-frame change and average rate">PFC TX Δ / Rate <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="TC{lossless_priority} transmitted frames since the previous sample">TC{lossless_priority} TX Δ <span class="sort-arrow">▲▼</span></th>
+<th class="sortable" data-type="number" aria-sort="none" title="Combined TC{lossless_priority} unicast-buffer and WRED discard change">Discard Δ <span class="sort-arrow">▲▼</span></th>
 <th class="sortable" data-type="number" aria-sort="none" title="Latest sample time and elapsed comparison window">Sample / Window <span class="sort-arrow">▲▼</span></th>
 </tr></thead><tbody>{table_body}</tbody></table></div></div></section>
 <script type="application/json" id="pfc-device-list">{device_list_json}</script>
 {deferred_script}
 <div id="metricGuideModal" class="guide-modal" role="dialog" aria-modal="true" aria-labelledby="metricGuideTitle" aria-hidden="true">
   <div class="guide-modal-box"><div class="guide-modal-head"><h2 id="metricGuideTitle">PFC/ECN Metric Guide</h2><button type="button" class="guide-modal-close" onclick="closeMetricGuide()" title="Close" aria-label="Close metric guide">&times;</button></div>
-  <div class="guide-modal-body"><div class="guide-intro">This report compares the latest switch counters with the previous successful collection. It monitors traffic class 3 (TC3) and switch priority 3 (SP3). Totals are cumulative hardware counters; “since last sample” values show what changed during the comparison window.</div>
-  <div class="guide-grid"><div class="guide-card"><h3>TC3 ECN marked</h3>ECN-capable traffic marked by this port's egress queue. An increase is evidence of egress congestion, but it does not mean packets were dropped.</div><div class="guide-card"><h3>SP3 PFC RX — peer paused us</h3>Priority-3 pause frames received from the link partner. An increase means the peer asked this port to pause priority-3 transmission.</div><div class="guide-card"><h3>SP3 PFC TX — we paused the peer</h3>Priority-3 pause frames sent to the link partner. An increase means this switch asked the peer to pause because of local ingress pressure.</div></div>
-  <div class="guide-section"><h3>Table columns</h3><table class="guide-table"><tbody><tr><th>Total</th><td>Current cumulative hardware counter. It can include activity from before the current sample window.</td></tr><tr><th>Δ</th><td>Increase since the previous successful sample: current total minus previous total.</td></tr><tr><th>Rate</th><td>Δ divided by the elapsed sample window. It is an average in frames/s, not an instantaneous rate.</td></tr><tr><th>ECN %</th><td>TC3 ECN Δ divided by TC3 TX Δ for the same window. It is unavailable when TC3 TX Δ is zero or missing.</td></tr><tr><th>PFC RX</th><td>SP3 pause frames received. The peer asked this port to pause priority-3 transmission.</td></tr><tr><th>PFC TX</th><td>SP3 pause frames sent. This switch asked the peer to pause priority-3 transmission because of local ingress pressure.</td></tr><tr><th>TC3 TX Δ</th><td>Traffic-class 3 frames transmitted since the previous successful sample; this is the denominator for ECN %.</td></tr><tr><th>Discard Δ</th><td>TC3 unicast-buffer discards plus WRED discards since the previous successful sample. Both counters must be available; a non-zero value is direct drop evidence.</td></tr><tr><th>Sample / Window</th><td>Time of the latest sample and elapsed time since the previous successful sample.</td></tr><tr><th>—</th><td>Data is unavailable; it does not mean zero.</td></tr></tbody></table></div>
+  <div class="guide-modal-body"><div class="guide-intro">This report compares the latest switch counters with the previous successful collection. It monitors traffic class {lossless_priority} (TC{lossless_priority}) and switch priority {lossless_priority} (SP{lossless_priority}), configurable through <code>PFC_ECN_PRIORITY</code>. Totals are cumulative hardware counters; “since last sample” values show what changed during the comparison window.</div>
+  <div class="guide-grid"><div class="guide-card"><h3>TC{lossless_priority} ECN marked</h3>ECN-capable traffic marked by this port's egress queue. An increase is evidence of egress congestion, but it does not mean packets were dropped.</div><div class="guide-card"><h3>SP{lossless_priority} PFC RX — peer paused us</h3>Priority-{lossless_priority} pause frames received from the link partner. An increase means the peer asked this port to pause priority-{lossless_priority} transmission.</div><div class="guide-card"><h3>SP{lossless_priority} PFC TX — we paused the peer</h3>Priority-{lossless_priority} pause frames sent to the link partner. An increase means this switch asked the peer to pause because of local ingress pressure.</div></div>
+  <div class="guide-section"><h3>Table columns</h3><table class="guide-table"><tbody><tr><th>Total</th><td>Current cumulative hardware counter. It can include activity from before the current sample window.</td></tr><tr><th>Δ</th><td>Increase since the previous successful sample: current total minus previous total.</td></tr><tr><th>Rate</th><td>Δ divided by the elapsed sample window. It is an average in frames/s, not an instantaneous rate.</td></tr><tr><th>ECN %</th><td>TC{lossless_priority} ECN Δ divided by TC{lossless_priority} TX Δ for the same window. It is unavailable when TC{lossless_priority} TX Δ is zero or missing.</td></tr><tr><th>PFC RX</th><td>SP{lossless_priority} pause frames received. The peer asked this port to pause priority-{lossless_priority} transmission.</td></tr><tr><th>PFC TX</th><td>SP{lossless_priority} pause frames sent. This switch asked the peer to pause priority-{lossless_priority} transmission because of local ingress pressure.</td></tr><tr><th>TC{lossless_priority} TX Δ</th><td>Traffic-class {lossless_priority} frames transmitted since the previous successful sample; this is the denominator for ECN %.</td></tr><tr><th>Discard Δ</th><td>TC{lossless_priority} unicast-buffer discards plus WRED discards since the previous successful sample. Both counters must be available; a non-zero value is direct drop evidence.</td></tr><tr><th>Sample / Window</th><td>Time of the latest sample and elapsed time since the previous successful sample.</td></tr><tr><th>—</th><td>Data is unavailable; it does not mean zero.</td></tr></tbody></table></div>
   <div class="guide-section"><h3>Filtering</h3><p>Click a signal summary card to filter the port table; click the active card again to clear it. Signal cards work together with device, status, and text filters. Devices reporting and Ports checked return the table to all rows.</p></div>
   <div class="guide-section"><h3>Status meanings</h3><ul><li><strong>No ECN/PFC activity:</strong> no new ECN marks or PFC frames were observed; check the Discards column separately.</li><li><strong>ECN marking:</strong> new ECN marks were observed.</li><li><strong>PFC activity:</strong> new PFC RX or TX frames were observed.</li><li><strong>ECN + PFC:</strong> both ECN marking and PFC activity occurred.</li><li><strong>Discards:</strong> new drop counters were observed; this status takes precedence.</li><li><strong>Baseline set:</strong> one more sample is required for deltas and rates.</li><li><strong>Counter reset:</strong> a counter decreased, so no misleading negative delta is shown.</li><li><strong>Data missing / Collection failed:</strong> exact counters were unavailable or the command did not return a usable sample.</li></ul></div>
   <div class="guide-note">There are no arbitrary warning or critical thresholds on this page. ECN and PFC are operational signals that must be interpreted by direction, duration, and affected ports. PFC counters count pause frames, not how long traffic remained paused.</div></div></div>
@@ -1720,6 +1810,10 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     finish_phase("load")
 
     records: List[Dict[str, Any]] = []
+    lossless_priority = configured_priority()
+    # Priorities seen on ports that returned nothing for the configured one.
+    # This is what separates "wrong priority configured" from "no counters".
+    unmatched_priorities: Set[str] = set()
     hosts_with_ports = set()
     new_history_by_host: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     for raw_file in sorted(current_files):
@@ -1763,11 +1857,13 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         hosts_with_ports.add(hostname)
         for interface, entry in sorted(physical_ports.items()):
             key = f"{hostname}:{interface}"
-            counters = (
-                extract_counters(entry.get("payload", {}))
-                if entry.get("status") == "ok" else
-                {name: None for name in COUNTER_PATHS}
-            )
+            if entry.get("status") == "ok":
+                payload = entry.get("payload", {})
+                counters = extract_counters(payload, lossless_priority)
+                if all(value is None for value in counters.values()):
+                    unmatched_priorities |= observed_priorities(payload)
+            else:
+                counters = {name: None for name in COUNTER_PATHS}
             record = build_port_record(
                 hostname, interface, counters, baselines.get(key), timestamp,
                 str(entry.get("status", "error")),
@@ -1908,6 +2004,8 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         len(hosts_with_ports) if snapshot_valid else None,
         collection_unavailable=all_devices_unavailable,
         coverage_failures=coverage_failures,
+        lossless_priority=lossless_priority,
+        unmatched_priorities=unmatched_priorities,
     )
     finish_phase("render")
     _atomic_json(baseline_path, baseline_output)

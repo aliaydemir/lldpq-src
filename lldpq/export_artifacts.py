@@ -92,7 +92,7 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "psu_efficiency", "psu_in_w", "psu_out_w", "fans",
     ),
     "log": (
-        "device", "severity", "original_severity", "timestamp", "section",
+        "device", "severity", "age", "timestamp", "section",
         "message",
     ),
     "transceiver": (

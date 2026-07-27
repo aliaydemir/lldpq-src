@@ -244,6 +244,14 @@ apply_monitor_tuning() {
         1|2|3|4|5|6|7|8) ;;
         *) PFC_ECN_MAX_PARALLEL=8 ;;
     esac
+    # The lossless class is not universally priority 3. Exported because the
+    # analyzer, not the collector, selects which priority's counters to read.
+    PFC_ECN_PRIORITY="${PFC_ECN_PRIORITY:-3}"
+    case "$PFC_ECN_PRIORITY" in
+        0|1|2|3|4|5|6|7) ;;
+        *) PFC_ECN_PRIORITY=3 ;;
+    esac
+    export PFC_ECN_PRIORITY
     case "$OPTICAL_COLLECTION_BUDGET_SECONDS" in
         ''|*[!0-9]*|0) OPTICAL_COLLECTION_BUDGET_SECONDS=120 ;;
     esac
@@ -3292,7 +3300,15 @@ EOF
         while IFS= read -r interface; do
             [ -n "$interface" ] || continue
             if [ -e "$_lldpq_net_class_root/$interface" ]; then
-                IFS= read -r carrier_count < "$_lldpq_net_class_root/$interface/carrier_changes" 2>/dev/null || carrier_count="0"
+                # A failed read must never be reported as 0. The analyzer
+                # compares against the previous cumulative value, so a phantom
+                # 0 reads as a counter reset, re-baselines the port, and bills
+                # the entire recovered count as new flaps on the next cycle.
+                IFS= read -r carrier_count < "$_lldpq_net_class_root/$interface/carrier_changes" 2>/dev/null || carrier_count="unavailable"
+                case "$carrier_count" in
+                    *[!0-9]*) carrier_count="unavailable" ;;
+                esac
+                [ -n "$carrier_count" ] || carrier_count="unavailable"
                 echo "$interface:$carrier_count"
             fi
         done < "$_lldpq_snapshot_dir/interfaces"
@@ -3332,6 +3348,30 @@ EOF
                 _optical_failed_spent=0
                 _optical_failed_spent_limit=40
                 _optical_abort=false
+                # Module EEPROM is readable whether or not the link is up, and
+                # skipping down ports made an intact module in a down port
+                # indistinguishable from an empty cage: the analyzer reported
+                # it as unplugged and asked an operator to replace hardware
+                # that was already seated. Link-up ports are still read first
+                # so a budget exhaustion costs visibility on idle ports rather
+                # than on ports carrying traffic.
+                : > "$_lldpq_snapshot_dir/optical_up"
+                : > "$_lldpq_snapshot_dir/optical_rest"
+                while IFS= read -r interface; do
+                    [ -n "$interface" ] || continue
+                    _optical_state=""
+                    if [ -e "$_lldpq_net_class_root/$interface" ]; then
+                        IFS= read -r _optical_state < "$_lldpq_net_class_root/$interface/operstate" 2>/dev/null || _optical_state=""
+                    fi
+                    if [ "$_optical_state" = "up" ]; then
+                        echo "$interface" >> "$_lldpq_snapshot_dir/optical_up"
+                    else
+                        echo "$interface" >> "$_lldpq_snapshot_dir/optical_rest"
+                    fi
+                done < "$_lldpq_snapshot_dir/interfaces"
+                cat "$_lldpq_snapshot_dir/optical_up" \
+                    "$_lldpq_snapshot_dir/optical_rest" \
+                    > "$_lldpq_snapshot_dir/optical_ordered"
                 while IFS= read -r interface; do
                     [ -n "$interface" ] || continue
                     echo "--- Interface: $interface"
@@ -3342,7 +3382,10 @@ EOF
                     fi
                     IFS= read -r state < "$_lldpq_net_class_root/$interface/operstate" 2>/dev/null || state="unknown"
                     echo "Interface state: ${state:-unknown}"
-                    if [ "$state" = "up" ]; then
+                    # A bond, VLAN or loopback has no cage to read. Testing for
+                    # a backing device keeps the sweep generic instead of
+                    # matching interface-name conventions.
+                    if [ "$state" = "up" ] || [ -e "$_lldpq_net_class_root/$interface/device" ]; then
                         if [ "$_optical_has_timeout" = "true" ]; then
                             _optical_remaining=$((_optical_deadline - $(date +%s)))
                             if [ "$_optical_abort" = "true" ] || [ "$_optical_remaining" -le 0 ]; then
@@ -3421,7 +3464,7 @@ EOF
                     else
                         echo "No transceiver data"
                     fi
-                done < "$_lldpq_snapshot_dir/interfaces"
+                done < "$_lldpq_snapshot_dir/optical_ordered"
             fi
         fi
         fi
@@ -3582,7 +3625,14 @@ EOF
                 fi
             fi
         done
-        if [ -n "$asic_raw" ]; then
+        # A dead sensor reads 0 or returns something non-numeric. Publishing
+        # that as "0.0" graded the hottest component in the box EXCELLENT; the
+        # thermal-zone fallback below already rejects it, so accept only a
+        # positive reading here too, and fall through when there is none.
+        case "$asic_raw" in
+            *[!0-9]*) asic_raw="" ;;
+        esac
+        if [ -n "$asic_raw" ] && [ "$asic_raw" -gt 0 ]; then
             awk "BEGIN{printf \"HW_MGMT_ASIC: %.1f\n\", $asic_raw/1000}"
         else
             # Fallback: Try alternative ASIC temperature sources
@@ -3630,7 +3680,10 @@ EOF
                 fi
             fi
         done
-        if [ -n "$cpu_raw" ]; then
+        case "$cpu_raw" in
+            *[!0-9]*) cpu_raw="" ;;
+        esac
+        if [ -n "$cpu_raw" ] && [ "$cpu_raw" -gt 0 ]; then
             awk "BEGIN{printf \"HW_MGMT_CPU: %.1f\n\", $cpu_raw/1000}"
         fi
         echo "MEMORY_INFO:"
