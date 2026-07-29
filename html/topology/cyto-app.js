@@ -330,16 +330,18 @@ function setLayout(layoutType) {
     
     currentLayout = layoutType;
     
-    // Update button states
-    document.querySelectorAll('.toolbar button').forEach(btn => {
-        btn.classList.remove('active');
-    });
-    
     const btnMap = {
         'dagre-lr': 'btn-hlr',
         'dagre-tb': 'btn-hud',
         'cose': 'btn-force'
     };
+    
+    // Only the layout buttons are mutually exclusive. Toolbar toggles such as
+    // Select and Full own their active state and must survive a layout change.
+    Object.values(btnMap).forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.classList.remove('active');
+    });
     
     const activeBtn = document.getElementById(btnMap[layoutType]);
     if (activeBtn) activeBtn.classList.add('active');
@@ -371,6 +373,117 @@ function setLayout(layoutType) {
     // Run layout
     const layout = cy.layout(layoutOptions);
     layout.run();
+}
+
+/**
+ * Select mode: pick several devices and drag them somewhere else as one group.
+ *
+ * Cytoscape already moves every selected node when one of them is dragged, so
+ * this mode only has to make selection reachable: node taps stop opening the
+ * device page, and dragging empty canvas rubber-bands a selection instead of
+ * panning.  Positions are deliberately not persisted - any layout button
+ * recomputes them from scratch.
+ */
+let selectMode = false;
+let selectionBoxOrigin = null;
+
+function toggleSelectMode(enabled) {
+    if (!cy) return;
+    selectMode = typeof enabled === 'boolean' ? enabled : !selectMode;
+    
+    // Empty-canvas drags become the rubber band, so panning has to stand down.
+    cy.userPanningEnabled(!selectMode);
+    cy.selectionType(selectMode ? 'additive' : 'single');
+    // Both directions start from a clean slate: ordinary clicking also selects
+    // nodes, and inheriting those stray picks would move devices unexpectedly.
+    hideSelectionBox();
+    cy.elements().unselect();
+    
+    const container = document.getElementById('cy');
+    if (container) container.classList.toggle('select-mode', selectMode);
+    updateSelectionCount();
+    
+    showNotification(selectMode
+        ? 'Select mode on: drag empty space to select devices, then drag any selected device to move the group'
+        : 'Select mode off');
+}
+
+/**
+ * Cytoscape only opens its built-in box selection for shift/ctrl/meta drags, so
+ * select mode draws its own rubber band. Coordinates are rendered (screen)
+ * pixels relative to the #cy container, which is what the overlay div uses too.
+ */
+const SELECTION_BOX_MIN_DRAG = 4; // below this the gesture was a tap, not a band
+
+function beginSelectionBox(event) {
+    if (!selectMode || event.target !== cy) return;
+    selectionBoxOrigin = { ...event.renderedPosition };
+    const box = ensureSelectionBox();
+    box.style.display = 'block';
+    updateSelectionBox(event.renderedPosition);
+}
+
+function ensureSelectionBox() {
+    let box = document.getElementById('selection-box');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'selection-box';
+        const container = document.getElementById('cy');
+        if (container) container.appendChild(box);
+    }
+    return box;
+}
+
+function updateSelectionBox(current) {
+    if (!selectionBoxOrigin) return;
+    const box = ensureSelectionBox();
+    box.style.left = Math.min(selectionBoxOrigin.x, current.x) + 'px';
+    box.style.top = Math.min(selectionBoxOrigin.y, current.y) + 'px';
+    box.style.width = Math.abs(current.x - selectionBoxOrigin.x) + 'px';
+    box.style.height = Math.abs(current.y - selectionBoxOrigin.y) + 'px';
+}
+
+function finishSelectionBox(event) {
+    if (!selectionBoxOrigin) return;
+    const origin = selectionBoxOrigin;
+    const end = event.renderedPosition;
+    hideSelectionBox();
+    
+    if (Math.abs(end.x - origin.x) < SELECTION_BOX_MIN_DRAG &&
+        Math.abs(end.y - origin.y) < SELECTION_BOX_MIN_DRAG) {
+        return;
+    }
+    
+    const left = Math.min(origin.x, end.x);
+    const right = Math.max(origin.x, end.x);
+    const top = Math.min(origin.y, end.y);
+    const bottom = Math.max(origin.y, end.y);
+    
+    // Hidden devices (filters, isolation) must stay out of the selection.
+    cy.nodes(':visible').forEach(node => {
+        const point = node.renderedPosition();
+        if (point.x >= left && point.x <= right && point.y >= top && point.y <= bottom) {
+            node.select();
+        }
+    });
+    updateSelectionCount();
+}
+
+function hideSelectionBox() {
+    selectionBoxOrigin = null;
+    const box = document.getElementById('selection-box');
+    if (box) box.style.display = 'none';
+}
+
+/**
+ * Keep the button showing how many devices would move together.
+ */
+function updateSelectionCount() {
+    const btn = document.getElementById('btn-select');
+    if (!btn) return;
+    const count = cy ? cy.nodes(':selected').length : 0;
+    btn.textContent = count > 0 ? `⬚ Select (${count})` : '⬚ Select';
+    btn.classList.toggle('active', selectMode);
 }
 
 /**
@@ -2156,8 +2269,10 @@ function initCytoscape() {
     
     cy.on('mouseout', 'edge', hideTooltip);
     
-    // Node click - open device page
+    // Node click - open device page.  In select mode a tap picks the device
+    // instead, so grouping devices never scatters browser tabs.
     cy.on('tap', 'node', function(event) {
+        if (selectMode) return;
         const node = event.target;
         const link = node.data('dcimDeviceLink');
         if (link && link !== '#') {
@@ -2181,8 +2296,10 @@ function initCytoscape() {
         showLinkContextMenu(event, event.target);
     });
     
-    // Click on background to reset isolation
+    // Click on background to reset isolation.  Skipped in select mode, where
+    // releasing a selection box also lands here.
     cy.on('tap', function(event) {
+        if (selectMode) return;
         if (event.target === cy) {
             // Clicked on background - clear isolation
             clearIsolation();
@@ -2202,6 +2319,25 @@ function initCytoscape() {
     // bursts during pan/zoom/layout and each update is O(nodes) DOM writes).
     cy.on('viewport', scheduleIconOverlayUpdate);
     cy.on('position', 'node', scheduleIconOverlayUpdate);
+    
+    // Rubber-band selection over empty canvas (select mode only).
+    cy.on('tapstart', beginSelectionBox);
+    cy.on('tapdrag', function(event) {
+        if (selectionBoxOrigin) updateSelectionBox(event.renderedPosition);
+    });
+    cy.on('tapend', function(event) {
+        if (selectionBoxOrigin) finishSelectionBox(event);
+    });
+    
+    // Keep the Select button's counter in step with the current selection.
+    cy.on('select unselect', 'node', updateSelectionCount);
+    
+    // A tooltip left hanging over the cursor obscures the devices being dragged.
+    cy.on('grab', hideTooltip);
+    
+    document.addEventListener('keydown', function(event) {
+        if (event.key === 'Escape' && selectMode) toggleSelectMode(false);
+    });
     
     console.log('✅ Cytoscape.js initialized');
     console.log(`   Nodes: ${nodeCount}, Links: ${linkCount}`);

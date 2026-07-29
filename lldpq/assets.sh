@@ -31,7 +31,7 @@ fi
 LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
-        --require-key WEB_ROOT --require-key LLDPQ_USER 2>/dev/null) || {
+        --require-key WEB_ROOT --require-key LLDPQ_USER) || {
         echo "assets: required runtime configuration is missing or unreadable" >&2
         exit 1
     }

@@ -142,6 +142,20 @@
             z-index: 1 !important;
         }
 
+        /* Select mode: dragging the empty canvas draws a selection box, not a pan */
+        #cy.select-mode {
+            cursor: crosshair;
+        }
+
+        #selection-box {
+            position: absolute;
+            display: none;
+            border: 1px solid #76b900;
+            background: rgba(118, 185, 0, 0.12);
+            pointer-events: none;
+            z-index: 5;
+        }
+
         /* Legend in toolbar */
         .legend {
             display: flex;
@@ -461,6 +475,7 @@
         <button onclick="setLayout('dagre-lr')" id="btn-hlr">→ Horizontal</button>
         <button onclick="setLayout('dagre-tb')" id="btn-hud" class="active">↓ Vertical</button>
         <button onclick="setLayout('cose')" id="btn-force">◎ Force</button>
+        <button onclick="toggleSelectMode()" id="btn-select" title="Select devices, then drag any selected one to move the group">⬚ Select</button>
         <button onclick="cy.fit(1); cy.zoom(cy.zoom() * 0.97);">⊞ Fit</button>
         <button onclick="toggleFullscreen()" id="btn-fullscreen">⤢ Full</button>
         <button onclick="showAllHidden()" id="btn-reset-filters" title="Restore hidden devices and re-apply filters">⟲ Reset</button>

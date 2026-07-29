@@ -14,8 +14,7 @@ LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 [[ -x "$LLDPQ_CONFIG_HELPER" ]] || \
     trigger_fatal "required config helper is missing: $LLDPQ_CONFIG_HELPER"
 if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
-    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
-    2>/dev/null); then
+    --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT); then
     trigger_fatal "required runtime configuration is missing or unreadable"
 fi
 eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \

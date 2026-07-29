@@ -9,7 +9,7 @@ set -o pipefail
 LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
-        --require-key LLDPQ_DIR 2>/dev/null) || {
+        --require-key LLDPQ_DIR) || {
         echo "fabric-scan: required runtime configuration is missing or unreadable" >&2
         exit 1
     }
