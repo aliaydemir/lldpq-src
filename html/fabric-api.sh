@@ -1784,6 +1784,98 @@ print(json.dumps(_resp))
 PYTHON
 }
 
+# Fabric-wide port/profile inventory in one pass. Feeds the migration page's
+# "Current State" panel, which needs every profiled port at once instead of the
+# per-device get-device round trips the wizard makes.
+get_fabric_port_state() {
+    python3 << 'PYTHON'
+import json
+import yaml  # PyYAML - faster for read-only operations
+import os
+import glob
+
+ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+inventory_base = os.path.join(ansible_dir, 'inventory')
+host_vars_dir = os.path.join(inventory_base, 'host_vars')
+port_profiles_file = os.path.join(inventory_base, 'group_vars', 'all', 'sw_port_profiles.yaml')
+vlan_profiles_file = os.path.join(inventory_base, 'group_vars', 'all', 'vlan_profiles.yaml')
+
+port_profiles = {}
+if os.path.exists(port_profiles_file):
+    try:
+        with open(port_profiles_file, 'r') as f:
+            port_profiles = (yaml.load(f, Loader=yaml.CSafeLoader) or {}).get('sw_port_profiles', {}) or {}
+    except Exception:
+        port_profiles = {}
+
+# Same shape get_device() returns, so the page resolves profile -> vlan -> vrf
+# with its existing profileInfo() helper.
+vlan_profiles_data = {}
+if os.path.exists(vlan_profiles_file):
+    try:
+        with open(vlan_profiles_file, 'r') as f:
+            vp_config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+        for profile_name, profile_data in (vp_config.get('vlan_profiles', {}) or {}).items():
+            if not profile_data or 'vlans' not in profile_data:
+                continue
+            vlans = profile_data['vlans'] or {}
+            try:
+                vlan_ids = sorted(int(v) for v in vlans.keys())
+            except (TypeError, ValueError):
+                vlan_ids = []
+            first_id = vlan_ids[0] if vlan_ids else None
+            first_cfg = vlans.get(str(first_id)) or vlans.get(first_id) or {}
+            vlan_profiles_data[profile_name] = {
+                'description': first_cfg.get('description', ''),
+                'vrf': first_cfg.get('vrf', 'default'),
+                'vlans': vlans,
+            }
+    except Exception:
+        vlan_profiles_data = {}
+
+ports = []
+devices = set()
+parse_errors = {}
+
+for host_file in sorted(glob.glob(os.path.join(host_vars_dir, '*.yaml')) +
+                        glob.glob(os.path.join(host_vars_dir, '*.yml'))):
+    hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+    try:
+        with open(host_file, 'r') as f:
+            host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+    except Exception as e:
+        parse_errors[os.path.basename(host_file)] = str(e)
+        continue
+
+    for section in ('interfaces', 'bonds'):
+        node = host_data.get(section) or {}
+        if not isinstance(node, dict):
+            continue
+        for name, cfg in node.items():
+            if not isinstance(cfg, dict):
+                continue
+            profile = cfg.get('sw_port_profile')
+            # A profile is what makes a port migration material; L3 ports, bond
+            # members and breakout parents never carry one.
+            if not isinstance(profile, str) or not profile:
+                continue
+            devices.add(hostname)
+            ports.append([hostname, str(name), str(cfg.get('description') or ''), profile])
+
+_resp = {
+    'success': True,
+    'ports': ports,
+    'port_profiles': port_profiles,
+    'vlan_profiles': vlan_profiles_data,
+    'device_count': len(devices),
+}
+if parse_errors:
+    _resp['parse_errors'] = parse_errors
+    _resp['warning'] = 'Some host_vars files could not be parsed: ' + ', '.join(parse_errors)
+print(json.dumps(_resp))
+PYTHON
+}
+
 # Get port profiles
 get_port_profiles() {
     local port_file="$ANSIBLE_DIR/inventory/group_vars/all/sw_port_profiles.yaml"
@@ -3958,6 +4050,9 @@ case "$ACTION" in
         ;;
     "get-port-profiles")
         get_port_profiles
+        ;;
+    "get-fabric-port-state")
+        get_fabric_port_state
         ;;
     "create-port-profile")
         create_port_profile

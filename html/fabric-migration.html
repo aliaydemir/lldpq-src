@@ -159,6 +159,14 @@
             cursor: pointer; user-select: none;
         }
         .chip.on { background: #1e2a10; color: #a5d66c; border-color: #4a6b1d; }
+        .chip.mixed { background: #33280f; color: #ffb74d; border-color: #6b551d; cursor: default; }
+
+        /* Current state panel */
+        #state-panel { margin-bottom: 20px; }
+        #state-head { cursor: pointer; }
+        #state-caret { display: inline-block; width: 12px; color: #888; }
+        .state-rack { color: #4fc3f7; cursor: pointer; }
+        .state-rack:hover { text-decoration: underline; }
 
         /* Tables */
         table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -309,6 +317,35 @@
     <div class="wstep" data-step="4" onclick="goStep(4)"><div class="num">4</div><div class="lbl">Diff &amp; Deploy</div></div>
     <div class="wconn"></div>
     <div class="wstep" data-step="5" onclick="goStep(5)"><div class="num">5</div><div class="lbl">Verify</div></div>
+</div>
+
+<!-- ============ CURRENT STATE ============ -->
+<div class="panel" id="state-panel">
+    <div class="panel-header" id="state-head" onclick="toggleStatePanel()">
+        <span class="panel-title"><span id="state-caret">&#9656;</span> Current State &mdash; rack &rarr; port profile &rarr; VRF</span>
+        <div class="select-actions" style="align-items:center;">
+            <span class="foot-note" id="state-summary"></span>
+            <a id="state-refresh">Refresh</a>
+        </div>
+    </div>
+    <div id="state-body" style="display:none;">
+        <div class="filter-row">
+            <label>Filter:</label>
+            <input type="text" id="state-filter" class="search-input" placeholder="rack, profile or VRF..." style="flex:1; min-width:200px;" oninput="renderStateTable()">
+            <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearStateFilter()">clear</a>
+        </div>
+        <div class="panel-body" style="max-height: 380px;">
+            <table class="tbl">
+                <thead><tr>
+                    <th>Rack</th><th>Port Profile</th><th>VRF</th><th style="width:70px;">Ports</th><th>Devices</th>
+                </tr></thead>
+                <tbody id="state-table-body">
+                    <tr><td colspan="5" class="muted" style="padding:20px;">Expand to load the fabric's current port-profile state.</td></tr>
+                </tbody>
+            </table>
+        </div>
+        <div style="padding: 8px 12px; border-top: 1px solid #3c3c3c;" class="foot-note" id="state-note"></div>
+    </div>
 </div>
 
 <div id="loaded-plan-banner" class="note-box good" style="display:none;"></div>
@@ -493,6 +530,7 @@
         <div style="display:flex; gap:10px;">
             <button class="btn btn-primary" onclick="runVerification()">Run Verification</button>
             <button class="btn btn-warning" id="rollback-btn" onclick="rollbackPlan()" disabled>Rollback This Migration</button>
+            <button class="btn btn-secondary" onclick="startNewMigration()" title="Clear this migration and go back to step 1">&#8635; Start New Migration</button>
         </div>
     </div>
 </div>
@@ -643,6 +681,70 @@
             el.classList.toggle('done', s < n);
             el.classList.toggle('disabled', !canEnter(s));
         });
+    }
+
+    // Drop everything one migration accumulated so the next run cannot inherit
+    // stale selections, mappings or a finished plan. Selection patterns and the
+    // Current State panel survive: neither belongs to a single migration.
+    function resetWizard() {
+        portRows = [];
+        selectedDevices.clear();
+        deviceData = {};
+        activeProfiles = null;
+        mappings = {};
+        currentPlan = null;
+        appliedPlan = null;
+        excludedCount = 0;
+        mode = 'migrate';
+        design = null;
+        designName = '';
+        facetShapes = facetRacks = facetSUs = null;
+        facetRanges.pmin = facetRanges.pmax = facetRanges.omin = facetRanges.omax = '';
+        portFilterRe = null;
+
+        $('device-search').value = '';
+        $('rack-input').value = '';
+        $('port-filter').value = '';
+        $('port-filter').classList.remove('bad');
+        $('plan-name').value = '';
+        $('check-all').checked = false;
+        $('bounce-ports-cb').checked = false;
+        $('mode-migrate').classList.add('on');
+        $('mode-assign').classList.remove('on');
+
+        $('apply-results').innerHTML = '';
+        $('readiness-box').innerHTML = '';
+        $('preview-table-body').innerHTML = '';
+        $('deploy-scope-note').innerHTML = '';
+        $('arp-note').textContent = '';
+        $('loaded-plan-banner').style.display = 'none';
+        $('loaded-plan-banner').innerHTML = '';
+        $('deploy-term').textContent = 'Run Generate / Diff to review the rendered NVUE change, then Deploy.';
+        $('verify-table-body').innerHTML =
+            '<tr><td colspan="5" class="muted" style="padding:20px;">Click "Run Verification" after deploying.</td></tr>';
+        for (const id of ['c3-changes', 'c3-files', 'c3-unmapped']) $(id).textContent = '0';
+        for (const id of ['c5-pass', 'c5-warn', 'c5-arp']) $(id).textContent = '-';
+        $('to-step4-btn').disabled = true;
+        $('rollback-btn').disabled = true;
+
+        renderDeviceList();
+        renderProfileChips();
+        renderFacets();
+        renderPortTable();
+    }
+
+    async function startNewMigration() {
+        if (localStorage.getItem(DEPLOY_JOB_KEY)) {
+            showAlert('A deploy is still running. Wait for it to finish before starting a new migration.', 'Deploy in Progress');
+            return;
+        }
+        const ok = await confirmAsync(
+            'Start a new migration? The current port selection, profile mappings and plan will be cleared. ' +
+            'Already applied changes stay in host_vars - saved plans remain available for rollback.',
+            'Start New Migration');
+        if (!ok) return;
+        resetWizard();
+        goStep(1);
     }
 
     // ---------- Step 1: devices & ports ----------
@@ -964,6 +1066,156 @@
         return DEFAULT_RACK_PATTERNS.slice();
     }
 
+    // applyRackFilter() substitutes a known token into the placeholders to match
+    // ports. The Current State panel needs the opposite direction, so the same
+    // patterns become capture groups that read the rack back out of a port.
+    let rackExtractors = null;
+    let rackExtractorKey = '';
+    function getRackExtractors() {
+        const pats = getRackPatterns();
+        const key = pats.join('\u0000');
+        if (rackExtractors && key === rackExtractorKey) return rackExtractors;
+        const out = [];
+        for (const p of pats) {
+            if (!p.includes('{rack}') && !p.includes('{rack2}')) continue;
+            const src = p.replaceAll('{rack2}', '(\\d{2})').replaceAll('{rack}', '([0-9A-Za-z]+)');
+            try { out.push(new RegExp(src, 'i')); } catch (e) { /* skip bad pattern */ }
+        }
+        rackExtractors = out;
+        rackExtractorKey = key;
+        return out;
+    }
+
+    // '014' and '14' are the same rack, matching applyRackFilter's normalization.
+    function normalizeRack(token) {
+        return /^\d+$/.test(token) ? String(parseInt(token, 10)) : token;
+    }
+
+    function rackFromPort(name, desc) {
+        for (const re of getRackExtractors()) {
+            const m = re.exec(name || '') || re.exec(desc || '');
+            if (m && m[1]) return normalizeRack(m[1]);
+        }
+        return '';
+    }
+
+    // ---------- Current State panel ----------
+    // Where every rack sits today, independent of the wizard's device selection.
+    let fabricState = null;   // {rows:[{rack,profile,vrf,ports,devices,mixed}], unmatched, totalPorts, deviceCount, warning}
+    let stateLoading = false;
+
+    function toggleStatePanel() { setStatePanel($('state-body').style.display === 'none'); }
+
+    function setStatePanel(open) {
+        $('state-body').style.display = open ? '' : 'none';
+        $('state-caret').innerHTML = open ? '&#9662;' : '&#9656;';
+        if (open && !fabricState && !stateLoading) loadFabricState();
+    }
+
+    async function loadFabricState() {
+        if (stateLoading) return;
+        stateLoading = true;
+        $('state-table-body').innerHTML = '<tr><td colspan="5" class="muted" style="padding:20px;">Loading fabric inventory...</td></tr>';
+        $('state-note').textContent = '';
+        try {
+            const r = await fetch('/fabric-api.sh?action=get-fabric-port-state');
+            const data = await r.json();
+            if (!data.success) throw new Error(data.error || 'Request failed');
+            fabricState = buildFabricState(data);
+            renderStateTable();
+        } catch (e) {
+            fabricState = null;
+            $('state-summary').textContent = '';
+            $('state-table-body').innerHTML =
+                `<tr><td colspan="5" style="padding:20px; color:#ef9a9a;">Failed to load fabric state: ${escapeHtml(e.message)}</td></tr>`;
+        } finally {
+            stateLoading = false;
+        }
+    }
+
+    function buildFabricState(data) {
+        const profiles = data.port_profiles || {};
+        const vlanProfiles = data.vlan_profiles || {};
+        const ports = data.ports || [];
+        const agg = new Map();
+        let unmatched = 0;
+        for (const [device, name, desc, profile] of ports) {
+            const rack = rackFromPort(name, desc);
+            if (!rack) { unmatched++; continue; }
+            const key = rack + '\u0000' + profile;
+            let row = agg.get(key);
+            if (!row) {
+                row = { rack, profile, vrf: profileInfo(profile, profiles, vlanProfiles).vrf || '',
+                        ports: 0, devices: new Set() };
+                agg.set(key, row);
+            }
+            row.ports++;
+            row.devices.add(device);
+        }
+        const rows = [...agg.values()].sort((a, b) =>
+            a.rack.localeCompare(b.rack, undefined, { numeric: true }) || a.profile.localeCompare(b.profile));
+        const perRack = new Map();
+        for (const r of rows) perRack.set(r.rack, (perRack.get(r.rack) || 0) + 1);
+        for (const r of rows) r.mixed = perRack.get(r.rack) > 1;
+        return { rows, unmatched, totalPorts: ports.length,
+                 deviceCount: data.device_count || 0, warning: data.warning || '' };
+    }
+
+    function clearStateFilter() { $('state-filter').value = ''; renderStateTable(); }
+
+    function renderStateTable() {
+        const st = fabricState;
+        if (!st) return;
+        const q = ($('state-filter').value || '').trim().toLowerCase();
+        const rows = q
+            ? st.rows.filter(r => r.rack.toLowerCase().includes(q) ||
+                                  r.profile.toLowerCase().includes(q) ||
+                                  (r.vrf || '').toLowerCase().includes(q))
+            : st.rows;
+        const tb = $('state-table-body');
+        if (!rows.length) {
+            tb.innerHTML = `<tr><td colspan="5" class="muted" style="padding:20px;">${st.rows.length
+                ? 'No rows match the filter.'
+                : 'No profiled port matched a rack pattern - check "Rack Patterns" in the header.'}</td></tr>`;
+        } else {
+            let lastRack = null;
+            tb.innerHTML = rows.map(r => {
+                const firstOfRack = r.rack !== lastRack;
+                lastRack = r.rack;
+                const rackCell = firstOfRack
+                    ? `<span class="state-rack" data-rack="${escapeHtml(r.rack)}" title="Filter step 1 by this rack">${escapeHtml(r.rack)}</span>` +
+                      (r.mixed ? ' <span class="chip mixed" title="More than one port profile in this rack">mixed</span>' : '')
+                    : '';
+                const devs = [...r.devices].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+                const devCell = devs.length > 3
+                    ? `${escapeHtml(devs.slice(0, 3).join(', '))} <span class="muted">+${devs.length - 3}</span>`
+                    : escapeHtml(devs.join(', '));
+                return `<tr><td>${rackCell}</td>` +
+                       `<td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>` +
+                       `<td class="mono">${escapeHtml(r.vrf || '-')}</td>` +
+                       `<td>${r.ports}</td>` +
+                       `<td title="${escapeHtml(devs.join(', '))}">${devCell}</td></tr>`;
+            }).join('');
+        }
+        const racks = new Set(st.rows.map(r => r.rack));
+        const profs = new Set(st.rows.map(r => r.profile));
+        const vrfs = new Set(st.rows.map(r => r.vrf).filter(Boolean));
+        $('state-summary').textContent = `${racks.size} racks · ${profs.size} profiles · ${vrfs.size} VRFs`;
+        const notes = [`${st.totalPorts} profiled port(s) across ${st.deviceCount} device(s).`];
+        // Patterns are site-specific, so a silent miss would look like missing racks
+        if (st.unmatched) notes.push(`${st.unmatched} port(s) matched no rack pattern and are not listed.`);
+        if (st.warning) notes.push(st.warning);
+        $('state-note').textContent = notes.join(' ');
+    }
+
+    function useRack(rack) {
+        $('rack-input').value = rack;
+        goStep(1);
+        setStatePanel(false);
+        if (portRows.length) applyRackFilter();
+        else $('rack-input').focus();
+    }
+
     // Load shared patterns from the server; one-time-migrate a legacy
     // localStorage copy so existing installs keep their custom patterns.
     async function loadSelectionPatterns() {
@@ -1119,13 +1371,15 @@
     }
 
     // ---------- Step 2: mapping ----------
-    function profileInfo(name) {
-        const p = portProfiles[name] || {};
+    // Tables default to the wizard's own copies; the Current State panel passes
+    // its fabric-wide tables so the two never overwrite each other.
+    function profileInfo(name, profiles, vlanProfiles) {
+        const p = (profiles || portProfiles)[name] || {};
         const mode = p.sw_port_mode || '?';
         const vlan = p.access_vlan != null ? parseInt(p.access_vlan, 10) : null;
         let vrf = null, gw = null, desc = null, sviProfile = null;
         if (vlan != null) {
-            for (const [vpName, vp] of Object.entries(vlanProfilesData)) {
+            for (const [vpName, vp] of Object.entries(vlanProfiles || vlanProfilesData)) {
                 const vlans = vp.vlans || {};
                 if (vlans[vlan] !== undefined || vlans[String(vlan)] !== undefined) {
                     const vcfg = vlans[vlan] || vlans[String(vlan)] || {};
@@ -1898,6 +2152,15 @@
         $('plans-body').addEventListener('click', e => {
             const a = e.target.closest('a[data-plan]');
             if (a) loadPlan(a.dataset.plan);
+        });
+        $('state-table-body').addEventListener('click', e => {
+            const el = e.target.closest('.state-rack');
+            if (el) useRack(el.dataset.rack);
+        });
+        $('state-refresh').addEventListener('click', e => {
+            e.stopPropagation();  // the whole header toggles the panel
+            setStatePanel(true);
+            loadFabricState();
         });
         await Promise.all([loadDevices(), loadSelectionPatterns()]);
         goStep(1);
