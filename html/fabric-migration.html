@@ -167,6 +167,31 @@
         #state-caret { display: inline-block; width: 12px; color: #888; }
         .state-link { color: #4fc3f7; cursor: pointer; }
         .state-link:hover { text-decoration: underline; }
+        /* Two sticky header rows: labels sort, the row under them filters. The
+           first row's height is pinned so the second can offset against it. */
+        #state-table-head tr.sort-row th { height: 30px; box-sizing: border-box; }
+        #state-table-head th.sortable { cursor: pointer; user-select: none; }
+        #state-table-head th.sortable:hover { color: #ccc; }
+        #state-table-head th.sorted { color: #a5d66c; }
+        #state-table-head th .arrow { font-size: 9px; margin-left: 3px; }
+        #state-table-head tr.col-filters th {
+            top: 30px; padding: 4px 6px; background: #262626; text-transform: none;
+        }
+        #state-table-head tr.col-filters input {
+            width: 100%; box-sizing: border-box;
+            background: #1a1a1a; border: 1px solid #3c3c3c; border-radius: 3px;
+            color: #ccc; font-family: inherit; font-size: 11px; font-weight: normal;
+            letter-spacing: 0; padding: 3px 6px; outline: none;
+        }
+        #state-table-head tr.col-filters input:focus { border-color: #76b900; }
+        #state-table-head tr.col-filters input.bad { border-color: #f44336; }
+        input:-webkit-autofill,
+        input:-webkit-autofill:hover,
+        input:-webkit-autofill:focus {
+            -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important;
+            -webkit-text-fill-color: #fff !important;
+            caret-color: #fff !important;
+        }
 
         /* Tables */
         table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -337,13 +362,13 @@
                 <span class="chip" data-group="endpoint" title="The server / DGX side of each link, from the P2P design when available">Endpoint</span>
                 <span class="chip" data-group="vrf">VRF</span>
             </span>
-            <label>Filter:</label>
-            <input type="text" id="state-filter" class="search-input" placeholder="group, profile or VRF..." style="flex:1; min-width:180px;" oninput="renderStateTable()">
-            <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearStateFilter()">clear</a>
+            <label>Search:</label>
+            <input type="text" id="state-filter" class="search-input" placeholder="any column..." style="flex:1; min-width:180px;" oninput="renderStateBody()">
+            <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearStateFilter()">clear all</a>
         </div>
         <div class="panel-body" style="max-height: 380px;">
             <table class="tbl">
-                <thead id="state-table-head"><tr>
+                <thead id="state-table-head"><tr class="sort-row">
                     <th>Device</th><th>Port Profile</th><th>VRF</th><th style="width:70px;">Ports</th><th>Racks</th>
                 </tr></thead>
                 <tbody id="state-table-body">
@@ -1163,6 +1188,8 @@
     let fabricState = null;   // {ports:[{device,name,desc,profile,vrf,rack,endpoint}], totalPorts, deviceCount, warning, design}
     let stateGroupBy = 'device';
     let stateLoading = false;
+    let stateSort = { head: null, dir: 1 };   // by column label; null = group column
+    let stateColFilters = {};                 // column label -> query
 
     function toggleStatePanel() { setStatePanel($('state-body').style.display === 'none'); }
 
@@ -1185,7 +1212,7 @@
             renderStateTable();
             // Declared rack/endpoint data beats anything guessed from a name, so
             // re-render once the design join lands. Best-effort: no design, no change.
-            if (await applyDesignToState()) renderStateTable();
+            if (await applyDesignToState()) renderStateBody();  // columns unchanged
         } catch (e) {
             fabricState = null;
             $('state-summary').textContent = '';
@@ -1296,7 +1323,11 @@
         renderStateTable();
     }
 
-    function clearStateFilter() { $('state-filter').value = ''; renderStateTable(); }
+    function clearStateFilter() {
+        $('state-filter').value = '';
+        stateColFilters = {};
+        renderStateTable();
+    }
 
     function setCellHtml(values) {
         const sorted = [...values].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
@@ -1307,51 +1338,141 @@
         return { html, title: sorted.join(', ') };
     }
 
-    function renderStateTable() {
+    // Numeric columns accept comparisons (>8, <=2, =4) as well as plain text,
+    // because "which racks have more than 8 ports" is the actual question.
+    const NUM_FILTER_RE = /^(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)$/;
+    function matchesColFilter(cell, q) {
+        if (cell.num !== undefined) {
+            const m = NUM_FILTER_RE.exec(q);
+            if (m) {
+                const n = parseFloat(m[2]);
+                switch (m[1]) {
+                    case '>': return cell.num > n;
+                    case '<': return cell.num < n;
+                    case '>=': return cell.num >= n;
+                    case '<=': return cell.num <= n;
+                    default: return cell.num === n;
+                }
+            }
+        }
+        return cell.text.toLowerCase().includes(q.toLowerCase());
+    }
+
+    // One descriptor per cell: what to draw, what to match against, what to sort
+    // by. Filtering matches the full value even when the cell shows "+3 more".
+    function stateCells(row, spec) {
+        let setIndex = -1;
+        return spec.columns.map(c => {
+            if (c.kind === 'set') {
+                setIndex++;
+                const { html, title } = setCellHtml(row.sets[setIndex]);
+                // Sorting a list of names by their count answers "who has most"
+                return { kind: c.kind, html, title, text: title, num: row.sets[setIndex].size };
+            }
+            if (c.kind === 'profile') {
+                return { kind: c.kind, html: `<span class="pbadge p-cur">${escapeHtml(row.profile)}</span>`,
+                         title: '', text: row.profile, sort: row.profile };
+            }
+            if (c.kind === 'vrf') {
+                return { kind: c.kind, html: `<span class="mono">${escapeHtml(row.vrf || '-')}</span>`,
+                         title: '', text: row.vrf || '', sort: row.vrf || '' };
+            }
+            if (c.kind === 'ports') {
+                return { kind: c.kind, html: String(row.ports), title: '', text: String(row.ports), num: row.ports };
+            }
+            const name = spec.link
+                ? `<span class="state-link" data-value="${escapeHtml(row.key)}" title="Use this ${spec.label.toLowerCase()} in step 1">${escapeHtml(row.key)}</span>`
+                : `<span class="mono">${escapeHtml(row.key)}</span>`;
+            const badge = row.mixed
+                ? ` <span class="chip mixed" title="More than one port profile in this ${spec.label.toLowerCase()}">mixed</span>` : '';
+            return { kind: c.kind, html: name + badge, title: '', text: row.key, sort: row.key };
+        });
+    }
+
+    // The sort choice is remembered by column label, so it survives a regroup
+    // whenever the new view still has that column.
+    function effectiveSort(spec) {
+        const index = spec.columns.findIndex(c => c.head === stateSort.head);
+        return index < 0 ? { index: 0, dir: 1 } : { index, dir: stateSort.dir };
+    }
+
+    function setStateSort(head) {
+        const spec = STATE_GROUPS[stateGroupBy];
+        const col = spec.columns.find(c => c.head === head);
+        if (!col) return;
+        if (stateSort.head === head) stateSort.dir = -stateSort.dir;
+        // Counts are most useful biggest-first; names read best A-Z
+        else stateSort = { head, dir: (col.kind === 'ports' || col.kind === 'set') ? -1 : 1 };
+        renderStateHead();
+        renderStateBody();
+    }
+
+    function renderStateTable() { renderStateHead(); renderStateBody(); }
+
+    // Kept apart from the body render: retyping a column filter must not tear
+    // down the input the user is typing into.
+    function renderStateHead() {
+        const spec = STATE_GROUPS[stateGroupBy];
+        const sort = effectiveSort(spec);
+        const sortRow = spec.columns.map((c, i) => {
+            const active = i === sort.index;
+            const arrow = active ? `<span class="arrow">${sort.dir > 0 ? '&#9650;' : '&#9660;'}</span>` : '';
+            const how = (c.kind === 'set') ? 'number of values' : (c.kind === 'ports' ? 'port count' : 'name');
+            return `<th class="sortable${active ? ' sorted' : ''}" data-col="${escapeHtml(c.head)}"` +
+                   `${c.kind === 'ports' ? ' style="width:70px;"' : ''} title="Sort by ${how}">${c.head}${arrow}</th>`;
+        }).join('');
+        const filterRow = spec.columns.map(c => {
+            const numeric = (c.kind === 'ports' || c.kind === 'set');
+            return `<th><input type="text" class="state-col-filter" data-col="${escapeHtml(c.head)}"` +
+                   ` value="${escapeHtml(stateColFilters[c.head] || '')}" autocomplete="off"` +
+                   ` placeholder="${numeric ? '&gt;8' : 'filter'}" aria-label="Filter by ${escapeHtml(c.head)}"></th>`;
+        }).join('');
+        $('state-table-head').innerHTML =
+            `<tr class="sort-row">${sortRow}</tr><tr class="col-filters">${filterRow}</tr>`;
+    }
+
+    function renderStateBody() {
         const st = fabricState;
         if (!st) return;
         const spec = STATE_GROUPS[stateGroupBy];
         const { rows: allRows, skipped } = aggregateState(stateGroupBy);
         const label = spec.label.toLowerCase();
-        const q = ($('state-filter').value || '').trim().toLowerCase();
-        const rows = q
-            ? allRows.filter(r => r.key.toLowerCase().includes(q) ||
-                                  r.profile.toLowerCase().includes(q) ||
-                                  (r.vrf || '').toLowerCase().includes(q))
-            : allRows;
+        const q = ($('state-filter').value || '').trim();
+        const colQ = spec.columns.map(c => (stateColFilters[c.head] || '').trim());
 
-        $('state-table-head').innerHTML = '<tr>' + spec.columns.map(c =>
-            `<th${c.kind === 'ports' ? ' style="width:70px;"' : ''}>${c.head}</th>`).join('') + '</tr>';
+        let rows = allRows.map(r => ({ row: r, cells: stateCells(r, spec) }));
+        if (q) rows = rows.filter(r => r.cells.some(c => matchesColFilter(c, q)));
+        colQ.forEach((cq, i) => { if (cq) rows = rows.filter(r => matchesColFilter(r.cells[i], cq)); });
+
+        const sort = effectiveSort(spec);
+        const numericKey = spec.columns[sort.index].kind === 'group' ? spec.numeric : true;
+        rows.sort((a, b) => {
+            const x = a.cells[sort.index], y = b.cells[sort.index];
+            const cmp = (x.num !== undefined)
+                ? x.num - y.num
+                : String(x.sort).localeCompare(String(y.sort), undefined, { numeric: numericKey });
+            // Ties keep the natural group/profile reading order
+            return (cmp * sort.dir) ||
+                   a.row.key.localeCompare(b.row.key, undefined, { numeric: spec.numeric }) ||
+                   a.row.profile.localeCompare(b.row.profile);
+        });
 
         const tb = $('state-table-body');
         if (!rows.length) {
             tb.innerHTML = `<tr><td colspan="${spec.columns.length}" class="muted" style="padding:20px;">${allRows.length
-                ? 'No rows match the filter.'
+                ? 'No rows match the filters.'
                 : `No port carries a known ${label} - upload a P2P design, adjust "Rack Patterns", or group by device.`}</td></tr>`;
         } else {
+            // Blanking the repeated group name only reads right while the table is
+            // ordered by that column; any other sort scatters the group's rows.
+            const groupRuns = spec.columns[sort.index].kind === 'group';
             let lastKey = null;
-            tb.innerHTML = rows.map(r => {
-                const firstOfGroup = r.key !== lastKey;
-                lastKey = r.key;
-                let setIndex = -1;
-                const cells = spec.columns.map(c => {
-                    if (c.kind === 'set') {
-                        setIndex++;
-                        const { html, title } = setCellHtml(r.sets[setIndex]);
-                        return `<td title="${escapeHtml(title)}">${html}</td>`;
-                    }
-                    if (c.kind === 'profile') return `<td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>`;
-                    if (c.kind === 'vrf') return `<td class="mono">${escapeHtml(r.vrf || '-')}</td>`;
-                    if (c.kind === 'ports') return `<td>${r.ports}</td>`;
-                    if (!firstOfGroup) return '<td></td>';
-                    const name = spec.link
-                        ? `<span class="state-link" data-value="${escapeHtml(r.key)}" title="Use this ${label} in step 1">${escapeHtml(r.key)}</span>`
-                        : `<span class="mono">${escapeHtml(r.key)}</span>`;
-                    const badge = r.mixed
-                        ? ` <span class="chip mixed" title="More than one port profile in this ${label}">mixed</span>` : '';
-                    return `<td>${name}${badge}</td>`;
-                });
-                return `<tr>${cells.join('')}</tr>`;
+            tb.innerHTML = rows.map(({ row, cells }) => {
+                const repeat = groupRuns && row.key === lastKey;
+                lastKey = row.key;
+                return '<tr>' + cells.map(c => c.kind === 'group' && repeat
+                    ? '<td></td>'
+                    : `<td${c.title ? ` title="${escapeHtml(c.title)}"` : ''}>${c.html}</td>`).join('') + '</tr>';
             }).join('');
         }
 
@@ -1362,7 +1483,11 @@
         $('state-summary').textContent =
             `${devices.size} devices · ${racks.size} racks · ${profs.size} profiles · ${vrfs.size} VRFs`;
 
-        const notes = [`${st.totalPorts} profiled port(s) across ${st.deviceCount} device(s).`];
+        const notes = [];
+        notes.push(rows.length === allRows.length
+            ? `${allRows.length} row(s).`
+            : `${rows.length} of ${allRows.length} row(s) shown.`);
+        notes.push(`${st.totalPorts} profiled port(s) across ${st.deviceCount} device(s).`);
         // Say where rack/endpoint came from: declared design data and a regex guess
         // are very different levels of trust.
         notes.push(st.designMatched
@@ -2335,6 +2460,22 @@
         $('state-group-chips').addEventListener('click', e => {
             const chip = e.target.closest('.chip');
             if (chip) setStateGroupBy(chip.dataset.group);
+        });
+        $('state-table-head').addEventListener('click', e => {
+            const th = e.target.closest('th.sortable');
+            if (th) setStateSort(th.dataset.col);
+        });
+        $('state-table-head').addEventListener('input', e => {
+            const input = e.target.closest('.state-col-filter');
+            if (!input) return;
+            const q = input.value.trim();
+            stateColFilters[input.dataset.col] = input.value;
+            // A malformed comparison on a numeric column would silently match
+            // nothing; on a text column "> " is just a substring, so leave it be.
+            const col = STATE_GROUPS[stateGroupBy].columns.find(c => c.head === input.dataset.col);
+            const numeric = col && (col.kind === 'ports' || col.kind === 'set');
+            input.classList.toggle('bad', numeric && /^[<>=]/.test(q) && !NUM_FILTER_RE.test(q));
+            renderStateBody();
         });
         $('state-refresh').addEventListener('click', e => {
             e.stopPropagation();  // the whole header toggles the panel
