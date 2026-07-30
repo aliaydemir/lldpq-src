@@ -165,8 +165,8 @@
         #state-panel { margin-bottom: 20px; }
         #state-head { cursor: pointer; }
         #state-caret { display: inline-block; width: 12px; color: #888; }
-        .state-rack { color: #4fc3f7; cursor: pointer; }
-        .state-rack:hover { text-decoration: underline; }
+        .state-link { color: #4fc3f7; cursor: pointer; }
+        .state-link:hover { text-decoration: underline; }
 
         /* Tables */
         table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
@@ -322,7 +322,7 @@
 <!-- ============ CURRENT STATE ============ -->
 <div class="panel" id="state-panel">
     <div class="panel-header" id="state-head" onclick="toggleStatePanel()">
-        <span class="panel-title"><span id="state-caret">&#9656;</span> Current State &mdash; rack &rarr; port profile &rarr; VRF</span>
+        <span class="panel-title"><span id="state-caret">&#9656;</span> Current State &mdash; port profiles and VRFs in use</span>
         <div class="select-actions" style="align-items:center;">
             <span class="foot-note" id="state-summary"></span>
             <a id="state-refresh">Refresh</a>
@@ -330,14 +330,20 @@
     </div>
     <div id="state-body" style="display:none;">
         <div class="filter-row">
+            <label>Group by:</label>
+            <span id="state-group-chips" style="display:flex; gap:6px;">
+                <span class="chip on" data-group="device">Device</span>
+                <span class="chip" data-group="rack" title="Rack ids are read from port names/descriptions using the header's Rack Patterns">Rack</span>
+                <span class="chip" data-group="vrf">VRF</span>
+            </span>
             <label>Filter:</label>
-            <input type="text" id="state-filter" class="search-input" placeholder="rack, profile or VRF..." style="flex:1; min-width:200px;" oninput="renderStateTable()">
+            <input type="text" id="state-filter" class="search-input" placeholder="group, profile or VRF..." style="flex:1; min-width:180px;" oninput="renderStateTable()">
             <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearStateFilter()">clear</a>
         </div>
         <div class="panel-body" style="max-height: 380px;">
             <table class="tbl">
-                <thead><tr>
-                    <th>Rack</th><th>Port Profile</th><th>VRF</th><th style="width:70px;">Ports</th><th>Devices</th>
+                <thead id="state-table-head"><tr>
+                    <th>Device</th><th>Port Profile</th><th>VRF</th><th style="width:70px;">Ports</th><th>Racks</th>
                 </tr></thead>
                 <tbody id="state-table-body">
                     <tr><td colspan="5" class="muted" style="padding:20px;">Expand to load the fabric's current port-profile state.</td></tr>
@@ -1100,8 +1106,36 @@
     }
 
     // ---------- Current State panel ----------
-    // Where every rack sits today, independent of the wizard's device selection.
-    let fabricState = null;   // {rows:[{rack,profile,vrf,ports,devices,mixed}], unmatched, totalPorts, deviceCount, warning}
+    // Where every profiled port sits today, independent of the wizard's device
+    // selection. The grouping dimension is a choice, not an assumption: rack ids
+    // only exist where a site encodes them in port names/descriptions, so device
+    // is the default because every fabric has one.
+    const STATE_GROUPS = {
+        device: {
+            label: 'Device',
+            head: ['Device', 'Port Profile', 'VRF', 'Ports', 'Racks'],
+            key: p => p.device,
+            member: p => p.rack,
+            numeric: true,
+        },
+        rack: {
+            label: 'Rack',
+            head: ['Rack', 'Port Profile', 'VRF', 'Ports', 'Devices'],
+            key: p => p.rack,
+            member: p => p.device,
+            numeric: true,
+        },
+        vrf: {
+            label: 'VRF',
+            head: ['VRF', 'Port Profile', 'Ports', 'Devices'],
+            key: p => p.vrf || '(no VRF)',
+            member: p => p.device,
+            numeric: false,
+        },
+    };
+
+    let fabricState = null;   // {ports:[{device,name,desc,profile,vrf,rack}], totalPorts, deviceCount, warning}
+    let stateGroupBy = 'device';
     let stateLoading = false;
 
     function toggleStatePanel() { setStatePanel($('state-body').style.display === 'none'); }
@@ -1136,29 +1170,49 @@
     function buildFabricState(data) {
         const profiles = data.port_profiles || {};
         const vlanProfiles = data.vlan_profiles || {};
-        const ports = data.ports || [];
+        const vrfOf = new Map();
+        const ports = (data.ports || []).map(([device, name, desc, profile]) => {
+            if (!vrfOf.has(profile)) vrfOf.set(profile, profileInfo(profile, profiles, vlanProfiles).vrf || '');
+            return { device, name, desc, profile, vrf: vrfOf.get(profile), rack: rackFromPort(name, desc) };
+        });
+        return { ports, totalPorts: ports.length,
+                 deviceCount: data.device_count || 0, warning: data.warning || '' };
+    }
+
+    // Rows are always (group, profile) pairs; only the group dimension changes.
+    function aggregateState(groupBy) {
+        const spec = STATE_GROUPS[groupBy];
         const agg = new Map();
-        let unmatched = 0;
-        for (const [device, name, desc, profile] of ports) {
-            const rack = rackFromPort(name, desc);
-            if (!rack) { unmatched++; continue; }
-            const key = rack + '\u0000' + profile;
-            let row = agg.get(key);
+        let skipped = 0;
+        for (const p of fabricState.ports) {
+            const key = spec.key(p);
+            if (!key) { skipped++; continue; }  // only rack grouping can come up empty
+            const id = key + '\u0000' + p.profile;
+            let row = agg.get(id);
             if (!row) {
-                row = { rack, profile, vrf: profileInfo(profile, profiles, vlanProfiles).vrf || '',
-                        ports: 0, devices: new Set() };
-                agg.set(key, row);
+                row = { key, profile: p.profile, vrf: p.vrf, ports: 0, members: new Set() };
+                agg.set(id, row);
             }
             row.ports++;
-            row.devices.add(device);
+            const member = spec.member(p);
+            if (member) row.members.add(member);
         }
         const rows = [...agg.values()].sort((a, b) =>
-            a.rack.localeCompare(b.rack, undefined, { numeric: true }) || a.profile.localeCompare(b.profile));
-        const perRack = new Map();
-        for (const r of rows) perRack.set(r.rack, (perRack.get(r.rack) || 0) + 1);
-        for (const r of rows) r.mixed = perRack.get(r.rack) > 1;
-        return { rows, unmatched, totalPorts: ports.length,
-                 deviceCount: data.device_count || 0, warning: data.warning || '' };
+            a.key.localeCompare(b.key, undefined, { numeric: spec.numeric }) ||
+            a.profile.localeCompare(b.profile));
+        const perKey = new Map();
+        for (const r of rows) perKey.set(r.key, (perKey.get(r.key) || 0) + 1);
+        for (const r of rows) r.mixed = perKey.get(r.key) > 1;
+        return { rows, skipped };
+    }
+
+    function setStateGroupBy(groupBy) {
+        if (!STATE_GROUPS[groupBy] || groupBy === stateGroupBy) return;
+        stateGroupBy = groupBy;
+        for (const chip of document.querySelectorAll('#state-group-chips .chip')) {
+            chip.classList.toggle('on', chip.dataset.group === groupBy);
+        }
+        renderStateTable();
     }
 
     function clearStateFilter() { $('state-filter').value = ''; renderStateTable(); }
@@ -1166,50 +1220,75 @@
     function renderStateTable() {
         const st = fabricState;
         if (!st) return;
+        const spec = STATE_GROUPS[stateGroupBy];
+        const { rows: allRows, skipped } = aggregateState(stateGroupBy);
+        const cols = spec.head.length;
         const q = ($('state-filter').value || '').trim().toLowerCase();
         const rows = q
-            ? st.rows.filter(r => r.rack.toLowerCase().includes(q) ||
+            ? allRows.filter(r => r.key.toLowerCase().includes(q) ||
                                   r.profile.toLowerCase().includes(q) ||
                                   (r.vrf || '').toLowerCase().includes(q))
-            : st.rows;
+            : allRows;
+
+        // Match on the label, not the index: the column order differs per mode.
+        $('state-table-head').innerHTML = '<tr>' + spec.head.map(h =>
+            `<th${h === 'Ports' ? ' style="width:70px;"' : ''}>${h}</th>`).join('') + '</tr>';
+
         const tb = $('state-table-body');
         if (!rows.length) {
-            tb.innerHTML = `<tr><td colspan="5" class="muted" style="padding:20px;">${st.rows.length
+            tb.innerHTML = `<tr><td colspan="${cols}" class="muted" style="padding:20px;">${allRows.length
                 ? 'No rows match the filter.'
-                : 'No profiled port matched a rack pattern - check "Rack Patterns" in the header.'}</td></tr>`;
+                : 'No port matched a rack pattern - adjust "Rack Patterns" in the header, or group by device.'}</td></tr>`;
         } else {
-            let lastRack = null;
+            let lastKey = null;
             tb.innerHTML = rows.map(r => {
-                const firstOfRack = r.rack !== lastRack;
-                lastRack = r.rack;
-                const rackCell = firstOfRack
-                    ? `<span class="state-rack" data-rack="${escapeHtml(r.rack)}" title="Filter step 1 by this rack">${escapeHtml(r.rack)}</span>` +
-                      (r.mixed ? ' <span class="chip mixed" title="More than one port profile in this rack">mixed</span>' : '')
+                const firstOfGroup = r.key !== lastKey;
+                lastKey = r.key;
+                const label = spec.label.toLowerCase();
+                const groupCell = firstOfGroup
+                    ? (stateGroupBy === 'vrf'
+                        ? `<span class="mono">${escapeHtml(r.key)}</span>`
+                        : `<span class="state-link" data-value="${escapeHtml(r.key)}" title="Use this ${label} in step 1">${escapeHtml(r.key)}</span>`) +
+                      (r.mixed ? ` <span class="chip mixed" title="More than one port profile in this ${label}">mixed</span>` : '')
                     : '';
-                const devs = [...r.devices].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-                const devCell = devs.length > 3
-                    ? `${escapeHtml(devs.slice(0, 3).join(', '))} <span class="muted">+${devs.length - 3}</span>`
-                    : escapeHtml(devs.join(', '));
-                return `<tr><td>${rackCell}</td>` +
+                const members = [...r.members].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+                const memberCell = members.length > 3
+                    ? `${escapeHtml(members.slice(0, 3).join(', '))} <span class="muted">+${members.length - 3}</span>`
+                    : escapeHtml(members.join(', ')) || '<span class="muted">-</span>';
+                return `<tr><td>${groupCell}</td>` +
                        `<td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>` +
-                       `<td class="mono">${escapeHtml(r.vrf || '-')}</td>` +
+                       (stateGroupBy === 'vrf' ? '' : `<td class="mono">${escapeHtml(r.vrf || '-')}</td>`) +
                        `<td>${r.ports}</td>` +
-                       `<td title="${escapeHtml(devs.join(', '))}">${devCell}</td></tr>`;
+                       `<td title="${escapeHtml(members.join(', '))}">${memberCell}</td></tr>`;
             }).join('');
         }
-        const racks = new Set(st.rows.map(r => r.rack));
-        const profs = new Set(st.rows.map(r => r.profile));
-        const vrfs = new Set(st.rows.map(r => r.vrf).filter(Boolean));
-        $('state-summary').textContent = `${racks.size} racks · ${profs.size} profiles · ${vrfs.size} VRFs`;
+
+        const devices = new Set(st.ports.map(p => p.device));
+        const profs = new Set(st.ports.map(p => p.profile));
+        const vrfs = new Set(st.ports.map(p => p.vrf).filter(Boolean));
+        const racks = new Set(st.ports.map(p => p.rack).filter(Boolean));
+        $('state-summary').textContent =
+            `${devices.size} devices · ${racks.size} racks · ${profs.size} profiles · ${vrfs.size} VRFs`;
+
         const notes = [`${st.totalPorts} profiled port(s) across ${st.deviceCount} device(s).`];
-        // Patterns are site-specific, so a silent miss would look like missing racks
-        if (st.unmatched) notes.push(`${st.unmatched} port(s) matched no rack pattern and are not listed.`);
+        // Rack ids are site-specific, so a silent miss would look like missing racks
+        if (skipped) notes.push(`${skipped} port(s) carry no ${spec.label.toLowerCase()} and are not listed.`);
         if (st.warning) notes.push(st.warning);
         $('state-note').textContent = notes.join(' ');
     }
 
-    function useRack(rack) {
-        $('rack-input').value = rack;
+    // Carry a row straight into step 1: racks prefill the pattern filter, devices
+    // tick their own checkbox. VRF is a report-only dimension.
+    function useStateGroup(value) {
+        if (stateGroupBy === 'vrf') return;
+        if (stateGroupBy === 'device') {
+            selectedDevices.add(value);
+            renderDeviceList();
+            goStep(1);
+            setStatePanel(false);
+            return;
+        }
+        $('rack-input').value = value;
         goStep(1);
         setStatePanel(false);
         if (portRows.length) applyRackFilter();
@@ -2154,8 +2233,12 @@
             if (a) loadPlan(a.dataset.plan);
         });
         $('state-table-body').addEventListener('click', e => {
-            const el = e.target.closest('.state-rack');
-            if (el) useRack(el.dataset.rack);
+            const el = e.target.closest('.state-link');
+            if (el) useStateGroup(el.dataset.value);
+        });
+        $('state-group-chips').addEventListener('click', e => {
+            const chip = e.target.closest('.chip');
+            if (chip) setStateGroupBy(chip.dataset.group);
         });
         $('state-refresh').addEventListener('click', e => {
             e.stopPropagation();  // the whole header toggles the panel
