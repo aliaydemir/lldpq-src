@@ -333,7 +333,8 @@
             <label>Group by:</label>
             <span id="state-group-chips" style="display:flex; gap:6px;">
                 <span class="chip on" data-group="device">Device</span>
-                <span class="chip" data-group="rack" title="Rack ids are read from port names/descriptions using the header's Rack Patterns">Rack</span>
+                <span class="chip" data-group="rack" title="Rack comes from the uploaded P2P design when available, otherwise from the header's Rack Patterns">Rack</span>
+                <span class="chip" data-group="endpoint" title="The server / DGX side of each link, from the P2P design when available">Endpoint</span>
                 <span class="chip" data-group="vrf">VRF</span>
             </span>
             <label>Filter:</label>
@@ -1110,31 +1111,56 @@
     // selection. The grouping dimension is a choice, not an assumption: rack ids
     // only exist where a site encodes them in port names/descriptions, so device
     // is the default because every fabric has one.
+    // Column kinds: 'group' (the aggregation key), 'profile', 'vrf', 'ports',
+    // or 'set' (distinct values collected across the group's ports).
     const STATE_GROUPS = {
         device: {
-            label: 'Device',
-            head: ['Device', 'Port Profile', 'VRF', 'Ports', 'Racks'],
+            label: 'Device', link: true, numeric: true,
             key: p => p.device,
-            member: p => p.rack,
-            numeric: true,
+            columns: [
+                { head: 'Device', kind: 'group' },
+                { head: 'Port Profile', kind: 'profile' },
+                { head: 'VRF', kind: 'vrf' },
+                { head: 'Ports', kind: 'ports' },
+                { head: 'Racks', kind: 'set', of: p => p.rack },
+            ],
         },
         rack: {
-            label: 'Rack',
-            head: ['Rack', 'Port Profile', 'VRF', 'Ports', 'Devices'],
+            label: 'Rack', link: true, numeric: true,
             key: p => p.rack,
-            member: p => p.device,
-            numeric: true,
+            columns: [
+                { head: 'Rack', kind: 'group' },
+                { head: 'Port Profile', kind: 'profile' },
+                { head: 'VRF', kind: 'vrf' },
+                { head: 'Ports', kind: 'ports' },
+                { head: 'Devices', kind: 'set', of: p => p.device },
+            ],
+        },
+        endpoint: {
+            label: 'Endpoint', link: false, numeric: true,
+            key: p => p.endpoint,
+            columns: [
+                { head: 'Endpoint', kind: 'group' },
+                { head: 'Rack', kind: 'set', of: p => p.rack },
+                { head: 'Port Profile', kind: 'profile' },
+                { head: 'VRF', kind: 'vrf' },
+                { head: 'Ports', kind: 'ports' },
+                { head: 'Switches', kind: 'set', of: p => p.device },
+            ],
         },
         vrf: {
-            label: 'VRF',
-            head: ['VRF', 'Port Profile', 'Ports', 'Devices'],
+            label: 'VRF', link: false, numeric: false,
             key: p => p.vrf || '(no VRF)',
-            member: p => p.device,
-            numeric: false,
+            columns: [
+                { head: 'VRF', kind: 'group' },
+                { head: 'Port Profile', kind: 'profile' },
+                { head: 'Ports', kind: 'ports' },
+                { head: 'Devices', kind: 'set', of: p => p.device },
+            ],
         },
     };
 
-    let fabricState = null;   // {ports:[{device,name,desc,profile,vrf,rack}], totalPorts, deviceCount, warning}
+    let fabricState = null;   // {ports:[{device,name,desc,profile,vrf,rack,endpoint}], totalPorts, deviceCount, warning, design}
     let stateGroupBy = 'device';
     let stateLoading = false;
 
@@ -1157,6 +1183,9 @@
             if (!data.success) throw new Error(data.error || 'Request failed');
             fabricState = buildFabricState(data);
             renderStateTable();
+            // Declared rack/endpoint data beats anything guessed from a name, so
+            // re-render once the design join lands. Best-effort: no design, no change.
+            if (await applyDesignToState()) renderStateTable();
         } catch (e) {
             fabricState = null;
             $('state-summary').textContent = '';
@@ -1173,29 +1202,81 @@
         const vrfOf = new Map();
         const ports = (data.ports || []).map(([device, name, desc, profile]) => {
             if (!vrfOf.has(profile)) vrfOf.set(profile, profileInfo(profile, profiles, vlanProfiles).vrf || '');
-            return { device, name, desc, profile, vrf: vrfOf.get(profile), rack: rackFromPort(name, desc) };
+            return {
+                device, name, desc, profile,
+                vrf: vrfOf.get(profile),
+                rack: rackFromPort(name, desc),
+                endpoint: peerOf(desc).peer,
+                fromDesign: false,
+            };
         });
-        return { ports, totalPorts: ports.length,
-                 deviceCount: data.device_count || 0, warning: data.warning || '' };
+        return { ports, totalPorts: ports.length, deviceCount: data.device_count || 0,
+                 warning: data.warning || '', design: '', designMatched: 0 };
+    }
+
+    // Overlay the published P2P design onto the loaded state. The design declares
+    // which rack an endpoint physically sits in, so it outranks the rack guessed
+    // from a port name. Returns true when anything changed.
+    async function applyDesignToState() {
+        const st = fabricState;
+        if (!st || !st.ports.length) return false;
+        const hosts = [...new Set(st.ports.map(p => p.device))];
+        const merged = {};
+        let name = '';
+        try {
+            // Backend caps one request at 500 devices; chunk like loadDesignFacets
+            for (let i = 0; i < hosts.length; i += 400) {
+                const resp = await fetch('/fabric-api.sh?action=get-p2p-enrichment', {
+                    method: 'POST', body: JSON.stringify({ devices: hosts.slice(i, i + 400) })
+                });
+                const data = await resp.json();
+                if (!data.success) return false;  // no design uploaded, or unreadable
+                name = data.design || name;
+                Object.assign(merged, data.devices || {});
+            }
+        } catch (e) {
+            return false;  // enrichment is best-effort
+        }
+
+        const byDevice = new Map();
+        for (const [dev, entries] of Object.entries(merged)) {
+            const m = new Map();
+            for (const e of entries) for (const a of (e.aliases || [])) if (!m.has(a)) m.set(a, e);
+            byDevice.set(dev, m);
+        }
+        let matched = 0;
+        for (const p of st.ports) {
+            const entry = (byDevice.get(p.device) || new Map()).get(p.name.toLowerCase());
+            if (!entry) continue;
+            matched++;
+            p.fromDesign = true;
+            // peer_rack is where the endpoint sits; rack is the switch's own slot
+            const rack = entry.peer_rack || entry.rack || '';
+            if (rack) p.rack = normalizeRack(String(rack));
+            if (entry.peer) p.endpoint = entry.peer;
+        }
+        st.design = name;
+        st.designMatched = matched;
+        return matched > 0;
     }
 
     // Rows are always (group, profile) pairs; only the group dimension changes.
     function aggregateState(groupBy) {
         const spec = STATE_GROUPS[groupBy];
+        const setCols = spec.columns.filter(c => c.kind === 'set');
         const agg = new Map();
         let skipped = 0;
         for (const p of fabricState.ports) {
             const key = spec.key(p);
-            if (!key) { skipped++; continue; }  // only rack grouping can come up empty
+            if (!key) { skipped++; continue; }  // rack/endpoint can be unknown
             const id = key + '\u0000' + p.profile;
             let row = agg.get(id);
             if (!row) {
-                row = { key, profile: p.profile, vrf: p.vrf, ports: 0, members: new Set() };
+                row = { key, profile: p.profile, vrf: p.vrf, ports: 0, sets: setCols.map(() => new Set()) };
                 agg.set(id, row);
             }
             row.ports++;
-            const member = spec.member(p);
-            if (member) row.members.add(member);
+            setCols.forEach((c, i) => { const v = c.of(p); if (v) row.sets[i].add(v); });
         }
         const rows = [...agg.values()].sort((a, b) =>
             a.key.localeCompare(b.key, undefined, { numeric: spec.numeric }) ||
@@ -1217,12 +1298,21 @@
 
     function clearStateFilter() { $('state-filter').value = ''; renderStateTable(); }
 
+    function setCellHtml(values) {
+        const sorted = [...values].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+        if (!sorted.length) return { html: '<span class="muted">-</span>', title: '' };
+        const html = sorted.length > 3
+            ? `${escapeHtml(sorted.slice(0, 3).join(', '))} <span class="muted">+${sorted.length - 3}</span>`
+            : escapeHtml(sorted.join(', '));
+        return { html, title: sorted.join(', ') };
+    }
+
     function renderStateTable() {
         const st = fabricState;
         if (!st) return;
         const spec = STATE_GROUPS[stateGroupBy];
         const { rows: allRows, skipped } = aggregateState(stateGroupBy);
-        const cols = spec.head.length;
+        const label = spec.label.toLowerCase();
         const q = ($('state-filter').value || '').trim().toLowerCase();
         const rows = q
             ? allRows.filter(r => r.key.toLowerCase().includes(q) ||
@@ -1230,36 +1320,38 @@
                                   (r.vrf || '').toLowerCase().includes(q))
             : allRows;
 
-        // Match on the label, not the index: the column order differs per mode.
-        $('state-table-head').innerHTML = '<tr>' + spec.head.map(h =>
-            `<th${h === 'Ports' ? ' style="width:70px;"' : ''}>${h}</th>`).join('') + '</tr>';
+        $('state-table-head').innerHTML = '<tr>' + spec.columns.map(c =>
+            `<th${c.kind === 'ports' ? ' style="width:70px;"' : ''}>${c.head}</th>`).join('') + '</tr>';
 
         const tb = $('state-table-body');
         if (!rows.length) {
-            tb.innerHTML = `<tr><td colspan="${cols}" class="muted" style="padding:20px;">${allRows.length
+            tb.innerHTML = `<tr><td colspan="${spec.columns.length}" class="muted" style="padding:20px;">${allRows.length
                 ? 'No rows match the filter.'
-                : 'No port matched a rack pattern - adjust "Rack Patterns" in the header, or group by device.'}</td></tr>`;
+                : `No port carries a known ${label} - upload a P2P design, adjust "Rack Patterns", or group by device.`}</td></tr>`;
         } else {
             let lastKey = null;
             tb.innerHTML = rows.map(r => {
                 const firstOfGroup = r.key !== lastKey;
                 lastKey = r.key;
-                const label = spec.label.toLowerCase();
-                const groupCell = firstOfGroup
-                    ? (stateGroupBy === 'vrf'
-                        ? `<span class="mono">${escapeHtml(r.key)}</span>`
-                        : `<span class="state-link" data-value="${escapeHtml(r.key)}" title="Use this ${label} in step 1">${escapeHtml(r.key)}</span>`) +
-                      (r.mixed ? ` <span class="chip mixed" title="More than one port profile in this ${label}">mixed</span>` : '')
-                    : '';
-                const members = [...r.members].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-                const memberCell = members.length > 3
-                    ? `${escapeHtml(members.slice(0, 3).join(', '))} <span class="muted">+${members.length - 3}</span>`
-                    : escapeHtml(members.join(', ')) || '<span class="muted">-</span>';
-                return `<tr><td>${groupCell}</td>` +
-                       `<td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>` +
-                       (stateGroupBy === 'vrf' ? '' : `<td class="mono">${escapeHtml(r.vrf || '-')}</td>`) +
-                       `<td>${r.ports}</td>` +
-                       `<td title="${escapeHtml(members.join(', '))}">${memberCell}</td></tr>`;
+                let setIndex = -1;
+                const cells = spec.columns.map(c => {
+                    if (c.kind === 'set') {
+                        setIndex++;
+                        const { html, title } = setCellHtml(r.sets[setIndex]);
+                        return `<td title="${escapeHtml(title)}">${html}</td>`;
+                    }
+                    if (c.kind === 'profile') return `<td><span class="pbadge p-cur">${escapeHtml(r.profile)}</span></td>`;
+                    if (c.kind === 'vrf') return `<td class="mono">${escapeHtml(r.vrf || '-')}</td>`;
+                    if (c.kind === 'ports') return `<td>${r.ports}</td>`;
+                    if (!firstOfGroup) return '<td></td>';
+                    const name = spec.link
+                        ? `<span class="state-link" data-value="${escapeHtml(r.key)}" title="Use this ${label} in step 1">${escapeHtml(r.key)}</span>`
+                        : `<span class="mono">${escapeHtml(r.key)}</span>`;
+                    const badge = r.mixed
+                        ? ` <span class="chip mixed" title="More than one port profile in this ${label}">mixed</span>` : '';
+                    return `<td>${name}${badge}</td>`;
+                });
+                return `<tr>${cells.join('')}</tr>`;
             }).join('');
         }
 
@@ -1271,16 +1363,20 @@
             `${devices.size} devices · ${racks.size} racks · ${profs.size} profiles · ${vrfs.size} VRFs`;
 
         const notes = [`${st.totalPorts} profiled port(s) across ${st.deviceCount} device(s).`];
-        // Rack ids are site-specific, so a silent miss would look like missing racks
-        if (skipped) notes.push(`${skipped} port(s) carry no ${spec.label.toLowerCase()} and are not listed.`);
+        // Say where rack/endpoint came from: declared design data and a regex guess
+        // are very different levels of trust.
+        notes.push(st.designMatched
+            ? `Rack and endpoint from P2P design "${st.design}" for ${st.designMatched}/${st.totalPorts} port(s); the rest fall back to name patterns.`
+            : 'No P2P design matched - rack and endpoint are derived from port names and descriptions.');
+        if (skipped) notes.push(`${skipped} port(s) carry no ${label} and are not listed.`);
         if (st.warning) notes.push(st.warning);
         $('state-note').textContent = notes.join(' ');
     }
 
     // Carry a row straight into step 1: racks prefill the pattern filter, devices
-    // tick their own checkbox. VRF is a report-only dimension.
+    // tick their own checkbox. VRF and endpoint are report-only dimensions.
     function useStateGroup(value) {
-        if (stateGroupBy === 'vrf') return;
+        if (!STATE_GROUPS[stateGroupBy].link) return;
         if (stateGroupBy === 'device') {
             selectedDevices.add(value);
             renderDeviceList();
