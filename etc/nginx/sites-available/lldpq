@@ -440,7 +440,7 @@ server {
         # "type; charset=..." string): gzip_types matches the content type
         # string exactly, so an embedded charset would silently disable
         # compression for these fabric-scale exports.
-        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_json$ {
+        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log|config-drift|routes|fabric-check)/export_json$ {
             alias /var/www/html/monitor-results/export/$lldpq_export_domain.json;
             types { }
             default_type application/json;
@@ -448,7 +448,7 @@ server {
             charset_types application/json;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
         }
-        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log)/export_csv$ {
+        location ~ ^/(?<lldpq_export_domain>bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|log|config-drift|routes|fabric-check)/export_csv$ {
             alias /var/www/html/monitor-results/export/$lldpq_export_domain.csv;
             types { }
             default_type text/csv;

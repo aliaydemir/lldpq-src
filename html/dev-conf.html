@@ -430,6 +430,12 @@
                         <button class="format-btn active" data-format="txt" onclick="selectFormat('txt')">NV-SET</button>
                         <button class="format-btn" data-format="yaml" onclick="selectFormat('yaml')">YAML</button>
                     </div>
+                    <button class="btn" onclick="window.location.href='/monitor-results/config-drift-analysis.html'" id="btn-drift" title="Config Drift Analysis - change history of collected configurations">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M13.5,8H12V13L16.28,15.54L17,14.33L13.5,12.25V8M13,3A9,9 0 0,0 4,12H1L4.96,16.03L9,12H6A7,7 0 0,1 13,5A7,7 0 0,1 20,12A7,7 0 0,1 13,19C11.07,19 9.32,18.21 8.06,16.94L6.64,18.36C8.27,20 10.5,21 13,21A9,9 0 0,0 22,12A9,9 0 0,0 13,3Z"/>
+                        </svg>
+                        Drift History
+                    </button>
                     <button class="btn" onclick="collectConfigs()" id="btn-collect" style="background: #ff9800; color: #000; font-weight: bold;">
                         <svg viewBox="0 0 24 24" fill="currentColor">
                             <path d="M19.35,10.04C18.67,6.59 15.64,4 12,4C9.11,4 6.6,5.64 5.35,8.04C2.34,8.36 0,10.91 0,14A6,6 0 0,0 6,20H19A5,5 0 0,0 24,15C24,12.36 21.95,10.22 19.35,10.04M19,18H6A4,4 0 0,1 2,14C2,11.95 3.53,10.24 5.56,10.03L6.63,9.92L7.13,8.97C8.08,7.14 9.94,6 12,6C14.62,6 16.88,7.86 17.39,10.43L17.69,11.93L19.22,12.04C20.78,12.14 22,13.45 22,15A3,3 0 0,1 19,18M8,13H10.55V16H13.45V13H16L12,9L8,13Z"/>

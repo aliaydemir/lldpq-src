@@ -34,13 +34,32 @@ EXPORT_CGIS = tuple(
 )
 NGINX_SITE = ROOT / "etc/nginx/sites-available/lldpq"
 
-EXPORT_DOMAIN_FILES = tuple(
+# Domains that existed when the export feature landed (legacy_v6 boundary).
+LEGACY_EXPORT_DOMAIN_FILES = tuple(
     f"export/{domain}.{suffix}"
     for domain in (
         "bgp", "evpn-mh", "duplicate", "flap", "optical",
         "ber", "pfc-ecn", "hardware", "log",
     )
     for suffix in ("json", "csv")
+)
+EXPORT_DOMAIN_FILES = LEGACY_EXPORT_DOMAIN_FILES + tuple(
+    f"export/{domain}.{suffix}"
+    for domain in ("config-drift", "routes", "fabric-check")
+    for suffix in ("json", "csv")
+)
+# Everything the config-drift/routes/fabric-check analyzers added on top of
+# the legacy_v6 schema (which itself is legacy_v5 + the legacy export files).
+NEW_ANALYZER_ARTIFACTS = (
+    "config-drift-analysis.html", "config_drift_history.json",
+    "config-drift-data/",
+    "routes-analysis.html", "routes_events.json", "routes-history/",
+    "fabric-check-analysis.html",
+    "summary/config-drift-summary.json", "summary/routes-summary.json",
+    "summary/fabric-check-summary.json",
+    "export/config-drift.json", "export/config-drift.csv",
+    "export/routes.json", "export/routes.csv",
+    "export/fabric-check.json", "export/fabric-check.csv",
 )
 
 
@@ -332,14 +351,27 @@ class MonitorExportContractTests(unittest.TestCase):
         cls.legacy_v5 = _extract_array(cls.source, "analysis_artifacts_legacy_v5")
 
     def test_current_schema_adds_exactly_the_export_files(self):
+        legacy_v6 = _extract_array(self.source, "analysis_artifacts_legacy_v6")
+        # legacy_v6 must be the frozen export-era schema: legacy_v5 plus the
+        # legacy export pairs, nothing else.
         self.assertEqual(
-            set(self.current) - set(self.legacy_v5),
-            set(EXPORT_DOMAIN_FILES),
+            set(legacy_v6) - set(self.legacy_v5),
+            set(LEGACY_EXPORT_DOMAIN_FILES),
         )
-        # legacy_v5 must be the frozen pre-export schema: nothing else differs.
-        self.assertEqual(set(self.legacy_v5) - set(self.current), set())
+        self.assertEqual(set(self.legacy_v5) - set(legacy_v6), set())
         self.assertEqual(
-            len(self.current), len(self.legacy_v5) + len(EXPORT_DOMAIN_FILES)
+            len(legacy_v6),
+            len(self.legacy_v5) + len(LEGACY_EXPORT_DOMAIN_FILES),
+        )
+        # The current schema adds exactly the config-drift/routes/fabric-check
+        # analyzer artifacts on top of legacy_v6.
+        self.assertEqual(
+            set(self.current) - set(legacy_v6),
+            set(NEW_ANALYZER_ARTIFACTS),
+        )
+        self.assertEqual(set(legacy_v6) - set(self.current), set())
+        self.assertEqual(
+            len(self.current), len(legacy_v6) + len(NEW_ANALYZER_ARTIFACTS)
         )
 
     def test_validation_and_overlays_cover_every_export_pair(self):

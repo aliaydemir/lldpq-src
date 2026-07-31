@@ -538,6 +538,66 @@
             </div>
         </div>
 
+        <!-- Config Drift Analysis Section -->
+        <div class="analysis-section">
+            <div class="section-header">
+                <h2 class="section-title" onclick="window.location.href='monitor-results/config-drift-analysis.html'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M13.5,8H12V13L16.28,15.54L17,14.33L13.5,12.25V8M13,3A9,9 0 0,0 4,12H1L4.96,16.03L9,12H6A7,7 0 0,1 13,5A7,7 0 0,1 20,12A7,7 0 0,1 13,19C11.07,19 9.32,18.21 8.06,16.94L6.64,18.36C8.27,20 10.5,21 13,21A9,9 0 0,0 22,12A9,9 0 0,0 13,3Z"/></svg>
+                    Config Drift Analysis
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <div class="summary-card card-total" onclick="window.location.href='monitor-results/config-drift-analysis.html'">
+                    <div class="card-value" id="cd-devices">0</div>
+                    <div class="card-label">Configs Tracked</div>
+                </div>
+                <div class="summary-card card-critical" onclick="window.location.href='monitor-results/config-drift-analysis.html'">
+                    <div class="card-value status-critical" id="cd-changed-24h">0</div>
+                    <div class="card-label">Changed (24h)</div>
+                </div>
+                <div class="summary-card card-warning" onclick="window.location.href='monitor-results/config-drift-analysis.html'">
+                    <div class="card-value status-warning" id="cd-changed-7d">0</div>
+                    <div class="card-label">Changed (7d)</div>
+                </div>
+                <div class="summary-card card-info" onclick="window.location.href='monitor-results/config-drift-analysis.html'">
+                    <div class="card-value status-info" id="cd-missing">0</div>
+                    <div class="card-label">Missing Configs</div>
+                </div>
+            </div>
+            </div>
+        </div>
+
+        <!-- Routes Analysis Section -->
+        <div class="analysis-section">
+            <div class="section-header">
+                <h2 class="section-title" onclick="window.location.href='monitor-results/routes-analysis.html'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M5,4H19A2,2 0 0,1 21,6V18A2,2 0 0,1 19,20H5A2,2 0 0,1 3,18V6A2,2 0 0,1 5,4M5,8V12H11V8H5M13,8V12H19V8H13M5,14V18H11V14H5M13,14V18H19V14H13Z"/></svg>
+                    Routes Analysis
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <div class="summary-card card-total" onclick="window.location.href='monitor-results/routes-analysis.html'">
+                    <div class="card-value" id="routes-total">0</div>
+                    <div class="card-label">Routes (Fabric)</div>
+                </div>
+                <div class="summary-card card-info" onclick="window.location.href='monitor-results/routes-analysis.html'">
+                    <div class="card-value status-info" id="routes-vrfs">0</div>
+                    <div class="card-label">VRFs</div>
+                </div>
+                <div class="summary-card card-critical" onclick="window.location.href='monitor-results/routes-analysis.html'">
+                    <div class="card-value status-critical" id="routes-anomalies">0</div>
+                    <div class="card-label">Route Anomalies (24h)</div>
+                </div>
+                <div class="summary-card card-warning" onclick="window.location.href='monitor-results/routes-analysis.html'">
+                    <div class="card-value status-warning" id="routes-stale">0</div>
+                    <div class="card-label">Stale Devices</div>
+                </div>
+            </div>
+            </div>
+        </div>
+
         <!-- BGP Analysis Section -->
         <div class="analysis-section">
             <div class="section-header">
@@ -832,6 +892,36 @@
                     <div class="card-label">Discarding Ports</div>
                     <div class="card-caption pfc-signal-caption" id="pfc-discards-caption" data-default-caption="Direct drop evidence · latest interval">Direct drop evidence · latest interval</div>
                 </a>
+            </div>
+            </div>
+        </div>
+
+        <!-- Fabric Check Analysis Section -->
+        <div class="analysis-section">
+            <div class="section-header">
+                <h2 class="section-title" onclick="window.location.href='monitor-results/fabric-check-analysis.html'">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M10,17L5,12L6.41,10.59L10,14.17L17.59,6.58L19,8L10,17Z"/></svg>
+                    Fabric Check Analysis
+                </h2>
+            </div>
+            <div class="section-content">
+            <div class="summary-grid">
+                <div class="summary-card card-total" onclick="window.location.href='monitor-results/fabric-check-analysis.html'">
+                    <div class="card-value" id="fc-links">0</div>
+                    <div class="card-label">Links Checked</div>
+                </div>
+                <div class="summary-card card-critical" onclick="window.location.href='monitor-results/fabric-check-analysis.html'">
+                    <div class="card-value status-critical" id="fc-mtu-mismatch">0</div>
+                    <div class="card-label">MTU Mismatches</div>
+                </div>
+                <div class="summary-card card-critical" onclick="window.location.href='monitor-results/fabric-check-analysis.html'">
+                    <div class="card-value status-critical" id="fc-speed-mismatch">0</div>
+                    <div class="card-label">Speed Mismatches</div>
+                </div>
+                <div class="summary-card card-warning" onclick="window.location.href='monitor-results/fabric-check-analysis.html'">
+                    <div class="card-value status-warning" id="fc-config-mismatch">0</div>
+                    <div class="card-label">Config &ne; Running MTU</div>
+                </div>
             </div>
             </div>
         </div>
@@ -1461,7 +1551,10 @@
             'pfc': 'pfc-ecn',
             'flap': 'flap',
             'hardware': 'hardware',
-            'duplicate': 'duplicate'
+            'duplicate': 'duplicate',
+            'config-drift': 'config-drift',
+            'routes': 'routes',
+            'fabric-check': 'fabric-check'
         };
 
         const DASHBOARD_SUMMARY_JSON_FIELDS = {
@@ -1496,7 +1589,17 @@
                 'excellent', 'good', 'warning', 'critical', 'unknown'],
             'duplicate': ['collection_status', 'coverage_partial',
                 'confirmed_ip_active', 'ip_quiesced', 'confirmed_mac_total',
-                'coverage_expected', 'coverage_current', 'coverage_failures']
+                'coverage_expected', 'coverage_current', 'coverage_failures'],
+            'config-drift': ['collection_status', 'devices_expected',
+                'devices_with_config', 'devices_missing', 'changed_24h',
+                'changed_7d', 'events_recorded'],
+            'routes': ['collection_status', 'devices_expected',
+                'devices_reporting', 'devices_stale', 'devices_missing',
+                'total_routes', 'vrf_count', 'route_drops_24h',
+                'vrfs_disappeared_24h'],
+            'fabric-check': ['collection_status', 'devices_expected',
+                'devices_covered', 'links_checked', 'mtu_mismatches',
+                'speed_mismatches', 'config_mtu_mismatches', 'findings_total']
         };
 
         function summaryJsonNumber(value) {
@@ -1754,6 +1857,35 @@
                 summaryData.critical = number(payload.critical) || 0;
                 summaryData.unknown = number(payload.unknown) || 0;
                 if (summaryData.unknown > 0) summaryData.coveragePartial = true;
+            } else if (dataType === 'config-drift') {
+                summaryData.devicesExpected = number(payload.devices_expected);
+                summaryData.devicesWithConfig = number(payload.devices_with_config);
+                summaryData.devicesMissing = number(payload.devices_missing) || 0;
+                summaryData.changed24h = number(payload.changed_24h);
+                summaryData.changed7d = number(payload.changed_7d);
+                summaryData.eventsRecorded = number(payload.events_recorded);
+                if (summaryData.devicesMissing > 0) summaryData.coveragePartial = true;
+            } else if (dataType === 'routes') {
+                summaryData.devicesExpected = number(payload.devices_expected);
+                summaryData.devicesReporting = number(payload.devices_reporting);
+                summaryData.devicesStale = number(payload.devices_stale) || 0;
+                summaryData.totalRoutes = number(payload.total_routes);
+                summaryData.vrfCount = number(payload.vrf_count);
+                summaryData.routeDrops24h = number(payload.route_drops_24h) || 0;
+                summaryData.vrfsDisappeared24h =
+                    number(payload.vrfs_disappeared_24h) || 0;
+                summaryData.anomalies24h = summaryData.routeDrops24h +
+                    summaryData.vrfsDisappeared24h;
+                if (summaryData.devicesStale > 0) summaryData.coveragePartial = true;
+            } else if (dataType === 'fabric-check') {
+                summaryData.devicesExpected = number(payload.devices_expected);
+                summaryData.devicesCovered = number(payload.devices_covered);
+                summaryData.linksChecked = number(payload.links_checked);
+                summaryData.mtuMismatches = number(payload.mtu_mismatches) || 0;
+                summaryData.speedMismatches = number(payload.speed_mismatches) || 0;
+                summaryData.configMtuMismatches =
+                    number(payload.config_mtu_mismatches) || 0;
+                summaryData.findingsTotal = number(payload.findings_total) || 0;
             } else {
                 return null;
             }
@@ -2009,7 +2141,10 @@
                         'evpn-mh': 'monitor-results/evpn-mh-analysis.html',
                         'ber': 'monitor-results/ber-analysis.html',
                         'pfc': 'monitor-results/pfc-ecn-analysis.html',
-                        'flap': 'monitor-results/link-flap-analysis.html'
+                        'flap': 'monitor-results/link-flap-analysis.html',
+                        'config-drift': 'monitor-results/config-drift-analysis.html',
+                        'routes': 'monitor-results/routes-analysis.html',
+                        'fabric-check': 'monitor-results/fabric-check-analysis.html'
                     };
                     
                     const pageUrl = pageMap[dataType];
@@ -2184,6 +2319,67 @@
                                     (summaryData.stable / summaryData.totalPorts) * 100,
                                     summaryData.problematic)
                                 : null;
+                        } else if (dataType === 'config-drift' ||
+                                   dataType === 'routes' ||
+                                   dataType === 'fabric-check') {
+                            // Machine-div attribute names contain digit
+                            // segments ("changed-24h") that the dataset
+                            // camelCase mapping mangles; read them verbatim.
+                            const attrNumber = name => {
+                                const text = reportMeta?.getAttribute?.(name);
+                                if (text === undefined || text === null ||
+                                    text === '') return null;
+                                const value = Number(text);
+                                return Number.isFinite(value) ? value : null;
+                            };
+                            if (reportMeta?.dataset?.analysisSummary !== dataType) {
+                                summaryData.unavailable = true;
+                                summaryData.coveragePartial = true;
+                            } else if (dataType === 'config-drift') {
+                                summaryData.devicesExpected = attrNumber('data-devices-expected');
+                                summaryData.devicesWithConfig = attrNumber('data-devices-with-config');
+                                summaryData.devicesMissing = attrNumber('data-devices-missing') || 0;
+                                summaryData.changed24h = attrNumber('data-changed-24h');
+                                summaryData.changed7d = attrNumber('data-changed-7d');
+                                summaryData.eventsRecorded = attrNumber('data-events-recorded');
+                                if (summaryData.changed24h === null ||
+                                    summaryData.devicesWithConfig === null) {
+                                    summaryData.unavailable = true;
+                                    summaryData.coveragePartial = true;
+                                }
+                                if (summaryData.devicesMissing > 0) {
+                                    summaryData.coveragePartial = true;
+                                }
+                            } else if (dataType === 'routes') {
+                                summaryData.devicesExpected = attrNumber('data-devices-expected');
+                                summaryData.devicesReporting = attrNumber('data-devices-reporting');
+                                summaryData.devicesStale = attrNumber('data-devices-stale') || 0;
+                                summaryData.totalRoutes = attrNumber('data-total-routes');
+                                summaryData.vrfCount = attrNumber('data-vrf-count');
+                                summaryData.routeDrops24h = attrNumber('data-route-drops-24h') || 0;
+                                summaryData.vrfsDisappeared24h = attrNumber('data-vrfs-disappeared-24h') || 0;
+                                summaryData.anomalies24h = summaryData.routeDrops24h +
+                                    summaryData.vrfsDisappeared24h;
+                                if (summaryData.totalRoutes === null) {
+                                    summaryData.unavailable = true;
+                                    summaryData.coveragePartial = true;
+                                }
+                                if (summaryData.devicesStale > 0) {
+                                    summaryData.coveragePartial = true;
+                                }
+                            } else {
+                                summaryData.devicesExpected = attrNumber('data-devices-expected');
+                                summaryData.devicesCovered = attrNumber('data-devices-covered');
+                                summaryData.linksChecked = attrNumber('data-links-checked');
+                                summaryData.mtuMismatches = attrNumber('data-mtu-mismatches') || 0;
+                                summaryData.speedMismatches = attrNumber('data-speed-mismatches') || 0;
+                                summaryData.configMtuMismatches = attrNumber('data-config-mtu-mismatches') || 0;
+                                summaryData.findingsTotal = attrNumber('data-findings-total') || 0;
+                                if (summaryData.linksChecked === null) {
+                                    summaryData.unavailable = true;
+                                    summaryData.coveragePartial = true;
+                                }
+                            }
                         }
                         const requiredTotal = dataType === 'bgp'
                             ? summaryData.totalNeighbors
@@ -2210,7 +2406,8 @@
                 // Fetch data directly from raw data files
                 const [assetsData, lldpData, bgpData, evpnData, evpnMhData,
                     opticalData, berData, pfcData, flapData, hardwareData,
-                    logData, dupData] = await Promise.all([
+                    logData, dupData, configDriftData, routesData,
+                    fabricCheckData] = await Promise.all([
                     fetchRawDataSummary('assets', pipelineState),
                     fetchRawDataSummary('lldp', pipelineState),
                     fetchRawDataSummary('bgp', pipelineState),
@@ -2222,7 +2419,10 @@
                     fetchRawDataSummary('flap', pipelineState),
                     fetchRawDataSummary('hardware', pipelineState),
                     fetchRawDataSummary('log', pipelineState),
-                    fetchRawDataSummary('duplicate', pipelineState)
+                    fetchRawDataSummary('duplicate', pipelineState),
+                    fetchRawDataSummary('config-drift', pipelineState),
+                    fetchRawDataSummary('routes', pipelineState),
+                    fetchRawDataSummary('fabric-check', pipelineState)
                 ]);
                 // A directory publication can happen while the browser has
                 // several report requests in flight. Accept the batch only if
@@ -2428,6 +2628,56 @@
                         : 'Confirmed simultaneous MAC conflicts; mobility and DAD evidence are shown separately in the report';
                 }
 
+                updateDashboardCard('cd-devices', dashboardMetric(
+                    configDriftData, configDriftData.devicesWithConfig
+                ));
+                updateDashboardCard('cd-changed-24h', dashboardMetric(
+                    configDriftData, configDriftData.changed24h
+                ));
+                updateDashboardCard('cd-changed-7d', dashboardMetric(
+                    configDriftData, configDriftData.changed7d
+                ));
+                updateDashboardCard('cd-missing', dashboardMetric(
+                    configDriftData, configDriftData.devicesMissing
+                ));
+
+                updateDashboardCard('routes-total', dashboardMetric(
+                    routesData, routesData.totalRoutes
+                ));
+                updateDashboardCard('routes-vrfs', dashboardMetric(
+                    routesData, routesData.vrfCount
+                ));
+                updateDashboardCard('routes-anomalies', dashboardMetric(
+                    routesData, routesData.anomalies24h
+                ));
+                setDashboardProblemSeverity(
+                    'routes-anomalies', routesData, routesData.anomalies24h, 0
+                );
+                updateDashboardCard('routes-stale', dashboardMetric(
+                    routesData, routesData.devicesStale
+                ));
+
+                updateDashboardCard('fc-links', dashboardMetric(
+                    fabricCheckData, fabricCheckData.linksChecked
+                ));
+                updateDashboardCard('fc-mtu-mismatch', dashboardMetric(
+                    fabricCheckData, fabricCheckData.mtuMismatches
+                ));
+                setDashboardProblemSeverity(
+                    'fc-mtu-mismatch', fabricCheckData,
+                    fabricCheckData.mtuMismatches, 0
+                );
+                updateDashboardCard('fc-speed-mismatch', dashboardMetric(
+                    fabricCheckData, fabricCheckData.speedMismatches
+                ));
+                setDashboardProblemSeverity(
+                    'fc-speed-mismatch', fabricCheckData,
+                    fabricCheckData.speedMismatches, 0
+                );
+                updateDashboardCard('fc-config-mismatch', dashboardMetric(
+                    fabricCheckData, fabricCheckData.configMtuMismatches
+                ));
+
                 // Calculate overall network statistics
                 const totalDevices = Number.isFinite(Number(assetsData.totalDevices))
                     ? Number(assetsData.totalDevices)
@@ -2438,7 +2688,8 @@
                 };
                 const nonDuplicateReports = [assetsData, lldpData, bgpEvpnState,
                     evpnMhData, opticalData, berData, pfcData, flapData,
-                    hardwareData, logData];
+                    hardwareData, logData, configDriftData, routesData,
+                    fabricCheckData];
                 const analysisReports = [...nonDuplicateReports, dupData];
                 const unavailableAnalyses = analysisReports.filter(data =>
                     !data || data.unavailable
@@ -2454,7 +2705,7 @@
                 // of only showing a count. (bgpEvpnState combines bgp+evpn.)
                 const nonDuplicateReportNames = ['assets', 'lldp', 'bgp/evpn',
                     'evpn-mh', 'optical', 'ber', 'pfc-ecn', 'flap', 'hardware',
-                    'log'];
+                    'log', 'config-drift', 'routes', 'fabric-check'];
                 const partialDomainNames = nonDuplicateReports
                     .map((data, i) => (data && !data.unavailable && data.coveragePartial)
                         ? nonDuplicateReportNames[i] : null)
@@ -2512,6 +2763,11 @@
                 'Quiesced IP Duplicates': dupData.quiescedIp || 0,
                 'Confirmed MAC Conflicts': dupData.confirmedMacConflicts || 0,
                 'Duplicate Coverage Partial': (!dupData.unavailable && dupData.coveragePartial) ? 1 : 0,
+                'Config Drift (24h)': configDriftData.changed24h || 0,
+                'Route Anomalies (24h)': routesData.anomalies24h || 0,
+                'MTU Mismatches': fabricCheckData.mtuMismatches || 0,
+                'Speed Mismatches': fabricCheckData.speedMismatches || 0,
+                'Config vs Running MTU': fabricCheckData.configMtuMismatches || 0,
                 'Partial Analyses': otherPartialAnalyses,
                 'Unavailable Analyses': unavailableAnalyses,
                 'Pipeline Not Current': pipelineNotCurrent ? 1 : 0
@@ -2527,7 +2783,8 @@
                 'Optical Critical', 'BER Critical', 'PFC Discarding Ports',
                 'Link Flap Critical',
                 'Hardware Critical', 'Log Critical', 'Active IP Duplicates',
-                'Confirmed MAC Conflicts'
+                'Confirmed MAC Conflicts',
+                'Route Anomalies (24h)', 'MTU Mismatches', 'Speed Mismatches'
             ]);
             // Name which domains drive the aggregate partial/unavailable rows so
             // the operator does not have to guess which analysis is affected.

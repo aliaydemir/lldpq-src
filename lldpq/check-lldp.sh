@@ -874,6 +874,31 @@ execute_commands_optimized() {
             fi
         done | sort -V
         echo '===PORT_SPEED_END==='
+
+        # Port MTU. Same physical-interface selection as the status section.
+        # MTU is reported for down ports too; link-consistency analysis needs
+        # both ends regardless of carrier.
+        echo ''
+        echo '===PORT_MTU_START==='
+        for port in /sys/class/net/*; do
+            [ -d \"\$port\" ] || continue
+            port_name=\$(basename \"\$port\")
+            case \"\$port_name\" in
+                lo|eth0|mgmt*|docker*|veth*|virbr*|br-*|cni*|flannel*|\
+                vxlan*|vni*|vrf*|dummy*|tun*|tap*) continue ;;
+            esac
+            if [ ! -e \"\$port/device\" ]; then
+                case \"\$port_name\" in
+                    swp*) ;;
+                    *) continue ;;
+                esac
+            fi
+            mtu=\$(cat \"\$port/mtu\" 2>/dev/null || echo '0')
+            if [ \"\$mtu\" -gt 0 ] 2>/dev/null; then
+                echo \"\$port_name \$mtu\"
+            fi
+        done | sort -V
+        echo '===PORT_MTU_END==='
         echo ''
     " > "$temporary_file" 2>/dev/null &&
        ! grep -q '__LLDPQ_LLDP_COLLECTION_ERROR__' "$temporary_file" &&

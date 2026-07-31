@@ -95,6 +95,19 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "device", "severity", "age", "timestamp", "section",
         "message",
     ),
+    "config-drift": (
+        "detected_at", "device", "change_type", "lines_added",
+        "lines_removed", "collected_at", "summary",
+    ),
+    "routes": (
+        "device", "vrf", "status", "routes_total", "routes_delta",
+        "bgp_routes", "kernel_routes", "static_routes", "other_routes",
+        "ecmp_routes", "max_ecmp_width", "arp_entries", "note",
+    ),
+    "fabric-check": (
+        "check", "severity", "device_a", "port_a", "value_a",
+        "device_b", "port_b", "value_b", "detail",
+    ),
     "transceiver": (
         "device", "port", "identifier", "vendor", "part_number", "serial",
         "vendor_rev", "connector", "fw_version", "cable_byte130", "fw_status",

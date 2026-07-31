@@ -123,6 +123,29 @@ cd lldpq-src
 - **system logs**: critical/error/warning/info counts with current-device
   coverage and per-device findings
 - **topology validation**: lldp neighbor verification against expected topology
+- **config drift**: change tracking over the collected `nv config show -o
+  commands` exports. get-conf keeps only the current file per device, so the
+  analyzer maintains its own per-device baseline copy, diffs every new
+  collection against it, and records drift events (detected time, +/- line
+  counts, capped unified-diff excerpt; 90-day retention). The first sighting
+  of a device establishes its baseline silently, and unreachable devices keep
+  their last-known-good file, so collection failures never appear as drift.
+- **routes**: per-device / per-VRF route-table metrics derived from the
+  fabric-scan kernel snapshots (`ip route`, per VRF): totals, protocol
+  breakdown (bgp/kernel/static/other), ECMP route count and widest nexthop
+  group, plus per-VRF ARP counts. A compact per-device history shard drives
+  delta columns; sudden drops (>20% loss on tables with >=50 routes between
+  consecutive samples) and VRFs that disappear while a device is still
+  reporting are flagged as anomalies (30-day event log).
+- **fabric check**: link-level consistency between LLDP-connected neighbor
+  ports. Running MTU and negotiated speed are captured per port (sysfs, zero
+  extra SSH) during the LLDP stage and published in the neighbor sidecar;
+  the analyzer joins both ends of every observed link between managed devices
+  and flags MTU mismatches and speed mismatches (critical), plus ports whose
+  running MTU differs from their explicit configured `link mtu` (warning,
+  NVUE ranges like `swp1-48` are expanded; platform defaults are never
+  inferred). An informational fabric-wide MTU distribution table makes
+  outliers obvious.
 
 ### PFC/ECN report
 
@@ -536,6 +559,9 @@ publish; use the index when that state is expected.
 | `/pfc-ecn/export_json`, `/pfc-ecn/export_csv` | JSON / CSV | Atomic monitor artifact | Per-port traffic signal/delta/rate data |
 | `/hardware/export_json`, `/hardware/export_csv` | JSON / CSV | Atomic monitor artifact | Per-device platform health |
 | `/log/export_json`, `/log/export_csv` | JSON / CSV | Atomic monitor artifact | Current normalized log findings |
+| `/config-drift/export_json`, `/config-drift/export_csv` | JSON / CSV | Atomic monitor artifact | Recent config drift events (detected time, +/- line counts) |
+| `/routes/export_json`, `/routes/export_csv` | JSON / CSV | Atomic monitor artifact | Per device/VRF route-table metrics and anomaly notes |
+| `/fabric-check/export_json`, `/fabric-check/export_csv` | JSON / CSV | Atomic monitor artifact | MTU/speed/config consistency findings per link/port |
 | `/transceiver/export_json`, `/transceiver/export_csv` | JSON / CSV | Atomic transceiver-scan artifact | Firmware/vendor/part/serial inventory |
 | `/ai/export_json` | JSON only | Verbatim current `analysis.json` | Latest autonomous/manual persisted report; `analysis` is Markdown and must be checked for a non-empty value |
 

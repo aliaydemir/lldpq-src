@@ -101,7 +101,10 @@
         ber: true,
         'pfc-ecn': true,
         hardware: true,
-        logs: true
+        logs: true,
+        'config-drift': true,
+        routes: true,
+        'fabric-check': true
     };
 
     function requireAnalysisScope(scope) {
@@ -269,7 +272,10 @@
         'ber-analysis.html': { scope: 'ber', label: 'BER' },
         'pfc-ecn-analysis.html': { scope: 'pfc-ecn', label: 'PFC/ECN' },
         'hardware-analysis.html': { scope: 'hardware', label: 'hardware' },
-        'log-analysis.html': { scope: 'logs', label: 'system log' }
+        'log-analysis.html': { scope: 'logs', label: 'system log' },
+        'config-drift-analysis.html': { scope: 'config-drift', label: 'config drift' },
+        'routes-analysis.html': { scope: 'routes', label: 'routes' },
+        'fabric-check-analysis.html': { scope: 'fabric-check', label: 'fabric check' }
     };
 
     function currentAnalysisPage() {

@@ -100,6 +100,7 @@ read_trigger_timestamp() {
 monitor_scope_valid() {
     case "${1-}" in
         all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs) return 0 ;;
+        config-drift|routes|fabric-check) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -128,6 +129,9 @@ read_monitor_trigger_request() {
             7) MONITOR_REQUEST_SCOPE=hardware ;;
             8) MONITOR_REQUEST_SCOPE=logs ;;
             9) MONITOR_REQUEST_SCOPE=evpn-mh ;;
+            10) MONITOR_REQUEST_SCOPE=config-drift ;;
+            11) MONITOR_REQUEST_SCOPE=routes ;;
+            12) MONITOR_REQUEST_SCOPE=fabric-check ;;
             *) return 1 ;;
         esac
     fi

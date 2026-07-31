@@ -59,6 +59,9 @@ case "$TRIGGER_SCOPE" in
     pfc-ecn) SCOPE_CODE=6 ;;
     hardware) SCOPE_CODE=7 ;;
     logs) SCOPE_CODE=8 ;;
+    config-drift) SCOPE_CODE=10 ;;
+    routes) SCOPE_CODE=11 ;;
+    fabric-check) SCOPE_CODE=12 ;;
     *)
         echo '{"status":"error","message":"Unsupported analysis scope"}'
         exit 1

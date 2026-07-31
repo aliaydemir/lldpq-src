@@ -99,7 +99,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MONITOR_SCOPE" in
-    all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs) ;;
+    all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs|config-drift|routes|fabric-check) ;;
     "")
         echo "Error: --only requires a non-empty scope" >&2
         show_usage >&2
@@ -336,11 +336,16 @@ analysis_artifacts=(
     hardware-analysis.html
     log-analysis.html log_summary.json
     duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+    config-drift-analysis.html config_drift_history.json config-drift-data/
+    routes-analysis.html routes_events.json routes-history/
+    fabric-check-analysis.html
     summary/bgp-summary.json summary/evpn-summary.json
     summary/evpn-mh-summary.json summary/flap-summary.json
     summary/optical-summary.json summary/ber-summary.json
     summary/pfc-ecn-summary.json summary/hardware-summary.json
     summary/duplicate-summary.json
+    summary/config-drift-summary.json summary/routes-summary.json
+    summary/fabric-check-summary.json
     export/bgp.json export/bgp.csv
     export/evpn-mh.json export/evpn-mh.csv
     export/duplicate.json export/duplicate.csv
@@ -350,6 +355,9 @@ analysis_artifacts=(
     export/pfc-ecn.json export/pfc-ecn.csv
     export/hardware.json export/hardware.csv
     export/log.json export/log.csv
+    export/config-drift.json export/config-drift.csv
+    export/routes.json export/routes.csv
+    export/fabric-check.json export/fabric-check.csv
 )
 
 # A retained analyzer rollback snapshot can predate the PFC/ECN feature.  Keep
@@ -439,6 +447,37 @@ analysis_artifacts_legacy_v5=(
     summary/optical-summary.json summary/ber-summary.json
     summary/pfc-ecn-summary.json summary/hardware-summary.json
     summary/duplicate-summary.json
+)
+
+# Snapshot schema before the config-drift/routes/fabric-check analyzers.
+analysis_artifacts_legacy_v6=(
+    .lldpq-current.json
+    .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    .pipeline-inputs/collection_status.json
+    bgp-analysis.html bgp_history.json
+    evpn-mh-analysis.html
+    link-flap-analysis.html flap_history.json
+    optical-analysis.html optical_history.json
+    ber-analysis.html ber_history.json ber_baseline.json
+    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+    pfc-ecn-history/
+    hardware-analysis.html
+    log-analysis.html log_summary.json
+    duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+    summary/bgp-summary.json summary/evpn-summary.json
+    summary/evpn-mh-summary.json summary/flap-summary.json
+    summary/optical-summary.json summary/ber-summary.json
+    summary/pfc-ecn-summary.json summary/hardware-summary.json
+    summary/duplicate-summary.json
+    export/bgp.json export/bgp.csv
+    export/evpn-mh.json export/evpn-mh.csv
+    export/duplicate.json export/duplicate.csv
+    export/flap.json export/flap.csv
+    export/optical.json export/optical.csv
+    export/ber.json export/ber.csv
+    export/pfc-ecn.json export/pfc-ecn.csv
+    export/hardware.json export/hardware.csv
+    export/log.json export/log.csv
 )
 
 snapshot_analysis_state() {
@@ -666,6 +705,7 @@ validate_analysis_backup_manifest() {
     local status relative extra expected expected_artifact backup count=0 valid=true
     local current_schema=true legacy_schema_v1=true legacy_schema_v2=true
     local legacy_schema_v3=true legacy_schema_v4=true legacy_schema_v5=true
+    local legacy_schema_v6=true
     local -A seen=()
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
 
@@ -726,9 +766,14 @@ validate_analysis_backup_manifest() {
     for expected_artifact in "${analysis_artifacts_legacy_v5[@]}"; do
         [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v5=false
     done
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v6[@]}" ]] || legacy_schema_v6=false
+    for expected_artifact in "${analysis_artifacts_legacy_v6[@]}"; do
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v6=false
+    done
     [[ "$current_schema" == "true" || "$legacy_schema_v1" == "true" ||
        "$legacy_schema_v2" == "true" || "$legacy_schema_v3" == "true" ||
-       "$legacy_schema_v4" == "true" || "$legacy_schema_v5" == "true" ]]
+       "$legacy_schema_v4" == "true" || "$legacy_schema_v5" == "true" ||
+       "$legacy_schema_v6" == "true" ]]
 }
 
 commit_analysis_state() {
@@ -1414,6 +1459,28 @@ select_scope_web_overlays() {
             SCOPE_WEB_OVERLAYS=(
                 log-analysis.html log_summary.json log-data
                 export/log.json export/log.csv
+            )
+            ;;
+        config-drift)
+            SCOPE_WEB_OVERLAYS=(
+                config-drift-analysis.html config_drift_history.json
+                config-drift-data
+                summary/config-drift-summary.json
+                export/config-drift.json export/config-drift.csv
+            )
+            ;;
+        routes)
+            SCOPE_WEB_OVERLAYS=(
+                routes-analysis.html routes_events.json routes-history
+                summary/routes-summary.json
+                export/routes.json export/routes.csv
+            )
+            ;;
+        fabric-check)
+            SCOPE_WEB_OVERLAYS=(
+                fabric-check-analysis.html
+                summary/fabric-check-summary.json
+                export/fabric-check.json export/fabric-check.csv
             )
             ;;
         *)
@@ -4438,26 +4505,40 @@ validate_analysis_outputs() {
                 ber-analysis.html ber_history.json ber_baseline.json
                 hardware-analysis.html
                 log-analysis.html log_summary.json
+                config-drift-analysis.html config_drift_history.json
+                config-drift-data/
+                routes-analysis.html routes_events.json routes-history/
+                fabric-check-analysis.html
                 summary/bgp-summary.json summary/evpn-summary.json
                 summary/flap-summary.json
                 summary/ber-summary.json
                 summary/hardware-summary.json
+                summary/config-drift-summary.json summary/routes-summary.json
+                summary/fabric-check-summary.json
                 export/bgp.json export/bgp.csv
                 export/flap.json export/flap.csv
                 export/ber.json export/ber.csv
                 export/hardware.json export/hardware.csv
                 export/log.json export/log.csv
+                export/config-drift.json export/config-drift.csv
+                export/routes.json export/routes.csv
+                export/fabric-check.json export/fabric-check.csv
             )
             json_files=(
                 bgp_history.json flap_history.json ber_history.json ber_baseline.json
                 log_summary.json
+                config_drift_history.json routes_events.json routes-history/
                 summary/bgp-summary.json summary/evpn-summary.json
                 summary/flap-summary.json
                 summary/ber-summary.json
                 summary/hardware-summary.json
+                summary/config-drift-summary.json summary/routes-summary.json
+                summary/fabric-check-summary.json
                 export/bgp.json
                 export/flap.json export/ber.json
                 export/hardware.json export/log.json
+                export/config-drift.json export/routes.json
+                export/fabric-check.json
             )
             if [[ "$SKIP_OPTICAL" != "true" ]]; then
                 required+=(
@@ -4593,6 +4674,39 @@ validate_analysis_outputs() {
             )
             json_files=(log_summary.json export/log.json)
             ;;
+        config-drift)
+            required=(
+                config-drift-analysis.html config_drift_history.json
+                config-drift-data/
+                summary/config-drift-summary.json
+                export/config-drift.json export/config-drift.csv
+            )
+            json_files=(
+                config_drift_history.json
+                summary/config-drift-summary.json export/config-drift.json
+            )
+            ;;
+        routes)
+            required=(
+                routes-analysis.html routes_events.json routes-history/
+                summary/routes-summary.json
+                export/routes.json export/routes.csv
+            )
+            json_files=(
+                routes_events.json routes-history/
+                summary/routes-summary.json export/routes.json
+            )
+            ;;
+        fabric-check)
+            required=(
+                fabric-check-analysis.html
+                summary/fabric-check-summary.json
+                export/fabric-check.json export/fabric-check.csv
+            )
+            json_files=(
+                summary/fabric-check-summary.json export/fabric-check.json
+            )
+            ;;
         *)
             echo "No validation contract for scope: $MONITOR_SCOPE" >&2
             return 2
@@ -4652,6 +4766,15 @@ if scope_selected logs; then
 fi
 if scope_selected duplicate && [[ "$SKIP_DUPLICATE" != "true" ]]; then
     start_analysis duplicate python3 process_duplicate_data.py
+fi
+if scope_selected config-drift; then
+    start_analysis config-drift python3 process_config_drift_data.py
+fi
+if scope_selected routes; then
+    start_analysis routes python3 process_routes_data.py
+fi
+if scope_selected fabric-check; then
+    start_analysis fabric-check python3 process_fabric_check_data.py
 fi
 
 for index in "${!analysis_pids[@]}"; do

@@ -102,6 +102,29 @@ def snapshot_topology(source_path, destination_directory):
             pass
         raise
 
+def _parse_port_metric_section(content, marker):
+    """Parse ``<port> <positive-int>`` lines from the last marker block.
+
+    PORT_SPEED / PORT_MTU sections share this shape; devices that predate a
+    marker simply produce an empty map, so consumers must treat the metric as
+    best-effort.
+    """
+    values = {}
+    matches = re.findall(
+        rf'==={marker}_START===(.*?)==={marker}_END===', content, re.DOTALL)
+    if matches:
+        for line in matches[-1].strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    value = int(parts[-1])
+                except ValueError:
+                    continue
+                if value > 0:
+                    values[parts[0]] = value
+    return values
+
+
 def parse_lldp_output(filename, known_device_names=()):
     neighbors = []
     port_status = {}
@@ -137,20 +160,34 @@ def parse_lldp_output(filename, known_device_names=()):
                             status = 'UNKNOWN'
                         port_status[port_name] = status
 
-    return neighbors, port_status
+        port_speed = _parse_port_metric_section(content, 'PORT_SPEED')
+        port_mtu = _parse_port_metric_section(content, 'PORT_MTU')
+        port_attrs = {}
+        for port_name in set(port_speed) | set(port_mtu):
+            attrs = {}
+            if port_name in port_speed:
+                attrs['speed'] = port_speed[port_name]
+            if port_name in port_mtu:
+                attrs['mtu'] = port_mtu[port_name]
+            port_attrs[port_name] = attrs
+
+    return neighbors, port_status, port_attrs
 
 def get_device_neighbors(lldp_dir, known_device_names=()):
     device_neighbors = {}
     device_port_status = {}
+    device_port_attrs = {}
     files_in_order = sorted(os.listdir(lldp_dir))
     for filename in files_in_order:
         if filename.endswith("_lldp_result.ini"):
             device_name = filename.replace("_lldp_result.ini", "")
             filepath = os.path.join(lldp_dir, filename)
-            neighbors, port_status = parse_lldp_output(filepath, known_device_names)
+            neighbors, port_status, port_attrs = parse_lldp_output(
+                filepath, known_device_names)
             device_neighbors[device_name] = neighbors
             device_port_status[device_name] = port_status
-    return device_neighbors, device_port_status, files_in_order
+            device_port_attrs[device_name] = port_attrs
+    return device_neighbors, device_port_status, device_port_attrs, files_in_order
 
 def _neighbor_sort_key(neighbor, resolver):
     return (
@@ -188,13 +225,19 @@ def _group_neighbors(neighbors, resolver):
     return grouped
 
 
-def write_neighbors_sidecar(destination_path, device_neighbors, resolver, created_at):
+def write_neighbors_sidecar(destination_path, device_neighbors, resolver, created_at,
+                            device_port_status=None, device_port_attrs=None):
     """Serialize every observed LLDP neighbor for display enrichment.
 
     The wiring aggregate intentionally omits ports whose neighbor is an
     unmanaged endpoint host, so analysis pages (BER neighbor columns) consume
     this sidecar instead.  Best-effort artifact: it is not part of the
     rollback-capable wiring report transaction.
+
+    The additive top-level ``ports`` map carries per-port oper/speed/mtu for
+    every collected physical port (link-consistency analysis needs attributes
+    for both ends of a link, including ports without a chosen neighbor).
+    Existing ``neighbors`` consumers are unaffected.
     """
     neighbors = {}
     for device in sorted(device_neighbors, key=str.casefold):
@@ -214,7 +257,28 @@ def write_neighbors_sidecar(destination_path, device_neighbors, resolver, create
                 }
         if ports:
             neighbors[device] = ports
-    payload = {'version': 1, 'created': created_at, 'neighbors': neighbors}
+    device_port_status = device_port_status or {}
+    device_port_attrs = device_port_attrs or {}
+    port_details = {}
+    for device in sorted(set(device_port_status) | set(device_port_attrs),
+                         key=str.casefold):
+        status_map = device_port_status.get(device) or {}
+        attrs_map = device_port_attrs.get(device) or {}
+        ports = {}
+        for local_port in sorted(set(status_map) | set(attrs_map), key=port_key):
+            entry = {}
+            if local_port in status_map:
+                entry['oper'] = status_map[local_port]
+            for key in ('speed', 'mtu'):
+                value = (attrs_map.get(local_port) or {}).get(key)
+                if value is not None:
+                    entry[key] = value
+            if entry:
+                ports[local_port] = entry
+        if ports:
+            port_details[device] = ports
+    payload = {'version': 1, 'created': created_at, 'neighbors': neighbors,
+               'ports': port_details}
     directory = os.path.dirname(os.path.abspath(destination_path))
     descriptor, temporary_path = tempfile.mkstemp(
         prefix='.lldp_neighbors.json.', dir=directory
@@ -454,7 +518,8 @@ def main():
             for name in (edge.left_device, edge.right_device)
         )
         resolver = DeviceNameResolver(known_device_names)
-        device_neighbors, device_port_status, _files_in_order = get_device_neighbors(
+        (device_neighbors, device_port_status, device_port_attrs,
+         _files_in_order) = get_device_neighbors(
             input_folder, known_device_names
         )
         results = check_connections(
@@ -501,6 +566,7 @@ def main():
                 write_neighbors_sidecar(
                     os.path.join(input_folder, "lldp_neighbors.json"),
                     device_neighbors, resolver, date_str,
+                    device_port_status, device_port_attrs,
                 )
             except Exception as sidecar_exc:
                 print(f"Warning: could not stage LLDP neighbor sidecar: {sidecar_exc}")
@@ -549,6 +615,7 @@ def main():
             write_neighbors_sidecar(
                 os.path.join(lldp_results_folder, "lldp_neighbors.json"),
                 device_neighbors, resolver, date_str,
+                device_port_status, device_port_attrs,
             )
         except Exception as sidecar_exc:
             print(f"Warning: could not write LLDP neighbor sidecar: {sidecar_exc}")
