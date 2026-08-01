@@ -6,13 +6,16 @@ Link-level consistency checks between connected neighbor ports:
 
     mtu-mismatch          running MTU differs between the two ends of a link
     speed-mismatch        negotiated speed differs between the two ends
+    fec-mismatch          active FEC encoding differs between the two ends
+    autoneg-mismatch      auto-negotiation setting differs between the ends
     config-mtu-mismatch   a port's running MTU differs from its configured
                           NVUE `link mtu` value
 
 Data comes from the LLDP neighbor sidecar (lldp-results/lldp_neighbors.json),
-whose `ports` map carries per-port oper/speed/mtu collected via sysfs during
-the LLDP stage, and from the collected NVUE command exports
-($WEB_ROOT/configs/<host>.txt) for configured MTU.
+whose `ports` map carries per-port oper/speed/mtu (sysfs) plus best-effort
+fec/autoneg (ethtool, carrier-up ports) collected during the LLDP stage, and
+from the collected NVUE command exports ($WEB_ROOT/configs/<host>.txt) for
+configured MTU.
 
 Local-only analyzer: no remote collection of its own.
 
@@ -151,6 +154,19 @@ def format_speed(mbps):
     return "%dM" % mbps
 
 
+# Genuine active-FEC encodings as ethtool reports them (casefolded).  Values
+# outside this set — "Not-reported", vendor oddities — mean the driver did
+# not disclose the running encoding, and comparing them would fabricate
+# mismatches on links whose other end reports correctly.
+_COMPARABLE_FEC = frozenset(("rs", "llrs", "baser", "fc", "none", "off"))
+
+
+def _comparable_fec(value):
+    """Casefolded FEC encoding, or None when not genuinely comparable."""
+    token = str(value or "").casefold()
+    return token if token in _COMPARABLE_FEC else None
+
+
 class FabricCheckAnalyzer:
     def __init__(self, result_dir=RESULT_DIR, sidecar_path=None,
                  configs_dir=None, now=None):
@@ -166,6 +182,8 @@ class FabricCheckAnalyzer:
         self.links_checked = 0
         self.links_mtu_compared = 0
         self.links_speed_compared = 0
+        self.links_fec_compared = 0
+        self.links_autoneg_compared = 0
         self.ports_seen = 0
         self.ports_config_compared = 0
         self.devices_covered = set()
@@ -282,6 +300,41 @@ class FabricCheckAnalyzer:
                             "detail": "negotiated speed differs between link ends",
                         })
 
+                # FEC/autoneg are best-effort attributes (ethtool on
+                # carrier-up ports); the check only runs when both ends
+                # reported a genuinely comparable value.  Drivers that answer
+                # "Not-reported" (some host NICs) must not fabricate a
+                # mismatch against a switch that reports its real encoding.
+                local_fec = _comparable_fec(local_attrs.get("fec"))
+                remote_fec = _comparable_fec(remote_attrs.get("fec"))
+                if local_fec and remote_fec:
+                    self.links_fec_compared += 1
+                    if local_fec != remote_fec:
+                        self.findings.append({
+                            "check": "fec-mismatch", "severity": "critical",
+                            "device_a": device, "port_a": port,
+                            "value_a": str(local_attrs.get("fec")),
+                            "device_b": remote_device, "port_b": remote_port,
+                            "value_b": str(remote_attrs.get("fec")),
+                            "detail": "active FEC encoding differs between "
+                                      "link ends",
+                        })
+
+                local_an = str(local_attrs.get("autoneg") or "").casefold()
+                remote_an = str(remote_attrs.get("autoneg") or "").casefold()
+                if local_an in ("on", "off") and remote_an in ("on", "off"):
+                    self.links_autoneg_compared += 1
+                    if local_an != remote_an:
+                        self.findings.append({
+                            "check": "autoneg-mismatch", "severity": "warning",
+                            "device_a": device, "port_a": port,
+                            "value_a": local_an,
+                            "device_b": remote_device, "port_b": remote_port,
+                            "value_b": remote_an,
+                            "detail": "auto-negotiation setting differs "
+                                      "between link ends",
+                        })
+
         # ------------------------------------------------------------------
         # Configured vs running MTU (per managed port with an explicit
         # `link mtu` line in the collected NVUE command export)
@@ -334,7 +387,8 @@ class FabricCheckAnalyzer:
 
     def summary_counts(self):
         by_check = {"mtu-mismatch": 0, "speed-mismatch": 0,
-                    "config-mtu-mismatch": 0}
+                    "config-mtu-mismatch": 0,
+                    "fec-mismatch": 0, "autoneg-mismatch": 0}
         for finding in self.findings:
             by_check[finding["check"]] = by_check.get(finding["check"], 0) + 1
         return {
@@ -343,11 +397,15 @@ class FabricCheckAnalyzer:
             "links_checked": self.links_checked,
             "links_mtu_compared": self.links_mtu_compared,
             "links_speed_compared": self.links_speed_compared,
+            "links_fec_compared": self.links_fec_compared,
+            "links_autoneg_compared": self.links_autoneg_compared,
             "ports_seen": self.ports_seen,
             "ports_config_compared": self.ports_config_compared,
             "mtu_mismatches": by_check["mtu-mismatch"],
             "speed_mismatches": by_check["speed-mismatch"],
             "config_mtu_mismatches": by_check["config-mtu-mismatch"],
+            "fec_mismatches": by_check["fec-mismatch"],
+            "autoneg_mismatches": by_check["autoneg-mismatch"],
             "findings_total": len(self.findings),
         }
 
@@ -384,11 +442,14 @@ class FabricCheckAnalyzer:
             ' data-mtu-mismatches="%d"'
             ' data-speed-mismatches="%d"'
             ' data-config-mtu-mismatches="%d"'
+            ' data-fec-mismatches="%d"'
+            ' data-autoneg-mismatches="%d"'
             ' data-findings-total="%d" style="display:none"></div>'
         ) % (
             status, counts["devices_expected"], counts["devices_covered"],
             counts["links_checked"], counts["mtu_mismatches"],
             counts["speed_mismatches"], counts["config_mtu_mismatches"],
+            counts["fec_mismatches"], counts["autoneg_mismatches"],
             counts["findings_total"],
         )
 
@@ -432,6 +493,12 @@ class FabricCheckAnalyzer:
             ("card-critical" if counts["speed_mismatches"] else
              "card-excellent", counts["speed_mismatches"],
              "SPEED MISMATCHES", "speed"),
+            ("card-critical" if counts["fec_mismatches"] else
+             "card-excellent", counts["fec_mismatches"],
+             "FEC MISMATCHES", "fec"),
+            ("card-warning" if counts["autoneg_mismatches"] else
+             "card-excellent", counts["autoneg_mismatches"],
+             "AUTONEG MISMATCHES", "autoneg"),
             ("card-warning" if counts["config_mtu_mismatches"] else
              "card-excellent", counts["config_mtu_mismatches"],
              "CONFIG &ne; RUNNING MTU", "config"),
@@ -456,6 +523,8 @@ class FabricCheckAnalyzer:
             check_label = {
                 "mtu-mismatch": "MTU mismatch",
                 "speed-mismatch": "Speed mismatch",
+                "fec-mismatch": "FEC mismatch",
+                "autoneg-mismatch": "Autoneg mismatch",
                 "config-mtu-mismatch": "Config &ne; running MTU",
             }.get(finding["check"], html.escape(finding["check"]))
             devices_attr = " ".join(
@@ -757,7 +826,7 @@ function showAllRows(){
 function cardFilter(kind, card){
   document.querySelectorAll('.summary-card').forEach(function(c){ c.classList.remove('active'); });
   if(card) card.classList.add('active');
-  var checkMap={mtu:'mtu-mismatch', speed:'speed-mismatch', config:'config-mtu-mismatch'};
+  var checkMap={mtu:'mtu-mismatch', speed:'speed-mismatch', fec:'fec-mismatch', autoneg:'autoneg-mismatch', config:'config-mtu-mismatch'};
   var target=checkMap[kind];
   if(!target){ return; }
   Array.prototype.slice.call(document.querySelectorAll('#fct tbody tr')).forEach(function(r){
@@ -846,7 +915,7 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260716-tf-3"></script>
+<script src="/css/table-filter.js?v=20260801-tf-4"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

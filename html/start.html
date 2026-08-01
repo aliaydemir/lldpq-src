@@ -2127,9 +2127,14 @@
                     // BGP, EVPN-MH, BER, PFC/ECN and Link Flap expose report-level
                     // summary contracts. Re-counting rendered rows loses unavailable,
                     // baseline, reset and status-precedence semantics.
-                    // EVPN-MH and PFC/ECN can be disabled per-run via lldpq.conf;
-                    // the card dataType 'pfc' maps to the manifest label 'pfc-ecn'.
-                    const manifestSkipName = { 'evpn-mh': 'evpn-mh', 'pfc': 'pfc-ecn' }[dataType];
+                    // EVPN-MH, PFC/ECN and the local analyzers (config-drift,
+                    // routes, fabric-check) can be disabled per-run via
+                    // lldpq.conf; the card dataType 'pfc' maps to 'pfc-ecn'.
+                    const manifestSkipName = {
+                        'evpn-mh': 'evpn-mh', 'pfc': 'pfc-ecn',
+                        'config-drift': 'config-drift', 'routes': 'routes',
+                        'fabric-check': 'fabric-check'
+                    }[dataType];
                     if (manifestSkipName &&
                         pipelineState.manifest.skipped.includes(manifestSkipName)) {
                         return { skipped: true, unavailable: false, coveragePartial: false };

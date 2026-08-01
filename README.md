@@ -148,13 +148,16 @@ cd lldpq-src
   reporting are flagged as anomalies (30-day event log).
 - **fabric check**: link-level consistency between LLDP-connected neighbor
   ports. Running MTU and negotiated speed are captured per port (sysfs, zero
-  extra SSH) during the LLDP stage and published in the neighbor sidecar;
-  the analyzer joins both ends of every observed link between managed devices
-  and flags MTU mismatches and speed mismatches (critical), plus ports whose
-  running MTU differs from their explicit configured `link mtu` (warning,
-  NVUE ranges like `swp1-48` are expanded; platform defaults are never
-  inferred). An informational fabric-wide MTU distribution table makes
-  outliers obvious.
+  extra SSH) during the LLDP stage and published in the neighbor sidecar,
+  along with best-effort active FEC encoding and auto-negotiation state
+  (read-only ethtool queries on carrier-up ports); the analyzer joins both
+  ends of every observed link between managed devices and flags MTU, speed
+  and FEC mismatches (critical) and autoneg mismatches (warning), plus ports
+  whose running MTU differs from their explicit configured `link mtu`
+  (warning, NVUE ranges like `swp1-48` are expanded; platform defaults are
+  never inferred). Drivers that do not disclose their active FEC
+  ("Not-reported") are skipped instead of fabricating mismatches. An
+  informational fabric-wide MTU distribution table makes outliers obvious.
 
 ### PFC/ECN report
 
@@ -1436,7 +1439,10 @@ unavailable or its collection fails.
 
 **Analyzer skip toggles:** `SKIP_DUPLICATE=true`, `SKIP_EVPN_MH=true` and
 `SKIP_PFC_ECN=true` disable the corresponding monitor sub-collection and
-analyzer the same way `SKIP_OPTICAL` does. The run manifest records them under
+analyzer the same way `SKIP_OPTICAL` does. `SKIP_CONFIG_DRIFT=true`,
+`SKIP_ROUTES=true` and `SKIP_FABRIC_CHECK=true` disable the local-only
+analyzers (they collect nothing over SSH, so the toggles only skip the
+analysis itself). The run manifest records them under
 `skipped`, the dashboard card shows the analysis as skipped, the report page
 is replaced by a "skipped" placeholder, and alert summaries state "Skipped by
 configuration". Scoped re-runs (`monitor.sh --only <name>`) refuse a disabled

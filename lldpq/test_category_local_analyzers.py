@@ -70,6 +70,18 @@ class CategoryLocalAnalyzerTests(unittest.TestCase):
         (result_dir / "ber_baseline.json").write_text(json.dumps(baseline))
         return baseline
 
+    @staticmethod
+    def _read_ber_state(result_dir):
+        """Merged history/current view over the per-device BER shards."""
+        merged = {"ber_history": {}, "current_ber_stats": {}}
+        shard_dir = result_dir / "ber-history"
+        if shard_dir.is_dir():
+            for path in sorted(shard_dir.glob("*.json")):
+                shard = json.loads(path.read_text())
+                merged["ber_history"].update(shard.get("history", {}))
+                merged["current_ber_stats"].update(shard.get("current", {}))
+        return merged
+
     def test_bgp_and_evpn_markers_publish_unavailable_coverage(self):
         result_dir = self._result_tree()
         bgp_dir = result_dir / "bgp-data"
@@ -198,7 +210,7 @@ class CategoryLocalAnalyzerTests(unittest.TestCase):
         self.assertIn('data-coverage-status="partial"', report)
         self.assertIn('data-coverage-current="0"', report)
         self.assertIn('data-coverage-expected="1"', report)
-        saved = json.loads((result_dir / "ber_history.json").read_text())
+        saved = self._read_ber_state(result_dir)
         self.assertEqual(saved["current_ber_stats"], {})
 
     def test_ber_marker_clears_preloaded_current_but_preserves_history_baseline(self):
@@ -220,7 +232,7 @@ class CategoryLocalAnalyzerTests(unittest.TestCase):
             success = process_ber_data.process_ber_data_files(str(ber_dir))
 
         self.assertTrue(success)
-        saved = json.loads((result_dir / "ber_history.json").read_text())
+        saved = self._read_ber_state(result_dir)
         self.assertEqual(saved["current_ber_stats"], {})
         self.assertIn("leaf1:swp99", saved["ber_history"])
         self.assertEqual(
@@ -246,7 +258,7 @@ class CategoryLocalAnalyzerTests(unittest.TestCase):
             success = process_ber_data.process_ber_data_files(str(ber_dir))
 
         self.assertTrue(success)
-        saved = json.loads((result_dir / "ber_history.json").read_text())
+        saved = self._read_ber_state(result_dir)
         self.assertEqual(saved["current_ber_stats"], {})
         self.assertIn("leaf1:swp99", saved["ber_history"])
         report = (result_dir / "ber-analysis.html").read_text()

@@ -861,6 +861,14 @@ def _pfc_history_source(monitor_dir: Path, web_root: Optional[Path]) -> Path:
     return _source_path(monitor_dir, web_root, "pfc_ecn_history.json")
 
 
+def _ber_history_source(monitor_dir: Path, web_root: Optional[Path]) -> Path:
+    """Same shard-first resolution for the BER history."""
+    shard_dir = _source_path(monitor_dir, web_root, "ber-history")
+    if shard_dir.is_dir():
+        return shard_dir
+    return _source_path(monitor_dir, web_root, "ber_history.json")
+
+
 def _mark_stream_limits(
     record: Dict[str, Any], state: _HistoryStreamState
 ) -> Dict[str, Any]:
@@ -1348,9 +1356,28 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
                     ))
             previous = current
 
-    load_status, stream_state = _stream_history(
-        path, "ber_history", (), consume_series
-    )
+    # The BER history is sharded per device (one JSON document per host
+    # under ber-history/); a plain file is the pre-shard monolith.
+    if path.is_dir():
+        stream_state = _HistoryStreamState()
+        load_status = "loaded"
+        for shard in sorted(path.glob("*.json")):
+            shard_status, shard_state = _stream_history(
+                shard, "history", (), consume_series
+            )
+            for flag in (
+                "truncated", "invalid_series", "oversized_series",
+                "series_truncated", "samples_truncated", "decode_limit_reached",
+            ):
+                if getattr(shard_state, flag, False):
+                    setattr(stream_state, flag, True)
+            if shard_status != "loaded":
+                load_status = shard_status
+                break
+    else:
+        load_status, stream_state = _stream_history(
+            path, "ber_history", (), consume_series
+        )
     if load_status != "loaded":
         failure = _coverage(
             "ber", load_status, 0, 0, None, start,
@@ -1776,7 +1803,7 @@ def build_timeline(
     jobs = [
         ("bgp", _extract_bgp, _source_path(monitor, web, "bgp_history.json")),
         ("optical", _extract_optical, _source_path(monitor, web, "optical_history.json")),
-        ("ber", _extract_ber, _source_path(monitor, web, "ber_history.json")),
+        ("ber", _extract_ber, _ber_history_source(monitor, web)),
         ("flaps", _extract_flaps, _source_path(monitor, web, "flap_history.json")),
         ("pfc_ecn", _extract_congestion, _pfc_history_source(monitor, web)),
     ]

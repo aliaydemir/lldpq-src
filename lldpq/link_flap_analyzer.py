@@ -20,6 +20,14 @@ from enum import Enum
 from typing import Dict, List, Any, Optional, NamedTuple
 from dataclasses import dataclass, asdict
 
+# At fabric scale a single synchronous <tbody> freezes the tab; only rows
+# that need eyes render inline, quiet rows hydrate in chunks after first
+# paint (process_pfc_ecn_data.py established the pattern and the sentinel
+# contract — dynamic row values are HTML-escaped, so the sentinel can never
+# occur within row content).
+DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
+INLINE_ROW_CAP = 5000
+
 try:
     import yaml
 except Exception:
@@ -967,6 +975,7 @@ class LinkFlapAnalyzer:
                 <span id="filter-text"></span>
                 <button onclick="clearFilter()">Show All</button>
             </div>
+            <div id="hydration-progress" class="filter-info" style="display:none"><span id="hydration-progress-text"></span></div>
             <table class="flap-table" id="flap-table">
                 <thead>
                 <tr>
@@ -985,8 +994,13 @@ class LinkFlapAnalyzer:
                 <tbody id="flap-data">
 """
         
-        # Build table rows using list for O(n) performance instead of O(n²) string concat
+        # Build table rows using list for O(n) performance instead of O(n²) string concat.
+        # Quiet (status ok) rows are deferred into an inert payload the page
+        # hydrates in chunks after first paint; the search dropdown is fed a
+        # complete device list so it never misses still-hydrating devices.
         table_rows = []
+        deferred_rows = []
+        device_names = {}
         for port in all_ports:
             # Badge class based on status
             status_val = port['status']
@@ -1011,7 +1025,8 @@ class LinkFlapAnalyzer:
             dashboard_status = "ok" if status_val == "ok" else "problematic"
             device_key = html.escape(str(port['device']), quote=True)
             port_key = html.escape(f"{port['device']}:{port['interface']}", quote=True)
-            table_rows.append(f"""
+            device_names.setdefault(str(port['device']), canonical(port['device']))
+            (table_rows if dashboard_status != "ok" else deferred_rows).append(f"""
         <tr class="flap-row" data-device-key="{device_key}" data-status="{dashboard_status}" data-flap-status="{status_val}" data-port-key="{port_key}" onclick="toggleFlapDetails(this)">
             <td>{canonical(port['device'])}</td>
             <td>{port['interface']}</td>
@@ -1025,9 +1040,15 @@ class LinkFlapAnalyzer:
             <td data-value="{port['total_transitions']}"><span class="{transition_class}">{port['total_transitions']}</span></td>
         </tr>""")
         
+        # A pathological fabric can put >cap rows in the attention set; keep
+        # first paint bounded by deferring the overflow ahead of quiet rows.
+        if len(table_rows) > INLINE_ROW_CAP:
+            deferred_rows = table_rows[INLINE_ROW_CAP:] + deferred_rows
+            table_rows = table_rows[:INLINE_ROW_CAP]
+
         # Empty-state placeholder that distinguishes healthy-empty from a
         # broken/partial collection, instead of bare headers over a blank body.
-        if not table_rows:
+        if not table_rows and not deferred_rows:
             if coverage_status == "unavailable":
                 empty_message = (
                     "No current carrier-transition data was collected. Device "
@@ -1048,12 +1069,22 @@ class LinkFlapAnalyzer:
 
         html_content += ''.join(table_rows)
 
-        html_content += """
+        deferred_script = (
+            f'<script type="text/html" id="flap-deferred-rows" '
+            f'data-count="{len(deferred_rows)}">'
+            + DEFERRED_ROW_SENTINEL.join(deferred_rows)
+            + '</script>'
+        ) if deferred_rows else ''
+
+        html_content += f"""
                 </tbody>
             </table>
         </div>
     </div>
+    {deferred_script}
+"""
 
+        html_content += """
     <div class="dashboard-section">
         <div class="section-header">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12,15.5A3.5,3.5 0 0,1 8.5,12A3.5,3.5 0 0,1 12,8.5A3.5,3.5 0 0,1 15.5,12A3.5,3.5 0 0,1 12,15.5M19.43,12.97C19.47,12.65 19.5,12.33 19.5,12C19.5,11.67 19.47,11.34 19.43,11L21.54,9.37C21.73,9.22 21.78,8.95 21.66,8.73L19.66,5.27C19.54,5.05 19.27,4.96 19.05,5.05L16.56,6.05C16.04,5.66 15.5,5.32 14.87,5.07L14.5,2.42C14.46,2.18 14.25,2 14,2H10C9.75,2 9.54,2.18 9.5,2.42L9.13,5.07C8.5,5.32 7.96,5.66 7.44,6.05L4.95,5.05C4.73,4.96 4.46,5.05 4.34,5.27L2.34,8.73C2.21,8.95 2.27,9.22 2.46,9.37L4.57,11C4.53,11.34 4.5,11.67 4.5,12C4.5,12.33 4.53,12.65 4.57,12.97L2.46,14.63C2.27,14.78 2.21,15.05 2.34,15.27L4.34,18.73C4.46,18.95 4.73,19.03 4.95,18.95L7.44,17.94C7.96,18.34 8.5,18.68 9.13,18.93L9.5,21.58C9.54,21.82 9.75,22 10,22H14C14.25,22 14.46,21.82 14.5,21.58L14.87,18.93C15.5,18.67 16.04,18.34 16.56,17.94L19.05,18.95C19.27,19.03 19.54,18.95 19.66,18.73L21.66,15.27C21.78,15.05 21.73,14.78 21.54,14.63L19.43,12.97Z"/></svg>
@@ -1082,10 +1113,14 @@ class LinkFlapAnalyzer:
     <script>
         // Filter functionality
         const FLAP_DETAILS = __FLAP_DETAILS_JSON__;
+        const FLAP_DEVICE_LIST = __FLAP_DEVICE_LIST_JSON__;
         let currentFilter = 'ALL';
         let allRows = [];
         let deviceSearchActive = false;
         let selectedDevice = '';
+        // True when rows landed after the user's last explicit sort; the
+        // hydrator restores the chosen order once, at the end.
+        let rowsAppendedSinceSort = false;
 
         function removeFlapDetailRows() {
             document.querySelectorAll('#flap-data tr.detail-row').forEach(function(r) {
@@ -1168,17 +1203,105 @@ class LinkFlapAnalyzer:
             // Store all data table rows for filtering (exclude the empty-state
             // placeholder and any dynamically-added detail rows).
             allRows = Array.from(document.querySelectorAll('#flap-data tr.flap-row'));
-            
+
             // Add click events to summary cards
             setupCardEvents();
-            
+
             // Initialize table sorting
             initTableSorting();
-            
+
             // Initialize device search
             populateDeviceList();
             initDeviceSearch();
+
+            // Stream the deferred quiet rows in after first paint.
+            hydrateFlapDeferredRows();
         });
+
+        // Mirrors the active card/device filter for rows that arrive during
+        // chunked hydration. Matches on data attributes only, so it stays
+        // correct when p2p-alias rewrites the displayed device names later.
+        function flapRowHidden(row) {
+            if (deviceSearchActive && selectedDevice) {
+                return row.dataset.deviceKey !== selectedDevice;
+            }
+            if (currentFilter === 'STABLE') return row.dataset.status !== 'ok';
+            if (currentFilter === 'PROBLEMATIC') return row.dataset.status !== 'problematic';
+            return false;
+        }
+
+        function updateHydrationProgress(done, total, finished) {
+            const box = document.getElementById('hydration-progress');
+            if (!box) return;
+            if (finished) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            document.getElementById('hydration-progress-text').textContent =
+                'Loading port rows: ' + done.toLocaleString() + ' / '
+                + total.toLocaleString()
+                + ' — search, sort and CSV cover loaded rows until this finishes.';
+        }
+
+        // Chunked hydration of the deferred quiet rows. The inline table
+        // carries only rows that need attention, so first paint is instant;
+        // the rest stream into the tbody in batches that never block input.
+        function hydrateFlapDeferredRows() {
+            const HYDRATION_CHUNK_ROWS = 1500;
+            const SENTINEL = '<!--=lldpq-row=-->';
+            const el = document.getElementById('flap-deferred-rows');
+            const body = document.getElementById('flap-data');
+            if (!el || !body) { updateHydrationProgress(0, 0, true); return; }
+            const total = parseInt(el.dataset.count || '0', 10) || 0;
+            const raw = el.textContent;
+            el.remove();
+            let pos = 0;
+            let done = 0;
+
+            function nextChunk() {
+                if (pos >= raw.length) {
+                    updateHydrationProgress(total, total, true);
+                    // Restore the user's chosen order in one pass, but only
+                    // when chunks actually landed after the sort.
+                    if (tableSortState.column >= 0 && rowsAppendedSinceSort) {
+                        const th = document.querySelector(
+                            '.sortable[data-column="' + tableSortState.column + '"]');
+                        sortFlapTable(tableSortState.column,
+                                      tableSortState.direction,
+                                      th ? th.dataset.type : 'string');
+                    }
+                    return;
+                }
+                let end = pos;
+                let count = 0;
+                while (count < HYDRATION_CHUNK_ROWS && end < raw.length) {
+                    const i = raw.indexOf(SENTINEL, end);
+                    end = i === -1 ? raw.length : i + SENTINEL.length;
+                    count++;
+                }
+                // Strip the join sentinels before insertion: comment nodes
+                // interleaved with rows make later sorts pathologically slow.
+                body.insertAdjacentHTML(
+                    'beforeend', raw.slice(pos, end).replaceAll(SENTINEL, ''));
+                pos = end;
+                done = Math.min(total, done + count);
+                rowsAppendedSinceSort = true;
+                const kids = body.children;
+                const filtered = (deviceSearchActive && selectedDevice)
+                    || (currentFilter !== 'ALL' && currentFilter !== 'TOTAL');
+                for (let i = kids.length - count; i < kids.length; i++) {
+                    allRows.push(kids[i]);
+                    if (filtered) {
+                        kids[i].style.display = flapRowHidden(kids[i]) ? 'none' : '';
+                    }
+                }
+                updateHydrationProgress(done, total, false);
+                setTimeout(nextChunk, 30);
+            }
+
+            updateHydrationProgress(0, total, false);
+            // Give first paint and the rest of DOMContentLoaded room to
+            // finish before the background build starts.
+            setTimeout(nextChunk, 80);
+        }
         
         function setupCardEvents() {
             // Check if elements exist
@@ -1319,53 +1442,55 @@ class LinkFlapAnalyzer:
         }
         
         function populateDeviceList() {
-            const deviceSet = new Set();
-            allRows.forEach(row => {
-                // First column is the device name
-                const deviceName = row.cells[0]?.textContent?.trim();
-                if (deviceName) deviceSet.add(deviceName);
-            });
-            
-            const sortedDevices = Array.from(deviceSet).sort((a, b) => 
-                a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+            // Complete embedded [raw key, display name] list: the dropdown
+            // must never miss devices whose rows are still hydrating.
+            const pairs = Array.isArray(FLAP_DEVICE_LIST) ? FLAP_DEVICE_LIST.slice() : [];
+            pairs.sort((a, b) =>
+                String(a[1]).localeCompare(String(b[1]), undefined, { numeric: true, sensitivity: 'base' })
             );
-            
+
             const select = document.getElementById('deviceSearch');
             select.innerHTML = '<option value="">Search Device...</option>';
-            sortedDevices.forEach(device => {
+            pairs.forEach(pair => {
                 const option = document.createElement('option');
-                option.value = device;
-                option.textContent = device;
+                option.value = pair[0];
+                option.textContent = pair[1];
                 select.appendChild(option);
             });
         }
-        
-        function filterByDevice(deviceName) {
-            if (!deviceName) return;
+
+        function filterByDevice(deviceKey) {
+            if (!deviceKey) return;
             removeFlapDetailRows();
 
-            selectedDevice = deviceName;
+            selectedDevice = deviceKey;
             deviceSearchActive = true;
-            
+
             // Clear card-based filter
             currentFilter = 'ALL';
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
-            
-            // Filter table rows
+
+            // Match on data-device-key so this keeps working when p2p-alias
+            // rewrites the displayed device names.
             let matchCount = 0;
+            let displayName = deviceKey;
             allRows.forEach(row => {
-                const rowDeviceName = row.cells[0]?.textContent?.trim();
-                if (rowDeviceName === deviceName) {
+                if (row.dataset.deviceKey === deviceKey) {
+                    if (matchCount === 0) displayName = row.cells[0]?.textContent?.trim() || deviceKey;
                     row.style.display = '';
                     matchCount++;
                 } else {
                     row.style.display = 'none';
                 }
             });
-            
+            if (matchCount === 0) {
+                const pair = FLAP_DEVICE_LIST.find(p => p[0] === deviceKey);
+                if (pair) displayName = pair[1];
+            }
+
             // Show filter info
             document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent = 'Showing interfaces for device: ' + deviceName + ' (' + matchCount + ' interfaces)';
+            document.getElementById('filter-text').textContent = 'Showing interfaces for device: ' + displayName + ' (' + matchCount + ' interfaces)';
             document.getElementById('clearSearchBtn').style.display = 'inline-block';
         }
         
@@ -1484,6 +1609,7 @@ class LinkFlapAnalyzer:
 
             // Re-append only the sorted data rows (detail rows already removed).
             rows.forEach(row => tbody.appendChild(row));
+            rowsAppendedSinceSort = false;
         }
 
         function flapCellNumber(row, columnIndex) {
@@ -1740,7 +1866,7 @@ class LinkFlapAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
+    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""
@@ -1754,8 +1880,14 @@ class LinkFlapAnalyzer:
         ).replace(
             "__FLAP_DETAILS_JSON__",
             details_json,
+        ).replace(
+            "__FLAP_DEVICE_LIST_JSON__",
+            json.dumps(
+                sorted(device_names.items()), separators=(",", ":"),
+                ensure_ascii=True
+            ).replace("</", "<\\/"),
         )
-        
+
         self._atomic_text_write(output_file, html_content)
 
 if __name__ == "__main__":

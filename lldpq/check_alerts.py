@@ -1359,6 +1359,25 @@ class LLDPqAlerts:
             print("Duplicate detection skipped by configuration; no duplicate alerts.")
         elif not self.check_duplicate_alerts():
             self.had_error = True
+        # The local analyzers are optional: pre-upgrade manifests (and scoped
+        # runs) simply do not list them, which is not an error.
+        manifest_analyses = (
+            {str(item) for item in run_manifest.get("analyses", []) or []}
+            if isinstance(run_manifest, dict) else set()
+        )
+        for domain, checker in (
+            ("config-drift", self.check_config_drift_alerts),
+            ("routes", self.check_routes_alerts),
+            ("fabric-check", self.check_fabric_check_alerts),
+        ):
+            if domain in manifest_skipped:
+                print(f"{domain} analysis skipped by configuration; "
+                      f"no {domain} alerts.")
+                continue
+            if domain not in manifest_analyses:
+                continue
+            if not checker():
+                self.had_error = True
 
     def send_summary_alert(self, devices, *, include_schedule=True):
         """Send dashboard-style summary alert"""
@@ -1835,6 +1854,132 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             "duplicate_ip", state,
         )
 
+    def _load_domain_summary(self, filename):
+        """Load one summary/<domain>-summary.json; None when absent/invalid."""
+        path = self.monitor_results / "summary" / filename
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def check_routes_alerts(self):
+        """Fabric-wide stateful alert for route drops / disappeared VRFs."""
+        stats = self._load_domain_summary("routes-summary.json")
+        if not stats:
+            self.had_error = True
+            return False
+        drops = int(stats.get("route_drops_24h") or 0)
+        vrf_losses = int(stats.get("vrfs_disappeared_24h") or 0)
+        stale = int(stats.get("devices_stale") or 0)
+        if drops or vrf_losses:
+            severity = "CRITICAL"
+            title = "Route Table Anomalies"
+        elif stale:
+            severity = "WARNING"
+            title = "Route Collection Stale"
+        else:
+            severity = "OK"
+            title = "Route Tables Stable"
+        state = ":".join(map(str, (severity, drops, vrf_losses, stale)))
+        previous_state = self.get_alert_state("_fabric", "routes")
+        if severity == "OK" and previous_state == "UNKNOWN":
+            return self.record_state_without_delivery(
+                "_fabric", "routes", state
+            )
+        if not self.should_send_alert("_fabric", "routes", state):
+            return True
+        message = (
+            f"Route drops (24h): {drops}; disappeared VRFs (24h): "
+            f"{vrf_losses}; stale device collections: {stale}; total routes: "
+            f"{stats.get('total_routes')}. See the Routes analysis page."
+        )
+        if severity == "OK":
+            if not self.config.get('frequency', {}).get('send_recovery', True):
+                return self.record_state_without_delivery(
+                    "_fabric", "routes", state
+                )
+            notification_severity = "RECOVERED"
+        else:
+            notification_severity = severity
+        return self.send_stateful_notification(
+            title, message, notification_severity, "_fabric", "routes", state,
+        )
+
+    def check_config_drift_alerts(self):
+        """Fabric-wide stateful alert for device configuration changes."""
+        stats = self._load_domain_summary("config-drift-summary.json")
+        if not stats:
+            self.had_error = True
+            return False
+        changed = int(stats.get("changed_24h") or 0)
+        missing = int(stats.get("devices_missing") or 0)
+        severity = "WARNING" if changed else "OK"
+        state = f"{severity}:{changed}:{missing}"
+        # Config changes are discrete events, not an outage that recovers:
+        # the cleared state is always recorded silently.
+        if severity == "OK":
+            return self.record_state_without_delivery(
+                "_fabric", "config_drift", state
+            )
+        if not self.should_send_alert("_fabric", "config_drift", state):
+            return True
+        message = (
+            f"Configuration changed on {changed} device(s) within the last "
+            f"24h; devices without a collected config: {missing}. "
+            "See the Config-Drift analysis page for diffs."
+        )
+        return self.send_stateful_notification(
+            "Device Configuration Changed", message, "WARNING", "_fabric",
+            "config_drift", state,
+        )
+
+    def check_fabric_check_alerts(self):
+        """Fabric-wide stateful alert for link consistency mismatches."""
+        stats = self._load_domain_summary("fabric-check-summary.json")
+        if not stats:
+            self.had_error = True
+            return False
+        mtu = int(stats.get("mtu_mismatches") or 0)
+        speed = int(stats.get("speed_mismatches") or 0)
+        fec = int(stats.get("fec_mismatches") or 0)
+        autoneg = int(stats.get("autoneg_mismatches") or 0)
+        config = int(stats.get("config_mtu_mismatches") or 0)
+        if mtu or speed or fec:
+            severity = "CRITICAL"
+            title = "Fabric Link Mismatches"
+        elif autoneg or config:
+            severity = "WARNING"
+            title = "Fabric Link Warnings"
+        else:
+            severity = "OK"
+            title = "Fabric Links Consistent"
+        state = ":".join(map(str, (severity, mtu, speed, fec, autoneg, config)))
+        previous_state = self.get_alert_state("_fabric", "fabric_check")
+        if severity == "OK" and previous_state == "UNKNOWN":
+            return self.record_state_without_delivery(
+                "_fabric", "fabric_check", state
+            )
+        if not self.should_send_alert("_fabric", "fabric_check", state):
+            return True
+        message = (
+            f"MTU mismatches: {mtu}; speed mismatches: {speed}; FEC "
+            f"mismatches: {fec}; autoneg mismatches: {autoneg}; configured "
+            f"vs running MTU: {config}. See the Fabric-Check analysis page."
+        )
+        if severity == "OK":
+            if not self.config.get('frequency', {}).get('send_recovery', True):
+                return self.record_state_without_delivery(
+                    "_fabric", "fabric_check", state
+                )
+            notification_severity = "RECOVERED"
+        else:
+            notification_severity = severity
+        return self.send_stateful_notification(
+            title, message, notification_severity, "_fabric",
+            "fabric_check", state,
+        )
+
     def should_send_summary_alert(self, current_signature, *, include_schedule=True):
         """Check if summary should be sent based on changes or schedule"""
         retry_interval = self.get_frequency_seconds('retry_interval_minutes', 5)
@@ -2011,13 +2156,23 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
     def get_device_ber_status(self, device):
         """Get BER status for a device"""
         try:
+            # Per-device shard first (ber-history/<host>.json); the legacy
+            # monolith stays readable until its one-time migration runs.
+            shard_file = self.monitor_results / "ber-history" / f"{device}.json"
             history_file = self.monitor_results / "ber_history.json"
-            if not history_file.exists():
+            if shard_file.exists():
+                payload = json.loads(shard_file.read_text(encoding="utf-8"))
+                current = payload.get("current", {})
+            elif (self.monitor_results / "ber-history").is_dir():
+                # Shard era, but this device produced no current BER data.
+                return "not_applicable"
+            elif history_file.exists():
+                payload = json.loads(history_file.read_text(encoding="utf-8"))
+                current = payload.get("current_ber_stats", {})
+            else:
                 return "unknown"
-            payload = json.loads(history_file.read_text(encoding="utf-8"))
-            current = payload.get("current_ber_stats", {})
             if not isinstance(current, dict):
-                raise ValueError("current_ber_stats must be an object")
+                raise ValueError("current BER stats must be an object")
             grades = []
             for port_name, port_stats in current.items():
                 if (not isinstance(port_name, str) or

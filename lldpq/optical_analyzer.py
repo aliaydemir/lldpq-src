@@ -21,6 +21,20 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
 
+# Per-device detail sidecars fetched by the report's expandable rows; file
+# names come from inventory hostnames, so refuse anything that could escape
+# the directory or hide as a dotfile.
+DETAILS_DIR_NAME = "optical-details"
+DETAIL_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# At fabric scale a single synchronous <tbody> freezes the tab; only rows
+# that need eyes render inline, quiet rows hydrate in chunks after first
+# paint (process_pfc_ecn_data.py established the pattern and the sentinel
+# contract — dynamic row values are HTML-escaped, so the sentinel can never
+# occur within row content).
+DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
+INLINE_ROW_CAP = 5000
+
 try:
     import yaml
 except ImportError:
@@ -915,6 +929,49 @@ class OpticalAnalyzer:
             })
         return rows
 
+    def _write_detail_sidecars(self, result_dir: str,
+                               details_by_host: Dict[str, Dict[str, Any]]) -> None:
+        """Publish per-device detail files consumed by the report's panels.
+
+        One optical-details/<host>.json per device keeps the report itself
+        small; stale files (retired or uncollected devices) are pruned so an
+        expanded row can never show another run's evidence.
+        """
+        details_dir = os.path.join(result_dir, DETAILS_DIR_NAME)
+        os.makedirs(details_dir, exist_ok=True)
+        written = set()
+        now = time.time()
+        for host, ports in sorted(details_by_host.items()):
+            if not DETAIL_HOST_RE.fullmatch(host):
+                print("⚠️  Skipping optical detail sidecar for unsafe "
+                      f"hostname: {host!r}")
+                continue
+            _atomic_write(
+                os.path.join(details_dir, f"{host}.json"),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updated_at": now,
+                        "host": host,
+                        "ports": ports,
+                    },
+                    separators=(",", ":"), ensure_ascii=True,
+                ),
+            )
+            written.add(f"{host}.json")
+        for name in os.listdir(details_dir):
+            if not name.endswith(".json") or name in written:
+                continue
+            stale = os.path.join(details_dir, name)
+            try:
+                os.unlink(stale)
+            except OSError:
+                continue
+            try:
+                analysis_sidecar.sidecar_path(stale).unlink()
+            except OSError:
+                pass
+
     def export_optical_data_for_web(self, output_file: str):
         """Export optical data for web display - EXACT same styling as BGP/Link Flap"""
         summary = self.get_optical_summary()
@@ -1178,13 +1235,16 @@ class OpticalAnalyzer:
 
         # Per-row evidence for the expandable detail panel.  Surfaces the
         # already-computed anomaly messages/actions and the raw per-lane arrays
-        # that the collapsed table row cannot show.  Emitted once as a single
-        # JSON blob (EVPN-MH pattern) and consumed by toggleDetails().
-        port_details: Dict[str, Any] = {}
+        # that the collapsed table row cannot show.  No longer embedded in the
+        # page: at fabric scale the inline JSON blob (raw diagnostics included)
+        # reached tens of MB, so toggleDetails() fetches one
+        # optical-details/<host>.json per device on first expand.
+        details_by_host: Dict[str, Dict[str, Any]] = {}
         for port in all_ports:
             port_name = port['port']
+            host = port_name.split(':')[0] if ':' in port_name else 'unknown'
             stats = self.current_optical_stats.get(port_name, {})
-            port_details[port_name] = {
+            details_by_host.setdefault(host, {})[port_name] = {
                 'health': port.get('health'),
                 'rx_lanes': stats.get('rx_power_lanes_dbm') or [],
                 'tx_lanes': stats.get('tx_power_lanes_dbm') or [],
@@ -1202,9 +1262,9 @@ class OpticalAnalyzer:
                 ],
                 'raw': stats.get('raw_data', ''),
             }
-        port_details_json = json.dumps(
-            port_details, separators=(',', ':'), ensure_ascii=True
-        ).replace('</', '<\\/')
+        self._write_detail_sidecars(
+            os.path.dirname(os.path.abspath(output_file)), details_by_host
+        )
 
         html_content += f"""
     <div class="dashboard-section">
@@ -1217,6 +1277,7 @@ class OpticalAnalyzer:
                 <span id="filter-text"></span>
                 <button onclick="clearFilter()">Show All</button>
             </div>
+            <div id="hydration-progress" class="filter-info" style="display:none"><span id="hydration-progress-text"></span></div>
             <table class="optical-table" id="optical-table">
                 <thead>
                 <tr>
@@ -1233,6 +1294,13 @@ class OpticalAnalyzer:
                 </tr>
                 </thead>
                 <tbody id="optical-data">"""
+
+        # Quiet rows are deferred into an inert payload the page hydrates in
+        # chunks after first paint; the search dropdown is fed a complete
+        # device list so it never misses devices whose rows are still loading.
+        inline_rows: List[str] = []
+        deferred_rows: List[str] = []
+        device_names: Dict[str, str] = {}
 
         for port in all_ports:
             # Split port name into device and interface
@@ -1279,7 +1347,8 @@ class OpticalAnalyzer:
                 badge_class = 'badge badge-gray'
 
             port_key = html.escape(str(port['port']), quote=True)
-            html_content += f"""
+            device_names.setdefault(str(device_name), canonical(device_name))
+            row_html = f"""
                 <tr class="detail-parent" data-device-key="{device_key}" data-health="{port['health']}" data-port="{port_key}" onclick="toggleDetails(this)">
                     <td>{canonical(device_name)}</td>
                     <td>{interface_name}</td>
@@ -1292,6 +1361,21 @@ class OpticalAnalyzer:
                     <td>{bias_current}</td>
                     <td>{recommended_action}</td>
                 </tr>"""
+            quiet = port['health'] in ('excellent', 'good', 'unplugged', 'unknown')
+            (deferred_rows if quiet else inline_rows).append(row_html)
+
+        # A pathological fabric can put >cap rows in the attention set; keep
+        # first paint bounded by deferring the overflow ahead of quiet rows.
+        if len(inline_rows) > INLINE_ROW_CAP:
+            deferred_rows = inline_rows[INLINE_ROW_CAP:] + deferred_rows
+            inline_rows = inline_rows[:INLINE_ROW_CAP]
+        html_content += "".join(inline_rows)
+        deferred_script = (
+            f'<script type="text/html" id="optical-deferred-rows" '
+            f'data-count="{len(deferred_rows)}">'
+            + DEFERRED_ROW_SENTINEL.join(deferred_rows)
+            + '</script>'
+        ) if deferred_rows else ''
 
         if not all_ports:
             # Distinguish healthy-empty from stale/unavailable: a partial or
@@ -1306,11 +1390,12 @@ class OpticalAnalyzer:
             html_content += f"""
                 <tr class="empty-row"><td colspan="10">{html.escape(empty_message)}</td></tr>"""
 
-        html_content += """
+        html_content += f"""
         </tbody>
             </table>
         </div>
-    </div>"""
+    </div>
+    {deferred_script}"""
 
         html_content += f"""
     <div class="dashboard-section">
@@ -1337,8 +1422,12 @@ class OpticalAnalyzer:
     </div>
 """
 
+        device_list_json = json.dumps(
+            sorted(device_names.items()), separators=(',', ':'),
+            ensure_ascii=True
+        ).replace('</', '<\\/')
         html_content += f"""
-    <script id="optical-details-data" type="application/json">{port_details_json}</script>
+    <script>window.__opticalDeviceList = {device_list_json};</script>
 """
 
         html_content += """
@@ -1353,13 +1442,27 @@ class OpticalAnalyzer:
         let deviceSearchActive = false;
         let selectedDevice = '';
 
-        // Per-row detail evidence (anomaly messages/actions + per-lane arrays).
-        let opticalDetails = {};
-        try {
-            const detailNode = document.getElementById('optical-details-data');
-            if (detailNode) opticalDetails = JSON.parse(detailNode.textContent || '{}');
-        } catch (e) {
-            console.error('Could not parse optical detail data:', e);
+        // Per-row detail evidence (anomaly messages/actions + per-lane
+        // arrays + raw diagnostics) is no longer embedded in the page; each
+        // device's optical-details sidecar is fetched on first row expand
+        // and cached as a promise to dedupe concurrent clicks.
+        const opticalDetailCache = new Map();
+        function opticalDeviceDetails(device) {
+            if (!device) return Promise.resolve(null);
+            if (opticalDetailCache.has(device)) return opticalDetailCache.get(device);
+            const request = fetch('optical-details/' + encodeURIComponent(device) + '.json', {cache: 'no-store'})
+                .then(response => {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.json();
+                })
+                .then(state => (state && typeof state === 'object' &&
+                    state.ports && typeof state.ports === 'object') ? state.ports : {})
+                .catch(() => {
+                    opticalDetailCache.delete(device);
+                    return null;
+                });
+            opticalDetailCache.set(device, request);
+            return request;
         }
 
         function esc(value) {
@@ -1380,15 +1483,25 @@ class OpticalAnalyzer:
                 (typeof v === 'number' ? v.toFixed(2) : esc(v)) + unit).join('  ');
         }
 
+        let opticalDetailToken = 0;
         function toggleDetails(row) {
             if (!row.classList.contains('detail-parent')) return;
             const next = row.nextElementSibling;
             const wasOpen = next && next.classList.contains('detail-row');
             removeDetailRows();
-            if (wasOpen) return;
+            if (wasOpen) { opticalDetailToken++; return; }
 
+            const token = ++opticalDetailToken;
+            opticalDeviceDetails(row.dataset.deviceKey || '').then(function(ports) {
+                // The panel may have been superseded (or its row sorted away)
+                // while the sidecar loaded.
+                if (token !== opticalDetailToken || !document.body.contains(row)) return;
+                renderDetailPanel(row, (ports || {})[row.dataset.port || ''] || {});
+            });
+        }
+
+        function renderDetailPanel(row, data) {
             const port = row.dataset.port || '';
-            const data = opticalDetails[port] || {};
             let inner = '<div class="detail-panel">';
             inner += '<div class="detail-title">' + esc(port) + ' — ' +
                 esc(String(data.health || 'unknown').toUpperCase()) + '</div>';
@@ -1440,11 +1553,104 @@ class OpticalAnalyzer:
 
             // Initialize table sorting
             initTableSorting();
-            
+
             // Initialize device search
             populateDeviceList();
             initDeviceSearch();
+
+            // Stream the deferred quiet rows in after first paint.
+            hydrateOpticalDeferredRows();
         });
+
+        // True when rows landed after the user's last explicit sort; the
+        // hydrator restores the chosen order once, at the end.
+        let rowsAppendedSinceSort = false;
+
+        // Mirrors the active card/device filter for rows that arrive during
+        // chunked hydration. Matches on data attributes only, so it stays
+        // correct when p2p-alias rewrites the displayed device names later.
+        function opticalRowHidden(row) {
+            if (deviceSearchActive && selectedDevice) {
+                return row.dataset.deviceKey !== selectedDevice;
+            }
+            if (currentFilter !== 'ALL' && currentFilter !== 'TOTAL') {
+                return row.dataset.health !== currentFilter.toLowerCase();
+            }
+            return false;
+        }
+
+        function updateHydrationProgress(done, total, finished) {
+            const box = document.getElementById('hydration-progress');
+            if (!box) return;
+            if (finished) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            document.getElementById('hydration-progress-text').textContent =
+                'Loading port rows: ' + done.toLocaleString() + ' / '
+                + total.toLocaleString()
+                + ' — search, sort and CSV cover loaded rows until this finishes.';
+        }
+
+        // Chunked hydration of the deferred quiet rows. The inline table
+        // carries only rows that need attention, so first paint is instant;
+        // the rest stream into the tbody in batches that never block input.
+        function hydrateOpticalDeferredRows() {
+            const HYDRATION_CHUNK_ROWS = 1500;
+            const SENTINEL = '<!--=lldpq-row=-->';
+            const el = document.getElementById('optical-deferred-rows');
+            const body = document.getElementById('optical-data');
+            if (!el || !body) { updateHydrationProgress(0, 0, true); return; }
+            const total = parseInt(el.dataset.count || '0', 10) || 0;
+            const raw = el.textContent;
+            el.remove();
+            let pos = 0;
+            let done = 0;
+
+            function nextChunk() {
+                if (pos >= raw.length) {
+                    updateHydrationProgress(total, total, true);
+                    // Restore the user's chosen order in one pass, but only
+                    // when chunks actually landed after the sort.
+                    if (tableSortState.column >= 0 && rowsAppendedSinceSort) {
+                        const th = document.querySelector(
+                            '.sortable[data-column="' + tableSortState.column + '"]');
+                        sortOpticalTable(tableSortState.column,
+                                         tableSortState.direction,
+                                         th ? th.dataset.type : 'string');
+                    }
+                    return;
+                }
+                let end = pos;
+                let count = 0;
+                while (count < HYDRATION_CHUNK_ROWS && end < raw.length) {
+                    const i = raw.indexOf(SENTINEL, end);
+                    end = i === -1 ? raw.length : i + SENTINEL.length;
+                    count++;
+                }
+                // Strip the join sentinels before insertion: comment nodes
+                // interleaved with rows make later sorts pathologically slow.
+                body.insertAdjacentHTML(
+                    'beforeend', raw.slice(pos, end).replaceAll(SENTINEL, ''));
+                pos = end;
+                done = Math.min(total, done + count);
+                rowsAppendedSinceSort = true;
+                const kids = body.children;
+                const filtered = (deviceSearchActive && selectedDevice)
+                    || (currentFilter !== 'ALL' && currentFilter !== 'TOTAL');
+                for (let i = kids.length - count; i < kids.length; i++) {
+                    allRows.push(kids[i]);
+                    if (filtered) {
+                        kids[i].style.display = opticalRowHidden(kids[i]) ? 'none' : '';
+                    }
+                }
+                updateHydrationProgress(done, total, false);
+                setTimeout(nextChunk, 30);
+            }
+
+            updateHydrationProgress(0, total, false);
+            // Give first paint and the rest of DOMContentLoaded room to
+            // finish before the background build starts.
+            setTimeout(nextChunk, 80);
+        }
 
         function setupCardEvents() {
             document.getElementById('total-ports-card').addEventListener('click', function() {
@@ -1610,56 +1816,55 @@ class OpticalAnalyzer:
         }
         
         function populateDeviceList() {
-            const deviceSet = new Set();
-            document.querySelectorAll('#optical-data tr.detail-parent').forEach(row => {
-                // Device column (cells[0]) contains just the hostname
-                const deviceName = row.cells[0]?.textContent?.trim();
-                if (deviceName) {
-                    deviceSet.add(deviceName);
-                }
-            });
-            
-            const sortedDevices = Array.from(deviceSet).sort((a, b) => 
-                a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+            // Complete embedded [raw key, display name] list: the dropdown
+            // must never miss devices whose rows are still hydrating.
+            const pairs = Array.isArray(window.__opticalDeviceList) ? window.__opticalDeviceList : [];
+            pairs.sort((a, b) =>
+                String(a[1]).localeCompare(String(b[1]), undefined, { numeric: true, sensitivity: 'base' })
             );
-            
+
             const select = document.getElementById('deviceSearch');
             select.innerHTML = '<option value="">Search Device...</option>';
-            sortedDevices.forEach(device => {
+            pairs.forEach(pair => {
                 const option = document.createElement('option');
-                option.value = device;
-                option.textContent = device;
+                option.value = pair[0];
+                option.textContent = pair[1];
                 select.appendChild(option);
             });
         }
         
-        function filterByDevice(deviceName) {
-            if (!deviceName) return;
-            
-            selectedDevice = deviceName;
+        function filterByDevice(deviceKey) {
+            if (!deviceKey) return;
+
+            selectedDevice = deviceKey;
             deviceSearchActive = true;
             removeDetailRows();
 
             // Clear card-based filter
             currentFilter = 'ALL';
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
-            
-            // Filter table rows - match hostname part of port name
+
+            // Match on data-device-key so this keeps working when p2p-alias
+            // rewrites the displayed device names.
             let matchCount = 0;
+            let displayName = deviceKey;
             allRows.forEach(row => {
-                const portName = row.cells[0]?.textContent?.trim() || '';
-                const hostname = portName.split(':')[0];
-                if (hostname === deviceName) {
+                if (row.dataset.deviceKey === deviceKey) {
+                    if (matchCount === 0) displayName = row.cells[0]?.textContent?.trim() || deviceKey;
                     row.style.display = '';
                     matchCount++;
                 } else {
                     row.style.display = 'none';
                 }
             });
-            
+            if (matchCount === 0) {
+                const pair = (window.__opticalDeviceList || []).find(p => p[0] === deviceKey);
+                if (pair) displayName = pair[1];
+            }
+
             // Show filter info
             document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent = 'Showing ports for device: ' + deviceName + ' (' + matchCount + ' ports)';
+            document.getElementById('filter-text').textContent = 'Showing ports for device: ' + displayName + ' (' + matchCount + ' ports)';
             document.getElementById('clearSearchBtn').style.display = 'inline-block';
         }
         
@@ -1746,6 +1951,7 @@ class OpticalAnalyzer:
             // Clear tbody and add sorted rows back
             tbody.innerHTML = '';
             rows.forEach(row => tbody.appendChild(row));
+            rowsAppendedSinceSort = false;
         }
 
         function comparePort(a, b) {
@@ -2007,7 +2213,7 @@ class OpticalAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
+    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

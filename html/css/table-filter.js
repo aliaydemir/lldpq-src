@@ -72,6 +72,16 @@
     function applyFilters(table) {
         var st = getState(table);
         var filters = st.filters;
+        // Fast path for the common no-filter case: pages that hydrate rows
+        // in chunks (BER/optical/flap/PFC) trigger the mutation observer per
+        // chunk, and a full-table pass on 60k+ rows per chunk adds seconds.
+        // Only skip while no filter has ever hidden a row on this table;
+        // clearing the last filter still runs one full pass to unhide.
+        if (filters.size === 0 && !st.hadActiveFilters) {
+            updateButtons(table);
+            return;
+        }
+        st.hadActiveFilters = filters.size > 0;
         var bodies = table.tBodies;
         for (var b = 0; b < bodies.length; b++) {
             var trs = bodies[b].rows;

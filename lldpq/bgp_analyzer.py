@@ -2827,7 +2827,7 @@ class BGPAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
+    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>

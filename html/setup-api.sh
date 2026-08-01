@@ -820,6 +820,7 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 LLDPQ_PREF_KEYS = (
     'LLDPQ_HOSTNAME', 'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL',
     'SKIP_OPTICAL', 'SKIP_L1', 'SKIP_DUPLICATE', 'SKIP_EVPN_MH', 'SKIP_PFC_ECN',
+    'SKIP_CONFIG_DRIFT', 'SKIP_ROUTES', 'SKIP_FABRIC_CHECK',
     'SKIP_ASSETS', 'SKIP_LLDP', 'SKIP_MONITOR', 'SKIP_FABRIC_SCAN', 'SKIP_ALERTS',
     'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'MONITOR_COMMAND_TIMEOUT_SECONDS',
     'PFC_ECN_MAX_PARALLEL',
@@ -1594,6 +1595,9 @@ COLLECTION_SKIP_KEYS = {
     'skip_duplicate': 'SKIP_DUPLICATE',
     'skip_evpn_mh': 'SKIP_EVPN_MH',
     'skip_pfc_ecn': 'SKIP_PFC_ECN',
+    'skip_config_drift': 'SKIP_CONFIG_DRIFT',
+    'skip_routes': 'SKIP_ROUTES',
+    'skip_fabric_check': 'SKIP_FABRIC_CHECK',
     'skip_assets': 'SKIP_ASSETS',
     'skip_lldp': 'SKIP_LLDP',
     'skip_monitor': 'SKIP_MONITOR',

@@ -899,6 +899,37 @@ execute_commands_optimized() {
             fi
         done | sort -V
         echo '===PORT_MTU_END==='
+
+        # Port link parameters (active FEC + autoneg), carrier-up ports only:
+        # both ends of an LLDP link are up by definition, and the carrier
+        # gate bounds the per-port ethtool cost. Read-only ethtool queries;
+        # a missing tool or unreadable port simply reports nothing.
+        echo ''
+        echo '===PORT_LINK_START==='
+        if command -v ethtool >/dev/null 2>&1; then
+            for port in /sys/class/net/*; do
+                [ -d \"\$port\" ] || continue
+                port_name=\$(basename \"\$port\")
+                case \"\$port_name\" in
+                    lo|eth0|mgmt*|docker*|veth*|virbr*|br-*|cni*|flannel*|\
+                    vxlan*|vni*|vrf*|dummy*|tun*|tap*) continue ;;
+                esac
+                if [ ! -e \"\$port/device\" ]; then
+                    case \"\$port_name\" in
+                        swp*) ;;
+                        *) continue ;;
+                    esac
+                fi
+                carrier=\$(cat \"\$port/carrier\" 2>/dev/null || echo '0')
+                [ \"\$carrier\" = '1' ] || continue
+                autoneg=\$(ethtool \"\$port_name\" 2>/dev/null | sed -n 's/^.*Auto-negotiation: *//p' | head -1 | tr ' ,' '--')
+                fec=\$(ethtool --show-fec \"\$port_name\" 2>/dev/null | sed -n 's/^Active FEC encodings*: *//p' | head -1 | tr ' ,' '--')
+                [ -n \"\$autoneg\" ] || autoneg='unknown'
+                [ -n \"\$fec\" ] || fec='unknown'
+                echo \"\$port_name fec=\$fec autoneg=\$autoneg\"
+            done | sort -V
+        fi
+        echo '===PORT_LINK_END==='
         echo ''
     " > "$temporary_file" 2>/dev/null &&
        ! grep -q '__LLDPQ_LLDP_COLLECTION_ERROR__' "$temporary_file" &&

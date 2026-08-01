@@ -1233,7 +1233,13 @@ def build_collection_metadata(devices, device_health):
             _mr_path('transceiver_inventory.json'), required=False
         ),
         'optical': _source_freshness(_mr_path('optical_history.json'), required=False),
-        'ber': _source_freshness(_mr_path('ber_history.json'), required=False),
+        'ber': (
+            _multi_file_source_freshness(
+                os.path.join(_mr_path('ber-history'), '*.json'), required=False
+            )
+            if os.path.isdir(_mr_path('ber-history'))
+            else _source_freshness(_mr_path('ber_history.json'), required=False)
+        ),
         'flaps': _source_freshness(_mr_path('flap_history.json'), required=False),
         'flap_snapshot': _multi_file_source_freshness(
             os.path.join(_mr_path('flap-data'), '*.txt'), required=False
@@ -1249,6 +1255,15 @@ def build_collection_metadata(devices, device_health):
         ),
         'hardware': _multi_file_source_freshness(
             os.path.join(_mr_path('hardware-data'), '*_hardware.txt'), required=False
+        ),
+        'config_drift': _source_freshness(
+            _mr_path('summary', 'config-drift-summary.json'), required=False
+        ),
+        'routes': _source_freshness(
+            _mr_path('summary', 'routes-summary.json'), required=False
+        ),
+        'fabric_check': _source_freshness(
+            _mr_path('summary', 'fabric-check-summary.json'), required=False
         ),
         'running_configs': _multi_file_source_freshness(
             os.path.join(WEB_ROOT, 'configs', '*.txt'), required=False
@@ -1590,7 +1605,7 @@ def build_fabric_summary():
     
     # 6. BER / interface error density summary
     try:
-        ber_stats = (_load_json_file(_mr_path('ber_history.json')) or {}).get('current_ber_stats') or {}
+        ber_stats = _load_ber_current_stats()
         if ber_stats:
             _SEVERITY_ORDER = {'critical': 0, 'warning': 1, 'good': 2, 'excellent': 3, 'unknown': 4}
             ber_by_grade = {}
@@ -1693,7 +1708,74 @@ def build_fabric_summary():
             summary.append(f"FABRIC TABLES: {arp_count} ARP entries, {mac_count} MAC entries, {vtep_count} VTEPs")
     except Exception:
         pass
-    
+
+    # 10. Local analyzer findings (config-drift / routes / fabric-check).
+    # Compact headline counts plus the most recent events, so the model can
+    # correlate "config changed yesterday" with "routes dropped today".
+    try:
+        drift = _load_json_file(_mr_path('summary', 'config-drift-summary.json')) or {}
+        if drift:
+            summary.append(
+                "CONFIG DRIFT: %s device(s) changed in 24h, %s in 7d, "
+                "%s device(s) without a collected config" % (
+                    drift.get('changed_24h', 0), drift.get('changed_7d', 0),
+                    drift.get('devices_missing', 0)))
+            events = (_load_json_file(_mr_path('events', 'config-drift.json')) or {}).get('events') or []
+            recent = [e for e in events if isinstance(e, dict)][-8:]
+            if recent and drift.get('changed_7d'):
+                lines = [
+                    "  %s %s: %s" % (
+                        time.strftime('%Y-%m-%d %H:%M', time.localtime(int(e.get('ts') or 0))),
+                        e.get('device', '?'), str(e.get('detail', ''))[:120])
+                    for e in reversed(recent)
+                ]
+                summary.append("RECENT CONFIG CHANGES:\n" + '\n'.join(lines))
+    except Exception:
+        pass
+    try:
+        routes = _load_json_file(_mr_path('summary', 'routes-summary.json')) or {}
+        if routes:
+            summary.append(
+                "ROUTES: %s total routes across %s VRF(s); route drops (24h): %s; "
+                "disappeared VRFs (24h): %s; stale device collections: %s" % (
+                    routes.get('total_routes', 0), routes.get('vrf_count', 0),
+                    routes.get('route_drops_24h', 0),
+                    routes.get('vrfs_disappeared_24h', 0),
+                    routes.get('devices_stale', 0)))
+            if routes.get('route_drops_24h') or routes.get('vrfs_disappeared_24h'):
+                events = (_load_json_file(_mr_path('events', 'routes.json')) or {}).get('events') or []
+                recent = [e for e in events if isinstance(e, dict)][-8:]
+                lines = [
+                    "  %s %s %s: %s" % (
+                        time.strftime('%Y-%m-%d %H:%M', time.localtime(int(e.get('ts') or 0))),
+                        e.get('device', '?'), e.get('object', ''),
+                        str(e.get('detail', ''))[:120])
+                    for e in reversed(recent)
+                ]
+                if lines:
+                    summary.append("RECENT ROUTE EVENTS:\n" + '\n'.join(lines))
+    except Exception:
+        pass
+    try:
+        fabric_check = _load_json_file(_mr_path('summary', 'fabric-check-summary.json')) or {}
+        if fabric_check:
+            mismatch_bits = []
+            for key, label in (('mtu_mismatches', 'MTU'),
+                               ('speed_mismatches', 'speed'),
+                               ('fec_mismatches', 'FEC'),
+                               ('autoneg_mismatches', 'autoneg'),
+                               ('config_mtu_mismatches', 'config-vs-running MTU')):
+                count = fabric_check.get(key) or 0
+                if count:
+                    mismatch_bits.append("%s %s" % (count, label))
+            summary.append(
+                "FABRIC CHECK: %s links checked — %s" % (
+                    fabric_check.get('links_checked', 0),
+                    ('mismatches: ' + ', '.join(mismatch_bits))
+                    if mismatch_bits else 'no link mismatches'))
+    except Exception:
+        pass
+
     collection_metadata = build_collection_metadata(devices, device_health)
     summary.append(format_collection_metadata(collection_metadata))
     return '\n'.join(summary), devices, device_health
@@ -2315,6 +2397,32 @@ def _load_json_file(path):
             return json.load(f)
     except Exception:
         return None
+
+
+def _load_ber_current_stats(hosts=None):
+    """Merged per-port current BER records from the ber-history/ shards.
+
+    The monolithic ber_history.json remains the fallback until its one-time
+    per-device shard migration runs.  ``hosts`` (a set of hostnames) limits
+    the shard reads to the devices actually requested.
+    """
+    shard_dir = _mr_path('ber-history')
+    try:
+        names = [n for n in os.listdir(shard_dir) if n.endswith('.json')]
+    except OSError:
+        names = []
+    if not names:
+        legacy = (_load_json_file(_mr_path('ber_history.json')) or {})
+        return legacy.get('current_ber_stats') or {}
+    stats = {}
+    for name in sorted(names):
+        if hosts and name[:-len('.json')] not in hosts:
+            continue
+        payload = _load_json_file(os.path.join(shard_dir, name)) or {}
+        current = payload.get('current')
+        if isinstance(current, dict):
+            stats.update(current)
+    return stats
 
 
 def _ensure_state_dir():
@@ -3370,7 +3478,7 @@ def build_optical_context(hosts=None, max_chars=9000):
 
 def build_ber_context(hosts=None, max_chars=16000):
     """Per-port interface error density plus raw/effective physical BER."""
-    stats = (_load_json_file(_mr_path('ber_history.json')) or {}).get('current_ber_stats') or {}
+    stats = _load_ber_current_stats(set(hosts) if hosts else None)
     if not stats:
         return ''
     header = (

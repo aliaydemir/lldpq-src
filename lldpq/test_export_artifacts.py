@@ -62,6 +62,10 @@ NEW_ANALYZER_ARTIFACTS = (
     "export/fabric-check.json", "export/fabric-check.csv",
 )
 
+# Added when the BER history was sharded per device and the optical detail
+# sidecars were split out of the report page.
+SHARD_ERA_ARTIFACTS = ("ber-history/", "optical-details/")
+
 
 class SchemaRegistryTests(unittest.TestCase):
     def test_unknown_domain_rejected(self):
@@ -363,15 +367,26 @@ class MonitorExportContractTests(unittest.TestCase):
             len(legacy_v6),
             len(self.legacy_v5) + len(LEGACY_EXPORT_DOMAIN_FILES),
         )
-        # The current schema adds exactly the config-drift/routes/fabric-check
-        # analyzer artifacts on top of legacy_v6.
+        # legacy_v7 must be the frozen pre-shard schema: legacy_v6 plus the
+        # config-drift/routes/fabric-check analyzer artifacts, nothing else.
+        legacy_v7 = _extract_array(self.source, "analysis_artifacts_legacy_v7")
         self.assertEqual(
-            set(self.current) - set(legacy_v6),
+            set(legacy_v7) - set(legacy_v6),
             set(NEW_ANALYZER_ARTIFACTS),
         )
-        self.assertEqual(set(legacy_v6) - set(self.current), set())
+        self.assertEqual(set(legacy_v6) - set(legacy_v7), set())
         self.assertEqual(
-            len(self.current), len(legacy_v6) + len(NEW_ANALYZER_ARTIFACTS)
+            len(legacy_v7), len(legacy_v6) + len(NEW_ANALYZER_ARTIFACTS)
+        )
+        # The current schema adds exactly the BER shard directory and the
+        # optical detail sidecars on top of legacy_v7.
+        self.assertEqual(
+            set(self.current) - set(legacy_v7),
+            set(SHARD_ERA_ARTIFACTS),
+        )
+        self.assertEqual(set(legacy_v7) - set(self.current), set())
+        self.assertEqual(
+            len(self.current), len(legacy_v7) + len(SHARD_ERA_ARTIFACTS)
         )
 
     def test_validation_and_overlays_cover_every_export_pair(self):

@@ -27,6 +27,16 @@ ANALYZER_SKIPS = {
     "SKIP_PFC_ECN": "pfc-ecn",
 }
 
+# Local-only analyzers share the whole contract except the remote-collection
+# gates (they have no remote section of their own).
+LOCAL_ANALYZER_SKIPS = {
+    "SKIP_CONFIG_DRIFT": "config-drift",
+    "SKIP_ROUTES": "routes",
+    "SKIP_FABRIC_CHECK": "fabric-check",
+}
+
+ALL_ANALYZER_SKIPS = {**ANALYZER_SKIPS, **LOCAL_ANALYZER_SKIPS}
+
 
 def _extract_function(source, name):
     """First function body up to the first line-start closing brace."""
@@ -43,13 +53,13 @@ class AnalyzerSkipStaticContractTests(unittest.TestCase):
         cls.source = MONITOR.read_text(encoding="utf-8")
 
     def test_flags_default_and_normalize(self):
-        for key in ANALYZER_SKIPS:
+        for key in ALL_ANALYZER_SKIPS:
             self.assertIn(f'{key}="${{{key}:-false}}"', self.source)
             self.assertIn(f'{key}="$(normalize_bool "${{{key}:-false}}")"',
                           self.source)
 
     def test_scoped_run_refuses_a_disabled_analyzer(self):
-        for key, scope in ANALYZER_SKIPS.items():
+        for key, scope in ALL_ANALYZER_SKIPS.items():
             pattern = (f'"$MONITOR_SCOPE" == "{scope}" && "${key}" == "true"')
             self.assertEqual(self.source.count(pattern), 2,
                              f"both scope guards must refuse --only {scope}")
@@ -71,14 +81,14 @@ class AnalyzerSkipStaticContractTests(unittest.TestCase):
             self.source.count('if [ "$SKIP_PFC_ECN" != "true" ]; then'), 1)
 
     def test_analyzers_do_not_start_when_skipped(self):
-        for key, scope in ANALYZER_SKIPS.items():
+        for key, scope in ALL_ANALYZER_SKIPS.items():
             self.assertIn(
                 f'if scope_selected {scope} && [[ "${key}" != "true" ]]; then',
                 self.source,
             )
 
     def test_validate_outputs_require_artifacts_only_when_enabled(self):
-        for key in ANALYZER_SKIPS:
+        for key in ALL_ANALYZER_SKIPS:
             self.assertIn(f'if [[ "${key}" != "true" ]]; then', self.source)
 
     def test_publish_purges_stage_artifacts_and_writes_placeholder(self):
@@ -95,14 +105,28 @@ class AnalyzerSkipStaticContractTests(unittest.TestCase):
             "summary/pfc-ecn-summary.json",
             "export/pfc-ecn.json", "export/pfc-ecn.json.sha256",
             "export/pfc-ecn.csv", "export/pfc-ecn.csv.sha256",
+            "config-drift-analysis.html", "config_drift_history.json",
+            "config-drift-data",
+            "summary/config-drift-summary.json",
+            "export/config-drift.json", "export/config-drift.json.sha256",
+            "export/config-drift.csv", "export/config-drift.csv.sha256",
+            "routes-analysis.html", "routes_events.json", "routes-history",
+            "summary/routes-summary.json",
+            "export/routes.json", "export/routes.json.sha256",
+            "export/routes.csv", "export/routes.csv.sha256",
+            "fabric-check-analysis.html",
+            "summary/fabric-check-summary.json",
+            "export/fabric-check.json", "export/fabric-check.json.sha256",
+            "export/fabric-check.csv", "export/fabric-check.csv.sha256",
         )
         for name in purged:
             self.assertIn(name, publish, f"{name} not purged when skipped")
-        self.assertEqual(publish.count('data-analysis-status="skipped"'), 4,
-                         "optical + duplicate + evpn-mh + pfc-ecn placeholders")
+        self.assertEqual(publish.count('data-analysis-status="skipped"'), 7,
+                         "optical + duplicate + evpn-mh + pfc-ecn + "
+                         "config-drift + routes + fabric-check placeholders")
 
     def test_manifest_records_every_skipped_analyzer(self):
-        for key, scope in ANALYZER_SKIPS.items():
+        for key, scope in ALL_ANALYZER_SKIPS.items():
             self.assertIn(f'[[ "${key}" == "true" ]] && skipped_list+="{scope},"',
                           self.source)
         self.assertIn(
@@ -117,7 +141,10 @@ class AnalyzerSkipStaticContractTests(unittest.TestCase):
             dashboard,
         )
         self.assertIn("manifest.skipped.includes('duplicate')", dashboard)
-        self.assertIn("{ 'evpn-mh': 'evpn-mh', 'pfc': 'pfc-ecn' }", dashboard)
+        self.assertIn("'evpn-mh': 'evpn-mh', 'pfc': 'pfc-ecn',", dashboard)
+        self.assertIn("'config-drift': 'config-drift', 'routes': 'routes',",
+                      dashboard)
+        self.assertIn("'fabric-check': 'fabric-check'", dashboard)
 
 
 class AnalyzerSkipFunctionalTests(unittest.TestCase):

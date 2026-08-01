@@ -353,13 +353,16 @@ class WiringContractTests(unittest.TestCase):
         self.assertIn(
             "all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs"
             "|config-drift|routes|fabric-check)", self.monitor)
-        for scope, script in (
-                ("config-drift", "process_config_drift_data.py"),
-                ("routes", "process_routes_data.py"),
-                ("fabric-check", "process_fabric_check_data.py")):
+        for scope, key, script in (
+                ("config-drift", "SKIP_CONFIG_DRIFT",
+                 "process_config_drift_data.py"),
+                ("routes", "SKIP_ROUTES", "process_routes_data.py"),
+                ("fabric-check", "SKIP_FABRIC_CHECK",
+                 "process_fabric_check_data.py")):
             self.assertIn(
-                "if scope_selected %s; then\n    start_analysis %s python3 %s"
-                % (scope, scope, script), self.monitor)
+                'if scope_selected %s && [[ "$%s" != "true" ]]; then\n'
+                "    start_analysis %s python3 %s"
+                % (scope, key, scope, script), self.monitor)
 
     def test_monitor_validate_and_overlays(self):
         for token in ("config-drift-analysis.html", "routes-analysis.html",

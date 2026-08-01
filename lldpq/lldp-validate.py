@@ -125,6 +125,37 @@ def _parse_port_metric_section(content, marker):
     return values
 
 
+_PORT_LINK_TOKEN_RE = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+
+def _parse_port_link_section(content):
+    """Parse ``<port> fec=<token> autoneg=<token>`` lines from PORT_LINK.
+
+    The section only exists on collectors that ship the ethtool query, and
+    only carrier-up ports report; consumers must treat both attributes as
+    best-effort.  Values are single collector-sanitized tokens; anything
+    else (untrusted device output) is dropped.
+    """
+    values = {}
+    matches = re.findall(
+        r'===PORT_LINK_START===(.*?)===PORT_LINK_END===', content, re.DOTALL)
+    if matches:
+        for line in matches[-1].strip().split('\n'):
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            attrs = {}
+            for token in parts[1:]:
+                key, sep, value = token.partition('=')
+                if (sep and key in ('fec', 'autoneg')
+                        and _PORT_LINK_TOKEN_RE.fullmatch(value)
+                        and value.lower() != 'unknown'):
+                    attrs[key] = value
+            if attrs:
+                values[parts[0]] = attrs
+    return values
+
+
 def parse_lldp_output(filename, known_device_names=()):
     neighbors = []
     port_status = {}
@@ -162,13 +193,15 @@ def parse_lldp_output(filename, known_device_names=()):
 
         port_speed = _parse_port_metric_section(content, 'PORT_SPEED')
         port_mtu = _parse_port_metric_section(content, 'PORT_MTU')
+        port_link = _parse_port_link_section(content)
         port_attrs = {}
-        for port_name in set(port_speed) | set(port_mtu):
+        for port_name in set(port_speed) | set(port_mtu) | set(port_link):
             attrs = {}
             if port_name in port_speed:
                 attrs['speed'] = port_speed[port_name]
             if port_name in port_mtu:
                 attrs['mtu'] = port_mtu[port_name]
+            attrs.update(port_link.get(port_name, {}))
             port_attrs[port_name] = attrs
 
     return neighbors, port_status, port_attrs
@@ -234,9 +267,10 @@ def write_neighbors_sidecar(destination_path, device_neighbors, resolver, create
     this sidecar instead.  Best-effort artifact: it is not part of the
     rollback-capable wiring report transaction.
 
-    The additive top-level ``ports`` map carries per-port oper/speed/mtu for
-    every collected physical port (link-consistency analysis needs attributes
-    for both ends of a link, including ports without a chosen neighbor).
+    The additive top-level ``ports`` map carries per-port oper/speed/mtu
+    (plus best-effort fec/autoneg from carrier-up ethtool queries) for every
+    collected physical port (link-consistency analysis needs attributes for
+    both ends of a link, including ports without a chosen neighbor).
     Existing ``neighbors`` consumers are unaffected.
     """
     neighbors = {}
@@ -269,7 +303,7 @@ def write_neighbors_sidecar(destination_path, device_neighbors, resolver, create
             entry = {}
             if local_port in status_map:
                 entry['oper'] = status_map[local_port]
-            for key in ('speed', 'mtu'):
+            for key in ('speed', 'mtu', 'fec', 'autoneg'):
                 value = (attrs_map.get(local_port) or {}).get(key)
                 if value is not None:
                     entry[key] = value

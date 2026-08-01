@@ -359,7 +359,8 @@ load_lldpq_config() {
             ANSIBLE_DIR|EDITOR_ROOT|PROJECT_DIR|DHCP_HOSTS_FILE|DHCP_CONF_FILE|\
             DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
             AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|SKIP_DUPLICATE|\
-            SKIP_EVPN_MH|SKIP_PFC_ECN|SKIP_ASSETS|SKIP_LLDP|SKIP_MONITOR|\
+            SKIP_EVPN_MH|SKIP_PFC_ECN|SKIP_CONFIG_DRIFT|SKIP_ROUTES|\
+            SKIP_FABRIC_CHECK|SKIP_ASSETS|SKIP_LLDP|SKIP_MONITOR|\
             SKIP_FABRIC_SCAN|SKIP_ALERTS|MONITOR_TIMING|\
             MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
@@ -902,7 +903,8 @@ render_runtime_tuning_config() {
     # values arrive via load_lldpq_config on update, caller overrides via env.
     # Anything but exactly "true" renders as false (fail-safe).
     local _skip_name _skip_value
-    for _skip_name in SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN SKIP_ASSETS \
+    for _skip_name in SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN \
+        SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK SKIP_ASSETS \
         SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS; do
         _skip_value="${!_skip_name:-false}"
         [[ "$_skip_value" == "true" ]] || _skip_value=false
@@ -4123,6 +4125,7 @@ LLDPQ_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # clean install must not carry old skip preferences into the new config,
 # but explicit environment overrides remain supported.
 _CALLER_SKIP_KEYS=(SKIP_L1 SKIP_OPTICAL SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN \
+    SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK \
     SKIP_ASSETS SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS)
 declare -A _CALLER_SKIP_WAS_SET=()
 declare -A _CALLER_SKIP_VALUE=()

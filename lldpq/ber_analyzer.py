@@ -17,9 +17,26 @@ import tempfile
 import html
 
 import analysis_sidecar
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from enum import Enum
+
+# Per-device history shards (PFC/ECN precedent): the monolithic
+# ber_history.json forced a full read-modify-rewrite of the entire fabric's
+# history every run.  Shard files are named after inventory hostnames; refuse
+# anything that could escape the shard directory or hide as a dotfile.
+HISTORY_DIR_NAME = "ber-history"
+SHARD_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# At fabric scale (60k+ ports) a single synchronous <tbody> freezes the tab
+# for minutes, so only rows that need eyes render inline; quiet rows ship in
+# an inert text/html block the page hydrates in chunks after first paint
+# (process_pfc_ecn_data.py established the pattern and sentinel contract).
+# Every dynamic value inside a row is HTML-escaped, so the sentinel can never
+# occur within row content.
+DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
+INLINE_ROW_CAP = 5000
 
 try:
     import yaml
@@ -102,6 +119,10 @@ class BERAnalyzer:
         self.data_dir = data_dir
         self.ber_history = {}  # port -> list of ber readings over time
         self.current_ber_stats = {}  # port -> current ber status
+        # True while the legacy monolithic ber_history.json is the loaded
+        # source; the next save splits it into per-device shards and retires
+        # it within the same analyzer transaction.
+        self._legacy_history_loaded = False
         self.config = self.DEFAULT_CONFIG.copy()
         self._raw_phy_ber_cache = {}  # hostname -> { interface: raw_ber_float }
         self._l1_extras_cache = {}  # hostname -> { interface: {effective_ber, symbol_errors} }
@@ -148,17 +169,52 @@ class BERAnalyzer:
                 return
     
     def load_ber_history(self):
-        """Load historical BER data from file"""
+        """Load historical BER data from per-device shards.
+
+        A still-present monolithic ber_history.json is the authoritative
+        one-time migration source: it is loaded whole, and the next
+        save_ber_history() splits it into ber-history/<host>.json shards and
+        retires it (monitor.sh's analyzer transaction snapshots both sides,
+        so a failed run restores monolith and shard directory together).
+        """
+        monolith = f"{self.data_dir}/ber_history.json"
         try:
-            with open(f"{self.data_dir}/ber_history.json", "r") as f:
+            with open(monolith, "r") as f:
                 data = json.load(f)
-                self.ber_history = data.get("ber_history", {})
-                self.current_ber_stats = data.get("current_ber_stats", {})
-                
-                # Clean old data (older than retention period)
-                self.cleanup_old_history()
+            self.ber_history = data.get("ber_history", {})
+            self.current_ber_stats = data.get("current_ber_stats", {})
+            self._legacy_history_loaded = True
+            self.cleanup_old_history()
+            return
         except (FileNotFoundError, json.JSONDecodeError):
+            pass
+
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+        try:
+            shard_names = sorted(os.listdir(shard_dir))
+        except FileNotFoundError:
             print("No previous BER history found, starting fresh")
+            return
+        for name in shard_names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(shard_dir, name), "r") as f:
+                    shard = json.load(f)
+            except (OSError, UnicodeError, json.JSONDecodeError) as e:
+                # A corrupt or unreadable shard drops only this device's
+                # history; its trends restart from the current run.
+                print(f"Error reading BER history shard {name}: {e}")
+                continue
+            if not isinstance(shard, dict):
+                continue
+            history = shard.get("history", {})
+            if isinstance(history, dict):
+                self.ber_history.update(history)
+            current = shard.get("current", {})
+            if isinstance(current, dict):
+                self.current_ber_stats.update(current)
+        self.cleanup_old_history()
     
     def load_baseline_data(self):
         """Load baseline counter data for delta calculations"""
@@ -454,28 +510,174 @@ class BERAnalyzer:
             return mapping[physical]
         return None
     
+    @staticmethod
+    def _history_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        """Slim per-sample projection persisted in the history shards.
+
+        Later runs only read timestamp/ber_value/sample_status (trend and
+        retention) plus the newest integer symbol_errors (the L1 counter
+        baseline); ai_insights additionally reads delta_errors for its
+        error-onset events, so a positive count survives.  Absolute interface
+        counters live in ber_baseline.json and the current-run record, so
+        persisting them per history sample only inflated every load/save.
+        """
+        slim = {
+            "timestamp": record.get("timestamp"),
+            "ber_value": record.get("ber_value"),
+            "grade": record.get("grade"),
+            "sample_status": record.get("sample_status", "analyzed"),
+        }
+        symbol_errors = record.get("symbol_errors")
+        if isinstance(symbol_errors, int):
+            slim["symbol_errors"] = symbol_errors
+        delta_errors = record.get("delta_errors")
+        if delta_errors is None and (
+            record.get("delta_rx_errors") or record.get("delta_tx_errors")
+        ):
+            try:
+                delta_errors = (int(record.get("delta_rx_errors") or 0)
+                                + int(record.get("delta_tx_errors") or 0))
+            except (TypeError, ValueError):
+                delta_errors = None
+        if isinstance(delta_errors, int) and delta_errors > 0:
+            slim["delta_errors"] = delta_errors
+        return slim
+
+    def _write_history_shard(self, shard_dir: str, host: str,
+                             payload: Dict[str, Any]) -> Optional[str]:
+        try:
+            self._atomic_json_write(
+                os.path.join(shard_dir, f"{host}.json"),
+                {
+                    "version": 1,
+                    "updated_at": time.time(),
+                    "host": host,
+                    "history_schema_version": self.HISTORY_SCHEMA_VERSION,
+                    **payload,
+                },
+            )
+            return None
+        except Exception as exc:
+            return f"{host}: {type(exc).__name__}: {exc}"
+
     def save_ber_history(self):
-        """Save BER history to file"""
+        """Persist BER history/current snapshots into per-device shards.
+
+        Only devices carrying current-run evidence are rewritten (the
+        monolith forced a whole-fabric rewrite every run); untouched shards
+        keep their old samples, which the retention pass prunes on load.
+        """
         try:
             # Bound both newly collected data and legacy time-only history
             # before serialization.  current_ber_stats and baselines remain
             # independent, complete snapshots.
             self.cleanup_old_history()
-            data = {
-                "ber_history": self.ber_history,
-                "current_ber_stats": self.current_ber_stats,
-                "last_update": time.time(),
-                "config": self.config,
-                "history_schema_version": self.HISTORY_SCHEMA_VERSION,
-                "history_max_entries_per_port": self.MAX_HISTORY_ENTRIES_PER_PORT,
-            }
-            self._atomic_json_write(
-                f"{self.data_dir}/ber_history.json", data
+            shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+            # The directory itself is contractual (validated after every
+            # run) even when no device produced history this run.
+            os.makedirs(shard_dir, exist_ok=True)
+
+            by_host: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            for port_name, entries in self.ber_history.items():
+                host = port_name.split(":", 1)[0]
+                bucket = by_host.setdefault(
+                    host, {"history": {}, "current": {}}
+                )
+                bucket["history"][port_name] = [
+                    self._history_record(entry) for entry in entries
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("timestamp"), (int, float))
+                ]
+            for port_name, record in self.current_ber_stats.items():
+                host = port_name.split(":", 1)[0]
+                bucket = by_host.setdefault(
+                    host, {"history": {}, "current": {}}
+                )
+                bucket["current"][port_name] = record
+
+            if self._legacy_history_loaded:
+                dirty_hosts = set(by_host)
+            else:
+                dirty_hosts = {
+                    port_name.split(":", 1)[0]
+                    for port_name in self.current_ber_stats
+                }
+            unsafe_hosts = sorted(
+                host for host in dirty_hosts
+                if not SHARD_HOST_RE.fullmatch(host)
             )
+            if unsafe_hosts:
+                print("Refusing unsafe BER shard hostnames: "
+                      + ", ".join(unsafe_hosts))
+                return False
+
+            tasks = [
+                (host, by_host.get(host, {"history": {}, "current": {}}))
+                for host in sorted(dirty_hosts)
+            ]
+            errors: List[str] = []
+            if tasks:
+                # Small shards: json.dumps is cheap and the win is
+                # overlapping the per-file fsyncs.
+                workers = max(1, min(8, os.cpu_count() or 2, len(tasks)))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    for error in executor.map(
+                        lambda task: self._write_history_shard(
+                            shard_dir, task[0], task[1]
+                        ),
+                        tasks,
+                    ):
+                        if error is not None:
+                            errors.append(error)
+            if errors:
+                print("BER history shard writes failed: " + "; ".join(errors))
+                return False
+
+            if self._legacy_history_loaded:
+                # Every shard from the monolith is durably written; retire
+                # the legacy document (monitor.sh's analyzer transaction
+                # restores both sides together if this run later fails).
+                monolith = f"{self.data_dir}/ber_history.json"
+                try:
+                    os.unlink(monolith)
+                except FileNotFoundError:
+                    pass
+                try:
+                    analysis_sidecar.sidecar_path(monolith).unlink()
+                except OSError:
+                    pass
+                self._legacy_history_loaded = False
             return True
         except Exception as e:
             print(f"Error saving BER history: {e}")
             return False
+
+    def prune_history_shards(self, active_hosts) -> bool:
+        """Unlink per-device history shards for retired devices."""
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+        try:
+            shard_names = os.listdir(shard_dir)
+        except FileNotFoundError:
+            return True
+        ok = True
+        for name in shard_names:
+            if not name.endswith(".json"):
+                continue
+            host = name[: -len(".json")]
+            if host in active_hosts:
+                continue
+            shard_path = os.path.join(shard_dir, name)
+            try:
+                os.unlink(shard_path)
+            except OSError as exc:
+                print(f"❌ Could not prune retired BER shard {name}: {exc}")
+                ok = False
+                continue
+            try:
+                analysis_sidecar.sidecar_path(shard_path).unlink()
+            except OSError:
+                pass
+        return ok
 
     def _bound_port_history(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Retain trend inputs, recent context, and the latest L1 baseline."""
@@ -1613,6 +1815,7 @@ class BERAnalyzer:
                 <span id="filter-text"></span>
                 <button onclick="clearFilter()">Show All</button>
             </div>
+            <div id="hydration-progress" class="filter-info" style="display:none"><span id="hydration-progress-text"></span></div>
             <table class="ber-table" id="ber-table">
                 <thead>
                     <tr>
@@ -1651,9 +1854,15 @@ class BERAnalyzer:
         
         sorted_ports = sorted(all_ports, key=get_ber_priority)
 
-        # Per-port evidence surfaced in the expandable detail panel.  These are
-        # values the analyzer already computed; nothing new is collected.
-        port_details: Dict[str, Any] = {}
+        # Quiet rows (no warning/critical evidence) are deferred into an inert
+        # payload the page hydrates in chunks; detail-panel evidence is no
+        # longer embedded at all — it is fetched per device from the
+        # ber-history/ shards on first row expand.
+        inline_rows: List[str] = []
+        deferred_rows: List[str] = []
+        # Complete raw-key -> display-name device list for the search
+        # dropdown, so it never misses devices whose rows are still hydrating.
+        device_names: Dict[str, str] = {}
 
         # Flat rows for the public machine-readable export, built from the
         # same objects (and in the same problems-first order) as the table
@@ -1762,7 +1971,7 @@ class BERAnalyzer:
                 'delta_tx_dropped': port_info.get('delta_tx_dropped', 0),
                 'sample_window': sample_window,
             }
-            port_details[port_name] = detail
+            device_names.setdefault(str(device), canonical(device))
 
             self.export_rows.append({
                 'device': canonical(device),
@@ -1787,7 +1996,7 @@ class BERAnalyzer:
                 ),
             })
 
-            html_content += f"""
+            row_html = f"""
                 <tr class="ber-row" data-device-key="{device_key}" data-status="{status.lower()}" data-port="{port_key}" onclick="toggleBerDetails(this)">
                     <td>{canonical(device)}</td>
                     <td>{interface}</td>
@@ -1804,7 +2013,23 @@ class BERAnalyzer:
                     <td data-sort="{ts_sort}">{timestamp} / {sample_window}</td>
                 </tr>
 """
+            quiet = status.lower() in ("excellent", "good", "unknown")
+            (deferred_rows if quiet else inline_rows).append(row_html)
         
+        # A pathological fabric can put >cap rows in the attention set; keep
+        # first paint bounded by deferring the overflow ahead of quiet rows.
+        if len(inline_rows) > INLINE_ROW_CAP:
+            deferred_rows = inline_rows[INLINE_ROW_CAP:] + deferred_rows
+            inline_rows = inline_rows[:INLINE_ROW_CAP]
+        html_content += "".join(inline_rows)
+        deferred_count = len(deferred_rows)
+        deferred_script = (
+            f'<script type="text/html" id="ber-deferred-rows" '
+            f'data-count="{deferred_count}">'
+            + DEFERRED_ROW_SENTINEL.join(deferred_rows)
+            + '</script>'
+        ) if deferred_rows else ''
+
         if not sorted_ports:
             if coverage_partial:
                 empty_message = (
@@ -1825,6 +2050,7 @@ class BERAnalyzer:
             </table>
         </div>
     </div>
+    {deferred_script}
 
     <div class="dashboard-section">
         <div class="section-header">
@@ -1866,11 +2092,17 @@ class BERAnalyzer:
 
 """
         
-        details_json = json.dumps(
-            port_details, separators=(",", ":"), ensure_ascii=True
+        # Detail evidence is no longer embedded (at fabric scale the inline
+        # blob alone reached tens of MB); toggleBerDetails() fetches the
+        # per-device ber-history shard on first expand.  Only the complete
+        # [raw key, display name] device list ships inline so the search
+        # dropdown covers rows that are still hydrating.
+        device_list_json = json.dumps(
+            sorted(device_names.items()), separators=(",", ":"),
+            ensure_ascii=True
         ).replace("</", "<\\/")
         html_content += f"""
-    <script>window.__berPortDetails = {details_json};</script>
+    <script>window.__berDeviceList = {device_list_json};</script>
 """
 
         html_content += """
@@ -1888,17 +2120,110 @@ class BERAnalyzer:
         document.addEventListener('DOMContentLoaded', function() {
             // Store all real data rows for filtering (excludes empty-state / detail rows)
             allRows = Array.from(document.querySelectorAll('#ber-data tr.ber-row'));
-            
+
             // Add click events to summary cards
             setupCardEvents();
-            
+
             // Initialize table sorting
             initTableSorting();
-            
+
             // Initialize device search
             populateDeviceList();
             initDeviceSearch();
+
+            // Stream the deferred quiet rows in after first paint.
+            hydrateBerDeferredRows();
         });
+
+        // True when rows landed after the user's last explicit sort; the
+        // hydrator restores the chosen order once, at the end.
+        let rowsAppendedSinceSort = false;
+
+        // Mirrors the active card/device filter for rows that arrive during
+        // chunked hydration. Matches on data attributes only, so it stays
+        // correct when p2p-alias rewrites the displayed device names later.
+        function berRowHidden(row) {
+            if (deviceSearchActive && selectedDevice) {
+                return row.dataset.deviceKey !== selectedDevice;
+            }
+            if (currentFilter !== 'ALL' && currentFilter !== 'TOTAL') {
+                return row.dataset.status !== currentFilter.toLowerCase();
+            }
+            return false;
+        }
+
+        function updateHydrationProgress(done, total, finished) {
+            const box = document.getElementById('hydration-progress');
+            if (!box) return;
+            if (finished) { box.style.display = 'none'; return; }
+            box.style.display = 'block';
+            document.getElementById('hydration-progress-text').textContent =
+                'Loading port rows: ' + done.toLocaleString() + ' / '
+                + total.toLocaleString()
+                + ' — search, sort and CSV cover loaded rows until this finishes.';
+        }
+
+        // Chunked hydration of the deferred quiet rows. The inline table
+        // carries only rows that need attention, so first paint is instant;
+        // the rest stream into the tbody in batches that never block input.
+        function hydrateBerDeferredRows() {
+            const HYDRATION_CHUNK_ROWS = 1500;
+            const SENTINEL = '<!--=lldpq-row=-->';
+            const el = document.getElementById('ber-deferred-rows');
+            const body = document.getElementById('ber-data');
+            if (!el || !body) { updateHydrationProgress(0, 0, true); return; }
+            const total = parseInt(el.dataset.count || '0', 10) || 0;
+            const raw = el.textContent;
+            el.remove();
+            let pos = 0;
+            let done = 0;
+
+            function nextChunk() {
+                if (pos >= raw.length) {
+                    updateHydrationProgress(total, total, true);
+                    // Restore the user's chosen order in one pass, but only
+                    // when chunks actually landed after the sort.
+                    if (tableSortState.column >= 0 && rowsAppendedSinceSort) {
+                        const th = document.querySelector(
+                            '.sortable[data-column="' + tableSortState.column + '"]');
+                        sortBERTable(tableSortState.column,
+                                     tableSortState.direction,
+                                     th ? th.dataset.type : 'string');
+                    }
+                    return;
+                }
+                let end = pos;
+                let count = 0;
+                while (count < HYDRATION_CHUNK_ROWS && end < raw.length) {
+                    const i = raw.indexOf(SENTINEL, end);
+                    end = i === -1 ? raw.length : i + SENTINEL.length;
+                    count++;
+                }
+                // Strip the join sentinels before insertion: comment nodes
+                // interleaved with rows make later sorts pathologically slow.
+                body.insertAdjacentHTML(
+                    'beforeend', raw.slice(pos, end).replaceAll(SENTINEL, ''));
+                pos = end;
+                done = Math.min(total, done + count);
+                rowsAppendedSinceSort = true;
+                const kids = body.children;
+                const filtered = (deviceSearchActive && selectedDevice)
+                    || (currentFilter !== 'ALL' && currentFilter !== 'TOTAL');
+                for (let i = kids.length - count; i < kids.length; i++) {
+                    allRows.push(kids[i]);
+                    if (filtered) {
+                        kids[i].style.display = berRowHidden(kids[i]) ? 'none' : '';
+                    }
+                }
+                updateHydrationProgress(done, total, false);
+                setTimeout(nextChunk, 30);
+            }
+
+            updateHydrationProgress(0, total, false);
+            // Give first paint and the rest of DOMContentLoaded room to
+            // finish before the background build starts.
+            setTimeout(nextChunk, 80);
+        }
         
         function setupCardEvents() {
             console.log('BER: Setting up card events...');
@@ -2059,53 +2384,56 @@ class BERAnalyzer:
         }
         
         function populateDeviceList() {
-            const deviceSet = new Set();
-            allRows.forEach(row => {
-                // First column is the device name
-                const deviceName = row.cells[0]?.textContent?.trim();
-                if (deviceName) deviceSet.add(deviceName);
-            });
-            
-            const sortedDevices = Array.from(deviceSet).sort((a, b) => 
-                a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+            // Complete embedded [raw key, display name] list: the dropdown
+            // must never miss devices whose rows are still hydrating.
+            const pairs = Array.isArray(window.__berDeviceList) ? window.__berDeviceList : [];
+            pairs.sort((a, b) =>
+                String(a[1]).localeCompare(String(b[1]), undefined, { numeric: true, sensitivity: 'base' })
             );
-            
+
             const select = document.getElementById('deviceSearch');
             select.innerHTML = '<option value="">Search Device...</option>';
-            sortedDevices.forEach(device => {
+            pairs.forEach(pair => {
                 const option = document.createElement('option');
-                option.value = device;
-                option.textContent = device;
+                option.value = pair[0];
+                option.textContent = pair[1];
                 select.appendChild(option);
             });
         }
-        
-        function filterByDevice(deviceName) {
-            if (!deviceName) return;
-            
-            selectedDevice = deviceName;
+
+        function filterByDevice(deviceKey) {
+            if (!deviceKey) return;
+
+            selectedDevice = deviceKey;
             deviceSearchActive = true;
             removeBerDetailRows();
 
             // Clear card-based filter
             currentFilter = 'ALL';
             document.querySelectorAll('.summary-card').forEach(card => card.classList.remove('active'));
-            
-            // Filter table rows
+
+            // Match on data-device-key so this keeps working when p2p-alias
+            // rewrites the displayed device names.
             let matchCount = 0;
+            let displayName = deviceKey;
             allRows.forEach(row => {
-                const rowDeviceName = row.cells[0]?.textContent?.trim();
-                if (rowDeviceName === deviceName) {
+                if (row.dataset.deviceKey === deviceKey) {
+                    if (matchCount === 0) displayName = row.cells[0]?.textContent?.trim() || deviceKey;
                     row.style.display = '';
                     matchCount++;
                 } else {
                     row.style.display = 'none';
                 }
             });
-            
+
+            if (matchCount === 0) {
+                const pair = (window.__berDeviceList || []).find(p => p[0] === deviceKey);
+                if (pair) displayName = pair[1];
+            }
+
             // Show filter info
             document.getElementById('filter-info').style.display = 'block';
-            document.getElementById('filter-text').textContent = 'Showing interfaces for device: ' + deviceName + ' (' + matchCount + ' interfaces)';
+            document.getElementById('filter-text').textContent = 'Showing interfaces for device: ' + displayName + ' (' + matchCount + ' interfaces)';
             document.getElementById('clearSearchBtn').style.display = 'inline-block';
         }
         
@@ -2255,6 +2583,7 @@ class BERAnalyzer:
 
             // Re-append in sorted order (appendChild moves the existing nodes).
             rows.forEach(row => tbody.appendChild(row));
+            rowsAppendedSinceSort = false;
         }
         
         function comparePort(a, b) {
@@ -2328,40 +2657,78 @@ class BERAnalyzer:
             return isNaN(n) ? berEsc(String(v)) : n.toLocaleString();
         }
 
+        // Detail evidence is no longer embedded in the page (at fabric scale
+        // the inline blob alone reached tens of MB). Each device's history
+        // shard is fetched on first row expand and cached as a promise to
+        // dedupe concurrent clicks (pfc-ecn precedent).
+        const berDetailCache = new Map();
+        function berDeviceDetails(device) {
+            if (!device) return Promise.resolve(null);
+            if (berDetailCache.has(device)) return berDetailCache.get(device);
+            const request = fetch('ber-history/' + encodeURIComponent(device) + '.json', {cache: 'no-store'})
+                .then(response => {
+                    if (!response.ok) throw new Error('HTTP ' + response.status);
+                    return response.json();
+                })
+                .then(state => (state && typeof state === 'object' &&
+                    state.current && typeof state.current === 'object') ? state.current : {})
+                .catch(() => {
+                    berDetailCache.delete(device);
+                    return null;
+                });
+            berDetailCache.set(device, request);
+            return request;
+        }
+
+        function berFmtWindow(seconds) {
+            const n = Math.floor(Number(seconds));
+            if (!isFinite(n) || n < 0) return 'N/A';
+            if (n < 60) return n + 's';
+            if (n < 3600) return Math.floor(n / 60) + 'm' + String(n % 60).padStart(2, '0') + 's';
+            return Math.floor(n / 3600) + 'h' + String(Math.floor((n % 3600) / 60)).padStart(2, '0') + 'm';
+        }
+
+        let berDetailToken = 0;
         function toggleBerDetails(row) {
             const next = row.nextElementSibling;
-            if (next && next.classList.contains('detail-row')) { next.remove(); return; }
+            if (next && next.classList.contains('detail-row')) { next.remove(); berDetailToken++; return; }
             removeBerDetailRows();
-            const details = (window.__berPortDetails || {})[row.dataset.port];
-            if (!details) return;
-            const device = row.cells[0] ? row.cells[0].textContent.trim() : '';
-            const iface = row.cells[1] ? row.cells[1].textContent.trim() : '';
-            const reasons = Array.isArray(details.severity_reasons) ? details.severity_reasons : [];
-            const reasonsHtml = reasons.length
-                ? '<ul class="detail-reasons">' + reasons.map(function(r) { return '<li>' + berEsc(r) + '</li>'; }).join('') + '</ul>'
-                : '<div class="detail-none">No warning/critical evidence — link is within thresholds.</div>';
-            const symText = (details.symbol_error_delta !== null && details.symbol_error_delta !== undefined)
-                ? ('+' + berFmtInt(details.symbol_error_delta) + ' since last sample (total ' + berFmtInt(details.symbol_errors) + ')')
-                : berFmtInt(details.symbol_errors);
-            const detail = document.createElement('tr');
-            detail.className = 'detail-row';
-            detail.innerHTML = '<td colspan="11"><div class="detail-panel">'
-                + '<div class="detail-title">' + berEsc(device) + ' : ' + berEsc(iface) + '</div>'
-                + '<div class="detail-kv">'
-                + '<span>Status</span><span>' + berEsc(String(details.status || '').toUpperCase()) + '</span>'
-                + '<span>Sample State</span><span>' + berEsc(String(details.sample_status || 'analyzed')) + '</span>'
-                + '<span>Frame Error Density</span><span>' + berFmtBer(details.frame_error_density) + '</span>'
-                + '<span>Physical BER (pre-FEC)</span><span>' + berFmtBer(details.raw_ber) + '</span>'
-                + '<span>Effective BER (post-FEC)</span><span>' + berFmtBer(details.effective_ber) + '</span>'
-                + '<span>PHY Symbol Errors</span><span>' + berEsc(symText) + '</span>'
-                + '<span>&Delta; Packets / RX Err / TX Err</span><span>' + berFmtInt(details.delta_packets) + ' / ' + berFmtInt(details.delta_rx_errors) + ' / ' + berFmtInt(details.delta_tx_errors) + '</span>'
-                + '<span>&Delta; RX Drop / TX Drop</span><span>' + berFmtInt(details.delta_rx_dropped) + ' / ' + berFmtInt(details.delta_tx_dropped) + '</span>'
-                + '<span>Sample Window</span><span>' + berEsc(String(details.sample_window || 'N/A')) + '</span>'
-                + '</div>'
-                + '<div><strong style="color:#d4d4d4;">Severity evidence:</strong></div>'
-                + reasonsHtml
-                + '</div></td>';
-            row.after(detail);
+            const token = ++berDetailToken;
+            berDeviceDetails(row.dataset.deviceKey || '').then(function(current) {
+                // The panel may have been superseded (or its row sorted away)
+                // while the shard loaded.
+                if (token !== berDetailToken || !document.body.contains(row)) return;
+                const details = (current || {})[row.dataset.port];
+                if (!details) return;
+                const device = row.cells[0] ? row.cells[0].textContent.trim() : '';
+                const iface = row.cells[1] ? row.cells[1].textContent.trim() : '';
+                const reasons = Array.isArray(details.severity_reasons) ? details.severity_reasons : [];
+                const reasonsHtml = reasons.length
+                    ? '<ul class="detail-reasons">' + reasons.map(function(r) { return '<li>' + berEsc(r) + '</li>'; }).join('') + '</ul>'
+                    : '<div class="detail-none">No warning/critical evidence — link is within thresholds.</div>';
+                const symText = (details.symbol_error_delta !== null && details.symbol_error_delta !== undefined)
+                    ? ('+' + berFmtInt(details.symbol_error_delta) + ' since last sample (total ' + berFmtInt(details.symbol_errors) + ')')
+                    : berFmtInt(details.symbol_errors);
+                const detail = document.createElement('tr');
+                detail.className = 'detail-row';
+                detail.innerHTML = '<td colspan="13"><div class="detail-panel">'
+                    + '<div class="detail-title">' + berEsc(device) + ' : ' + berEsc(iface) + '</div>'
+                    + '<div class="detail-kv">'
+                    + '<span>Status</span><span>' + berEsc(String(details.effective_grade || row.dataset.status || '').toUpperCase()) + '</span>'
+                    + '<span>Sample State</span><span>' + berEsc(String(details.sample_status || 'analyzed')) + '</span>'
+                    + '<span>Frame Error Density</span><span>' + berFmtBer(details.ber_value) + '</span>'
+                    + '<span>Physical BER (pre-FEC)</span><span>' + berFmtBer(details.raw_ber) + '</span>'
+                    + '<span>Effective BER (post-FEC)</span><span>' + berFmtBer(details.effective_ber) + '</span>'
+                    + '<span>PHY Symbol Errors</span><span>' + berEsc(symText) + '</span>'
+                    + '<span>&Delta; Packets / RX Err / TX Err</span><span>' + berFmtInt(details.delta_packets) + ' / ' + berFmtInt(details.delta_rx_errors) + ' / ' + berFmtInt(details.delta_tx_errors) + '</span>'
+                    + '<span>&Delta; RX Drop / TX Drop</span><span>' + berFmtInt(details.delta_rx_dropped) + ' / ' + berFmtInt(details.delta_tx_dropped) + '</span>'
+                    + '<span>Sample Window</span><span>' + berEsc(berFmtWindow(details.sample_duration_seconds)) + '</span>'
+                    + '</div>'
+                    + '<div><strong style="color:#d4d4d4;">Severity evidence:</strong></div>'
+                    + reasonsHtml
+                    + '</div></td>';
+                row.after(detail);
+            });
         }
 
         // Run Analysis Function
@@ -2552,7 +2919,7 @@ class BERAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260716-tf-3"></script>
+    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

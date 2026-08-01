@@ -219,9 +219,31 @@ def _normalized_ber_grade(record):
     return max(candidates, key=lambda value: priority.get(value, 0)) if candidates else ""
 
 
+def _load_ber_current_stats(mr_dir):
+    """Merged current BER records from the per-device ber-history/ shards.
+
+    The monolithic ber_history.json remains the fallback until its one-time
+    shard migration runs.
+    """
+    shard_dir = os.path.join(mr_dir, "ber-history")
+    try:
+        names = [n for n in os.listdir(shard_dir) if n.endswith(".json")]
+    except OSError:
+        names = []
+    if not names:
+        document = _load_json(os.path.join(mr_dir, "ber_history.json"))
+        return (document or {}).get("current_ber_stats")
+    stats = {}
+    for name in sorted(names):
+        payload = _load_json(os.path.join(shard_dir, name)) or {}
+        current = payload.get("current")
+        if isinstance(current, dict):
+            stats.update(current)
+    return stats
+
+
 def _collect_ber(mr_dir):
-    document = _load_json(os.path.join(mr_dir, "ber_history.json"))
-    stats = (document or {}).get("current_ber_stats")
+    stats = _load_ber_current_stats(mr_dir)
     anomalies = []
     for key in sorted(stats if isinstance(stats, dict) else {}):
         record = stats[key]
@@ -242,7 +264,7 @@ def _collect_ber(mr_dir):
         elif density is not None:
             detail += "; frame error-event density %.3g" % density
         anomalies.append(_anomaly(
-            "ber", device, port, "grade", grade, grade, detail, "ber_history.json",
+            "ber", device, port, "grade", grade, grade, detail, "ber-history/",
         ))
     return anomalies
 

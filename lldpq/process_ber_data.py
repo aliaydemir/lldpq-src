@@ -162,6 +162,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             for port_name in list(mapping):
                 if port_name.split(":", 1)[0] not in active_hosts:
                     del mapping[port_name]
+        if not ber_analyzer.prune_history_shards(active_hosts):
+            return False
 
     current_files = [
         filename for filename in os.listdir(data_dir)
@@ -403,13 +405,17 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
         print("❌ BER history state could not be saved")
         return False
 
-    for required_state in (
-        os.path.join(result_dir, "ber_baseline.json"),
-        os.path.join(result_dir, "ber_history.json"),
-    ):
-        if not os.path.isfile(required_state) or os.path.getsize(required_state) == 0:
-            print(f"❌ BER state was not saved: {required_state}")
-            return False
+    baseline_state = os.path.join(result_dir, "ber_baseline.json")
+    if not os.path.isfile(baseline_state) or os.path.getsize(baseline_state) == 0:
+        print(f"❌ BER state was not saved: {baseline_state}")
+        return False
+    # History lives in per-device shards; the directory itself is the
+    # contractual artifact (it may legitimately be empty on a run where no
+    # device produced counters).
+    history_dir = os.path.join(result_dir, "ber-history")
+    if not os.path.isdir(history_dir):
+        print(f"❌ BER state was not saved: {history_dir}")
+        return False
     
     print("\nLink Error / BER Analysis Summary:")
     print(f"  Total devices processed: {processed_devices}")

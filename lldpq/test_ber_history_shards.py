@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Per-device BER history shards (ber-history/) and their consumers.
+
+Mirrors the PFC/ECN shard contract: slim per-sample records, one-time
+monolith migration inside the analyzer transaction, retired-host pruning,
+and shard-first fallback readers in check_alerts / ai-api / ai_insights /
+ai_correlate.
+"""
+
+import json
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from ber_analyzer import BERAnalyzer
+
+
+def _record(ts, **extra):
+    base = {
+        "timestamp": ts,
+        "ber_value": 0.0,
+        "grade": "excellent",
+        "sample_status": "analyzed",
+        "rx_packets": 1000,
+        "tx_packets": 1000,
+        "rx_errors": 0,
+        "tx_errors": 0,
+        "total_packets": 2000,
+        "delta_rx_errors": 0,
+        "delta_tx_errors": 0,
+        "sample_duration_seconds": 60,
+    }
+    base.update(extra)
+    return base
+
+
+class BerShardFunctionalTests(unittest.TestCase):
+    def _tmp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return temporary.name
+
+    def test_save_writes_only_dirty_hosts_with_slim_records(self):
+        tmp = self._tmp()
+        analyzer = BERAnalyzer(tmp)
+        now = time.time()
+        analyzer.ber_history = {
+            "leaf1:swp1": [_record(now - 100, symbol_errors=42,
+                                   delta_rx_errors=3, delta_tx_errors=1)],
+            "leaf2:swp9": [_record(now - 50)],
+        }
+        analyzer.current_ber_stats = {
+            "leaf1:swp1": _record(now, effective_grade="excellent"),
+        }
+        self.assertTrue(analyzer.save_ber_history())
+        shard_dir = Path(tmp) / "ber-history"
+        names = sorted(p.name for p in shard_dir.glob("*.json"))
+        # leaf2 carries no current-run evidence: its shard is not rewritten.
+        self.assertEqual(names, ["leaf1.json"])
+        shard = json.loads((shard_dir / "leaf1.json").read_text())
+        slim = shard["history"]["leaf1:swp1"][0]
+        self.assertEqual(
+            set(slim),
+            {"timestamp", "ber_value", "grade", "sample_status",
+             "symbol_errors", "delta_errors"},
+        )
+        self.assertEqual(slim["symbol_errors"], 42)
+        self.assertEqual(slim["delta_errors"], 4)
+        # The current record stays complete for the detail panel.
+        self.assertEqual(
+            shard["current"]["leaf1:swp1"]["effective_grade"], "excellent")
+        # Producer digest sidecar rides every shard.
+        self.assertTrue((shard_dir / "leaf1.json.sha256").exists())
+
+    def test_reload_round_trip_from_shards(self):
+        tmp = self._tmp()
+        analyzer = BERAnalyzer(tmp)
+        now = time.time()
+        analyzer.ber_history = {"leaf1:swp1": [_record(now - 10)]}
+        analyzer.current_ber_stats = {"leaf1:swp1": _record(now)}
+        self.assertTrue(analyzer.save_ber_history())
+        reloaded = BERAnalyzer(tmp)
+        self.assertIn("leaf1:swp1", reloaded.ber_history)
+        self.assertIn("leaf1:swp1", reloaded.current_ber_stats)
+
+    def test_legacy_monolith_migrates_and_retires(self):
+        tmp = self._tmp()
+        now = time.time()
+        monolith = {
+            "ber_history": {
+                "leaf1:swp1": [_record(now - 10)],
+                "leaf9:swp2": [_record(now - 20)],
+            },
+            "current_ber_stats": {"leaf1:swp1": _record(now - 10)},
+        }
+        (Path(tmp) / "ber_history.json").write_text(json.dumps(monolith))
+        analyzer = BERAnalyzer(tmp)
+        self.assertTrue(analyzer._legacy_history_loaded)
+        self.assertTrue(analyzer.save_ber_history())
+        self.assertFalse((Path(tmp) / "ber_history.json").exists(),
+                         "monolith must retire after migration")
+        names = sorted(
+            p.name for p in (Path(tmp) / "ber-history").glob("*.json"))
+        self.assertEqual(names, ["leaf1.json", "leaf9.json"])
+
+    def test_unsafe_hostname_refused(self):
+        tmp = self._tmp()
+        analyzer = BERAnalyzer(tmp)
+        analyzer.current_ber_stats = {"../evil:swp1": _record(time.time())}
+        self.assertFalse(analyzer.save_ber_history())
+
+    def test_prune_removes_retired_host_shards(self):
+        tmp = self._tmp()
+        analyzer = BERAnalyzer(tmp)
+        now = time.time()
+        analyzer.current_ber_stats = {
+            "leaf1:swp1": _record(now),
+            "leaf2:swp1": _record(now),
+        }
+        self.assertTrue(analyzer.save_ber_history())
+        self.assertTrue(analyzer.prune_history_shards({"leaf1"}))
+        names = sorted(
+            p.name for p in (Path(tmp) / "ber-history").glob("*.json"))
+        self.assertEqual(names, ["leaf1.json"])
+
+
+class BerShardConsumerContractTests(unittest.TestCase):
+    """Every reader of the former monolith must be shard-first."""
+
+    def test_check_alerts_reads_the_device_shard_first(self):
+        source = (SCRIPT_DIR / "check_alerts.py").read_text(encoding="utf-8")
+        self.assertIn('"ber-history" / f"{device}.json"', source)
+        self.assertIn('payload.get("current", {})', source)
+
+    def test_ai_api_merges_shards_with_monolith_fallback(self):
+        source = (SCRIPT_DIR.parent / "html" / "ai-api.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("def _load_ber_current_stats(hosts=None):", source)
+        self.assertEqual(source.count("_load_ber_current_stats("), 3)
+        self.assertIn("os.path.isdir(_mr_path('ber-history'))", source)
+
+    def test_ai_insights_streams_shards(self):
+        source = (SCRIPT_DIR.parent / "html" / "ai_insights.py").read_text(
+            encoding="utf-8")
+        self.assertIn("def _ber_history_source(", source)
+        self.assertIn('("ber", _extract_ber, _ber_history_source(monitor, web)),',
+                      source)
+
+    def test_ai_correlate_merges_shards(self):
+        source = (SCRIPT_DIR.parent / "html" / "ai_correlate.py").read_text(
+            encoding="utf-8")
+        self.assertIn("def _load_ber_current_stats(mr_dir):", source)
+        self.assertIn('os.path.join(mr_dir, "ber-history")', source)
+
+    def test_monitor_registers_the_shard_directory(self):
+        source = (SCRIPT_DIR / "monitor.sh").read_text(encoding="utf-8")
+        self.assertIn("ber-history/", source)
+        # Scoped BER runs overlay the shard directory, not the monolith.
+        self.assertIn(
+            "ber-analysis.html ber_baseline.json ber-data ber-history",
+            source,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
