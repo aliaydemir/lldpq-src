@@ -123,6 +123,15 @@ cd lldpq-src
 - **system logs**: critical/error/warning/info counts with current-device
   coverage and per-device findings
 - **topology validation**: lldp neighbor verification against expected topology
+- **event timeline**: one chronological, cross-domain feed (`/timeline.html`)
+  of route drops / disappeared VRFs, config drift, link flaps, BGP down-count
+  transitions and ISO-stamped critical/error log lines, with an activity
+  histogram, range/domain/device filters and CSV export. Analyzers publish
+  compact per-domain sidecars under `monitor-results/events/` (capped at 500
+  events / 30 days per domain; best-effort, outside the analyzer rollback
+  transaction), so the page stays lightweight at any fabric size. Detail
+  panels on the Routes and PFC/ECN pages additionally render inline
+  trend sparklines from the per-device history shards.
 - **config drift**: change tracking over the collected `nv config show -o
   commands` exports. get-conf keeps only the current file per device, so the
   analyzer maintains its own per-device baseline copy, diffs every new

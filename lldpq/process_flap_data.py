@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from datetime import datetime
+import analysis_events
 import export_artifacts
 from link_flap_analyzer import LinkFlapAnalyzer
 from collection_freshness import (
@@ -203,6 +204,10 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     if not os.path.isfile(history_file) or os.path.getsize(history_file) == 0:
         print("Flap history could not be saved")
         return False
+
+    # Timeline sidecar (best-effort; publish_events never raises).
+    analysis_events.publish_events(
+        result_dir, "flap", flap_analyzer.cycle_events)
     
     # Generate web report
     output_file = os.path.join(result_dir, "link-flap-analysis.html")

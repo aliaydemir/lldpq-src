@@ -16,6 +16,7 @@ import time
 import html
 import tempfile
 
+import analysis_events
 import analysis_sidecar
 import export_artifacts
 from datetime import datetime, timedelta, timezone
@@ -174,6 +175,7 @@ class BGPAnalyzer:
         self.data_dir = data_dir
         self.bgp_history = {}  # hostname -> BGP historical data
         self.current_bgp_stats = {}  # hostname -> current BGP neighbors
+        self.cycle_events = []  # down-count transitions THIS run (Timeline)
         self.current_evpn_stats = {}  # hostname -> EVPN statistics
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
         self.collection_coverage = {
@@ -273,6 +275,9 @@ class BGPAnalyzer:
             )
         except Exception as e:
             print(f"Error saving BGP history: {e}")
+        # Timeline sidecar (best-effort; publish_events never raises).
+        analysis_events.publish_events(
+            self.data_dir, "bgp", self.cycle_events)
     
     def cleanup_old_history(self):
         """Remove history entries older than retention period"""
@@ -670,7 +675,42 @@ class BGPAnalyzer:
             "warning_neighbors": warning_neighbors,
             "critical_neighbors": critical_neighbors,
         }
-        
+
+        # Timeline sidecar: device-level down-count transitions between the
+        # previous and current cycle. History keeps counters only (the full
+        # neighbor lists were deliberately dropped from snapshots), so the
+        # event is device-granular by design.
+        previous_entry = self.bgp_history[hostname][-1] \
+            if self.bgp_history[hostname] else None
+        if isinstance(previous_entry, dict):
+            try:
+                previous_down = int(previous_entry.get("down_count") or 0)
+            except (TypeError, ValueError):
+                previous_down = 0
+            current_down = history_entry["down_count"]
+            if current_down > previous_down:
+                self.cycle_events.append({
+                    "ts": int(time.time()),
+                    "severity": "critical" if critical_neighbors else "warning",
+                    "device": hostname,
+                    "object": "bgp",
+                    "kind": "bgp-neighbors-down",
+                    "detail": "down neighbors %d → %d (of %d)" % (
+                        previous_down, current_down,
+                        history_entry["total_neighbors"]),
+                })
+            elif current_down < previous_down:
+                self.cycle_events.append({
+                    "ts": int(time.time()),
+                    "severity": "info",
+                    "device": hostname,
+                    "object": "bgp",
+                    "kind": "bgp-neighbors-recovered",
+                    "detail": "down neighbors %d → %d (of %d)" % (
+                        previous_down, current_down,
+                        history_entry["total_neighbors"]),
+                })
+
         self.bgp_history[hostname].append(history_entry)
         
         # Keep only last 50 entries

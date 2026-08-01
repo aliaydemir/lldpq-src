@@ -1613,6 +1613,23 @@ function pfcTime(value) {{
     ? pfcEsc(value)
     : d.toISOString().replace('T', ' ').replace(/\\.\\d+Z$/, ' UTC').replace('Z', ' UTC');
 }}
+function pfcSpark(values, width, height) {{
+  if (!Array.isArray(values) || values.length < 2) return '';
+  const w = width || 300, h = height || 36, pad = 3;
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = (max - min) || 1;
+  const step = (w - pad * 2) / (values.length - 1);
+  const coords = values.map((v, i) => {{
+    const x = pad + i * step;
+    const y = h - pad - ((v - min) / span) * (h - pad * 2);
+    return [x.toFixed(1), y.toFixed(1)];
+  }});
+  const points = coords.map(c => c[0] + ',' + c[1]).join(' ');
+  const last = coords[coords.length - 1];
+  return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="display:block">'
+    + '<polyline points="' + points + '" fill="none" stroke="#76b900" stroke-width="1.5"/>'
+    + '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="2.5" fill="#76b900"/></svg>';
+}}
 async function togglePfcDetails(row) {{
   const next = row.nextElementSibling;
   if (next && next.classList.contains('detail-row')) {{ next.remove(); return; }}
@@ -1628,7 +1645,8 @@ async function togglePfcDetails(row) {{
   // The panel may have been closed (or replaced) while the shard loaded.
   const body = detail.isConnected && detail.querySelector('.detail-body');
   if (!body) return;
-  const samples = history === null ? [] : pfcTrail(history[key]).reverse();
+  const trail = history === null ? [] : pfcTrail(history[key]);
+  const samples = trail.slice().reverse();
   if (history === null) {{
     body.textContent = 'Sample history could not be loaded.';
   }} else if (!samples.length) {{
@@ -1640,7 +1658,18 @@ async function togglePfcDetails(row) {{
       + `<td>${{pfcNum(s.ecn)}}</td><td>${{pfcPct(s.share)}}</td><td>${{pfcNum(s.rx)}}</td>`
       + `<td>${{pfcNum(s.tx)}}</td><td>${{pfcNum(s.loss)}}</td></tr>`
     ).join('');
-    body.innerHTML = `<table class="detail-table"><thead><tr><th>Sample (UTC)</th><th>Signal</th>`
+    // ECN-delta trend over the retained samples (chronological order).
+    let trend = '';
+    const ecnSeries = trail.map(s => Number(s.ecn)).filter(Number.isFinite);
+    if (ecnSeries.length >= 2) {{
+      trend = `<div style="margin:0 0 12px">`
+        + `<div style="color:#888;font-size:11px;margin:0 0 4px">ECN Δ trend — `
+        + `${{ecnSeries.length}} samples, max ${{Math.max(...ecnSeries).toLocaleString()}}, `
+        + `latest ${{ecnSeries[ecnSeries.length - 1].toLocaleString()}}</div>`
+        + pfcSpark(ecnSeries) + `</div>`;
+    }}
+    body.innerHTML = trend
+      + `<table class="detail-table"><thead><tr><th>Sample (UTC)</th><th>Signal</th>`
       + `<th>ECN Δ</th><th>ECN %</th><th>PFC RX Δ</th><th>PFC TX Δ</th><th>Discard Δ</th></tr></thead>`
       + `<tbody>${{rowsHtml}}</tbody></table>`;
   }}

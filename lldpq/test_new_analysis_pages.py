@@ -84,6 +84,10 @@ class ConfigDriftAnalyzerTests(unittest.TestCase):
             self.assertEqual(event["host"], "Leaf1")
             self.assertEqual(event["type"], "modified")
             self.assertEqual((event["added"], event["removed"]), (1, 1))
+            sidecar = json.loads(
+                (Path(tmp) / "monitor-results" / "events" /
+                 "config-drift.json").read_text())
+            self.assertEqual(sidecar["events"][0]["kind"], "config-modified")
 
             page = (Path(tmp) / "monitor-results" /
                     "config-drift-analysis.html").read_text()
@@ -165,6 +169,11 @@ class RoutesAnalyzerTests(unittest.TestCase):
                 (Path(tmp) / "monitor-results" / "routes-history" /
                  "Leaf1.json").read_text())
             self.assertEqual(len(shard["history"]), 2)
+            sidecar = json.loads(
+                (Path(tmp) / "monitor-results" / "events" /
+                 "routes.json").read_text())
+            self.assertEqual({event["kind"] for event in sidecar["events"]},
+                             {"route-drop", "vrf-disappeared"})
             page = (Path(tmp) / "monitor-results" /
                     "routes-analysis.html").read_text()
             self.assertIn('data-analysis-summary="routes"', page)

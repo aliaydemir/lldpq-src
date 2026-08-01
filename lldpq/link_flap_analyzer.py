@@ -89,6 +89,7 @@ class LinkFlapAnalyzer:
         self.prev_cumulative = {}  # port -> last cycle's cumulative carrier_changes (persisted baseline)
         self.prev_sample_time = {}  # port -> timestamp of persisted baseline
         self.flapping_counters = {}  # port -> {period: count}
+        self.cycle_events = []  # flaps detected THIS run (Timeline sidecar)
         self._port_cache = {}  # Cache for calculated port status/counters
         self._export_rows = None  # Cache for get_export_rows()
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
@@ -338,6 +339,18 @@ class LinkFlapAnalyzer:
                         interval_start,
                         interval_seconds,
                     ))
+                    # Timeline sidecar record for this cycle's detected flaps.
+                    device, _, interface = port_name.partition(":")
+                    flaps = delta // 2
+                    self.cycle_events.append({
+                        "ts": int(curr_time),
+                        "severity": "critical" if flaps >= 5 else "warning",
+                        "device": device,
+                        "object": interface or port_name,
+                        "kind": "link-flap",
+                        "detail": "%d flap(s) within %ds poll interval" % (
+                            flaps, int(interval_seconds)),
+                    })
         # current < prev => counter reset (e.g. reboot); skip this cycle and just re-baseline below.
         self.prev_cumulative[port_name] = current_transitions
         self.prev_sample_time[port_name] = curr_time

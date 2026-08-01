@@ -36,6 +36,7 @@ import sys
 import tempfile
 import time
 
+import analysis_events
 import export_artifacts
 
 try:
@@ -354,6 +355,21 @@ class ConfigDriftAnalyzer:
         _atomic_write(self.history_path, json.dumps(
             {"version": 1, "last_update": self.now, "events": self.events},
             separators=(",", ":")) + "\n")
+        # Timeline sidecar (best-effort; publish_events never raises).
+        analysis_events.publish_events(self.result_dir, "config-drift", [
+            {
+                "ts": event.get("ts"),
+                "severity": "warning",
+                "device": event.get("host"),
+                "object": "config",
+                "kind": "config-modified",
+                "detail": "+%s/−%s lines — %s" % (
+                    event.get("added"), event.get("removed"),
+                    event.get("summary")),
+            }
+            for event in self.events
+            if event.get("type") == "modified"
+        ], now=self.now)
 
     def export_rows(self):
         rows = []

@@ -34,6 +34,7 @@ import sys
 import tempfile
 import time
 
+import analysis_events
 import export_artifacts
 
 try:
@@ -353,6 +354,19 @@ class RoutesAnalyzer:
         _atomic_write(self.events_path, json.dumps(
             {"version": 1, "last_update": self.now, "events": self.events},
             separators=(",", ":")) + "\n")
+        # Timeline sidecar (best-effort; publish_events never raises).
+        analysis_events.publish_events(self.result_dir, "routes", [
+            {
+                "ts": event.get("ts"),
+                "severity": "critical",
+                "device": event.get("host"),
+                "object": event.get("vrf"),
+                "kind": event.get("kind"),
+                "detail": "routes %s → %s" % (
+                    event.get("prev"), event.get("current")),
+            }
+            for event in self.events
+        ], now=self.now)
 
     def export_rows(self):
         rows = []
@@ -776,10 +790,46 @@ function rtDeviceSnapshot(device){
   rtSnapshotCache.set(device, request);
   return request;
 }
+var rtHistoryCache = new Map();
+function rtHistoryShard(device){
+  if(!device) return Promise.resolve(null);
+  if(rtHistoryCache.has(device)) return rtHistoryCache.get(device);
+  var request = fetch('routes-history/' + encodeURIComponent(device) + '.json', {cache:'no-store'})
+    .then(function(response){
+      if(!response.ok) throw new Error('HTTP ' + response.status);
+      return response.json();
+    })
+    .then(function(shard){
+      return (shard && Array.isArray(shard.history)) ? shard.history : null;
+    })
+    .catch(function(){
+      rtHistoryCache.delete(device);
+      return null;
+    });
+  rtHistoryCache.set(device, request);
+  return request;
+}
 function rtEsc(value){
   return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch){
     return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
   });
+}
+function rtSpark(values, width, height){
+  if(!Array.isArray(values) || values.length < 2) return '';
+  var w = width || 300, h = height || 36, pad = 3;
+  var min = Math.min.apply(null, values), max = Math.max.apply(null, values);
+  var span = (max - min) || 1;
+  var step = (w - pad * 2) / (values.length - 1);
+  var coords = values.map(function(v, i){
+    var x = pad + i * step;
+    var y = h - pad - ((v - min) / span) * (h - pad * 2);
+    return [x.toFixed(1), y.toFixed(1)];
+  });
+  var points = coords.map(function(c){ return c[0] + ',' + c[1]; }).join(' ');
+  var last = coords[coords.length - 1];
+  return '<svg width="' + w + '" height="' + h + '" viewBox="0 0 ' + w + ' ' + h + '" style="display:block">'
+    + '<polyline points="' + points + '" fill="none" stroke="#76b900" stroke-width="1.5"/>'
+    + '<circle cx="' + last[0] + '" cy="' + last[1] + '" r="2.5" fill="#76b900"/></svg>';
 }
 function rtNexthopCell(entry){
   var hops = Array.isArray(entry.ecmp_nexthops) ? entry.ecmp_nexthops : [];
@@ -811,7 +861,8 @@ async function toggleRouteDetails(row){
     + '<div class="detail-title">Route table &mdash; ' + rtEsc(device) + ' / VRF ' + rtEsc(vrf) + '</div>'
     + '<div class="detail-body detail-empty">Loading route table&hellip;</div></div></td>';
   row.after(detail);
-  var snapshot = await rtDeviceSnapshot(device);
+  var loaded = await Promise.all([rtDeviceSnapshot(device), rtHistoryShard(device)]);
+  var snapshot = loaded[0], shardHistory = loaded[1];
   var body = detail.isConnected && detail.querySelector('.detail-body');
   if(!body) return;
   if(snapshot === null){
@@ -844,7 +895,30 @@ async function toggleRouteDetails(row){
   if(collected){
     note += '<div class="detail-note">Snapshot: ' + rtEsc(String(collected).replace('T', ' ').slice(0, 19)) + '</div>';
   }
-  body.innerHTML = '<table class="detail-table"><thead><tr><th class="mono">Prefix</th>'
+  // Route-count trend from the per-device history shard (48h of samples).
+  var trend = '';
+  if(Array.isArray(shardHistory)){
+    var series = [];
+    shardHistory.forEach(function(record){
+      if(record && record.vrfs && typeof record.vrfs === 'object' &&
+         record.vrfs[vrf] && typeof record.vrfs[vrf] === 'object'){
+        var total = Number(record.vrfs[vrf].total);
+        if(Number.isFinite(total)) series.push(total);
+      }
+    });
+    if(series.length >= 2){
+      var minValue = Math.min.apply(null, series);
+      var maxValue = Math.max.apply(null, series);
+      trend = '<div style="margin:0 0 12px">'
+        + '<div class="detail-note" style="margin:0 0 4px">Route count trend &mdash; '
+        + series.length + ' samples, min ' + minValue.toLocaleString()
+        + ', max ' + maxValue.toLocaleString()
+        + ', now ' + series[series.length - 1].toLocaleString() + '</div>'
+        + rtSpark(series) + '</div>';
+    }
+  }
+  body.innerHTML = trend
+    + '<table class="detail-table"><thead><tr><th class="mono">Prefix</th>'
     + '<th>Protocol</th><th>Nexthop(s)</th><th>Interface</th><th>Metric</th></tr></thead>'
     + '<tbody>' + rowsHtml + '</tbody></table>' + note;
 }

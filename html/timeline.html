@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Event Timeline</title>
+<link rel="shortcut icon" href="/png/favicon.ico">
+<link rel="stylesheet" type="text/css" href="/css/select2.min.css">
+<link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; background:#1e1e1e; color:#d4d4d4; padding:20px; min-height:100vh; }
+.page-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; padding-bottom:15px; border-bottom:1px solid #404040; }
+.page-title { font-size:24px; font-weight:600; color:#76b900; }
+.last-updated { font-size:13px; color:#888; }
+.dashboard-section { background:#2d2d2d; border-radius:8px; margin-bottom:20px; overflow:hidden; }
+.section-header { padding:12px 16px; background:#333; font-weight:600; font-size:14px; color:#76b900; border-bottom:1px solid #404040; }
+.section-content { padding:16px; }
+.summary-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; }
+.summary-card { background:#252526; padding:15px; border-radius:6px; border-left:3px solid #76b900; cursor:pointer; transition:all 0.15s; }
+.summary-card:hover { background:#2d2d2d; transform:translateY(-1px); }
+.summary-card.inactive { opacity:0.38; }
+.summary-card.nodata { opacity:0.38; cursor:default; }
+.summary-card.nodata:hover { background:#252526; transform:none; }
+.card-routes { border-left-color:#4fc3f7; }
+.card-config-drift { border-left-color:#ba68c8; }
+.card-flap { border-left-color:#ff9800; }
+.card-bgp { border-left-color:#f44336; }
+.card-log { border-left-color:#9ccc65; }
+.metric { font-size:22px; font-weight:bold; color:#d4d4d4; }
+.metric-label { font-size:12px; color:#888; margin-top:4px; }
+table.tl-table { width:100%; border-collapse:collapse; font-size:13px; }
+.tl-table th, .tl-table td { border:1px solid #404040; padding:9px 11px; text-align:left; vertical-align:top; }
+.tl-table th { background:#333; color:#76b900; font-weight:600; font-size:12px; cursor:pointer; user-select:none; }
+.tl-table th:hover { background:#3c3c3c; }
+.tl-table tbody tr { background:#252526; }
+.tl-table tbody tr:hover { background:#2d2d2d; }
+.mono { font-family:'Consolas','Courier New',monospace; font-size:12px; }
+.dim { color:#888; font-size:11px; }
+.empty { text-align:center; color:#76b900; padding:18px; }
+.empty.empty-stale { color:#ffb74d; }
+.coverage-banner { margin:0 0 16px; padding:9px 12px; background:#35270f; color:#ffb74d; border:1px solid #6d511d; border-radius:6px; font-size:13px; }
+.badge { display:inline-block; padding:3px 9px; border-radius:4px; font-size:11px; font-weight:600; text-transform:uppercase; }
+.badge-green { background:rgba(118,185,0,0.2); color:#76b900; }
+.badge-red { background:rgba(244,67,54,0.2); color:#ff6b6b; }
+.badge-orange { background:rgba(255,152,0,0.2); color:#ffb74d; }
+.badge-gray { background:rgba(158,158,158,0.2); color:#999; }
+.badge-blue { background:rgba(79,195,247,0.2); color:#4fc3f7; }
+.badge-purple { background:rgba(186,104,200,0.2); color:#ba68c8; }
+.action-buttons { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.btn { padding:8px 14px; border:none; border-radius:4px; font-size:13px; font-weight:500; cursor:pointer; display:flex; align-items:center; gap:6px; background:#333; color:#d4d4d4; border:1px solid #404040; }
+.btn:hover { background:#3c3c3c; border-color:#76b900; }
+.btn-primary { background:linear-gradient(0deg,#76b900 0%,#5a8c00 100%); color:#fff; border:none; }
+.btn-primary:hover { background:linear-gradient(0deg,#8bd400 0%,#6ba000 100%); }
+.range-group { display:flex; gap:0; border:1px solid #404040; border-radius:6px; overflow:hidden; }
+.range-btn { padding:8px 14px; font-size:13px; background:#2d2d2d; color:#d4d4d4; border:none; cursor:pointer; border-right:1px solid #404040; }
+.range-btn:last-child { border-right:none; }
+.range-btn.active { background:#76b900; color:#000; font-weight:600; }
+.device-search-container { display:flex; align-items:center; gap:8px; }
+.device-search-container .select2-container { min-width:180px; }
+.device-search-container .select2-container--default .select2-selection--single { height:34px; border:1px solid #555; border-radius:4px; background:#3c3c3c; display:flex; align-items:center; }
+.device-search-container .select2-container--default .select2-selection--single .select2-selection__rendered { line-height:34px; color:#d4d4d4; padding-left:10px; font-size:13px; }
+.device-search-container .select2-container--default .select2-selection--single .select2-selection__arrow { height:34px; }
+.select2-dropdown { background:#2d2d2d; border:1px solid #555; }
+.select2-container--default .select2-results__option { color:#d4d4d4; padding:8px 12px; }
+.select2-container--default .select2-results__option--highlighted[aria-selected] { background:#76b900; color:#000; }
+.select2-container--default .select2-search--dropdown .select2-search__field { background:#3c3c3c; border:1px solid #555; color:#d4d4d4; }
+.clear-search-btn { background:#f44336; color:#fff; border:none; padding:6px 10px; border-radius:4px; cursor:pointer; font-size:12px; display:none; }
+.activity-wrap { padding:6px 4px 0; }
+.activity-svg { width:100%; height:74px; display:block; }
+.activity-meta { display:flex; justify-content:space-between; color:#888; font-size:11px; margin-top:4px; }
+</style>
+</head>
+<body>
+<div class="page-header">
+  <div>
+    <div class="page-title">Event Timeline</div>
+    <div class="last-updated" id="lastUpdated">Loading&hellip;</div>
+  </div>
+  <div class="action-buttons">
+    <div class="device-search-container">
+      <select id="deviceSearch" style="width:200px;"><option value="">Search Device...</option></select>
+      <button id="clearSearchBtn" class="clear-search-btn" onclick="clearDeviceSearch()">&#10005;</button>
+    </div>
+    <div class="range-group" id="rangeGroup">
+      <button class="range-btn" data-range="86400">24h</button>
+      <button class="range-btn active" data-range="604800">7d</button>
+      <button class="range-btn" data-range="2592000">30d</button>
+      <button class="range-btn" data-range="0">All</button>
+    </div>
+    <button class="btn btn-primary" onclick="downloadCSV()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>
+      Download CSV</button>
+  </div>
+</div>
+<div class="coverage-banner" id="freshnessBanner" style="display:none"></div>
+<div class="dashboard-section">
+  <div class="section-header">Activity <span class="dim" id="activityLabel"></span></div>
+  <div class="section-content">
+    <div class="activity-wrap">
+      <svg class="activity-svg" id="activitySvg" preserveAspectRatio="none"></svg>
+      <div class="activity-meta"><span id="activityFrom"></span><span id="activityTo"></span></div>
+    </div>
+  </div>
+</div>
+<div class="dashboard-section">
+  <div class="section-header">Domains (click to toggle)</div>
+  <div class="section-content"><div class="summary-grid" id="domainCards"></div></div>
+</div>
+<div class="dashboard-section">
+  <div class="section-header">Events (most recent first)</div>
+  <div class="section-content">
+    <table class="tl-table" id="tlt" data-filterable>
+      <thead><tr><th>Time</th><th>Domain</th><th>Severity</th><th>Device</th><th>Object</th><th>Event</th><th>Detail</th></tr></thead>
+      <tbody><tr><td colspan="7" class="empty">Loading events&hellip;</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="/css/jquery-3.5.1.min.js"></script>
+<script src="/css/select2.min.js"></script>
+<script>
+// Client-side aggregation of the per-domain event sidecars each analyzer
+// publishes under monitor-results/events/. The published tree is swapped
+// atomically, so one page load always reads a consistent generation.
+var EVENT_SOURCES = [
+  { domain: 'routes',       label: 'Routes',       badge: 'badge-blue',   card: 'card-routes' },
+  { domain: 'config-drift', label: 'Config Drift', badge: 'badge-purple', card: 'card-config-drift' },
+  { domain: 'flap',         label: 'Link Flap',    badge: 'badge-orange', card: 'card-flap' },
+  { domain: 'bgp',          label: 'BGP',          badge: 'badge-red',    card: 'card-bgp' },
+  { domain: 'log',          label: 'Logs',         badge: 'badge-green',  card: 'card-log' }
+];
+var KIND_LABELS = {
+  'route-drop': 'Route count drop', 'vrf-disappeared': 'VRF disappeared',
+  'config-modified': 'Config modified', 'link-flap': 'Link flap',
+  'bgp-neighbors-down': 'BGP neighbors down',
+  'bgp-neighbors-recovered': 'BGP neighbors recovered',
+  'log-critical': 'Log critical', 'log-error': 'Log error'
+};
+var allEvents = [];
+var domainAvailable = {};
+var activeDomains = new Set(EVENT_SOURCES.map(function(s){ return s.domain; }));
+var rangeSeconds = 604800;
+var deviceFilter = '';
+
+function noCacheUrl(path){ return path + (path.includes('?') ? '&' : '?') + '_=' + Date.now(); }
+function esc(value){
+  return String(value == null ? '' : value).replace(/[&<>"']/g, function(ch){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+  });
+}
+function fmtTime(ts){
+  var d = new Date(ts * 1000), pad = function(n){ return (n < 10 ? '0' : '') + n; };
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+}
+function severityBadge(severity){
+  if (severity === 'critical') return "<span class='badge badge-red'>critical</span>";
+  if (severity === 'warning') return "<span class='badge badge-orange'>warning</span>";
+  return "<span class='badge badge-gray'>info</span>";
+}
+
+async function loadEvents(){
+  var results = await Promise.all(EVENT_SOURCES.map(async function(source){
+    try {
+      var response = await fetch(noCacheUrl('/monitor-results/events/' + source.domain + '.json'), {cache:'no-store'});
+      if (!response.ok) return null;
+      var payload = await response.json();
+      if (!payload || !Array.isArray(payload.events)) return null;
+      return payload.events.filter(function(event){
+        return event && typeof event === 'object' && Number.isFinite(Number(event.ts));
+      }).map(function(event){
+        return {
+          ts: Number(event.ts),
+          severity: String(event.severity || 'info'),
+          device: String(event.device || ''),
+          object: String(event.object || ''),
+          kind: String(event.kind || ''),
+          detail: String(event.detail || ''),
+          domain: source.domain
+        };
+      });
+    } catch (error) { return null; }
+  }));
+  allEvents = [];
+  results.forEach(function(events, index){
+    domainAvailable[EVENT_SOURCES[index].domain] = events !== null;
+    if (events) allEvents = allEvents.concat(events);
+  });
+  allEvents.sort(function(a, b){ return b.ts - a.ts; });
+
+  try {
+    var response = await fetch(noCacheUrl('/monitor-results/.lldpq-current.json'), {cache:'no-store'});
+    if (response.ok) {
+      var manifest = await response.json();
+      if (manifest && manifest.completed_at) {
+        document.getElementById('lastUpdated').textContent =
+          'Pipeline: ' + manifest.completed_at + ' — ' + allEvents.length + ' event(s) retained';
+      }
+    }
+  } catch (error) {}
+  if (document.getElementById('lastUpdated').textContent.indexOf('Pipeline') !== 0) {
+    document.getElementById('lastUpdated').textContent = allEvents.length + ' event(s) retained';
+  }
+  if (allEvents.length === 0 && Object.values(domainAvailable).every(function(v){ return !v; })) {
+    var banner = document.getElementById('freshnessBanner');
+    banner.style.display = 'block';
+    banner.innerHTML = 'No event sidecars found yet &mdash; they are produced by the ' +
+      'monitor pipeline (every 10 minutes by default). This page fills in as analyzers detect events.';
+  }
+  render();
+}
+
+function visibleEvents(){
+  var cutoff = rangeSeconds > 0 ? (Date.now() / 1000) - rangeSeconds : 0;
+  return allEvents.filter(function(event){
+    if (event.ts < cutoff) return false;
+    if (!activeDomains.has(event.domain)) return false;
+    if (deviceFilter && event.device.toLowerCase() !== deviceFilter) return false;
+    return true;
+  });
+}
+
+function render(){
+  var events = visibleEvents();
+  renderCards();
+  renderActivity(events);
+  renderTable(events);
+  renderDeviceOptions();
+}
+
+function renderCards(){
+  var cutoff = rangeSeconds > 0 ? (Date.now() / 1000) - rangeSeconds : 0;
+  var html = EVENT_SOURCES.map(function(source){
+    var count = allEvents.filter(function(event){
+      return event.domain === source.domain && event.ts >= cutoff &&
+        (!deviceFilter || event.device.toLowerCase() === deviceFilter);
+    }).length;
+    var available = domainAvailable[source.domain];
+    var classes = 'summary-card ' + source.card;
+    if (!available) classes += ' nodata';
+    else if (!activeDomains.has(source.domain)) classes += ' inactive';
+    return "<div class='" + classes + "' data-domain='" + source.domain + "'>" +
+      "<div class='metric'>" + (available ? count.toLocaleString() : '—') + "</div>" +
+      "<div class='metric-label'>" + esc(source.label.toUpperCase()) +
+      (available ? '' : ' (NO DATA)') + "</div></div>";
+  }).join('');
+  var container = document.getElementById('domainCards');
+  container.innerHTML = html;
+  container.querySelectorAll('.summary-card[data-domain]').forEach(function(card){
+    var domain = card.getAttribute('data-domain');
+    if (!domainAvailable[domain]) return;
+    card.addEventListener('click', function(){
+      if (activeDomains.has(domain)) activeDomains.delete(domain);
+      else activeDomains.add(domain);
+      render();
+    });
+  });
+}
+
+function renderActivity(events){
+  var svg = document.getElementById('activitySvg');
+  var now = Date.now() / 1000;
+  var span = rangeSeconds > 0 ? rangeSeconds :
+    Math.max(3600, now - (events.length ? Math.min.apply(null, events.map(function(e){ return e.ts; })) : now - 3600));
+  var start = now - span;
+  var buckets = 48;
+  var counts = [], critical = [];
+  for (var i = 0; i < buckets; i++) { counts.push(0); critical.push(false); }
+  events.forEach(function(event){
+    var index = Math.floor((event.ts - start) / span * buckets);
+    if (index < 0 || index >= buckets) return;
+    counts[index]++;
+    if (event.severity === 'critical') critical[index] = true;
+  });
+  var max = Math.max.apply(null, counts.concat([1]));
+  var width = 960, height = 74, gap = 2;
+  var barWidth = (width - gap * (buckets - 1)) / buckets;
+  var parts = [];
+  for (var j = 0; j < buckets; j++) {
+    var barHeight = counts[j] ? Math.max(3, Math.round(counts[j] / max * (height - 14))) : 1;
+    var x = j * (barWidth + gap);
+    var color = counts[j] === 0 ? '#333' : (critical[j] ? '#f44336' : '#76b900');
+    parts.push('<rect x="' + x.toFixed(1) + '" y="' + (height - barHeight) +
+      '" width="' + barWidth.toFixed(1) + '" height="' + barHeight +
+      '" fill="' + color + '" rx="1"><title>' + counts[j] + ' event(s)</title></rect>');
+  }
+  svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
+  svg.innerHTML = parts.join('');
+  document.getElementById('activityLabel').textContent =
+    '— ' + events.length + ' event(s) in range, peak bucket ' + max;
+  document.getElementById('activityFrom').textContent = fmtTime(start);
+  document.getElementById('activityTo').textContent = 'now';
+}
+
+function renderTable(events){
+  var body = document.querySelector('#tlt tbody');
+  if (!events.length) {
+    body.innerHTML = "<tr><td colspan='7' class='empty'>No events in the selected range.</td></tr>";
+    return;
+  }
+  body.innerHTML = events.map(function(event){
+    var kind = KIND_LABELS[event.kind] || event.kind;
+    return "<tr data-devices='" + esc(event.device.toLowerCase()) + "'>" +
+      "<td class='mono' data-sort='" + event.ts + "'>" + esc(fmtTime(event.ts)) + "</td>" +
+      "<td>" + domainBadge(event.domain) + "</td>" +
+      "<td data-sort='" + (event.severity === 'critical' ? 0 : event.severity === 'warning' ? 1 : 2) + "'>" +
+        severityBadge(event.severity) + "</td>" +
+      "<td>" + esc(event.device) + "</td>" +
+      "<td class='mono'>" + (esc(event.object) || "<span class='dim'>&mdash;</span>") + "</td>" +
+      "<td>" + esc(kind) + "</td>" +
+      "<td class='mono'>" + esc(event.detail) + "</td></tr>";
+  }).join('');
+}
+
+function domainBadge(domain){
+  var source = EVENT_SOURCES.find(function(s){ return s.domain === domain; });
+  if (!source) return esc(domain);
+  return "<span class='badge " + source.badge + "'>" + esc(source.label) + "</span>";
+}
+
+function renderDeviceOptions(){
+  if (!window.jQuery) return;
+  var $search = jQuery('#deviceSearch');
+  if ($search.data('tl-init')) return;
+  var devices = Array.from(new Set(allEvents.map(function(e){ return e.device; }))).sort();
+  var options = '<option value=""></option>';
+  devices.forEach(function(device){ options += '<option value="' + esc(device) + '">' + esc(device) + '</option>'; });
+  $search.html(options).data('tl-init', true);
+  $search.select2({placeholder:'Search Device...', allowClear:true, width:'200px', dropdownAutoWidth:true});
+  $search.on('select2:select', function(e){
+    deviceFilter = String(e.params.data.id || '').toLowerCase();
+    document.getElementById('clearSearchBtn').style.display = 'inline-block';
+    render();
+  });
+  $search.on('select2:clear', function(){ clearDeviceSearch(); });
+}
+function clearDeviceSearch(){
+  deviceFilter = '';
+  document.getElementById('clearSearchBtn').style.display = 'none';
+  if (window.jQuery && jQuery('#deviceSearch').data('select2')) jQuery('#deviceSearch').val('').trigger('change.select2');
+  render();
+}
+
+document.getElementById('rangeGroup').addEventListener('click', function(event){
+  var button = event.target.closest('.range-btn');
+  if (!button) return;
+  document.querySelectorAll('.range-btn').forEach(function(b){ b.classList.remove('active'); });
+  button.classList.add('active');
+  rangeSeconds = parseInt(button.getAttribute('data-range'), 10) || 0;
+  render();
+});
+
+function sortKey(cell){ if(!cell) return ''; var v=cell.getAttribute('data-sort'); return v!==null ? v : (cell.innerText||'').trim(); }
+function sortTable(tid, col, numeric) {
+  var t = document.getElementById(tid), tb = t.tBodies[0];
+  var rows = Array.prototype.slice.call(tb.rows).filter(function(r){return !r.querySelector('.empty');});
+  if (!rows.length) return;
+  var asc = t.getAttribute('data-sc') != (col+(numeric?'n':''));
+  t.setAttribute('data-sc', asc ? (col+(numeric?'n':'')) : '');
+  rows.sort(function(a,b){
+    var x=sortKey(a.cells[col]), y=sortKey(b.cells[col]);
+    if (numeric){ x=parseFloat(String(x).replace(/[^0-9.\-]/g,''))||0; y=parseFloat(String(y).replace(/[^0-9.\-]/g,''))||0; return asc?x-y:y-x; }
+    return asc ? String(x).localeCompare(String(y)) : String(y).localeCompare(String(x));
+  });
+  rows.forEach(function(r){ tb.appendChild(r); });
+}
+Array.prototype.forEach.call(document.querySelectorAll('#tlt thead th'), function(th, i){
+  var num = /Time|Severity/i.test(th.innerText);
+  th.addEventListener('click', function(){ sortTable('tlt', i, num); });
+});
+
+function csvEsc(v){ v=(v==null?'':String(v)); return '"'+v.replace(/"/g,'""')+'"'; }
+function downloadCSV(){
+  var t = document.getElementById('tlt');
+  var out = [Array.prototype.slice.call(t.tHead.rows[0].cells).map(function(c){ return (c.innerText||'').trim(); })];
+  Array.prototype.slice.call(t.tBodies[0].rows).forEach(function(r){
+    if(r.style.display==='none' || r.querySelector('.empty') || r.classList.contains('tf-hidden')) return;
+    out.push(Array.prototype.slice.call(r.cells).map(function(c){ return (c.innerText||'').trim().replace(/\s+/g,' '); }));
+  });
+  var csv = out.map(function(r){ return r.map(csvEsc).join(','); }).join('\n');
+  var d=new Date(), pad=function(n){ return (n<10?'0':'')+n; };
+  var ts=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'_'+pad(d.getHours())+'-'+pad(d.getMinutes());
+  var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); var a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download='Event_Timeline_'+ts+'.csv'; document.body.appendChild(a); a.click(); a.remove();
+}
+
+loadEvents();
+</script>
+<script src="/p2p-alias.js"></script>
+<script src="/css/table-filter.js?v=20260716-tf-3"></script>
+</body>
+</html>

@@ -14,6 +14,7 @@ import html
 import tempfile
 from datetime import datetime, timezone
 from collections import defaultdict
+import analysis_events
 from collection_freshness import (
     asset_snapshot_is_valid,
     is_current_collection,
@@ -1584,6 +1585,30 @@ class LogAnalyzer:
             summary_data["collection_status"],
             generated_at=generated_at.timestamp(),
         )
+
+        # Timeline sidecar (best-effort; publish_events never raises). Only
+        # unambiguous ISO-stamped lines are emitted — syslog month/day stamps
+        # have no year/timezone and would misplace events on the timeline.
+        timeline_events = []
+        for device_name, categories in self.log_analysis.items():
+            for severity, mapped in (("critical", "critical"),
+                                     ("error", "warning")):
+                for entry in categories.get(severity, []):
+                    if not isinstance(entry, dict):
+                        continue
+                    stamp = self.parse_timestamp_to_datetime(
+                        str(entry.get("message") or ""))
+                    if stamp is None:
+                        continue
+                    timeline_events.append({
+                        "ts": int(stamp.timestamp()),
+                        "severity": mapped,
+                        "device": str(canonical(device_name)),
+                        "object": str(entry.get("section") or "log"),
+                        "kind": "log-%s" % severity,
+                        "detail": str(entry.get("message") or ""),
+                    })
+        analysis_events.publish_events(self.data_dir, "log", timeline_events)
 
         print(f"Log summary data saved: {summary_file}")
     
