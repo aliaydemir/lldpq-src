@@ -6817,13 +6817,35 @@ result = {
 
 try:
     # Optical: current_optical_stats is the collection snapshot.  Historical
-    # readings must never be presented as current device state.
-    optical_data, optical_error = load_json_source('optical_history.json')
+    # readings must never be presented as current device state.  The
+    # snapshot lives in per-device optical-history/ shards; the monolithic
+    # optical_history.json remains the fallback until its one-time
+    # migration runs.
+    optical_shard_dir = os.path.join(monitor_dir, 'optical-history')
+    if os.path.isdir(optical_shard_dir):
+        shard_relative = os.path.join('optical-history', device + '.json')
+        optical_source_path = os.path.join(monitor_dir, shard_relative)
+        if os.path.exists(optical_source_path):
+            shard_payload, optical_error = load_json_source(shard_relative)
+            optical_data = None if optical_error else {
+                'current_optical_stats': shard_payload.get('current'),
+                'last_update': shard_payload.get('updated_at'),
+            }
+        else:
+            # A device with no optical ports on record has no shard file;
+            # the analyzer refreshes the directory timestamp every run, so
+            # freshness still tracks the pipeline.
+            optical_source_path = optical_shard_dir
+            optical_data = {'current_optical_stats': {}, 'last_update': None}
+            optical_error = None
+    else:
+        optical_source_path = os.path.join(monitor_dir, 'optical_history.json')
+        optical_data, optical_error = load_json_source('optical_history.json')
     if optical_error:
         optical_meta = optical_error
     else:
         optical_meta = source_metadata(
-            os.path.join(monitor_dir, 'optical_history.json'),
+            optical_source_path,
             optical_data.get('last_update'),
         )
         current_stats = optical_data.get('current_optical_stats')

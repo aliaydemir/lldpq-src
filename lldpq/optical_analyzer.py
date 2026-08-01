@@ -17,6 +17,7 @@ import html
 import tempfile
 
 import analysis_sidecar
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from enum import Enum
@@ -26,6 +27,14 @@ from enum import Enum
 # the directory or hide as a dotfile.
 DETAILS_DIR_NAME = "optical-details"
 DETAIL_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Per-device history shards (PFC/BER precedent): the monolithic
+# optical_history.json forced a full read-modify-rewrite of the entire
+# fabric's 100-sample port history every run (hundreds of MB at scale).
+# Shards are read, appended, and written inside the per-device parse
+# workers, so the parent process never holds the fabric-wide history.
+HISTORY_DIR_NAME = "optical-history"
+SHARD_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # At fabric scale a single synchronous <tbody> freezes the tab; only rows
 # that need eyes render inline, quiet rows hydrate in chunks after first
@@ -153,6 +162,7 @@ class OpticalAnalyzer:
         self.data_dir = data_dir
         self.optical_history = {}  # port -> historical readings
         self.current_optical_stats = {}  # port -> current optical status
+        self._legacy_history_loaded = False
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
         self._load_network_thresholds()
 
@@ -197,34 +207,256 @@ class OpticalAnalyzer:
                 return
 
     def load_optical_history(self):
-        """Load historical optical data"""
+        """Load historical optical data from per-device shards.
+
+        A still-present monolithic optical_history.json is the authoritative
+        one-time migration source: it is loaded whole, and the next
+        save_optical_history() splits it into optical-history/<host>.json
+        shards and retires it (monitor.sh's analyzer transaction snapshots
+        both sides, so a failed run restores monolith and shard directory
+        together).
+        """
+        monolith = f"{self.data_dir}/optical_history.json"
         try:
-            with open(f"{self.data_dir}/optical_history.json", "r") as f:
+            with open(monolith, "r") as f:
                 data = json.load(f)
-                self.optical_history = data.get("optical_history", {})
-                self.current_optical_stats = data.get("current_optical_stats", {})
+            self.optical_history = data.get("optical_history", {})
+            self.current_optical_stats = data.get("current_optical_stats", {})
+            self._legacy_history_loaded = True
+            return
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
-    def save_optical_history(self):
-        """Save optical history to file"""
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
         try:
-            data = {
-                "optical_history": self.optical_history,
-                "current_optical_stats": self.current_optical_stats,
-                "last_update": time.time()
-            }
-            # Compact separators: this file carries every port's 100-sample
-            # history, so pretty-printing multiplies serialize/parse time and
-            # size for a machine-only artifact.
+            shard_names = sorted(os.listdir(shard_dir))
+        except FileNotFoundError:
+            return
+        for name in shard_names:
+            if not name.endswith(".json"):
+                continue
+            host = name[: -len(".json")]
+            history, current, _existed = self.load_history_shard(host)
+            self.optical_history.update(history)
+            self.current_optical_stats.update(current)
+
+    def history_shard_path(self, host: str) -> str:
+        return os.path.join(self.data_dir, HISTORY_DIR_NAME, f"{host}.json")
+
+    def load_history_shard(self, host: str):
+        """Return (history, current, shard_existed) for one device's shard.
+
+        Parse workers seed their per-file state with this; a corrupt or
+        unreadable shard drops only this device's history (its trends restart
+        from the current run).
+        """
+        path = self.history_shard_path(host)
+        try:
+            with open(path, "r") as f:
+                shard = json.load(f)
+        except FileNotFoundError:
+            return {}, {}, False
+        except (OSError, UnicodeError, json.JSONDecodeError) as e:
+            print(f"Error reading optical history shard {host}.json: {e}")
+            return {}, {}, True
+        if not isinstance(shard, dict):
+            return {}, {}, True
+        history = shard.get("history", {})
+        if not isinstance(history, dict):
+            history = {}
+        current = shard.get("current", {})
+        if not isinstance(current, dict):
+            current = {}
+        return history, current, True
+
+    def _host_bucket(self, host: str) -> Dict[str, Dict[str, Any]]:
+        """This host's slice of the in-memory history/current state."""
+        prefix = f"{host}:"
+        return {
+            "history": {
+                port: entries
+                for port, entries in self.optical_history.items()
+                if port.startswith(prefix)
+            },
+            "current": {
+                port: stats
+                for port, stats in self.current_optical_stats.items()
+                if port.startswith(prefix)
+            },
+        }
+
+    def _write_history_shard(self, host: str,
+                             payload: Dict[str, Any]) -> Optional[str]:
+        try:
             _atomic_write(
-                f"{self.data_dir}/optical_history.json",
-                json.dumps(data, separators=(",", ":")),
+                self.history_shard_path(host),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "updated_at": time.time(),
+                        "host": host,
+                        **payload,
+                    },
+                    separators=(",", ":"), ensure_ascii=True,
+                ),
             )
+            return None
+        except Exception as exc:
+            return f"{host}: {type(exc).__name__}: {exc}"
+
+    def write_history_shard(self, host: str) -> Optional[str]:
+        """Persist one device's shard from the in-memory state.
+
+        Returns an error string on failure (parse workers propagate it so
+        the run fails loudly instead of silently losing history).
+        """
+        if not SHARD_HOST_RE.fullmatch(host):
+            return f"{host!r}: unsafe shard hostname"
+        return self._write_history_shard(host, self._host_bucket(host))
+
+    def save_optical_history(self):
+        """Persist the full in-memory state into per-device shards.
+
+        The steady-state writer is the per-device parse worker
+        (write_history_shard); this full-state path serves the one-time
+        monolith migration and history-loaded compatibility flows.
+        """
+        try:
+            shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+            # The directory itself is contractual (validated after every
+            # run) even when no device produced optical history this run.
+            os.makedirs(shard_dir, exist_ok=True)
+
+            hosts = {
+                port.split(":", 1)[0] for port in self.optical_history
+            } | {
+                port.split(":", 1)[0] for port in self.current_optical_stats
+            }
+            unsafe_hosts = sorted(
+                host for host in hosts if not SHARD_HOST_RE.fullmatch(host)
+            )
+            if unsafe_hosts:
+                # Refusing only the unsafe names would strand them in the
+                # monolith forever; drop them with a loud warning instead.
+                print("Skipping unsafe optical shard hostnames: "
+                      + ", ".join(unsafe_hosts))
+
+            tasks = sorted(hosts - set(unsafe_hosts))
+            errors: List[str] = []
+            if tasks:
+                # Small shards: json.dumps is cheap and the win is
+                # overlapping the per-file fsyncs.
+                workers = max(1, min(8, os.cpu_count() or 2, len(tasks)))
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    for error in executor.map(self.write_history_shard, tasks):
+                        if error is not None:
+                            errors.append(error)
+            if errors:
+                print("Optical history shard writes failed: "
+                      + "; ".join(errors))
+                return False
+
+            if self._legacy_history_loaded:
+                # Every shard from the monolith is durably written; retire
+                # the legacy document (monitor.sh's analyzer transaction
+                # restores both sides together if this run later fails).
+                monolith = f"{self.data_dir}/optical_history.json"
+                try:
+                    os.unlink(monolith)
+                except FileNotFoundError:
+                    pass
+                try:
+                    analysis_sidecar.sidecar_path(monolith).unlink()
+                except OSError:
+                    pass
+                self._legacy_history_loaded = False
             return True
         except Exception as e:
             print(f"Error saving optical history: {e}")
             return False
+
+    def prune_history_shards(self, active_hosts) -> bool:
+        """Unlink per-device history shards for retired devices."""
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+        try:
+            shard_names = os.listdir(shard_dir)
+        except FileNotFoundError:
+            return True
+        ok = True
+        for name in shard_names:
+            if not name.endswith(".json"):
+                continue
+            host = name[: -len(".json")]
+            if host in active_hosts:
+                continue
+            shard_path = os.path.join(shard_dir, name)
+            try:
+                os.unlink(shard_path)
+            except OSError as exc:
+                print(f"❌ Could not prune retired optical shard {name}: {exc}")
+                ok = False
+                continue
+            try:
+                analysis_sidecar.sidecar_path(shard_path).unlink()
+            except OSError:
+                pass
+        return ok
+
+    def clear_stale_shard_current(self, processed_hosts) -> bool:
+        """Empty the persisted current snapshot of unrefreshed shards.
+
+        The monolith rebuilt current_optical_stats from scratch every run, so
+        a device without a current collection dropped out of the persisted
+        snapshot; shard consumers (alerts, AI context) must see the same:
+        history survives, current does not.
+        """
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+        try:
+            shard_names = sorted(os.listdir(shard_dir))
+        except FileNotFoundError:
+            return True
+        stale = [
+            name[: -len(".json")]
+            for name in shard_names
+            if name.endswith(".json")
+            and name[: -len(".json")] not in processed_hosts
+        ]
+
+        def clear_one(host: str) -> Optional[str]:
+            path = self.history_shard_path(host)
+            try:
+                with open(path, "r") as f:
+                    shard = json.load(f)
+            except FileNotFoundError:
+                return None
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return f"{host}: {type(exc).__name__}: {exc}"
+            if not isinstance(shard, dict) or not shard.get("current"):
+                return None
+            shard["current"] = {}
+            shard["updated_at"] = time.time()
+            try:
+                _atomic_write(
+                    path,
+                    json.dumps(shard, separators=(",", ":"),
+                               ensure_ascii=True),
+                )
+                return None
+            except Exception as exc:
+                return f"{host}: {type(exc).__name__}: {exc}"
+
+        errors: List[str] = []
+        if stale:
+            workers = max(1, min(8, os.cpu_count() or 2, len(stale)))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for error in executor.map(clear_one, stale):
+                    if error is not None:
+                        errors.append(error)
+        if errors:
+            print("Optical shard current-snapshot reconcile failed: "
+                  + "; ".join(errors))
+            return False
+        return True
 
     def parse_optical_data(self, optical_data: str) -> Optional[Dict[str, Any]]:
         """Parse optical output (NVUE transceiver commands) for optical parameters
@@ -2130,7 +2362,10 @@ class OpticalAnalyzer:
                         row.classList.contains('empty-row')) {
                         return;
                     }
-                    if (row.style.display !== 'none') {
+                    // table-filter.js funnels hide rows via the tf-hidden
+                    // class, never via style.display; honor both so the
+                    // export matches the visible table.
+                    if (row.style.display !== 'none' && !row.classList.contains('tf-hidden')) {
                         const cells = row.querySelectorAll('td');
                         if (cells.length) {
                             const rowData = Array.from(cells).map(cell =>

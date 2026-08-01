@@ -378,16 +378,25 @@ class MonitorExportContractTests(unittest.TestCase):
         self.assertEqual(
             len(legacy_v7), len(legacy_v6) + len(NEW_ANALYZER_ARTIFACTS)
         )
-        # The current schema adds exactly the BER shard directory and the
-        # optical detail sidecars on top of legacy_v7.
+        # legacy_v8 must be the frozen pre-optical-shard schema: legacy_v7
+        # plus the BER shard directory and optical detail sidecars.
+        legacy_v8 = _extract_array(self.source, "analysis_artifacts_legacy_v8")
         self.assertEqual(
-            set(self.current) - set(legacy_v7),
+            set(legacy_v8) - set(legacy_v7),
             set(SHARD_ERA_ARTIFACTS),
         )
-        self.assertEqual(set(legacy_v7) - set(self.current), set())
+        self.assertEqual(set(legacy_v7) - set(legacy_v8), set())
         self.assertEqual(
-            len(self.current), len(legacy_v7) + len(SHARD_ERA_ARTIFACTS)
+            len(legacy_v8), len(legacy_v7) + len(SHARD_ERA_ARTIFACTS)
         )
+        # The current schema adds exactly the optical history shard
+        # directory on top of legacy_v8.
+        self.assertEqual(
+            set(self.current) - set(legacy_v8),
+            {"optical-history/"},
+        )
+        self.assertEqual(set(legacy_v8) - set(self.current), set())
+        self.assertEqual(len(self.current), len(legacy_v8) + 1)
 
     def test_validation_and_overlays_cover_every_export_pair(self):
         validate = _extract_function(self.source, "validate_analysis_outputs")

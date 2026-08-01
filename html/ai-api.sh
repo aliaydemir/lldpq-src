@@ -1232,7 +1232,13 @@ def build_collection_metadata(devices, device_health):
         'transceivers': _source_freshness(
             _mr_path('transceiver_inventory.json'), required=False
         ),
-        'optical': _source_freshness(_mr_path('optical_history.json'), required=False),
+        'optical': (
+            _multi_file_source_freshness(
+                os.path.join(_mr_path('optical-history'), '*.json'), required=False
+            )
+            if os.path.isdir(_mr_path('optical-history'))
+            else _source_freshness(_mr_path('optical_history.json'), required=False)
+        ),
         'ber': (
             _multi_file_source_freshness(
                 os.path.join(_mr_path('ber-history'), '*.json'), required=False
@@ -2425,6 +2431,32 @@ def _load_ber_current_stats(hosts=None):
     return stats
 
 
+def _load_optical_current_stats(hosts=None):
+    """Merged per-port current optical records from optical-history/ shards.
+
+    The monolithic optical_history.json remains the fallback until its
+    one-time per-device shard migration runs.  ``hosts`` (a set of
+    hostnames) limits the shard reads to the devices actually requested.
+    """
+    shard_dir = _mr_path('optical-history')
+    try:
+        names = [n for n in os.listdir(shard_dir) if n.endswith('.json')]
+    except OSError:
+        names = []
+    if not names:
+        legacy = (_load_json_file(_mr_path('optical_history.json')) or {})
+        return legacy.get('current_optical_stats') or {}
+    stats = {}
+    for name in sorted(names):
+        if hosts and name[:-len('.json')] not in hosts:
+            continue
+        payload = _load_json_file(os.path.join(shard_dir, name)) or {}
+        current = payload.get('current')
+        if isinstance(current, dict):
+            stats.update(current)
+    return stats
+
+
 def _ensure_state_dir():
     try:
         os.makedirs(AI_STATE_DIR, mode=0o2770, exist_ok=True)
@@ -3461,7 +3493,7 @@ def build_transceiver_context(hosts=None, max_chars=9000):
 
 def build_optical_context(hosts=None, max_chars=9000):
     """Optical DOM per port: health, Rx/Tx power, temperature, voltage, bias, link margin."""
-    stats = (_load_json_file(_mr_path('optical_history.json')) or {}).get('current_optical_stats') or {}
+    stats = _load_optical_current_stats(set(hosts) if hosts else None)
     if not stats:
         return ''
     lines = ["OPTICAL DOM (host:port: health rx_dBm tx_dBm temp_C volt bias_mA margin_dB):"]

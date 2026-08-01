@@ -1763,7 +1763,10 @@ class LinkFlapAnalyzer:
                 // annotate exactly how many rows the export contains.
                 const dataLines = [];
                 rows.forEach(row => {
-                    if (row.style.display === 'none') return;
+                    // table-filter.js funnels hide rows via the tf-hidden
+                    // class, never via style.display; honor both so the
+                    // export matches the visible table.
+                    if (row.style.display === 'none' || row.classList.contains('tf-hidden')) return;
                     const cells = row.querySelectorAll('td');
                     if (cells.length < 10) return;
                     const rowData = [

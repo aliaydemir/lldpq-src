@@ -14,8 +14,13 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime
+import analysis_sidecar
 import export_artifacts
-from optical_analyzer import OpticalAnalyzer, _atomic_write
+from optical_analyzer import (
+    HISTORY_DIR_NAME,
+    OpticalAnalyzer,
+    _atomic_write,
+)
 from collection_freshness import (
     asset_snapshot_is_valid,
     is_current_collection,
@@ -126,16 +131,32 @@ def _init_optical_parse_worker(result_dir):
 def _classify_optical_file(filepath, hostname):
     """Parse one device's optical file and return merge operations.
 
-    Runs in a worker process.  Decisions that need the parent's optical
-    history (unplugged detection) are deferred as 'maybe_unplugged' ops so
-    the parent resolves them during the merge.
+    Runs in a worker process.  The worker owns the device's history shard
+    for the whole file: it loads optical-history/<hostname>.json, applies
+    every append and state decision locally (so unplugged detection sees the
+    device's prior readings), writes the shard back, and returns the ops the
+    parent still needs for its fabric-wide current snapshot.
     """
     port_data, file_failures = read_optical_diagnostics_file(filepath)
     failed_interfaces = {
         interface for _reason, interface in file_failures if interface
     }
     analyzer = _parse_worker_analyzer
+    # The pooled worker analyzer is reused across devices (and across the
+    # whole fleet in the sequential fallback); state is strictly per-file.
+    # The persisted current snapshot is rebuilt from this run's data only,
+    # so the shard's old current is deliberately discarded here.
+    analyzer.current_optical_stats = {}
+    analyzer.optical_history, _stale_current, shard_existed = (
+        analyzer.load_history_shard(hostname)
+    )
     ops = []
+
+    def state_op(port_name, health, snippet):
+        # Mirror the parent's merge locally so the shard's persisted current
+        # matches the fabric snapshot for this device.
+        record_optical_state(analyzer, port_name, hostname, health, snippet)
+        ops.append(('state', port_name, health, snippet))
 
     def updated_entries(port_name):
         stats_entry = analyzer.current_optical_stats.get(port_name)
@@ -146,7 +167,7 @@ def _classify_optical_file(filepath, hostname):
         port_name = f"{hostname}:{interface}"
 
         if interface in failed_interfaces:
-            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            state_op(port_name, 'unknown', optical_data[:500])
             continue
 
         # Skip non-optical interfaces (management, virtual interfaces)
@@ -170,12 +191,13 @@ def _classify_optical_file(filepath, hostname):
             # no transceiver data.  A port with previous optical
             # readings that now reads empty is an unplugged module,
             # not a never-populated cage.  Previous readings live in
-            # the parent's history, so the decision is deferred.
+            # this device's history shard, loaded above.
             if (NO_TRANSCEIVER_DATA_RE.search(optical_data) and
                     re.search(r'^\s*Interface\s+state\s*:\s*down\b',
                               optical_data,
                               re.IGNORECASE | re.MULTILINE)):
-                ops.append(('maybe_unplugged', port_name, optical_data[:500]))
+                if port_name in analyzer.optical_history:
+                    state_op(port_name, 'unplugged', optical_data[:500])
             continue
 
         # DAC/Copper cables do not provide optical diagnostics.  Keep
@@ -196,7 +218,7 @@ def _classify_optical_file(filepath, hostname):
         # Check for unplugged ports - add as "unplugged" status for troubleshooting
         if re.search(r'^\s*status\s*:\s*unplugged\b', optical_data,
                      re.IGNORECASE | re.MULTILINE):
-            ops.append(('state', port_name, 'unplugged', optical_data[:500]))
+            state_op(port_name, 'unplugged', optical_data[:500])
             continue
 
         state_match = re.search(
@@ -229,7 +251,7 @@ def _classify_optical_file(filepath, hostname):
                 ops.append(('update', port_name, stats_entry, history_entry))
             continue
         if interface_state == 'unknown':
-            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            state_op(port_name, 'unknown', optical_data[:500])
             continue
 
         # Check for ports with no meaningful optical readings (N/A values, temp 0.0, etc.)
@@ -237,7 +259,7 @@ def _classify_optical_file(filepath, hostname):
              "temperature                 : 0.00" in optical_data) and
             ("voltage                     : 0.0" in optical_data or
              "voltage                     : 0.00" in optical_data)):
-            ops.append(('state', port_name, 'unknown', optical_data[:500]))
+            state_op(port_name, 'unknown', optical_data[:500])
             continue
 
         # Update optical analyzer
@@ -249,37 +271,39 @@ def _classify_optical_file(filepath, hostname):
     # marker without that block.
     for reason, interface in file_failures:
         if interface and interface not in port_data:
-            ops.append((
-                'state', f"{hostname}:{interface}", 'unknown',
+            state_op(
+                f"{hostname}:{interface}", 'unknown',
                 describe_optical_collection_failure(reason, interface),
-            ))
+            )
 
-    return ops, file_failures
+    # Persist this device's shard from the worker.  A device that never had
+    # optical state (all-DAC racks) gets no file, so the shard directory
+    # stays proportional to optical devices, not fleet size.
+    shard_error = None
+    if (analyzer.optical_history or analyzer.current_optical_stats
+            or shard_existed):
+        shard_error = analyzer.write_history_shard(hostname)
+
+    return ops, file_failures, shard_error
 
 
 def _merge_optical_ops(analyzer, hostname, ops):
-    """Apply one file's worker ops to the parent analyzer state."""
+    """Apply one file's worker ops to the parent's fabric-wide snapshot.
+
+    History never reaches the parent: the worker already persisted it into
+    the device's optical-history/<host>.json shard (including the unplugged
+    decision, which needs the device's prior readings).  Only the current
+    stats that feed the summary, anomaly, and report paths merge here.
+    """
     for op in ops:
         kind = op[0]
         if kind == 'state':
             _kind, port_name, health, snippet = op
             record_optical_state(analyzer, port_name, hostname, health, snippet)
-        elif kind == 'maybe_unplugged':
-            _kind, port_name, snippet = op
-            if port_name in analyzer.optical_history:
-                record_optical_state(
-                    analyzer, port_name, hostname, 'unplugged', snippet
-                )
         elif kind == 'update':
-            _kind, port_name, stats_entry, history_entry = op
+            _kind, port_name, stats_entry, _history_entry = op
             if stats_entry:
                 analyzer.current_optical_stats[port_name] = stats_entry
-            if history_entry:
-                history = analyzer.optical_history.setdefault(port_name, [])
-                history.append(history_entry)
-                # Keep last 100 entries, matching update_optical_stats
-                if len(history) > 100:
-                    analyzer.optical_history[port_name] = history[-100:]
 
 
 def _optical_parse_worker_limit(task_count):
@@ -294,7 +318,11 @@ def _optical_parse_worker_limit(task_count):
 
 
 def _classify_optical_files(result_dir, tasks):
-    """Yield (hostname, ops, file_failures) per file, parallel when possible."""
+    """Yield (hostname, ops, file_failures, shard_error) per file.
+
+    Parallel when possible; each worker also owns the device's history
+    shard read/append/write.
+    """
     completed = 0
     workers = _optical_parse_worker_limit(len(tasks))
     if workers > 1:
@@ -310,8 +338,8 @@ def _classify_optical_files(result_dir, tasks):
                     for filepath, hostname in tasks
                 ]
                 for hostname, future in futures:
-                    ops, file_failures = future.result()
-                    yield hostname, ops, file_failures
+                    ops, file_failures, shard_error = future.result()
+                    yield hostname, ops, file_failures, shard_error
                     completed += 1
                 return
         except (OSError, PermissionError, BrokenProcessPool):
@@ -321,8 +349,37 @@ def _classify_optical_files(result_dir, tasks):
             pass
     _init_optical_parse_worker(result_dir)
     for filepath, hostname in tasks[completed:]:
-        ops, file_failures = _classify_optical_file(filepath, hostname)
-        yield hostname, ops, file_failures
+        ops, file_failures, shard_error = _classify_optical_file(filepath, hostname)
+        yield hostname, ops, file_failures, shard_error
+
+
+def _migrate_optical_history_monolith(result_dir):
+    """One-time split of the legacy monolith into per-device shards.
+
+    Runs inside monitor.sh's analyzer transaction: on any later failure the
+    monolith and the shard directory are restored together.
+    """
+    monolith = os.path.join(result_dir, "optical_history.json")
+    if not os.path.exists(monolith):
+        return True
+    print("Migrating optical_history.json into optical-history/ shards...")
+    migrator = OpticalAnalyzer(result_dir)  # loads the monolith whole
+    if migrator._legacy_history_loaded:
+        return migrator.save_optical_history()
+    # Unreadable monolith: the legacy loader restarted history silently;
+    # retire the corrupt document once instead of re-parsing it every run.
+    print("⚠ optical_history.json is unreadable; retiring it "
+          "(history restarts from this run)")
+    try:
+        os.unlink(monolith)
+    except OSError as exc:
+        print(f"❌ Could not retire corrupt optical_history.json: {exc}")
+        return False
+    try:
+        analysis_sidecar.sidecar_path(monolith).unlink()
+    except OSError:
+        pass
+    return True
 
 
 def process_optical_data_files(data_dir="monitor-results/optical-data"):
@@ -346,11 +403,13 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
             )
         phase_started = now
 
-    optical_analyzer = OpticalAnalyzer(result_dir)
+    if not _migrate_optical_history_monolith(result_dir):
+        return False
+    # Parse workers own the per-device history shards (read, append, write);
+    # the parent only ever holds the fabric-wide current snapshot, and only
+    # files from this successful collection may populate it.
+    optical_analyzer = OpticalAnalyzer(result_dir, load_history=False)
     finish_phase("load")
-    # Historical readings remain in optical_history; only files from this
-    # successful collection may populate the current snapshot.
-    optical_analyzer.current_optical_stats = {}
 
     print("Processing optical diagnostics data")
     print(f"Data directory: {data_dir}")
@@ -412,7 +471,9 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
          filename.removesuffix("_optical.txt"))
         for filename in files
     ]
-    for hostname, ops, file_failures in _classify_optical_files(result_dir, tasks):
+    shard_errors = []
+    for hostname, ops, file_failures, shard_error in _classify_optical_files(
+            result_dir, tasks):
         # Category-local collector failures remain per file so the optical
         # report can expose incomplete coverage without invalidating BGP,
         # BER, PFC, hardware, logs, or other complete categories.
@@ -422,15 +483,40 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
                 describe_optical_collection_failure(reason, interface)
                 for reason, interface in file_failures
             ]
+        if shard_error:
+            shard_errors.append(shard_error)
         total_processed += 1
         _merge_optical_ops(optical_analyzer, hostname, ops)
 
     print(f"\nProcessed {total_processed} files total")
     finish_phase("parse_records")
 
-    # Save updated optical history
-    if optical_analyzer.save_optical_history():
-        print("Optical history saved")
+    if shard_errors:
+        # Fail loudly inside the analyzer transaction instead of silently
+        # losing devices' history appends.
+        print("❌ Optical history shard writes failed: "
+              + "; ".join(shard_errors))
+        return False
+
+    # Parse workers already wrote the shards of collected devices; reconcile
+    # the rest so shard consumers keep monolith semantics: retire shards of
+    # devices no longer in inventory, and empty the persisted current
+    # snapshot of devices without a current collection.  The directory
+    # itself is contractual (validated after every run), and its timestamp
+    # is the freshness heartbeat for devices that have no shard file.
+    shard_dir_path = os.path.join(result_dir, HISTORY_DIR_NAME)
+    os.makedirs(shard_dir_path, exist_ok=True)
+    os.utime(shard_dir_path, None)
+    reconcile_ok = True
+    if snapshot_valid:
+        reconcile_ok = optical_analyzer.prune_history_shards(
+            inventory_hosts | collected_hosts
+        )
+    if not optical_analyzer.clear_stale_shard_current(collected_hosts):
+        reconcile_ok = False
+    if not reconcile_ok:
+        return False
+    print("Optical history shards reconciled")
     finish_phase("write_history")
 
     # Generate web report

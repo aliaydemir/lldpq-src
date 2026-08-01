@@ -15,6 +15,15 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import process_optical_data as optical
 
 
+def _read_shard_current(result_dir):
+    """Merge the per-device shards' persisted current snapshot."""
+    merged = {}
+    for shard in sorted((result_dir / "optical-history").glob("*.json")):
+        payload = json.loads(shard.read_text())
+        merged.update(payload.get("current", {}))
+    return merged
+
+
 class OpticalCollectionIsolationTests(unittest.TestCase):
     def _run(self, statuses, files):
         temporary = tempfile.TemporaryDirectory()
@@ -49,9 +58,9 @@ class OpticalCollectionIsolationTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        history = json.loads((result_dir / "optical_history.json").read_text())
+        current = _read_shard_current(result_dir)
         self.assertEqual(
-            history["current_optical_stats"]["leaf1:swp17"]["health_status"],
+            current["leaf1:swp17"]["health_status"],
             "unknown",
         )
         report = (result_dir / "optical-analysis.html").read_text()
@@ -79,9 +88,9 @@ class OpticalCollectionIsolationTests(unittest.TestCase):
         )
 
         self.assertTrue(success)
-        history = json.loads((result_dir / "optical_history.json").read_text())
+        current = _read_shard_current(result_dir)
         self.assertEqual(
-            history["current_optical_stats"]["leaf1:swp18"]["health_status"],
+            current["leaf1:swp18"]["health_status"],
             "unknown",
         )
         report = (result_dir / "optical-analysis.html").read_text()

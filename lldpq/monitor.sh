@@ -337,11 +337,12 @@ analysis_backup_dir=""
 analysis_transaction_active=false
 recovery_bundle_must_be_preserved=false
 
-# Entries with a trailing slash are whole directories (per-device PFC/ECN
-# and BER history shards, optical detail sidecars); snapshot/rollback treat
-# them as one atomic tree.  pfc_ecn_history.json and ber_history.json stay
-# listed so the one-time migrations that split them into shards remain
-# covered by the same transaction.
+# Entries with a trailing slash are whole directories (per-device PFC/ECN,
+# BER, and optical history shards, optical detail sidecars);
+# snapshot/rollback treat them as one atomic tree.  pfc_ecn_history.json,
+# ber_history.json, and optical_history.json stay listed so the one-time
+# migrations that split them into shards remain covered by the same
+# transaction.
 analysis_artifacts=(
     .lldpq-current.json
     .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
@@ -350,6 +351,7 @@ analysis_artifacts=(
     evpn-mh-analysis.html
     link-flap-analysis.html flap_history.json
     optical-analysis.html optical_history.json optical-details/
+    optical-history/
     ber-analysis.html ber_history.json ber_baseline.json ber-history/
     pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
     pfc-ecn-history/
@@ -511,6 +513,45 @@ analysis_artifacts_legacy_v7=(
     link-flap-analysis.html flap_history.json
     optical-analysis.html optical_history.json
     ber-analysis.html ber_history.json ber_baseline.json
+    pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
+    pfc-ecn-history/
+    hardware-analysis.html
+    log-analysis.html log_summary.json
+    duplicate-analysis.html dup-data/dup_seq_state.json dup-data/dup_ip_state.json
+    config-drift-analysis.html config_drift_history.json config-drift-data/
+    routes-analysis.html routes_events.json routes-history/
+    fabric-check-analysis.html
+    summary/bgp-summary.json summary/evpn-summary.json
+    summary/evpn-mh-summary.json summary/flap-summary.json
+    summary/optical-summary.json summary/ber-summary.json
+    summary/pfc-ecn-summary.json summary/hardware-summary.json
+    summary/duplicate-summary.json
+    summary/config-drift-summary.json summary/routes-summary.json
+    summary/fabric-check-summary.json
+    export/bgp.json export/bgp.csv
+    export/evpn-mh.json export/evpn-mh.csv
+    export/duplicate.json export/duplicate.csv
+    export/flap.json export/flap.csv
+    export/optical.json export/optical.csv
+    export/ber.json export/ber.csv
+    export/pfc-ecn.json export/pfc-ecn.csv
+    export/hardware.json export/hardware.csv
+    export/log.json export/log.csv
+    export/config-drift.json export/config-drift.csv
+    export/routes.json export/routes.csv
+    export/fabric-check.json export/fabric-check.csv
+)
+
+# Snapshot schema before the optical history was sharded per device.
+analysis_artifacts_legacy_v8=(
+    .lldpq-current.json
+    .pipeline-inputs/assets.ini .pipeline-inputs/lldp_results.ini
+    .pipeline-inputs/collection_status.json
+    bgp-analysis.html bgp_history.json
+    evpn-mh-analysis.html
+    link-flap-analysis.html flap_history.json
+    optical-analysis.html optical_history.json optical-details/
+    ber-analysis.html ber_history.json ber_baseline.json ber-history/
     pfc-ecn-analysis.html pfc_ecn_baseline.json pfc_ecn_history.json
     pfc-ecn-history/
     hardware-analysis.html
@@ -765,7 +806,7 @@ validate_analysis_backup_manifest() {
     local status relative extra expected expected_artifact backup count=0 valid=true
     local current_schema=true legacy_schema_v1=true legacy_schema_v2=true
     local legacy_schema_v3=true legacy_schema_v4=true legacy_schema_v5=true
-    local legacy_schema_v6=true legacy_schema_v7=true
+    local legacy_schema_v6=true legacy_schema_v7=true legacy_schema_v8=true
     local -A seen=()
     [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
 
@@ -834,10 +875,15 @@ validate_analysis_backup_manifest() {
     for expected_artifact in "${analysis_artifacts_legacy_v7[@]}"; do
         [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v7=false
     done
+    [[ "$count" -eq "${#analysis_artifacts_legacy_v8[@]}" ]] || legacy_schema_v8=false
+    for expected_artifact in "${analysis_artifacts_legacy_v8[@]}"; do
+        [[ -n "${seen[$expected_artifact]+x}" ]] || legacy_schema_v8=false
+    done
     [[ "$current_schema" == "true" || "$legacy_schema_v1" == "true" ||
        "$legacy_schema_v2" == "true" || "$legacy_schema_v3" == "true" ||
        "$legacy_schema_v4" == "true" || "$legacy_schema_v5" == "true" ||
-       "$legacy_schema_v6" == "true" || "$legacy_schema_v7" == "true" ]]
+       "$legacy_schema_v6" == "true" || "$legacy_schema_v7" == "true" ||
+       "$legacy_schema_v8" == "true" ]]
 }
 
 commit_analysis_state() {
@@ -1356,6 +1402,7 @@ publish_full_monitor_results() {
         # Keep the private history for a future enabled run, but never republish
         # an old aggregate/history as though it belonged to this skipped run.
         if ! sudo rm -rf "$stage_dir/optical_history.json" \
+                "$stage_dir/optical-history" \
                 "$stage_dir/optical-analysis.html" \
                 "$stage_dir/optical-details" \
                 "$stage_dir/summary/optical-summary.json" \
@@ -1564,8 +1611,11 @@ select_scope_web_overlays() {
             )
             ;;
         optical)
+            # History lives in per-device shards; the legacy monolith is
+            # deleted by the one-time migration, and a missing artifact fails
+            # the scoped publish outright.
             SCOPE_WEB_OVERLAYS=(
-                optical-analysis.html optical_history.json optical-data
+                optical-analysis.html optical-history optical-data
                 optical-details
                 summary/optical-summary.json
                 export/optical.json export/optical.csv
@@ -4718,13 +4768,13 @@ validate_analysis_outputs() {
             fi
             if [[ "$SKIP_OPTICAL" != "true" ]]; then
                 required+=(
-                    optical-analysis.html optical_history.json
+                    optical-analysis.html optical-history/
                     optical-details/
                     summary/optical-summary.json
                     export/optical.json export/optical.csv
                 )
                 json_files+=(
-                    optical_history.json optical-details/
+                    optical-history/ optical-details/
                     summary/optical-summary.json
                     export/optical.json
                 )
@@ -4806,12 +4856,12 @@ validate_analysis_outputs() {
             ;;
         optical)
             required=(
-                optical-analysis.html optical_history.json optical-details/
+                optical-analysis.html optical-history/ optical-details/
                 summary/optical-summary.json
                 export/optical.json export/optical.csv
             )
             json_files=(
-                optical_history.json optical-details/
+                optical-history/ optical-details/
                 summary/optical-summary.json
                 export/optical.json
             )

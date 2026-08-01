@@ -2219,15 +2219,26 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
     def get_device_optical_status(self, device):
         """Get optical diagnostics status for a device from processed summary"""
         try:
-            # Read from processed optical_history.json
+            # Per-device shard first (optical-history/<host>.json); the
+            # legacy monolith stays readable until its one-time migration.
+            shard_file = (
+                self.monitor_results / "optical-history" / f"{device}.json"
+            )
             optical_history_file = self.monitor_results / "optical_history.json"
-            if not optical_history_file.exists():
+            if shard_file.exists():
+                optical_data = json.loads(
+                    shard_file.read_text(encoding="utf-8")
+                )
+                current_stats = optical_data.get("current", {})
+            elif (self.monitor_results / "optical-history").is_dir():
+                # Shard era, but this device has no optical ports on record.
+                return "not_applicable"
+            elif optical_history_file.exists():
+                with open(optical_history_file, 'r') as f:
+                    optical_data = json.load(f)
+                current_stats = optical_data.get("current_optical_stats", {})
+            else:
                 return "unknown"
-                
-            with open(optical_history_file, 'r') as f:
-                optical_data = json.load(f)
-
-            current_stats = optical_data.get("current_optical_stats", {})
             if not isinstance(current_stats, dict):
                 raise ValueError("current_optical_stats must be an object")
             health_values = []

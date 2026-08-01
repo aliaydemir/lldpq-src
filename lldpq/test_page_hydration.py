@@ -72,6 +72,13 @@ class HydrationSourceContractTests(unittest.TestCase):
         for source in (self.ber, self.optical, self.flap):
             self.assertIn("row.dataset.deviceKey === deviceKey", source)
 
+    def test_csv_export_honors_table_filter_funnels(self):
+        # table-filter.js hides rows via the tf-hidden class, never via
+        # style.display; every CSV export must filter both (PFC precedent,
+        # pinned in test_pfc_ecn_dashboard_contract).
+        for source in (self.ber, self.optical, self.flap):
+            self.assertIn("classList.contains('tf-hidden')", source)
+
 
 class TableFilterFastPathTests(unittest.TestCase):
     def test_empty_filter_pass_is_skipped(self):

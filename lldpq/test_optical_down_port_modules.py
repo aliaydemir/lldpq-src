@@ -70,7 +70,7 @@ class CollectorContractTests(unittest.TestCase):
 
 
 class DownPortClassificationTests(unittest.TestCase):
-    def _classify(self, body):
+    def _classify(self, body, history=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -78,12 +78,18 @@ class DownPortClassificationTests(unittest.TestCase):
         sample = root / "optical-data" / "leaf1_optical.txt"
         sample.write_text(body)
 
+        if history is not None:
+            seeder = OpticalAnalyzer(str(root), load_history=False)
+            seeder.optical_history = history
+            assert seeder.save_optical_history()
+
         process_optical_data._parse_worker_analyzer = OpticalAnalyzer(
             str(root), load_history=False
         )
-        ops, _failures = process_optical_data._classify_optical_file(
+        ops, _failures, shard_error = process_optical_data._classify_optical_file(
             str(sample), "leaf1"
         )
+        self.assertIsNone(shard_error)
         return ops
 
     def test_a_readable_module_on_a_down_port_is_not_unplugged(self):
@@ -91,22 +97,36 @@ class DownPortClassificationTests(unittest.TestCase):
             "--- Interface: swp7\n"
             "Interface state: down\n" + DOM_SAMPLE
         )
-        kinds = {op[0] for op in ops}
+        health_states = {op[2] for op in ops if op[0] == "state"}
         self.assertNotIn(
-            "maybe_unplugged", kinds,
+            "unplugged", health_states,
             "a module that answered a DOM read is present, not missing",
         )
-        self.assertIn("update", kinds)
+        self.assertIn("update", {op[0] for op in ops})
 
-    def test_an_empty_cage_on_a_down_port_is_still_reported(self):
+    def test_an_empty_cage_with_prior_readings_is_unplugged(self):
+        # The unplugged decision needs the device's earlier readings; the
+        # worker resolves it from the device's history shard, loaded above.
+        ops = self._classify(
+            "--- Interface: swp8\n"
+            "Interface state: down\n"
+            "No transceiver data\n",
+            history={"leaf1:swp8": [{"timestamp": 1.0, "health": "good"}]},
+        )
+        self.assertEqual(
+            [(op[0], op[2]) for op in ops], [("state", "unplugged")],
+            "a port with prior optical readings that reads empty lost its module",
+        )
+
+    def test_an_empty_cage_with_no_history_stays_unmonitored(self):
         ops = self._classify(
             "--- Interface: swp8\n"
             "Interface state: down\n"
             "No transceiver data\n"
         )
         self.assertEqual(
-            [op[0] for op in ops], ["maybe_unplugged"],
-            "with down ports now sampled, silence really does mean no module",
+            ops, [],
+            "an empty cage that never carried a module is not a monitored port",
         )
 
     def test_a_healthy_up_port_is_unaffected(self):

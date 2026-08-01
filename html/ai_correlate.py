@@ -178,9 +178,31 @@ def _collect_bgp(mr_dir):
     return anomalies
 
 
+def _load_optical_current_stats(mr_dir):
+    """Merged current optical records from optical-history/ shards.
+
+    The monolithic optical_history.json remains the fallback until its
+    one-time shard migration runs.
+    """
+    shard_dir = os.path.join(mr_dir, "optical-history")
+    try:
+        names = [n for n in os.listdir(shard_dir) if n.endswith(".json")]
+    except OSError:
+        names = []
+    if not names:
+        document = _load_json(os.path.join(mr_dir, "optical_history.json"))
+        return (document or {}).get("current_optical_stats")
+    stats = {}
+    for name in sorted(names):
+        payload = _load_json(os.path.join(shard_dir, name)) or {}
+        current = payload.get("current")
+        if isinstance(current, dict):
+            stats.update(current)
+    return stats
+
+
 def _collect_optical(mr_dir):
-    document = _load_json(os.path.join(mr_dir, "optical_history.json"))
-    stats = (document or {}).get("current_optical_stats")
+    stats = _load_optical_current_stats(mr_dir)
     anomalies = []
     for key in sorted(stats if isinstance(stats, dict) else {}):
         record = stats[key]
@@ -200,7 +222,7 @@ def _collect_optical(mr_dir):
         anomalies.append(_anomaly(
             "optical", device, port, "health_status", health, health,
             "Optical health %s%s" % (health, " (" + " ".join(parts) + ")" if parts else ""),
-            "optical_history.json",
+            "optical-history/",
         ))
     return anomalies
 
