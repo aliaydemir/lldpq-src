@@ -239,6 +239,9 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         tbody = report.split("<tbody>", 1)[1].split("</tbody>", 1)[0]
         self.assertEqual(tbody.count("port-row"), analyzer.INLINE_ROW_CAP)
         self.assertIn("const hydrationTotal = 3;", report)
+        # Until every deferred row lands, a DOM-walking export silently
+        # truncates the CSV; the button stays disabled while hydrating.
+        self.assertIn("csvButton.disabled = !finished", report)
 
 
 if __name__ == "__main__":

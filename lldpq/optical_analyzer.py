@@ -236,7 +236,7 @@ class OpticalAnalyzer:
             if not name.endswith(".json"):
                 continue
             host = name[: -len(".json")]
-            history, current, _existed = self.load_history_shard(host)
+            history, current, _shard = self.load_history_shard(host)
             self.optical_history.update(history)
             self.current_optical_stats.update(current)
 
@@ -244,33 +244,42 @@ class OpticalAnalyzer:
         return os.path.join(self.data_dir, HISTORY_DIR_NAME, f"{host}.json")
 
     def load_history_shard(self, host: str):
-        """Return (history, current, shard_existed) for one device's shard.
+        """Return (history, current, shard) for one device's shard.
 
-        Parse workers seed their per-file state with this; a corrupt or
-        unreadable shard drops only this device's history (its trends restart
-        from the current run).
+        ``shard`` is the raw document (callers read idempotency metadata from
+        it) or None when the file does not exist; a corrupt or unreadable
+        shard yields an empty non-None dict, dropping only this device's
+        history (its trends restart from the current run).
+
+        Parse workers seed their per-file state with this.
         """
         path = self.history_shard_path(host)
         try:
             with open(path, "r") as f:
                 shard = json.load(f)
         except FileNotFoundError:
-            return {}, {}, False
+            return {}, {}, None
         except (OSError, UnicodeError, json.JSONDecodeError) as e:
             print(f"Error reading optical history shard {host}.json: {e}")
-            return {}, {}, True
+            return {}, {}, {}
         if not isinstance(shard, dict):
-            return {}, {}, True
+            return {}, {}, {}
         history = shard.get("history", {})
         if not isinstance(history, dict):
             history = {}
         current = shard.get("current", {})
         if not isinstance(current, dict):
             current = {}
-        return history, current, True
+        return history, current, shard
 
     def _host_bucket(self, host: str) -> Dict[str, Dict[str, Any]]:
-        """This host's slice of the in-memory history/current state."""
+        """This host's slice of the in-memory history/current state.
+
+        The persisted current snapshot drops raw_data: the expandable-row
+        evidence lives in the optical-details/ sidecars, and no machine
+        consumer of the shards reads it.  The in-memory current keeps it (the
+        detail sidecars are built from there).
+        """
         prefix = f"{host}:"
         return {
             "history": {
@@ -279,7 +288,10 @@ class OpticalAnalyzer:
                 if port.startswith(prefix)
             },
             "current": {
-                port: stats
+                port: {
+                    key: value for key, value in stats.items()
+                    if key != "raw_data"
+                }
                 for port, stats in self.current_optical_stats.items()
                 if port.startswith(prefix)
             },
@@ -304,15 +316,24 @@ class OpticalAnalyzer:
         except Exception as exc:
             return f"{host}: {type(exc).__name__}: {exc}"
 
-    def write_history_shard(self, host: str) -> Optional[str]:
+    def write_history_shard(self, host: str,
+                            source_mtime: Optional[float] = None
+                            ) -> Optional[str]:
         """Persist one device's shard from the in-memory state.
+
+        ``source_mtime`` records which collection file produced this write;
+        the parse worker uses it to recognize an already-merged file and skip
+        the duplicate history append (pool-retry and re-analysis cases).
 
         Returns an error string on failure (parse workers propagate it so
         the run fails loudly instead of silently losing history).
         """
         if not SHARD_HOST_RE.fullmatch(host):
             return f"{host!r}: unsafe shard hostname"
-        return self._write_history_shard(host, self._host_bucket(host))
+        payload = self._host_bucket(host)
+        if source_mtime is not None:
+            payload["source_mtime"] = source_mtime
+        return self._write_history_shard(host, payload)
 
     def save_optical_history(self):
         """Persist the full in-memory state into per-device shards.
@@ -1812,6 +1833,13 @@ class OpticalAnalyzer:
         }
 
         function updateHydrationProgress(done, total, finished) {
+            const csvButton = document.getElementById('download-csv');
+            if (csvButton) {
+                // The export walks the DOM; until every deferred row lands
+                // a CSV would be silently truncated.
+                csvButton.disabled = !finished;
+                csvButton.title = finished ? '' : 'Rows are still loading…';
+            }
             const box = document.getElementById('hydration-progress');
             if (!box) return;
             if (finished) { box.style.display = 'none'; return; }

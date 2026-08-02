@@ -101,6 +101,84 @@ class OpticalShardWorkerTests(unittest.TestCase):
         self.assertEqual(len(payload["history"]["leaf1:swp1"]), 2)
         self.assertEqual(len(payload["current"]), 1)
 
+    def test_reprocessing_the_same_collection_file_is_idempotent(self):
+        # A broken-pool retry (or a re-analysis without new collection)
+        # feeds the exact same file to the worker again; the recorded
+        # source_mtime must keep the duplicate append out of the history.
+        sample = self.root / "optical-data" / "leaf1_optical.txt"
+        self._classify("leaf1", LEAF1_FILE)
+        first = (self.root / "optical-history" / "leaf1.json").read_text()
+        mtime = sample.stat().st_mtime
+
+        optical._parse_worker_analyzer = OpticalAnalyzer(
+            str(self.root), load_history=False
+        )
+        ops, _failures, shard_error = optical._classify_optical_file(
+            str(sample), "leaf1"
+        )
+        self.assertIsNone(shard_error)
+        # The parent's current snapshot is still rebuilt from the ops.
+        self.assertEqual([op[0] for op in ops], ["update"])
+        payload = json.loads(
+            (self.root / "optical-history" / "leaf1.json").read_text()
+        )
+        self.assertEqual(len(payload["history"]["leaf1:swp1"]), 1)
+        self.assertEqual(payload["source_mtime"], mtime)
+        self.assertEqual(
+            (self.root / "optical-history" / "leaf1.json").read_text(), first,
+            "an already-merged file must not rewrite the shard",
+        )
+
+    def test_shard_current_carries_no_raw_data(self):
+        self._classify("leaf1", LEAF1_FILE)
+        payload = json.loads(
+            (self.root / "optical-history" / "leaf1.json").read_text()
+        )
+        for record in payload["current"].values():
+            self.assertNotIn(
+                "raw_data", record,
+                "raw evidence belongs to optical-details/, not the shard",
+            )
+        # The in-memory current keeps raw_data: detail sidecars are built
+        # from it.
+        worker = optical._parse_worker_analyzer
+        self.assertIn("raw_data", worker.current_optical_stats["leaf1:swp1"])
+
+    def test_complete_collection_prunes_removed_port_history(self):
+        seeder = OpticalAnalyzer(str(self.root), load_history=False)
+        seeder.optical_history = {
+            "leaf1:swp1": [_history_entry(1.0)],
+            "leaf1:swp99": [_history_entry(1.0)],
+        }
+        self.assertTrue(seeder.save_optical_history())
+
+        self._classify("leaf1", LEAF1_FILE)  # complete file lists only swp1
+        payload = json.loads(
+            (self.root / "optical-history" / "leaf1.json").read_text()
+        )
+        self.assertIn("leaf1:swp1", payload["history"])
+        self.assertNotIn(
+            "leaf1:swp99", payload["history"],
+            "a port absent from a complete collection was reconfigured away",
+        )
+
+    def test_incomplete_collection_preserves_all_history(self):
+        seeder = OpticalAnalyzer(str(self.root), load_history=False)
+        seeder.optical_history = {"leaf1:swp99": [_history_entry(1.0)]}
+        self.assertTrue(seeder.save_optical_history())
+
+        body = LEAF1_FILE + (
+            "__LLDPQ_COLLECTION_ERROR__:OPTICAL_BUDGET:swp2\n"
+        )
+        self._classify("leaf1", body)
+        payload = json.loads(
+            (self.root / "optical-history" / "leaf1.json").read_text()
+        )
+        self.assertIn(
+            "leaf1:swp99", payload["history"],
+            "an aborted collection must never prune history",
+        )
+
     def test_state_rows_reach_the_persisted_current_snapshot(self):
         body = (
             "=== OPTICAL DIAGNOSTICS ===\n"

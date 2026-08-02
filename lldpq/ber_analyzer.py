@@ -2153,6 +2153,13 @@ class BERAnalyzer:
         }
 
         function updateHydrationProgress(done, total, finished) {
+            const csvButton = document.getElementById('download-csv');
+            if (csvButton) {
+                // The export walks the DOM; until every deferred row lands
+                // a CSV would be silently truncated.
+                csvButton.disabled = !finished;
+                csvButton.title = finished ? '' : 'Rows are still loading…';
+            }
             const box = document.getElementById('hydration-progress');
             if (!box) return;
             if (finished) { box.style.display = 'none'; return; }

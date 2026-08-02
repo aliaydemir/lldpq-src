@@ -1481,6 +1481,13 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
   const hydrationProgressText = document.querySelector('#hydration-progress-text');
 
   function updateHydrationProgress(finished) {{
+    const csvButton = document.getElementById('download-csv');
+    if (csvButton) {{
+      // The export walks the DOM; until every deferred row lands a CSV
+      // would be silently truncated.
+      csvButton.disabled = !finished;
+      csvButton.title = finished ? '' : 'Rows are still loading…';
+    }}
     if (!hydrationProgress) return;
     if (finished) {{ hydrationProgress.hidden = true; return; }}
     hydrationProgress.hidden = false;

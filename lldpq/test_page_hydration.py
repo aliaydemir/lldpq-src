@@ -79,6 +79,12 @@ class HydrationSourceContractTests(unittest.TestCase):
         for source in (self.ber, self.optical, self.flap):
             self.assertIn("classList.contains('tf-hidden')", source)
 
+    def test_csv_export_waits_for_hydration(self):
+        # Until every deferred row lands, a DOM-walking export silently
+        # truncates the CSV; the button stays disabled while hydrating.
+        for source in (self.ber, self.optical, self.flap):
+            self.assertIn("csvButton.disabled = !finished", source)
+
 
 class TableFilterFastPathTests(unittest.TestCase):
     def test_empty_filter_pass_is_skipped(self):

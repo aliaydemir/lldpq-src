@@ -147,9 +147,13 @@ def _classify_optical_file(filepath, hostname):
     # The persisted current snapshot is rebuilt from this run's data only,
     # so the shard's old current is deliberately discarded here.
     analyzer.current_optical_stats = {}
-    analyzer.optical_history, _stale_current, shard_existed = (
+    analyzer.optical_history, _stale_current, shard = (
         analyzer.load_history_shard(hostname)
     )
+    try:
+        source_mtime = os.path.getmtime(filepath)
+    except OSError:
+        source_mtime = None
     ops = []
 
     def state_op(port_name, health, snippet):
@@ -276,13 +280,37 @@ def _classify_optical_file(filepath, hostname):
                 describe_optical_collection_failure(reason, interface),
             )
 
+    # A complete collection is the authority on which interfaces exist: a
+    # history key absent from the file is a removed or renamed port
+    # (breakout reconfiguration), not a down module — down and empty-cage
+    # ports still appear in the file.  An incomplete collection (budget,
+    # timeout, inventory failure) must not prune anything.
+    if not file_failures and analyzer.optical_history:
+        live = {f"{hostname}:{iface}" for iface in port_data}
+        analyzer.optical_history = {
+            port: entries
+            for port, entries in analyzer.optical_history.items()
+            if port in live
+        }
+
     # Persist this device's shard from the worker.  A device that never had
     # optical state (all-DAC racks) gets no file, so the shard directory
-    # stays proportional to optical devices, not fleet size.
+    # stays proportional to optical devices, not fleet size.  A shard whose
+    # recorded source_mtime matches this file was already fully merged (a
+    # broken-pool retry or a re-analysis without new collection); rewriting
+    # it would append this file's samples to the history a second time.
     shard_error = None
-    if (analyzer.optical_history or analyzer.current_optical_stats
-            or shard_existed):
-        shard_error = analyzer.write_history_shard(hostname)
+    already_merged = (
+        shard is not None
+        and source_mtime is not None
+        and shard.get("source_mtime") == source_mtime
+    )
+    if not already_merged and (
+            analyzer.optical_history or analyzer.current_optical_stats
+            or shard is not None):
+        shard_error = analyzer.write_history_shard(
+            hostname, source_mtime=source_mtime
+        )
 
     return ops, file_failures, shard_error
 
