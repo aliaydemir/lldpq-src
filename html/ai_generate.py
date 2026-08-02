@@ -62,19 +62,22 @@ def _os_port(port):
     match = re.match(r"^(\d+)/(\d+)$", low)  # breakout N/M -> swpNs(M-1) (0-based sub-port)
     if match:
         return "swp%ss%d" % (match.group(1), int(match.group(2)) - 1)
-    # Three-part port/cage/split notation: '3/1/2' = port 3, cage 1, split 2
-    # (1-based) -> swp3s1.
+    # Three-part port/group/sub notation: unreachable via the normal callers
+    # (resolve_port_map covers every named three-part endpoint first) but kept
+    # aligned with its singleton fitting: lane = (Y-1)*max(1,Z) + (Z-1).
     match = re.match(r"^(\d+)/(\d+)/(\d+)$", low)
     if match:
-        return "swp%ss%d" % (match.group(1), int(match.group(3)) - 1)
+        y, z = int(match.group(2)), int(match.group(3))
+        return "swp%ss%d" % (match.group(1), (y - 1) * max(1, z) + (z - 1))
     if re.match(r"^\d+$", low):  # bare number -> swpN
         return "swp" + low
     return raw
 
 
 def _bad_token(text):
-    """True when a device/port cannot appear in topology.dot (empty / whitespace)."""
-    return not text or bool(_WS_RE.search(text))
+    """True when a device/port cannot appear in topology.dot (empty /
+    whitespace / double quote, which would corrupt the quoted DOT tokens)."""
+    return not text or bool(_WS_RE.search(text)) or '"' in text
 
 
 # ---------------------------------------------------------------------------
@@ -299,12 +302,20 @@ def validate_p2p(connections):
 
     resolved = ai_p2p.resolve_port_map(connections)
     port_owner = {}       # (device_key, os_port) -> (sheet_name, row_number)
+    base_usage = {}       # (device_key, base_port) -> {"whole": [...], "split": [...]}
     edge_seen = {}        # frozenset endpoint keys -> first row_number
     unresolved = 0
+
+    def _loc(s, r):
+        return ("'%s' row %s" % (s, r)) if s else ("row %s" % r)
 
     for record in records:
         row = record.get("row_number", "?")
         sheet = record.get("sheet_name", "")
+        if record.get("unresolved"):
+            unresolved += 1
+            continue  # tbd/blank/customer endpoints must not own ports or edges
+
         endpoints = []
         for side in ("source", "dest"):
             dev = _clean(record.get(side + "_name"))
@@ -312,29 +323,6 @@ def validate_p2p(connections):
             os_port = (ai_p2p.resolved_os_port(resolved, dev, raw_port)
                        or _os_port(raw_port))
             endpoints.append((dev, raw_port, os_port))
-            if not dev or not raw_port:
-                continue
-            dev_key = min(ai_p2p._device_keys(dev))
-            # port(OS)/breakout mismatch: a breakout child port on a device whose
-            # base swpN is also cabled as a whole (design inconsistency).
-            key = (dev_key, os_port)
-            if key in port_owner and port_owner[key] != (sheet, row):
-                first_sheet, first_row = port_owner[key]
-                def _loc(s, r):
-                    return ("'%s' row %s" % (s, r)) if s else ("row %s" % r)
-                issues.append({
-                    "severity": "error",
-                    "kind": "duplicate-port",
-                    "message": "%s port %s (%s) used by %s and %s"
-                    % (dev, raw_port, os_port, _loc(first_sheet, first_row), _loc(sheet, row)),
-                    "device": dev, "port": raw_port, "row": row,
-                })
-            else:
-                port_owner.setdefault(key, (sheet, row))
-
-        if record.get("unresolved"):
-            unresolved += 1
-            continue
 
         (a_dev, a_raw, a_os), (b_dev, b_raw, b_os) = endpoints
         if a_dev and b_dev and a_raw and b_raw:
@@ -355,8 +343,52 @@ def validate_p2p(connections):
                     % (a_dev, a_raw, b_dev, b_raw, edge_seen[edge_key], row),
                     "row": row,
                 })
+                # An exact duplicate pair is one finding: re-registering its
+                # ports would double-report it as two duplicate-port errors.
+                continue
             else:
                 edge_seen[edge_key] = row
+
+        for dev, raw_port, os_port in endpoints:
+            if not dev or not raw_port:
+                continue
+            if ai_p2p._is_placeholder_name(raw_port):
+                continue  # 'tbd'/'x'/'-' pseudo-ports are not cabled endpoints
+            dev_key = min(ai_p2p._device_keys(dev))
+            key = (dev_key, os_port)
+            if key in port_owner and port_owner[key] != (sheet, row):
+                first_sheet, first_row = port_owner[key]
+                issues.append({
+                    "severity": "error",
+                    "kind": "duplicate-port",
+                    "message": "%s port %s (%s) used by %s and %s"
+                    % (dev, raw_port, os_port, _loc(first_sheet, first_row), _loc(sheet, row)),
+                    "device": dev, "port": raw_port, "row": row,
+                })
+            else:
+                port_owner.setdefault(key, (sheet, row))
+            # port(OS)/breakout mismatch bookkeeping: a whole swpN and any
+            # swpNsM child cabled on the same device is a design inconsistency.
+            m = re.match(r"^swp(\d+)(s\d+)?$", os_port)
+            if m:
+                usage = base_usage.setdefault(
+                    (dev_key, int(m.group(1))), {"whole": [], "split": []})
+                usage["split" if m.group(2) else "whole"].append(
+                    (dev, os_port, sheet, row))
+
+    for (dev_key, base), usage in base_usage.items():
+        if not (usage["whole"] and usage["split"]):
+            continue
+        whole_locs = ", ".join(_loc(s, r) for _, _, s, r in usage["whole"])
+        split_locs = ", ".join(
+            "%s (%s)" % (p, _loc(s, r)) for _, p, s, r in usage["split"])
+        issues.append({
+            "severity": "error", "kind": "breakout-conflict",
+            "message": "%s port swp%d cabled both whole (%s) and as breakout %s"
+            % (usage["whole"][0][0], base, whole_locs, split_locs),
+            "device": usage["whole"][0][0], "port": "swp%d" % base,
+            "row": usage["whole"][0][3],
+        })
 
     if unresolved:
         issues.append({
@@ -371,10 +403,18 @@ def validate_p2p(connections):
         "resolved_links": len(edge_seen),
         "duplicate_ports": sum(1 for i in issues if i["kind"] == "duplicate-port"),
         "duplicate_records": sum(1 for i in issues if i["kind"] == "duplicate-record"),
+        "breakout_conflicts": sum(1 for i in issues if i["kind"] == "breakout-conflict"),
         "unresolved": unresolved,
     }
     order = {"error": 0, "warning": 1, "info": 2}
-    issues.sort(key=lambda i: (order.get(i["severity"], 3), str(i.get("row"))))
+
+    def _row_key(value):
+        try:
+            return (0, int(value))
+        except (TypeError, ValueError):
+            return (1, 0)  # non-numeric rows (None, '?') sort last
+
+    issues.sort(key=lambda i: (order.get(i["severity"], 3), _row_key(i.get("row"))))
     return {"issues": issues, "counts": counts, "warnings": warnings}
 
 
@@ -413,7 +453,9 @@ def _switch_role(role, hostname):
         return None
     verbatim = re.sub(r"\s+", "_", str(role or "").strip())
     verbatim = re.sub(r"[^A-Za-z0-9_-]", "", verbatim)
-    return verbatim or canon
+    # Lowercased so role sorting and devices.yaml diffs stay case-stable
+    # (design 'Spine' must equal canon 'spine').
+    return verbatim.lower() or canon
 
 
 def _map_switch_role(role, hostname):
@@ -744,7 +786,9 @@ def ipam_to_topology_config_yaml(ipam, p2p=None):
         seen_patterns.add(pattern)
         lines += ["  # %s (%d device%s)" % (role, len(hosts),
                                             "" if len(hosts) == 1 else "s"),
-                  '  - pattern: "%s"' % pattern,
+                  # Double-escape: a single '\.' is an invalid escape inside a
+                  # YAML double-quoted scalar (yaml.safe_load rejects the file).
+                  '  - pattern: "%s"' % pattern.replace("\\", "\\\\"),
                   "    layer: %d" % layer,
                   '    icon: "%s"' % _family_icon(role, hosts[0]),
                   ""]

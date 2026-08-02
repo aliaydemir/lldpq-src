@@ -115,7 +115,9 @@ _RULES: Dict[str, Tuple[Dict[str, str], ...]] = {
         {
             "section": "bgp-summary",
             "kind": "confirm",
-            "pattern": r"(?m)^\S+\s+4\s+\d+.*\b(?:Idle|Active|Connect|OpenSent|OpenConfirm)\b",
+            # State must sit right after the Up/Down column (never/uptime) so
+            # a Desc column such as "Active-Backup uplink" cannot match.
+            "pattern": r"(?m)^\S+\s+4\s+\d+.*\s(?:never|\d+:[\d:]+|\d+[ydwhm][\dydwhm]*)\s+(?:Idle|Active|Connect|OpenSent|OpenConfirm)\b",
             "signal": "BGP peer not in Established state",
         },
         {
@@ -133,7 +135,10 @@ _RULES: Dict[str, Tuple[Dict[str, str], ...]] = {
         {
             "section": "bgp-failed",
             "kind": "confirm",
-            "pattern": r"(?m)^\S+\s+4\s+\d+.*\b(?:Idle|Active|Connect|OpenSent|OpenConfirm)\b",
+            # "summary failed" rows: Neighbor EstdCnt DropCnt ResetTime Reason
+            # (e.g. "swp1  0  0  never  Waiting for peer OPEN"); the header
+            # line and "Displayed neighbors 0" must not match.
+            "pattern": r"(?m)^(?!Neighbor\b)\S+\s+\d+\s+\d+\s+(?:never|\d+:[\d:]+|\d+[ydwhm][\dydwhm]*)\s+\S.*$",
             "signal": "failed BGP session listed",
         },
         {
@@ -147,7 +152,9 @@ _RULES: Dict[str, Tuple[Dict[str, str], ...]] = {
         {
             "section": "evpn-summary",
             "kind": "confirm",
-            "pattern": r"(?m)^\S+\s+4\s+\d+.*\b(?:Idle|Active|Connect|OpenSent|OpenConfirm)\b",
+            # Same Up/Down anchoring as bgp-summary: keep Desc columns from
+            # matching the state words.
+            "pattern": r"(?m)^\S+\s+4\s+\d+.*\s(?:never|\d+:[\d:]+|\d+[ydwhm][\dydwhm]*)\s+(?:Idle|Active|Connect|OpenSent|OpenConfirm)\b",
             "signal": "EVPN peer not in Established state",
         },
         {
@@ -165,7 +172,9 @@ _RULES: Dict[str, Tuple[Dict[str, str], ...]] = {
         {
             "section": "vxlan-links",
             "kind": "clean",
-            "pattern": r"(?m)\bvxlan\b",
+            # "ip link show type vxlan" interface lines ("12: vxlan48: <...>"
+            # or "13: vni10100: <...>"); \bvxlan\b would miss both schemes.
+            "pattern": r"(?mi)^\d+:\s+\S*(?:vxlan|vni)\S*:",
             "signal": "VXLAN kernel interfaces present",
         },
     ),
@@ -315,6 +324,15 @@ def _parse_sections(output: Any) -> Dict[str, Dict[str, Any]]:
     return sections
 
 
+def _uses_journal_grep(command: str) -> bool:
+    """True when a pack command filters the journal with -g/--grep."""
+    tokens = command.split()
+    return "journalctl" in tokens and any(
+        token in ("-g", "--grep") or token.startswith("--grep=")
+        for token in tokens
+    )
+
+
 def analyze(pack: str, sectioned_output: Any) -> Dict[str, Any]:
     """Deterministic verdict for one pack's sectioned output (fail closed)."""
     tool = "audit-pack:%s" % pack
@@ -342,6 +360,7 @@ def analyze(pack: str, sectioned_output: Any) -> Dict[str, Any]:
         }
 
     expected = [name for name, _cmd in PACKS[pack]]
+    grep_sections = {name for name, cmd in PACKS[pack] if _uses_journal_grep(cmd)}
     signals: List[str] = []
     limitations: List[str] = []
     confirmed = warned = clean = 0
@@ -357,11 +376,22 @@ def analyze(pack: str, sectioned_output: Any) -> Dict[str, Any]:
             )
             continue
         if entry["rc"] != 0:
-            limitations.append(
-                "section %s exited rc=%d (feature absent, unsupported command, "
-                "or wrong device role)" % (name, entry["rc"])
+            # journalctl --grep exits rc=1 on zero matches (systemd >= 246);
+            # an empty match set from a grep section is a healthy quiet
+            # journal, not a failed command. rc>1 or rc=1 with real output
+            # (error text) keeps the fail-closed handling below.
+            body_text = str(entry["body"] or "").strip()
+            grep_quiet = (
+                entry["rc"] == 1
+                and name in grep_sections
+                and body_text in ("", "-- No entries --")
             )
-            continue
+            if not grep_quiet:
+                limitations.append(
+                    "section %s exited rc=%d (feature absent, unsupported command, "
+                    "or wrong device role)" % (name, entry["rc"])
+                )
+                continue
         ok_sections += 1
         body = entry["body"]
         for rule in _RULES.get(pack, ()):

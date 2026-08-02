@@ -412,10 +412,16 @@ class OpticalShardConsumerContractTests(unittest.TestCase):
         )
         optical_extract = source.split("def _extract_optical(", 1)[1]
         optical_extract = optical_extract.split("def _extract_", 1)[0]
-        self.assertIn('_stream_history(\n                shard, "history"',
-                      optical_extract)
+        # Shard directories go through the shared per-shard streaming merge
+        # (one bad shard must not blank the source); the monolith fallback
+        # still streams the single file directly.
+        self.assertIn("_stream_history_shards(", optical_extract)
         self.assertIn('_stream_history(\n            path, "optical_history"',
                       optical_extract)
+        shard_helper = source.split("def _stream_history_shards(", 1)[1]
+        shard_helper = shard_helper.split("\ndef ", 1)[0]
+        self.assertIn('_stream_history(\n            shard, "history"',
+                      shard_helper)
 
     def test_ai_correlate_merges_shards(self):
         source = self._read("html/ai_correlate.py")

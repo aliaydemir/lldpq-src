@@ -274,7 +274,21 @@ class ParseWorkbookTest(unittest.TestCase):
         via_device = ai_ipam.lookup_host(self.result, "spine-01")
         self.assertEqual(via_device["fabric"][0]["hostname"], "tan-spine-01")
         self.assertEqual(ai_ipam.lookup_host(self.result, "no-such-host"),
-                         {"hostname": "no-such-host", "hosts": [], "fabric": []})
+                         {"hostname": "no-such-host", "hosts": [], "fabric": [],
+                          "l3_links": []})
+
+    def test_lookup_ip_and_host_include_l3_links(self):
+        hit = ai_ipam.lookup_ip(self.result, "192.0.2.4")
+        self.assertEqual(len(hit["l3_links"]), 1)
+        self.assertEqual(hit["l3_links"][0]["a_host"], "p1-border-leaf1")
+        # the peer side of the /31 matches too
+        peer = ai_ipam.lookup_ip(self.result, "192.0.2.5")
+        self.assertEqual([l["a_host"] for l in peer["l3_links"]], ["p1-border-leaf1"])
+        # host lookup is case/FQDN tolerant on both link sides
+        host_hit = ai_ipam.lookup_host(self.result, "TAN-BORDER-01.dc.example.com")
+        self.assertEqual([l["a_if"] for l in host_hit["l3_links"]], ["swp29"])
+        via_b_side = ai_ipam.lookup_host(self.result, "fw-01")
+        self.assertEqual([l["b_if"] for l in via_b_side["l3_links"]], ["eth1/1"])
 
     def test_expected_bgp(self):
         bgp = ai_ipam.expected_bgp(self.result)
@@ -282,6 +296,93 @@ class ParseWorkbookTest(unittest.TestCase):
         self.assertEqual(bgp["tan-core-01"], {"loopback": "", "asn": "4200010001"})
         # fabric rows without loopback and ASN are excluded from BGP truth
         self.assertNotIn("oob-spine-01", bgp)
+
+
+# A subnet-catalog mini-table stacked ABOVE a wide host table: the wide table
+# used to be lost entirely (the wide sniff only ran as a whole-sheet fallback).
+CATALOG_PLUS_RAILS_ROWS = [
+    ["VRF", "VLAN", "Network", "Network GW", "Purpose"],
+    ["default", "VLAN_10", "10.1.0.0/24", "10.1.0.254", "OOB mgmt"],
+    [],
+    ["Hostname", "Rail0", "Rail1", "CIDR"],
+    ["gpu-r1-01", "10.128.0.1", "10.128.4.1", "/22"],
+    ["gpu-r1-02", "10.128.0.2", None, "/22"],
+]
+
+# Assignment block with placeholder vlan/vrf cells that must not become truth.
+PLACEHOLDER_ASSIGN_ROWS = [
+    ["HOSTNAME", "INTERFACE", "IP ADDRESS", "MASK", "GATEWAY", "VLAN", "VRF"],
+    ["ctrl-01", "BMC", "10.9.0.1", "/24", "10.9.0.254", "N/A", "-"],
+    ["ctrl-02", "BMC", "10.9.0.2", "/24", "10.9.0.254", "VLAN_9", "mgmt"],
+]
+
+# Wide host table with a gateway-ish ip column (subnet metadata, not per-host).
+GW_COLUMN_ROWS = [
+    ["Server", "bmc_ip", "gw ip", "bmc_net"],
+    ["node-01", "10.9.1.10", "10.9.1.254", "/26"],
+]
+
+
+class ParserRegressionTest(unittest.TestCase):
+    """Regressions: mid-sheet wide tables, placeholder vlan/vrf filtering,
+    gateway ip columns, expected_bgp merge semantics."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        path = Path(cls.tmp.name) / "regr.xlsx"
+        build_xlsx(path, [
+            ("Catalog Plus Rails", CATALOG_PLUS_RAILS_ROWS),
+            ("Ctrl Assign", PLACEHOLDER_ASSIGN_ROWS),
+            ("Servers GW", GW_COLUMN_ROWS),
+        ])
+        cls.result = ai_ipam.parse_workbook(path)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def _hosts(self, sheet):
+        return {h["hostname"]: h for h in self.result["hosts"] if h["sheet"] == sheet}
+
+    def test_wide_host_table_below_a_catalog_still_parses(self):
+        subnets = {s["prefix"]: s for s in self.result["subnets"]}
+        self.assertIn("10.1.0.0/24", subnets)
+        hosts = self._hosts("Catalog Plus Rails")
+        ru01 = {a["role_or_interface"]: a for a in hosts["gpu-r1-01"]["assignments"]}
+        self.assertEqual(ru01["Rail0"]["ip"], "10.128.0.1")
+        self.assertEqual(ru01["Rail0"]["prefixlen_or_mask"], "22")
+        self.assertEqual(ru01["Rail1"]["ip"], "10.128.4.1")
+        self.assertEqual(len(hosts["gpu-r1-02"]["assignments"]), 1)
+        # rail rows no longer fall through to the catalog state, so no bogus
+        # invalid-prefix warnings are emitted for this sheet
+        self.assertFalse(any("Catalog Plus Rails" in w and "invalid" in w
+                             for w in self.result["warnings"]))
+
+    def test_assignment_placeholder_vlan_vrf_not_stored(self):
+        hosts = self._hosts("Ctrl Assign")
+        first = hosts["ctrl-01"]["assignments"][0]
+        self.assertNotIn("vlan", first)
+        self.assertNotIn("vrf", first)
+        second = hosts["ctrl-02"]["assignments"][0]
+        self.assertEqual(second["vlan"], "VLAN_9")
+        self.assertEqual(second["vrf"], "mgmt")
+
+    def test_gateway_ip_column_is_not_an_assignment(self):
+        hosts = self._hosts("Servers GW")
+        assignments = hosts["node-01"]["assignments"]
+        self.assertEqual([a["ip"] for a in assignments], ["10.9.1.10"])
+        self.assertEqual(assignments[0]["prefixlen_or_mask"], "26")
+
+    def test_expected_bgp_merges_records_case_insensitively(self):
+        data = {"fabric": [
+            {"hostname": "tan-core-01", "asn": "4200010001", "sheet": "A"},
+            {"hostname": "TAN-CORE-01", "loopback_ip": "10.0.0.1",
+             "asn": "4200099999", "sheet": "B"},
+        ]}
+        bgp = ai_ipam.expected_bgp(data)
+        self.assertEqual(bgp, {"tan-core-01":
+                               {"loopback": "10.0.0.1", "asn": "4200010001"}})
 
 
 class HelperTest(unittest.TestCase):

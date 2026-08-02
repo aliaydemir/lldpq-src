@@ -276,6 +276,8 @@ except Exception:
 # simply runs without KB digest/section injection.
 _kb_digest = None
 _kb_select = None
+_kb_keys = None
+_kb_sections_for_keys = None
 try:
     _kb_path = os.path.join(WEB_ROOT, 'ai_kb.py')
     if os.path.isfile(_kb_path):
@@ -285,9 +287,15 @@ try:
             _kb_spec.loader.exec_module(_kb_module)
             _kb_digest = _kb_module.kb_digest
             _kb_select = _kb_module.kb_select
+            _kb_keys = getattr(_kb_module, 'kb_keys', None)
+            _kb_sections_for_keys = getattr(
+                _kb_module, 'kb_sections_for_keys', None
+            )
 except Exception:
     _kb_digest = None
     _kb_select = None
+    _kb_keys = None
+    _kb_sections_for_keys = None
 
 # Named audit packs (server-composed compound probes + deterministic verdict
 # analyzer). Optional like the other co-deployed helpers: when ai_audit_packs.py
@@ -418,7 +426,7 @@ _BEARER_RE = re.compile(r'(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)(\S+)')
 _URI_CREDENTIAL_RE = re.compile(r'(?i)(https?://[^\s/@:]+:)([^\s/@]+)(@)')
 _URL_KEY_RE = re.compile(r'(?i)([?&](?:key|api[-_]?key|token)=)[^&\s]+')
 _TOOL_TAG_RE = re.compile(
-    r'\[(DRYRUN|RUNALL|RUN|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|FIX|NEXT|CONSOLE)\s*:',
+    r'\[(DRYRUN|RUNALL|RUN|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|FIX|NEXT|CONSOLE)\s*:',
     re.IGNORECASE,
 )
 _OBSERVATION_BOUNDARY_RE = re.compile(
@@ -489,7 +497,17 @@ def prepare_outbound_messages(messages, provider=None):
             raise ValueError("Invalid LLM message role or content")
         if provider_is_cloud(provider):
             content = redact_secrets(content)
-        clean.append({'role': role, 'content': content})
+        clean_message = {'role': role, 'content': content}
+        # An attached image rides as message metadata, never inside content:
+        # budgeting/redaction/history keep operating on plain text and each
+        # provider serializer renders the binary part natively.
+        image = message.get('image')
+        if isinstance(image, dict) and image.get('b64'):
+            clean_message['image'] = {
+                'b64': str(image['b64']),
+                'media_type': str(image.get('media_type') or 'image/png'),
+            }
+        clean.append(clean_message)
     return clean
 
 
@@ -991,8 +1009,11 @@ def _source_freshness(path, required=False, inspect_json=False):
         record.update({'available': True, 'current': age <= _max_collection_age_seconds(),
                        'age_seconds': age})
         if inspect_json and path.endswith('.json'):
-            with open(path, 'r') as source_file:
-                parsed = json.load(source_file)
+            # Memoized: the same files are parsed again by the context
+            # builders within this request.
+            parsed = _load_json_cached(path)
+            if parsed is None:
+                raise ValueError('unreadable JSON source')
             if isinstance(parsed, dict) and isinstance(parsed.get('complete'), bool):
                 record['complete'] = parsed['complete']
                 if not parsed['complete']:
@@ -1551,10 +1572,8 @@ def build_fabric_summary():
     
     # 4. BGP history
     try:
-        bgp_file = _mr_path('bgp_history.json')
-        if os.path.exists(bgp_file):
-            with open(bgp_file, 'r') as f:
-                bgp = json.load(f)
+        bgp = _load_json_cached(_mr_path('bgp_history.json'))
+        if bgp is not None:
             total_sessions = 0
             down_sessions = []
             for device, stats in _current_bgp_stats(bgp).items():
@@ -1579,10 +1598,8 @@ def build_fabric_summary():
     
     # 5. Log summary (totals + per-device critical breakdown)
     try:
-        log_file = _mr_path('log_summary.json')
-        if os.path.exists(log_file):
-            with open(log_file, 'r') as f:
-                logs = json.load(f)
+        logs = _load_json_cached(_mr_path('log_summary.json'))
+        if logs is not None:
             totals = logs.get('totals', {}) if isinstance(logs, dict) else {}
             critical = _nonnegative_int(totals.get('critical'))
             errors = _nonnegative_int(totals.get('error'))
@@ -1687,10 +1704,8 @@ def build_fabric_summary():
     
     # 9. Fabric tables summary
     try:
-        summary_file = _mr_path('fabric-tables', 'summary.json')
-        if os.path.exists(summary_file):
-            with open(summary_file, 'r') as f:
-                fsummary = json.load(f)
+        fsummary = _load_json_cached(_mr_path('fabric-tables', 'summary.json'))
+        if fsummary is not None:
             table_devices = fsummary.get('devices', []) if isinstance(fsummary, dict) else []
             if isinstance(table_devices, list) and table_devices:
                 arp_count = sum(
@@ -1784,7 +1799,10 @@ def build_fabric_summary():
 
     collection_metadata = build_collection_metadata(devices, device_health)
     summary.append(format_collection_metadata(collection_metadata))
-    return '\n'.join(summary), devices, device_health
+    # The metadata is returned alongside the text so callers never pay for a
+    # second build_collection_metadata() pass (it re-stats and re-parses every
+    # collection source).
+    return '\n'.join(summary), devices, device_health, collection_metadata
 
 
 def build_device_detail(hostname, devices, device_health):
@@ -1834,10 +1852,8 @@ def build_device_detail(hostname, devices, device_health):
     
     # BGP for this device
     try:
-        bgp_file = _mr_path('bgp_history.json')
-        if os.path.exists(bgp_file):
-            with open(bgp_file, 'r') as f:
-                bgp = json.load(f)
+        bgp = _load_json_cached(_mr_path('bgp_history.json'))
+        if bgp is not None:
             dev_bgp = _current_bgp_stats(bgp).get(hostname, {})
             if dev_bgp:
                 neighbors = _bgp_neighbor_rows(dev_bgp)
@@ -2403,6 +2419,48 @@ def _load_json_file(path):
             return json.load(f)
     except Exception:
         return None
+
+
+# Per-process memo for read-only collection files that several context
+# builders re-parse within one request (bgp_history.json alone was parsed
+# four times per chat). Keyed by mtime+size so a mid-request producer update
+# is still picked up. State files that participate in locked
+# read-modify-write cycles (learnings/findings/suppressions/analysis) must
+# keep using _load_json_file directly.
+_JSON_MEMO = {}
+
+
+def _load_json_cached(path):
+    try:
+        stat = os.stat(path)
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        _JSON_MEMO.pop(path, None)
+        return None
+    cached = _JSON_MEMO.get(path)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    data = _load_json_file(path)
+    _JSON_MEMO[path] = (key, data)
+    return data
+
+
+def _fabric_capabilities():
+    """Deterministic fabric capability signals for KB section gating.
+
+    Only signals the collected data can prove either way are present; unknown
+    capabilities stay absent so gated sections keep injecting (the tri-state
+    semantics ai_kb expects)."""
+    caps = {}
+    summary = _load_json_cached(_mr_path('fabric-tables', 'summary.json'))
+    table_devices = summary.get('devices') if isinstance(summary, dict) else None
+    if isinstance(table_devices, list) and table_devices:
+        vteps = sum(
+            _nonnegative_int(item.get('vtep_count'))
+            for item in table_devices if isinstance(item, dict)
+        )
+        caps['evpn'] = caps['vxlan'] = vteps > 0
+    return caps
 
 
 def _load_ber_current_stats(hosts=None):
@@ -3919,10 +3977,8 @@ def build_device_list(devices, device_health):
     
     # Check BGP issues
     try:
-        bgp_file = _mr_path('bgp_history.json')
-        if os.path.exists(bgp_file):
-            with open(bgp_file, 'r') as f:
-                bgp = json.load(f)
+        bgp = _load_json_cached(_mr_path('bgp_history.json'))
+        if bgp is not None:
             for device_name, stats in _current_bgp_stats(bgp).items():
                 if isinstance(stats, dict):
                     neighbors = _bgp_neighbor_rows(stats)
@@ -4224,14 +4280,21 @@ def _build_gemini_payload(messages, max_output_tokens=DEFAULT_LLM_MAX_OUTPUT_TOK
         )
         if role is None:
             continue
-        part = {"text": message['content']}
+        parts = []
+        image = message.get('image') if isinstance(message.get('image'), dict) else None
+        if image and image.get('b64') and role == 'user':
+            parts.append({"inline_data": {
+                "mime_type": image.get('media_type') or 'image/png',
+                "data": image['b64'],
+            }})
+        parts.append({"text": message['content']})
         # Gemini chat examples alternate user/model turns. Merge adjacent
         # same-role messages (for example observations + a user-first browser
         # history) into one Content with multiple text parts.
         if gemini_contents and gemini_contents[-1]['role'] == role:
-            gemini_contents[-1]['parts'].append(part)
+            gemini_contents[-1]['parts'].extend(parts)
         else:
-            gemini_contents.append({"role": role, "parts": [part]})
+            gemini_contents.append({"role": role, "parts": parts})
     payload = {"contents": gemini_contents}
     if system_text:
         # Keep trusted instructions out of the untrusted observation turn.
@@ -4332,8 +4395,15 @@ def _record_provider_usage(provider, model, result):
             'model': model,
             'usage': usage,
         }, default=str)
+        usage_path = os.path.join(AI_STATE_DIR, 'usage.jsonl')
+        try:
+            # Bounded retention: one rotated generation, ~4 MB total.
+            if os.path.getsize(usage_path) > 2 * 1024 * 1024:
+                os.replace(usage_path, usage_path + '.1')
+        except OSError:
+            pass
         descriptor = os.open(
-            os.path.join(AI_STATE_DIR, 'usage.jsonl'),
+            usage_path,
             os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o660,
         )
         try:
@@ -4353,6 +4423,11 @@ def _provider_request_once(
     import urllib.request
 
     safe_messages = prepare_outbound_messages(messages, provider=AI_PROVIDER)
+
+    def _message_image(entry):
+        image = entry.get('image')
+        return image if isinstance(image, dict) and image.get('b64') else None
+
     if AI_PROVIDER == 'ollama':
         url = f"{OLLAMA_URL}/api/chat"
         options = {"num_predict": max(1, int(max_output_tokens))}
@@ -4366,8 +4441,17 @@ def _provider_request_once(
                 ))
         except Exception:
             pass
+        ollama_msgs = []
+        for m in safe_messages:
+            entry = {"role": m['role'], "content": m['content']}
+            image = _message_image(m)
+            if image:
+                # Ollama multimodal contract: base64 images ride beside the
+                # text; text-only models simply ignore the field.
+                entry["images"] = [image['b64']]
+            ollama_msgs.append(entry)
         payload = json.dumps({
-            "model": model, "messages": safe_messages, "stream": False,
+            "model": model, "messages": ollama_msgs, "stream": False,
             "options": options,
         }).encode()
         headers = {'Content-Type': 'application/json'}
@@ -4375,10 +4459,22 @@ def _provider_request_once(
         base_url = AI_API_URL.rstrip('/')
         url = f"{base_url}/messages" if '/messages' not in base_url else base_url
         system_msg = '\n\n'.join(m['content'] for m in safe_messages if m['role'] == 'system')
-        claude_msgs = [
-            {"role": m['role'], "content": m['content']}
-            for m in safe_messages if m['role'] != 'system'
-        ]
+        claude_msgs = []
+        for m in safe_messages:
+            if m['role'] == 'system':
+                continue
+            image = _message_image(m)
+            if image and m['role'] == 'user':
+                claude_msgs.append({"role": m['role'], "content": [
+                    {"type": "image", "source": {
+                        "type": "base64",
+                        "media_type": image.get('media_type') or 'image/png',
+                        "data": image['b64'],
+                    }},
+                    {"type": "text", "text": m['content']},
+                ]})
+            else:
+                claude_msgs.append({"role": m['role'], "content": m['content']})
         # Anthropic prompt caching is an explicit opt-in. The system prompt
         # and the first user block (the large fabric-observation payload) are
         # the stable prefix re-sent on every tool round and forced final
@@ -4390,7 +4486,8 @@ def _provider_request_once(
                 "type": "text", "text": system_msg,
                 "cache_control": {"type": "ephemeral"},
             }]
-        if claude_msgs and claude_msgs[0]['role'] == 'user':
+        if (claude_msgs and claude_msgs[0]['role'] == 'user'
+                and isinstance(claude_msgs[0]['content'], str)):
             claude_msgs[0]['content'] = [{
                 "type": "text", "text": claude_msgs[0]['content'],
                 "cache_control": {"type": "ephemeral"},
@@ -4408,7 +4505,24 @@ def _provider_request_once(
         headers = {'Content-Type': 'application/json'}
     else:
         url = f"{AI_API_URL.rstrip('/')}/chat/completions"
-        body = {"model": model, "messages": safe_messages}
+        openai_msgs = []
+        for m in safe_messages:
+            image = _message_image(m)
+            if image and m['role'] == 'user':
+                # OpenAI-compatible vision contract (data-URL image_url);
+                # the NVIDIA inference proxy forwards it to Bedrock/Claude.
+                openai_msgs.append({"role": m['role'], "content": [
+                    {"type": "image_url", "image_url": {"url": (
+                        "data:%s;base64,%s" % (
+                            image.get('media_type') or 'image/png',
+                            image['b64'],
+                        )
+                    )}},
+                    {"type": "text", "text": m['content']},
+                ]})
+            else:
+                openai_msgs.append({"role": m['role'], "content": m['content']})
+        body = {"model": model, "messages": openai_msgs}
         # api.openai.com rejects the legacy max_tokens on current reasoning
         # models; other OpenAI-compatible gateways still expect max_tokens.
         if 'api.openai.com' in url:
@@ -4943,6 +5057,20 @@ address is SUPPOSED to be (design truth), to compare against live observations:
 """
 if _p2p_module is not None or _ipam_module is not None:
     TOOL_INSTRUCTIONS += DESIGN_INSTRUCTIONS
+
+# Advertised only when ai_kb.py provides explicit key lookup; the digest in
+# the system prompt lists the available section keys.
+KB_INSTRUCTIONS = """
+=== LOCAL RUNBOOK KB ===
+To pull a specific local runbook section into context (no device access, no
+network), request it by key on its own line:
+[KB: <key> [<key> ...]]
+  - Keys come from the KB catalog in the system prompt (e.g. ber-fec, mlag).
+  - Sections matching the question are auto-injected already; use this only
+    when you need a section the auto-match did not include. Costs one tool slot.
+"""
+if _kb_sections_for_keys is not None:
+    TOOL_INSTRUCTIONS += KB_INSTRUCTIONS
 
 
 def _policy_block_hint(command, error):
@@ -6163,8 +6291,7 @@ def action_chat():
                      "unsuppressed": (_removed or {}).get('id', '')})
 
     # Build context
-    fabric_summary, devices, device_health = build_fabric_summary()
-    collection_metadata = build_collection_metadata(devices, device_health)
+    fabric_summary, devices, device_health, collection_metadata = build_fabric_summary()
     context_sources = set()
     context_source_gaps = set()
     extra_context = neutralize_untrusted_tool_tags(
@@ -6225,7 +6352,10 @@ def action_chat():
             pass
     if _kb_select is not None:
         try:
-            _kb_sections = _kb_select(question, None)
+            # Capability gating gets real observed signals (e.g. vtep counts)
+            # so an EVPN-less fabric no longer receives the EVPN runbook as
+            # trusted reference; unknown capabilities stay ungated.
+            _kb_sections = _kb_select(question, _fabric_capabilities())
         except Exception:
             _kb_sections = []
         if _kb_sections:
@@ -6252,19 +6382,17 @@ def action_chat():
     history_messages = _history_context_messages(
         history, limit=MAX_HISTORY_MESSAGES
     )
-    if _img_b64 and AI_PROVIDER == 'claude':
-        _question_content = [
-            {"type": "image", "source": {
-                "type": "base64", "media_type": _img_type, "data": _img_b64,
-            }},
-            {"type": "text", "text": question},
-        ]
-    else:
-        _question_content = question
     question_message = {
-        "role": "user", "content": _question_content,
+        "role": "user", "content": question,
         "context_pin": True, "context_kind": "question",
     }
+    if _img_b64:
+        # The image rides as message metadata for EVERY provider (Claude
+        # blocks, OpenAI-compatible image_url, Gemini inline_data, Ollama
+        # images[]). Keeping content a plain string means token budgeting
+        # never mistakes megabytes of base64 for prompt text and redaction/
+        # history handling stay untouched.
+        question_message["image"] = {"b64": _img_b64, "media_type": _img_type}
     observation_text = _reduce_untrusted_context_if_needed(
         observation_text,
         question,
@@ -6379,6 +6507,9 @@ def action_chat():
     )
     finalize_skipped_tags = []
     run_results_cache = {}
+    # Same-request dispatch reuse: a fan-out repeated across rounds must not
+    # pay a second SSH sweep over up to 60 devices.
+    dispatch_results_cache = {}
     # Async-job Stop button: the flag is honored before every provider call
     # and inside every tool family's budget guard; always False in sync mode.
     cancelled = False
@@ -6441,7 +6572,10 @@ def action_chat():
         ipams = re.findall(
             r'(?m)^\s*\[IPAM:\s*([^\]\r\n]+)\]\s*$', response or ''
         ) if _ipam_module is not None else []
-        round_requested = sum(map(len, (runs, runalls, audits, promqls, promranges, paths, searches, dryruns, p2ps, ipams)))
+        kbs = re.findall(
+            r'(?m)^\s*\[KB:\s*([^\]\r\n]+)\]\s*$', response or ''
+        ) if _kb_sections_for_keys is not None else []
+        round_requested = sum(map(len, (runs, runalls, audits, promqls, promranges, paths, searches, dryruns, p2ps, ipams, kbs)))
         if round_requested == 0 or time.monotonic() > deadline:
             if (round_requested == 0 and not phantom_nudged
                     and deadline - time.monotonic() > FINALIZE_RESERVE_SECONDS
@@ -6488,6 +6622,7 @@ def action_chat():
                 + [f"[DRYRUN: {d} {c}]" for d, c in dryruns]
                 + [f"[P2P: {t}]" for t in p2ps]
                 + [f"[IPAM: {t}]" for t in ipams]
+                + [f"[KB: {t}]" for t in kbs]
             )
             tools_used.append({
                 'dispatch': 'not-executed',
@@ -6679,6 +6814,26 @@ def action_chat():
             cmd = cmd.strip()
             total_tools += 1
             round_tools += 1
+            dispatch_key = (tgt.lower(), cmd)
+            cached_dispatch = dispatch_results_cache.get(dispatch_key)
+            if cached_dispatch is not None:
+                # Identical fan-out already ran in an earlier round of this
+                # request; reuse it instead of a second parallel SSH sweep.
+                hosts, dres = cached_dispatch
+                dispatch_ok = bool(hosts) and all(
+                    bool(dres.get(host, (False, ''))[0]) for host in hosts
+                )
+                tools_used.append({
+                    'dispatch': tgt, 'command': cmd, 'devices': len(hosts),
+                    'ok': dispatch_ok,
+                })
+                lines = [f"[RUNALL {tgt}: {cmd}]  ({len(hosts)} devices, cached "
+                         "result from an earlier round of this request)"]
+                for h in hosts:
+                    ok, out = dres.get(h, (False, ''))
+                    lines.append(f"--- {h} [{'OK' if ok else 'FAIL'}] ---\n{out}")
+                results.append('\n'.join(lines))
+                continue
             _job_emit({'event': 'tool', 'status': 'started',
                        'dispatch': tgt, 'command': cmd[:200]})
             hosts, dres = run_dispatch(tgt, cmd, devices, cookie,
@@ -6687,6 +6842,7 @@ def action_chat():
                                        deadline=deadline)
             dispatches_used += 1
             dispatch_dev_total += len(hosts)
+            dispatch_results_cache[dispatch_key] = (hosts, dres)
             _job_emit({'event': 'tool', 'status': 'finished',
                        'dispatch': tgt, 'command': cmd[:200],
                        'devices': len(hosts)})
@@ -6836,6 +6992,43 @@ def action_chat():
                 'active IPAM design could not'))
             tools_used.append({'ipam': target, 'ok': lookup_ok})
             results.append(f"[IPAM: {target}]\n{out}")
+        # Local runbook KB sections requested by key (no device or network
+        # access; the section bodies are trusted reference text).
+        for keys_raw in kbs[:MAX_TOOLS_PER_ROUND]:
+            if (round_tools >= MAX_TOOLS_PER_ROUND or total_tools >= MAX_TOTAL_TOOLS
+                    or time.monotonic() > deadline or _job_cancelled()):
+                break
+            keys = [k for k in re.split(r'[\s,]+', keys_raw.strip()) if k]
+            dedup_key = ('kb', ' '.join(sorted(k.lower() for k in keys)))
+            if dedup_key in seen_this_round:
+                round_requested -= 1
+                continue
+            seen_this_round.add(dedup_key)
+            total_tools += 1
+            round_tools += 1
+            try:
+                bodies, unknown = _kb_sections_for_keys(keys)
+            except Exception:
+                bodies, unknown = [], [k.lower() for k in keys]
+            available = ', '.join(_kb_keys()) if _kb_keys is not None else ''
+            if bodies:
+                out = '\n\n'.join(bodies)
+                if unknown:
+                    out += ("\n\n(unknown KB keys ignored: %s%s)" % (
+                        ', '.join(unknown),
+                        ('; available: ' + available) if available else ''))
+                kb_ok = True
+            else:
+                out = ("no matching KB sections for '%s'%s" % (
+                    keys_raw.strip(),
+                    ('; available keys: ' + available) if available else ''))
+                kb_ok = False
+            tools_used.append({
+                'device': 'local-kb',
+                'command': 'runbook section(s): %s' % keys_raw.strip()[:120],
+                'ok': kb_ok,
+            })
+            results.append(f"[KB: {keys_raw.strip()}]\n{out}")
         if round_tools < round_requested:
             tools_used.append({
                 'dispatch': 'not-executed',
@@ -6888,7 +7081,7 @@ def action_chat():
                 "Request more data only if needed; otherwise give the final answer "
                 "with no [RUN: ...] / [RUNALL: ...] / [AUDIT: ...] / [PROMQL: ...] / "
                 "[PROMQLRANGE: ...] / [PATH: ...] / [SEARCH: ...] / [P2P: ...] / "
-                "[IPAM: ...] / [DRYRUN: ...] lines."
+                "[IPAM: ...] / [KB: ...] / [DRYRUN: ...] lines."
             ),
             "context_group": tool_group,
             "context_pin": True,
@@ -6917,7 +7110,7 @@ def action_chat():
     # Stop request), force one final answer. Meta/capability answers are
     # exempt: their tags are illustrative examples, not pending requests.
     if (not meta_question and time.monotonic() < deadline
-            and re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM):', response or '')):
+            and re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB):', response or '')):
         # Rebuild the system message WITHOUT the tool catalog for this last
         # call; an instruction alone does not reliably stop tag emission.
         system_message['content'] = system_prompt_core
@@ -6927,6 +7120,14 @@ def action_chat():
                 " These requested checks were NOT run because time ran out: "
                 + '; '.join(finalize_skipped_tags[:10])
                 + ". Treat their would-be results as UNKNOWN and say so."
+            )
+        if not search_allowed and re.search(r'\[SEARCH:', response or ''):
+            # The model asked for web research it cannot have; without this
+            # note it may imply external sources were consulted.
+            skipped_note += (
+                " Web search is not enabled for this question/configuration; "
+                "no external research ran. Answer from the fabric evidence "
+                "only and state that external lookup was unavailable."
             )
         if cancelled:
             skipped_note += (
@@ -6940,7 +7141,7 @@ def action_chat():
                 "Stop using tools. Give your final answer now from the retained "
                 "results above; do not emit any data-tool lines "
                 "([RUN:]/[RUNALL:]/[AUDIT:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]/[SEARCH:]/"
-                "[P2P:]/[IPAM:]/[DRYRUN:]). "
+                "[P2P:]/[IPAM:]/[KB:]/[DRYRUN:]). "
                 "You MAY include [FIX: ...], [NEXT: ...] and [CONSOLE: ...] suggestions."
                 + skipped_note
             ),
@@ -6965,24 +7166,34 @@ def action_chat():
         response = llm_result['text']
     
     # Suggested remediation commands (NOT executed) -> returned as one-click buttons.
+    # Meta/capability answers are exempt end-to-end: their tags are quoted
+    # EXAMPLES that must stay visible in the prose and must not become
+    # buttons/chips.
     fixes = []
-    for dev, cmd in re.findall(r'\[FIX:\s*(\S+)\s+(.+?)\]', response or ''):
-        fixes.append({'device': dev.strip(), 'command': cmd.strip()})
-    # Suggested follow-up questions -> one-click chips.
-    followups = [q.strip() for q in re.findall(r'\[NEXT:\s*(.+?)\]', response or '')][:4]
-    # Suggested live-console targets -> "Open Console" buttons (validated against the fabric).
+    followups = []
     consoles = []
-    for dev in re.findall(r'\[CONSOLE:\s*([^\]\s]+)\s*\]', response or ''):
-        dev = dev.strip()
-        if dev in valid_hostnames and dev not in consoles:
-            consoles.append(dev)
-    
+    if not meta_question:
+        for dev, cmd in re.findall(r'\[FIX:\s*(\S+)\s+(.+?)\]', response or ''):
+            fixes.append({'device': dev.strip(), 'command': cmd.strip()})
+        # Suggested follow-up questions -> one-click chips.
+        followups = [q.strip() for q in re.findall(r'\[NEXT:\s*(.+?)\]', response or '')][:4]
+        # Suggested live-console targets -> "Open Console" buttons. Models
+        # often re-case hostnames; resolve like [RUN:] targets instead of an
+        # exact match so a valid suggestion never silently disappears.
+        for dev in re.findall(r'\[CONSOLE:\s*([^\]\s]+)\s*\]', response or ''):
+            canonical = _resolve_hostname(dev.strip())
+            if canonical and canonical not in consoles:
+                consoles.append(canonical)
+
     # Strip leftover tool-call / suggestion lines from the visible answer (line-based:
     # robust even when a PromQL expression contains ']' like a [5m] range selector).
-    final = '\n'.join(
-        ln for ln in (response or '').splitlines()
-        if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|FIX|NEXT|CONSOLE):', ln)
-    ).strip()
+    if meta_question:
+        final = (response or '').strip()
+    else:
+        final = '\n'.join(
+            ln for ln in (response or '').splitlines()
+            if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|FIX|NEXT|CONSOLE):', ln)
+        ).strip()
     
     if not final:
         error_json("AI request ended without a final answer")
@@ -7325,8 +7536,7 @@ def action_chat_worker(job_id):
 
 def action_get_context():
     """Return the current fabric summary (for UI context indicator)."""
-    fabric_summary, devices, device_health = build_fabric_summary()
-    collection_metadata = build_collection_metadata(devices, device_health)
+    fabric_summary, devices, device_health, collection_metadata = build_fabric_summary()
     device_names = sorted(set(d['hostname'] for d in devices.values() if d['hostname']))
     result_json({
         "success": True,
@@ -7351,8 +7561,7 @@ def action_get_timeline():
         error_json("Timeline window must be one of: 1h, 6h, 24h, 7d")
 
     timeline = _build_timeline(requested)
-    _summary, devices, device_health = build_fabric_summary()
-    collection_metadata = build_collection_metadata(devices, device_health)
+    _summary, devices, device_health, collection_metadata = build_fabric_summary()
     evidence_bundle = _build_evidence(
         _collection_for_evidence(collection_metadata, set(), timeline), [], timeline
     )
@@ -7870,10 +8079,9 @@ def _build_analysis_v2(mr_dir, devices, cookie, deadline):
 
 def action_analyze():
     """Run autonomous fabric health analysis (with change detection vs the previous run)."""
-    fabric_summary, devices, device_health = build_fabric_summary()
+    fabric_summary, devices, device_health, collection_metadata = build_fabric_summary()
     fabric_summary = neutralize_untrusted_tool_tags(fabric_summary)
     device_list = neutralize_untrusted_tool_tags(build_device_list(devices, device_health))
-    collection_metadata = build_collection_metadata(devices, device_health)
     timeline = _build_timeline('24h')
     evidence_collection_metadata = _collection_for_evidence(
         collection_metadata, set(), timeline
@@ -7883,7 +8091,12 @@ def action_analyze():
     # fcgiwrap) get a longer budget for the tiered scan/drill-down/synthesis
     # ladder; interactive requests keep the original 90s window.
     is_cron = os.environ.get('LLDPQ_AUTH_USER', '') == 'lldpq-ai-cron'
-    deadline = time.monotonic() + (420 if is_cron else 90)
+    # The detached analyze worker (Analyze button -> analyze-submit) is no
+    # longer bound by the CGI/nginx read timeout, so it gets the same budget
+    # as the cron ladder; only a direct synchronous CGI call keeps 90s.
+    deadline = time.monotonic() + (
+        420 if (is_cron or _JOB_CONTEXT is not None) else 90
+    )
 
     # Change detection is trustworthy only with complete, current coverage. A
     # partial collection must never turn absent devices into REMOVED findings
@@ -8287,6 +8500,22 @@ Correlations show temporal coincidence only and do not prove causation.""")
             "sources that failed or are stale, and never mark a domain healthy "
             "when its collection failed or is unresolved — use UNKNOWN there."
         )
+    # Async-job Stop pressed before the synthesis call: report honestly
+    # instead of spending the LLM budget (always False outside a worker).
+    if _job_cancelled():
+        evidence_bundle = _build_evidence(
+            evidence_collection_metadata, drill_records, timeline,
+            context_info=context_state,
+        )
+        result_json({"success": True, "cancelled": True,
+                     "analysis": "Stopped by operator before the analysis "
+                                 "was generated.",
+                     "timestamp": time.time(), "changes": changes,
+                     "collection": collection_metadata, "timeline": timeline,
+                     "evidence": evidence_bundle['records'],
+                     "confidence": evidence_bundle['confidence'],
+                     "persisted": False, "snapshot_updated": False})
+
     analysis_objective = (
         "Analyze the untrusted fabric observations above now. Begin with the "
         "fenced JSON findings array required by the system instructions, then "

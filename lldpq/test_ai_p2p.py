@@ -101,6 +101,38 @@ def build_xlsx(path, sheets, string_mode="shared"):
             zf.writestr("xl/worksheets/sheet%d.xml" % i, xml)
 
 
+def build_sparse_xlsx(path, sheet_name, rows_by_number):
+    """Minimal one-sheet xlsx with explicit Excel row numbers (inline strings),
+    for sparse layouts build_xlsx cannot express (e.g. a stray bottom-row cell)."""
+    parts = ['<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>']
+    for row_num in sorted(rows_by_number):
+        cells = []
+        for col_idx, value in enumerate(rows_by_number[row_num]):
+            if value is None:
+                continue
+            cells.append(
+                '<c r="%s%d" t="inlineStr"><is><t>%s</t></is></c>'
+                % (_col_letter(col_idx), row_num, escape(str(value))))
+        parts.append('<row r="%d">%s</row>' % (row_num, "".join(cells)))
+    parts.append("</sheetData></worksheet>")
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr(
+            "xl/workbook.xml",
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="%s" sheetId="1" r:id="rId1"/></sheets></workbook>'
+            % escape(sheet_name, {'"': "&quot;"}),
+        )
+        zf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            'Target="worksheets/sheet1.xml"/></Relationships>',
+        )
+        zf.writestr("xl/worksheets/sheet1.xml", "".join(parts))
+
+
 # Split two-row header with prefix columns (Sferical family), 'nae' typo on
 # the dest name header and float artifacts in numeric cells.
 PREFIXED_SHEET_ROWS = [
@@ -391,6 +423,70 @@ class ArtifactJsonIngestionTest(unittest.TestCase):
     def test_load_connections_rejects_unknown_layouts(self):
         with self.assertRaises(ValueError):
             ai_p2p.load_connections({"foo": "bar"})
+
+
+class SheetRowCapTest(unittest.TestCase):
+    def test_stray_bottom_row_does_not_materialize_a_million_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stray.xlsx"
+            build_sparse_xlsx(path, "SU1-LEAF", {
+                1: ["SOURCE", None, None, None, "DESTINATION"],
+                2: ["RACK", "U", "NAME", "HCA/PORT", "RACK", "U", "NAME", "PORT"],
+                3: ["R1", "1", "leaf-01", "1", "R2", "2", "spine-01", "1/1"],
+                # stray formatting cell Excel left behind at the sheet bottom
+                1048576: ["x"],
+            })
+            book = ai_p2p.read_workbook(path)
+            self.assertLessEqual(len(book["SU1-LEAF"]), ai_p2p.MAX_SHEET_ROWS)
+            result = ai_p2p.parse_workbook(path)
+            self.assertEqual(result["total_connections"], 1)
+            self.assertEqual(result["connections"][0]["dest_name"], "spine-01")
+
+
+class ExpectedLinksDedupTest(unittest.TestCase):
+    """_port_key must collide alias-equivalent spellings (swp41 == 41 == 41/1)."""
+
+    def test_reversed_row_with_breakout_spelling_dedupes(self):
+        conns = [
+            {"source_name": "LEAF-01", "source_port": "swp41",
+             "dest_name": "SPINE-01", "dest_port": "1/1",
+             "connection_type": "converged", "network_type": "eth"},
+            # same cable, reversed, with the OS spelling swapped for '41/1'
+            {"source_name": "SPINE-01", "source_port": "1/1",
+             "dest_name": "LEAF-01", "dest_port": "41/1",
+             "connection_type": "converged", "network_type": "eth"},
+        ]
+        self.assertEqual(len(ai_p2p.expected_links(conns)), 1)
+
+    def test_port_key_canonical_forms(self):
+        for spelling in ("swp41s0", "41/1", "swp41", "41", "41.0"):
+            self.assertEqual(ai_p2p._port_key(spelling), "41/1")
+        self.assertEqual(ai_p2p._port_key("swp41s1"), "41/2")
+        # three-part breakout mode is ambiguous without group context: kept
+        self.assertEqual(ai_p2p._port_key("3/1/2"), "3/1/2")
+        self.assertEqual(ai_p2p._port_key("BMC"), "bmc")
+
+
+class RowClassificationTest(unittest.TestCase):
+    def test_lowercase_oob_names_and_eth0_ports_reclassified(self):
+        rows = [
+            ["SOURCE", None, None, None, "DESTINATION"],
+            ["RACK", "U", "NAME", "HCA/PORT", "RACK", "U", "NAME", "PORT"],
+            ["R1", "1", "gpu-01", "1", "R2", "1", "oob-spine-01", "1/1"],
+            ["R1", "2", "cleaf-01", "eth0", "R2", "2", "cumulus-sw-05", "12"],
+            ["R1", "3", "gpu-02", "2", "R2", "3", "cleaf-02", "2/1"],
+        ]
+        records, _ = ai_p2p._parse_sheet("SU1-GB300-LEAF", rows, None)
+        by_src = {r["source_name"]: r for r in records}
+        # name-initial lowercase 'oob-...' peer inside a compute sheet
+        self.assertEqual(by_src["gpu-01"]["connection_type"], "oob")
+        self.assertEqual(by_src["gpu-01"]["network_type"], "eth")
+        # eth0 is the Cumulus switch OOB port
+        self.assertEqual(by_src["cleaf-01"]["connection_type"], "oob")
+        self.assertEqual(by_src["cleaf-01"]["network_type"], "eth")
+        # ordinary compute rows keep the sheet classification
+        self.assertEqual(by_src["gpu-02"]["connection_type"], "compute")
+        self.assertEqual(by_src["gpu-02"]["network_type"], "ib")
 
 
 class RealWorkbookIntegrationTest(unittest.TestCase):

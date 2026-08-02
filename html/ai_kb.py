@@ -229,6 +229,20 @@ def _section_matches(
     return False
 
 
+def _key_matches(key: str, token_set: set, normalized: str) -> bool:
+    """Match a section key against question tokens.
+
+    Hyphenated keys ("ber-fec") tokenize into several words, so a plain
+    ``key in token_set`` test can never match them; require the key's own
+    token sequence to appear adjacently instead."""
+    key_tokens = _normalize_tokens(key)
+    if not key_tokens:
+        return False
+    if len(key_tokens) == 1:
+        return key_tokens[0] in token_set
+    return " %s " % " ".join(key_tokens) in " %s " % normalized
+
+
 def _gated_off(gates: Sequence[str], fabric_caps: Optional[Mapping[str, Any]]) -> bool:
     """True only when every present gate capability is explicitly False."""
     if not gates or not isinstance(fabric_caps, Mapping):
@@ -263,7 +277,7 @@ def kb_select(
     selected: List[str] = []
     total = 0
     for key, _one_liner, aliases, gates, body in _SECTIONS:
-        if key not in token_set and not _section_matches(
+        if not _key_matches(key, token_set, normalized) and not _section_matches(
             aliases, token_set, normalized
         ):
             continue
@@ -274,6 +288,33 @@ def kb_select(
         selected.append(body)
         total += len(body)
     return selected
+
+
+def kb_sections_for_keys(requested: Sequence[Any]) -> Tuple[List[str], List[str]]:
+    """Bodies for explicitly requested section keys (the [KB: <keys>] tool).
+
+    Returns (bodies, unknown_keys). Matching is exact on the section key after
+    lowercase normalization; capability gates deliberately do not apply to an
+    explicit request."""
+    by_key: Dict[str, str] = {
+        key: body for key, _line, _aliases, _gates, body in _SECTIONS
+    }
+    bodies: List[str] = []
+    unknown: List[str] = []
+    seen: set = set()
+    total = 0
+    for raw in requested or ():
+        key = re.sub(r"[^a-z0-9-]+", "", str(raw or "").strip().lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        body = by_key.get(key)
+        if body is None:
+            unknown.append(key)
+        elif total + len(body) <= KB_MAX_INJECT_CHARS:
+            bodies.append(body)
+            total += len(body)
+    return bodies, unknown
 
 
 # Content anchors: catch accidental section loss/bloat at import time so any
@@ -291,4 +332,7 @@ assert "1e-8" in dict((row[0], row[4]) for row in _SECTIONS)["ber-fec"]
 assert len(kb_digest()) <= 1_200, "KB digest must stay prompt-sized"
 
 
-__all__ = ["KB_MAX_INJECT_CHARS", "kb_digest", "kb_keys", "kb_select"]
+__all__ = [
+    "KB_MAX_INJECT_CHARS", "kb_digest", "kb_keys", "kb_sections_for_keys",
+    "kb_select",
+]

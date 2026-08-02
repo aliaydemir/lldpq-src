@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sys
+import time
+from datetime import datetime
 
 
 SEVERITY_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
@@ -31,6 +34,21 @@ _WARNING_WORDS = {"warning", "warn", "degraded", "marginal", "fair"}
 
 # The flap producer grades per-hour, and check_alerts reads the same window.
 FLAP_WINDOW_SECONDS = 3600
+
+# Timestamps beyond this far in the future are clock skew, never fresh data;
+# the ai_insights timeline applies the same +300s tolerance.
+CLOCK_SKEW_SECONDS = 300
+
+# Sources without their own collection horizon (PFC/ECN, hardware, logs) are
+# age-gated against the reference clock: once the newest persisted record is
+# older than this, the producer has stopped and its last grade must not keep
+# replaying as a current incident.  Generous versus the 10-minute collection
+# cadence and aligned with the analysis staleness window.
+STALE_RECORD_SECONDS = 2 * 3600
+
+# A per-port anomaly flood must not balloon one incident's prompt block:
+# only this many evidence lines render, the rest collapse into a count.
+MAX_EVIDENCE_LINES = 40
 
 # Fabric-wide grouping: an anomaly type shared by at least this share of the
 # device universe collapses into one incident.  A minimum of three distinct
@@ -65,7 +83,7 @@ def _number(value):
         result = float(value)
     except (TypeError, ValueError):
         return None
-    return result if result == result else None  # reject NaN
+    return result if math.isfinite(result) else None  # reject NaN and infinities
 
 
 def _integer(value):
@@ -73,6 +91,30 @@ def _integer(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _reference_time(now):
+    """Injected reference clock for age gating; wall clock by default."""
+    reference = _number(now)
+    return time.time() if reference is None else reference
+
+
+def _record_epoch(value):
+    """Epoch seconds from a producer timestamp (numeric or ISO text)."""
+    numeric = _number(value)
+    if numeric is not None:
+        return numeric
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    # Naive stamps (legacy hardware entries) were written in local time.
+    return parsed.timestamp()
 
 
 def _norm_status(value):
@@ -181,19 +223,19 @@ def _collect_bgp(mr_dir):
 def _load_optical_current_stats(mr_dir):
     """Merged current optical records from optical-history/ shards.
 
-    The monolithic optical_history.json remains the fallback until its
-    one-time shard migration runs.
+    The monolithic optical_history.json is read only while the shard
+    directory does not exist yet: like _load_pfc_history and the ai_insights
+    resolvers, an existing shard store is authoritative even when empty, so
+    retired monolith data is never resurrected.
     """
     shard_dir = os.path.join(mr_dir, "optical-history")
-    try:
-        names = [n for n in os.listdir(shard_dir) if n.endswith(".json")]
-    except OSError:
-        names = []
-    if not names:
+    if not os.path.isdir(shard_dir):
         document = _load_json(os.path.join(mr_dir, "optical_history.json"))
         return (document or {}).get("current_optical_stats")
     stats = {}
-    for name in sorted(names):
+    for name in sorted(os.listdir(shard_dir)):
+        if not name.endswith(".json"):
+            continue
         payload = _load_json(os.path.join(shard_dir, name)) or {}
         current = payload.get("current")
         if isinstance(current, dict):
@@ -244,19 +286,19 @@ def _normalized_ber_grade(record):
 def _load_ber_current_stats(mr_dir):
     """Merged current BER records from the per-device ber-history/ shards.
 
-    The monolithic ber_history.json remains the fallback until its one-time
-    shard migration runs.
+    The monolithic ber_history.json is read only while the shard directory
+    does not exist yet: like _load_pfc_history and the ai_insights resolvers,
+    an existing shard store is authoritative even when empty, so retired
+    monolith data is never resurrected.
     """
     shard_dir = os.path.join(mr_dir, "ber-history")
-    try:
-        names = [n for n in os.listdir(shard_dir) if n.endswith(".json")]
-    except OSError:
-        names = []
-    if not names:
+    if not os.path.isdir(shard_dir):
         document = _load_json(os.path.join(mr_dir, "ber_history.json"))
         return (document or {}).get("current_ber_stats")
     stats = {}
-    for name in sorted(names):
+    for name in sorted(os.listdir(shard_dir)):
+        if not name.endswith(".json"):
+            continue
         payload = _load_json(os.path.join(shard_dir, name)) or {}
         current = payload.get("current")
         if isinstance(current, dict):
@@ -325,6 +367,11 @@ def _collect_flaps(mr_dir):
                 flap_count = _integer(item.get("flaps") or item.get("count"))
             if stamp is None or flap_count is None or flap_count <= 0:
                 continue
+            # Stamps beyond the shared skew allowance are clock skew, not
+            # recent flaps; without this bound they would always fit the
+            # window below.
+            if stamp > reference + CLOCK_SKEW_SECONDS:
+                continue
             if reference - stamp <= FLAP_WINDOW_SECONDS:
                 flaps += flap_count
         if flaps <= 0:
@@ -353,15 +400,20 @@ def _load_pfc_history(mr_dir):
                 continue
             document = _load_json(os.path.join(shard_dir, name))
             history = (document or {}).get("history")
-            if isinstance(history, dict):
-                merged.update(history)
+            if not isinstance(history, dict):
+                continue
+            for key, series in history.items():
+                # Correlation reads only the newest record per series; keep
+                # just the tail while merging instead of every shard's rows.
+                merged[key] = series[-1:] if isinstance(series, list) else series
         return merged
     document = _load_json(os.path.join(mr_dir, "pfc_ecn_history.json"))
     history = (document or {}).get("history")
     return history if isinstance(history, dict) else {}
 
 
-def _collect_pfc_ecn(mr_dir):
+def _collect_pfc_ecn(mr_dir, now=None):
+    reference = _reference_time(now)
     history = _load_pfc_history(mr_dir)
     anomalies = []
     for key in sorted(history if isinstance(history, dict) else {}):
@@ -370,6 +422,11 @@ def _collect_pfc_ecn(mr_dir):
             continue
         record = series[-1]
         if not isinstance(record, dict):
+            continue
+        # A record this old means the producer stopped; its last grade must
+        # not keep replaying as a current incident.
+        stamp = _record_epoch(record.get("timestamp"))
+        if stamp is not None and reference - stamp > STALE_RECORD_SECONDS:
             continue
         if record.get("sample_status") != "analyzed":
             continue
@@ -391,7 +448,8 @@ def _collect_pfc_ecn(mr_dir):
     return anomalies
 
 
-def _collect_hardware(mr_dir):
+def _collect_hardware(mr_dir, now=None):
+    reference = _reference_time(now)
     document = _load_json(os.path.join(mr_dir, "hardware_history.json"))
     history = (document or {}).get("hardware_history")
     anomalies = []
@@ -401,6 +459,10 @@ def _collect_hardware(mr_dir):
             continue
         latest = entries[-1]
         if not isinstance(latest, dict):
+            continue
+        # Entries carry ISO timestamps; skip devices whose producer stopped.
+        stamp = _record_epoch(latest.get("timestamp"))
+        if stamp is not None and reference - stamp > STALE_RECORD_SECONDS:
             continue
         grade = _norm_status(latest.get("overall_grade"))
         if grade not in {"warning", "critical"}:
@@ -412,9 +474,18 @@ def _collect_hardware(mr_dir):
     return anomalies
 
 
-def _collect_logs(mr_dir):
-    document = _load_json(os.path.join(mr_dir, "log_summary.json"))
+def _collect_logs(mr_dir, now=None):
+    path = os.path.join(mr_dir, "log_summary.json")
+    document = _load_json(path)
     if not isinstance(document, dict):
+        return []
+    # The summary persists no timestamps, so the file mtime is the producer
+    # heartbeat: a summary this old only describes a long-gone collection.
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    if mtime is not None and _reference_time(now) - mtime > STALE_RECORD_SECONDS:
         return []
     # Only the explicit per-device map is trusted; falling back to the whole
     # document would turn metadata keys like "totals" into phantom devices.
@@ -451,13 +522,23 @@ _COLLECTORS = (
     _collect_logs,
 )
 
+# Collectors whose sources carry no self-anchoring horizon (unlike the flap
+# window, which is anchored to producer time); they receive the reference
+# clock and gate on record age (STALE_RECORD_SECONDS).
+_AGE_GATED_COLLECTORS = (_collect_pfc_ecn, _collect_hardware, _collect_logs)
 
-def collect_anomalies(mr_dir):
+
+def collect_anomalies(mr_dir, now=None):
     """Extract per-domain anomalies from the analyzers' persisted grades."""
+    reference = _reference_time(now)
     anomalies = []
     for collector in _COLLECTORS:
+        if collector in _AGE_GATED_COLLECTORS:
+            args = (str(mr_dir), reference)
+        else:
+            args = (str(mr_dir),)
         try:
-            anomalies.extend(collector(str(mr_dir)))
+            anomalies.extend(collector(*args))
         except Exception:
             # One malformed domain file must never hide the other domains.
             continue
@@ -686,11 +767,15 @@ def _render_incident(incident):
     lines = ["[%s] %s %s" % (
         incident.get("severity"), incident.get("kind"), incident.get("summary")
     )]
-    for item in incident.get("evidence") or []:
+    evidence = incident.get("evidence") or []
+    for item in evidence[:MAX_EVIDENCE_LINES]:
         lines.append("  %s %s %s=%s (%s)" % (
             item.get("domain"), _subject(item), item.get("metric"),
             item.get("value"), item.get("status"),
         ))
+    hidden = len(evidence) - MAX_EVIDENCE_LINES
+    if hidden > 0:
+        lines.append("  ... (+%d more evidence rows)" % hidden)
     return "\n".join(lines)
 
 

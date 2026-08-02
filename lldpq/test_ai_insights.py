@@ -262,6 +262,94 @@ class AskAiInsightsTest(unittest.TestCase):
         self.assertIn(("leaf02", "swp2"), subjects)
         self.assertNotIn(("stale01", "swp9"), subjects)
 
+    def _write_ber_shard(self, shard_dir, host, history):
+        (shard_dir / f"{host}.json").write_text(json.dumps({
+            "version": 1,
+            "host": host,
+            "history": history,
+        }), encoding="utf-8")
+
+    def test_truncated_shard_merges_without_crash_and_is_disclosed(self):
+        shard_dir = self.monitor / "ber-history"
+        shard_dir.mkdir()
+        self._write_ber_shard(shard_dir, "leaf01", {"leaf01:swp1": [
+            {"timestamp": NOW - 200, "grade": "excellent", "sample_status": "analyzed"},
+            {"timestamp": NOW - 100, "grade": "critical", "sample_status": "analyzed"},
+        ]})
+        self._write_ber_shard(shard_dir, "leaf02", {"leaf02:swp9": [
+            {"timestamp": NOW - 1200 + index, "grade": "good",
+             "sample_status": "analyzed"}
+            for index in range(1001)
+        ]})
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        events = [event for event in timeline["events"] if event["category"] == "ber"]
+        self.assertEqual(source["status"], "partial")
+        self.assertTrue(source["truncated"])
+        self.assertIn("sample limit", source["detail"])
+        self.assertEqual(source["samples"], 1002)
+        self.assertEqual(
+            [(event["device"], event["subject"]) for event in events],
+            [("leaf01", "swp1")],
+        )
+
+    def test_oversized_series_counts_sum_across_shards(self):
+        shard_dir = self.monitor / "ber-history"
+        shard_dir.mkdir()
+        for host in ("leaf01", "leaf02"):
+            self._write_ber_shard(shard_dir, host, {
+                f"{host}:swp1": [
+                    {"timestamp": NOW - 200, "grade": "excellent",
+                     "sample_status": "analyzed"},
+                    {"timestamp": NOW - 100, "grade": "critical",
+                     "sample_status": "analyzed"},
+                ],
+                f"{host}:swp9": [
+                    {"timestamp": NOW - 90, "grade": "good", "padding": "x" * 700},
+                ],
+            })
+        with mock.patch.object(ai_insights, "MAX_SERIES_BYTES", 512):
+            timeline = build_timeline(
+                monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+            )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        subjects = {
+            (event["device"], event["subject"])
+            for event in timeline["events"] if event["category"] == "ber"
+        }
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("2 oversized series skipped", source["detail"])
+        self.assertEqual(subjects, {("leaf01", "swp1"), ("leaf02", "swp1")})
+
+    def test_corrupt_shard_does_not_blank_other_device_shards(self):
+        shard_dir = self.monitor / "ber-history"
+        shard_dir.mkdir()
+        self._write_ber_shard(shard_dir, "leaf01", {"leaf01:swp1": [
+            {"timestamp": NOW - 200, "grade": "excellent", "sample_status": "analyzed"},
+            {"timestamp": NOW - 100, "grade": "critical", "sample_status": "analyzed"},
+        ]})
+        (shard_dir / "zz-corrupt.json").write_bytes(b"")
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        events = [event for event in timeline["events"] if event["category"] == "ber"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["device"], "leaf01")
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("1 device shard(s) could not be read", source["detail"])
+
+        # Per-file fail-closed still stands when no shard loads at all.
+        (shard_dir / "leaf01.json").unlink()
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        self.assertEqual(source["status"], "invalid")
+        self.assertFalse(any(event["category"] == "ber" for event in timeline["events"]))
+
     def test_modern_ber_schema_detects_combined_grade_and_error_onset(self):
         self.write_monitor("ber_history.json", {
             "ber_history": {
@@ -517,6 +605,28 @@ class AskAiInsightsTest(unittest.TestCase):
         self.assertEqual(flap["latest_timestamp"], NOW - 5)
         self.assertEqual(flap["covers_to"], NOW - 5)
 
+    def test_quiet_fabric_with_fresh_flap_poll_is_not_stale(self):
+        # Newest flap EVENT predates the window, but the producer polled
+        # moments ago: that is a quiet fabric, not a stale source.
+        self.write_monitor("flap_history.json", {
+            "flapping_hist": {
+                "leaf01:swp1": [[NOW - 7200, 10, 1, NOW - 7300, 100]]
+            },
+            "last_update": NOW - 5,
+            "collection_coverage": {
+                "expected_devices": 1,
+                "current_devices": 1,
+                "unavailable_devices": [],
+            },
+        })
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        flap = next(row for row in timeline["coverage"] if row["source"] == "flaps")
+        self.assertEqual(flap["status"], "ok")
+        self.assertEqual(flap["latest_timestamp"], NOW - 5)
+        self.assertFalse(any(event["category"] == "link" for event in timeline["events"]))
+
     def test_fresh_flap_poll_does_not_hide_incomplete_device_coverage(self):
         self.write_monitor("flap_history.json", {
             "flapping_hist": {
@@ -713,6 +823,88 @@ class AskAiInsightsTest(unittest.TestCase):
         ]
         result = build_evidence(metadata, timeline=unusable, now=NOW)
         self.assertEqual(result["confidence"]["level"], "low")
+
+    def test_fully_healthy_fixture_reaches_high_confidence(self):
+        quiet = {"down_count": 0, "critical_neighbors": 0}
+        self.write_monitor("bgp_history.json", {
+            "bgp_history": {"leaf01": [
+                dict(quiet, timestamp=NOW - 4000),
+                dict(quiet, timestamp=NOW - 100),
+            ]},
+            "collection_coverage": {
+                "expected_devices": 1,
+                "current_bgp_devices": 1,
+                "unavailable_bgp_devices": [],
+            },
+        })
+        self.write_monitor("optical_history.json", {
+            "optical_history": {"leaf01:swp1": [
+                {"timestamp": NOW - 4000, "health": "good", "rx_power_dbm": -3.0},
+                {"timestamp": NOW - 100, "health": "good", "rx_power_dbm": -3.0},
+            ]}
+        })
+        self.write_monitor("ber_history.json", {
+            "ber_history": {"leaf01:swp1": [
+                {"timestamp": NOW - 4000, "grade": "excellent",
+                 "sample_status": "analyzed"},
+                {"timestamp": NOW - 100, "grade": "excellent",
+                 "sample_status": "analyzed"},
+            ]}
+        })
+        self.write_monitor("flap_history.json", {
+            "flapping_hist": {
+                "leaf01:swp1": [[NOW - 7200, 10, 1, NOW - 7300, 100]]
+            },
+            "last_update": NOW - 5,
+            "collection_coverage": {
+                "expected_devices": 1,
+                "current_devices": 1,
+                "unavailable_devices": [],
+            },
+        })
+        self.write_monitor("pfc_ecn_history.json", {
+            "history": {"leaf01:swp1": [
+                {"timestamp": NOW - 4000, "sample_status": "analyzed",
+                 "signal": "quiet", "loss_delta": 0},
+                {"timestamp": NOW - 100, "sample_status": "analyzed",
+                 "signal": "quiet", "loss_delta": 0},
+            ]}
+        })
+        self.write_monitor("log_summary.json", {"timestamp": NOW - 50})
+        self.write_web("fabric-scan-cache.json", {
+            "timestamp": (NOW - 95) * 1000,
+            "pendingDevices": [],
+        })
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        statuses = {row["source"]: row["status"] for row in timeline["coverage"]}
+        for source in ("bgp", "optical", "ber", "flaps", "pfc_ecn"):
+            self.assertEqual(statuses[source], "ok", source)
+        # The daily point-in-time scan stays visible as partial reference
+        # data in coverage, but must not cap confidence.
+        self.assertEqual(statuses["config"], "partial")
+
+        metadata = {
+            "complete": True,
+            "sources": {
+                "bgp": {
+                    "required": True,
+                    "available": True,
+                    "current": True,
+                    "complete": True,
+                    "age_seconds": 20,
+                }
+            },
+        }
+        result = build_evidence(metadata, timeline=timeline, now=NOW)
+        self.assertEqual(result["confidence"]["level"], "high")
+        self.assertTrue(result["confidence"]["complete"])
+        timeline_record = next(
+            record for record in result["records"] if record["kind"] == "timeline"
+        )
+        self.assertEqual(timeline_record["status"], "ok")
+        self.assertEqual(timeline_record["freshness"], "current")
 
     def test_prompt_smallest_allowed_limit_remains_valid_json(self):
         timeline = {

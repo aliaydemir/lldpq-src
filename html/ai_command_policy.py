@@ -15,14 +15,17 @@ from typing import List, Tuple
 
 
 _MAX_COMMAND_CHARS = 512
+# journalctl treats "-n all" as uncapped, so line caps must be real integers.
+_MAX_JOURNAL_LINES = 5000
 _SHELL_CONTROL_RE = re.compile(r"[;&|<>`$(){}\[\]\\\r\n\x00]")
 _SAFE_ARG_RE = re.compile(r"^[A-Za-z0-9_.:/,@%+= -]{1,220}$")
 _SAFE_INTERFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 # FRR "show" command with at most one output modifier. The pipe is interpreted
-# by vtysh itself inside the quoted -c string, never by the remote shell.
+# by vtysh itself inside the quoted -c string, never by the remote shell. The
+# filter charclass includes '^' for anchored regexes ("| include ^neighbor").
 _VTYSH_SHOW_RE = re.compile(
     r"^show [A-Za-z0-9_.:/,@%+= -]{0,220}"
-    r"(?:\| *(?:include|exclude|begin|section) +[A-Za-z0-9_.:/,@%+= -]{1,160})?$",
+    r"(?:\| *(?:include|exclude|begin|section) +[A-Za-z0-9_.:/,@%+=^ -]{1,160})?$",
     re.IGNORECASE,
 )
 
@@ -33,6 +36,15 @@ def _result(ok: bool, reason: str = "") -> Tuple[bool, str]:
 
 def _safe_args(tokens: List[str]) -> bool:
     return bool(tokens) and all(_SAFE_ARG_RE.fullmatch(token or "") for token in tokens)
+
+
+def _safe_interface(token: str) -> bool:
+    """Interface/argument slots must never absorb option flags (-w, --version)."""
+    return (
+        bool(token)
+        and not token.startswith("-")
+        and _SAFE_INTERFACE_RE.fullmatch(token) is not None
+    )
 
 
 def _strip_sudo(tokens: List[str]) -> Tuple[bool, List[str]]:
@@ -67,23 +79,29 @@ def _allow_ethtool(tokens: List[str]) -> bool:
     else:
         return False
     if len(tokens) == 1:
-        return _SAFE_INTERFACE_RE.fullmatch(tokens[0]) is not None
+        return _safe_interface(tokens[0])
     return (
         len(tokens) == 2
         and tokens[0] in {"-m", "-S", "-i"}
-        and _SAFE_INTERFACE_RE.fullmatch(tokens[1]) is not None
+        and _safe_interface(tokens[1])
     )
 
 
 def _allow_ip(tokens: List[str]) -> bool:
     if len(tokens) < 2 or tokens[0] != "ip" or not _safe_args(tokens):
         return False
-    family = tokens[1]
+    tokens = tokens[1:]
+    # Optional address-family selector (ip -6 route show / ip -4 addr show).
+    if tokens[0] in {"-4", "-6"}:
+        tokens = tokens[1:]
+        if not tokens:
+            return False
+    family = tokens[0]
     if family not in {"link", "addr", "route", "neigh"}:
         return False
-    if len(tokens) == 2:
+    if len(tokens) == 1:
         return True
-    action = tokens[2]
+    action = tokens[1]
     if family == "route":
         return action in {"show", "list", "get"}
     return action in {"show", "list"}
@@ -106,7 +124,7 @@ def _allow_lldpctl(tokens: List[str]) -> bool:
         return True
     if rest[:2] in (["-f", "json"], ["-f", "keyvalue"]):
         rest = rest[2:]
-    return len(rest) <= 1 and (not rest or _SAFE_INTERFACE_RE.fullmatch(rest[0]) is not None)
+    return len(rest) <= 1 and (not rest or _safe_interface(rest[0]))
 
 
 def _allow_journalctl(tokens: List[str]) -> bool:
@@ -147,15 +165,25 @@ def _allow_journalctl(tokens: List[str]) -> bool:
 
 
 def _journalctl_is_bounded(tokens: List[str]) -> bool:
-    """Require --no-pager and a line cap; Ask-AI runs one-shot under ssh -tt."""
+    """Require --no-pager and a line cap; Ask-AI runs one-shot under ssh -tt.
+
+    The cap must be a positive integer <= _MAX_JOURNAL_LINES: journalctl
+    documents "-n all" / "--lines=all" as UNCAPPED, and huge values would tie
+    up the 60s SSH session just the same.
+    """
     _sudo, tokens = _strip_sudo(tokens)
     rest = tokens[1:]
-    has_no_pager = "--no-pager" in rest
-    has_line_cap = any(
-        token in {"-n", "--lines"} or token.startswith("--lines=")
-        for token in rest
+    if "--no-pager" not in rest:
+        return False
+    caps: List[str] = []
+    for index, token in enumerate(rest):
+        if token in {"-n", "--lines"} and index + 1 < len(rest):
+            caps.append(rest[index + 1])
+        elif token.startswith("--lines="):
+            caps.append(token[len("--lines="):])
+    return bool(caps) and all(
+        cap.isdigit() and 0 < int(cap) <= _MAX_JOURNAL_LINES for cap in caps
     )
-    return has_no_pager and has_line_cap
 
 
 def _allow_dmesg(tokens: List[str]) -> bool:
@@ -244,7 +272,7 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
             and re.fullmatch(r"/proc/net/bonding/[A-Za-z0-9_.:-]{1,64}", bare[1]) is not None
         )
     elif bare[0] == "l1-show":
-        allowed = len(bare) == 2 and _SAFE_INTERFACE_RE.fullmatch(bare[1]) is not None
+        allowed = len(bare) == 2 and _safe_interface(bare[1])
     elif bare[0] == "clagctl":
         allowed = len(bare) == 1 or bare == ["clagctl", "status"]
     elif bare[0] in {"nvt", "/usr/local/bin/nvt"} and not _sudo:
@@ -254,7 +282,8 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
         if allowed and not _journalctl_is_bounded(tokens):
             return _result(
                 False,
-                "journalctl must include --no-pager and a line cap such as -n 200",
+                "journalctl must include --no-pager and an integer line cap "
+                "such as -n 200 (1-%d; 'all' is not allowed)" % _MAX_JOURNAL_LINES,
             )
     elif bare[0] == "dmesg":
         allowed = _allow_dmesg(tokens)

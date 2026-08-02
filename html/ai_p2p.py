@@ -41,6 +41,9 @@ _M = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 _R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 MAX_HEADER_SCAN_ROWS = 50
+# Cap on materialized rows per sheet: a stray formatting cell at the Excel
+# bottom (row 1,048,576) must not balloon into a million padded empty rows.
+MAX_SHEET_ROWS = 100_000
 
 BASE_FIELDS = (
     "source_rack", "source_ru", "source_name", "source_port", "source_transceiver",
@@ -52,7 +55,8 @@ _PLACEHOLDER_NAMES = {"", "tbd", "tba", "n/a", "na", "none", "null", "-", "--", 
 _PLACEHOLDER_MARKERS = ("customer", "tbd", "to be determined", "future", "not used", "spare port")
 
 # Ports that mark a row as OOB/BMC management plane even inside compute sheets
-_BMC_PORT_TOKENS = {"bmc", "bfbmc", "bf-bmc", "bf bmc", "ipmi", "mgmt", "mgmt0", "idrac", "ilo"}
+# (eth0 is the Cumulus switch OOB port).
+_BMC_PORT_TOKENS = {"bmc", "bfbmc", "bf-bmc", "bf bmc", "ipmi", "mgmt", "mgmt0", "idrac", "ilo", "eth0"}
 _POWER_NAME_RE = re.compile(
     r"\b(?:PDU|PSU)\d*\b|\bPWR\b|\bPOWER\s*(?:SHELF|SHLF|SHLVS?)?\b"
     r"|(?:PWR|POWER)[-_ ]?SH(?:E?LF|LVS?)",
@@ -166,13 +170,17 @@ def iter_workbook_sheets(path):
     """Yield (sheet_name, rows) one sheet at a time; rows are positional lists.
 
     Row index in the returned list matches Excel row number - 1 (gaps from
-    sparse workbooks are padded with empty lists).
+    sparse workbooks are padded with empty lists). Rows beyond MAX_SHEET_ROWS
+    are dropped: real design sheets are hundreds of rows, so anything further
+    down is stray formatting noise that would only materialize padding.
     """
     with zipfile.ZipFile(str(path)) as zf:
         shared = _load_shared_strings(zf)
         for name, target in _sheet_targets(zf):
             rows = []
             for row_num, values in _stream_sheet_rows(zf, target, shared):
+                if row_num > MAX_SHEET_ROWS:
+                    break
                 while len(rows) < row_num - 1:
                     rows.append([])
                 if len(rows) == row_num - 1:
@@ -460,7 +468,9 @@ def _classify_row(record, sheet_ctype, sheet_ntype):
         return "power", "eth"
     if sport in _BMC_PORT_TOKENS or dport in _BMC_PORT_TOKENS:
         return "oob", "eth"
-    if re.search(r"\bOOB\b|[-_]OOB[-_]|[-_]oob[-_]", names):
+    # Word boundaries keep 'foobar' safe while catching any-case 'oob' at the
+    # name start ('oob-spine-01'), middle or end.
+    if re.search(r"\boob\b", names, re.IGNORECASE):
         if sheet_ctype in ("compute", "converged"):
             return "oob", "eth"
     return sheet_ctype, sheet_ntype
@@ -720,12 +730,23 @@ def _port_aliases(port):
 
 
 def _port_key(port):
-    """Canonical single key for dedup: prefer 'N/M' slash form."""
-    aliases = _port_aliases(port)
-    for alias in sorted(aliases):
-        if re.match(r"^\d+(?:/\d+)*$", alias):
-            return alias
-    return min(aliases) if aliases else ""
+    """Canonical single key for dedup: the two-part 'X/Y' slash form.
+
+    Alias-equivalent spellings must collide: 'swpXsY' -> 'X/(Y+1)', and whole
+    ports 'swpX'/'X' -> 'X/1' (lane 1 of an unsplit port, matching
+    _port_aliases). Two-part 'X/Y' is kept as-is; three-part 'X/Y/Z' is kept
+    unchanged because the breakout mode is ambiguous without group context.
+    """
+    p = _clean_value(port).lower().replace(" ", "")
+    if not p:
+        return ""
+    m = re.match(r"^swp(\d+)s(\d+)$", p)
+    if m:
+        return "%s/%d" % (m.group(1), int(m.group(2)) + 1)
+    m = re.match(r"^(?:swp)?(\d+)$", p)
+    if m:
+        return m.group(1) + "/1"
+    return p
 
 
 def resolve_port_map(conns):

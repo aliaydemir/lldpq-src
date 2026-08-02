@@ -50,8 +50,15 @@ class BerShardFunctionalTests(unittest.TestCase):
         analyzer = BERAnalyzer(tmp)
         now = time.time()
         analyzer.ber_history = {
-            "leaf1:swp1": [_record(now - 100, symbol_errors=42,
-                                   delta_rx_errors=3, delta_tx_errors=1)],
+            "leaf1:swp1": [
+                _record(now - 100, symbol_errors=42,
+                        delta_rx_errors=3, delta_tx_errors=1),
+                # Combined status equal to the frame grade stays implicit.
+                _record(now - 70, grade="good", effective_grade="good"),
+                # An L1-escalated combined status differing from the frame
+                # grade is persisted so ai_insights can see the transition.
+                _record(now - 40, grade="good", effective_grade="critical"),
+            ],
             "leaf2:swp9": [_record(now - 50)],
         }
         analyzer.current_ber_stats = {
@@ -63,14 +70,25 @@ class BerShardFunctionalTests(unittest.TestCase):
         # leaf2 carries no current-run evidence: its shard is not rewritten.
         self.assertEqual(names, ["leaf1.json"])
         shard = json.loads((shard_dir / "leaf1.json").read_text())
-        slim = shard["history"]["leaf1:swp1"][0]
+        rows = shard["history"]["leaf1:swp1"]
         self.assertEqual(
-            set(slim),
+            set(rows[0]),
             {"timestamp", "ber_value", "grade", "sample_status",
              "symbol_errors", "delta_errors"},
         )
-        self.assertEqual(slim["symbol_errors"], 42)
-        self.assertEqual(slim["delta_errors"], 4)
+        self.assertEqual(rows[0]["symbol_errors"], 42)
+        self.assertEqual(rows[0]["delta_errors"], 4)
+        # status is additive and conditional: only a combined status that
+        # differs from the frame grade is persisted.
+        self.assertEqual(
+            set(rows[1]),
+            {"timestamp", "ber_value", "grade", "sample_status"},
+        )
+        self.assertEqual(
+            set(rows[2]),
+            {"timestamp", "ber_value", "grade", "sample_status", "status"},
+        )
+        self.assertEqual(rows[2]["status"], "critical")
         # The current record stays complete for the detail panel.
         self.assertEqual(
             shard["current"]["leaf1:swp1"]["effective_grade"], "excellent")

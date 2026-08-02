@@ -8,6 +8,7 @@ and the display-alias translation applied when generating topology.dot.
 
 from __future__ import annotations
 
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -117,6 +118,16 @@ class TopologyGenerationTests(unittest.TestCase):
         conns = [_conn("OOB-02", "51", "OOB SP-02", "3/1/2")]
         dot = ai_generate.p2p_to_topology_dot(conns)
         self.assertNotIn("OOB SP-02", dot)
+
+    def test_quoted_design_label_is_dropped(self):
+        conns = [
+            _conn("leaf-01", "49", 'spine"01', "50"),
+            _conn("leaf-02", "51", "spine-02", "52"),
+        ]
+        dot = ai_generate.p2p_to_topology_dot(conns)
+        # a double quote would corrupt the quoted DOT statement
+        self.assertNotIn('spine"01', dot)
+        self.assertIn('"leaf-02":"swp51" -- "spine-02":"swp52"', dot)
 
 
 class TopologyScopeTests(unittest.TestCase):
@@ -262,6 +273,119 @@ class TopologyConfigTests(unittest.TestCase):
         self.assertIn('pattern: "spine"', cfg)
         self.assertIn("default:", cfg)
 
+    def test_dotted_prefix_pattern_survives_yaml_load(self):
+        ipam = {"format": "ipam", "subnets": [], "hosts": [], "fabric": [
+            {"hostname": "pod1.leaf-01", "role": "leaf", "mgmt_ip": "10.0.0.1"},
+            {"hostname": "pod1.leaf-02", "role": "leaf", "mgmt_ip": "10.0.0.2"},
+        ]}
+        cfg = ai_generate.ipam_to_topology_config_yaml(ipam)
+        # '\.' alone is an invalid escape inside YAML double quotes: the
+        # emitted scalar must carry the double-escaped '\\.' form.
+        self.assertIn('pattern: "^pod1\\\\.leaf"', cfg)
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML not available")
+        loaded = yaml.safe_load(cfg)
+        patterns = [c["pattern"] for c in loaded["device_categories"]]
+        self.assertIn("^pod1\\.leaf", patterns)
+        pattern = next(p for p in patterns if "pod1" in p)
+        self.assertTrue(re.search(pattern, "pod1.leaf-01"))
+        self.assertFalse(re.search(pattern, "pod1-leaf-01"))
+
+
+class ValidateP2PTests(unittest.TestCase):
+    def _validate(self, conns):
+        return ai_generate.validate_p2p({"connections": conns, "warnings": []})
+
+    def _kinds(self, report):
+        return [i["kind"] for i in report["issues"]]
+
+    def test_unresolved_and_placeholder_ports_produce_no_duplicate_port(self):
+        conns = [
+            # unresolved record: its real-side port must not own swp5
+            {"source_name": "LEAF-01", "source_port": "swp5",
+             "dest_name": "tbd", "dest_port": "tbd",
+             "connection_type": "oob", "network_type": "eth",
+             "row_number": 2, "unresolved": True},
+            {"source_name": "LEAF-01", "source_port": "swp5",
+             "dest_name": "SPINE-01", "dest_port": "swp1",
+             "connection_type": "oob", "network_type": "eth", "row_number": 3},
+            # placeholder ports pass truthiness but are not cabled endpoints
+            {"source_name": "LEAF-02", "source_port": "x",
+             "dest_name": "SPINE-01", "dest_port": "swp2",
+             "connection_type": "oob", "network_type": "eth", "row_number": 4},
+            {"source_name": "LEAF-02", "source_port": "x",
+             "dest_name": "SPINE-01", "dest_port": "swp3",
+             "connection_type": "oob", "network_type": "eth", "row_number": 5},
+        ]
+        report = self._validate(conns)
+        self.assertNotIn("duplicate-port", self._kinds(report))
+        self.assertEqual(report["counts"]["duplicate_ports"], 0)
+        self.assertEqual(report["counts"]["unresolved"], 1)
+
+    def test_exact_duplicate_pair_reported_once_as_duplicate_record(self):
+        base = {"source_name": "LEAF-01", "source_port": "swp10",
+                "dest_name": "SPINE-01", "dest_port": "swp20",
+                "connection_type": "oob", "network_type": "eth"}
+        conns = [dict(base, row_number=2), dict(base, row_number=7)]
+        report = self._validate(conns)
+        self.assertEqual(self._kinds(report), ["duplicate-record"])
+        self.assertEqual(report["counts"]["duplicate_records"], 1)
+        self.assertEqual(report["counts"]["duplicate_ports"], 0)
+        self.assertEqual(report["counts"]["resolved_links"], 1)
+
+    def test_genuine_port_reuse_still_flagged(self):
+        conns = [
+            {"source_name": "LEAF-01", "source_port": "swp7",
+             "dest_name": "SPINE-01", "dest_port": "swp1",
+             "connection_type": "oob", "network_type": "eth", "row_number": 2},
+            {"source_name": "LEAF-01", "source_port": "swp7",
+             "dest_name": "SPINE-02", "dest_port": "swp1",
+             "connection_type": "oob", "network_type": "eth", "row_number": 3},
+        ]
+        report = self._validate(conns)
+        dup = [i for i in report["issues"] if i["kind"] == "duplicate-port"]
+        self.assertEqual(len(dup), 1)
+        self.assertEqual(dup[0]["device"], "LEAF-01")
+
+    def test_breakout_conflict_between_whole_and_split_port(self):
+        conns = [
+            {"source_name": "LEAF-01", "source_port": "64",
+             "dest_name": "SPINE-01", "dest_port": "1/1",
+             "connection_type": "converged", "network_type": "eth",
+             "row_number": 3},
+            {"source_name": "LEAF-01", "source_port": "64/1",
+             "dest_name": "SPINE-02", "dest_port": "1/1",
+             "connection_type": "converged", "network_type": "eth",
+             "row_number": 9},
+        ]
+        report = self._validate(conns)
+        conflicts = [i for i in report["issues"] if i["kind"] == "breakout-conflict"]
+        self.assertEqual(len(conflicts), 1)
+        issue = conflicts[0]
+        self.assertEqual(issue["severity"], "error")
+        self.assertEqual(issue["device"], "LEAF-01")
+        self.assertEqual(issue["port"], "swp64")
+        self.assertIn("row 3", issue["message"])
+        self.assertIn("row 9", issue["message"])
+        self.assertIn("swp64s0", issue["message"])
+        self.assertEqual(report["counts"]["breakout_conflicts"], 1)
+
+    def test_issue_sort_is_numeric_with_unrowed_last(self):
+        def self_loop(dev, row=None):
+            rec = {"source_name": dev, "source_port": "swp1",
+                   "dest_name": dev, "dest_port": "swp1",
+                   "connection_type": "oob", "network_type": "eth"}
+            if row is not None:
+                rec["row_number"] = row
+            return rec
+
+        report = self._validate([self_loop("A", 10), self_loop("B", 9),
+                                 self_loop("C")])
+        rows = [i["row"] for i in report["issues"] if i["kind"] == "self-loop"]
+        self.assertEqual(rows, [9, 10, "?"])
+
 
 class DevicesYamlRoleTests(unittest.TestCase):
     def _yaml(self, records):
@@ -282,11 +406,29 @@ class DevicesYamlRoleTests(unittest.TestCase):
         ])
         self.assertIn("leaf-07 @leaf", text)
 
-    def test_role_text_is_sanitized_to_a_token(self):
+    def test_role_text_is_sanitized_to_a_lowercase_token(self):
         text = self._yaml([
             {"hostname": "spine-x", "role": "Tan Spine (row 3)!", "mgmt_ip": "10.0.0.1"},
         ])
-        self.assertIn("spine-x @Tan_Spine_row_3", text)
+        self.assertIn("spine-x @tan_spine_row_3", text)
+
+    def test_capitalized_role_normalized_for_sort_and_diff(self):
+        ipam = {"format": "ipam", "subnets": [], "hosts": [], "fabric": [
+            {"hostname": "spine-01", "role": "Spine", "mgmt_ip": "10.0.0.9"},
+            {"hostname": "leaf-01", "role": "Leaf", "mgmt_ip": "10.0.0.2"},
+        ]}
+        existing = ("devices:\n"
+                    "  10.0.0.9: spine-01 @spine\n"
+                    "  10.0.0.2: leaf-01 @leaf\n")
+        result = ai_generate.ipam_to_devices_yaml(ipam, existing_yaml=existing)
+        self.assertIn("spine-01 @spine", result["yaml"])
+        # canonical role buckets apply: spine sorts above leaf despite the
+        # higher management IP
+        self.assertLess(result["yaml"].index("spine-01"),
+                        result["yaml"].index("leaf-01"))
+        # case-only role differences must not mark every device changed
+        self.assertEqual(result["diff"]["changed"], [])
+        self.assertEqual(result["diff"]["added"], [])
 
     def test_non_switch_records_stay_filtered(self):
         result = ai_generate.ipam_to_devices_yaml({

@@ -346,11 +346,14 @@ server {
             fastcgi_param CONTENT_TYPE $content_type;
             fastcgi_param CONTENT_LENGTH $content_length;
             fastcgi_param HTTP_COOKIE $http_cookie;
-            
+
             # Long timeout for LLM responses (streaming can take 60s+)
             fastcgi_read_timeout 300;
             # Disable buffering for SSE streaming
             fastcgi_buffering off;
+            # Image attachments ride as base64 in the JSON body (backend caps
+            # them at ~6.3 MB); without this the nginx default 1m returns 413.
+            client_max_body_size 8m;
         }
         
         # Provision API endpoint (ZTP + Base Config)

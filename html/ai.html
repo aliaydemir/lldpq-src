@@ -781,13 +781,13 @@ function onProviderChange(userInitiated) {
         // NVIDIA Inference proxy (OpenAI-compatible / LiteLLM). URL is fixed; only the key is needed.
         if (userInitiated || !apiUrl.value) apiUrl.value = 'https://inference-api.nvidia.com';
         apiUrl.disabled = true;
-        cloudModel.placeholder = 'e.g. aws/anthropic/bedrock-claude-opus-4-8';
+        cloudModel.placeholder = 'e.g. aws/anthropic/bedrock-claude-opus-5';
         // Sensible Nvidia-inference defaults: fill on an explicit switch, or when empty.
         const _m = cloudModel;
         const _s = document.getElementById('cfgSearchModel');
         const _f = document.getElementById('cfgFallbackModel');
-        if (userInitiated || !_m.value) _m.value = 'aws/anthropic/bedrock-claude-opus-4-8';
-        if (userInitiated || !_f.value) _f.value = 'aws/anthropic/bedrock-claude-opus-4-8';
+        if (userInitiated || !_m.value) _m.value = 'aws/anthropic/bedrock-claude-opus-5';
+        if (userInitiated || !_f.value) _f.value = 'aws/anthropic/bedrock-claude-opus-5';
         if (userInitiated || !_s.value) _s.value = 'perplexity/perplexity/sonar-pro';
     }
 }
@@ -1716,7 +1716,14 @@ async function pollChatJob(jobId, generation, controller, startCursor = 0) {
             // Tolerate brief poll hiccups — the worker keeps running server-side.
             failures += 1;
             if (failures >= 4) {
-                return { success: false, error: data.error || 'Lost contact with the background chat job' };
+                // lostContact keeps the saved job record so a page reload can
+                // reattach to the still-running worker instead of losing it.
+                return {
+                    success: false,
+                    lostContact: true,
+                    error: (data.error || 'Lost contact with the background job')
+                        + ' — it may still be running; reload the page to reattach.',
+                };
             }
         } else {
             failures = 0;
@@ -1752,8 +1759,29 @@ async function stopChatJob() {
 }
 
 // Render a terminal chat result (success or failure) into the chat area and
-// history. Shared by the live send path and the reload-resume path.
+// history. Shared by the live send path, the Analyze button, and the
+// reload-resume path (analyze-job outcomes carry analysis instead of response).
 function renderChatOutcome(data) {
+    if (data.success && data.analysis && !data.response) {
+        const suggestions = document.getElementById('suggestions');
+        if (suggestions) suggestions.remove();
+        addMessage('system', 'Autonomous fabric health analysis:');
+        const _info = {
+            evidence: data.evidence,
+            confidence: data.confidence,
+            timeline: data.timeline,
+            findings: data.findings,
+            findings_summary: data.findings_summary,
+            ts: Date.now(),
+        };
+        addMessage('assistant', data.analysis, _info);
+        chatHistory.push(Object.assign({ role: 'assistant', content: data.analysis, analysis: true }, _info));
+        saveChatToStorage();
+        // The fresh run replaced the persisted analysis: refresh the
+        // "Last Analysis" button timestamp instead of hiding anything.
+        loadAnalysisBadge();
+        return;
+    }
     if (data.success && data.response) {
         const _info = {
             tools: data.tools_used,
@@ -1791,10 +1819,11 @@ function renderChatOutcome(data) {
 // in localStorage while the job runs and removed on every terminal outcome.
 const CHAT_JOB_KEY = 'lldpq_ai_chat_job';
 
-function saveActiveChatJob(jobId, question) {
+function saveActiveChatJob(jobId, question, kind) {
     try {
         localStorage.setItem(CHAT_JOB_KEY, JSON.stringify({
-            job_id: String(jobId), question: String(question ?? ''), ts: Date.now(),
+            job_id: String(jobId), question: String(question ?? ''),
+            kind: kind === 'analyze' ? 'analyze' : 'chat', ts: Date.now(),
         }));
     } catch (e) {}
 }
@@ -1831,17 +1860,28 @@ async function resumeChatJob(saved) {
     btn.disabled = true;
     btn.setAttribute('aria-busy', 'true');
     try {
-        // Probe first (no UI yet): unknown/expired jobs must clear silently.
-        const probe = await apiCall('chat-poll', { job_id: jobId, cursor: 0 }, { signal: controller.signal });
-        if (generation !== requestGeneration || controller.signal.aborted || probe.aborted) return;
-        if (!probe.success) {
-            clearSavedChatJob();
-            return;
+        // Probe first (no UI yet). Retry transient failures — a briefly
+        // unreachable backend right after a reload must not discard a job
+        // that is still running; only a definitive server rejection clears it.
+        let probe = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            probe = await apiCall('chat-poll', { job_id: jobId, cursor: 0 }, { signal: controller.signal });
+            if (generation !== requestGeneration || controller.signal.aborted || probe.aborted) return;
+            if (probe.success) break;
+            if (/unknown job|invalid job|another session/i.test(probe.error || '')) {
+                clearSavedChatJob();
+                return;
+            }
+            await sleepWithAbort(2000, controller.signal);
         }
+        if (!probe || !probe.success) return; // transient — keep the saved job
         activeChatJobId = jobId;
+        const isAnalysisJob = saved.kind === 'analyze';
         const question = String(saved.question || '').trim();
-        addMessage('system', 'Resumed the background investigation from before the reload'
-            + (question ? ` — "${truncateContextText(question, 120)}"` : '') + '...');
+        addMessage('system', (isAnalysisJob
+            ? 'Resumed the background fabric analysis from before the reload'
+            : 'Resumed the background investigation from before the reload')
+            + (question && !isAnalysisJob ? ` — "${truncateContextText(question, 120)}"` : '') + '...');
         let data;
         if (probe.done) {
             data = (probe.result && typeof probe.result === 'object') ? probe.result
@@ -1855,7 +1895,7 @@ async function resumeChatJob(saved) {
                 Number.isFinite(probe.cursor) ? probe.cursor : 0);
         }
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
-        clearSavedChatJob();
+        if (data.lostContact !== true) clearSavedChatJob();
         renderChatOutcome(data);
     } catch (e) {
         if (generation === requestGeneration && !controller.signal.aborted) {
@@ -1956,6 +1996,7 @@ async function sendMessage() {
     // render directly below the just-sent message, never above it.
     showTypingIndicator();
 
+    let lostContact = false;
     try {
         // Async-first: submit as a background job and poll for progress.
         // Any submit failure (older backend without chat-submit, unavailable
@@ -1967,7 +2008,7 @@ async function sendMessage() {
         if (submitted.success && submitted.job_id) {
             activeChatJobId = String(submitted.job_id);
             // Persist the in-flight job so a page reload can resume polling.
-            saveActiveChatJob(activeChatJobId, message);
+            saveActiveChatJob(activeChatJobId, message, 'chat');
             setStopButtonVisible(true);
             showChatProgress();
             data = await pollChatJob(activeChatJobId, generation, controller);
@@ -1976,6 +2017,7 @@ async function sendMessage() {
         }
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
 
+        lostContact = data.lostContact === true;
         renderChatOutcome(data);
     } catch (e) {
         if (generation === requestGeneration && !controller.signal.aborted) {
@@ -1986,7 +2028,9 @@ async function sendMessage() {
             removeTypingIndicator();
             removeChatProgress();
             activeChatJobId = null;
-            clearSavedChatJob();
+            // A lost-contact outcome keeps the saved job: the worker may
+            // still be running and a reload can reattach to it.
+            if (!lostContact) clearSavedChatJob();
             setStopButtonVisible(false);
             chatRequestController = null;
             isStreaming = false;
@@ -1995,11 +2039,6 @@ async function sendMessage() {
             input.focus();
         }
     }
-}
-
-function sendSuggestion(el) {
-    document.getElementById('chatInput').value = el.textContent;
-    sendMessage();
 }
 
 function clearChat() {
@@ -2172,6 +2211,7 @@ async function runAnalysis() {
         btn.setAttribute('aria-busy', 'true');
     }
     showToast('Running fabric health analysis...', 'info');
+    let lostContact = false;
     try {
         const submitted = await apiCall('analyze-submit', null, { signal: controller.signal });
         if (generation !== requestGeneration || controller.signal.aborted || submitted.aborted) return;
@@ -2179,36 +2219,28 @@ async function runAnalysis() {
             showToast('Analysis failed: ' + (submitted.error || ''), 'error');
             return;
         }
-        const data = await pollChatJob(submitted.job_id, generation, controller);
+        // Same job lifecycle as chat: live progress panel, a working Stop
+        // button, and a localStorage record so a reload can reattach.
+        activeChatJobId = String(submitted.job_id);
+        saveActiveChatJob(activeChatJobId, 'Autonomous fabric health analysis', 'analyze');
+        setStopButtonVisible(true);
+        showChatProgress();
+        const data = await pollChatJob(activeChatJobId, generation, controller);
         if (generation !== requestGeneration || controller.signal.aborted || data.aborted) return;
+        lostContact = data.lostContact === true;
+        renderChatOutcome(data);
         if (data.success && data.analysis) {
-            // Remove suggestions if present
-            const suggestions = document.getElementById('suggestions');
-            if (suggestions) suggestions.remove();
-
-            addMessage('system', 'Autonomous fabric health analysis:');
-            // action=analyze returns analysis/evidence/confidence/timeline/
-            // findings only — it never emits tools_used/fixes/followups/consoles.
-            const _info = {
-                evidence: data.evidence,
-                confidence: data.confidence,
-                timeline: data.timeline,
-                findings: data.findings,
-                findings_summary: data.findings_summary,
-                ts: Date.now(),
-            };
-            addMessage('assistant', data.analysis, _info);
-            chatHistory.push(Object.assign({ role: 'assistant', content: data.analysis, analysis: true }, _info));
-            saveChatToStorage();
-            // The fresh run replaced the persisted analysis: refresh the
-            // "Last Analysis" button timestamp instead of hiding anything.
-            loadAnalysisBadge();
-            showToast('Analysis complete', 'success');
-        } else {
+            showToast(data.cancelled ? 'Analysis stopped' : 'Analysis complete',
+                data.cancelled ? 'info' : 'success');
+        } else if (!data.success) {
             showToast('Analysis failed: ' + (data.error || ''), 'error');
         }
     } finally {
         if (generation === requestGeneration && analysisRequestController === controller) {
+            removeChatProgress();
+            activeChatJobId = null;
+            if (!lostContact) clearSavedChatJob();
+            setStopButtonVisible(false);
             analysisRequestController = null;
             isAnalysisRunning = false;
             if (btn) {

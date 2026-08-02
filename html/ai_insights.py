@@ -838,6 +838,68 @@ def _stream_history(
     return "loaded", state
 
 
+def _merge_stream_state(
+    target: _HistoryStreamState, shard_state: _HistoryStreamState
+) -> None:
+    """Fold one shard's bookkeeping into the merged whole-source state.
+
+    ``truncated`` is a derived read-only property and must never be assigned;
+    boolean limit flags combine with ``or`` while integer counters are summed
+    so the disclosed "%d ... skipped" counts stay real across shards.
+    """
+    target.series_seen += shard_state.series_seen
+    target.series_processed += shard_state.series_processed
+    target.decoded_samples += shard_state.decoded_samples
+    target.series_truncated = bool(
+        target.series_truncated or shard_state.series_truncated
+    )
+    target.samples_truncated = bool(
+        target.samples_truncated or shard_state.samples_truncated
+    )
+    target.decode_limit_reached = bool(
+        target.decode_limit_reached or shard_state.decode_limit_reached
+    )
+    target.invalid_series += shard_state.invalid_series
+    target.oversized_series += shard_state.oversized_series
+    target.oversized_samples += shard_state.oversized_samples
+    target.oversized_metadata += shard_state.oversized_metadata
+
+
+def _stream_history_shards(
+    path: Path,
+    callback: Callable[[str, Sequence[Any], int], None],
+) -> Tuple[str, _HistoryStreamState, int]:
+    """Merge every per-device shard under ``path`` into one source view.
+
+    Each shard fails closed on its own: an unreadable file contributes no
+    state and is only counted for disclosure, so one corrupt/vanished shard
+    cannot erase every other device's history.  The whole source fails only
+    when no shard could be read at all.  A "partial" shard hit a finite
+    processing limit after delivering validated series; its already-delivered
+    data is kept and the limit flags are merged for disclosure.
+    """
+    state = _HistoryStreamState()
+    shard_total = 0
+    readable = 0
+    failed = 0
+    first_failure = "invalid"
+    for shard in sorted(path.glob("*.json")):
+        shard_total += 1
+        shard_status, shard_state = _stream_history(
+            shard, "history", (), callback
+        )
+        if shard_status not in {"loaded", "partial"}:
+            failed += 1
+            if failed == 1:
+                first_failure = shard_status
+            continue
+        readable += 1
+        _merge_stream_state(state, shard_state)
+    if shard_total and not readable:
+        return first_failure, state, failed
+    return "loaded", state, failed
+
+
 def _source_path(monitor_dir: Path, web_root: Optional[Path], filename: str) -> Path:
     # Production publishes immutable snapshots through the web tree.  Whenever
     # that root is configured, an absent directory/file remains explicitly
@@ -903,6 +965,20 @@ def _mark_stream_limits(
         existing = _bounded_text(record.get("detail"), MAX_FIELD_CHARS)
         record["detail"] = _bounded_text(
             (existing + "; " if existing else "") + ", ".join(bits),
+            MAX_FIELD_CHARS,
+        )
+    return record
+
+
+def _mark_failed_shards(record: Dict[str, Any], failed: int) -> Dict[str, Any]:
+    """Disclose unreadable per-device shards as a coverage limitation."""
+    if failed:
+        if record.get("status") in {"ok", "empty"}:
+            record["status"] = "partial"
+        existing = _bounded_text(record.get("detail"), MAX_FIELD_CHARS)
+        record["detail"] = _bounded_text(
+            (existing + "; " if existing else "")
+            + "%d device shard(s) could not be read" % failed,
             MAX_FIELD_CHARS,
         )
     return record
@@ -1233,22 +1309,11 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
 
     # The optical history is sharded per device (one JSON document per host
     # under optical-history/); a plain file is the pre-shard monolith.
+    failed_shards = 0
     if path.is_dir():
-        stream_state = _HistoryStreamState()
-        load_status = "loaded"
-        for shard in sorted(path.glob("*.json")):
-            shard_status, shard_state = _stream_history(
-                shard, "history", (), consume_series
-            )
-            for flag in (
-                "truncated", "invalid_series", "oversized_series",
-                "series_truncated", "samples_truncated", "decode_limit_reached",
-            ):
-                if getattr(shard_state, flag, False):
-                    setattr(stream_state, flag, True)
-            if shard_status != "loaded":
-                load_status = shard_status
-                break
+        load_status, stream_state, failed_shards = _stream_history_shards(
+            path, consume_series
+        )
     else:
         load_status, stream_state = _stream_history(
             path, "optical_history", (), consume_series
@@ -1258,7 +1323,9 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
             "optical", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_stream_limits(failure, stream_state)
+        return [], _mark_failed_shards(
+            _mark_stream_limits(failure, stream_state), failed_shards
+        )
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1280,6 +1347,7 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
         incomplete_series=incomplete_series,
     )
     result = _mark_stream_limits(result, stream_state)
+    result = _mark_failed_shards(result, failed_shards)
     return events.values(), result
 
 
@@ -1331,9 +1399,11 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
         previous: Optional[Mapping[str, Any]] = None
         for stamp, current in samples:
             if previous is not None and stamp >= start:
-                # Current producers persist the combined result as
-                # effective_grade (and report records use status/frame_grade);
-                # grade is retained for the legacy frame-only schema.
+                # Current slim shard records persist the combined result as
+                # status (only when it differs from the frame grade); legacy
+                # monolith records may instead carry effective_grade or the
+                # other component grades, and grade alone is the frame-only
+                # schema.
                 old_grade = _normalized_ber_grade(previous)
                 new_grade = _normalized_ber_grade(current)
                 parts: List[str] = []
@@ -1385,22 +1455,11 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
 
     # The BER history is sharded per device (one JSON document per host
     # under ber-history/); a plain file is the pre-shard monolith.
+    failed_shards = 0
     if path.is_dir():
-        stream_state = _HistoryStreamState()
-        load_status = "loaded"
-        for shard in sorted(path.glob("*.json")):
-            shard_status, shard_state = _stream_history(
-                shard, "history", (), consume_series
-            )
-            for flag in (
-                "truncated", "invalid_series", "oversized_series",
-                "series_truncated", "samples_truncated", "decode_limit_reached",
-            ):
-                if getattr(shard_state, flag, False):
-                    setattr(stream_state, flag, True)
-            if shard_status != "loaded":
-                load_status = shard_status
-                break
+        load_status, stream_state, failed_shards = _stream_history_shards(
+            path, consume_series
+        )
     else:
         load_status, stream_state = _stream_history(
             path, "ber_history", (), consume_series
@@ -1410,7 +1469,9 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
             "ber", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_stream_limits(failure, stream_state)
+        return [], _mark_failed_shards(
+            _mark_stream_limits(failure, stream_state), failed_shards
+        )
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1433,6 +1494,7 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
         incomplete_series=incomplete_series,
     )
     result = _mark_stream_limits(result, stream_state)
+    result = _mark_failed_shards(result, failed_shards)
     return events.values(), result
 
 
@@ -1529,8 +1591,16 @@ def _extract_flaps(path: Path, start: float, now: float, max_age: int) -> Tuple[
             and isinstance(unavailable, list)
             and not unavailable
         )
+    # flapping_hist is event-only; a quiet fabric does not append samples.
+    # Producer last_update is therefore the source freshness authority and
+    # must drive the staleness decision itself: an old newest flap EVENT with
+    # a fresh poll is a quiet fabric, not a stale source.
+    if last_update is not None and last_update <= now + 300:
+        source_latest = last_update
+    else:
+        source_latest = latest
     result = _coverage(
-        "flaps", load_status, sample_count, events.total, latest, start,
+        "flaps", load_status, sample_count, events.total, source_latest, start,
         truncated=events.truncated or stream_state.truncated,
     )
     current_zero = bool(
@@ -1547,10 +1617,6 @@ def _extract_flaps(path: Path, start: float, now: float, max_age: int) -> Tuple[
             "latest_timestamp": round(last_update, 3),
             "detail": "Current complete collection has no retained flap events",
         })
-    elif last_update is not None and last_update <= now + 300:
-        # flapping_hist is event-only; a quiet fabric does not append samples.
-        # Producer last_update is therefore the source freshness authority.
-        result["latest_timestamp"] = round(last_update, 3)
     if result["status"] == "ok" and not coverage_complete:
         result.update({
             "status": "partial",
@@ -1561,7 +1627,7 @@ def _extract_flaps(path: Path, start: float, now: float, max_age: int) -> Tuple[
         earliest=earliest,
         start=start,
         now=now,
-        latest=last_update if last_update is not None and last_update <= now + 300 else latest,
+        latest=source_latest,
         max_source_age_seconds=max_age,
         retention_seconds=24 * 60 * 60,
         event_only_zero_is_complete=False,
@@ -1608,8 +1674,6 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
             if signal == previous_signal:
                 if not (signal == "loss" and loss):
                     continue
-            if signal == previous_signal and not loss:
-                continue
             detail = "PFC/ECN signal observed on %s: %s→%s" % (
                 subject or "port", previous_signal or "unknown", signal
             )
@@ -1628,22 +1692,11 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
 
     # The PFC/ECN history is sharded per device (one JSON document per host
     # under pfc-ecn-history/); a plain file is the pre-shard monolith.
+    failed_shards = 0
     if path.is_dir():
-        stream_state = _HistoryStreamState()
-        load_status = "loaded"
-        for shard in sorted(path.glob("*.json")):
-            shard_status, shard_state = _stream_history(
-                shard, "history", (), consume_series
-            )
-            for flag in (
-                "truncated", "invalid_series", "oversized_series",
-                "series_truncated", "samples_truncated", "decode_limit_reached",
-            ):
-                if getattr(shard_state, flag, False):
-                    setattr(stream_state, flag, True)
-            if shard_status != "loaded":
-                load_status = shard_status
-                break
+        load_status, stream_state, failed_shards = _stream_history_shards(
+            path, consume_series
+        )
     else:
         load_status, stream_state = _stream_history(
             path, "history", (), consume_series
@@ -1653,7 +1706,9 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
             "pfc_ecn", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_stream_limits(failure, stream_state)
+        return [], _mark_failed_shards(
+            _mark_stream_limits(failure, stream_state), failed_shards
+        )
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1676,6 +1731,7 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
         incomplete_series=incomplete_series,
     )
     result = _mark_stream_limits(result, stream_state)
+    result = _mark_failed_shards(result, failed_shards)
     return events.values(), result
 
 
@@ -2004,10 +2060,15 @@ def _confidence(
         coverage = timeline.get("coverage")
         relevant: List[Mapping[str, Any]] = []
         if isinstance(coverage, list):
+            # The config drift scan is point-in-time reference data collected
+            # daily; its structural partial/stale status must not cap the
+            # confidence of otherwise-current history sources.  It stays
+            # visible in the coverage rows, like logs/unsupported.
             relevant = [
                 row for row in coverage
                 if isinstance(row, Mapping)
                 and not (row.get("source") == "logs" and row.get("status") == "unsupported")
+                and row.get("source") != "config"
             ]
         current_history = sum(1 for row in relevant if row.get("status") == "ok")
         if relevant and current_history == len(relevant):
@@ -2108,10 +2169,13 @@ def build_evidence(
         event_count = len(events) if isinstance(events, list) else 0
         correlation_count = len(correlations) if isinstance(correlations, list) else 0
         coverage_rows = safe_timeline.get("coverage")
+        # Same exclusions as _confidence: logs are unsupported by design and
+        # the config scan is structurally partial/stale reference data.
         relevant_rows = [
             row for row in coverage_rows
             if isinstance(row, Mapping)
             and not (row.get("source") == "logs" and row.get("status") == "unsupported")
+            and row.get("source") != "config"
         ] if isinstance(coverage_rows, list) else []
         ok_count = sum(1 for row in relevant_rows if row.get("status") == "ok")
         if relevant_rows and ok_count == len(relevant_rows):

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,6 +179,132 @@ class CollectAnomaliesTest(FixtureCase):
         self.assertNotIn("ber", domains)
         self.assertIn("bgp", domains)
         self.assertIn("hardware", domains)
+
+
+class StalenessAndValidityTest(FixtureCase):
+    """Stale-record gating, future-stamp rejection, non-finite rejection and
+    the empty-shard-directory semantics."""
+
+    def pfc_payload(self, stamp):
+        return {
+            "version": 1,
+            "history": {
+                "Leaf2:swp5": [
+                    {"sample_status": "analyzed", "signal": "loss",
+                     "loss_delta": 12, "timestamp": stamp},
+                ],
+            },
+        }
+
+    def collected_domains(self, now):
+        return {
+            item["domain"]
+            for item in ai_correlate.collect_anomalies(self.mr_dir, now=now)
+        }
+
+    def test_stale_pfc_record_is_not_a_current_anomaly(self):
+        write_json(self.mr_dir, "pfc_ecn_history.json", self.pfc_payload(NOW - 60))
+        self.assertIn("pfc_ecn", self.collected_domains(NOW))
+        stale = NOW - ai_correlate.STALE_RECORD_SECONDS - 3600
+        write_json(self.mr_dir, "pfc_ecn_history.json", self.pfc_payload(stale))
+        self.assertNotIn("pfc_ecn", self.collected_domains(NOW))
+
+    def test_stale_hardware_record_is_not_a_current_anomaly(self):
+        def payload(stamp):
+            return {
+                "hardware_history": {
+                    "Leaf2": [{
+                        "overall_grade": "CRITICAL",
+                        "timestamp": datetime.fromtimestamp(
+                            stamp, tz=timezone.utc).isoformat(),
+                    }],
+                },
+            }
+        write_json(self.mr_dir, "hardware_history.json", payload(NOW - 60))
+        self.assertIn("hardware", self.collected_domains(NOW))
+        stale = NOW - ai_correlate.STALE_RECORD_SECONDS - 3600
+        write_json(self.mr_dir, "hardware_history.json", payload(stale))
+        self.assertNotIn("hardware", self.collected_domains(NOW))
+
+    def test_hardware_record_without_timestamp_stays_visible(self):
+        # Age gating must never silence records whose age is unknowable.
+        write_json(self.mr_dir, "hardware_history.json", {
+            "hardware_history": {"Leaf2": [{"overall_grade": "CRITICAL"}]},
+        })
+        self.assertIn("hardware", self.collected_domains(NOW))
+
+    def test_stale_log_summary_is_not_a_current_anomaly(self):
+        path = write_json(self.mr_dir, "log_summary.json", {
+            "device_counts": {"Leaf2": {"critical": 2, "error": 0}},
+        })
+        self.assertIn("log", self.collected_domains(NOW))
+        stale = NOW - ai_correlate.STALE_RECORD_SECONDS - 3600
+        os.utime(path, (stale, stale))
+        self.assertNotIn("log", self.collected_domains(NOW))
+
+    def test_future_flap_stamps_are_rejected(self):
+        write_json(self.mr_dir, "flap_history.json", {
+            "flapping_hist": {
+                "Leaf1:swp49": [
+                    # Clock-skewed far-future entry must not count ...
+                    [NOW + 7200, 24, 5, NOW + 6900, 300],
+                    # ... while one within the +300s allowance still does.
+                    [NOW + 60, 24, 2, NOW - 240, 300],
+                ],
+            },
+            "last_update": NOW,
+        })
+        anomalies = [
+            item for item in ai_correlate.collect_anomalies(self.mr_dir)
+            if item["domain"] == "flap"
+        ]
+        self.assertEqual(len(anomalies), 1)
+        self.assertEqual(anomalies[0]["value"], 2)
+
+    def test_number_rejects_non_finite_values(self):
+        self.assertIsNone(ai_correlate._number(float("inf")))
+        self.assertIsNone(ai_correlate._number(float("-inf")))
+        self.assertIsNone(ai_correlate._number("inf"))
+        self.assertIsNone(ai_correlate._number(float("nan")))
+        self.assertEqual(ai_correlate._number("2.5"), 2.5)
+
+    def test_infinite_optical_reading_never_reaches_detail(self):
+        write_json(self.mr_dir, "optical_history.json", {
+            "current_optical_stats": {
+                "Leaf1:swp49": {"health_status": "critical",
+                                "rx_power_dbm": float("inf")},
+            },
+        })
+        anomalies = [
+            item for item in ai_correlate.collect_anomalies(self.mr_dir)
+            if item["domain"] == "optical"
+        ]
+        self.assertEqual(len(anomalies), 1)
+        self.assertNotIn("inf", anomalies[0]["detail"])
+
+    def test_empty_optical_shard_dir_does_not_fall_back_to_monolith(self):
+        write_json(self.mr_dir, "optical_history.json", {
+            "current_optical_stats": {
+                "Retired1:swp1": {"health_status": "critical"},
+            },
+        })
+        os.makedirs(os.path.join(self.mr_dir, "optical-history"))
+        anomalies = ai_correlate.collect_anomalies(self.mr_dir)
+        self.assertEqual(
+            [item for item in anomalies if item["domain"] == "optical"], []
+        )
+
+    def test_empty_ber_shard_dir_does_not_fall_back_to_monolith(self):
+        write_json(self.mr_dir, "ber_history.json", {
+            "current_ber_stats": {
+                "Retired1:swp1": {"status": "critical", "effective_ber": 1e-5},
+            },
+        })
+        os.makedirs(os.path.join(self.mr_dir, "ber-history"))
+        anomalies = ai_correlate.collect_anomalies(self.mr_dir)
+        self.assertEqual(
+            [item for item in anomalies if item["domain"] == "ber"], []
+        )
 
 
 class ExpectedLinksTest(FixtureCase):
@@ -370,6 +497,25 @@ class RenderCandidatesTest(FixtureCase):
         incidents = self.build_incidents()
         text = ai_correlate.render_candidates(incidents, max_chars=100000)
         self.assertNotIn("omitted", text)
+
+    def test_render_caps_evidence_lines_per_incident(self):
+        count = ai_correlate.MAX_EVIDENCE_LINES + 10
+        anomalies = [
+            {"domain": "pfc_ecn", "device": "Leaf%03d" % index, "port": "swp1",
+             "metric": "signal", "value": "ecn", "status": "ecn",
+             "detail": "", "source": "pfc_ecn_history.json"}
+            for index in range(count)
+        ]
+        devices = ["Leaf%03d" % index for index in range(count)]
+        incidents = ai_correlate.correlate(anomalies, [], devices=devices)
+        self.assertEqual(len(incidents), 1)
+        text = ai_correlate.render_candidates(incidents, max_chars=1000000)
+        evidence_lines = [
+            line for line in text.splitlines()
+            if line.startswith("  ") and not line.startswith("  ...")
+        ]
+        self.assertEqual(len(evidence_lines), ai_correlate.MAX_EVIDENCE_LINES)
+        self.assertIn("... (+10 more evidence rows)", text)
 
 
 class CliTest(FixtureCase):

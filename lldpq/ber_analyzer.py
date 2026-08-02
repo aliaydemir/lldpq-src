@@ -517,7 +517,10 @@ class BERAnalyzer:
         Later runs only read timestamp/ber_value/sample_status (trend and
         retention) plus the newest integer symbol_errors (the L1 counter
         baseline); ai_insights additionally reads delta_errors for its
-        error-onset events, so a positive count survives.  Absolute interface
+        error-onset events, so a positive count survives, and the combined
+        per-port status so L1 (raw/effective/symbol) grade transitions
+        produce timeline events -- it is persisted only when it differs from
+        the frame grade to keep the common record slim.  Absolute interface
         counters live in ber_baseline.json and the current-run record, so
         persisting them per history sample only inflated every load/save.
         """
@@ -527,6 +530,12 @@ class BERAnalyzer:
             "grade": record.get("grade"),
             "sample_status": record.get("sample_status", "analyzed"),
         }
+        # _analyze_port stores the combined result on the current history
+        # record as effective_grade; already-slim reloaded records carry it
+        # as status.
+        combined_status = record.get("status") or record.get("effective_grade")
+        if combined_status and combined_status != slim["grade"]:
+            slim["status"] = combined_status
         symbol_errors = record.get("symbol_errors")
         if isinstance(symbol_errors, int):
             slim["symbol_errors"] = symbol_errors

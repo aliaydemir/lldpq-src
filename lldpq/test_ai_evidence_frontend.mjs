@@ -173,8 +173,8 @@ test('findings renderer stamps trend badges and keeps suppressed rows dimmed and
 });
 
 test('async chat submit/poll/stop path keeps the sync fallback intact', () => {
-  assert.match(aiHtml, /apiCall\('chat-submit', \{ message: finalMessage, history: historyPayload \}/);
-  assert.match(aiHtml, /apiCall\('chat', \{ message: finalMessage, history: historyPayload \}/);
+  assert.match(aiHtml, /apiCall\('chat-submit', \{ message: finalMessage, history: historyPayload, \.\.\.imagePayload \}/);
+  assert.match(aiHtml, /apiCall\('chat', \{ message: finalMessage, history: historyPayload, \.\.\.imagePayload \}/);
   assert.match(aiHtml, /apiCall\('chat-poll', \{ job_id: jobId, cursor \}/);
   assert.match(aiHtml, /apiCall\('chat-stop', \{ job_id: activeChatJobId \}/);
   assert.match(aiHtml, /await sleepWithAbort\(1500, controller\.signal\)/);
@@ -259,7 +259,7 @@ test('attached logs obey line, character, and total message budgets', () => {
 
 test('oversized user input is rejected before streaming state is claimed', async () => {
   const match = aiHtml.match(
-    /async function sendMessage\(\) \{[\s\S]*?(?=\nfunction sendSuggestion)/,
+    /async function sendMessage\(\) \{[\s\S]*?(?=\nfunction clearChat)/,
   );
   assert.ok(match, 'sendMessage should be present');
   const input = {

@@ -58,7 +58,6 @@ from ai_p2p import iter_workbook_sheets, read_workbook, _clean_value  # noqa: E4
 
 CANONICAL_FORMAT = "ipam"
 
-MAX_HEADER_SCAN_ROWS = 50
 MAX_WARNING_EXAMPLES = 3
 
 _PLACEHOLDERS = {
@@ -295,12 +294,10 @@ def _assignment_from_block(values, block, stats):
     gw, _, gw_status = _parse_ip(_cell(values, block, "gateway"))
     if gw_status == "ok":
         assignment["gateway"] = gw
-    vlan = _cell(values, block, "vlan")
-    if vlan:
-        assignment["vlan"] = vlan
-    vrf = _cell(values, block, "vrf")
-    if vrf:
-        assignment["vrf"] = vrf
+    for key in ("vlan", "vrf"):
+        value = _cell(values, block, key)
+        if value and not _is_placeholder(value):
+            assignment[key] = value
     return assignment
 
 
@@ -556,6 +553,9 @@ def _catalog_row(values, col_map, records, sheet_name, stats):
 # ---------------------------------------------------------------------------
 
 _RAIL_RE = re.compile(r"^rail\d+$")
+# Gateway-ish '<stem> ip' columns ('gw ip', 'gateway ip', 'def gw ip', 'mgmt
+# gw ip'...) describe the subnet, not a per-host assignment: never map them.
+_GATEWAY_STEM_RE = re.compile(r"(?:gw|gateway)$")
 
 
 def _map_wide_host(values):
@@ -577,7 +577,8 @@ def _map_wide_host(values):
                 device_col = idx
         elif _RAIL_RE.match(sq):
             ip_cols.append((idx, text, sq))
-        elif sq.endswith("ip") and len(sq) > 2 and "mac" not in sq:
+        elif (sq.endswith("ip") and len(sq) > 2 and "mac" not in sq
+              and not _GATEWAY_STEM_RE.search(sq[:-2])):
             ip_cols.append((idx, text, sq[:-2]))
         elif sq in ("cidr", "mask", "subnetmask") and global_mask is None:
             global_mask = idx
@@ -596,48 +597,43 @@ def _map_wide_host(values):
     return result
 
 
-def _parse_wide_host_sheet(sheet_name, rows, header_idx, wide_map):
-    hosts = {}
-    stats = _SheetStats(sheet_name)
+def _wide_host_row(values, wide_map, hosts, sheet_name, stats):
     host_col = wide_map["host"]
     host_fallback_col = wide_map.get("host_fallback")
-    for row_idx in range(header_idx + 1, len(rows)):
-        values = rows[row_idx]
-        if not values or host_col >= len(values):
+    if host_col >= len(values):
+        return
+    hostname = _clean_value(values[host_col])
+    if (not hostname or _is_placeholder(hostname)) and host_fallback_col is not None:
+        if host_fallback_col < len(values):
+            hostname = _clean_value(values[host_fallback_col])
+    if not hostname or _is_placeholder(hostname) or _looks_like_header_repeat(hostname):
+        return
+    assignments = []
+    for idx, header, stem in wide_map["ips"]:
+        raw = values[idx] if idx < len(values) else None
+        ip, prefixlen, status = _parse_ip(raw)
+        if status == "blank":
+            continue  # sparse wide tables: empty cells are normal
+        if status == "invalid":
+            stats.note_invalid(raw)
             continue
-        hostname = _clean_value(values[host_col])
-        if (not hostname or _is_placeholder(hostname)) and host_fallback_col is not None:
-            if host_fallback_col < len(values):
-                hostname = _clean_value(values[host_fallback_col])
-        if not hostname or _is_placeholder(hostname) or _looks_like_header_repeat(hostname):
-            continue
-        assignments = []
-        for idx, header, stem in wide_map["ips"]:
-            raw = values[idx] if idx < len(values) else None
-            ip, prefixlen, status = _parse_ip(raw)
-            if status == "blank":
-                continue  # sparse wide tables: empty cells are normal
-            if status == "invalid":
-                stats.note_invalid(raw)
-                continue
-            assignment = {"role_or_interface": header, "ip": ip}
-            mask = ""
-            if stem in wide_map["masks"]:
-                mask = _norm_mask(_cell(values, {"m": wide_map["masks"][stem]}, "m"))
-            if not mask and prefixlen is not None:
-                mask = str(prefixlen)
-            if not mask and wide_map["global_mask"] is not None:
-                mask = _norm_mask(_cell(values, {"m": wide_map["global_mask"]}, "m"))
-            if mask:
-                assignment["prefixlen_or_mask"] = mask
-            assignments.append(assignment)
-        if not assignments:
-            continue
-        record = hosts.setdefault(hostname, {
-            "hostname": hostname, "assignments": [], "sheet": sheet_name,
-        })
-        record["assignments"].extend(assignments)
-    return list(hosts.values()), stats.warnings()
+        assignment = {"role_or_interface": header, "ip": ip}
+        mask = ""
+        if stem in wide_map["masks"]:
+            mask = _norm_mask(_cell(values, {"m": wide_map["masks"][stem]}, "m"))
+        if not mask and prefixlen is not None:
+            mask = str(prefixlen)
+        if not mask and wide_map["global_mask"] is not None:
+            mask = _norm_mask(_cell(values, {"m": wide_map["global_mask"]}, "m"))
+        if mask:
+            assignment["prefixlen_or_mask"] = mask
+        assignments.append(assignment)
+    if not assignments:
+        return
+    record = hosts.setdefault(hostname, {
+        "hostname": hostname, "assignments": [], "sheet": sheet_name,
+    })
+    record["assignments"].extend(assignments)
 
 
 # ---------------------------------------------------------------------------
@@ -648,11 +644,12 @@ def _parse_sheet(sheet_name, rows):
     """-> ({category: records}, warnings) or (None, None) for non-data tabs.
 
     Every row is checked against the header sniffers in specificity order
-    (assignment blocks, L3 links, fabric inventory, subnet catalog); a match
-    switches the active table state, so mini-tables of different families
-    stacked vertically inside one sheet (subnet catalogs above hostname/ASN
-    tables, repeated catalog headers, ...) all parse. Wide host tables are a
-    whole-sheet fallback because their sniff is the loosest.
+    (assignment blocks, L3 links, fabric inventory, subnet catalog, wide host
+    tables); a match switches the active table state, so mini-tables of
+    different families stacked vertically inside one sheet (subnet catalogs
+    above hostname/ASN tables, wide host tables below a catalog, repeated
+    catalog headers, ...) all parse. The wide-host sniff is the loosest, so
+    it is tried last.
     """
     stats = _SheetStats(sheet_name)
     hosts = {}
@@ -677,31 +674,27 @@ def _parse_sheet(sheet_name, rows):
         if catalog_map:
             state = ("subnets", catalog_map)
             continue
+        wide_map = _map_wide_host(values)
+        if wide_map:
+            state = ("wide_hosts", wide_map)
+            continue
         if state is None:
             continue
         category, mapping = state
         if category == "hosts":
             _assignment_row(values, mapping, hosts, sheet_name, stats)
+        elif category == "wide_hosts":
+            _wide_host_row(values, mapping, hosts, sheet_name, stats)
         elif category == "l3_links":
             _l3_row(values, mapping, out["l3_links"], sheet_name, stats)
         elif category == "fabric":
             _fabric_row(values, mapping, out["fabric"], sheet_name, stats)
         else:
             _catalog_row(values, mapping, out["subnets"], sheet_name, stats)
-    if state is not None:
-        out["hosts"] = list(hosts.values())
-        return out, stats.warnings()
-    # Fallback: wide host tables (hostname + many IP columns)
-    limit = min(len(rows), MAX_HEADER_SCAN_ROWS)
-    for idx in range(limit):
-        values = rows[idx]
-        if not values:
-            continue
-        wide_map = _map_wide_host(values)
-        if wide_map:
-            records, warnings = _parse_wide_host_sheet(sheet_name, rows, idx, wide_map)
-            return {"hosts": records}, warnings
-    return None, None
+    if state is None:
+        return None, None
+    out["hosts"] = list(hosts.values())
+    return out, stats.warnings()
 
 
 def parse_workbook(path):
@@ -756,7 +749,8 @@ def _host_keys(name):
 def lookup_host(data, hostname):
     """All design records for a hostname (case/FQDN tolerant).
 
-    -> {'hostname', 'hosts': [host records], 'fabric': [fabric records]}
+    -> {'hostname', 'hosts': [host records], 'fabric': [fabric records],
+        'l3_links': [link records touching the host on either side]}
     Fabric records also match on their 'device' label alias.
     """
     want = _host_keys(hostname)
@@ -765,7 +759,12 @@ def lookup_host(data, hostname):
         f for f in data.get("fabric", [])
         if (_host_keys(f.get("hostname")) | _host_keys(f.get("device"))) & want
     ]
-    return {"hostname": hostname, "hosts": hosts, "fabric": fabric}
+    l3_links = [
+        l for l in data.get("l3_links", [])
+        if (_host_keys(l.get("a_host")) | _host_keys(l.get("b_host"))) & want
+    ]
+    return {"hostname": hostname, "hosts": hosts, "fabric": fabric,
+            "l3_links": l3_links}
 
 
 def lookup_ip(data, ip):
@@ -773,10 +772,11 @@ def lookup_ip(data, ip):
 
     -> {'ip', 'hosts': [{hostname, sheet, assignment}], 'fabric':
         [{record, match_field}], 'subnets': [subnet records, longest prefix
-        first]}
+        first], 'l3_links': [link records with this IP on either side]}
     """
     ip_str, _, status = _parse_ip(ip)
-    result = {"ip": ip_str or _clean_value(ip), "hosts": [], "fabric": [], "subnets": []}
+    result = {"ip": ip_str or _clean_value(ip), "hosts": [], "fabric": [],
+              "subnets": [], "l3_links": []}
     if status != "ok":
         return result
     ip_obj = ipaddress.ip_address(ip_str)
@@ -793,6 +793,9 @@ def lookup_ip(data, ip):
             if record.get(field) == ip_str:
                 result["fabric"].append({"record": record, "match_field": field})
                 break
+    for link in data.get("l3_links", []):
+        if ip_str in (link.get("a_ip"), link.get("b_ip")):
+            result["l3_links"].append(link)
     matches = []
     for subnet in data.get("subnets", []):
         try:
@@ -809,17 +812,23 @@ def lookup_ip(data, ip):
 def expected_bgp(data):
     """Design BGP truth for design-vs-live checks.
 
-    -> {hostname: {'loopback': ip_or_'', 'asn': str_or_''}} from fabric
-    records that carry a loopback and/or ASN.
+    -> {hostname_lower: {'loopback': ip_or_'', 'asn': str_or_''}} from fabric
+    records that carry a loopback and/or ASN. Records are merged per host
+    (case-insensitively): later records fill fields earlier ones left empty,
+    so an ASN-only table and a loopback table both contribute.
     """
     out = {}
     for record in data.get("fabric", []):
-        hostname = record.get("hostname", "")
+        hostname = str(record.get("hostname", "")).strip()
         loopback = record.get("loopback_ip", "")
         asn = record.get("asn", "")
         if not hostname or not (loopback or asn):
             continue
-        out.setdefault(hostname, {"loopback": loopback, "asn": asn})
+        entry = out.setdefault(hostname.lower(), {"loopback": "", "asn": ""})
+        if loopback and not entry["loopback"]:
+            entry["loopback"] = loopback
+        if asn and not entry["asn"]:
+            entry["asn"] = asn
     return out
 
 
