@@ -895,7 +895,13 @@ def write_conf(pairs):
         if stripped and not stripped.startswith('#') and key in keys:
             continue
         output.append(line)
-    output.extend('%s=%s' % (key, value) for key, value in pairs.items())
+    def _fmt_val(v):
+        if isinstance(v, bool):
+            return 'yes' if v else 'no'
+        if isinstance(v, (int, float)):
+            return str(v)
+        return '"' + str(v).replace('"', '\\"') + '"'
+    output.extend('%s=%s' % (key, _fmt_val(value)) for key, value in pairs.items())
     if install_text_as_root(
         '\n'.join(output) + '\n', '/etc/lldpq.conf', '.lldpq.conf.setup.tmp',
         '660', config_owner

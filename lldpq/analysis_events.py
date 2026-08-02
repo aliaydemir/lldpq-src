@@ -17,6 +17,7 @@ Event shape:
 """
 
 import json
+import logging
 import os
 import tempfile
 import time
@@ -37,7 +38,10 @@ def _atomic_write(path, content):
     )
     try:
         # Web-served output: nginx must always retain read access.
-        mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else 0o664
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except FileNotFoundError:
+            mode = 0o664
         os.fchmod(fd, mode | 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
@@ -100,15 +104,13 @@ def publish_events(result_dir, domain, new_events, cap=EVENTS_CAP, now=None):
             normalized = _normalize(event, now)
             if normalized:
                 key = (normalized["ts"], normalized["device"],
-                       normalized["object"], normalized["kind"],
-                       normalized["detail"])
+                       normalized["object"], normalized["kind"])
                 merged[key] = normalized
         for event in (new_events or []):
             normalized = _normalize(event, now)
             if normalized:
                 key = (normalized["ts"], normalized["device"],
-                       normalized["object"], normalized["kind"],
-                       normalized["detail"])
+                       normalized["object"], normalized["kind"])
                 merged[key] = normalized
         cutoff = now - RETENTION_SEC
         events = sorted(
@@ -122,5 +124,6 @@ def publish_events(result_dir, domain, new_events, cap=EVENTS_CAP, now=None):
             "events": events,
         }, separators=(",", ":")) + "\n")
         return True
-    except Exception:
+    except Exception as e:
+        logging.debug("publish_events failed: %s", e)
         return False

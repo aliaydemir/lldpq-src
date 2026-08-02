@@ -661,7 +661,7 @@
     function setLastUpdated(createdAt, ageSeconds = null) {
         const target = document.getElementById('last-updated');
         const match = typeof createdAt === 'string'
-            ? createdAt.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/)
+            ? createdAt.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/)
             : null;
         if (!match) {
             target.textContent = 'Unavailable';
@@ -948,6 +948,11 @@
                 else if (unit.startsWith('day')) minutes += amount * 24 * 60;
                 else if (unit.startsWith('hour')) minutes += amount * 60;
                 else minutes += amount;
+            }
+            const timeMatch = String(uptime).match(/(\d+):(\d{2}):(\d{2})/);
+            if (timeMatch) {
+                minutes += (parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseInt(timeMatch[3])) / 60;
+                matched = true;
             }
             return matched ? minutes : null;
         };

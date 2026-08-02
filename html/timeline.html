@@ -262,7 +262,7 @@ function renderActivity(events){
   var svg = document.getElementById('activitySvg');
   var now = Date.now() / 1000;
   var span = rangeSeconds > 0 ? rangeSeconds :
-    Math.max(3600, now - (events.length ? Math.min.apply(null, events.map(function(e){ return e.ts; })) : now - 3600));
+    Math.max(3600, now - (allEvents.length ? Math.min.apply(null, allEvents.map(function(e){ return e.ts; })) : now - 3600));
   var start = now - span;
   var buckets = 48;
   var counts = [], critical = [];
@@ -329,7 +329,9 @@ function renderDeviceOptions(){
   $search.html(options).data('tl-init', true);
   $search.select2({placeholder:'Search Device...', allowClear:true, width:'200px', dropdownAutoWidth:true});
   $search.on('select2:select', function(e){
-    deviceFilter = String(e.params.data.id || '').toLowerCase();
+    var tmp = document.createElement('textarea');
+    tmp.innerHTML = e.params.data.id;
+    deviceFilter = tmp.value.toLowerCase();
     document.getElementById('clearSearchBtn').style.display = 'inline-block';
     render();
   });

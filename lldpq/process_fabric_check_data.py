@@ -834,7 +834,7 @@ function cardFilter(kind, card){
     r.style.display = (r.getAttribute('data-check')===target) ? '' : 'none';
   });
   document.getElementById('fct').scrollIntoView({behavior:'smooth', block:'start'});
-  var labels={mtu:'MTU mismatches', speed:'Speed mismatches', config:'Config \\u2260 running MTU'};
+  var labels={mtu:'MTU mismatches', speed:'Speed mismatches', config:'Config \\u2260 running MTU', fec:'FEC mismatches', autoneg:'Autoneg mismatches'};
   setFilterInfo(labels[kind]);
 }
 function filterByDevice(dev){

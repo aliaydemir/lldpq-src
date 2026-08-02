@@ -221,7 +221,7 @@ def _render_updates(
     for line in original.splitlines(keepends=True):
         matched_key = None
         for key in normalized:
-            if line.startswith(f"{key}="):
+            if line.lstrip().startswith(f"{key}="):
                 matched_key = key
                 break
         if matched_key is None:

@@ -100,6 +100,7 @@ sys.dont_write_bytecode = True
 WEB_ROOT = os.environ.get('WEB_ROOT', '/var/www/html')
 LLDPQ_DIR = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
 LLDPQ_USER = os.environ.get('LLDPQ_USER', 'lldpq')
+LLDPQ_GROUP = os.environ.get('LLDPQ_GROUP', 'www-data')
 AI_STATE_DIR = os.environ.get('AI_STATE_DIR', '/var/lib/lldpq/ai')
 DIRECT_WRITE_STATE_DIR = os.environ.get('DIRECT_WRITE_STATE_DIR', '')
 SETUP_SAFETY = os.environ.get('SETUP_SAFETY', '')
@@ -162,7 +163,7 @@ def ensure_dir(path, mode=0o2770):
         pass
     for cmd in (
         ['sudo', '-n', 'mkdir', '-p', path],
-        ['sudo', '-n', 'chown', '%s:www-data' % LLDPQ_USER, path],
+        ['sudo', '-n', 'chown', '%s:%s' % (LLDPQ_USER, LLDPQ_GROUP), path],
         ['sudo', '-n', 'chmod', '2770', path],
     ):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
@@ -376,7 +377,7 @@ def parse_multipart(body, content_type):
         return {}, {}
     boundary = ('--' + match.group(2)).encode()
     files, fields = {}, {}
-    for part in body.split(boundary):
+    for part in body.split(b'\r\n' + boundary):
         part = part.strip(b'\r\n')
         if not part or part == b'--':
             continue

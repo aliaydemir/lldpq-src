@@ -3899,7 +3899,7 @@ try:
     with open('/etc/lldpq.conf') as f:
         for line in f:
             if line.startswith('LLDPQ_DIR='):
-                lldpq_dir = line.strip().split('=', 1)[1]
+                lldpq_dir = line.strip().split('=', 1)[1].strip('"\'')
                 break
 except OSError:
     pass
@@ -4017,7 +4017,7 @@ try:
     with open('/etc/lldpq.conf') as f:
         for line in f:
             if line.startswith('LLDPQ_DIR='):
-                lldpq_dir = line.strip().split('=', 1)[1]
+                lldpq_dir = line.strip().split('=', 1)[1].strip('"\'')
                 break
 except OSError:
     pass
@@ -4171,7 +4171,7 @@ try:
                 continue
             
             # Collect route_map -> target_vrf mapping from VRFs
-            vrfs = device_data.get('vrfs', {})
+            vrfs = device_data.get('vrfs') or {}
             for vrf_name, vrf_config in vrfs.items():
                 if isinstance(vrf_config, dict):
                     bgp = vrf_config.get('bgp', {})
@@ -4256,7 +4256,7 @@ try:
                 continue
             
             # Part 1: Build route_map -> target_vrf mapping
-            vrfs = device_data.get('vrfs', {})
+            vrfs = device_data.get('vrfs') or {}
             for vrf_name, vrf_config in vrfs.items():
                 if isinstance(vrf_config, dict):
                     bgp = vrf_config.get('bgp', {})
@@ -4337,7 +4337,7 @@ try:
                 device_data = yaml.load(f, Loader=yaml.CSafeLoader)
             if not device_data:
                 continue
-            vrfs = device_data.get('vrfs', {})
+            vrfs = device_data.get('vrfs') or {}
             for vrf_name, vrf_config in vrfs.items():
                 if isinstance(vrf_config, dict):
                     bgp = vrf_config.get('bgp', {})

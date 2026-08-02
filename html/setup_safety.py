@@ -311,6 +311,11 @@ def validate_topology_dot(content: str, topology_parser_path: str = None) -> Non
             if '--' in line and not (quoted.fullmatch(line) or unquoted.fullmatch(line)):
                 raise SetupSafetyError("Unsupported topology edge syntax: " + line[:160])
             if '--' not in line:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#') or stripped.startswith('//'):
+                    continue
+                if '--' in stripped or stripped in ('{', '}') or stripped.endswith(';'):
+                    continue
                 raise SetupSafetyError("Unsupported topology.dot statement: " + line[:160])
 
     dot = shutil.which("dot")

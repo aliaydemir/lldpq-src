@@ -188,6 +188,7 @@ class ConfigDriftAnalyzer:
         self.devices_missing = []
         self.device_rows = []
         self.configs_dir_available = os.path.isdir(self.configs_dir)
+        self._pending_baselines = []
 
     # ------------------------------------------------------------------
     # Analysis
@@ -257,7 +258,6 @@ class ConfigDriftAnalyzer:
                     "diff_truncated": truncated,
                 })
                 self.new_events += 1
-                self._write_baseline(host, content)
                 entry.update({
                     "sha256": digest,
                     "collected_at": collected_at,
@@ -265,6 +265,7 @@ class ConfigDriftAnalyzer:
                     "size": stat_result.st_size,
                     "last_changed_at": self.now,
                 })
+                self._pending_baselines.append((host, content))
             else:
                 entry["collected_at"] = collected_at
             self._append_device_row(host, entry, status="current",
@@ -871,6 +872,8 @@ def main():
     output_file = os.path.join(RESULT_DIR, OUTPUT_HTML)
     analyzer.export_html(output_file)
     analyzer.save_state()
+    for host, content in analyzer._pending_baselines:
+        analyzer._write_baseline(host, content)
 
     counts = analyzer.summary_counts()
     print("Config drift analysis complete:")

@@ -74,14 +74,11 @@ def publish_digest(path: Union[str, Path], digest: str) -> None:
         except BaseException:
             try:
                 os.unlink(temporary)
-            except FileNotFoundError:
+            except OSError:
                 pass
             raise
     except OSError:
-        try:
-            destination.unlink()
-        except OSError:
-            pass
+        pass
 
 
 def read_sidecar_digest(path: Union[str, Path]) -> Optional[str]:

@@ -280,6 +280,7 @@ function fmtTs(ts) {
 async function apiGet(action, params) {
     const qs = new URLSearchParams(Object.assign({ action }, params || {})).toString();
     const r = await fetch(API + '?' + qs, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
 }
 async function apiPost(action, body, params) {
@@ -289,6 +290,7 @@ async function apiPost(action, body, params) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {}),
     });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
 }
 
@@ -347,7 +349,7 @@ function renderVersions(kind, versions) {
         const action = active
             ? '<span class="badge green">Active</span>'
             : '<button class="btn secondary sm" onclick="activate(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Use as Design</button>' +
-              '<button class="btn danger sm" title="Delete this stored version" onclick="deleteVersion(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Del</button>';
+              '<button class="btn danger sm" title="Delete this stored version" onclick="deleteVersion(\'' + kind + '\',\'' + escHtml(v.version) + '\',\'' + escHtml(name) + '\')">Del</button>';
         return '<div class="ver-row' + (active ? ' active' : '') + '">' +
             '<svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>' +
             '<span class="ver-name" title="' + escHtml(name) + '">' + escHtml(name) + '</span>' +
@@ -363,6 +365,8 @@ async function loadVersions() {
         if (data.success) {
             renderVersions('p2p', (data.versions || {}).p2p || []);
             renderVersions('ipam', (data.versions || {}).ipam || []);
+        } else {
+            setStatus('st-p2p', data.error || 'Failed to load versions', 'err');
         }
     } catch (e) { /* offline / no backend: leave placeholders */ }
 }
@@ -387,8 +391,8 @@ async function activate(kind, version) {
     }
 }
 
-async function deleteVersion(kind, version) {
-    if (!window.confirm('Delete stored version ' + version + '?\n\nThe design copy is removed permanently. The active version cannot be deleted.')) return;
+async function deleteVersion(kind, version, filename) {
+    if (!window.confirm('Delete stored version ' + (filename || version) + '?\n\nThe design copy is removed permanently. The active version cannot be deleted.')) return;
     setStatus('st-' + kind, 'Deleting…', 'info');
     setListBusy(kind, true);
     try {
@@ -617,9 +621,11 @@ async function advisorSend() {
                 setStatus(ui.st, 'Advisor proposed ' + ui.file + '. Review, then confirm to write.', 'info');
             }
         } else {
+            advisorHistory.pop();
             advisorAppend('system', (data && data.error) || 'Advisor request failed.');
         }
     } catch (e) {
+        advisorHistory.pop();
         advisorAppend('system', 'Advisor request failed: ' + e.message);
     }
     document.getElementById('adv-send').disabled = false;

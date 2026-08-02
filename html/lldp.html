@@ -2418,7 +2418,7 @@
             });
             
             // Re-apply the filter whenever the set of selected devices changes (select / unselect / clear)
-            $('#deviceSearch').on('change', function() {
+            $('#deviceSearch').off('change').on('change', function() {
                 if (_suppressDeviceChange) return;
                 applyDeviceFilter($(this).val() || []);
             });

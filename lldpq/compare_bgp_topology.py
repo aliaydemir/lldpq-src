@@ -70,14 +70,12 @@ def parse_bgp_report(csv_path):
                 continue
             
             if state == 'ESTABLISHED':
-                match = re.match(r'([a-z]{3}-\d[a-z]{2}-\d+-\d+)', neighbor_raw)
-                if match:
-                    neighbor = match.group(1)
-                    devices.add(neighbor)
-                    link = tuple(sorted([device, neighbor]))
-                    established_links.add(link)
-                    device_neighbors[device].add(neighbor)
-                    device_neighbors[neighbor].add(device)
+                neighbor = neighbor_raw.strip().lower()
+                devices.add(neighbor)
+                link = tuple(sorted([device, neighbor]))
+                established_links.add(link)
+                device_neighbors[device].add(neighbor)
+                device_neighbors[neighbor].add(device)
             elif state == 'IDLE':
                 down_idle.append((device, neighbor_raw))
             elif state == 'ACTIVE':

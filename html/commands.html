@@ -543,6 +543,18 @@ function esc(s) {
     return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function ansi256ToHex(n) {
+    if (n < 16) {
+        var basic = ['#000000','#800000','#008000','#808000','#000080','#800080','#008080','#c0c0c0',
+                     '#808080','#ff0000','#00ff00','#ffff00','#0000ff','#ff00ff','#00ffff','#ffffff'];
+        return basic[n] || '#ffffff';
+    }
+    if (n >= 232) { var g = (n - 232) * 10 + 8; return 'rgb(' + g + ',' + g + ',' + g + ')'; }
+    var idx = n - 16, r = Math.floor(idx / 36), g2 = Math.floor((idx % 36) / 6), b = idx % 6;
+    var v = function(x) { return x ? x * 40 + 55 : 0; };
+    return 'rgb(' + v(r) + ',' + v(g2) + ',' + v(b) + ')';
+}
+
 // Convert ANSI SGR color codes (e.g. from nvt) to safe HTML.
 // Text is HTML-escaped; only fixed-palette / numeric-rgb color spans are injected.
 function ansiToHtml(input) {
@@ -551,12 +563,13 @@ function ansiToHtml(input) {
         90:'#777',91:'#ef9a9a',92:'#a5d6a7',93:'#fff59d',94:'#90caf9',95:'#ce93d8',96:'#80deea',97:'#ffffff'
     };
     const s = String(input ?? '').replace(/\r/g, '');
-    let out = '', open = false, fg = null, bold = false;
+    let out = '', open = false, fg = null, bg = null, bold = false;
     const close = () => { if (open) { out += '</span>'; open = false; } };
     const apply = () => {
         close();
         let st = '';
         if (fg) st += 'color:' + fg + ';';
+        if (bg) st += 'background-color:' + bg + ';';
         if (bold) st += 'font-weight:bold;';
         if (st) { out += '<span style="' + st + '">'; open = true; }
     };
@@ -566,12 +579,21 @@ function ansiToHtml(input) {
         const codes = parts[i].split(';').map(n => n === '' ? 0 : parseInt(n, 10));
         for (let k = 0; k < codes.length; k++) {
             const c = codes[k];
-            if (c === 0) { fg = null; bold = false; }
+            if (c === 0) { fg = null; bg = null; bold = false; }
             else if (c === 1) bold = true;
             else if (c === 22) bold = false;
             else if (c === 39) fg = null;
             else if (c === 38 && codes[k + 1] === 2) { fg = `rgb(${codes[k + 2] || 0},${codes[k + 3] || 0},${codes[k + 4] || 0})`; k += 4; }
-            else if (c === 38 && codes[k + 1] === 5) { k += 2; }
+            else if (c === 38 && codes[k + 1] === 5 && codes[k + 2] !== undefined) {
+                var n256 = codes[k + 2];
+                fg = ansi256ToHex(n256);
+                k += 2;
+            }
+            else if (c === 48 && codes[k + 1] === 5 && codes[k + 2] !== undefined) {
+                var n256b = codes[k + 2];
+                bg = ansi256ToHex(n256b);
+                k += 2;
+            }
             else if (BASIC[c]) fg = BASIC[c];
         }
         apply();

@@ -1098,7 +1098,7 @@
                 </tr>
             </thead>
             <tbody id="bindingsBody">
-                <tr><td colspan="10" class="loading">Loading inventory...</td></tr>
+                <tr><td colspan="11" class="loading">Loading inventory...</td></tr>
             </tbody>
         </table>
     </div>
@@ -2290,6 +2290,7 @@ async function saveDHCPConfig() {
         auto_base_config: document.getElementById('autoBaseConfig').checked,
         auto_ztp_disable: document.getElementById('autoZtpDisable').checked,
         auto_set_hostname: document.getElementById('autoSetHostname').checked,
+        scan_interval: parseInt(document.getElementById('scanInterval').value) || 0,
     };
 
     if (!config.subnet || !config.netmask || !config.gateway) {
@@ -2581,7 +2582,7 @@ function applyBulkImport() {
 
 // ===================== TAB 1: BINDINGS =====================
 async function loadBindings() {
-    document.getElementById('bindingsBody').innerHTML = '<tr><td colspan="10" class="loading">Loading inventory...</td></tr>';
+    document.getElementById('bindingsBody').innerHTML = '<tr><td colspan="11" class="loading">Loading inventory...</td></tr>';
     const data = await apiCall('list-bindings');
     if (data.success) {
         allBindings = data.bindings || [];
@@ -2592,7 +2593,7 @@ async function loadBindings() {
         renderBindings();
         return true;
     } else {
-        document.getElementById('bindingsBody').innerHTML = `<tr><td colspan="9" style="color:#f44336;padding:20px;">Error: ${data.error}</td></tr>`;
+        document.getElementById('bindingsBody').innerHTML = `<tr><td colspan="11" style="color:#f44336;padding:20px;">Error: ${data.error}</td></tr>`;
         return false;
     }
 }
