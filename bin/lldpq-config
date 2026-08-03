@@ -12,6 +12,7 @@ import fcntl
 import re
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -73,6 +74,9 @@ ALLOWED_KEYS = frozenset({
     "AUTO_SET_HOSTNAME",
     "DISCOVERY_RANGE",
     "SCAN_INTERVAL",
+    "FABRIC_SCAN_MAX_PARALLEL",
+    "FABRIC_SCAN_MIN_INTERVAL_SECONDS",
+    "MONITOR_DATA_MAX_AGE_MINUTES",
     # Transceiver firmware collection.
     "TRANSCEIVER_FW_SKIP_MODELS",
     "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY",
@@ -206,7 +210,21 @@ def parse_config(path: Path, required: bool = False) -> Dict[str, str]:
         except FileNotFoundError:
             lock_handle = None
         if lock_handle is not None:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            # Bounded wait: a Setup transaction can hold the exclusive lock
+            # for a long time.  Writers replace the file atomically (stage +
+            # rename), so once the wait expires an unlocked read still yields
+            # a complete snapshot instead of stalling every shell entrypoint.
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    fcntl.flock(
+                        lock_handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB
+                    )
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.1)
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         if required:

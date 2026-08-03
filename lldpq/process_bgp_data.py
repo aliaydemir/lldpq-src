@@ -17,7 +17,9 @@ from collection_freshness import (
     asset_snapshot_is_authoritative,
     asset_snapshot_is_valid,
     is_current_collection,
+    max_data_age_seconds,
     read_asset_snapshot,
+    read_collection_outcomes,
 )
 
 
@@ -56,18 +58,26 @@ def parse_asset_statuses(assets_file):
 
 
 def get_collection_problem(filepath, hostname, assets_file, asset_statuses):
-    """Return why a raw BGP file cannot represent the current collection."""
+    """Return why a raw BGP file cannot represent the current collection.
+
+    Same checks as collection_freshness.is_current_collection, kept in step
+    with the shared helpers; only the reason codes are local."""
     try:
         file_mtime = os.path.getmtime(filepath)
     except OSError:
         return "collection_missing"
 
-    try:
-        max_age_minutes = float(os.environ.get("BGP_DATA_MAX_AGE_MINUTES", "30"))
-    except ValueError:
-        max_age_minutes = 30
-    if time.time() - file_mtime > max(max_age_minutes, 0) * 60:
+    if time.time() - file_mtime > max_data_age_seconds():
         return "collection_stale"
+
+    # This generation's explicit per-device outcome manifest is
+    # authoritative when configured.
+    collection_outcomes = read_collection_outcomes()
+    if (
+        collection_outcomes is not None
+        and collection_outcomes.get(hostname) != "current"
+    ):
+        return "collection_not_refreshed"
 
     # In the normal full run assets.ini is finalized before monitor.sh starts.
     # A BGP file older than that inventory snapshot belongs to an earlier run.

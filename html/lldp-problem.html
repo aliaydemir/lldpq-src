@@ -265,7 +265,13 @@
         }
 
         window.onload = async function () {
-            if (!await LLDPqAuth.check()) return;
+            if (!await LLDPqAuth.checkWithRetry()) {
+                if (LLDPqAuth.lastCheckTransient) {
+                    document.getElementById('metinAlani-1').textContent =
+                        'Auth check unreachable — reload the page to retry.';
+                }
+                return;
+            }
             fetchAndDisplayLLDPResults();
         };
     </script>

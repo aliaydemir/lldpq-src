@@ -4,3 +4,5 @@
 *.md
 LICENSE
 assets/
+**/__pycache__
+**/*.pyc

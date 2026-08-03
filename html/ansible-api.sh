@@ -707,6 +707,27 @@ git_diff() {
 # Main
 parse_query
 
+# Large host lists overflow the URL length limit: diff/deploy/generate also
+# accept the same comma-joined list via a POST body of JSON {"host": "..."}.
+# The action stays in the query string, and a host query param still wins.
+if [ "$REQUEST_METHOD" = "POST" ] && [ -z "$HOST" ]; then
+    case "$ACTION" in
+        diff|deploy|generate)
+            if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+                POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
+                HOST=$(printf '%s' "$POST_DATA" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = {}
+host = data.get("host", "") if isinstance(data, dict) else ""
+print(host if isinstance(host, str) else "")')
+            fi
+            ;;
+    esac
+fi
+
 # Get commit message from POST data if present
 if [ "$ACTION" = "git-commit" ]; then
     if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
@@ -896,12 +917,12 @@ PYEOF
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
         git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
         
-        # Get modified files in inventory/host_vars/
-        modified_files=$(git diff --name-only 2>/dev/null | grep "inventory/host_vars/.*\.yaml$" || true)
-        untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null | grep "inventory/host_vars/.*\.yaml$" || true)
-        
-        # Combine, extract hostnames, make unique
-        all_hostnames=$(echo -e "${modified_files}\n${untracked_files}" | grep -v "^$" | xargs -I{} basename {} .yaml 2>/dev/null | sort -u | grep -v "^$" || true)
+        # Get modified files in inventory/host_vars/ (.yaml or .yml)
+        modified_files=$(git diff --name-only 2>/dev/null | grep -E "inventory/host_vars/.*\.(yaml|yml)$" || true)
+        untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null | grep -E "inventory/host_vars/.*\.(yaml|yml)$" || true)
+
+        # Combine, extract hostnames (strip either extension), make unique
+        all_hostnames=$(echo -e "${modified_files}\n${untracked_files}" | grep -v "^$" | sed 's|.*/||; s/\.yaml$//; s/\.yml$//' | sort -u | grep -v "^$" || true)
         
         # Build JSON array
         if [ -z "$all_hostnames" ]; then

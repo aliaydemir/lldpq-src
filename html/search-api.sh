@@ -461,7 +461,10 @@ def get_device_table(record):
             ]
             result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
         else:  # arp - get ARP with interface VRF mappings
-            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null'
+            # Trailing exit 0 mirrors the single-device script: the loop
+            # legitimately ends with a failed test when the last interface
+            # has no master; that must not look like an SSH failure.
+            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null; exit 0'
             cmd_parts = [
                 "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
                 "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
@@ -476,7 +479,9 @@ def get_device_table(record):
             for line in result.stdout.strip().split('\n'):
                 if not line.strip():
                     continue
-                if "permanent" in line:
+                # Same skip set as the single-device parser: permanent AND
+                # self entries are local bridge addresses, not learned MACs.
+                if "permanent" in line or "self" in line:
                     continue
                 parts = line.split()
                 if len(parts) >= 3:
@@ -488,7 +493,10 @@ def get_device_table(record):
                             iface = parts[i + 1]
                         if p == "vlan" and i + 1 < len(parts):
                             vlan = parts[i + 1]
-                    
+
+                    if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac) or not iface:
+                        continue
+
                     entry = {
                         "device": hostname,
                         "mac": mac,
@@ -1320,8 +1328,24 @@ run_fabric_scan() {
         return
     fi
     sudo -u "$LLDPQ_USER" nohup env LLDPQ_FABRIC_SCAN_FORCE=1 bash "$scan_script" > /tmp/fabric-scan.log 2>&1 &
-    
-    echo '{"success": true, "message": "Fabric scan started"}'
+    local scan_pid=$!
+
+    # Confirm the detached launch actually took before reporting success: the
+    # launcher (or the scan process it started) must still be alive shortly
+    # after backgrounding. ps works regardless of the sudo uid switch.
+    local started=false
+    for _ in 1 2 3 4 5; do
+        sleep 0.2
+        if ps -p "$scan_pid" > /dev/null 2>&1 || pgrep -f "fabric-scan.sh" > /dev/null 2>&1; then
+            started=true
+            break
+        fi
+    done
+    if [[ "$started" == true ]]; then
+        echo '{"success": true, "message": "Fabric scan started"}'
+    else
+        echo '{"success": false, "error": "Fabric scan failed to launch; check /tmp/fabric-scan.log on the server"}'
+    fi
 }
 
 # Search cached routes (VRF-grouped structure)

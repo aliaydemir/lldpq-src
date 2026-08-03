@@ -146,6 +146,26 @@ class BerShardFunctionalTests(unittest.TestCase):
             p.name for p in (Path(tmp) / "ber-history").glob("*.json"))
         self.assertEqual(names, ["leaf1.json"])
 
+    def test_clear_stale_shard_current_keeps_history(self):
+        tmp = self._tmp()
+        analyzer = BERAnalyzer(tmp)
+        now = time.time()
+        analyzer.ber_history = {"leaf2:swp1": [_record(now - 60)]}
+        analyzer.current_ber_stats = {
+            "leaf1:swp1": _record(now),
+            "leaf2:swp1": _record(now),
+        }
+        self.assertTrue(analyzer.save_ber_history())
+        # leaf2 misses the next collection: its persisted current must be
+        # emptied while its history survives.
+        self.assertTrue(analyzer.clear_stale_shard_current({"leaf1"}))
+        shard_dir = Path(tmp) / "ber-history"
+        leaf2 = json.loads((shard_dir / "leaf2.json").read_text())
+        self.assertEqual(leaf2["current"], {})
+        self.assertIn("leaf2:swp1", leaf2["history"])
+        leaf1 = json.loads((shard_dir / "leaf1.json").read_text())
+        self.assertIn("leaf1:swp1", leaf1["current"])
+
 
 class BerShardConsumerContractTests(unittest.TestCase):
     """Every reader of the former monolith must be shard-first."""
@@ -166,7 +186,8 @@ class BerShardConsumerContractTests(unittest.TestCase):
         source = (SCRIPT_DIR.parent / "html" / "ai_insights.py").read_text(
             encoding="utf-8")
         self.assertIn("def _ber_history_source(", source)
-        self.assertIn('("ber", _extract_ber, _ber_history_source(monitor, web)),',
+        # Pin the shard-first source wiring, not the tuple arity.
+        self.assertIn('("ber", _extract_ber, _ber_history_source(monitor, web)',
                       source)
 
     def test_ai_correlate_merges_shards(self):

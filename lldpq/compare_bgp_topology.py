@@ -33,6 +33,10 @@ def parse_bgp_report(csv_path):
     # picked up the Neighbor column and never matched IDLE/ACTIVE/ESTABLISHED.
     # Fall back to the legacy positional layout when no header row is present.
     col = {'device': 0, 'neighbor': 1, 'state': 3}
+    # The Neighbor token is a usable local port only on unnumbered fabrics;
+    # numbered sessions carry a peer IP there.  Prefer the explicit Interface
+    # column for device:port topology lookups whenever the CSV provides one.
+    interface_col = None
 
     with open(csv_path, 'r') as f:
         reader = csv.reader(f)
@@ -54,32 +58,41 @@ def parse_bgp_report(csv_path):
                     )
                     col['neighbor'] = lookup.get('neighbor', col['neighbor'])
                     col['state'] = lookup.get('state', col['state'])
+                    interface_col = lookup.get('interface')
                     continue
                 # No header: fall through and parse this first row positionally.
 
             if len(row) <= max(col.values()):
                 continue
 
-            device = row[col['device']]
+            # Device/neighbor/topology names are compared casefolded so mixed
+            # case can never fabricate a missing device or hide a down link.
+            device = row[col['device']].strip().casefold()
             neighbor_raw = row[col['neighbor']]
             state = row[col['state']].strip().upper()
             devices.add(device)
-            
+
             # Skip firewall links
             if 'cfw' in neighbor_raw.lower():
                 continue
-            
+
+            neighbor = neighbor_raw.strip().casefold()
+            local_port = neighbor
+            if interface_col is not None and len(row) > interface_col:
+                interface = row[interface_col].strip()
+                if interface and interface.upper() != 'N/A':
+                    local_port = interface.casefold()
+
             if state == 'ESTABLISHED':
-                neighbor = neighbor_raw.strip().lower()
                 devices.add(neighbor)
                 link = tuple(sorted([device, neighbor]))
                 established_links.add(link)
                 device_neighbors[device].add(neighbor)
                 device_neighbors[neighbor].add(device)
             elif state == 'IDLE':
-                down_idle.append((device, neighbor_raw))
+                down_idle.append((device, local_port))
             elif state == 'ACTIVE':
-                down_active.append((device, neighbor_raw))
+                down_active.append((device, neighbor))
     
     return devices, established_links, down_idle, down_active, device_neighbors
 
@@ -97,7 +110,8 @@ def parse_topology_dot(dot_path):
             
             match = re.findall(r'"([^"]+)"', line)
             if len(match) >= 4:
-                d1, p1, d2, p2 = match[0], match[1], match[2], match[3]
+                # Casefolded to match the CSV-side names (see parse_bgp_report).
+                d1, p1, d2, p2 = (token.casefold() for token in match[:4])
                 # Skip non-switch links (DGX, servers, etc.)
                 if any(x in d1.lower() or x in d2.lower() for x in ['dgx-', 'enp', 'prod-']):
                     continue

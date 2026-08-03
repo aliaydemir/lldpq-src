@@ -154,6 +154,19 @@ class EvpnMhAnalyzerTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "healthy")
         self.assertEqual(len(rows[0]["attachments"]), 2)
 
+    def test_partial_bgp_collection_does_not_fabricate_warnings(self):
+        left = snapshot("tan-leaf-06", df=True)
+        right = snapshot("tan-leaf-08", df=False)
+        # The peer's BGP sub-sections failed: its views are empty, not zero.
+        right["errors"] = ["EVPN_MH_BGP_ESI", "EVPN_MH_BGP_ES_EVI"]
+        right["bgp_esi"] = {}
+        right["bgp_es_evi"] = {}
+        rows = correlate_snapshots({"tan-leaf-06": left, "tan-leaf-08": right})
+        self.assertEqual(rows[0]["status"], "partial_data")
+        self.assertNotIn("VNI membership mismatch", rows[0]["reason"])
+        self.assertNotIn("BGP ES record missing", rows[0]["reason"])
+        self.assertIn("partial BGP collection", rows[0]["reason"])
+
     def test_runtime_member_and_ifalias_fallback(self):
         left = snapshot("tan-leaf-06", df=True)
         right = snapshot("tan-leaf-08", df=False)

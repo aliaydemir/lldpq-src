@@ -110,7 +110,6 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
         print("Publishing flap report with unavailable device coverage")
     
     processed_devices = 0
-    processing_errors = 0
     category_failed_hosts = set()
     processed_hosts = set()
     for filename in current_files:
@@ -122,12 +121,12 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                 content = f.read().strip()
         except OSError as exc:
             print(f"Error processing {filepath}: {exc}")
-            processing_errors += 1
+            category_failed_hosts.add(hostname)
             continue
 
         if not content:
             print(f"Empty current carrier transition file: {filename}")
-            processing_errors += 1
+            category_failed_hosts.add(hostname)
             continue
 
         processed_interfaces = 0
@@ -140,11 +139,11 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                 continue
             if "__LLDPQ_COLLECTION_ERROR__:" in line:
                 print(f"Unknown device collection error in {filename}: {line}")
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
                 continue
             if ":" not in line:
                 print(f"Invalid carrier transition row in {filename}: {line}")
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
                 continue
             interface, transitions_str = line.split(":", 1)
             interface = interface.strip()
@@ -158,17 +157,17 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                     f"Carrier counter unavailable for {hostname}:{interface}; "
                     "keeping the previous baseline"
                 )
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
                 continue
             try:
                 transitions = int(transitions_str)
             except ValueError:
                 print(f"Invalid transition count '{transitions_str}' for {interface}")
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
                 continue
             if not interface or transitions < 0:
                 print(f"Invalid carrier transition row in {filename}: {line}")
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
                 continue
             flap_analyzer.update_carrier_transitions(
                 f"{hostname}:{interface}", transitions
@@ -177,14 +176,15 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
         if processed_interfaces == 0:
             if hostname not in category_failed_hosts:
                 print(f"No carrier transition rows found for current host {hostname}")
-                processing_errors += 1
+                category_failed_hosts.add(hostname)
         else:
             processed_devices += 1
             processed_hosts.add(hostname)
 
-    if processing_errors:
-        print("Carrier transition collection was incomplete; preserving the prior report")
-        return False
+    # Per-port/per-file content problems above only degrade that host to
+    # partial coverage; returning False is reserved for structural failures
+    # (invalid asset snapshot, state save failure) so one flaky counter read
+    # cannot roll back every domain.
     if (processed_devices == 0 and not all_devices_unavailable
             and not category_failed_hosts and not missing_hosts):
         print("No usable carrier transition data was collected")

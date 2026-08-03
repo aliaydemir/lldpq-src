@@ -85,24 +85,40 @@ class UnavailableRowHandlingTests(unittest.TestCase):
             mock.patch.object(
                 LinkFlapAnalyzer, "update_carrier_transitions", autospec=True
             ) as update,
+            mock.patch.object(
+                LinkFlapAnalyzer, "set_collection_coverage", autospec=True
+            ) as coverage,
         ):
-            process_flap_data.process_carrier_transition_files(str(flap_dir))
-        return [(call.args[1], call.args[2]) for call in update.call_args_list]
+            result = process_flap_data.process_carrier_transition_files(
+                str(flap_dir)
+            )
+        samples = [(call.args[1], call.args[2]) for call in update.call_args_list]
+        expected_hosts, current_hosts = coverage.call_args.args[1:3]
+        return result, samples, set(expected_hosts) - set(current_hosts)
 
     def test_unavailable_rows_are_not_sampled(self):
-        samples = self._run("swp1:unavailable\nswp2:41\n")
+        result, samples, failed_hosts = self._run("swp1:unavailable\nswp2:41\n")
         self.assertEqual(samples, [("leaf1:swp2", 41)])
+        self.assertTrue(
+            result,
+            "one unreadable counter must not roll back every domain",
+        )
+        self.assertIn("leaf1", failed_hosts)
 
     def test_a_normal_collection_is_unaffected(self):
-        samples = self._run("swp1:12\nswp2:41\n")
+        result, samples, failed_hosts = self._run("swp1:12\nswp2:41\n")
         self.assertEqual(samples, [("leaf1:swp1", 12), ("leaf1:swp2", 41)])
+        self.assertTrue(result)
+        self.assertEqual(failed_hosts, set())
 
     def test_zero_remains_a_legitimate_reading(self):
-        samples = self._run("swp1:0\n")
+        result, samples, failed_hosts = self._run("swp1:0\n")
         self.assertEqual(
             samples, [("leaf1:swp1", 0)],
             "a port that genuinely never flapped still reports 0",
         )
+        self.assertTrue(result)
+        self.assertEqual(failed_hosts, set())
 
 
 class CollectorContractTests(unittest.TestCase):

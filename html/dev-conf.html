@@ -596,7 +596,9 @@
             const deviceSet = new Set();
             files.forEach(file => {
                 const fileName = file.split('/').pop();
-                const deviceName = fileName.split('.')[0];
+                // Strip only the trailing format extension so dotted hostnames
+                // (FQDNs) keep their full name
+                const deviceName = fileName.replace(/\.(txt|yaml)$/i, '');
                 deviceSet.add(deviceName);
             });
             devices = Array.from(deviceSet).sort();
@@ -1076,41 +1078,76 @@
             });
         }
         
+        // Newest file timestamp in the nginx autoindex listing (each <a> is
+        // followed by a text node like "  02-Aug-2026 09:33  12K").
+        function newestConfigsMtime(doc) {
+            const months = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+            let newest = 0;
+            doc.querySelectorAll('a').forEach(a => {
+                if (a.getAttribute('href') === '../') return;
+                const text = (a.nextSibling && a.nextSibling.textContent) || '';
+                const m = text.match(/(\d{2})-([A-Za-z]{3})-(\d{4})\s+(\d{2}):(\d{2})/);
+                if (!m || !(m[2] in months)) return;
+                const t = new Date(+m[3], months[m[2]], +m[1], +m[4], +m[5]).getTime();
+                if (t > newest) newest = t;
+            });
+            return newest;
+        }
+
+        async function fetchNewestConfigsMtime() {
+            const r = await fetch('/configs/');
+            const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+            return newestConfigsMtime(doc);
+        }
+
         async function collectConfigs() {
             const btn = document.getElementById('btn-collect');
             const text = document.getElementById('collect-text');
-            
+
             btn.disabled = true;
             btn.style.opacity = '0.6';
             text.textContent = 'Collecting...';
-            
+
             try {
+                // Baseline BEFORE triggering: completion = server-side mtimes advancing
+                // past it. Comparing server times to server times is immune to browser
+                // clock skew and works on re-collection where the file count never grows.
+                let baselineMtime = 0;
+                try {
+                    baselineMtime = await fetchNewestConfigsMtime();
+                } catch (e) { /* empty/unreadable listing: any mtime counts as progress */ }
+
                 const response = await fetch('/trigger-configs', { method: 'POST' });
                 const data = await response.json();
-                
+
                 if (data.status === 'started') {
                     text.textContent = 'Collecting... (1-2 min)';
-                    
+
                     // Poll for completion every 10 seconds
                     let attempts = 0;
+                    let lastNewest = -1;
                     const poll = setInterval(async () => {
                         attempts++;
+                        const finishPoll = () => {
+                            clearInterval(poll);
+                            text.textContent = 'Collect Configs';
+                            btn.disabled = false;
+                            btn.style.opacity = '1';
+                            listFiles(); // Reload device list
+                        };
                         try {
-                            const r = await fetch('/configs/');
-                            const html = await r.text();
-                            const parser = new DOMParser();
-                            const doc = parser.parseFromString(html, 'text/html');
-                            const newCount = Array.from(doc.querySelectorAll('a'))
-                                .filter(a => a.getAttribute('href') !== '../').length;
-                            
-                            if (newCount > files.length || attempts >= 18) {
-                                clearInterval(poll);
-                                text.textContent = 'Collect Configs';
-                                btn.disabled = false;
-                                btn.style.opacity = '1';
-                                listFiles(); // Reload device list
-                            }
-                        } catch (e) { /* keep polling */ }
+                            const newest = await fetchNewestConfigsMtime();
+                            // Done when mtimes advanced past the baseline and stopped
+                            // moving between two polls; the attempt cap is the fallback.
+                            const settled = newest > baselineMtime && newest === lastNewest;
+                            lastNewest = newest;
+
+                            if (settled || attempts >= 18) finishPoll();
+                        } catch (e) {
+                            // Listing unreadable: keep polling, but still honor the
+                            // attempt cap so the button can never stay stuck disabled.
+                            if (attempts >= 18) finishPoll();
+                        }
                     }, 10000);
                 } else {
                     // Not started: 403 (non-admin) or trigger error -> re-enable and report

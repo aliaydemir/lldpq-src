@@ -320,6 +320,71 @@ count_status() {
     printf '%s\n' "$count"
 }
 
+write_collection_status_json() {
+    # STATUS_DIR is removed by the EXIT trap, so persist per-device attempt
+    # outcomes first: stale last-known-good FW rows must stay distinguishable
+    # from fresh ones. last_success_at survives from the previous file when
+    # this attempt failed.
+    local target="$TRANSCEIVER_DIR/collection-status.json"
+    local status_tsv="$STATUS_DIR/.collection-status.tsv"
+    local status_device status_hostname status_line
+    : > "$status_tsv" || return 1
+    for status_device in "${!devices[@]}"; do
+        IFS=' ' read -r _ status_hostname <<< "${devices[$status_device]}"
+        status_line=$(head -1 "$(status_file_for "$status_hostname")" 2>/dev/null)
+        printf '%s\t%s\n' "$status_hostname" "${status_line%%|*}" >> "$status_tsv"
+    done
+    python3 - "$status_tsv" "$target" "$now" <<'PYEOF'
+import json
+import os
+import sys
+
+status_tsv, target, attempted_at = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+previous = {}
+try:
+    with open(target, "r", encoding="utf-8") as fh:
+        loaded = json.load(fh)
+    if isinstance(loaded, dict):
+        previous = loaded
+except (OSError, ValueError):
+    pass
+
+result = {}
+with open(status_tsv, "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        host, _, raw_status = line.partition("\t")
+        # A missing/empty per-device status means the attempt never recorded
+        # an outcome; treat it as failed rather than claiming freshness.
+        status = "ok" if raw_status and raw_status != "failed" else "failed"
+        if status == "ok":
+            last_success = attempted_at
+        else:
+            prior = previous.get(host)
+            last_success = (
+                prior.get("last_success_at") if isinstance(prior, dict) else None
+            )
+            if not isinstance(last_success, int):
+                last_success = None
+        result[host] = {
+            "status": status,
+            "attempted_at": attempted_at,
+            "last_success_at": last_success,
+        }
+
+tmp = target + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(result, fh, indent=2, sort_keys=True)
+    fh.flush()
+    os.fsync(fh.fileno())
+os.chmod(tmp, 0o664)
+os.replace(tmp, target)
+PYEOF
+}
+
 publish_web_file() {
     # Stage next to the target, then rename so web readers never see a
     # partially written file.
@@ -409,6 +474,10 @@ for device in "${!devices[@]}"; do
     fi
 done
 wait || true
+
+if ! write_collection_status_json; then
+    echo "WARN: Could not write $TRANSCEIVER_DIR/collection-status.json" >&2
+fi
 
 ok_count=$(count_status "ok")
 no_modules_count=$(count_status "no_modules")

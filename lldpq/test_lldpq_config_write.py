@@ -5,8 +5,11 @@ import contextlib
 import importlib.util
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -16,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "html" / "lldpq_config_write.py"
 AI_API = ROOT / "html" / "ai-api.sh"
 FABRIC_API = ROOT / "html" / "fabric-api.sh"
+SETUP_API = ROOT / "html" / "setup-api.sh"
+CONFIG_HELPER = ROOT / "bin" / "lldpq-config"
 
 
 def load_helper():
@@ -369,6 +374,85 @@ class ConfigWriterApiContractTests(unittest.TestCase):
         self.assertIn("update_lldpq_config", save_block)
         self.assertIn("update_lldpq_config", remove_block)
         self.assertNotIn("open('/etc/lldpq.conf', 'w')", save_block + remove_block)
+
+
+def _setup_api_fmt_val():
+    """Exec only write_conf's nested _fmt_val out of the setup-api heredoc."""
+    source = extract_heredoc(SETUP_API.read_text(encoding="utf-8"), "PYTHON")
+    lines = source.splitlines()
+    start = next(
+        index for index, line in enumerate(lines)
+        if line.lstrip().startswith("def _fmt_val(")
+    )
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    block = [lines[start][indent:]]
+    for line in lines[start + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        block.append(line[indent:] if len(line) > indent else "")
+    namespace = {}
+    exec("\n".join(block) + "\n", namespace)
+    return namespace["_fmt_val"]
+
+
+class SetSchedulesConfRoundTripTests(unittest.TestCase):
+    """A set-schedules-shaped write must decode back to the bare cron string.
+
+    Regression: pre-quoted caller values were quoted a second time by
+    _fmt_val, producing LLDPQ_CRON="\\"*/10 * * * *\\"" which the next
+    install.sh aborted on with 'Invalid LLDPQ_CRON'."""
+
+    def _decode(self, conf_text):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "lldpq.conf"
+            config.write_text(conf_text, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(CONFIG_HELPER), "--config", str(config)],
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = {}
+        for line in result.stdout.splitlines():
+            key, _, raw = line.partition("=")
+            values[key] = shlex.split(raw)[0] if raw else ""
+        return values
+
+    def test_set_schedules_shaped_write_round_trips_bare_cron(self):
+        fmt_val = _setup_api_fmt_val()
+        conf = "LLDPQ_CRON=%s\nGETCONF_CRON=%s\n" % (
+            fmt_val("*/10 * * * *"), fmt_val("0 */6 * * *"))
+        values = self._decode(conf)
+        self.assertEqual(values["LLDPQ_CRON"], "*/10 * * * *")
+        self.assertEqual(values["GETCONF_CRON"], "0 */6 * * *")
+
+    def test_fmt_val_strips_one_layer_of_literal_pre_quoting(self):
+        # The exact shape the buggy callers produced; also heals values read
+        # back from a conf corrupted while the bug was live.
+        fmt_val = _setup_api_fmt_val()
+        values = self._decode("LLDPQ_CRON=%s\n" % fmt_val('"*/10 * * * *"'))
+        self.assertEqual(values["LLDPQ_CRON"], "*/10 * * * *")
+
+    def test_round_trip_value_passes_installer_cron_validation(self):
+        fmt_val = _setup_api_fmt_val()
+        values = self._decode("LLDPQ_CRON=%s\n" % fmt_val("*/10 * * * *"))
+        result = subprocess.run(
+            [sys.executable, str(CONFIG_HELPER),
+             "--validate-cron", values["LLDPQ_CRON"]],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_write_conf_callers_pass_raw_unquoted_values(self):
+        source = SETUP_API.read_text(encoding="utf-8")
+        for pre_quoted in (
+            "'LLDPQ_CRON': '\"' + lldpq_cron",
+            "'GETCONF_CRON': '\"' + getconf_cron",
+            "'TRANSCEIVER_FW_SKIP_MODELS': '\"' + skip_models",
+        ):
+            self.assertNotIn(pre_quoted, source)
+        self.assertIn("'LLDPQ_CRON': lldpq_cron", source)
+        self.assertIn("'GETCONF_CRON': getconf_cron", source)
+        self.assertIn("'TRANSCEIVER_FW_SKIP_MODELS': skip_models", source)
 
 
 if __name__ == "__main__":

@@ -96,6 +96,26 @@ fi
     echo "=== lldpq-ai-analyze run $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
 } > "$LOG_FILE"
 
+# Persist the outcome of every attempt so ai-api.sh (action=get-analysis) can
+# surface silent detached failures in the UI as last_attempt.
+ATTEMPT_STATUS_FILE="$AI_STATE_DIR/last-attempt.json"
+write_attempt_status() {
+    local ok="$1" persisted="$2" error="$3" status_temp
+    status_temp=$(mktemp "$AI_STATE_DIR/.last-attempt.json.XXXXXXXX") || return 0
+    if python3 -c '
+import json, sys
+print(json.dumps({"ts": int(sys.argv[1]), "ok": sys.argv[2] == "true",
+                  "persisted": sys.argv[3] == "true",
+                  "error": sys.argv[4][:300]}))
+' "$(date +%s)" "$ok" "$persisted" "$error" > "$status_temp" 2>>"$LOG_FILE" &&
+       chmod 0660 "$status_temp" &&
+       mv -fT "$status_temp" "$ATTEMPT_STATUS_FILE"; then
+        :
+    else
+        rm -f "$status_temp"
+    fi
+}
+
 # Check if a local provider is reachable only after the hourly attempt has been
 # claimed; otherwise every successful full pipeline would retry the outage.
 if [[ "$AI_PROVIDER" == "ollama" ]]; then
@@ -103,6 +123,7 @@ if [[ "$AI_PROVIDER" == "ollama" ]]; then
     if ! curl --silent --fail --connect-timeout 3 --max-time 10 \
         "${OLLAMA_URL}/api/tags" > /dev/null 2>&1; then
         echo "Ollama is unavailable; autonomous analysis skipped" >> "$LOG_FILE"
+        write_attempt_status false false "Ollama is unavailable; autonomous analysis skipped"
         exit 0
     fi
 fi
@@ -120,20 +141,42 @@ API_STATUS=$?
 printf '%s\n' "$RESPONSE" >> "$LOG_FILE"
 
 if [[ $API_STATUS -ne 0 ]]; then
+    write_attempt_status false false "ai-api.sh exited with status $API_STATUS"
     echo "ERROR: lldpq-ai-analyze: ai-api.sh exited with status $API_STATUS; see $LOG_FILE" >&2
     exit 1
 fi
 
 # The CGI output is headers, a blank line, then one JSON object. A detached
 # autonomous run is successful only when its current-generation report was
-# actually persisted for the Last Report UI.
-if ! printf '%s\n' "$RESPONSE" | python3 -c '
+# actually persisted for the Last Report UI. Exit codes: 0 = persisted,
+# 2 = analysis succeeded but was not persisted, 1 = failure/unparseable.
+ANALYZE_ERROR=$(printf '%s\n' "$RESPONSE" | python3 -c '
 import json, sys
 raw = sys.stdin.read()
 body = raw.split("\n\n", 1)[1] if "\n\n" in raw else raw
-data = json.loads(body)
-sys.exit(0 if data.get("success") is True and data.get("persisted") is True else 1)
-' 2>>"$LOG_FILE"; then
+try:
+    data = json.loads(body)
+except Exception:
+    print("unparseable ai-api.sh response")
+    sys.exit(1)
+if not isinstance(data, dict):
+    print("unparseable ai-api.sh response")
+    sys.exit(1)
+if data.get("success") is True and data.get("persisted") is True:
+    sys.exit(0)
+if data.get("success") is True:
+    print("analysis completed but the report was not persisted")
+    sys.exit(2)
+print(str(data.get("error") or "AI analysis reported failure")[:300])
+sys.exit(1)
+' 2>>"$LOG_FILE")
+ANALYZE_STATUS=$?
+case $ANALYZE_STATUS in
+    0) write_attempt_status true true "" ;;
+    2) write_attempt_status true false "$ANALYZE_ERROR" ;;
+    *) write_attempt_status false false "$ANALYZE_ERROR" ;;
+esac
+if [[ $ANALYZE_STATUS -ne 0 ]]; then
     echo "ERROR: lldpq-ai-analyze: AI analysis reported failure; see $LOG_FILE" >&2
     exit 1
 fi

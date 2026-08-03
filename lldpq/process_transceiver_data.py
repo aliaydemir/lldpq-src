@@ -13,16 +13,34 @@ Licensed under MIT License - see LICENSE file for details
 import os
 import re
 import json
+import sys
 import tempfile
 from datetime import datetime
 
 import export_artifacts
+from parse_devices import get_all_devices, load_devices_yaml
 
 try:
     from device_names import canonical
 except Exception:
     def canonical(_n):
         return _n
+
+
+def _inventory_hostnames():
+    """Managed hostnames from devices.yaml; None when unavailable.
+
+    An unreadable or empty inventory must not gate (or prune) anything:
+    processing every collected file beats deleting the whole domain."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        config = load_devices_yaml(os.path.join(script_dir, 'devices.yaml'))
+        hostnames = {
+            hostname for _addr, _user, hostname, _role in get_all_devices(config)
+        }
+    except (Exception, SystemExit):
+        return None
+    return hostnames or None
 
 
 def parse_optical_vendor_info(filepath):
@@ -86,7 +104,11 @@ def parse_optical_vendor_info(filepath):
                 }
 
     except Exception as e:
-        pass
+        # None (unlike {}) tells the caller this host failed to parse so the
+        # gap is disclosed instead of silently published as zero modules.
+        print(f"Failed to parse optical vendor info from {filepath}: {e}",
+              file=sys.stderr)
+        return None
 
     return modules
 
@@ -163,18 +185,58 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
                               output_dir='monitor-results'):
     """Build transceiver inventory from optical + mlxlink data"""
 
+    inventory = _inventory_hostnames()
+
+    # Retired hosts must not keep publishing stale FW rows. Prune only this
+    # domain's own raw files; optical-data raw files belong to monitor.sh.
+    if inventory is not None:
+        try:
+            for filename in sorted(os.listdir(transceiver_dir)):
+                if not filename.endswith('_transceiver.txt'):
+                    continue
+                if filename.removesuffix('_transceiver.txt') not in inventory:
+                    try:
+                        os.unlink(os.path.join(transceiver_dir, filename))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+
+    # Per-device FW collection outcomes written by collect-transceiver-fw.sh:
+    # {"<host>": {"status": "ok"|"failed", "attempted_at": epoch,
+    #             "last_success_at": epoch|null}}.  Absent file tolerated.
+    collection_outcomes = {}
+    try:
+        with open(os.path.join(transceiver_dir, 'collection-status.json'), 'r') as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            collection_outcomes = loaded
+    except (OSError, ValueError):
+        pass
+
     all_modules = []
+    parse_failed = []
+    skipped_hosts = []
 
     for filename in sorted(os.listdir(optical_dir)):
         if not filename.endswith('_optical.txt'):
             continue
 
         hostname = filename.replace('_optical.txt', '')
+        if inventory is not None and hostname not in inventory:
+            skipped_hosts.append(hostname)
+            continue
         optical_path = os.path.join(optical_dir, filename)
         transceiver_path = os.path.join(transceiver_dir, f'{hostname}_transceiver.txt')
 
         vendor_info = parse_optical_vendor_info(optical_path)
+        if vendor_info is None:
+            parse_failed.append(hostname)
+            continue
         fw_info, cable_byte130_info, fw_status, fw_detail = parse_transceiver_fw(transceiver_path)
+        host_outcome = collection_outcomes.get(hostname)
+        if not isinstance(host_outcome, dict):
+            host_outcome = None
 
         for iface, info in vendor_info.items():
             port_num_match = re.match(r'swp(\d+)', iface)
@@ -202,7 +264,7 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
                     module_status = fw_status
                     module_detail = fw_detail
 
-            all_modules.append({
+            module = {
                 'device': hostname,
                 'port': iface,
                 'identifier': info['identifier'],
@@ -215,7 +277,12 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
                 'cable_byte130': cable_byte130,
                 'fw_status': module_status,
                 'fw_status_detail': module_detail
-            })
+            }
+            if host_outcome is not None:
+                # Additive stamps so consumers can flag stale FW rows.
+                module['fw_collection_status'] = host_outcome.get('status')
+                module['fw_collected_at'] = host_outcome.get('last_success_at')
+            all_modules.append(module)
 
     # Build summary
     unique_models = set()
@@ -238,16 +305,25 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
 
     mixed_fw_models = [pn for pn, versions in fw_by_model.items() if len(versions) > 1]
 
+    if skipped_hosts:
+        print("Skipping optical files for hosts not in inventory: "
+              + ", ".join(skipped_hosts), file=sys.stderr)
+    if parse_failed:
+        print(f"Vendor info parse failed for {len(parse_failed)} host(s): "
+              + ", ".join(parse_failed), file=sys.stderr)
+
     result = {
         'last_update': datetime.now().isoformat(),
         'modules': all_modules,
+        'parse_failed': parse_failed,
         'summary': {
             'total_modules': len(all_modules),
             'unique_models': len(unique_models),
             'devices_with_modules': len(devices_with_modules),
             'fw_versions': fw_by_model,
             'mixed_fw_models': mixed_fw_models,
-            'status_counts': status_counts
+            'status_counts': status_counts,
+            'parse_failed_count': len(parse_failed)
         }
     }
 
@@ -275,7 +351,13 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
 
     # Public machine-readable export, published to the web tree by
     # collect-transceiver-fw.sh alongside the inventory it derives from.
-    export_rows = [dict(m, device=canonical(m['device'])) for m in all_modules]
+    # The additive collection stamps stay out of the registry-governed rows.
+    export_rows = [
+        {key: value for key, value in
+         dict(m, device=canonical(m['device'])).items()
+         if key in export_artifacts.EXPORT_SCHEMAS['transceiver']}
+        for m in all_modules
+    ]
     export_artifacts.write_export(
         output_dir, 'transceiver', export_rows, result['summary'], None,
         subdir=None, basename='transceiver-export')

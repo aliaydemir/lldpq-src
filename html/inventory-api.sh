@@ -68,8 +68,17 @@ QS_MGMT=$(echo "$QUERY_STRING"    | grep -oP 'mgmt=\K[^&]*'    | head -1)
 
 # Read the raw request body binary-safe (uploads are xlsx). Large/binary bodies
 # overflow the kernel per-string env limit on exec, so always spool to a file.
+# Enforce the size ceiling BEFORE spooling (mirrors setup-api.sh) so an
+# oversized upload — including the pre-parsed JSON 'data' path — never lands
+# on disk at all.
+MAX_BODY_BYTES=33554432
 POST_DATA_FILE=""
 if [ "$REQUEST_METHOD" = "POST" ] && [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+    if ! [[ "$CONTENT_LENGTH" =~ ^[0-9]+$ ]] || [ "${#CONTENT_LENGTH}" -gt 10 ] \
+        || [ "$((10#$CONTENT_LENGTH))" -gt "$MAX_BODY_BYTES" ]; then
+        echo '{"success": false, "error": "Request body exceeds the 32 MiB limit"}'
+        exit 0
+    fi
     POST_DATA_FILE=$(mktemp /tmp/lldpq-inventory.XXXXXX) || POST_DATA_FILE=""
     if [ -n "$POST_DATA_FILE" ]; then
         trap 'rm -f "$POST_DATA_FILE"' EXIT

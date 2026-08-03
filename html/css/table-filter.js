@@ -52,8 +52,12 @@
     function cellValue(row, col) {
         var cell = row.cells[col];
         if (!cell) return '';
-        var v = cell.dataset && cell.dataset.sort != null && cell.dataset.sort !== ''
-            ? cell.dataset.sort : cell.textContent;
+        // data-filter (optional) provides a human-readable funnel label for
+        // cells whose data-sort holds a machine key (epoch, severity rank).
+        var v = cell.dataset && cell.dataset.filter != null && cell.dataset.filter !== ''
+            ? cell.dataset.filter
+            : cell.dataset && cell.dataset.sort != null && cell.dataset.sort !== ''
+                ? cell.dataset.sort : cell.textContent;
         return v.replace(/\s+/g, ' ').trim();
     }
 

@@ -50,6 +50,30 @@ esac
 case "$SSH_TIMEOUT" in
     ''|*[!0-9]*|0) SSH_TIMEOUT=60 ;;
 esac
+FABRIC_SCAN_MIN_INTERVAL_SECONDS="${FABRIC_SCAN_MIN_INTERVAL_SECONDS:-300}"
+case "$FABRIC_SCAN_MIN_INTERVAL_SECONDS" in
+    ''|*[!0-9]*) FABRIC_SCAN_MIN_INTERVAL_SECONDS=300 ;;
+esac
+LAST_SUCCESS_FILE="${FABRIC_SCAN_LAST_SUCCESS_FILE:-monitor-results/.fabric-scan-last-success}"
+
+# The one-minute cron dispatch must not degenerate into continuous
+# full-fabric collection holding the global pipeline lock. Skip quietly while
+# the last successful scan is still fresh; the explicit web "scan now"
+# trigger bypasses the gate the same way it bypasses SKIP_FABRIC_SCAN.
+if [[ "$FABRIC_SCAN_MIN_INTERVAL_SECONDS" -gt 0 && \
+      "${LLDPQ_FABRIC_SCAN_FORCE:-0}" != "1" ]]; then
+    last_scan_success=0
+    if [[ -f "$LAST_SUCCESS_FILE" ]]; then
+        last_scan_success=$(cat "$LAST_SUCCESS_FILE" 2>/dev/null || echo 0)
+    fi
+    case "$last_scan_success" in
+        ''|*[!0-9]*) last_scan_success=0 ;;
+    esac
+    if [[ "$last_scan_success" -gt 0 ]] && \
+       (( $(date +%s) - last_scan_success < FABRIC_SCAN_MIN_INTERVAL_SECONDS )); then
+        exit 0
+    fi
+fi
 
 if ! command -v flock >/dev/null 2>&1; then
     echo "fabric-scan requires flock (util-linux)" >&2
@@ -140,17 +164,20 @@ collect_device_data() {
     local username="${3:-cumulus}"
     local raw_file="$STAGING_DIR/raw/${hostname}.txt"
     local output_file="$STAGING_DIR/data/${hostname}.json"
-    local ssh_status
-    
+    local ssh_status ping_reachable=true connect_timeout=5
+
     # A failed host keeps its last-known-good JSON. The parent process will
     # mark that snapshot stale and record the failure in summary.json.
+    # ICMP is only a fast hint: devices may drop echo requests, so the SSH
+    # collection below stays authoritative. A ping-failed host only gets a
+    # tighter connect bound so silent hosts free their slot sooner.
     if ! is_reachable "$ip"; then
-        write_collection_status "$hostname" "unreachable" "ping_failed"
-        return 10
+        ping_reachable=false
+        connect_timeout=3
     fi
-    
+
     # Collect into a private raw file. Do not parse or publish partial stdout.
-    timeout "$SSH_TIMEOUT" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+    timeout "$SSH_TIMEOUT" ssh -o StrictHostKeyChecking=no -o ConnectTimeout="$connect_timeout" \
         -o BatchMode=yes "${username}@${ip}" '
         echo "===ARP==="
         _arp_output=$(/usr/sbin/ip neigh show 2>/dev/null)
@@ -234,6 +261,10 @@ collect_device_data() {
 
     if [[ $ssh_status -ne 0 ]]; then
         rm -f "$raw_file"
+        if [[ "$ping_reachable" == "false" ]]; then
+            write_collection_status "$hostname" "unreachable" "ping_and_ssh_failed"
+            return 10
+        fi
         write_collection_status "$hostname" "ssh-failed" "ssh_status_${ssh_status}"
         return 11
     fi
@@ -800,40 +831,43 @@ device_count=${#devices[@]}
 echo "Devices: $device_count"
 echo "Collecting..."
 
-declare -a scan_pids=()
-declare -a scan_hosts=()
 declare -a scan_failures=()
-next_wait=0
 active_jobs=0
 
-wait_for_scan_job() {
-    local index="$1" status
-    if wait "${scan_pids[$index]}"; then
-        status=0
+# Free a dispatch slot as soon as ANY collector exits instead of waiting for
+# jobs in launch order: FIFO waits let a single slow or timing-out device
+# block the launch pipeline behind it (head-of-line blocking). Failures are
+# read back from the per-host status files after the fan-out, so per-pid exit
+# statuses are not needed for slot management.
+scan_supports_wait_n=true
+if ! ( : & wait -n ) 2>/dev/null; then
+    scan_supports_wait_n=false
+fi
+
+run_scan_job() {
+    if collect_device_data "$1" "$2" "$3"; then
         printf '.'
     else
-        status=$?
-        scan_failures+=("${scan_hosts[$index]}:${status}")
         printf 'x'
     fi
 }
 
 for ip in "${!devices[@]}"; do
     IFS=' ' read -r username hostname <<< "${devices[$ip]}"
-    collect_device_data "$ip" "$hostname" "$username" 8>&- &
-    scan_pids+=("$!")
-    scan_hosts+=("$hostname")
+    run_scan_job "$ip" "$hostname" "$username" 8>&- &
     ((active_jobs++))
     if (( active_jobs >= MAX_PARALLEL )); then
-        wait_for_scan_job "$next_wait"
-        ((next_wait++))
-        ((active_jobs--))
+        if [[ "$scan_supports_wait_n" == "true" ]]; then
+            wait -n 2>/dev/null || true
+            ((active_jobs--)) || true
+        else
+            # Bash without wait -n: drain the whole batch before refilling.
+            wait || true
+            active_jobs=0
+        fi
     fi
 done
-while (( next_wait < ${#scan_pids[@]} )); do
-    wait_for_scan_job "$next_wait"
-    ((next_wait++))
-done
+wait || true
 echo ""
 
 # Convert failed device snapshots into explicitly stale LKG copies. A host
@@ -843,10 +877,10 @@ for ip in "${!devices[@]}"; do
     status_file="$STAGING_DIR/status/${hostname}.status"
     if [[ ! -f "$status_file" ]]; then
         write_collection_status "$hostname" "unavailable" "missing_child_status"
-        scan_failures+=("${hostname}:missing-status")
     fi
     IFS=$'\t' read -r collection_status collection_reason < "$status_file"
     if [[ "$collection_status" != "current" ]]; then
+        scan_failures+=("${hostname}:${collection_status}")
         prepare_last_known_snapshot "$hostname" "${collection_reason:-collection_failed}"
     fi
 done
@@ -872,6 +906,10 @@ if ! prepare_publish_tree || ! publish_complete_tree; then
     echo "Fabric cache publication failed; the previous complete tree was preserved." >&2
     exit 1
 fi
+
+# Gate reference for the scheduled one-minute cron: only a published scan
+# counts as a completion.
+date +%s > "$LAST_SUCCESS_FILE" 2>/dev/null || true
 
 [[ $retired_count -gt 0 ]] && echo "Removed $retired_count retired fabric cache files"
 python3 - "$STAGING_DIR/summary.json" "$OUTPUT_DIR" <<'PYEOF'

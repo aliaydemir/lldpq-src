@@ -168,7 +168,7 @@ Checkable rules:
 - MTU must be symmetric on both ends of a link. A mismatch surfaces as clagd/LACP 'conflict' or as jumbo-only loss (small packets pass, iperf/RDMA stalls).
 - L3/SVI (IRB) MTU must cover the VXLAN payload; a router MTU under 9216 breaks only the large EVPN type-5 flows.
 - Host NIC MTU (GB300 ConnectX/BlueField) must match the leaf access port: a 9000 host into a 9216 fabric is fine, a 9216 host into a 1500 port is not.
-Fast isolation: `ping -M do -s 8972 <peer>` across each hop — the first hop that fails names the offender.""",
+Fast isolation (operator step from a device shell; Ask-AI cannot run ping): `ping -M do -s 8972 <peer>` across each hop — the first hop that fails names the offender.""",
     ),
     (
         "rail-topology",

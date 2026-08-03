@@ -994,20 +994,34 @@ collection_dir=$(mktemp -d "$SCRIPT_DIR/lldp-results/.collection.XXXXXX") || exi
 chmod 700 "$collection_dir" || exit 1
 echo "Devices: $TOTAL_DEVICES"
 
+# A reaped job's nonzero exit status must not trigger a full drain: that
+# would degrade dispatch to serial for the rest of the run. Shells without
+# wait -n drain the whole batch and reset the counter instead.
+lldp_supports_wait_n=true
+if ! ( : & wait -n ) 2>/dev/null; then
+    lldp_supports_wait_n=false
+fi
+
 job_count=0
 for device in "${!devices[@]}"; do
     IFS=' ' read -r user hostname <<< "${devices[$device]}"
-    
+
     # Start job in background
     process_device "$device" "$user" "$hostname" 9>&- &
     collection_pids+=("$!")
-    
+
     job_count=$((job_count + 1))
-    
+
     # Limit parallel jobs
     if [ $job_count -ge $MAX_PARALLEL ]; then
-        wait -n 2>/dev/null || wait
-        job_count=$((job_count - 1))
+        if [[ "$lldp_supports_wait_n" == "true" ]]; then
+            wait -n 2>/dev/null || true
+            job_count=$((job_count - 1))
+        else
+            # Bash without wait -n: drain the whole batch before refilling.
+            wait || true
+            job_count=0
+        fi
     fi
 done
 

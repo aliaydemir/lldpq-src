@@ -860,7 +860,7 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""
@@ -871,9 +871,13 @@ def main():
     analyzer.analyze()
     output_file = os.path.join(RESULT_DIR, OUTPUT_HTML)
     analyzer.export_html(output_file)
-    analyzer.save_state()
+    # Baselines land before the state (same order as the first-sighting
+    # path): a crash between the two can only produce one duplicate
+    # empty-diff event on the next run, never a silently stale baseline
+    # that misattributes the following diff.
     for host, content in analyzer._pending_baselines:
         analyzer._write_baseline(host, content)
+    analyzer.save_state()
 
     counts = analyzer.summary_counts()
     print("Config drift analysis complete:")

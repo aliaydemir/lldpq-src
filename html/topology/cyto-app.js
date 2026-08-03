@@ -92,6 +92,7 @@ function convertToCytoscapeFormat(topologyData) {
                 iconChar: iconChar,
                 iconBgChar: bgChar,
                 color: color,
+                unreachable: node.unreachable === true,
                 // Store original data
                 primaryIP: node.primaryIP || 'N/A',
                 model: node.model || 'N/A',
@@ -1358,9 +1359,11 @@ function toggleHostnames(show) {
 
 /**
  * True for endpoint nodes (icon type 'host', 'server', 'firewall', 'unknown'),
- * i.e. the devices hidden by the EndPoint toggle.
+ * i.e. the devices hidden by the EndPoint toggle. Unreachable managed switches
+ * also carry icon 'unknown' but must stay visible when endpoints are hidden.
  */
 function isEndpointNode(node) {
+    if (node.data('unreachable')) return false;
     const iconType = node.data('icon');
     return iconType === 'host' || iconType === 'server' || iconType === 'firewall' || iconType === 'unknown';
 }
@@ -2119,6 +2122,14 @@ function initCytoscape() {
                 style: {
                     'text-halign': 'left',
                     'text-margin-x': -6
+                }
+            },
+            // Unreachable managed switch (no LLDP collection): reddish label so
+            // a dead switch reads differently from a healthy endpoint.
+            {
+                selector: 'node[?unreachable]',
+                style: {
+                    'color': '#e05252'
                 }
             },
             // Highlighted node

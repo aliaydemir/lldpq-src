@@ -477,6 +477,21 @@ def ensure_ssh_key_lock():
     fcntl.flock(descriptor, fcntl.LOCK_EX)
     _SSH_KEY_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
 
+def release_configuration_lock():
+    """Drop the global configuration lock before a long per-device fan-out.
+
+    The ssh-key lock alone serializes key transactions; keeping the exclusive
+    configuration lock across a many-minute SSH fan-out would stall every CGI
+    (including login) behind bin/lldpq-config's shared flock."""
+    global _CONFIG_LOCK_HANDLE
+    if _CONFIG_LOCK_HANDLE is None:
+        return
+    try:
+        fcntl.flock(_CONFIG_LOCK_HANDLE.fileno(), fcntl.LOCK_UN)
+    finally:
+        _CONFIG_LOCK_HANDLE.close()
+        _CONFIG_LOCK_HANDLE = None
+
 def valid_cron_schedule(schedule):
     if not isinstance(schedule, str):
         return False
@@ -830,6 +845,7 @@ LLDPQ_PREF_KEYS = (
     'LLDP_MAX_PARALLEL', 'ASSETS_MAX_PARALLEL',
     'GET_CONFIGS_MAX_PARALLEL', 'GET_CONFIGS_SSH_TIMEOUT',
     'SEND_CMD_MAX_PARALLEL', 'TELEMETRY_MAX_PARALLEL',
+    'FABRIC_SCAN_MAX_PARALLEL',
     'AUTO_BASE_CONFIG', 'AUTO_ZTP_DISABLE', 'AUTO_SET_HOSTNAME',
     'TRANSCEIVER_FW_SKIP_MODELS', 'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY',
     'TRANSCEIVER_FW_MAX_PARALLEL', 'TRANSCEIVER_FW_MIN_INTERVAL', 'TRANSCEIVER_FW_SSH_TIMEOUT',
@@ -900,7 +916,14 @@ def write_conf(pairs):
             return 'yes' if v else 'no'
         if isinstance(v, (int, float)):
             return str(v)
-        return '"' + str(v).replace('"', '\\"') + '"'
+        v = str(v)
+        # Quoting is this function's job. Strip one layer of literal
+        # surrounding double quotes so a pre-quoted caller value (or a value
+        # read back from a conf corrupted by one) cannot be quoted twice,
+        # which the installer's cron validation then rejects.
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            v = v[1:-1]
+        return '"' + v.replace('"', '\\"') + '"'
     output.extend('%s=%s' % (key, _fmt_val(value)) for key, value in pairs.items())
     if install_text_as_root(
         '\n'.join(output) + '\n', '/etc/lldpq.conf', '.lldpq.conf.setup.tmp',
@@ -914,6 +937,12 @@ def write_conf(pairs):
         '660', config_owner
     )
     return False if rolled_back else None
+
+# Shared error for the None (diverged) write_conf outcome above.
+WRITE_CONF_DIVERGED_ERROR = (
+    'Failed to write config and automatic rollback also failed; '
+    '/etc/lldpq.conf may already hold the new values (config state diverged). '
+    'Verify it or save these settings again.')
 
 def reserve_background_job(state_dir, kind, log_path):
     """Atomically reserve one service-user job slot and return a unique id."""
@@ -1336,6 +1365,8 @@ if action == 'verify':
             res['sudo_msg'] = 'Sudo not checked'
         return res
 
+    # Key material is resolved; the ssh-key lock alone covers the fan-out.
+    release_configuration_lock()
     results = []
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(verify_device, d): d for d in all_devices}
@@ -1506,7 +1537,8 @@ if action == 'set-ansible':
             print(json.dumps({'success': False, 'error': 'Directory not found or missing an inventory/ folder: ' + val}))
             sys.exit(0)
         new_val = val
-    if write_conf({'ANSIBLE_DIR': new_val, 'EDITOR_ROOT': new_val}):
+    conf_status = write_conf({'ANSIBLE_DIR': new_val, 'EDITOR_ROOT': new_val})
+    if conf_status:
         warnings = []
         ready = True
         if new_val != 'NoNe':
@@ -1523,6 +1555,8 @@ if action == 'set-ansible':
                           'path': '' if new_val == 'NoNe' else new_val,
                           'editor_root': '' if new_val == 'NoNe' else new_val,
                           'ready': ready, 'warnings': warnings}))
+    elif conf_status is None:
+        print(json.dumps({'success': False, 'error': WRITE_CONF_DIVERGED_ERROR}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -1548,8 +1582,11 @@ if action == 'set-hostname':
             'error': 'Use 1-64 letters, numbers, dots, underscores or hyphens',
         }))
         sys.exit(0)
-    if write_conf({'LLDPQ_HOSTNAME': value}):
+    conf_status = write_conf({'LLDPQ_HOSTNAME': value})
+    if conf_status:
         print(json.dumps({'success': True, 'hostname': value}))
+    elif conf_status is None:
+        print(json.dumps({'success': False, 'error': WRITE_CONF_DIVERGED_ERROR}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -1587,8 +1624,11 @@ if action == 'set-parallel':
             print(json.dumps({'success': False, 'error': 'Value for ' + fk + ' must be between 1 and 1000'}))
             sys.exit(0)
         pairs[ck] = v
-    if write_conf(pairs):
+    conf_status = write_conf(pairs)
+    if conf_status:
         print(json.dumps({'success': True}))
+    elif conf_status is None:
+        print(json.dumps({'success': False, 'error': WRITE_CONF_DIVERGED_ERROR}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -1628,8 +1668,11 @@ if action == 'set-collection-options':
             print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
             sys.exit(0)
         pairs[ck] = 'true' if v else 'false'
-    if write_conf(pairs):
+    conf_status = write_conf(pairs)
+    if conf_status:
         print(json.dumps({'success': True}))
+    elif conf_status is None:
+        print(json.dumps({'success': False, 'error': WRITE_CONF_DIVERGED_ERROR}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -1683,7 +1726,7 @@ if action == 'set-transceiver-fw':
         'ssh_timeout': ('TRANSCEIVER_FW_SSH_TIMEOUT', 1, 86400),
     }
     pairs = {
-        'TRANSCEIVER_FW_SKIP_MODELS': '"' + skip_models + '"',
+        'TRANSCEIVER_FW_SKIP_MODELS': skip_models,
         'TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY': policy,
     }
     for fk, (ck, low, high) in tfw_ranges.items():
@@ -1697,8 +1740,11 @@ if action == 'set-transceiver-fw':
                               'error': f'Value for {fk} must be between {low} and {high}'}))
             sys.exit(0)
         pairs[ck] = v
-    if write_conf(pairs):
+    conf_status = write_conf(pairs)
+    if conf_status:
         print(json.dumps({'success': True, 'skip_models': skip_models}))
+    elif conf_status is None:
+        print(json.dumps({'success': False, 'error': WRITE_CONF_DIVERGED_ERROR}))
     else:
         print(json.dumps({'success': False, 'error': 'Failed to write config'}))
     sys.exit(0)
@@ -2197,8 +2243,8 @@ if action == 'set-schedules':
             print(json.dumps({'success': False, 'error': error}))
             sys.exit(0)
         conf_status = write_conf({
-            'LLDPQ_CRON': '"' + lldpq_cron + '"',
-            'GETCONF_CRON': '"' + getconf_cron + '"',
+            'LLDPQ_CRON': lldpq_cron,
+            'GETCONF_CRON': getconf_cron,
         })
         if conf_status is not True:
             if conf_status is False:
@@ -2492,29 +2538,51 @@ if action == 'backup-import':
 # ─── Action: Maintenance — disk usage + count of old update backups ───
 if action == 'get-maintenance':
     def _run(cmd):
+        """Return probe stdout, or None when the probe failed or timed out."""
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            return r.stdout.strip()
         except Exception:
-            return ''
+            return None
+        out = r.stdout.strip()
+        # du can exit non-zero on partially unreadable trees while still
+        # printing a usable total; only an empty failure is a dead probe.
+        return out if (r.returncode == 0 or out) else None
+    probe_failed = False
     mr = os.path.join(lldpq_dir, 'monitor-results')
     # monitor-results is group-readable by www-data ($USER:www-data, 775/664), so du runs directly
     # as the CGI user. (Going through `sudo -u LLDPQ_USER du` fails: du is not in the sudoers
     # whitelist, which only allows bash/ssh/tee/etc.)
-    mon = _run(['du', '-sm', mr]) if os.path.isdir(mr) else ''
-    mon_mb = int(mon.split()[0]) if mon and mon.split() and mon.split()[0].isdigit() else 0
+    mon_mb = 0
+    if os.path.isdir(mr):
+        mon = _run(['du', '-sm', mr])
+        if mon and mon.split() and mon.split()[0].isdigit():
+            mon_mb = int(mon.split()[0])
+        else:
+            # null instead of a silent zero so the UI cannot show "0 MB used"
+            # for a probe that never answered.
+            mon_mb = None
+            probe_failed = True
     info = _run(['sudo', '-n', '-u', lldpq_user, '/usr/bin/bash', '-c',
                  'shopt -s nullglob; f=(); for d in ~/lldpq-backup-*; do '
                  '[ -d "$d" ] && [ -s "$d/COMPLETE" ] && f+=("$d"); done; '
                  'echo -n "${#f[@]} "; if [ ${#f[@]} -gt 0 ]; then '
                  'du -scm "${f[@]}" 2>/dev/null | tail -1 | cut -f1; else echo 0; fi'])
-    parts = info.split()
-    bk_count = int(parts[0]) if len(parts) >= 1 and parts[0].isdigit() else 0
-    bk_mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    parts = info.split() if info else []
+    if len(parts) >= 1 and parts[0].isdigit():
+        bk_count = int(parts[0])
+        bk_mb = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    else:
+        bk_count = None
+        bk_mb = None
+        probe_failed = True
     disk = _run(['bash', '-c', 'df -h ' + shlex.quote(lldpq_dir) +
                  " | tail -1 | awk '{print $4\" free of \"$2\" (\"$5\" used)\"}'"])
+    if not disk:
+        disk = None
+        probe_failed = True
     print(json.dumps({'success': True, 'monitor_mb': mon_mb,
-                      'backup_count': bk_count, 'backup_mb': bk_mb, 'disk': disk}))
+                      'backup_count': bk_count, 'backup_mb': bk_mb, 'disk': disk,
+                      'probe_failed': probe_failed}))
     sys.exit(0)
 
 # ─── Action: Purge old update backups (~/lldpq-backup-*) — safe, service-user owned only ───
@@ -2590,7 +2658,9 @@ if retry_devices:
         print(json.dumps({'success': False, 'error': 'No matching devices for retry'}))
         sys.exit(0)
 
-# Run setup for all devices in parallel
+# Run setup for all devices in parallel. Key material is resolved; the
+# ssh-key lock alone covers the fan-out.
+release_configuration_lock()
 results = []
 with ThreadPoolExecutor(max_workers=20) as executor:
     futures = {

@@ -733,6 +733,7 @@ def _process_history_shard(
     legacy_seed: Optional[Dict[str, Any]],
     cutoff: float,
     now: float,
+    source_mtime: Optional[float] = None,
 ) -> Tuple[str, Optional[str]]:
     """Merge, prune and persist one device's 24h history shard.
 
@@ -756,6 +757,14 @@ def _process_history_shard(
             histories: Dict[str, Any] = dict(legacy_seed)
         else:
             state = _read_state(shard, {"version": 1, "history": {}})
+            # A shard whose recorded source_mtime matches this run's raw file
+            # was already fully merged (a broken-pool retry or a re-analysis
+            # without new collection); rewriting it would append the same
+            # samples a second time.  Absent field = pre-guard shard, always
+            # write.
+            if (source_mtime is not None
+                    and state.get("source_mtime") == source_mtime):
+                return hostname, None
             histories = state.get("history", {})
             if not isinstance(histories, dict):
                 histories = {}
@@ -767,9 +776,9 @@ def _process_history_shard(
         for key in list(histories):
             values = histories[key]
             if not isinstance(values, list):
-                histories[key] = []
+                del histories[key]
                 continue
-            histories[key] = [
+            pruned = [
                 # Migrate pre-slim records (recognizable by their embedded
                 # absolute counters) on the fly, so the file-size win applies
                 # immediately instead of phasing in over the 24h retention.
@@ -780,12 +789,21 @@ def _process_history_shard(
                 and isinstance(value.get("timestamp"), (int, float))
                 and value["timestamp"] >= cutoff
             ][-HISTORY_MAX_RECORDS_PER_PORT:]
-        _atomic_json(shard, {
+            if pruned:
+                histories[key] = pruned
+            else:
+                # A key that drains empty is a removed or renamed port;
+                # keeping it would grow shards forever.
+                del histories[key]
+        payload = {
             "version": 1,
             "updated_at": _iso(now),
             "host": hostname,
             "history": histories,
-        })
+        }
+        if source_mtime is not None:
+            payload["source_mtime"] = source_mtime
+        _atomic_json(shard, payload)
         return hostname, None
     except Exception as exc:
         return hostname, f"{type(exc).__name__}: {exc}"
@@ -1741,7 +1759,7 @@ async function runAnalysis() {{
 }}
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body></html>'''
 
@@ -1852,6 +1870,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
     unmatched_priorities: Set[str] = set()
     hosts_with_ports = set()
     new_history_by_host: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+    source_mtimes: Dict[str, float] = {}
     for raw_file in sorted(current_files):
         hostname = raw_file.name.removesuffix("_pfc_ecn.txt")
         try:
@@ -1891,6 +1910,16 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             print(f"No physical PFC/ECN port records for {hostname}", file=sys.stderr)
             continue
         hosts_with_ports.add(hostname)
+        source_mtimes[hostname] = timestamp
+        # A validated complete snapshot is the authority on which ports exist
+        # on this host: baselines of removed or renamed ports (breakout
+        # reconfiguration) must not persist forever.  Ports with failed
+        # counter reads still appear in the snapshot, so their baselines are
+        # untouched.
+        host_prefix = f"{hostname}:"
+        for key in [k for k in baselines if k.startswith(host_prefix)]:
+            if key.split(":", 1)[1] not in physical_ports:
+                del baselines[key]
         for interface, entry in sorted(physical_ports.items()):
             key = f"{hostname}:{interface}"
             if entry.get("status") == "ok":
@@ -1958,6 +1987,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             host,
             new_history_by_host.get(host, {}),
             legacy_by_host.get(host, {}) if legacy_histories is not None else None,
+            source_mtimes.get(host),
         )
         for host in sorted(shard_hosts)
     ]
@@ -1975,20 +2005,23 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
                         executor.submit(
                             _process_history_shard,
                             str(history_dir), host, new_slims, seed, cutoff, now,
+                            mtime,
                         )
-                        for host, new_slims, seed in shard_tasks
+                        for host, new_slims, seed, mtime in shard_tasks
                     ]
                     shard_results = [future.result() for future in futures]
             except (OSError, PermissionError, BrokenProcessPool):
                 # Constrained containers can deny multiprocessing primitives.
-                # Fall back to the same complete sequential pass.
+                # Fall back to the same complete sequential pass; shards the
+                # pool already wrote are recognized by their source_mtime and
+                # not re-appended.
                 shard_results = []
         if not shard_results:
             shard_results = [
                 _process_history_shard(
-                    str(history_dir), host, new_slims, seed, cutoff, now
+                    str(history_dir), host, new_slims, seed, cutoff, now, mtime
                 )
-                for host, new_slims, seed in shard_tasks
+                for host, new_slims, seed, mtime in shard_tasks
             ]
         for host, error in shard_results:
             if error is not None:

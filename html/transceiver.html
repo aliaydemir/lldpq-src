@@ -407,6 +407,8 @@
         } catch (e) {
             showBanner('warn', 'Collection unavailable — could not load the transceiver inventory. '
                 + 'The data shown may be missing or out of date.');
+            // Stale chunks from a previous render must not append after this message
+            cancelPendingRenderChunks();
             document.getElementById('module-table').innerHTML =
                 '<tr><td colspan="9"><div class="no-data"><svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg><h3>No Data Yet</h3><p>Transceiver inventory will be available after the next monitor run.</p></div></td></tr>';
         }
@@ -558,8 +560,22 @@
         renderDebounceTimer = setTimeout(renderTable, 200);
     }
 
+    // Chunked rendering: first chunk lands synchronously, the rest streams in
+    // rAF batches so 25-50k modules never freeze the tab. A re-render cancels
+    // any chunks still pending from the previous pass.
+    const RENDER_CHUNK_SIZE = 500;
+    let renderChunkRaf = null;
+
+    function cancelPendingRenderChunks() {
+        if (renderChunkRaf !== null) {
+            cancelAnimationFrame(renderChunkRaf);
+            renderChunkRaf = null;
+        }
+    }
+
     function renderTable() {
         const tbody = document.getElementById('module-table');
+        cancelPendingRenderChunks();
         let filtered = getFilteredModules();
 
         filtered.sort((a, b) => {
@@ -584,7 +600,7 @@
             return;
         }
 
-        tbody.innerHTML = filtered.map((m, i) => {
+        const rowHtml = (m, i) => {
             const isMixed = mixedFwModels.includes(m.part_number);
             const majorityFw = isMixed ? getMajorityFw(m.part_number) : null;
             const isMinority = isMixed && m.fw_version && m.fw_version !== majorityFw;
@@ -609,7 +625,22 @@
                 <td class="${fwClass}">${fwDisplay}</td>
                 <td style="font-family: monospace; font-size: 12px;">${esc(m.cable_byte130 || '-')}</td>
             </tr>`;
-        }).join('');
+        };
+
+        tbody.innerHTML = filtered.slice(0, RENDER_CHUNK_SIZE).map(rowHtml).join('');
+
+        if (filtered.length > RENDER_CHUNK_SIZE) {
+            let next = RENDER_CHUNK_SIZE;
+            const renderNextChunk = () => {
+                renderChunkRaf = null;
+                const end = Math.min(next + RENDER_CHUNK_SIZE, filtered.length);
+                tbody.insertAdjacentHTML('beforeend',
+                    filtered.slice(next, end).map((m, i) => rowHtml(m, next + i)).join(''));
+                next = end;
+                if (next < filtered.length) renderChunkRaf = requestAnimationFrame(renderNextChunk);
+            };
+            renderChunkRaf = requestAnimationFrame(renderNextChunk);
+        }
     }
 
     // Expandable per-row detail (EVPN-MH pattern): surfaces connector and
@@ -754,6 +785,6 @@
 </script>
 <script src="/p2p-alias.js"></script>
 <script src="/css/analysis-guard.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 </body>
 </html>

@@ -1504,7 +1504,7 @@ class LogAnalyzer:
         }
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
+    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

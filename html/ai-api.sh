@@ -1160,8 +1160,8 @@ def _pipeline_generation_state(inventory_hosts):
 
     Explicitly unavailable devices are valid current evidence, not a broken
     transaction. Only stale/malformed metadata, missing inventory outcomes, or
-    a real failed collection makes the generation unsafe to persist as the
-    latest AI report.
+    failed collections beyond the monitor's containment threshold make the
+    generation unsafe to persist as the latest AI report.
     """
     result = {
         'current': False,
@@ -1213,7 +1213,23 @@ def _pipeline_generation_state(inventory_hosts):
             if status not in computed:
                 return result
             computed[status] += 1
-        if outcomes.get('counts') != computed or computed['failed'] != 0:
+        if outcomes.get('counts') != computed:
+            return result
+        # Mirror monitor.sh containment: a published generation may carry
+        # contained failed devices; only threshold-exceeding failure counts
+        # invalidate it (same rule as LLDPQ_COLLECTION_FAILURE_ABORT_PCT).
+        try:
+            abort_pct = int(os.environ.get(
+                'LLDPQ_COLLECTION_FAILURE_ABORT_PCT', '10'
+            ))
+        except ValueError:
+            abort_pct = 10
+        if abort_pct < 0 or abort_pct > 999:
+            abort_pct = 10
+        if (
+            computed['failed'] >= 2
+            and computed['failed'] * 100 > len(inventory_hosts) * abort_pct
+        ):
             return result
 
         result.update({
@@ -2067,7 +2083,9 @@ def _empty_timeline(window, status='unavailable'):
     }
 
 
-def _build_timeline(window):
+def _build_timeline(window, time_budget_seconds=20):
+    # Interactive/chat-context callers keep the default 20s wall-clock budget
+    # for the fabric-wide shard sweep; the hourly analyze passes a larger one.
     window = _normalize_timeline_window(window)
     if _insights_build_timeline is None:
         return _empty_timeline(window)
@@ -2079,6 +2097,7 @@ def _build_timeline(window):
             max_events=200,
             correlation_seconds=180,
             max_source_age_seconds=min(604800, max(1, int(_max_collection_age_seconds()))),
+            time_budget_seconds=time_budget_seconds,
         )
         if not isinstance(timeline, dict):
             return _empty_timeline(window, status='invalid')
@@ -3152,11 +3171,13 @@ def _covered_devices_for_findings(devices, collection_complete):
     }
 
 
-def _classify_findings(findings, covered_devices):
+def _classify_findings(findings, covered_devices, persist=True):
     """Diff findings against findings-state.json (flock-serialized) and stamp
     NEW / ONGOING(duration) / RESOLVED plus worsened/reopened flags. A device
     absent from the current collection never resolves its findings — they are
-    carried as unknown in the state file instead."""
+    carried as unknown in the state file instead. With persist=False the run
+    classifies against the ledger read-only: the ledger only advances together
+    with a report that is actually persisted."""
     now = int(time.time())
 
     def _mutate(raw):
@@ -3240,9 +3261,13 @@ def _classify_findings(findings, covered_devices):
                     > FINDINGS_STATE_MAX_AGE_SECONDS:
                 # Unverifiable for weeks (device left the collection): prune.
                 state.pop(fingerprint, None)
-        _save_json_state(FINDINGS_STATE_FILE, {'updated': now, 'findings': state})
+        if persist:
+            _save_json_state(FINDINGS_STATE_FILE, {'updated': now, 'findings': state})
         return classified
 
+    if not persist:
+        # Read-only classification: no ledger write, so no lock is needed.
+        return _mutate(_load_json_file(FINDINGS_STATE_FILE))
     return _locked_state_file_update(FINDINGS_STATE_FILE, _mutate)
 
 
@@ -3272,11 +3297,11 @@ def _findings_summary(classified):
     return summary
 
 
-def _classified_findings_or_fallback(findings, covered_devices):
+def _classified_findings_or_fallback(findings, covered_devices, persist=True):
     """Classified findings plus badge counts; classification failures fail
     open to the unclassified list (never fail the analysis over state I/O)."""
     try:
-        classified = _classify_findings(findings, covered_devices)
+        classified = _classify_findings(findings, covered_devices, persist=persist)
     except Exception:
         classified = list(findings or [])
     return classified, _findings_summary(classified)
@@ -3549,12 +3574,50 @@ def build_transceiver_context(hosts=None, max_chars=9000):
     return '\n'.join(lines)[:max_chars]
 
 
+# A generic optical/BER question that names no device must not sweep every
+# per-device shard on a large fabric; only this many shards are read and the
+# cap is disclosed in the context.
+CHAT_CONTEXT_MAX_SHARDS = 40
+
+
+def _history_shard_hosts(dirname):
+    """Sorted hostnames that have a shard under monitor-results/<dirname>."""
+    try:
+        return sorted(
+            name[:-len('.json')]
+            for name in os.listdir(_mr_path(dirname)) if name.endswith('.json')
+        )
+    except OSError:
+        return []
+
+
+def _capped_shard_filter(hosts, dirname):
+    """(hosts, disclosure_note) for one shard-backed context builder.
+
+    A named device keeps its full detail; without one the sweep is capped to
+    the first CHAT_CONTEXT_MAX_SHARDS shards and the cap is disclosed."""
+    if hosts:
+        return hosts, ''
+    shard_hosts = _history_shard_hosts(dirname)
+    if len(shard_hosts) <= CHAT_CONTEXT_MAX_SHARDS:
+        return None, ''
+    note = (
+        "  NOTE: no device was named in the question, so only the first "
+        "%d of %d device shards were scanned; name a device for its full "
+        "detail." % (CHAT_CONTEXT_MAX_SHARDS, len(shard_hosts))
+    )
+    return shard_hosts[:CHAT_CONTEXT_MAX_SHARDS], note
+
+
 def build_optical_context(hosts=None, max_chars=9000):
     """Optical DOM per port: health, Rx/Tx power, temperature, voltage, bias, link margin."""
+    hosts, cap_note = _capped_shard_filter(hosts, 'optical-history')
     stats = _load_optical_current_stats(set(hosts) if hosts else None)
     if not stats:
         return ''
     lines = ["OPTICAL DOM (host:port: health rx_dBm tx_dBm temp_C volt bias_mA margin_dB):"]
+    if cap_note:
+        lines.append(cap_note)
     for key in sorted(stats):
         if hosts and key.split(':')[0] not in hosts:
             continue
@@ -3563,11 +3626,12 @@ def build_optical_context(hosts=None, max_chars=9000):
                      f"tx={v.get('tx_power_dbm','')} temp={v.get('temperature_c','')} "
                      f"v={v.get('voltage_v','')} bias={v.get('bias_current_ma','')} "
                      f"margin={v.get('link_margin_db','')}")
-    return '\n'.join(lines)[:max_chars] if len(lines) > 1 else ''
+    return '\n'.join(lines)[:max_chars] if len(lines) > (2 if cap_note else 1) else ''
 
 
 def build_ber_context(hosts=None, max_chars=16000):
     """Per-port interface error density plus raw/effective physical BER."""
+    hosts, cap_note = _capped_shard_filter(hosts, 'ber-history')
     stats = _load_ber_current_stats(set(hosts) if hosts else None)
     if not stats:
         return ''
@@ -3587,6 +3651,9 @@ def build_ber_context(hosts=None, max_chars=16000):
     )
     lines = [header]
     budget = max_chars - len(header) - 1
+    if cap_note:
+        lines.append(cap_note)
+        budget -= len(cap_note) + 1
     for key, v in items:
         frame_density = v.get('frame_error_density', v.get('ber_value', ''))
         delta_rx = v.get('delta_rx_errors')
@@ -3605,7 +3672,7 @@ def build_ber_context(hosts=None, max_chars=16000):
             break
         lines.append(line)
         budget -= len(line) + 1
-    return '\n'.join(lines) if len(lines) > 1 else ''
+    return '\n'.join(lines) if len(lines) > (2 if cap_note else 1) else ''
 
 
 def build_hardware_context(hosts=None, max_chars=9000):
@@ -7196,7 +7263,18 @@ def action_chat():
         ).strip()
     
     if not final:
-        error_json("AI request ended without a final answer")
+        # Keep the accumulated tool trace/evidence with the failure so the
+        # investigation context is not lost (the UI renders them on errors).
+        evidence_bundle = _build_evidence(
+            evidence_collection_metadata, tools_used, timeline,
+            context_info=context_state,
+        )
+        result_json({"success": False,
+                     "error": "AI request ended without a final answer",
+                     "tools_used": tools_used,
+                     "evidence": evidence_bundle['records'],
+                     "confidence": evidence_bundle['confidence'],
+                     "timeline": timeline})
     evidence_bundle = _build_evidence(
         evidence_collection_metadata, tools_used, timeline,
         context_info=context_state,
@@ -7450,6 +7528,18 @@ def action_chat_poll():
             result = {'success': False,
                       'error': 'The background chat worker stopped without '
                                'returning a result.'}
+            # This poll response is terminal for the client: raise the cancel
+            # flag so a wedged-but-alive worker finalizes instead of writing a
+            # late result, and append a terminal marker so later polls agree.
+            try:
+                descriptor = os.open(cancel_path, os.O_WRONLY | os.O_CREAT, 0o660)
+                os.close(descriptor)
+            except OSError:
+                pass
+            _job_emit({'event': 'error',
+                       'error': 'The background chat worker stopped without '
+                                'returning a result.'},
+                      events_path=events_path)
     response = {"success": True, "job_id": job_id, "events": events,
                 "cursor": len(lines), "done": done,
                 "cancelled": os.path.exists(cancel_path)}
@@ -8077,12 +8167,26 @@ def _build_analysis_v2(mr_dir, devices, cookie, deadline):
     return result
 
 
+def _generation_still_current(devices):
+    """Re-validate the transactional generation immediately before a persist:
+    a new collection may have started while the LLM ladder ran, and the report
+    must never overwrite state from a newer generation."""
+    inventory_hosts = {
+        dev.get('hostname') for dev in (devices or {}).values()
+        if dev.get('hostname')
+    }
+    try:
+        return bool(_pipeline_generation_state(inventory_hosts).get('current'))
+    except Exception:
+        return False
+
+
 def action_analyze():
     """Run autonomous fabric health analysis (with change detection vs the previous run)."""
     fabric_summary, devices, device_health, collection_metadata = build_fabric_summary()
     fabric_summary = neutralize_untrusted_tool_tags(fabric_summary)
     device_list = neutralize_untrusted_tool_tags(build_device_list(devices, device_health))
-    timeline = _build_timeline('24h')
+    timeline = _build_timeline('24h', time_budget_seconds=120)
     evidence_collection_metadata = _collection_for_evidence(
         collection_metadata, set(), timeline
     )
@@ -8202,23 +8306,27 @@ def action_analyze():
             for _carry_key in ('findings', 'findings_summary'):
                 if reused_prior.get(_carry_key) is not None:
                     analysis[_carry_key] = reused_prior[_carry_key]
-            try:
-                _save_json_state(ANALYSIS_FILE, analysis)
-                _save_json_state(
-                    snap_file, {"timestamp": time.time(), "statuses": cur_snap,
-                                "config_hashes": cur_config_hashes}
-                )
-            except Exception as error:
-                error_json(
-                    "AI analysis refresh could not be saved: "
-                    + redact_secrets(str(error))
-                )
+            # Re-validate the generation right before the refresh write; a
+            # newer collection in flight downgrades to a non-persisted reply.
+            persisted = _generation_still_current(devices)
+            if persisted:
+                try:
+                    _save_json_state(ANALYSIS_FILE, analysis)
+                    _save_json_state(
+                        snap_file, {"timestamp": time.time(), "statuses": cur_snap,
+                                    "config_hashes": cur_config_hashes}
+                    )
+                except Exception as error:
+                    error_json(
+                        "AI analysis refresh could not be saved: "
+                        + redact_secrets(str(error))
+                    )
             result_json({"success": True, "analysis": analysis['analysis'],
                          "timestamp": analysis['timestamp'],
                          "changes": changes, "collection": collection_metadata,
                          "timeline": timeline, "evidence": evidence_bundle['records'],
                          "confidence": evidence_bundle['confidence'],
-                         "persisted": True, "snapshot_updated": True,
+                         "persisted": persisted, "snapshot_updated": persisted,
                          "model": analysis['model'],
                          "fallback_used": analysis['fallback_used'],
                          "reused": True,
@@ -8312,9 +8420,16 @@ Correlations show temporal coincidence only and do not prove causation.""")
             # A clean verdict is trustworthy only with complete device
             # coverage. With explicit unavailable devices, continue to full
             # synthesis so the saved report names the blind spots as UNKNOWN.
+            # The transactional-generation gate applies to the scan-clean
+            # shortcut exactly like the synthesis path; re-validated here
+            # because the scan LLM call takes time. The findings ledger only
+            # advances together with a persisted report.
+            persistable_now = (
+                report_persistable and _generation_still_current(devices)
+            )
             covered = _covered_devices_for_findings(devices, collection_complete)
             classified, findings_summary = _classified_findings_or_fallback(
-                [], covered
+                [], covered, persist=persistable_now
             )
             response = (
                 "Fabric scan: clean. The findings-only scan reported no "
@@ -8349,7 +8464,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
                 "stages": stages,
             }
             persisted = False
-            if collection_complete:
+            if persistable_now:
                 try:
                     _save_json_state(ANALYSIS_FILE, analysis)
                     _save_json_state(
@@ -8580,12 +8695,16 @@ Correlations show temporal coincidence only and do not prove causation.""")
             for f in parsed_findings
         ) or "No findings: the analysis reported a clean fabric."
     findings_fields = {}
+    # Re-validate the pipeline generation after the LLM ladder: the findings
+    # ledger and the persisted report may only advance together on a still-
+    # current generation.
+    persistable_now = report_persistable and _generation_still_current(devices)
     if parsed_findings is not None:
         try:
             parsed_findings = _apply_suppressions(parsed_findings, devices)
             covered = _covered_devices_for_findings(devices, collection_complete)
             classified, findings_summary = _classified_findings_or_fallback(
-                parsed_findings, covered
+                parsed_findings, covered, persist=persistable_now
             )
             findings_fields = {'findings': classified,
                                'findings_summary': findings_summary}
@@ -8625,7 +8744,7 @@ Correlations show temporal coincidence only and do not prove causation.""")
     # removals/resolutions and steady-state reuse.
     persisted = False
     snapshot_updated = False
-    if report_persistable:
+    if persistable_now:
         try:
             _save_json_state(ANALYSIS_FILE, analysis)
             persisted = True
@@ -8759,11 +8878,36 @@ def action_analyze_worker(job_id):
     sys.exit(1)
 
 
+def _autonomous_attempt_status():
+    """Outcome of the newest autonomous analyze attempt, persisted by
+    bin/lldpq-ai-analyze so silent cron failures become visible in the UI.
+    None when the wrapper has not recorded one."""
+    attempt = _load_json_file(os.path.join(AI_STATE_DIR, 'last-attempt.json'))
+    if not isinstance(attempt, dict):
+        return None
+    ts = attempt.get('ts')
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return {
+        'ts': float(ts),
+        'ok': attempt.get('ok') is True,
+        'persisted': attempt.get('persisted') is True,
+        'error': redact_secrets(str(attempt.get('error') or ''))[:300],
+    }
+
+
 def action_get_analysis():
     """Get the latest autonomous analysis."""
     source = ANALYSIS_FILE if os.path.exists(ANALYSIS_FILE) else LEGACY_ANALYSIS_FILE
     if not os.path.exists(source):
-        result_json({"success": True, "analysis": "", "timestamp": 0, "stale": True})
+        empty = {"success": True, "analysis": "", "timestamp": 0, "stale": True}
+        try:
+            attempt = _autonomous_attempt_status()
+            if attempt is not None:
+                empty['last_attempt'] = attempt
+        except Exception:
+            pass
+        result_json(empty)
     try:
         with open(source, 'r') as f:
             data = json.load(f)
@@ -8795,6 +8939,20 @@ def action_get_analysis():
             or generation_was_current is not True
         )
         data['age_seconds'] = int(age)
+        # Additive: expose when the analysis text itself was generated plus
+        # the reuse flag so the UI can tell a reused report from a fresh one.
+        if isinstance(data.get('generated_at'), bool) or \
+                not isinstance(data.get('generated_at'), (int, float)):
+            data['generated_at'] = data.get('timestamp', 0)
+        data['reused'] = data.get('reused') is True
+        # Additive best-effort: the last autonomous attempt outcome must
+        # never fail readback of a good report.
+        try:
+            attempt = _autonomous_attempt_status()
+            if attempt is not None:
+                data['last_attempt'] = attempt
+        except Exception:
+            pass
         # Additive: active operator suppressions ride along so the UI can
         # render acknowledged findings without another endpoint.
         try:

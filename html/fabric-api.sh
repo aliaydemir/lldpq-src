@@ -246,7 +246,7 @@ LLDPQ_DEVICE_NAME_RE='[A-Za-z0-9][A-Za-z0-9_.()-]{0,252}'
 export LLDPQ_DEVICE_NAME_RE
 _FABRIC_ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
 case "$_FABRIC_ACTION" in
-    ansible-status|list-devices)
+    ansible-status|list-devices|get-telemetry-config|get-active-telemetry-devices|prometheus-query|prometheus-query-range)
         require_auth ;;
     *)
         require_admin ;;
@@ -4532,6 +4532,117 @@ except Exception as e:
     print(json.dumps({'success': False, 'error': str(e), 'devices_updated': devices_updated}))
 PYTHON
         ;;
+    "remove-subnet-leak")
+        # Remove a subnet from prefix-list (exact inverse of add-subnet-leak)
+        acquire_lock
+        read_post_body
+        export POST_DATA
+        python3 << PYTHON
+$LLDPQ_MODE_FLOOR_DEF
+$LLDPQ_ATOMIC_WRITE_DEF
+$LLDPQ_VALIDATORS_DEF
+import json
+from ruamel.yaml import YAML
+yaml = YAML()
+yaml.preserve_quotes = True
+import tempfile
+import shutil
+import os
+import sys
+import glob
+
+# Read POST data
+try:
+    params = json.loads(os.environ.get('POST_DATA') or '{}')
+except:
+    params = {}
+
+subnet = params.get('subnet', '')
+route_map = params.get('route_map', '')
+
+if not subnet or not route_map:
+    print(json.dumps({'success': False, 'error': 'Missing subnet or route_map'}))
+    sys.exit(0)
+
+# Same validation as add-subnet-leak (entries are matched by the exact
+# posted subnet string, mirroring add's duplicate check)
+_subnet_net = _v_ip_network(subnet)
+if _subnet_net is None:
+    print(json.dumps({'success': False, 'error': f'Invalid subnet: {subnet}'}))
+    sys.exit(0)
+
+ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
+host_vars_dir = f"{ansible_dir}/inventory/host_vars"
+
+# Find all devices that have this prefix_list and remove the subnet
+devices_updated = []
+errors = []
+
+try:
+    # Pass 1: load every host_vars file and compute the new content in
+    # memory; nothing is written until every target file staged cleanly
+    _loaded = []
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+        with open(yaml_file, 'r') as f:
+            content = f.read()
+            device_data = yaml.load(content)
+        _loaded.append((yaml_file, device_data))
+
+    _staged_writes = []
+    _staged_hosts = []
+    for yaml_file, device_data in _loaded:
+        hostname = os.path.basename(yaml_file).replace('.yaml', '')
+
+        if not device_data:
+            continue
+
+        policies = device_data.get('policies', {}) or {}
+        prefix_lists = policies.get('prefix_list', {}) if hasattr(policies, 'get') else {}
+
+        if not hasattr(prefix_lists, 'get') or route_map not in prefix_lists:
+            continue
+
+        prefix_list = prefix_lists[route_map]
+
+        # A None/list-valued policy cannot carry sequence entries
+        if not hasattr(prefix_list, 'items'):
+            continue
+
+        # Collect the sequence keys carrying this subnet
+        _remove_keys = [
+            _seq for _seq, _entry in prefix_list.items()
+            if hasattr(_entry, 'get') and _entry.get('match') == subnet
+        ]
+
+        if not _remove_keys:
+            continue
+
+        for _seq in _remove_keys:
+            del prefix_list[_seq]
+
+        _staged_writes.append((device_data, yaml_file))
+        _staged_hosts.append(hostname)
+
+    # Pass 2: write all files only after pass 1 succeeded for every device
+    if _staged_writes:
+        _atomic_write_many(yaml, _staged_writes)
+    devices_updated = _staged_hosts
+
+    if devices_updated:
+        _message = f"Subnet {subnet} removed from prefix-list {route_map} on {len(devices_updated)} device(s)"
+    else:
+        # Idempotent: removing an absent entry is a no-op success
+        _message = f"Subnet {subnet} was not present in prefix-list {route_map}; nothing to remove"
+    print(json.dumps({
+        'success': True,
+        'devices_updated': devices_updated,
+        'count': len(devices_updated),
+        'message': _message
+    }))
+except Exception as e:
+    print(json.dumps({'success': False, 'error': str(e), 'devices_updated': devices_updated}))
+PYTHON
+        ;;
     "save-dhcp-relay")
         # Save (create or update) DHCP relay entry
         acquire_lock
@@ -4796,6 +4907,12 @@ try:
     ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
     host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
 
+    # Try .yml if .yaml doesn't exist
+    if not os.path.exists(host_file):
+        alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+        if os.path.exists(alt_file):
+            host_file = alt_file
+
     if not os.path.exists(host_file):
         print(json.dumps({'success': False, 'error': f'Host file not found: {device}.yaml'}))
         sys.exit(0)
@@ -4856,14 +4973,20 @@ try:
 
     ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
     host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
-    
+
+    # Try .yml if .yaml doesn't exist
+    if not os.path.exists(host_file):
+        alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+        if os.path.exists(alt_file):
+            host_file = alt_file
+
     if not os.path.exists(host_file):
         print(json.dumps({'success': False, 'error': f'Host file not found: {device}.yaml'}))
         sys.exit(0)
-    
+
     with open(host_file, 'r') as f:
         host_data = yaml.load(f) or {}
-    
+
     if 'evpn_mh' not in host_data:
         print(json.dumps({'success': False, 'error': 'EVPN Multihoming not configured'}))
         sys.exit(0)
@@ -4935,6 +5058,12 @@ if not re.match(r'^[A-Za-z0-9_./-]+$', str(bond_name)):
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
+
+# Try .yml if .yaml doesn't exist
+if not os.path.exists(host_file):
+    alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+    if os.path.exists(alt_file):
+        host_file = alt_file
 
 try:
     # Load host file
@@ -5031,6 +5160,12 @@ if not re.match(r'^[A-Za-z0-9_.-]+$', str(device)):
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
 
+# Try .yml if .yaml doesn't exist
+if not os.path.exists(host_file):
+    alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+    if os.path.exists(alt_file):
+        host_file = alt_file
+
 try:
     with open(host_file, 'r') as f:
         host_data = yaml.load(f) or {}
@@ -5112,6 +5247,12 @@ subif_id = parts[1]
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
+
+# Try .yml if .yaml doesn't exist
+if not os.path.exists(host_file):
+    alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+    if os.path.exists(alt_file):
+        host_file = alt_file
 
 try:
     with open(host_file, 'r') as f:
@@ -5208,6 +5349,12 @@ if not re.match(r'^[A-Za-z0-9_./-]+$', str(interface_name)):
 
 ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_file = f"{ansible_dir}/inventory/host_vars/{device}.yaml"
+
+# Try .yml if .yaml doesn't exist
+if not os.path.exists(host_file):
+    alt_file = f"{ansible_dir}/inventory/host_vars/{device}.yml"
+    if os.path.exists(alt_file):
+        host_file = alt_file
 
 try:
     # Load host file
@@ -5647,7 +5794,13 @@ try:
 
     # 1. Update host_vars - add subinterface
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
-    
+
+    # Try .yml if .yaml doesn't exist
+    if not os.path.exists(host_file):
+        alt_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yml')
+        if os.path.exists(alt_file):
+            host_file = alt_file
+
     if not os.path.exists(host_file):
         print(json.dumps({'success': False, 'error': f'Device file not found: {device}.yaml'}))
         exit(0)
@@ -5843,6 +5996,13 @@ try:
     # All mutations are staged and committed together at the end so a failure
     # in the BGP profile phase cannot leave the subinterface removal applied.
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
+
+    # Try .yml if .yaml doesn't exist
+    if not os.path.exists(host_file):
+        alt_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yml')
+        if os.path.exists(alt_file):
+            host_file = alt_file
+
     subif_removed = False
     host_data = None
     _host_dirty = False
@@ -6106,6 +6266,12 @@ try:
 
     # 1. Update host_vars - update subinterface
     host_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yaml')
+
+    # Try .yml if .yaml doesn't exist
+    if not os.path.exists(host_file):
+        alt_file = os.path.join(ansible_dir, 'inventory', 'host_vars', f'{device}.yml')
+        if os.path.exists(alt_file):
+            host_file = alt_file
 
     if not os.path.exists(host_file):
         print(json.dumps({'success': False, 'error': f'Device file not found: {device}.yaml'}))
@@ -7119,6 +7285,7 @@ import hashlib
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -7320,17 +7487,31 @@ try:
 
     with tempfile.NamedTemporaryFile(
         mode='wb', dir=download_dir, prefix='.download-', delete=False
-    ) as output:
+    ) as output, tempfile.TemporaryFile() as errput:
         temporary_file = output.name
-        result = subprocess.run(
-            ssh_command,
-            stdout=output,
-            stderr=subprocess.PIPE,
-            timeout=120,
-        )
+        # A silent 120s ssh cat gives nginx no body bytes for longer than its
+        # read timeout, which cuts the request at 60s on large cl-support
+        # bundles. Emit JSON-whitespace keepalive bytes while the transfer
+        # streams to the staging file; the leading newlines are ignored by
+        # the client's response.json(). The 120s cap stays.
+        proc = subprocess.Popen(ssh_command, stdout=output, stderr=errput)
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                proc.wait(timeout=10)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    proc.wait()
+                    raise
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+        errput.seek(0)
+        stderr_bytes = errput.read(65536)
 
     if (
-        result.returncode == 0
+        proc.returncode == 0
         and os.path.exists(temporary_file)
         and os.path.getsize(temporary_file) > 0
     ):
@@ -7346,11 +7527,11 @@ try:
             'filename': filename,
         }))
     else:
-        stderr = result.stderr.decode('utf-8', errors='replace').strip()
+        stderr = stderr_bytes.decode('utf-8', errors='replace').strip()
         print(json.dumps({
             'success': False,
             'error': ('SSH cat failed: ' + stderr)[:200],
-            'exit_code': result.returncode,
+            'exit_code': proc.returncode,
         }))
 except subprocess.TimeoutExpired:
     print(json.dumps({'success': False, 'error': 'Download timeout'}))
@@ -7658,19 +7839,19 @@ def check_device(device, device_info, lldpq_user):
         # was not probed at all. The remote nv pipe ends in head, so a
         # reachable device always exits 0 and is judged on its output below.
         if result.returncode != 0:
-            return {'device': device, 'supported': False,
-                    'error': (result.stderr or result.stdout or
-                              f'SSH exited with status {result.returncode}').strip()[:200]}
+            return {'device': device, 'status': 'error',
+                    'detail': (result.stderr or result.stdout or
+                               f'SSH exited with status {result.returncode}').strip()[:200]}
         # Check if export is supported
         if "'export' is not one of" in output or "Error:" in output:
-            return {'device': device, 'supported': False}
+            return {'device': device, 'status': 'unsupported', 'detail': 'telemetry export not supported'}
         else:
-            return {'device': device, 'supported': True}
-    
+            return {'device': device, 'status': 'supported', 'detail': ''}
+
     except subprocess.TimeoutExpired:
-        return {'device': device, 'supported': False, 'error': 'timeout'}
+        return {'device': device, 'status': 'error', 'detail': 'timeout'}
     except Exception as e:
-        return {'device': device, 'supported': False, 'error': str(e)}
+        return {'device': device, 'status': 'error', 'detail': str(e)}
 
 try:
     data = json.loads(os.environ.get('POST_DATA', '{}'))
@@ -7698,6 +7879,19 @@ max_workers = max(1, min(max_workers, 50))
 
 supported = []
 unsupported = []
+errors = []
+
+def emit(result):
+    # Stream one NDJSON line per device as soon as its probe finishes so
+    # nginx never times out waiting for the whole fabric to be checked.
+    if result['status'] == 'supported':
+        supported.append(result['device'])
+    elif result['status'] == 'unsupported':
+        unsupported.append(result['device'])
+    else:
+        errors.append(result['device'])
+    sys.stdout.write(json.dumps(result) + '\n')
+    sys.stdout.flush()
 
 # Check all devices in parallel
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -7705,30 +7899,25 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
     for device in devices:
         device_info = get_device_info(device, ansible_dir, lldpq_conf)
         if device_info is None:
-            # Device not found in devices.yaml/inventory - cannot be supported
-            unsupported.append(device)
+            # Device not found in devices.yaml/inventory - capability unknown
+            if _devices_yaml_errors:
+                detail = f'devices.yaml could not be parsed: {_devices_yaml_errors[0]}'
+            else:
+                detail = 'Device not found in devices.yaml/inventory'
+            emit({'device': device, 'status': 'error', 'detail': detail})
             continue
         future = executor.submit(check_device, device, device_info, lldpq_user)
         futures[future] = device
-    
-    for future in as_completed(futures):
-        result = future.result()
-        if result.get('supported'):
-            supported.append(result['device'])
-        else:
-            unsupported.append(result['device'])
 
-_resp = {
-    'success': True,
+    for future in as_completed(futures):
+        emit(future.result())
+
+print(json.dumps({
+    'done': True,
     'supported': supported,
     'unsupported': unsupported,
-    'supported_count': len(supported),
-    'unsupported_count': len(unsupported)
-}
-if _devices_yaml_errors:
-    _resp['errors'] = sorted(set(_devices_yaml_errors))
-    _resp['warning'] = 'devices.yaml could not be parsed: ' + _resp['errors'][0]
-print(json.dumps(_resp))
+    'errors': errors
+}))
 
 PYTHON_CHECK_TELEM
         exit 0
@@ -10764,19 +10953,65 @@ except Exception as e:
 PYTHON_END
         ;;
     refresh-assets)
-        # Trigger assets.sh to refresh device inventory using trigger file mechanism
-        # A cron job running as lldpq user watches this file and runs assets.sh
-        TRIGGER_FILE="/tmp/.assets_refresh_trigger"
-        
-        # Create trigger file with timestamp
-        echo "$(date +%s)" > "$TRIGGER_FILE" 2>/dev/null
-        chmod 666 "$TRIGGER_FILE" 2>/dev/null
-        
-        if [ -f "$TRIGGER_FILE" ]; then
-            echo '{"success": true, "message": "Assets refresh triggered. Please wait about 30 seconds."}'
-        else
-            echo '{"success": false, "error": "Failed to create trigger file"}'
+        # Queue a real Assets refresh through the same job-file mechanism as
+        # /trigger-assets: bin/lldpq-trigger consumes $ASSETS_JOB_DIR/*.request.
+        # (The old /tmp/.assets_refresh_trigger file had no consumer, so this
+        # action used to claim success while doing nothing.)
+        ASSETS_JOB_DIR="${LLDPQ_ASSETS_JOB_DIR:-/var/lib/lldpq/assets-jobs}"
+        if ! mkdir -p -m 2770 "$ASSETS_JOB_DIR" 2>/dev/null; then
+            echo '{"success": false, "error": "Assets job directory is unavailable"}'
+            exit 0
         fi
+        chmod 2770 "$ASSETS_JOB_DIR" 2>/dev/null || true
+        _ASSETS_TOKEN=""
+        if [[ -r /proc/sys/kernel/random/uuid ]]; then
+            _ASSETS_TOKEN=$(tr -d '-' < /proc/sys/kernel/random/uuid 2>/dev/null || true)
+        fi
+        if [[ ! "$_ASSETS_TOKEN" =~ ^[a-f0-9]{32}$ ]] && [[ -r /dev/urandom ]]; then
+            _ASSETS_TOKEN=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
+        fi
+        if [[ ! "$_ASSETS_TOKEN" =~ ^[a-f0-9]{32}$ ]]; then
+            echo '{"success": false, "error": "Could not allocate an Assets job token"}'
+            exit 0
+        fi
+        _ASSETS_CREATED=$(date +%s)
+        # Same status/request field format trigger-assets.sh publishes; the
+        # status file must exist before the request so a fast worker never
+        # sees an untracked request.
+        _ASSETS_STATUS_TMP=$(mktemp "$ASSETS_JOB_DIR/.${_ASSETS_TOKEN}.status.XXXXXXXX" 2>/dev/null) || _ASSETS_STATUS_TMP=""
+        if [[ -z "$_ASSETS_STATUS_TMP" ]] || ! {
+            printf 'token=%s\n' "$_ASSETS_TOKEN"
+            printf 'state=queued\n'
+            printf 'created_at=%s\n' "$_ASSETS_CREATED"
+            printf 'updated_at=%s\n' "$(date +%s)"
+            printf 'started_at=0\n'
+            printf 'completed_at=0\n'
+            printf 'attempt=0\n'
+            printf 'exit_code=\n'
+            printf 'next_retry_at=0\n'
+            printf 'retry_scheduled=false\n'
+            printf 'worker_pid=0\n'
+            printf 'reason=Waiting for the Assets worker\n'
+        } > "$_ASSETS_STATUS_TMP" 2>/dev/null || \
+           ! chmod 0660 "$_ASSETS_STATUS_TMP" 2>/dev/null || \
+           ! mv -f "$_ASSETS_STATUS_TMP" "$ASSETS_JOB_DIR/$_ASSETS_TOKEN.status" 2>/dev/null; then
+            rm -f "$_ASSETS_STATUS_TMP" 2>/dev/null || true
+            echo '{"success": false, "error": "Could not create Assets job status"}'
+            exit 0
+        fi
+        _ASSETS_REQUEST_TMP=$(mktemp "$ASSETS_JOB_DIR/.${_ASSETS_TOKEN}.request.XXXXXXXX" 2>/dev/null) || _ASSETS_REQUEST_TMP=""
+        if [[ -z "$_ASSETS_REQUEST_TMP" ]] || ! {
+            printf 'token=%s\n' "$_ASSETS_TOKEN"
+            printf 'created_at=%s\n' "$_ASSETS_CREATED"
+        } > "$_ASSETS_REQUEST_TMP" 2>/dev/null || \
+           ! chmod 0660 "$_ASSETS_REQUEST_TMP" 2>/dev/null || \
+           ! mv -f "$_ASSETS_REQUEST_TMP" "$ASSETS_JOB_DIR/$_ASSETS_TOKEN.request" 2>/dev/null; then
+            rm -f "$_ASSETS_REQUEST_TMP" 2>/dev/null || true
+            echo '{"success": false, "error": "Could not queue the Assets job"}'
+            exit 0
+        fi
+        printf '{"success": true, "token": "%s", "message": "Assets refresh queued. Poll /trigger-assets?token=%s for completion."}\n' \
+            "$_ASSETS_TOKEN" "$_ASSETS_TOKEN"
         ;;
     "ansible-status")
         # Check if Ansible is configured and available

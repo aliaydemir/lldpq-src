@@ -1832,8 +1832,17 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
             if str(existing_key) != ip:
                 old_info = devices[existing_key]
                 del devices[existing_key]
-                # Re-create at new IP key
-                if role:
+                # Re-create at new IP key. Dict-form entries keep all their
+                # fields (per-device username override etc.); only
+                # hostname/role change.
+                if isinstance(old_info, dict):
+                    old_info['hostname'] = hostname
+                    if role:
+                        old_info['role'] = role
+                    else:
+                        old_info.pop('role', None)
+                    devices[ip] = old_info
+                elif role:
                     devices[ip] = f"{hostname} @{role}"
                 else:
                     devices[ip] = hostname
@@ -2297,9 +2306,11 @@ def action_ping_scan():
     
     result_json({"success": True, "entries": entries, "scan_type": "ping"})
 
-def run_subnet_scan(apply_post_provision=True):
+def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     """Full subnet discovery: ping all IPs in range, ARP for MACs, SSH probe for classification,
-    post-provision actions (sw-base, ztp disable, hostname set) for newly provisioned devices."""
+    post-provision actions (sw-base, ztp disable, hostname set) for newly provisioned devices.
+    heartbeat, when given, is called between scan phases so the discovery
+    worker's liveness record stays fresh during long scans."""
     
     # Get discovery range
     disc_range = read_lldpq_conf_key('DISCOVERY_RANGE', DISCOVERY_RANGE)
@@ -2396,7 +2407,9 @@ def run_subnet_scan(apply_post_provision=True):
         for future in as_completed(futures):
             ip, alive = future.result()
             ping_results[ip] = alive
-    
+    if heartbeat:
+        heartbeat()
+
     # Step 2: Read local ARP table
     local_arp = {}
     try:
@@ -2427,6 +2440,8 @@ def run_subnet_scan(apply_post_provision=True):
         for future in as_completed(futures):
             ip, is_open = future.result()
             tcp_results[ip] = is_open
+    if heartbeat:
+        heartbeat()
 
     # Inventory addresses always receive an SSH attempt even when neither ICMP
     # nor the short TCP probe answered. Unknown addresses need at least one
@@ -2491,6 +2506,9 @@ def run_subnet_scan(apply_post_provision=True):
         for future in as_completed(futures):
             probe = future.result()
             ssh_results[probe['ip']] = probe
+            # Per-completion: this sweep alone can exceed the stall window
+            if heartbeat:
+                heartbeat()
 
     reachable_ips = [
         ip for ip in all_ips
@@ -2745,6 +2763,9 @@ def run_subnet_scan(apply_post_provision=True):
                     ip, status, actions = future.result()
                     post_results[ip] = status
                     post_action_results[ip] = actions
+                    # Per-device: base deploys can run for minutes
+                    if heartbeat:
+                        heartbeat()
 
         # Update both executed and identity-blocked entries with aggregate state.
         for entry in entries:
@@ -3092,8 +3113,27 @@ def run_discovery_worker(job_id):
             job['worker_heartbeat'] = int(time.time())
             save_discovery_job(job)
         try:
+            _hb_last = [0.0]
+
+            def refresh_heartbeat():
+                # Refresh worker_heartbeat between scan phases (throttled) so
+                # a long scan is not misread as stalled and relaunched by the
+                # 120s liveness check in discovery-status/schedule.
+                now = time.time()
+                if now - _hb_last[0] < 30:
+                    return
+                _hb_last[0] = now
+                try:
+                    with discovery_job_lock(job_id):
+                        current = load_discovery_job(job_id)
+                        current['worker_heartbeat'] = int(now)
+                        save_discovery_job(current)
+                except Exception:
+                    pass
+
             with exclusive_file_lock(os.path.join(DISCOVERY_JOBS_DIR, '.scan.lock')):
-                result = run_subnet_scan(job.get('apply_post_provision', True))
+                result = run_subnet_scan(job.get('apply_post_provision', True),
+                                         heartbeat=refresh_heartbeat)
             with discovery_job_lock(job_id):
                 job = load_discovery_job(job_id)
                 job['status'] = 'success'
@@ -4775,9 +4815,24 @@ def action_upgrade_candidates():
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {executor.submit(get_device_version, d): d for d in devices}
         for future in as_completed(futures):
-            candidates.append(future.result())
+            info = future.result()
+            candidates.append(info)
+            # Stream one NDJSON progress line per device as it completes so
+            # the fastcgi timeout never cuts off a full-fabric sweep.
+            if info.get('reachable'):
+                status = 'ok'
+            elif info.get('error') == 'Invalid SSH username':
+                status = 'error'
+            else:
+                status = 'unreachable'
+            sys.stdout.write(json.dumps({
+                'device': info.get('hostname', ''),
+                'version': info.get('current_version') or None,
+                'status': status,
+            }) + '\n')
+            sys.stdout.flush()
     candidates.sort(key=lambda x: x.get('hostname', ''))
-    result_json({'success': True, 'devices': candidates, 'images': list_os_image_objects(), 'server_ip': get_server_ip()})
+    result_json({'success': True, 'devices': candidates, 'images': list_os_image_objects(), 'server_ip': get_server_ip(), 'done': True})
 
 def run_upgrade_precheck(device, target_version, image_name, server_ip):
     info = get_device_version(device)

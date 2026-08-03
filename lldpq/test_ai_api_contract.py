@@ -93,15 +93,33 @@ class AskAiApiContractTest(unittest.TestCase):
             self.assertEqual(state["current_devices"], 1)
             self.assertEqual(state["unavailable_devices"], 1)
 
+            # A single contained failed device mirrors monitor.sh containment:
+            # the generation is still published and reportable.
             outcomes["counts"] = {"current": 1, "unavailable": 0, "failed": 1}
             outcomes["devices"]["leaf2"]["status"] = "failed"
+            status_path.write_text(json.dumps(outcomes), encoding="utf-8")
+            contained = ns["_pipeline_generation_state"]({"leaf1", "leaf2"})
+            self.assertTrue(contained["current"])
+            self.assertEqual(contained["failed_devices"], 1)
+
+            # Failures beyond the containment threshold (>= 2 devices and
+            # above LLDPQ_COLLECTION_FAILURE_ABORT_PCT) invalidate it.
+            outcomes["counts"] = {"current": 0, "unavailable": 0, "failed": 2}
+            outcomes["devices"]["leaf1"]["status"] = "failed"
             status_path.write_text(json.dumps(outcomes), encoding="utf-8")
             self.assertFalse(
                 ns["_pipeline_generation_state"]({"leaf1", "leaf2"})["current"]
             )
 
     def test_partial_coverage_persists_report_but_not_trusted_snapshot(self):
-        self.assertIn("if report_persistable:", PYTHON_TEXT)
+        # The persist gate now also re-validates the generation right before
+        # the write (a new collection may have started during the LLM ladder).
+        self.assertIn("if persistable_now:", PYTHON_TEXT)
+        self.assertIn(
+            "persistable_now = report_persistable and "
+            "_generation_still_current(devices)",
+            PYTHON_TEXT,
+        )
         self.assertIn("if collection_complete:", PYTHON_TEXT)
         self.assertIn(
             "if not isinstance(prev_snap, dict) or not prev_snap:", PYTHON_TEXT

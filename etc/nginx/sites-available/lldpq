@@ -127,8 +127,9 @@ server {
             return 404;
         }
 
-        # Never serve backend Python sources (e.g. console-pty.py) as static text.
-        location ~ \.py$ {
+        # Never serve backend Python sources (e.g. console-pty.py) or their
+        # compiled bytecode (__pycache__/*.pyc) as static text.
+        location ~ \.pyc?$ {
             return 404;
         }
 

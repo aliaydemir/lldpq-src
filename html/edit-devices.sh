@@ -48,7 +48,7 @@ if [ "$METHOD" = "GET" ]; then
 elif [ "$METHOD" = "POST" ]; then
     # Read POST data from stdin
     if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-        POST_DATA=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+        POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
     else
         POST_DATA=$(cat)
     fi

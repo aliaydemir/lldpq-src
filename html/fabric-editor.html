@@ -2192,6 +2192,19 @@
         
         // API calls
         async function apiCall(action, data = {}) {
+            // Large host lists overflow the URL limit (nginx 414): the backend
+            // accepts the comma-joined list as POST body JSON for these actions,
+            // with the action kept in the query string.
+            if (typeof data.host === 'string' && data.host.length > 2048 &&
+                (action === 'diff' || action === 'deploy' || action === 'generate')) {
+                const { host, ...rest } = data;
+                const response = await fetch('/ansible-api?' + new URLSearchParams({ action, ...rest }), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ host })
+                });
+                return response.json();
+            }
             const response = await fetch('/ansible-api?' + new URLSearchParams({ action, ...data }), {
                 method: data.content !== undefined ? 'POST' : 'GET',
                 headers: data.content !== undefined ? { 'Content-Type': 'application/json' } : {},
@@ -3395,13 +3408,26 @@
             showLoading(false);
         }
         
+        // Ansible reads files from disk, so unsaved editor buffers are invisible
+        // to generate/diff/deploy - warn before running with dirty buffers.
+        async function confirmUnsavedBuffers(actionLabel) {
+            const modifiedFiles = Object.entries(state.files).filter(([_, f]) => f.modified);
+            if (modifiedFiles.length === 0) return true;
+            const names = modifiedFiles.map(([p, _]) => escapeHtml(p.split('/').pop())).join(', ');
+            return await confirmAsync('Unsaved Changes',
+                `<strong>${modifiedFiles.length} file(s)</strong> have unsaved changes:<br><br>${names}<br><br>` +
+                `Unsaved changes will NOT be included in ${actionLabel} &mdash; continue?`);
+        }
+
         // Run generate configs
         async function runGenerate() {
             const host = getSelectedHosts();
-            
+
+            if (!(await confirmUnsavedBuffers('Generate'))) return;
+
             // Note: confirm() removed as browsers block it
             const targetMsg = host ? ` for ${host}` : ' for all hosts';
-            
+
             showLoading(true, 'Generating configs' + targetMsg + '...');
             try {
                 const result = await apiCall('generate', { host: host || '' });
@@ -3419,7 +3445,9 @@
                 showOutput('Please select at least one host', 'error');
                 return;
             }
-            
+
+            if (!(await confirmUnsavedBuffers('Diff'))) return;
+
             showLoading(true, 'Running diff for ' + host + '...');
             try {
                 const result = await apiCall('diff', { host });
@@ -3625,6 +3653,8 @@
                 showOutput('Please select at least one target host/group', 'error');
                 return;
             }
+
+            if (!(await confirmUnsavedBuffers('Deploy'))) return;
 
             // Note: confirm() removed as browsers block it
             showLoading(true, 'Deploying to ' + host + '...');

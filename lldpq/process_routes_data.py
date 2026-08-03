@@ -33,6 +33,7 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime
 
 import analysis_events
 import export_artifacts
@@ -51,6 +52,11 @@ OUTPUT_HTML = "routes-analysis.html"
 HISTORY_MAX_RECORDS = 288            # ~48h at the 10-minute monitor cadence
 EVENTS_RETENTION_SEC = 30 * 86400
 EVENTS_MAX = 2000
+
+# A dead fabric-scan keeps its last tables on disk; beyond this scan age the
+# run publishes as stale instead of current, and history sampling pauses
+# (frozen identical samples would blind the drop detection).
+ROUTES_SCAN_MAX_AGE_MINUTES = 30
 
 # Sudden-drop policy: only meaningful tables (>= floor) alarm, and only on a
 # loss of at least the given fraction between two consecutive samples.
@@ -111,6 +117,15 @@ def _load_json(path, default):
     return payload if isinstance(payload, type(default)) else default
 
 
+def _scan_max_age_seconds():
+    raw = os.environ.get("ROUTES_SCAN_MAX_AGE_MINUTES", "")
+    try:
+        minutes = int(raw)
+    except ValueError:
+        minutes = 0
+    return (minutes if minutes > 0 else ROUTES_SCAN_MAX_AGE_MINUTES) * 60
+
+
 def _vrf_metrics(route_entries, arp_by_vrf, vrf):
     total = 0
     bgp = kernel = static = other = 0
@@ -157,6 +172,7 @@ class RoutesAnalyzer:
         self.device_status = {}
         self.scan_available = os.path.isdir(self.tables_dir)
         self.scan_timestamp = None
+        self.scan_stale = False
 
     # ------------------------------------------------------------------
     # Analysis
@@ -165,6 +181,7 @@ class RoutesAnalyzer:
         os.makedirs(self.history_dir, exist_ok=True)
         summary = _load_json(os.path.join(self.tables_dir, "summary.json"), {})
         self.scan_timestamp = summary.get("timestamp")
+        self.scan_stale = self._scan_is_stale()
 
         managed = [name for name in sorted(self.managed_devices,
                                            key=str.casefold)
@@ -272,10 +289,30 @@ class RoutesAnalyzer:
                         "max_width": 0, "arp": 0,
                     })
 
-            history.append({"timestamp": self.now, "vrfs": current_vrfs})
-            self._write_shard(shard_path, host, history)
+            # A stale scan republishes the same frozen tables; appending
+            # identical samples would blind drop detection and fill the
+            # shard with no information.
+            if not self.scan_stale:
+                history.append({"timestamp": self.now, "vrfs": current_vrfs})
+                self._write_shard(shard_path, host, history)
 
         self._prune_events()
+
+    def _scan_is_stale(self):
+        # A missing summary.json (first run) keeps the ungated behavior.
+        if not isinstance(self.scan_timestamp, str) or not self.scan_timestamp:
+            return False
+        try:
+            scanned = datetime.fromisoformat(
+                self.scan_timestamp.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if scanned.tzinfo is not None:
+            scanned_epoch = scanned.timestamp()
+        else:
+            # fabric-scan stamps naive local time.
+            scanned_epoch = time.mktime(scanned.timetuple())
+        return self.now - scanned_epoch > _scan_max_age_seconds()
 
     def _placeholder_row(self, host, status, note):
         return {
@@ -315,6 +352,10 @@ class RoutesAnalyzer:
     def collection_status(self):
         if not self.scan_available:
             return "unavailable"
+        if self.scan_stale:
+            # fabric-scan stopped: the tables on disk are frozen last-known
+            # state, not a current collection.
+            return "stale"
         reporting = sum(1 for status in self.device_status.values()
                         if status == "current")
         if not reporting:
@@ -422,6 +463,14 @@ class RoutesAnalyzer:
                 "enabled (SKIP_FABRIC_SCAN) and that devices are reachable."
                 "</div>"
             )
+        elif status == "stale":
+            coverage_banner = (
+                "<div class='coverage-banner banner-critical'>"
+                "fabric-scan data is stale (last scan %s) &mdash; route "
+                "tables show last-known state, not a current collection. "
+                "fabric-scan runs every minute; check that it is enabled "
+                "(SKIP_FABRIC_SCAN) and healthy.</div>"
+            ) % html.escape(str(self.scan_timestamp))
         elif status == "partial":
             degraded = sorted(host for host, state in
                               self.device_status.items()
@@ -1061,7 +1110,7 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

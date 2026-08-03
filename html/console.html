@@ -447,7 +447,9 @@
         ws.binaryType = 'arraybuffer';
         sess.ws = ws;
         const dec = new TextDecoder('utf-8', { fatal: false });
+        let sockOpened = false;
         ws.onopen = () => {
+            sockOpened = true;
             if (sess.ws !== ws || sess.closing) return;
             if (options.resetOnOpen) {
                 try { sess.term.reset(); } catch (e) { try { sess.term.clear(); } catch (_) {} }
@@ -476,18 +478,45 @@
             if (sess.ws !== ws || sess.closing) return;
             sess.connected = false;
             sess.tabEl.classList.remove('connected'); sess.tabEl.classList.add('closed');
+            const code = event && Number(event.code);
+            // 1006 before onopen ever fired = the bridge rejected the upgrade
+            // (auth, unknown target, capacity). Deterministic — blind retries
+            // cannot succeed, so disambiguate via an auth probe instead.
+            if (code === 1006 && !sockOpened) {
+                sess.term.write('\r\n\x1b[90m• connection rejected before it opened\x1b[0m\r\n');
+                handlePreOpenRejection(sess);
+                return;
+            }
             const detail = closeDescription(event);
             sess.term.write(`\r\n\x1b[90m• ${detail}\x1b[0m\r\n`);
-            if (shouldAutoReconnect(event && Number(event.code))) scheduleReconnect(sess, detail);
+            if (shouldAutoReconnect(code)) scheduleReconnect(sess, detail);
             else showReconnect(sess, detail);
         };
         ws.onerror = () => { try { ws.close(); } catch(e){} };
     }
 
     // Auto-reconnect only on transient/unexpected closes, never on policy rejections
-    // (1008) or application close codes (4xxx) that mean "do not retry".
+    // (1008) or application close codes (4xxx) that mean "do not retry". 1006 only
+    // qualifies for drops AFTER a successful open; pre-open 1006 rejections are
+    // handled by handlePreOpenRejection() and never retried automatically.
     function shouldAutoReconnect(code) {
         return code === 1001 || code === 1006 || code === 1012 || code === 1013;
+    }
+
+    // A socket that closed with 1006 before ever opening was rejected during the
+    // HTTP upgrade. Probe auth once: an expired session goes back to login, anything
+    // else is a bridge-side rejection (unknown target / capacity) worth no retries.
+    async function handlePreOpenRejection(sess) {
+        try {
+            const resp = await fetch('/auth-api?action=check');
+            const data = await resp.json();
+            if (!data || !data.authenticated) {
+                if (window.LLDPqAuth) LLDPqAuth.redirectToLogin();
+                else window.location.href = '/login.html';
+                return;
+            }
+        } catch (e) { /* probe failed — fall through to the manual reconnect box */ }
+        showReconnect(sess, 'was rejected by the console service (unknown target, session capacity reached, or the service is unavailable)');
     }
     function scheduleReconnect(sess, detail) {
         if (sess.closing) return;

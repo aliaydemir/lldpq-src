@@ -634,9 +634,9 @@ GENERATED_CONFIGS_DIR=/var/www/html/generated_config_folder
 PROVISION_UPLOAD_DIR=/var/www/html/provision-uploads
 mkdir -p "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR"
 chown -R lldpq:www-data "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR"
-find "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR" -type d -exec chmod 775 {} \;
-find "$GENERATED_CONFIGS_DIR" -type f -exec chmod 664 {} \;
-find "$PROVISION_UPLOAD_DIR" -type f -exec chmod 664 {} \;
+find "$GENERATED_CONFIGS_DIR" "$PROVISION_UPLOAD_DIR" -type d -exec chmod 775 {} +
+find "$GENERATED_CONFIGS_DIR" -type f -exec chmod 664 {} +
+find "$PROVISION_UPLOAD_DIR" -type f -exec chmod 664 {} +
 
 _publish_provision_link() {
     local name="$1" root_path="/var/www/html/$1"
@@ -940,6 +940,8 @@ if ! /usr/local/bin/lldpq-config --validate-cron "$GETCONF_CRON"; then
     exit 1
 fi
 cat > /etc/cron.d/lldpq << CRON
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # LLDPq full run (assets + lldp + monitor + alerts)
 $LLDPQ_CRON lldpq LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq > /dev/null 2>&1
 # Web trigger daemon (handles Refresh buttons from UI) - every minute
@@ -951,6 +953,16 @@ $LLDPQ_CRON lldpq LLDPQ_MONITOR_LOCK_WAIT_SECONDS=300 /usr/local/bin/lldpq > /de
 # Config backup
 $GETCONF_CRON lldpq /usr/local/bin/get-conf > /dev/null 2>&1
 CRON
+# Native-install parity: daily Ansible-diff scan, only when an Ansible
+# directory with playbooks/ is configured at container start.
+if [ -n "${ANSIBLE_DIR:-}" ] && [ "$ANSIBLE_DIR" != "NoNe" ] && \
+   [ -d "$ANSIBLE_DIR" ] && [ -d "$ANSIBLE_DIR/playbooks" ]; then
+    chmod +x /home/lldpq/lldpq/fabric-scan-cron.sh 2>/dev/null || true
+    cat >> /etc/cron.d/lldpq << CRON
+# Fabric scan (Ansible diff check) - daily at 03:33
+33 3 * * * lldpq /home/lldpq/lldpq/fabric-scan-cron.sh > /dev/null 2>&1
+CRON
+fi
 chmod 644 /etc/cron.d/lldpq
 
 # ─── DHCP Server Setup ───
@@ -1680,7 +1692,7 @@ chmod 775 /var/www/html/cumulus-ztp.sh
 if [ -d /home/lldpq/lldpq/sw-base ]; then
     chown -R lldpq:lldpq /home/lldpq/lldpq/sw-base
     chmod 755 /home/lldpq/lldpq/sw-base
-    find /home/lldpq/lldpq/sw-base -type f -exec chmod 644 {} \;
+    find /home/lldpq/lldpq/sw-base -type f -exec chmod 644 {} +
     # Binaries and scripts need execute
     for f in exa cmd nvc nvt motd.sh; do
         [ -f "/home/lldpq/lldpq/sw-base/$f" ] && chmod 755 "/home/lldpq/lldpq/sw-base/$f"

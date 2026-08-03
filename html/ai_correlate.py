@@ -306,12 +306,18 @@ def _load_ber_current_stats(mr_dir):
     return stats
 
 
-def _collect_ber(mr_dir):
+def _collect_ber(mr_dir, now=None):
+    reference = _reference_time(now)
     stats = _load_ber_current_stats(mr_dir)
     anomalies = []
     for key in sorted(stats if isinstance(stats, dict) else {}):
         record = stats[key]
         if not isinstance(record, dict):
+            continue
+        # A record this old means the producer stopped; its last grade must
+        # not keep replaying as a current incident.
+        stamp = _record_epoch(record.get("timestamp"))
+        if stamp is not None and reference - stamp > STALE_RECORD_SECONDS:
             continue
         grade = _normalized_ber_grade(record)
         if grade not in {"warning", "critical"}:
@@ -525,7 +531,9 @@ _COLLECTORS = (
 # Collectors whose sources carry no self-anchoring horizon (unlike the flap
 # window, which is anchored to producer time); they receive the reference
 # clock and gate on record age (STALE_RECORD_SECONDS).
-_AGE_GATED_COLLECTORS = (_collect_pfc_ecn, _collect_hardware, _collect_logs)
+_AGE_GATED_COLLECTORS = (
+    _collect_ber, _collect_pfc_ecn, _collect_hardware, _collect_logs,
+)
 
 
 def collect_anomalies(mr_dir, now=None):

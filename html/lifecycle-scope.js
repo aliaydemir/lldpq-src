@@ -264,7 +264,7 @@
             if (stateText === 'established') established++;
             if (health === 'critical' || health === 'warning') problems++;
         });
-        metric('#total-devices', state.selected.size);
+        metric('#total-devices', uniqueDevices(rows));
         metric('#total-neighbors', rows.length);
         metric('#established-neighbors', established);
         metric('#down-neighbors', problems);

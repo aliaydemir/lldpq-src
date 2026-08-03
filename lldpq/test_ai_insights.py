@@ -350,6 +350,41 @@ class AskAiInsightsTest(unittest.TestCase):
         self.assertEqual(source["status"], "invalid")
         self.assertFalse(any(event["category"] == "ber" for event in timeline["events"]))
 
+    def test_time_budget_stops_shard_sweep_and_discloses_partial(self):
+        shard_dir = self.monitor / "ber-history"
+        shard_dir.mkdir()
+        for host in ("leaf01", "leaf02"):
+            self._write_ber_shard(shard_dir, host, {f"{host}:swp1": [
+                {"timestamp": NOW - 200, "grade": "excellent",
+                 "sample_status": "analyzed"},
+                {"timestamp": NOW - 100, "grade": "critical",
+                 "sample_status": "analyzed"},
+            ]})
+        # deadline = 0 + 1; first shard check at 0.5 passes, second at 2 stops.
+        with mock.patch.object(
+            ai_insights.time, "monotonic", side_effect=[0.0, 0.5, 2.0]
+        ):
+            timeline = build_timeline(
+                monitor_dir=self.monitor, web_root=self.web, window="1h",
+                now=NOW, time_budget_seconds=1,
+            )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        events = [event for event in timeline["events"] if event["category"] == "ber"]
+        self.assertEqual(source["status"], "partial")
+        self.assertIn("time budget reached after 1 of 2 shards", source["detail"])
+        self.assertEqual([event["device"] for event in events], ["leaf01"])
+
+        # Without a budget the whole sweep still runs and nothing is disclosed.
+        timeline = build_timeline(
+            monitor_dir=self.monitor, web_root=self.web, window="1h", now=NOW
+        )
+        source = next(row for row in timeline["coverage"] if row["source"] == "ber")
+        events = [event for event in timeline["events"] if event["category"] == "ber"]
+        self.assertNotIn("time budget", source.get("detail") or "")
+        self.assertEqual(
+            sorted(event["device"] for event in events), ["leaf01", "leaf02"]
+        )
+
     def test_modern_ber_schema_detects_combined_grade_and_error_onset(self):
         self.write_monitor("ber_history.json", {
             "ber_history": {

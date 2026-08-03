@@ -429,6 +429,7 @@
                 <input type="text" id="port-filter" class="search-input" placeholder="e.g. ^A14-|bond_1_14_" style="flex:1; min-width:180px;" oninput="onPortFilterInput()">
                 <a style="color:#4fc3f7; font-size:12px; cursor:pointer;" onclick="clearPortFilter()">clear</a>
             </div>
+            <div class="filter-row foot-note" id="rack-note" style="display:none;"></div>
             <div id="facet-box" style="display:none;"></div>
             <div class="filter-row" id="profile-chips"></div>
             <div class="panel-body" style="max-height: 420px;">
@@ -738,6 +739,7 @@
         $('rack-input').value = '';
         $('port-filter').value = '';
         $('port-filter').classList.remove('bad');
+        hideRackNote();
         $('plan-name').value = '';
         $('check-all').checked = false;
         $('bounce-ports-cb').checked = false;
@@ -907,6 +909,7 @@
             }
             portRows.sort((a, b) => a.device.localeCompare(b.device) ||
                 a.name.localeCompare(b.name, undefined, { numeric: true }));
+            portRows.forEach((r, i) => { r.idx = i; });  // stable index for row checkboxes
             activeProfiles = null;
             facetShapes = facetRacks = facetSUs = null;
             facetRanges.pmin = facetRanges.pmax = facetRanges.omin = facetRanges.omax = '';
@@ -965,7 +968,7 @@
         // Clean slate per mode: mixing first-assignments and migrations in one
         // plan is valid for the backend but confusing to review.
         for (const r of portRows) { r.checked = false; r.evidence = ''; }
-        if (portFilterRe && portFilterRe.rackMode) { portFilterRe = null; $('port-filter').value = ''; }
+        if (portFilterRe && portFilterRe.rackMode) { portFilterRe = null; hideRackNote(); }
         mappings = {};
         activeProfiles = null;
         facetShapes = facetRacks = facetSUs = null;
@@ -1074,7 +1077,15 @@
     }
 
     let portFilterRe = null;
+    let portFilterTimer = null;
+    // Debounced: recompiling the regex and re-rendering the table on every
+    // keystroke stalls large port lists.
     function onPortFilterInput() {
+        clearTimeout(portFilterTimer);
+        portFilterTimer = setTimeout(applyPortFilter, 150);
+    }
+    function applyPortFilter() {
+        hideRackNote();  // typing starts a fresh user filter, leaving rack mode
         const v = $('port-filter').value.trim();
         try {
             portFilterRe = v ? new RegExp(v, 'i') : null;
@@ -1087,7 +1098,20 @@
         for (const r of portRows) r.evidence = '';
         renderPortTable();
     }
-    function clearPortFilter() { $('port-filter').value = ''; onPortFilterInput(); }
+    function clearPortFilter() { clearTimeout(portFilterTimer); $('port-filter').value = ''; applyPortFilter(); }
+
+    // Applied rack patterns live in a read-only note, never in the regex input
+    // (the pattern join is not a valid regex and would collapse the list).
+    function showRackNote(pats) {
+        const el = $('rack-note');
+        el.textContent = 'Rack patterns applied: ' + pats.join('  |  ') + ' - type in the filter or clear to leave rack mode.';
+        el.style.display = '';
+    }
+    function hideRackNote() {
+        const el = $('rack-note');
+        el.textContent = '';
+        el.style.display = 'none';
+    }
 
     function getRackPatterns() {
         if (Array.isArray(serverPatterns) && serverPatterns.length) return serverPatterns.slice();
@@ -1580,8 +1604,10 @@
             if (hit) (r.managed === (mode === 'migrate')) ? matched++ : otherMode++;
         }
         portFilterRe = { test: () => true, rackMode: true };  // visibility driven by evidence
-        $('port-filter').value = pats.join(' | ');
+        clearTimeout(portFilterTimer);  // a pending keystroke must not wipe rack mode
+        $('port-filter').value = '';
         $('port-filter').classList.remove('bad');
+        showRackNote(pats);
         renderPortTable();
         if (!matched) {
             showAlert(otherMode
@@ -1622,7 +1648,7 @@
         const rows = portRows.filter(rowVisible);
         let html = '';
         for (const r of rows) {
-            const idx = portRows.indexOf(r);
+            const idx = r.idx;
             html += `<tr>
                 <td><input type="checkbox" ${r.checked ? 'checked' : ''} onchange="portRows[${idx}].checked = this.checked; updateStep1Cards();"></td>
                 <td>${escapeHtml(r.device)}</td>
@@ -1959,6 +1985,18 @@
 
     async function ansibleApiCall(action, hosts) {
         const params = new URLSearchParams({ action });
+        // Large host lists overflow the URL limit (nginx 414): the backend
+        // accepts the same comma-joined list as POST body JSON for these
+        // actions, with the action kept in the query string.
+        if (hosts && hosts.length > 2048 &&
+            (action === 'diff' || action === 'deploy' || action === 'generate')) {
+            const response = await fetch(`/ansible-api?${params}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ host: hosts })
+            });
+            return await response.json();
+        }
         if (hosts) params.append('host', hosts);
         const response = await fetch(`/ansible-api?${params}`);
         return await response.json();

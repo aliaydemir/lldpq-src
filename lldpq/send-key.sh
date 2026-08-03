@@ -30,6 +30,10 @@ SSH_KEY=""
 PASSWORD=""
 DO_KEY=true
 DO_SUDO=true
+MAX_PARALLEL="${SEND_KEY_MAX_PARALLEL:-50}"
+case "$MAX_PARALLEL" in
+    ''|*[!0-9]*|0) MAX_PARALLEL=50 ;;
+esac
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -178,16 +182,31 @@ main() {
     echo -e "${BLUE}Processing $total devices...${NC}"
     echo ""
 
-    local pids=()
+    local supports_wait_n=true
+    if ! ( : & wait -n ) 2>/dev/null; then
+        supports_wait_n=false
+    fi
+
+    local job_count=0
     for device in "${!devices[@]}"; do
         IFS=' ' read -r user hostname <<< "${devices[$device]}"
         process_device "$device" "$user" "$hostname" &
-        pids+=($!)
+        ((job_count++))
+
+        # Limit parallel jobs
+        if [ $job_count -ge $MAX_PARALLEL ]; then
+            if [[ "$supports_wait_n" == "true" ]]; then
+                wait -n 2>/dev/null || true
+                ((job_count--))
+            else
+                # Bash without wait -n: drain the whole batch before refilling.
+                wait || true
+                job_count=0
+            fi
+        fi
     done
 
-    for pid in "${pids[@]}"; do
-        wait $pid
-    done
+    wait || true
 
     echo ""
     echo "=================================="

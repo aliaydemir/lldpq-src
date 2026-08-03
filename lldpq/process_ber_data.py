@@ -8,7 +8,6 @@ Licensed under MIT License - see LICENSE file for details
 """
 
 import os
-import re
 import sys
 import time
 from datetime import datetime
@@ -59,39 +58,6 @@ def parse_proc_net_dev(content):
                 continue
     
     return interfaces
-
-def process_detailed_counters(content, hostname):
-    """Process detailed interface counters (nv show interface counters output)"""
-    detailed_stats = {}
-    current_interface = None
-    
-    for line in content.split('\n'):
-        line = line.strip()
-        
-        # Look for interface headers
-        if line.startswith('Interface:') or 'Interface' in line and ':' in line:
-            interface_match = re.search(r'(\w+\d+)', line)
-            if interface_match:
-                current_interface = interface_match.group(1)
-                if current_interface not in detailed_stats:
-                    detailed_stats[current_interface] = {}
-        
-        # Parse counter values
-        if current_interface and ':' in line:
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                key = parts[0].strip().lower().replace(' ', '_').replace('-', '_')
-                value_str = parts[1].strip()
-                
-                # Extract numeric value
-                value_match = re.search(r'(\d+)', value_str)
-                if value_match:
-                    try:
-                        detailed_stats[current_interface][key] = int(value_match.group(1))
-                    except ValueError:
-                        pass
-    
-    return detailed_stats
 
 def process_ber_data_files(data_dir="monitor-results/ber-data"):
     """Process BER data files and update BER analyzer"""
@@ -148,7 +114,11 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             ):
                 if filename.endswith(suffix):
                     hostname = filename.removesuffix(suffix)
-                    if hostname not in active_hosts:
+                    # The detailed-counters extract is retired (monitor.sh
+                    # backs it up for rollback but no longer replaces it);
+                    # leftovers go regardless of host status.
+                    if (hostname not in active_hosts
+                            or suffix == "_detailed_counters.txt"):
                         try:
                             os.unlink(os.path.join(data_dir, filename))
                         except OSError as exc:
@@ -229,18 +199,6 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                     print(f"⚠️  No interface data found in {filename}")
                     processing_errors += 1
                     continue
-                
-                # Process detailed counters if available
-                detailed_file = os.path.join(data_dir, f"{hostname}_detailed_counters.txt")
-                detailed_stats = {}
-                if os.path.exists(detailed_file):
-                    try:
-                        with open(detailed_file, "r") as f:
-                            detailed_content = f.read().strip()
-                        detailed_stats = process_detailed_counters(detailed_content, hostname)
-                    except Exception as e:
-                        print(f"⚠️  Error processing detailed counters for {hostname}: {e}")
-                        processing_errors += 1
                 
                 # Process each interface with delta-based calculation
                 processed_interfaces = 0
@@ -403,6 +361,11 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     anomalies = ber_analyzer.detect_ber_anomalies(summary)
     if not ber_analyzer.save_ber_history():
         print("❌ BER history state could not be saved")
+        return False
+    # save_ber_history only rewrites hosts with current-run evidence; empty
+    # the persisted current snapshot of every other shard so consumers
+    # cannot read a stale collection as current.  History survives.
+    if not ber_analyzer.clear_stale_shard_current(hosts_with_interfaces):
         return False
 
     baseline_state = os.path.join(result_dir, "ber_baseline.json")

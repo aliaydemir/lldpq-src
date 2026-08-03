@@ -1133,6 +1133,7 @@
         let vlanProfiles = {};  // Global VLAN profiles
         let portProfiles = {};  // Global SW Port profiles
         let leakedSubnets = {};  // Subnet -> {target_vrf, route_map}
+        let editVlanInitialLeak = null;  // Leak state when the Edit VLAN modal opened: {subnet, route_map, target_vrf}
 
         // Helper: Escape a value for safe insertion into innerHTML / HTML attributes
         function escapeHtml(value) {
@@ -3129,9 +3130,16 @@
             const subnetForLeak = ipToNetwork(vp.vrr_vip || vp.ip);
             if (subnetForLeak && leakedSubnets[subnetForLeak]) {
                 const leakInfo = leakedSubnets[subnetForLeak];
+                // Remember the initial leak so saveVlanEdit can remove it when
+                // leaking is disabled or the leaked subnet changes
+                editVlanInitialLeak = {
+                    subnet: subnetForLeak,
+                    route_map: leakInfo.route_map,
+                    target_vrf: leakInfo.target_vrf
+                };
                 document.getElementById('edit-vlan-leaking-enabled').checked = true;
                 document.getElementById('edit-vlan-leaking-fields').classList.add('visible');
-                
+
                 // Load targets and select the current one
                 loadEditVlanLeakingTargets().then(() => {
                     const select = document.getElementById('edit-vlan-leak-target-vrf');
@@ -3143,10 +3151,11 @@
                     }
                 });
             } else {
+                editVlanInitialLeak = null;
                 document.getElementById('edit-vlan-leaking-enabled').checked = false;
                 document.getElementById('edit-vlan-leaking-fields').classList.remove('visible');
             }
-            
+
             modal.classList.add('visible');
         }
         
@@ -3261,41 +3270,72 @@
                 const result = await response.json();
                 
                 if (result.success) {
-                    // Handle leaking if enabled
+                    // Handle leaking changes (add / remove / re-point on subnet change)
                     let leakingMsg = '';
                     const leakingEnabled = document.getElementById('edit-vlan-leaking-enabled').checked;
                     const leakTargetSelect = document.getElementById('edit-vlan-leak-target-vrf');
                     const leakTargetVrf = leakTargetSelect.value;
                     const leakRouteMap = leakTargetSelect.selectedOptions[0]?.dataset?.routemap || '';
-                    
-                    if (leakingEnabled && leakTargetVrf && leakRouteMap && sviEnabled) {
-                        let subnet = '';
-                        if (vrrEnabled) {
-                            subnet = document.getElementById('edit-vlan-vrr-vip').value.trim();
-                        } else {
-                            subnet = document.getElementById('edit-vlan-gateway-ip').value.trim();
-                        }
-                        
-                        if (subnet) {
-                            const networkAddr = ipToNetwork(subnet);
-                            if (networkAddr) {
-                                try {
-                                    const leakResp = await fetch('/fabric-api.sh?action=add-subnet-leak', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({ subnet: networkAddr, route_map: leakRouteMap })
-                                    });
-                                    const leakResult = await leakResp.json();
-                                    if (leakResult.success && leakResult.count > 0) {
-                                        leakingMsg = `<p><strong>Leaking:</strong> ${networkAddr} → ${leakTargetVrf} (${leakResult.count} device(s))</p>`;
-                                    }
-                                } catch (e) {
-                                    console.error('Leaking error:', e);
+
+                    let networkAddr = '';
+                    if (sviEnabled) {
+                        const subnet = vrrEnabled
+                            ? document.getElementById('edit-vlan-vrr-vip').value.trim()
+                            : document.getElementById('edit-vlan-gateway-ip').value.trim();
+                        if (subnet) networkAddr = ipToNetwork(subnet) || '';
+                    }
+
+                    const wantsLeak = leakingEnabled && leakTargetVrf && leakRouteMap && sviEnabled && networkAddr;
+
+                    // Remove the old leak when leaking was enabled at open and is
+                    // now off, or when the subnet/route-map changed while enabled.
+                    // An empty leakRouteMap while still enabled means the target
+                    // list has not loaded - leave the existing leak untouched.
+                    if (editVlanInitialLeak &&
+                        (!leakingEnabled || !sviEnabled || networkAddr !== editVlanInitialLeak.subnet ||
+                         (leakRouteMap && leakRouteMap !== editVlanInitialLeak.route_map))) {
+                        try {
+                            const removeResp = await fetch('/fabric-api.sh?action=remove-subnet-leak', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ subnet: editVlanInitialLeak.subnet, route_map: editVlanInitialLeak.route_map })
+                            });
+                            const removeResult = await removeResp.json();
+                            if (removeResult.success) {
+                                if (removeResult.count > 0) {
+                                    leakingMsg += `<p><strong>Leaking removed:</strong> ${editVlanInitialLeak.subnet} (${removeResult.count} device(s))</p>`;
                                 }
+                                editVlanInitialLeak = null;
+                            } else {
+                                leakingMsg += `<p style="color: #ff6b6b;"><strong>Leaking removal failed:</strong> ${escapeHtml(removeResult.error || 'Unknown error')}</p>`;
                             }
+                        } catch (e) {
+                            console.error('Leaking error:', e);
+                            leakingMsg += `<p style="color: #ff6b6b;"><strong>Leaking removal failed:</strong> ${escapeHtml(e.message)}</p>`;
                         }
                     }
-                    
+
+                    if (wantsLeak) {
+                        try {
+                            const leakResp = await fetch('/fabric-api.sh?action=add-subnet-leak', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ subnet: networkAddr, route_map: leakRouteMap })
+                            });
+                            const leakResult = await leakResp.json();
+                            if (leakResult.success) {
+                                if (leakResult.count > 0) {
+                                    leakingMsg += `<p><strong>Leaking:</strong> ${networkAddr} → ${leakTargetVrf} (${leakResult.count} device(s))</p>`;
+                                }
+                            } else {
+                                leakingMsg += `<p style="color: #ff6b6b;"><strong>Leaking failed:</strong> ${escapeHtml(leakResult.error || 'Unknown error')}</p>`;
+                            }
+                        } catch (e) {
+                            console.error('Leaking error:', e);
+                            leakingMsg += `<p style="color: #ff6b6b;"><strong>Leaking failed:</strong> ${escapeHtml(e.message)}</p>`;
+                        }
+                    }
+
                     closeEditFormModal();
                     let msg = `<div style="color: #76b900; margin-bottom: 15px;">✓ VLAN "${data.profile_name}" updated successfully!</div>`;
                     if (leakingMsg) {
@@ -4198,7 +4238,10 @@
                 .filter(([name, _]) => name !== 'default')
                 .map(([name, config]) => ({
                     name: name,
-                    l3vni: config.vxlan_int || config.l3vni || '-'
+                    // Prefer the real L3VNI; label honestly when only the VXLAN
+                    // interface VLAN is available
+                    l3vni: config.l3vni || config.vxlan_int || '-',
+                    l3vniLabel: !config.l3vni && config.vxlan_int ? 'VXLAN Int' : 'L3VNI'
                 }));
             
             if (deviceVrfs.length === 0) {
@@ -4215,7 +4258,7 @@
                         <div class="vlan-edit-item">
                             <div class="vlan-edit-info">
                                 <span class="vlan-name">${escapeHtml(v.name)}</span>
-                                <span class="vlan-info">L3VNI: ${escapeHtml(v.l3vni)}</span>
+                                <span class="vlan-info">${v.l3vniLabel}: ${escapeHtml(v.l3vni)}</span>
                             </div>
                             <div class="vlan-edit-actions">
                                 <button class="btn-icon btn-icon-delete" onclick="closeEditVrfModal(); confirmUnassignVrf('${v.name}')" title="Remove from device">

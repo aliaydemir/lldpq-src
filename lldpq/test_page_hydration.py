@@ -102,10 +102,25 @@ class TableFilterFastPathTests(unittest.TestCase):
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             if "table-filter.js?v=" in text and \
-                    "table-filter.js?v=20260801-tf-4" not in text:
+                    "table-filter.js?v=20260803-tf-5" not in text:
                 stale.append(path.name)
         self.assertEqual(stale, [],
                          "stale table-filter.js cache version references")
+
+    def test_lifecycle_scope_cache_bust_bumped_everywhere(self):
+        # lifecycle-scope.js edits must bump the token here and at every
+        # reference so browsers never serve a stale cached copy.
+        stale = []
+        for path in list(SCRIPT_DIR.glob("*.py")) + list(
+                (SCRIPT_DIR.parent / "html").glob("*.html")):
+            if path.name.startswith("test_"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if "lifecycle-scope.js?v=" in text and \
+                    "lifecycle-scope.js?v=20260803-1" not in text:
+                stale.append(path.name)
+        self.assertEqual(stale, [],
+                         "stale lifecycle-scope.js cache version references")
 
 
 if __name__ == "__main__":

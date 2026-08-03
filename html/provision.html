@@ -4797,7 +4797,39 @@ async function loadUpgradeCandidates() {
     body.innerHTML = '<tr><td colspan="9" class="loading">Loading candidates...</td></tr>';
     if (!ztpLoaded) await loadZTPScript();
     syncUpgradeServerIPFromZTP();
-    const data = await apiCall('upgrade-candidates');
+    // upgrade-candidates streams NDJSON: one progress line per device, then a
+    // final line carrying the full payload with done:true.
+    let data = null;
+    try {
+        const resp = await fetch('/provision-api.sh?action=upgrade-candidates');
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let scanned = 0;
+        const handleLine = (line) => {
+            if (!line.trim()) return;
+            let obj;
+            try { obj = JSON.parse(line); } catch (e) { return; }
+            if (obj.done || obj.success === false) { data = obj; return; }
+            if (obj.device) {
+                scanned++;
+                body.innerHTML = `<tr><td colspan="9" class="loading">Scanning devices... ${scanned} checked (last: ${escHtml(obj.device)})</td></tr>`;
+            }
+        };
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop();
+            lines.forEach(handleLine);
+        }
+        buf += decoder.decode();
+        buf.split('\n').forEach(handleLine);
+        if (!data) data = { success: false, error: 'Stream ended without final payload' };
+    } catch (e) {
+        data = { success: false, error: e.message };
+    }
     if (!data.success) {
         body.innerHTML = `<tr><td colspan="9" style="color:#f44336;text-align:center;padding:20px;">${escHtml(data.error || 'Failed to load')}</td></tr>`;
         return;

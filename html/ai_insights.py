@@ -868,7 +868,8 @@ def _merge_stream_state(
 def _stream_history_shards(
     path: Path,
     callback: Callable[[str, Sequence[Any], int], None],
-) -> Tuple[str, _HistoryStreamState, int]:
+    deadline: Optional[float] = None,
+) -> Tuple[str, _HistoryStreamState, int, Optional[Tuple[int, int]]]:
     """Merge every per-device shard under ``path`` into one source view.
 
     Each shard fails closed on its own: an unreadable file contributes no
@@ -877,14 +878,24 @@ def _stream_history_shards(
     when no shard could be read at all.  A "partial" shard hit a finite
     processing limit after delivering validated series; its already-delivered
     data is kept and the limit flags are merged for disclosure.
+
+    ``deadline`` (time.monotonic seconds) is the caller's optional wall-clock
+    budget: once reached, remaining shards are not read and the stop is
+    reported as ``(shards_read, shard_total)`` for disclosure.
     """
     state = _HistoryStreamState()
-    shard_total = 0
+    shards = sorted(path.glob("*.json"))
+    shard_total = len(shards)
+    processed = 0
     readable = 0
     failed = 0
+    budget_stop: Optional[Tuple[int, int]] = None
     first_failure = "invalid"
-    for shard in sorted(path.glob("*.json")):
-        shard_total += 1
+    for shard in shards:
+        if deadline is not None and time.monotonic() >= deadline:
+            budget_stop = (processed, shard_total)
+            break
+        processed += 1
         shard_status, shard_state = _stream_history(
             shard, "history", (), callback
         )
@@ -895,9 +906,9 @@ def _stream_history_shards(
             continue
         readable += 1
         _merge_stream_state(state, shard_state)
-    if shard_total and not readable:
-        return first_failure, state, failed
-    return "loaded", state, failed
+    if processed and not readable:
+        return first_failure, state, failed, budget_stop
+    return "loaded", state, failed, budget_stop
 
 
 def _source_path(monitor_dir: Path, web_root: Optional[Path], filename: str) -> Path:
@@ -979,6 +990,22 @@ def _mark_failed_shards(record: Dict[str, Any], failed: int) -> Dict[str, Any]:
         record["detail"] = _bounded_text(
             (existing + "; " if existing else "")
             + "%d device shard(s) could not be read" % failed,
+            MAX_FIELD_CHARS,
+        )
+    return record
+
+
+def _mark_time_budget(
+    record: Dict[str, Any], budget_stop: Optional[Tuple[int, int]]
+) -> Dict[str, Any]:
+    """Disclose a shard sweep stopped by the caller's wall-clock budget."""
+    if budget_stop:
+        if record.get("status") in {"ok", "empty"}:
+            record["status"] = "partial"
+        existing = _bounded_text(record.get("detail"), MAX_FIELD_CHARS)
+        record["detail"] = _bounded_text(
+            (existing + "; " if existing else "")
+            + "time budget reached after %d of %d shards" % budget_stop,
             MAX_FIELD_CHARS,
         )
     return record
@@ -1254,7 +1281,7 @@ def _health_severity(value: Any) -> str:
     return "info"
 
 
-def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _extract_optical(path: Path, start: float, now: float, max_age: int, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     events = _EventAccumulator()
     sample_count = 0
     earliest: Optional[float] = None
@@ -1310,9 +1337,10 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
     # The optical history is sharded per device (one JSON document per host
     # under optical-history/); a plain file is the pre-shard monolith.
     failed_shards = 0
+    budget_stop = None
     if path.is_dir():
-        load_status, stream_state, failed_shards = _stream_history_shards(
-            path, consume_series
+        load_status, stream_state, failed_shards, budget_stop = _stream_history_shards(
+            path, consume_series, deadline
         )
     else:
         load_status, stream_state = _stream_history(
@@ -1323,9 +1351,9 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
             "optical", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_failed_shards(
+        return [], _mark_time_budget(_mark_failed_shards(
             _mark_stream_limits(failure, stream_state), failed_shards
-        )
+        ), budget_stop)
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1348,6 +1376,7 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int) -> Tupl
     )
     result = _mark_stream_limits(result, stream_state)
     result = _mark_failed_shards(result, failed_shards)
+    result = _mark_time_budget(result, budget_stop)
     return events.values(), result
 
 
@@ -1375,7 +1404,7 @@ def _normalized_ber_grade(record: Mapping[str, Any]) -> str:
     return max(candidates, key=lambda value: priority.get(value, 0)) if candidates else ""
 
 
-def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _extract_ber(path: Path, start: float, now: float, max_age: int, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     events = _EventAccumulator()
     sample_count = 0
     earliest: Optional[float] = None
@@ -1456,9 +1485,10 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
     # The BER history is sharded per device (one JSON document per host
     # under ber-history/); a plain file is the pre-shard monolith.
     failed_shards = 0
+    budget_stop = None
     if path.is_dir():
-        load_status, stream_state, failed_shards = _stream_history_shards(
-            path, consume_series
+        load_status, stream_state, failed_shards, budget_stop = _stream_history_shards(
+            path, consume_series, deadline
         )
     else:
         load_status, stream_state = _stream_history(
@@ -1469,9 +1499,9 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
             "ber", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_failed_shards(
+        return [], _mark_time_budget(_mark_failed_shards(
             _mark_stream_limits(failure, stream_state), failed_shards
-        )
+        ), budget_stop)
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1495,6 +1525,7 @@ def _extract_ber(path: Path, start: float, now: float, max_age: int) -> Tuple[Li
     )
     result = _mark_stream_limits(result, stream_state)
     result = _mark_failed_shards(result, failed_shards)
+    result = _mark_time_budget(result, budget_stop)
     return events.values(), result
 
 
@@ -1636,7 +1667,7 @@ def _extract_flaps(path: Path, start: float, now: float, max_age: int) -> Tuple[
     return events.values(), result
 
 
-def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _extract_congestion(path: Path, start: float, now: float, max_age: int, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     events = _EventAccumulator()
     sample_count = 0
     earliest: Optional[float] = None
@@ -1693,9 +1724,10 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
     # The PFC/ECN history is sharded per device (one JSON document per host
     # under pfc-ecn-history/); a plain file is the pre-shard monolith.
     failed_shards = 0
+    budget_stop = None
     if path.is_dir():
-        load_status, stream_state, failed_shards = _stream_history_shards(
-            path, consume_series
+        load_status, stream_state, failed_shards, budget_stop = _stream_history_shards(
+            path, consume_series, deadline
         )
     else:
         load_status, stream_state = _stream_history(
@@ -1706,9 +1738,9 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
             "pfc_ecn", load_status, 0, 0, None, start,
             truncated=stream_state.truncated,
         )
-        return [], _mark_failed_shards(
+        return [], _mark_time_budget(_mark_failed_shards(
             _mark_stream_limits(failure, stream_state), failed_shards
-        )
+        ), budget_stop)
     incomplete_series = bool(
         incomplete_series
         or stream_state.invalid_series
@@ -1732,6 +1764,7 @@ def _extract_congestion(path: Path, start: float, now: float, max_age: int) -> T
     )
     result = _mark_stream_limits(result, stream_state)
     result = _mark_failed_shards(result, failed_shards)
+    result = _mark_time_budget(result, budget_stop)
     return events.values(), result
 
 
@@ -1854,6 +1887,7 @@ def build_timeline(
     max_events: int = 200,
     correlation_seconds: int = 180,
     max_source_age_seconds: int = 1800,
+    time_budget_seconds: Any = None,
 ) -> Dict[str, Any]:
     """Build a deterministic operational timeline from bounded history files.
 
@@ -1861,6 +1895,10 @@ def build_timeline(
     ``ValueError`` rather than silently broadening how much history is read.
     Missing or malformed sources are represented in ``coverage`` and never
     interpreted as healthy or as "no events".
+
+    ``time_budget_seconds`` optionally bounds the fabric-wide per-device
+    shard sweeps: once exceeded, remaining shards are not read and every
+    affected source is marked partial with an explicit disclosure.
     """
     if window not in WINDOW_SECONDS:
         raise ValueError("unsupported timeline window")
@@ -1878,6 +1916,15 @@ def build_timeline(
         or not 1 <= max_source_age_seconds <= WINDOW_SECONDS["7d"]
     ):
         raise ValueError("max_source_age_seconds must be between 1 and 604800")
+    deadline: Optional[float] = None
+    if time_budget_seconds is not None:
+        if (
+            isinstance(time_budget_seconds, bool)
+            or not isinstance(time_budget_seconds, (int, float))
+            or not 1 <= time_budget_seconds <= 3600
+        ):
+            raise ValueError("time_budget_seconds must be between 1 and 3600")
+        deadline = time.monotonic() + float(time_budget_seconds)
     current = _now_epoch(now)
     start = current - WINDOW_SECONDS[window]
     monitor = Path(os.fspath(monitor_dir))
@@ -1890,11 +1937,19 @@ def build_timeline(
         ("flaps", _extract_flaps, _source_path(monitor, web, "flap_history.json")),
         ("pfc_ecn", _extract_congestion, _pfc_history_source(monitor, web)),
     ]
+    # Only the sharded per-device histories honor the optional wall-clock
+    # budget; the monolith sources are single bounded reads.
+    budgeted = {_extract_optical, _extract_ber, _extract_congestion}
     all_events: List[Dict[str, Any]] = []
     coverage: List[Dict[str, Any]] = []
     for source_name, extractor, path in jobs:
         try:
-            events, source_coverage = extractor(path, start, current, max_source_age_seconds)
+            if deadline is not None and extractor in budgeted:
+                events, source_coverage = extractor(
+                    path, start, current, max_source_age_seconds, deadline=deadline
+                )
+            else:
+                events, source_coverage = extractor(path, start, current, max_source_age_seconds)
         except Exception as error:
             # One misbehaving source must not blank the whole timeline; keep
             # the healthy sources and disclose the failure in coverage.

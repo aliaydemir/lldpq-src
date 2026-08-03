@@ -287,6 +287,15 @@ def build_attachment(
         int(row["vni"]) for row in evi_rows
         if isinstance(row, Mapping) and isinstance(row.get("vni"), int)
     })
+    # A failed BGP sub-collection leaves this host's bgp_esi/bgp_es_evi
+    # views empty; correlating peers against them would fabricate
+    # vni_mismatch/bgp_missing warnings for healthy shared ESes.
+    errors = [str(error) for error in snapshot.get("errors") or []]
+    bgp_partial = any(
+        error in ("EVPN_MH_BGP_ESI", "EVPN_MH_BGP_ES_EVI")
+        or error.startswith("BGP_ESI_JSON:")
+        for error in errors
+    )
     inconsistent = (
         int(bgp_item.get("inconsistent-vni-count") or 0) > 0
         or any("I" in str(row.get("flags", "")) for row in evi_rows)
@@ -329,6 +338,7 @@ def build_attachment(
         "num_ports": ad_info.get("num_ports", ""),
         "inconsistent": inconsistent,
         "bgp_present": bool(bgp_item),
+        "bgp_partial": bgp_partial,
         "originator_ip": str(bgp_item.get("originator-ip", "")),
         "rd": str(bgp_item.get("rd", "")),
         "collection_partial": bool(snapshot.get("errors")),
@@ -374,8 +384,18 @@ def correlate_snapshots(
             if item["oper_up"]
         )
         vni_sets = {tuple(item["vnis"]) for item in attachments}
-        vni_mismatch = len(vni_sets) > 1
-        bgp_missing = any(not item["bgp_present"] for item in attachments)
+        # A peer whose BGP sub-collection failed contributes an empty BGP
+        # view; comparing against it fabricates mismatches, so these two
+        # checks are suppressed for the ESes involving that host.
+        bgp_view_partial = any(item["bgp_partial"] for item in attachments)
+        vni_mismatch = not bgp_view_partial and len(vni_sets) > 1
+        bgp_missing = not bgp_view_partial and any(
+            not item["bgp_present"] for item in attachments
+        )
+        suppressed_bgp_checks = bgp_view_partial and (
+            len(vni_sets) > 1
+            or any(not item["bgp_present"] for item in attachments)
+        )
 
         if collision or inconsistent or dual_df_conflict or no_df_conflict:
             status = "critical"
@@ -385,6 +405,10 @@ def correlate_snapshots(
             status = "inactive"
         elif orphan or not all_remote or lacp_degraded or vni_mismatch or bgp_missing:
             status = "warning"
+        elif suppressed_bgp_checks:
+            # Informational, not a warning: the coverage banner already
+            # discloses the partial collection.
+            status = "partial_data"
         else:
             status = "healthy"
 
@@ -411,6 +435,10 @@ def correlate_snapshots(
             reasons.append("VNI membership mismatch")
         if bgp_missing:
             reasons.append("BGP ES record missing")
+        if suppressed_bgp_checks:
+            reasons.append(
+                "partial BGP collection on a peer; VNI/BGP checks skipped"
+            )
         if not reasons:
             reasons.append("operational and synchronized")
 
@@ -930,7 +958,7 @@ filterRows();
 recountSeverityCards();
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 <script src="/css/analysis-guard.js?v=20260710-evpn-mh"></script>
 </body></html>"""
 

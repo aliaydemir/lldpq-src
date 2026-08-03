@@ -4763,19 +4763,9 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
             echo "  • SSH keys (~/.ssh/id_*)"
         fi
 
-        # Monitoring data snapshot (may hold root-owned files from cron).
-        for _d in monitor-results lldp-results alert-states assets.ini; do
-            _backup_copy "$LLDPQ_INSTALL_DIR/$_d" "$BACKUP_DIR/" "$_d/" || exit 1
-        done
-
         # The README promises that configuration history is included when a
         # full backup is explicitly requested.
         _backup_copy "$LLDPQ_INSTALL_DIR/.git" "$BACKUP_DIR/lldpq-git-history" ".git history" || exit 1
-
-        printf 'LLDPq requested backup completed at %s\n' "$(date -Is)" > "$BACKUP_DIR/COMPLETE"
-        test -s "$BACKUP_DIR/COMPLETE" || exit 1
-
-        echo "  Backup complete"
     else
         echo "  Skipping full backup (monitoring data is still preserved across the update)"
     fi
@@ -4887,6 +4877,21 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # self-deadlock when the root recovery service takes the same lock.
     release_update_config_lock
 
+    # Snapshot the live runtime trees only now that collection and web writers
+    # are quiesced/locked out; copying them earlier raced the periodic publish
+    # and aborted the update on files that vanished mid-copy.
+    if [[ "$_do_backup" == "true" ]]; then
+        # Monitoring data snapshot (may hold root-owned files from cron).
+        for _d in monitor-results lldp-results alert-states assets.ini; do
+            _backup_copy "$LLDPQ_INSTALL_DIR/$_d" "$BACKUP_DIR/" "$_d/" || exit 1
+        done
+
+        printf 'LLDPq requested backup completed at %s\n' "$(date -Is)" > "$BACKUP_DIR/COMPLETE"
+        test -s "$BACKUP_DIR/COMPLETE" || exit 1
+
+        echo "  Backup complete"
+    fi
+
     _data_preserve_failed=false
     for _d in monitor-results lldp-results alert-states assets.ini; do
         if [[ -e "$LLDPQ_INSTALL_DIR/$_d" ]] && \
@@ -4981,6 +4986,10 @@ fi
 echo "  - Copying html/* to $WEB_ROOT/"
 sudo cp -r html/* "$WEB_ROOT/"
 
+# A development tree can carry compiled bytecode in html/__pycache__; never
+# leave it published under the web root.
+sudo rm -rf -- "$WEB_ROOT/__pycache__"
+
 # The former Commissioning/Handed Over overview was replaced by the per-tab
 # Analysis Scope filter. In-place updates do not otherwise remove files that
 # disappeared from html/, so explicitly retire the obsolete deployed page.
@@ -5020,9 +5029,9 @@ sudo chmod 664 "$WEB_ROOT/VERSION"
 echo "  - Setting permissions on web directories"
 sudo chmod o+rx /var/www 2>/dev/null || true
 sudo chown -R "$LLDPQ_USER:www-data" "$WEB_ROOT/"
-sudo find "$WEB_ROOT" -type d -exec chmod 775 {} \;
-sudo find "$WEB_ROOT" -type f -exec chmod 664 {} \;
-sudo find "$WEB_ROOT" -name '*.sh' -exec chmod 775 {} \;
+sudo find "$WEB_ROOT" -type d -exec chmod 775 {} +
+sudo find "$WEB_ROOT" -type f -exec chmod 664 {} +
+sudo find "$WEB_ROOT" -name '*.sh' -exec chmod 775 {} +
 sudo mkdir -p "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
     "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 "$WEB_ROOT/.locks"
@@ -5316,8 +5325,8 @@ sudo chmod 750 "$LLDPQ_INSTALL_DIR"
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/devices.yaml" 2>/dev/null || true
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/tracking.yaml" 2>/dev/null || true
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/notifications.yaml" 2>/dev/null || true
-sudo find "$LLDPQ_INSTALL_DIR" -name '*.sh' -exec chmod 755 {} \;
-sudo find "$LLDPQ_INSTALL_DIR" -name '*.py' -exec chmod 755 {} \;
+sudo find "$LLDPQ_INSTALL_DIR" -name '*.sh' -exec chmod 755 {} +
+sudo find "$LLDPQ_INSTALL_DIR" -name '*.py' -exec chmod 755 {} +
 sudo mkdir -p "$LLDPQ_INSTALL_DIR/monitor-results/fabric-tables"
 sudo chmod 750 "$LLDPQ_INSTALL_DIR/monitor-results"
 sudo chmod 750 "$LLDPQ_INSTALL_DIR/monitor-results/fabric-tables"
@@ -6382,8 +6391,8 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/alert-states" 2>/dev/null || true
         sudo chown "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/assets.ini" 2>/dev/null || true
         sudo chmod 664 "$LLDPQ_INSTALL_DIR/assets.ini" 2>/dev/null || true
-        sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type d -exec chmod 775 {} \; 2>/dev/null || true
-        sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type f -exec chmod 664 {} \; 2>/dev/null || true
+        sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type d -exec chmod 775 {} + 2>/dev/null || true
+        sudo find "$LLDPQ_INSTALL_DIR/monitor-results" -type f -exec chmod 664 {} + 2>/dev/null || true
         if find "$_DATA_PRESERVE" -mindepth 1 -print -quit 2>/dev/null | grep -q .; then
             echo "[!] Preserved runtime directory is not empty; refusing to delete it: $_DATA_PRESERVE" >&2
             exit 1
@@ -6646,6 +6655,33 @@ echo "  Source provenance saved to $LLDPQ_SOURCE_MANIFEST"
 if [[ "$INSTALL_MODE" == "update" ]]; then
     if ! lldpq_install_exit_handler 0 return; then
         exit 1
+    fi
+fi
+
+# The update replaced the telemetry/ tree; a stack that was already running
+# keeps serving the previous shipped configuration until its containers are
+# recreated. Best-effort only — never fail the committed update over this.
+if [[ "$INSTALL_MODE" == "update" ]] && \
+   [[ "${_SAVE_TELEMETRY_ENABLED:-}" == "true" ]] && \
+   [[ -f "$LLDPQ_INSTALL_DIR/telemetry/docker-compose.yaml" ]] && \
+   command -v docker >/dev/null 2>&1; then
+    if docker ps --filter "name=lldpq-prometheus" --format "{{.Status}}" 2>/dev/null | grep -q "Up" || \
+       sudo docker ps --filter "name=lldpq-prometheus" --format "{{.Status}}" 2>/dev/null | grep -q "Up"; then
+        echo "  Restarting telemetry stack with the updated configuration..."
+        cd "$LLDPQ_INSTALL_DIR/telemetry"
+        if docker compose up -d 2>&1; then
+            :
+        elif docker-compose up -d 2>&1; then
+            :
+        elif sudo docker compose up -d 2>&1; then
+            :
+        elif sudo docker-compose up -d 2>&1; then
+            :
+        else
+            echo "  [!] Could not restart the telemetry stack. Apply manually:"
+            echo "      cd $LLDPQ_INSTALL_DIR/telemetry && sudo docker compose up -d"
+        fi
+        cd - > /dev/null
     fi
 fi
 

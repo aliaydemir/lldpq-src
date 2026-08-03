@@ -652,27 +652,28 @@ trap 'exit 143' TERM
 PING="ping"
 
 ping_test() {
-    local device="$1" hostname="$2"
-    if ! "$PING" -c 1 -W 0.5 "$device" >/dev/null 2>&1; then
-        printf '%s\t%s\n' "$device" "$hostname" >> "$UNREACHABLE_FILE"
-        return 1
-    fi
+    local device="$1"
+    "$PING" -c 1 -W 0.5 "$device" >/dev/null 2>&1
 }
 
 execute_commands() {
-    local device="$1" user="$2" hostname="$3"
-    local yaml_temp set_temp
+    local device="$1" user="$2" hostname="$3" ping_reachable="${4:-true}"
+    local yaml_temp set_temp connect_timeout=10
 
     if ! safe_config_filename "$hostname"; then
         echo "Invalid hostname for config filename: '$hostname'" >&2
         return 1
     fi
 
+    # ICMP is only a fast hint; a ping-failed host still gets the
+    # authoritative SSH attempt, just with a tighter connect bound.
+    [[ "$ping_reachable" == "false" ]] && connect_timeout=5
+
     yaml_temp="$STAGING_DIR/nv-yaml/.${hostname}.yaml.tmp.$$"
     set_temp="$STAGING_DIR/nv-set/.${hostname}.txt.tmp.$$"
 
     if timeout --signal=TERM --kill-after=5 "$GET_CONFIGS_SSH_TIMEOUT" \
-        ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
+        ssh -q -o BatchMode=yes -o ConnectTimeout="$connect_timeout" \
         -o ServerAliveInterval=10 -o ServerAliveCountMax=2 \
         -o StrictHostKeyChecking=no \
         "${user}@${device}" "sudo cat /etc/nvue.d/startup.yaml" \
@@ -681,7 +682,7 @@ execute_commands() {
         : > "$STAGING_DIR/status/${hostname}.yaml.ok"
 
         if timeout --signal=TERM --kill-after=5 "$GET_CONFIGS_SSH_TIMEOUT" \
-            ssh -q -o BatchMode=yes -o ConnectTimeout=10 \
+            ssh -q -o BatchMode=yes -o ConnectTimeout="$connect_timeout" \
             -o ServerAliveInterval=10 -o ServerAliveCountMax=2 \
             -o StrictHostKeyChecking=no \
             "${user}@${device}" "nv config show -o commands" \
@@ -701,9 +702,14 @@ execute_commands() {
 }
 
 process_device() {
-    local device="$1" user="$2" hostname="$3"
-    ping_test "$device" "$hostname" || return 1
-    execute_commands "$device" "$user" "$hostname"
+    local device="$1" user="$2" hostname="$3" ping_reachable=true
+    # ICMP is only a hint: unreachable is classified from the SSH result,
+    # never from a single dropped echo.
+    ping_test "$device" || ping_reachable=false
+    if ! execute_commands "$device" "$user" "$hostname" "$ping_reachable"; then
+        printf '%s\t%s\n' "$device" "$hostname" >> "$UNREACHABLE_FILE"
+        return 1
+    fi
 }
 
 wait_for_slot() {

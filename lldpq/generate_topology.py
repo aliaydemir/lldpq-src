@@ -11,6 +11,7 @@ Copyright (c) 2024 LLDPq Project
 Licensed under MIT License - see LICENSE file for details
 """
 import argparse
+import fnmatch
 import os
 import re
 import json
@@ -257,10 +258,12 @@ def parse_endpoint_hosts(devices_yaml_path):
                 continue
             entry = entry.strip()
             if '*' in entry:
-                # Convert glob pattern to regex
-                # *dgx* -> .*dgx.*
-                regex_pattern = entry.replace('*', '.*')
-                patterns.append(re.compile(f'^{regex_pattern}$', re.IGNORECASE))
+                # Convert glob pattern to regex (fnmatch escapes other
+                # regex metacharacters so one bad entry cannot abort the run)
+                try:
+                    patterns.append(re.compile(fnmatch.translate(entry), re.IGNORECASE))
+                except re.error as exc:
+                    print(f"Warning: skipping invalid endpoint_hosts pattern '{entry}': {exc}")
             else:
                 host_names.add(entry)
     except (FileNotFoundError, yaml.YAMLError):
@@ -558,6 +561,8 @@ def parse_lldp_results(
            node["name"] not in reachable_devices and \
            node["icon"] not in ("server", "host", "firewall"):
             node["icon"] = "unknown"
+            # Explicit flag so the UI can tell a dead switch from an endpoint
+            node["unreachable"] = True
 
     return topology_data, device_nodes, link_id, all_lldp_links_found, all_port_status, all_port_speed
 
@@ -738,7 +743,7 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
             temp_path = file.name
             os.fchmod(
                 file.fileno(),
-                stat.S_IMODE(existing_stat.st_mode) if existing_stat else 0o664,
+                (stat.S_IMODE(existing_stat.st_mode) | 0o644) if existing_stat else 0o664,
             )
             if existing_stat and hasattr(os, "fchown"):
                 try:

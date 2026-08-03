@@ -31,9 +31,11 @@
     var deviceMap = {};                              // lower(realName) -> device alias
     var interfaceMap = {};                           // lower(realName) -> interface alias
     var fallbackMap = {};                            // only keys unambiguous across both maps
+    var aliasCount = 0;                              // total entries across both maps
     var loaded = false;
     var observer = null;
     var pending = false;
+    var pendingRoots = [];                           // mutated subtree roots; null => full pass
     var aliasLoadSeq = 0;
 
     function loadAliases(done) {
@@ -69,39 +71,49 @@
                     }
                 });
                 deviceMap = devices; interfaceMap = interfaces; fallbackMap = fallback;
+                aliasCount = Object.keys(devices).length + Object.keys(interfaces).length;
                 loaded = true; if (done) done();
             })
             .catch(function () {
                 if (seq !== aliasLoadSeq) return;
-                deviceMap = {}; interfaceMap = {}; fallbackMap = {}; loaded = true; if (done) done();
+                deviceMap = {}; interfaceMap = {}; fallbackMap = {}; aliasCount = 0;
+                loaded = true; if (done) done();
             });
     }
 
     // Explicitly tagged elements may live inside a compound table cell. Untagged
     // pages keep the legacy exact-leaf matching behaviour.
-    function leafCells() {
-        var out = [];
-        var seen = new Set();
-        var explicit = document.querySelectorAll('[data-p2p-key]');
+    function addLeafCells(td, out, seen) {
+        if (td.childElementCount === 0) {
+            if (!seen.has(td)) { out.push(td); seen.add(td); }
+            return;
+        }
+        var kids = td.querySelectorAll('*');
+        for (var j = 0; j < kids.length; j++) {
+            if (kids[j].childElementCount === 0 && !seen.has(kids[j])) {
+                out.push(kids[j]);
+                seen.add(kids[j]);
+            }
+        }
+    }
+
+    function collectLeafCells(scope, out, seen) {
+        if (scope.matches && scope.matches('[data-p2p-key]') && !seen.has(scope)) {
+            out.push(scope);
+            seen.add(scope);
+        }
+        var explicit = scope.querySelectorAll('[data-p2p-key]');
         for (var e = 0; e < explicit.length; e++) {
-            out.push(explicit[e]);
-            seen.add(explicit[e]);
+            if (!seen.has(explicit[e])) { out.push(explicit[e]); seen.add(explicit[e]); }
         }
-        var tds = document.querySelectorAll('table td, table th');
-        for (var i = 0; i < tds.length; i++) {
-            var td = tds[i];
-            if (td.childElementCount === 0) {
-                if (!seen.has(td)) out.push(td);
-                continue;
-            }
-            var kids = td.querySelectorAll('*');
-            for (var j = 0; j < kids.length; j++) {
-                if (kids[j].childElementCount === 0 && !seen.has(kids[j])) {
-                    out.push(kids[j]);
-                }
-            }
+        // A scan root inside (or at) a single table cell only needs that cell.
+        var owner = scope.closest ? scope.closest('td, th') : null;
+        if (owner) {
+            addLeafCells(owner, out, seen);
+            return;
         }
-        return out;
+        var tds = scope.querySelectorAll('table td, table th');
+        for (var i = 0; i < tds.length; i++) addLeafCells(tds[i], out, seen);
     }
 
     function saveTitle(el, canonical) {
@@ -216,7 +228,7 @@
         for (var i = 0; i < applied.length; i++) restoreAppliedElement(applied[i]);
     }
 
-    function apply() {
+    function apply(roots) {
         if (!loaded) return;
         if (observer) observer.disconnect();      // avoid reacting to our own edits
         if (!on) {
@@ -224,11 +236,22 @@
             connectObserver();
             return;
         }
+        // Empty alias maps can never match anything: skip scanning entirely and
+        // leave the observer disconnected until a future reload provides maps.
+        if (aliasCount === 0) return;
         var context = {
             headersByTable: new WeakMap(),
             hasExplicitNamespaces: !!document.querySelector('[data-p2p-namespace]')
         };
-        var cells = leafCells();
+        var cells = [];
+        var seen = new Set();
+        if (roots && roots.length) {
+            for (var r = 0; r < roots.length; r++) {
+                if (roots[r].isConnected) collectLeafCells(roots[r], cells, seen);
+            }
+        } else {
+            collectLeafCells(document, cells, seen);
+        }
         for (var i = 0; i < cells.length; i++) {
             var el = cells[i];
             if (el.getAttribute('data-p2p-applied') === 'true') continue;
@@ -255,14 +278,38 @@
         connectObserver();
     }
 
+    // Collect the mutated subtree roots so the debounced apply() pass scans
+    // only what changed instead of the whole document. Large batches fall
+    // back to a full pass (pendingRoots === null).
+    function onMutations(muts) {
+        if (pendingRoots !== null) {
+            for (var i = 0; i < muts.length && pendingRoots !== null; i++) {
+                var added = muts[i].addedNodes;
+                for (var j = 0; j < added.length; j++) {
+                    var el = added[j].nodeType === 1 ? added[j] : added[j].parentElement;
+                    if (el) pendingRoots.push(el);
+                    if (pendingRoots.length > 64) { pendingRoots = null; break; }
+                }
+            }
+        }
+        // Removal-only batches leave nothing new to alias.
+        if (pendingRoots && pendingRoots.length === 0) return;
+        scheduleApply();
+    }
+
     function scheduleApply() {
         if (pending) return;
         pending = true;
-        setTimeout(function () { pending = false; apply(); }, 150);
+        setTimeout(function () {
+            pending = false;
+            var roots = pendingRoots;
+            pendingRoots = [];
+            apply(roots || undefined);
+        }, 150);
     }
 
     function connectObserver() {
-        if (!observer) observer = new MutationObserver(scheduleApply);
+        if (!observer) observer = new MutationObserver(onMutations);
         observer.observe(document.body, { childList: true, subtree: true });
     }
 

@@ -195,11 +195,29 @@ def load_assets_payload(
     }
 
 
+def _cron_interval_minutes(schedule: str) -> float:
+    """Interval of an every-N-minutes cron preset; 0 when unrecognized."""
+
+    fields = schedule.split()
+    if len(fields) == 5 and fields[1:] == ["*", "*", "*", "*"]:
+        minute = fields[0]
+        if minute.startswith("*/") and minute[2:].isdigit():
+            return float(minute[2:])
+    return 0.0
+
+
 def configured_max_age_seconds() -> float:
     """Read the shared freshness policy used by monitoring consumers."""
 
+    raw = os.environ.get("MONITOR_DATA_MAX_AGE_MINUTES")
+    if raw is None:
+        # No explicit policy: follow the collection cadence (two missed runs)
+        # so slower presets such as */30 are not flagged stale by a fixed
+        # 30-minute ceiling. 30 minutes stays the floor.
+        interval = _cron_interval_minutes(os.environ.get("LLDPQ_CRON", ""))
+        return max(interval * 2.0, 30.0) * 60.0
     try:
-        minutes = float(os.environ.get("MONITOR_DATA_MAX_AGE_MINUTES", "30"))
+        minutes = float(raw)
         if not math.isfinite(minutes):
             raise ValueError("non-finite maximum age")
     except ValueError:

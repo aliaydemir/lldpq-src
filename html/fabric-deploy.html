@@ -1080,11 +1080,18 @@
             return null;
         }
         
-        // Apply the most recent scan result (server cron cache preferred, then local cache).
+        // Apply the most recent scan result (newer of server cron cache and local cache).
         // Provides an instant view that survives reload and shows the "last scan" age.
         async function applyScanCache() {
+            // Prefer the newer of the two caches: a deploy that just cleared
+            // badges (saved locally) must not be resurrected by an older
+            // nightly server scan.
             let cache = await loadServerCache();
-            if (!cache) cache = loadScanCache();
+            const local = loadScanCache();
+            if (local && Array.isArray(local.pendingDevices) &&
+                (!cache || (local.timestamp || 0) > (cache.timestamp || 0))) {
+                cache = local;
+            }
             if (!cache || !Array.isArray(cache.pendingDevices)) return false;
 
             scanModifiedDevices = new Set(cache.pendingDevices);
@@ -1742,6 +1749,18 @@
         
         async function ansibleApiCall(action, hosts) {
             const params = new URLSearchParams({ action });
+            // Whole-fabric host lists overflow the URL limit (nginx 414): the
+            // backend accepts the same comma-joined list as POST body JSON for
+            // these actions, with the action kept in the query string.
+            if (hosts && hosts.length > 2048 &&
+                (action === 'diff' || action === 'deploy' || action === 'generate')) {
+                const response = await fetch(`/ansible-api?${params}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ host: hosts })
+                });
+                return await response.json();
+            }
             if (hosts) params.append('host', hosts);
             const response = await fetch(`/ansible-api?${params}`);
             return await response.json();
@@ -2084,6 +2103,13 @@
         // Ask the validator whether the generated dir is missing/stale before deploying.
         // Advisory only (matches the mtime-based backend gate) - returns generate_state or null.
         async function checkGenerateState(hosts) {
+            // edit-config only takes the device list via GET; a whole-fabric
+            // list would 414, so skip this advisory probe for oversized lists
+            // (same net effect as the failed fetch it replaces).
+            if (hosts && hosts.length > 2048) {
+                console.warn('[checkGenerateState] host list too long for GET; skipping advisory check');
+                return null;
+            }
             try {
                 const response = await fetch(`/edit-config?action=validate&devices=${encodeURIComponent(hosts)}`);
                 const data = await response.json();
@@ -2137,6 +2163,7 @@
                     gitModifiedDevices.delete(hostname);
                 }
             }
+            saveScanCache(scanModifiedDevices);  // persist so a reload cannot resurrect cleared badges
             rebuildModifiedDevices();
             renderDeviceList();
             updateSummaryCards();
@@ -2289,6 +2316,7 @@
                         gitModifiedDevices.delete(hostname);
                     }
                 }
+                saveScanCache(scanModifiedDevices);  // persist so a reload cannot resurrect cleared badges
                 rebuildModifiedDevices();
                 renderDeviceList();
                 updateSummaryCards();

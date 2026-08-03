@@ -276,6 +276,19 @@ apply_monitor_tuning() {
             fi
             ;;
     esac
+
+    # Systemic-failure abort threshold: isolated 'failed' devices are
+    # contained (their not-current outcome gates the analyzers), and the run
+    # aborts only when failed devices exceed this percentage of the
+    # dispatched inventory with at least 2 devices failed.
+    LLDPQ_COLLECTION_FAILURE_ABORT_PCT="${LLDPQ_COLLECTION_FAILURE_ABORT_PCT:-10}"
+    case "$LLDPQ_COLLECTION_FAILURE_ABORT_PCT" in
+        ''|*[!0-9]*|????*) LLDPQ_COLLECTION_FAILURE_ABORT_PCT=10 ;;
+        *)
+            # Force decimal so leading zeros cannot trip octal arithmetic.
+            LLDPQ_COLLECTION_FAILURE_ABORT_PCT=$((10#$LLDPQ_COLLECTION_FAILURE_ABORT_PCT))
+            ;;
+    esac
 }
 apply_monitor_tuning
 if [[ "$MONITOR_SCOPE" == "optical" && "$SKIP_OPTICAL" == "true" ]]; then
@@ -1030,10 +1043,20 @@ write_report_state_marker() {
 
 mark_reports_stale() {
     local reason=$1
-    local failure_time
+    local failure_time failure_log_lines
     failure_time=$(date -Is) || return 1
     write_report_state_marker stale "$failure_time" "$reason" || return 1
     printf '%s %s\n' "$failure_time" "$reason" >> "$SCRIPT_DIR/monitor-failures.log"
+    # Bound the failure history; this log only ever grows otherwise.
+    failure_log_lines=$(wc -l < "$SCRIPT_DIR/monitor-failures.log" 2>/dev/null) || \
+        failure_log_lines=0
+    if (( failure_log_lines > 1000 )); then
+        tail -n 1000 "$SCRIPT_DIR/monitor-failures.log" \
+                > "$SCRIPT_DIR/monitor-failures.log.tmp.$$" &&
+            mv -f "$SCRIPT_DIR/monitor-failures.log.tmp.$$" \
+                "$SCRIPT_DIR/monitor-failures.log" ||
+            rm -f -- "$SCRIPT_DIR/monitor-failures.log.tmp.$$"
+    fi
     if [[ "$scoped_run" == "true" ]]; then
         echo "Monitoring scope '$MONITOR_SCOPE' failed; last-known-good web reports were preserved: $reason" >&2
     else
@@ -1081,6 +1104,27 @@ preflight_publish_disk_space() {
         mark_reports_stale "disk_full: publish staging needs ~$(( required_kb / 1024 ))MB on $WEB_ROOT, $(( available_kb / 1024 ))MB available"
         return 1
     fi
+    return 0
+}
+
+prune_orphaned_publish_stages() {
+    # SIGKILL/OOM/power loss between publish staging and activation leaves
+    # $WEB_ROOT/.monitor-results.new.* trees (and their .previous rollback
+    # copies) behind until they trip the disk_full preflight. The global
+    # monitor lock is held, so no concurrent publisher owns any stage tree;
+    # only trees older than 2 hours are removed, and never while the
+    # published tree itself is missing (a retained .previous may then be the
+    # only copy of the last-known-good web reports).
+    local stale_stage
+    [[ -d "$WEB_ROOT/monitor-results" ]] || return 0
+    while IFS= read -r -d '' stale_stage; do
+        if sudo rm -rf -- "$stale_stage"; then
+            echo "Removed orphaned publish stage: $stale_stage"
+        else
+            echo "Warning: could not remove orphaned publish stage: $stale_stage" >&2
+        fi
+    done < <(sudo find "$WEB_ROOT" -mindepth 1 -maxdepth 1 \
+        -name '.monitor-results.new.*' -mmin +120 -print0 2>/dev/null)
     return 0
 }
 
@@ -1269,6 +1313,8 @@ try:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
+    # cp -a into WEB_ROOT preserves this mode; keep the web-served floor.
+    os.chmod(temporary, 0o664)
     os.replace(temporary, destination)
 except Exception:
     temporary.unlink(missing_ok=True)
@@ -1952,7 +1998,7 @@ clear_current_device_artifacts() {
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_dup.txt" \
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_fdb.txt" \
         "$SCRIPT_DIR/monitor-results/dup-data/${hostname}_neigh.txt" \
-        "$SCRIPT_DIR/monitor-results/flap-data/${hostname}_"* \
+        "$SCRIPT_DIR/monitor-results/flap-data/${hostname}_carrier_transitions.txt" \
         "$SCRIPT_DIR/monitor-results/optical-data/${hostname}_optical.txt" \
         "$SCRIPT_DIR/monitor-results/ber-data/${hostname}_interface_errors.txt" \
         "$SCRIPT_DIR/monitor-results/ber-data/${hostname}_detailed_counters.txt" \
@@ -1960,6 +2006,51 @@ clear_current_device_artifacts() {
         "$SCRIPT_DIR/monitor-results/pfc-ecn-data/${hostname}_pfc_ecn.txt" \
         "$SCRIPT_DIR/monitor-results/hardware-data/${hostname}_hardware.txt" \
         "$SCRIPT_DIR/monitor-results/log-data/${hostname}_logs.txt"
+}
+
+# Remove per-device raw artifacts and device pages whose host is no longer in
+# the parsed inventory (full runs only, after load_devices validated it as
+# non-empty). Only exact per-domain filenames are matched, never loose globs:
+# hostnames may contain underscores. The device-page removal additionally
+# requires the page's own hostname banner so analysis pages are never touched.
+prune_retired_host_artifacts() {
+    local -A inventory_hosts=()
+    local entry inventory_user inventory_host
+    local spec dir suffix file base host pruned=0
+    for entry in "${devices[@]}"; do
+        IFS=' ' read -r inventory_user inventory_host <<< "$entry"
+        [[ -n "$inventory_host" ]] && inventory_hosts["$inventory_host"]=1
+    done
+    [[ "${#inventory_hosts[@]}" -gt 0 ]] || return 0
+    for spec in \
+        "log-data _logs.txt" \
+        "hardware-data _hardware.txt" \
+        "optical-data _optical.txt" \
+        "dup-data _dup.txt" \
+        "dup-data _fdb.txt" \
+        "dup-data _neigh.txt" \
+        "evpn-mh-data _evpn_mh.txt"; do
+        read -r dir suffix <<< "$spec"
+        for file in "$SCRIPT_DIR/monitor-results/$dir/"*"$suffix"; do
+            [[ -f "$file" ]] || continue
+            base=${file##*/}
+            host=${base%"$suffix"}
+            [[ -n "$host" && -z "${inventory_hosts[$host]+x}" ]] || continue
+            rm -f -- "$file" && pruned=$((pruned + 1))
+        done
+    done
+    for file in "$SCRIPT_DIR/monitor-results/"*.html; do
+        [[ -f "$file" ]] || continue
+        base=${file##*/}
+        host=${base%.html}
+        [[ -n "$host" && -z "${inventory_hosts[$host]+x}" ]] || continue
+        grep -qF "Monitor Results - ${host}<" "$file" || continue
+        rm -f -- "$file" && pruned=$((pruned + 1))
+    done
+    if (( pruned > 0 )); then
+        echo "Pruned ${pruned} artifacts from retired hosts"
+    fi
+    return 0
 }
 
 write_unreachable_device_report() {
@@ -2905,9 +2996,15 @@ EOF
     # Verbose output removed for performance
     local ssh_start=$(date +%s)
 
-    # Umbrella must cover every per-section budget it forwards plus a fixed
-    # margin for the unbudgeted sections (defaults: 60 + 120 + 120 = 300).
-    local ssh_umbrella_timeout=$((PFC_ECN_COLLECTION_BUDGET_SECONDS + OPTICAL_COLLECTION_BUDGET_SECONDS + 120))
+    # BOUNDED_CMD_COUNT must track the number of _lldpq_run_bounded calls in
+    # the remote collector below; each one can hold a wedged device for up to
+    # MONITOR_COMMAND_TIMEOUT_SECONDS before its own timeout fires.
+    local BOUNDED_CMD_COUNT=49
+    # Umbrella must cover every per-section budget it forwards plus the sum
+    # of the per-command bounds and fixed slack, so a wedged-but-reachable
+    # device finishes as a bounded slow collection instead of being killed
+    # mid-session.
+    local ssh_umbrella_timeout=$((PFC_ECN_COLLECTION_BUDGET_SECONDS + OPTICAL_COLLECTION_BUDGET_SECONDS + BOUNDED_CMD_COUNT * MONITOR_COMMAND_TIMEOUT_SECONDS + 60))
 
     # The leading -o wins over the ConnectTimeout inside SSH_OPTS (OpenSSH
     # uses the first obtained value), so ping-failed hosts get the short bound.
@@ -4114,7 +4211,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status AUTH OK
-                printf "%s\n" "$_source_output" | grep -v -E "(journalctl|monitor\.sh|--since|--grep|swp\|bond\|vlan\|carrier\|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
+                printf "%s\n" "$_source_output" | grep -v -E "(journalctl|monitor\.sh|--since|--grep|swp|bond|vlan|carrier|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
             else
                 _lldpq_log_status AUTH ERROR
             fi
@@ -4123,7 +4220,7 @@ EOF
             _source_status=$?
             if [ "$_source_status" -eq 0 ]; then
                 _lldpq_log_status AUTH OK
-                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized)" | grep -v -E "(journalctl|monitor\.sh|--since|swp\|bond\|vlan\|carrier\|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
+                printf "%s\n" "$_source_output" | grep -E "$(date '\''+%b %d'\'')|$(date '\''+%b %e'\'')" | tail -30 | grep -E "(FAIL|ERROR|INVALID|DENIED|ATTACK|authentication|unauthorized)" | grep -v -E "(journalctl|monitor\.sh|--since|swp|bond|vlan|carrier|link|vtysh|sudo.*authentication.*grantor=pam_permit|USER_AUTH.*res=success)" || echo "No recent auth issues"
             else
                 _lldpq_log_status AUTH ERROR
             fi
@@ -4355,8 +4452,8 @@ process_device() {
     local COLLECTION_FAILURE_KIND=""
 
     # ICMP is only a fast hint.  A dropped/filtered echo must not suppress a
-    # valid SSH collection; the existing 300-second collection timeout remains
-    # the authoritative reachability bound.
+    # valid SSH collection; the existing SSH umbrella collection timeout
+    # remains the authoritative reachability bound.
     ping_test "$device" || ping_reachable=false
     if execute_commands_optimized "$device" "$user" "$hostname" "$ping_reachable"; then
         record_collection_status "$hostname" current 0 ok || return 1
@@ -4392,8 +4489,18 @@ process_device() {
     fi
 
     # The SSH handshake was observed, or a local staging/commit operation
-    # failed. Keep fail-closed generation semantics once collection actually
-    # started instead of disguising a partial bundle as an unavailable host.
+    # failed. Keep the fail-closed per-device 'failed' outcome instead of
+    # disguising a partial bundle as an unavailable host; analyzers gate on
+    # the outcome manifest, so like the unavailable path this device's
+    # previous raw snapshot or per-device page must not look current. A
+    # retained per-device rollback journal is the exception: startup recovery
+    # proves the preserved originals against their recorded checksums, so the
+    # destinations must stay untouched for that replay.
+    if [[ "$scoped_run" != "true" ]] && \
+       ! compgen -G "$bundle_root/device-${hostname}.*/.retain-device-recovery" \
+            >/dev/null; then
+        clear_current_device_artifacts "$hostname" || return 1
+    fi
     record_collection_status \
         "$hostname" failed "$collection_status" \
         "${COLLECTION_FAILURE_KIND:-collection-failed}" || true
@@ -4507,7 +4614,11 @@ if [[ "$MONITOR_SCOPE" == "fabric-check" && "$SKIP_FABRIC_CHECK" == "true" ]]; t
 fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
+prune_orphaned_publish_stages
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1
+if [[ "$scoped_run" != "true" ]]; then
+    prune_retired_host_artifacts
+fi
 bundle_root=$(mktemp -d "$bundle_parent/run-XXXXXXXX") || exit 1
 chmod 700 "$bundle_root" || exit 1
 collection_status_file="$bundle_root/collection-status.tsv"
@@ -4635,18 +4746,31 @@ export LLDPQ_COLLECTION_STATUS_FILE="$collection_status_manifest"
 
 if [[ -s "$collection_failures_file" ]]; then
     failure_text="collection jobs failed: $(tr '\t' ':' < "$collection_failures_file" | paste -sd' ' -)"
-    mark_reports_stale "$failure_text"
-    exit 1
+    failed_device_count=$(grep -c '' "$collection_failures_file") || failed_device_count=0
+    if (( failed_device_count >= 2 && \
+          failed_device_count * 100 > device_count * LLDPQ_COLLECTION_FAILURE_ABORT_PCT )); then
+        mark_reports_stale "$failure_text (${failed_device_count}/${device_count} devices exceed ${LLDPQ_COLLECTION_FAILURE_ABORT_PCT}% abort threshold)"
+        exit 1
+    fi
+    # Contained: each failed device carries a not-current outcome in the
+    # manifest, so analyzers skip it while the run continues.
+    echo "Contained (${failed_device_count}/${device_count} devices within ${LLDPQ_COLLECTION_FAILURE_ABORT_PCT}% abort threshold): $failure_text" >&2
 fi
-if ! python3 - "$collection_status_manifest" <<'PYTHON'
+if ! python3 - "$collection_status_manifest" \
+        "$LLDPQ_COLLECTION_FAILURE_ABORT_PCT" <<'PYTHON'
 import json
 import sys
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
     payload = json.load(handle)
-raise SystemExit(0 if payload.get("counts", {}).get("failed") == 0 else 1)
+failed = payload.get("counts", {}).get("failed")
+expected = payload.get("expected_devices")
+if not isinstance(failed, int) or not isinstance(expected, int):
+    raise SystemExit(1)
+abort_pct = int(sys.argv[2])
+raise SystemExit(1 if failed >= 2 and failed * 100 > expected * abort_pct else 0)
 PYTHON
 then
-    mark_reports_stale "collection outcome manifest contains failed devices"
+    mark_reports_stale "collection outcome manifest failures exceed the ${LLDPQ_COLLECTION_FAILURE_ABORT_PCT}% abort threshold"
     exit 1
 fi
 

@@ -98,8 +98,18 @@ def publish_events(result_dir, domain, new_events, cap=EVENTS_CAP, now=None):
             with open(path, encoding="utf-8") as handle:
                 payload = json.load(handle)
             existing = payload.get("events") if isinstance(payload, dict) else None
-        except (OSError, ValueError):
+        except OSError:
             existing = None
+        except ValueError as e:
+            # Keep the unreadable sidecar as evidence instead of silently
+            # rebuilding history from the current run alone.
+            existing = None
+            try:
+                os.replace(path, path + ".bad")
+                print("Warning: unreadable events sidecar %s (%s); "
+                      "renamed to %s.json.bad" % (path, e, domain))
+            except OSError:
+                pass
         for event in (existing or []):
             normalized = _normalize(event, now)
             if normalized:

@@ -66,14 +66,13 @@ test('broadcast sends a command to every connected target without confirmation',
   assert.equal(harness.input.value, '');
 });
 
-test('empty broadcast sends Enter to every connected target', () => {
+test('empty broadcast is skipped with a warning instead of sending Enter', () => {
   const harness = createHarness('');
 
   harness.run();
 
   assert.deepEqual(harness.confirmations, []);
-  assert.deepEqual(harness.sent, [
-    [{ t: 'i', d: '\r' }],
-    [{ t: 'i', d: '\r' }],
-  ]);
+  assert.deepEqual(harness.sent, [[], []]);
+  assert.equal(harness.toasts.length, 1);
+  assert.equal(harness.toasts[0][1], 'warning');
 });

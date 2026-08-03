@@ -83,10 +83,24 @@ class PfcEcnHistoryShardTests(unittest.TestCase):
     def test_second_run_appends_to_existing_shard(self):
         result_dir = self._result_tree(["leaf1"])
         self.assertTrue(self._run(result_dir, {"leaf1": "OK"}))
+        # A fresh collection carries a newer raw-file mtime.
+        raw_file = result_dir / "pfc-ecn-data" / "leaf1_pfc_ecn.txt"
+        later = time.time() + 5
+        os.utime(raw_file, (later, later))
         self.assertTrue(self._run(result_dir, {"leaf1": "OK"}))
         shard = result_dir / "pfc-ecn-history" / "leaf1.json"
         state = json.loads(shard.read_text(encoding="utf-8"))
         self.assertEqual(len(state["history"]["leaf1:swp1"]), 2)
+
+    def test_rerun_without_new_collection_does_not_double_append(self):
+        result_dir = self._result_tree(["leaf1"])
+        self.assertTrue(self._run(result_dir, {"leaf1": "OK"}))
+        # Re-analysis (or a broken-pool retry) over the same raw file must
+        # recognize the already-merged shard by its source_mtime.
+        self.assertTrue(self._run(result_dir, {"leaf1": "OK"}))
+        shard = result_dir / "pfc-ecn-history" / "leaf1.json"
+        state = json.loads(shard.read_text(encoding="utf-8"))
+        self.assertEqual(len(state["history"]["leaf1:swp1"]), 1)
 
     def test_legacy_monolith_migrates_into_shards(self):
         result_dir = self._result_tree(["leaf1"])

@@ -2995,6 +2995,7 @@ WEB_TARGETS=(
     "$WEB_ROOT/edit-topology.sh" "$WEB_ROOT/editor-test.html"
     "$WEB_ROOT/fabric-api.sh" "$WEB_ROOT/fabric-config.html" "$WEB_ROOT/fabric-deploy.html"
     "$WEB_ROOT/fabric-editor.html" "$WEB_ROOT/fabric-exit.html"
+    "$WEB_ROOT/fabric-migration.html"
     "$WEB_ROOT/auth-api.sh" "$WEB_ROOT/auth-guard.sh" "$WEB_ROOT/ansible-api.sh"
     "$WEB_ROOT/ai-api.sh" "$WEB_ROOT/ai.html" "$WEB_ROOT/ai_command_policy.py"
     "$WEB_ROOT/ai_insights.py" "$WEB_ROOT/ai_context.py"
@@ -3011,6 +3012,7 @@ WEB_TARGETS=(
     "$WEB_ROOT/export-api.sh" "$WEB_ROOT/lldp-export-api.sh"
     "$WEB_ROOT/ai-export-api.sh"
     "$WEB_ROOT/setup-api.sh" "$WEB_ROOT/telemetry.html"
+    "$WEB_ROOT/timeline.html"
     "$WEB_ROOT/tracepath.html" "$WEB_ROOT/transceiver.html"
     "$WEB_ROOT/vlan-report.html" "$WEB_ROOT/vrf-report.html"
     "$WEB_ROOT/lldpq-ztp-new-device-flow.html"
@@ -3036,6 +3038,7 @@ WEB_DIRS=(
     "$WEB_ROOT/css" "$WEB_ROOT/png" "$WEB_ROOT/topology"
     "$WEB_ROOT/configs" "$WEB_ROOT/hstr" "$WEB_ROOT/monitor-results"
     "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" "$WEB_ROOT/monaco"
+    "$WEB_ROOT/__pycache__"
 )
 
 if $WEB_ROOT_CLEANABLE; then

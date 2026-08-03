@@ -82,7 +82,7 @@ def _allow_ethtool(tokens: List[str]) -> bool:
         return _safe_interface(tokens[0])
     return (
         len(tokens) == 2
-        and tokens[0] in {"-m", "-S", "-i"}
+        and tokens[0] in {"-m", "-S", "-i", "--show-fec"}
         and _safe_interface(tokens[1])
     )
 
@@ -91,6 +91,11 @@ def _allow_ip(tokens: List[str]) -> bool:
     if len(tokens) < 2 or tokens[0] != "ip" or not _safe_args(tokens):
         return False
     tokens = tokens[1:]
+    # Optional read-only details flag (ip -d link show swpX).
+    if tokens[0] == "-d":
+        tokens = tokens[1:]
+        if not tokens:
+            return False
     # Optional address-family selector (ip -6 route show / ip -4 addr show).
     if tokens[0] in {"-4", "-6"}:
         tokens = tokens[1:]
@@ -267,9 +272,11 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
     elif bare[0] == "lldpctl":
         allowed = _allow_lldpctl(tokens)
     elif bare[0] == "cat":
-        allowed = (
-            len(bare) == 2
-            and re.fullmatch(r"/proc/net/bonding/[A-Za-z0-9_.:-]{1,64}", bare[1]) is not None
+        allowed = len(bare) == 2 and (
+            re.fullmatch(r"/proc/net/bonding/[A-Za-z0-9_.:-]{1,64}", bare[1]) is not None
+            or re.fullmatch(
+                r"/sys/class/net/[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}/mtu", bare[1]
+            ) is not None
         )
     elif bare[0] == "l1-show":
         allowed = len(bare) == 2 and _safe_interface(bare[1])

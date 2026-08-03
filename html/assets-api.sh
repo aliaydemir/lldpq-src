@@ -43,6 +43,15 @@ elif [[ -z "${LLDPQ_DIR:-}" ]]; then
         "Required runtime configuration helper is missing"
 fi
 
+# Freshness policy inputs for the Python reader: the explicit operator ceiling
+# wins; otherwise it derives one from the collection cadence (LLDPQ_CRON).
+if [[ -n "${MONITOR_DATA_MAX_AGE_MINUTES:-}" ]]; then
+    export MONITOR_DATA_MAX_AGE_MINUTES
+fi
+if [[ -n "${LLDPQ_CRON:-}" ]]; then
+    export LLDPQ_CRON
+fi
+
 ASSETS_FILE="${LLDPQ_ASSETS_FILE:-$LLDPQ_DIR/assets.ini}"
 PIPELINE_ASSETS_FILE="${LLDPQ_PIPELINE_ASSETS_FILE:-$LLDPQ_DIR/monitor-results/.pipeline-inputs/assets.ini}"
 DEVICES_FILE="${LLDPQ_DEVICES_FILE:-$LLDPQ_DIR/devices.yaml}"

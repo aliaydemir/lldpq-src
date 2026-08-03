@@ -202,11 +202,13 @@ async function loadEvents(){
   if (document.getElementById('lastUpdated').textContent.indexOf('Pipeline') !== 0) {
     document.getElementById('lastUpdated').textContent = allEvents.length + ' event(s) retained';
   }
+  var banner = document.getElementById('freshnessBanner');
   if (allEvents.length === 0 && Object.values(domainAvailable).every(function(v){ return !v; })) {
-    var banner = document.getElementById('freshnessBanner');
     banner.style.display = 'block';
     banner.innerHTML = 'No event sidecars found yet &mdash; they are produced by the ' +
       'monitor pipeline (every 10 minutes by default). This page fills in as analyzers detect events.';
+  } else {
+    banner.style.display = 'none';
   }
   render();
 }
@@ -301,10 +303,15 @@ function renderTable(events){
   }
   body.innerHTML = events.map(function(event){
     var kind = KIND_LABELS[event.kind] || event.kind;
+    // data-sort keeps the machine sort key; data-filter feeds the funnel
+    // popup a human label (rendered timestamp / severity name).
+    var severityLabel = event.severity === 'critical' ? 'critical'
+      : event.severity === 'warning' ? 'warning' : 'info';
     return "<tr data-devices='" + esc(event.device.toLowerCase()) + "'>" +
-      "<td class='mono' data-sort='" + event.ts + "'>" + esc(fmtTime(event.ts)) + "</td>" +
+      "<td class='mono' data-sort='" + event.ts + "' data-filter='" + esc(fmtTime(event.ts)) + "'>" + esc(fmtTime(event.ts)) + "</td>" +
       "<td>" + domainBadge(event.domain) + "</td>" +
-      "<td data-sort='" + (event.severity === 'critical' ? 0 : event.severity === 'warning' ? 1 : 2) + "'>" +
+      "<td data-sort='" + (event.severity === 'critical' ? 0 : event.severity === 'warning' ? 1 : 2) +
+        "' data-filter='" + severityLabel + "'>" +
         severityBadge(event.severity) + "</td>" +
       "<td>" + esc(event.device) + "</td>" +
       "<td class='mono'>" + (esc(event.object) || "<span class='dim'>&mdash;</span>") + "</td>" +
@@ -388,8 +395,22 @@ function downloadCSV(){
 }
 
 loadEvents();
+
+// Auto-refresh: re-read the event sidecars when the tab becomes visible and
+// every 3 minutes. Domain/range/device filters live in module state, so
+// render() re-applies them to the fresh event set.
+var refreshInFlight = false;
+function refreshEvents(){
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  loadEvents().finally(function(){ refreshInFlight = false; });
+}
+setInterval(refreshEvents, 180000);
+document.addEventListener('visibilitychange', function(){
+  if (document.visibilityState === 'visible') refreshEvents();
+});
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 </body>
 </html>

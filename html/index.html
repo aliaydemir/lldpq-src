@@ -908,7 +908,7 @@
                 if (!doc || !doc.head || doc.getElementById('lldpq-lifecycle-scope-script')) return;
                 const script = doc.createElement('script');
                 script.id = 'lldpq-lifecycle-scope-script';
-                script.src = '/lifecycle-scope.js?v=20260707-1';
+                script.src = '/lifecycle-scope.js?v=20260803-1';
                 doc.head.appendChild(script);
             } catch (e) {
                 // Optional cross-origin pages cannot inherit the LLDPq scope.
@@ -1003,8 +1003,15 @@
         
         // Initialize authentication
         async function initAuth() {
-            const isAuth = await LLDPqAuth.check();
-            if (!isAuth) return;
+            const isAuth = await LLDPqAuth.checkWithRetry();
+            if (!isAuth) {
+                if (LLDPqAuth.lastCheckTransient) {
+                    const menuContainer = document.getElementById('user-menu-container');
+                    if (menuContainer) menuContainer.textContent =
+                        'Auth check unreachable — reload the page to retry.';
+                }
+                return;
+            }
 
             if (LLDPqAuth.isAdmin()) {
                 document.body.classList.add('lldpq-admin');

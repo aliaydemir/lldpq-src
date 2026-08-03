@@ -17,6 +17,12 @@ if [[ "$REQUEST_METHOD" == "OPTIONS" ]]; then
     exit 0
 fi
 
+# Only allow POST requests
+if [ "$REQUEST_METHOD" != "POST" ]; then
+    echo '{"status": "error", "message": "Only POST method is allowed"}'
+    exit 1
+fi
+
 # The lldpq-trigger daemon runs as LLDPQ_USER and handles the actual collection.
 TRIGGER_FILE="/tmp/.configs_web_trigger"
 TRIGGER_NOW=$(date +%s%N 2>/dev/null || true)

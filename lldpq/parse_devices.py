@@ -41,11 +41,35 @@ import argparse
 import json
 import shlex
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects duplicate mapping keys instead of last-wins"""
+
+    def construct_mapping(self, node, deep=False):
+        # yaml.safe_load silently collapses duplicate IP keys last-wins,
+        # dropping a device from all collection.  Fail loudly instead.
+        seen = set()
+        for key_node, _value_node in node.value:
+            # Merge keys (<<: *anchor) are expanded by flatten_mapping in the
+            # parent constructor; constructing them here would fail.
+            if key_node.tag == 'tag:yaml.org,2002:merge':
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                if key in seen:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        f"found duplicate key {key!r}", key_node.start_mark)
+                seen.add(key)
+            except TypeError:
+                # Unhashable keys are rejected by SafeConstructor itself.
+                pass
+        return super().construct_mapping(node, deep)
+
 def load_devices_yaml(yaml_file="devices.yaml"):
     """Load and parse devices.yaml configuration"""
     try:
         with open(yaml_file, 'r') as f:
-            config = yaml.safe_load(f)
+            config = yaml.load(f, Loader=UniqueKeyLoader)
         if config is None:
             return {}
         if not isinstance(config, dict):

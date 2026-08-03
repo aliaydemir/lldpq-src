@@ -966,22 +966,14 @@
         }
 
         function applyCurrentFilters() {
-            const filterInput = document.getElementById('tableFilter');
-            const query = filterInput ? filterInput.value.trim() : '';
-            const base = filterConnectionsByState(allConnections, currentFilter, selectedDevices, '');
-            const filtered = filterConnectionsByState(allConnections, currentFilter, selectedDevices, query);
+            const filtered = filterConnectionsByState(allConnections, currentFilter, selectedDevices, '');
             const statusDefinition = STATUS_FILTERS[currentFilter];
             const filterInfo = document.getElementById('filter-info');
             const filterText = document.getElementById('filter-text');
             const hasStatusFilter = Boolean(statusDefinition);
             const hasDeviceFilter = deviceSearchActive && selectedDevices.length > 0;
 
-            if (query) {
-                const scope = [statusDefinition?.label, hasDeviceFilter ? selectedDevices.join(', ') : '']
-                    .filter(Boolean).join(' / ') || 'All';
-                filterInfo.style.display = 'block';
-                filterText.textContent = `${scope}: "${filterInput.value}" — ${filtered.length} of ${base.length} ports`;
-            } else if (hasDeviceFilter) {
+            if (hasDeviceFilter) {
                 const statusLabel = statusDefinition ? `${statusDefinition.label.toLowerCase()} ` : '';
                 filterInfo.style.display = 'block';
                 filterText.textContent = `Showing ${filtered.length} ${statusLabel}connections for ${selectedDevices.length} device${selectedDevices.length > 1 ? 's' : ''}: ${selectedDevices.join(', ')}`;
@@ -1008,8 +1000,6 @@
             selectedDevices = [];
             deviceSearchActive = false;
             updateSummaryCardSelection();
-            const tableFilterInput = document.getElementById('tableFilter');
-            if (tableFilterInput) tableFilterInput.value = '';
             _suppressDeviceChange = true;
             $('#deviceSearch').val(null).trigger('change');
             _suppressDeviceChange = false;
@@ -1019,12 +1009,6 @@
 
         function filterTable() {
             return applyCurrentFilters();
-        }
-
-        let filterDebounceTimer = null;
-        function debouncedFilterTable() {
-            clearTimeout(filterDebounceTimer);
-            filterDebounceTimer = setTimeout(filterTable, 200);
         }
 
         function determineLLDPStatus(connection) {
@@ -1502,61 +1486,107 @@
             }
         }
 
+        function buildConnectionRow(connection) {
+            const status = determineLLDPStatus(connection);
+            const row = document.createElement('tr');
+            rowConnectionMap.set(row, connection);
+            // Raw lifecycle identity. Display aliases must never influence
+            // Commissioning/Handed Over scope membership.
+            row.dataset.deviceKey = connection.localDevice;
+            row.className = status.healthClass;
+            // Click to expand the design-vs-actual wiring detail panel
+            // (handled by the delegated tbody click listener).
+            row.classList.add('lldp-clickable');
+
+            setAliasedCell(row.insertCell(0), connection.localDevice, deviceAliasLc);
+            setAliasedCell(row.insertCell(1), connection.localPort, portAliasLc);
+
+            // Port Status cell with badge
+            const portStatusCell = row.insertCell(2);
+            const portStatus = connection.portStatus || 'N/A';
+            let portBadgeClass = 'badge badge-gray';
+            if (portStatus === 'UP') {
+                portBadgeClass = 'badge badge-green';
+            } else if (portStatus === 'DOWN') {
+                portBadgeClass = 'badge badge-red';
+            }
+            portStatusCell.innerHTML = `<span class="${portBadgeClass}">${portStatus}</span>`;
+
+            setAliasedCell(row.insertCell(3), connection.expectedDevice, deviceAliasLc);
+            setAliasedCell(row.insertCell(4), connection.expectedPort, portAliasLc);
+            setAliasedCell(row.insertCell(5), connection.actualDevice, deviceAliasLc);
+            setAliasedCell(row.insertCell(6), connection.actualPort, portAliasLc);
+
+            // Status cell with badge
+            const statusCell = row.insertCell(7);
+            let statusBadgeClass = 'badge badge-gray';
+            if (status.status === 'SUCCESS') {
+                statusBadgeClass = 'badge badge-green';
+            } else if (status.status === 'FAILED') {
+                statusBadgeClass = 'badge badge-red';
+            } else if (status.status === 'WARNING') {
+                statusBadgeClass = 'badge badge-orange';
+            } else if (status.status === 'NO INFO') {
+                statusBadgeClass = 'badge badge-gray';
+            }
+            statusCell.innerHTML = `<span class="${statusBadgeClass}">${status.status}</span>`;
+
+            row.insertCell(8).textContent = status.health;
+            return row;
+        }
+
+        // Progressive rendering: first chunk lands synchronously, the rest in
+        // rAF-scheduled chunks so large fabrics never block the main thread.
+        // A newer render (filter/sort/alias change) supersedes pending chunks.
+        const RENDER_CHUNK_SIZE = 500;
+        let connectionsRenderGeneration = 0;
+        let pendingConnectionsRender = null;   // { generation, ordered, next }
+
+        function appendConnectionsChunk() {
+            const job = pendingConnectionsRender;
+            if (!job || job.generation !== connectionsRenderGeneration) return;
+            const tbody = document.getElementById('lldp-data');
+            const fragment = document.createDocumentFragment();
+            const end = Math.min(job.next + RENDER_CHUNK_SIZE, job.ordered.length);
+            for (let i = job.next; i < end; i++) {
+                fragment.appendChild(buildConnectionRow(job.ordered[i]));
+            }
+            tbody.appendChild(fragment);
+            if (end < job.ordered.length) {
+                job.next = end;
+                requestAnimationFrame(appendConnectionsChunk);
+            } else {
+                pendingConnectionsRender = null;
+            }
+        }
+
+        // The CSV export walks the DOM; any still-pending chunks must land
+        // synchronously first so the export is never truncated.
+        function flushPendingConnectionsRender() {
+            while (pendingConnectionsRender &&
+                   pendingConnectionsRender.generation === connectionsRenderGeneration) {
+                appendConnectionsChunk();
+            }
+        }
+
         function renderConnectionsTable(connections) {
             const tbody = document.getElementById('lldp-data');
+            const generation = ++connectionsRenderGeneration;
+            if (tbody.dataset.delegatedClick !== 'true') {
+                tbody.dataset.delegatedClick = 'true';
+                tbody.addEventListener('click', event => {
+                    const row = event.target.closest('tr.lldp-clickable');
+                    if (row) toggleLldpDetails(row);
+                });
+            }
+            // Sort the data array up front: one pass here replaces the full
+            // DOM re-sort that used to run after every render.
+            const ordered = currentSort.column >= 0
+                ? connections.slice().sort(compareConnectionsForSort)
+                : connections;
             tbody.innerHTML = '';
-            const fragment = document.createDocumentFragment();
-
-            connections.forEach(connection => {
-                const status = determineLLDPStatus(connection);
-                const row = document.createElement('tr');
-                fragment.appendChild(row);
-                rowConnectionMap.set(row, connection);
-                // Raw lifecycle identity. Display aliases must never influence
-                // Commissioning/Handed Over scope membership.
-                row.dataset.deviceKey = connection.localDevice;
-                row.className = status.healthClass;
-                // Click to expand the design-vs-actual wiring detail panel.
-                row.classList.add('lldp-clickable');
-                row.addEventListener('click', () => toggleLldpDetails(row));
-                
-                setAliasedCell(row.insertCell(0), connection.localDevice, deviceAliasLc);
-                setAliasedCell(row.insertCell(1), connection.localPort, portAliasLc);
-                
-                // Port Status cell with badge
-                const portStatusCell = row.insertCell(2);
-                const portStatus = connection.portStatus || 'N/A';
-                let portBadgeClass = 'badge badge-gray';
-                if (portStatus === 'UP') {
-                    portBadgeClass = 'badge badge-green';
-                } else if (portStatus === 'DOWN') {
-                    portBadgeClass = 'badge badge-red';
-                }
-                portStatusCell.innerHTML = `<span class="${portBadgeClass}">${portStatus}</span>`;
-                
-                setAliasedCell(row.insertCell(3), connection.expectedDevice, deviceAliasLc);
-                setAliasedCell(row.insertCell(4), connection.expectedPort, portAliasLc);
-                setAliasedCell(row.insertCell(5), connection.actualDevice, deviceAliasLc);
-                setAliasedCell(row.insertCell(6), connection.actualPort, portAliasLc);
-                
-                // Status cell with badge
-                const statusCell = row.insertCell(7);
-                let statusBadgeClass = 'badge badge-gray';
-                if (status.status === 'SUCCESS') {
-                    statusBadgeClass = 'badge badge-green';
-                } else if (status.status === 'FAILED') {
-                    statusBadgeClass = 'badge badge-red';
-                } else if (status.status === 'WARNING') {
-                    statusBadgeClass = 'badge badge-orange';
-                } else if (status.status === 'NO INFO') {
-                    statusBadgeClass = 'badge badge-gray';
-                }
-                statusCell.innerHTML = `<span class="${statusBadgeClass}">${status.status}</span>`;
-                
-                row.insertCell(8).textContent = status.health;
-            });
-            tbody.appendChild(fragment);
-            applyCurrentSortToRenderedTable();
+            pendingConnectionsRender = { generation, ordered, next: 0 };
+            appendConnectionsChunk();
         }
 
         function parseLLDPReportData(data) {
@@ -1842,9 +1872,10 @@
                     });
                     header.classList.add(currentSort.direction);
                     header.setAttribute('aria-sort', currentSort.direction === 'asc' ? 'ascending' : 'descending');
-                    
-                    // Sort table
-                    sortLLDPTable(column, currentSort.direction, type);
+
+                    // Re-render the current view; renderConnectionsTable sorts
+                    // the data array before building rows.
+                    applyCurrentFilters();
                 };
                 header.addEventListener('click', activate);
                 header.addEventListener('keydown', event => {
@@ -1855,55 +1886,45 @@
             });
         }
 
-        function applyCurrentSortToRenderedTable() {
-            if (currentSort.column < 0) return;
-            sortLLDPTable(currentSort.column, currentSort.direction, currentSort.type);
+        // Data-level sort: mirrors the displayed cell text per column so the
+        // order matches what the operator sees (aliases included).
+        function connectionSortValue(connection, column) {
+            switch (column) {
+                case 0: return aliasedLabel(connection.localDevice, deviceAliasLc);
+                case 1: return aliasedLabel(connection.localPort, portAliasLc);
+                case 2: return connection.portStatus || 'N/A';
+                case 3: return aliasedLabel(connection.expectedDevice, deviceAliasLc);
+                case 4: return aliasedLabel(connection.expectedPort, portAliasLc);
+                case 5: return aliasedLabel(connection.actualDevice, deviceAliasLc);
+                case 6: return aliasedLabel(connection.actualPort, portAliasLc);
+                case 7: return determineLLDPStatus(connection).status;
+                case 8: return determineLLDPStatus(connection).health;
+                default: return '';
+            }
         }
-        
-        function sortLLDPTable(columnIndex, direction, type) {
-            const table = document.getElementById('lldp-table');
-            const tbody = table.querySelector('tbody');
-            // Detail panels are single-cell rows; drop them before reordering so
-            // they never detach from their parent connection row.
-            closeAllLldpDetails();
-            const rows = Array.from(tbody.rows);
-            const sortableRows = rows.filter(row => row.cells && row.cells.length > columnIndex);
-            const passthroughRows = rows.filter(row => !row.cells || row.cells.length <= columnIndex);
-            
-            sortableRows.sort((a, b) => {
-                let aVal = a.cells[columnIndex].textContent.trim();
-                let bVal = b.cells[columnIndex].textContent.trim();
-                
-                // Extract actual text for status column (remove HTML)
-                if (type === 'lldp-status') {
-                    aVal = a.cells[columnIndex].querySelector('span')?.textContent || aVal;
-                    bVal = b.cells[columnIndex].querySelector('span')?.textContent || bVal;
-                }
-                
-                let result = 0;
-                
-                switch(type) {
-                    case 'port':
-                        result = comparePort(aVal, bVal);
-                        break;
-                    case 'lldp-status':
-                        result = compareLLDPStatus(aVal, bVal);
-                        break;
-                    case 'port-status':
-                        result = comparePortStatus(aVal, bVal);
-                        break;
-                    case 'string':
-                    default:
-                        result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
-                        break;
-                }
-                
-                return direction === 'desc' ? -result : result;
-            });
-            
-            // Clear tbody and add sorted rows back
-            tbody.innerHTML = '';
-            sortableRows.concat(passthroughRows).forEach(row => tbody.appendChild(row));
+
+        function compareConnectionsForSort(a, b) {
+            const aVal = connectionSortValue(a, currentSort.column);
+            const bVal = connectionSortValue(b, currentSort.column);
+            let result = 0;
+
+            switch (currentSort.type) {
+                case 'port':
+                    result = comparePort(aVal, bVal);
+                    break;
+                case 'lldp-status':
+                    result = compareLLDPStatus(aVal, bVal);
+                    break;
+                case 'port-status':
+                    result = comparePortStatus(aVal, bVal);
+                    break;
+                case 'string':
+                default:
+                    result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
+                    break;
+            }
+
+            return currentSort.direction === 'desc' ? -result : result;
         }
         
         function comparePort(a, b) {
@@ -2348,9 +2369,17 @@
         }
 
         function renderedConnectionsInTableOrder() {
+            flushPendingConnectionsRender();
+            // The funnel observer marks tf-hidden asynchronously; re-apply
+            // synchronously so rows flushed just now cannot leak into the CSV.
+            if (window.TableFilter) {
+                const table = document.getElementById('lldp-table');
+                if (table) window.TableFilter.refresh(table);
+            }
             const rows = document.querySelectorAll('#lldp-data tr:not(.lldp-detail-row)');
             return Array.from(rows)
-                .filter(row => row.style.display !== 'none')
+                .filter(row => row.style.display !== 'none' &&
+                    !(window.TableFilter && window.TableFilter.isHidden(row)))
                 .map(row => rowConnectionMap.get(row))
                 .filter(Boolean);
         }
@@ -2362,9 +2391,7 @@
                 const dateStr = now.toISOString().slice(0, 10);
                 const timeStr = now.toTimeString().slice(0, 5).replace(':', '-');
                 const filterSuffix = (currentFilter && currentFilter !== 'ALL') ? `_${currentFilter}` : '';
-                const textFilter = (document.getElementById('tableFilter')?.value || '').trim();
-                const textSuffix = textFilter ? `_${textFilter.replace(/[^a-zA-Z0-9-]/g, '')}` : '';
-                const filename = `LLDP_Report${filterSuffix}${textSuffix}_${dateStr}_${timeStr}.csv`;
+                const filename = `LLDP_Report${filterSuffix}_${dateStr}_${timeStr}.csv`;
                 const csvContent = buildLLDPCSV(renderedConnectionsInTableOrder());
                 
                 // Create and trigger download
@@ -2827,6 +2854,6 @@
             }
         })();
     </script>
-<script src="/css/table-filter.js?v=20260801-tf-4"></script>
+<script src="/css/table-filter.js?v=20260803-tf-5"></script>
 </body>
 </html>

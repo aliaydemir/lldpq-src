@@ -152,6 +152,18 @@ class LLDPqAlerts:
         # checks do not re-read and re-parse the whole file for every host.
         self._log_summary_loaded = False
         self._log_summary_data = None
+        # Same run-cache pattern for the other per-device sources: the flap
+        # and BGP history monoliths are parsed and indexed once per run, and
+        # the assets/inventory snapshot is read once instead of once per host.
+        self._flap_history_loaded = False
+        self._flap_history_index = None
+        self._flap_history_error = None
+        self._bgp_history_loaded = False
+        self._bgp_current_stats = None
+        self._bgp_history_error = None
+        self._inventory_devices = None
+        self._asset_rows_loaded = False
+        self._asset_rows = None
         
         # Create state directory if it doesn't exist (like `mkdir -p`)
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -448,22 +460,40 @@ class LLDPqAlerts:
                 return float(value)
         return self.get_frequency_seconds("data_stale_minutes", 30)
     
+    @staticmethod
+    def _state_severity_rank(state):
+        """Coarse severity rank of an alert state for escalation checks.
+
+        Composite states (``CRITICAL:2:0:1``) lead with their severity token.
+        """
+        token = str(state).split(":", 1)[0].upper()
+        if token in {"CRITICAL", "OUTAGE"}:
+            return 2
+        if token.startswith("WARNING") or token in {"DOWN", "UNPLUGGED"}:
+            return 1
+        return 0
+
     def should_send_alert(self, device, alert_type, current_state):
         """Check if we should send an alert based on state changes and frequency limits"""
         if not self.config:
             return False
-            
+
         last_state = self.get_alert_state(device, alert_type)
-        
+
         # Only alert on state changes
         if current_state == last_state:
             return False
-            
-        # Check minimum interval (prevent spam)
-        min_interval = self.get_frequency_seconds('min_interval_minutes', 30)
-        last_delivery = self._read_marker_time(device, alert_type, "timestamp")
-        if last_delivery is not None and time.time() - last_delivery < min_interval:
-            return False
+
+        # Check minimum interval (prevent spam). A severity escalation (e.g.
+        # WARNING -> CRITICAL) must not wait out the throttle; repeats,
+        # de-escalations and recoveries keep it.
+        escalated = (self._state_severity_rank(current_state) >
+                     self._state_severity_rank(last_state))
+        if not escalated:
+            min_interval = self.get_frequency_seconds('min_interval_minutes', 30)
+            last_delivery = self._read_marker_time(device, alert_type, "timestamp")
+            if last_delivery is not None and time.time() - last_delivery < min_interval:
+                return False
 
         # A failed webhook remains pending, but rapid/manual invocations should not
         # hammer Slack. This marker is deliberately separate from last delivery.
@@ -566,12 +596,19 @@ class LLDPqAlerts:
         hardware_file = self.monitor_results / "hardware-data" / f"{device}_hardware.txt"
         if not hardware_file.exists():
             return
-            
+
+        # Same stable/pipeline-window read as check_system_alerts: this alert
+        # must never grade a sample from another (older or racing) collection.
+        run_manifest = getattr(self, "run_manifest", None)
         try:
-            with open(hardware_file, 'r') as f:
-                hardware_data = f.read()
-        except OSError as exc:
-            print(f"    ❌ Could not read hardware data for {device}: {exc}")
+            hardware_data = read_stable_pipeline_file(
+                hardware_file, run_manifest
+            )
+        except (OSError, OverflowError, RuntimeError, TypeError, ValueError) as exc:
+            print(
+                f"    ❌ Hardware data for {device} is not from the current "
+                f"stable pipeline: {exc}"
+            )
             self.had_error = True
             return
         
@@ -958,29 +995,18 @@ class LLDPqAlerts:
             ))
         return all(result is not False for result in results)
 
-    def get_device_flap_counts(self, device, window_seconds=3600):
-        """Return per-interface flap deltas recorded inside the time window."""
-        asset_stats = self.get_asset_stats([device])
-        if not asset_stats:
-            return None
-        asset_status = asset_stats["statuses"].get(device, "unknown")
-        if asset_status == "unreachable":
-            print(f"    ⚠️ Skipping link flaps for unreachable device {device}")
-            return None
-        if asset_status != "successful":
-            print(
-                f"    ❌ Link-flap data is not current for {device}: "
-                f"asset status is {asset_status}"
-            )
-            self.had_error = True
-            return None
+    def _load_flap_history(self):
+        """Parse flap_history.json once per run and index its ports by device.
 
+        Returns ``(index, error)``.  The index maps device -> list of
+        ``(port, interface, entries)`` tuples; a payload-level failure is
+        cached so every per-device caller keeps its loud fail-closed report
+        without re-reading the whole monolith.
+        """
+        if self._flap_history_loaded:
+            return self._flap_history_index, self._flap_history_error
+        self._flap_history_loaded = True
         history_file = self.monitor_results / "flap_history.json"
-        if not history_file.exists():
-            print(f"    ❌ Link-flap history is missing for {device}")
-            self.had_error = True
-            return None
-
         try:
             payload = json.loads(history_file.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
@@ -1004,15 +1030,54 @@ class LLDPqAlerts:
                     f"link-flap history is stale ({history_age / 60:.1f} minutes old)"
                 )
 
+            index = {}
+            for port, entries in histories.items():
+                if not isinstance(port, str) or ":" not in port:
+                    continue
+                port_device, interface = port.split(":", 1)
+                index.setdefault(port_device, []).append(
+                    (port, interface, entries)
+                )
+            self._flap_history_index = index
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._flap_history_error = exc
+        return self._flap_history_index, self._flap_history_error
+
+    def get_device_flap_counts(self, device, window_seconds=3600):
+        """Return per-interface flap deltas recorded inside the time window."""
+        asset_stats = self.get_asset_stats([device])
+        if not asset_stats:
+            return None
+        asset_status = asset_stats["statuses"].get(device, "unknown")
+        if asset_status == "unreachable":
+            print(f"    ⚠️ Skipping link flaps for unreachable device {device}")
+            return None
+        if asset_status != "successful":
+            print(
+                f"    ❌ Link-flap data is not current for {device}: "
+                f"asset status is {asset_status}"
+            )
+            self.had_error = True
+            return None
+
+        history_file = self.monitor_results / "flap_history.json"
+        if not history_file.exists():
+            print(f"    ❌ Link-flap history is missing for {device}")
+            self.had_error = True
+            return None
+
+        index, load_error = self._load_flap_history()
+        if load_error is not None or index is None:
+            print(f"    ❌ Could not evaluate link flaps for {device}: {load_error}")
+            self.had_error = True
+            return None
+
+        try:
             now = time.time()
             window = max(float(window_seconds), 0)
             cutoff = now - window
-            prefix = f"{device}:"
             counts = {}
-            for port, entries in histories.items():
-                if not isinstance(port, str) or not port.startswith(prefix):
-                    continue
-                interface = port[len(prefix):]
+            for port, interface, entries in index.get(device, []):
                 total = 0
                 if not isinstance(entries, list):
                     raise ValueError(f"invalid flap history for {port}")
@@ -1091,17 +1156,21 @@ class LLDPqAlerts:
 
     def get_inventory_devices(self):
         """Return every configured hostname from devices.yaml in inventory order."""
+        if self._inventory_devices is not None:
+            return list(self._inventory_devices)
         devices_file = self.script_dir / "devices.yaml"
         try:
             with open(devices_file, 'r') as f:
                 config = yaml.safe_load(f) or {}
         except (OSError, yaml.YAMLError) as e:
             print(f"❌ Error reading device inventory: {e}")
+            self._inventory_devices = []
             return []
 
         configured = config.get('devices', {})
         if not isinstance(configured, dict):
             print("❌ Invalid devices.yaml: 'devices' must be a mapping")
+            self._inventory_devices = []
             return []
 
         hostnames = []
@@ -1121,24 +1190,14 @@ class LLDPqAlerts:
             if hostname not in hostnames:
                 hostnames.append(hostname)
 
-        return hostnames
+        self._inventory_devices = hostnames
+        return list(hostnames)
 
-    def get_asset_stats(self, devices):
-        """Classify every inventory device using the latest assets collection.
-
-        Existing ``successful``/``failed`` fields are retained for message
-        compatibility. ``unknown`` and ``stale`` make missing/old evidence
-        explicit instead of silently treating it as a success.
-        """
-        stats = {
-            "successful": 0,
-            "failed": 0,
-            "unreachable": 0,
-            "unknown": 0,
-            "stale": 0,
-            "total": len(devices),
-            "statuses": {},
-        }
+    def _load_asset_rows(self):
+        """Read and validate the assets snapshot once per run; cache the rows."""
+        if self._asset_rows_loaded:
+            return self._asset_rows
+        self._asset_rows_loaded = True
         if (isinstance(self.run_manifest, dict) and
                 self.run_manifest.get("pipeline_complete")):
             assets_file = (
@@ -1149,9 +1208,9 @@ class LLDPqAlerts:
         if not assets_file.exists():
             print("❌ assets.ini is missing")
             self.had_error = True
-            return {}
+            return None
         if not self.source_matches_run_manifest("assets", assets_file):
-            return {}
+            return None
 
         max_age_seconds = self.get_data_max_age_seconds()
 
@@ -1187,12 +1246,39 @@ class LLDPqAlerts:
                 if parts[0] in rows:
                     raise ValueError(f"duplicate assets row: {parts[0]}")
                 rows[parts[0]] = parts[7].upper()
-            inventory_devices = self.get_inventory_devices()
-            expected_devices = set(inventory_devices or devices)
-            if set(rows) != expected_devices:
-                raise ValueError("assets device set does not match inventory")
         except (OSError, UnicodeError, ValueError) as e:
             print(f"❌ Error reading assets status: {e}")
+            self.had_error = True
+            return None
+
+        self._asset_rows = rows
+        return rows
+
+    def get_asset_stats(self, devices):
+        """Classify every inventory device using the latest assets collection.
+
+        Existing ``successful``/``failed`` fields are retained for message
+        compatibility. ``unknown`` and ``stale`` make missing/old evidence
+        explicit instead of silently treating it as a success.
+        """
+        stats = {
+            "successful": 0,
+            "failed": 0,
+            "unreachable": 0,
+            "unknown": 0,
+            "stale": 0,
+            "total": len(devices),
+            "statuses": {},
+        }
+        rows = self._load_asset_rows()
+        if rows is None:
+            return {}
+        expected_devices = set(self.get_inventory_devices() or devices)
+        if set(rows) != expected_devices:
+            print(
+                "❌ Error reading assets status: assets device set does not "
+                "match inventory"
+            )
             self.had_error = True
             return {}
 
@@ -2089,24 +2175,40 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             "info": device_counts.get("info", 0),
         }
 
-    def get_device_bgp_status(self, device):
-        """Get BGP status for a device from processed summary"""
+    def _load_bgp_current_stats(self):
+        """Parse bgp_history.json once per run; cache its stats or failure."""
+        if self._bgp_history_loaded:
+            return self._bgp_current_stats, self._bgp_history_error
+        self._bgp_history_loaded = True
+        bgp_history_file = self.monitor_results / "bgp_history.json"
+        if not bgp_history_file.exists():
+            return None, None
         try:
-            # Read from processed bgp_history.json
-            bgp_history_file = self.monitor_results / "bgp_history.json"
-            if not bgp_history_file.exists():
-                return "unknown"
-                
             with open(bgp_history_file, 'r') as f:
                 bgp_data = json.load(f)
             if not isinstance(bgp_data, dict):
                 raise ValueError("BGP history root must be an object")
-            
-            # Get latest BGP stats for this device. Older files may not contain
-            # data_status; those remain compatible and are treated as current.
             current_stats = bgp_data.get("current_bgp_stats", {})
             if not isinstance(current_stats, dict):
                 raise ValueError("current_bgp_stats must be an object")
+            self._bgp_current_stats = current_stats
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._bgp_history_error = exc
+        return self._bgp_current_stats, self._bgp_history_error
+
+    def get_device_bgp_status(self, device):
+        """Get BGP status for a device from processed summary"""
+        # Read from processed bgp_history.json (parsed once per run).
+        current_stats, load_error = self._load_bgp_current_stats()
+        if load_error is not None:
+            print(f"    ❌ Error reading BGP status for {device}: {load_error}")
+            self.had_error = True
+            return "unknown"
+        if current_stats is None:
+            return "unknown"
+        try:
+            # Get latest BGP stats for this device. Older files may not contain
+            # data_status; those remain compatible and are treated as current.
             device_bgp = current_stats.get(device, {})
             if device_bgp and not isinstance(device_bgp, dict):
                 raise ValueError(f"invalid BGP status record for {device}")
@@ -2174,10 +2276,21 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             if not isinstance(current, dict):
                 raise ValueError("current BER stats must be an object")
             grades = []
+            max_age_seconds = self.get_data_max_age_seconds()
+            now = time.time()
             for port_name, port_stats in current.items():
                 if (not isinstance(port_name, str) or
                         port_name.split(":", 1)[0] != device or
                         not isinstance(port_stats, dict)):
+                    continue
+                # Defense in depth: a "current" record whose own timestamp
+                # predates the freshness window is a leftover, not live
+                # evidence, and must not grade the device.
+                record_time = port_stats.get("timestamp")
+                if (not isinstance(record_time, bool) and
+                        isinstance(record_time, (int, float)) and
+                        math.isfinite(float(record_time)) and
+                        now - float(record_time) > max_age_seconds):
                     continue
                 grade = str(
                     port_stats.get("status")
@@ -2267,100 +2380,6 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             print(f"    ❌ Error reading optical status for {device}: {exc}")
             self.had_error = True
             return "unknown"
-
-    def analyze_lldp_topology(self):
-        """Analyze LLDP topology data like the web frontend does"""
-        try:
-            # Check for lldp_results.ini in different locations
-            lldp_file = None
-            possible_paths = [
-                self.cable_check_dir.parent / "html" / "lldp_results.ini",  # main html dir
-                self.monitor_results.parent / "html" / "lldp_results.ini", # relative to monitor-results
-                self.cable_check_dir / "lldp-results" / "lldp_results.ini", # lldp-results dir
-                self.monitor_results / "lldp_results.ini"  # monitor-results dir
-            ]
-            
-            for path in possible_paths:
-                if path.exists():
-                    lldp_file = path
-                    break
-                    
-            if not lldp_file:
-                print(f"    ❌ No lldp_results.ini found in any expected location")
-                return {"successful": 0, "failed": 0, "warnings": 0, "no_info": 0}
-            
-            with open(lldp_file, 'r') as f:
-                data = f.read()
-            
-            # Parse LLDP data similar to the frontend JavaScript
-            lines = data.split('\n')
-            connections = []
-            current_device = ''
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                parts = line.split('\t')
-                if len(parts) == 1:
-                    # Device name line
-                    current_device = parts[0]
-                elif len(parts) >= 6 and current_device:
-                    # Connection line
-                    connection = {
-                        'localDevice': current_device,
-                        'localPort': parts[0],
-                        'expectedDevice': parts[1] if parts[1] != 'N/A' else None,
-                        'expectedPort': parts[2] if parts[2] != 'N/A' else None,
-                        'actualDevice': parts[3] if parts[3] != 'N/A' else None,
-                        'actualPort': parts[4] if parts[4] != 'N/A' else None,
-                        'lldpStatus': parts[5]
-                    }
-                    connections.append(connection)
-            
-            # Count by status (replicate frontend logic)
-            stats = {"successful": 0, "failed": 0, "warnings": 0, "no_info": 0}
-            
-            for connection in connections:
-                status = self.determine_lldp_status(connection)
-                if status == 'SUCCESS':
-                    stats["successful"] += 1
-                elif status == 'FAILED':
-                    stats["failed"] += 1
-                elif status == 'WARNING':
-                    stats["warnings"] += 1
-                elif status == 'NO INFO':
-                    stats["no_info"] += 1
-            
-            return stats
-            
-        except Exception as e:
-            print(f"    ❌ Error analyzing LLDP topology: {e}")
-            return {"successful": 0, "failed": 0, "warnings": 0, "no_info": 0}
-    
-    def determine_lldp_status(self, connection):
-        """Determine LLDP connection status (replicate frontend logic)"""
-        lldp_status = connection.get('lldpStatus', '').upper()
-        
-        if lldp_status == 'SUCCESS':
-            return 'SUCCESS'
-        elif lldp_status == 'NO LLDP INFO':
-            return 'NO INFO'
-        elif lldp_status in ['MISSING FROM EXPECTED', 'EXTRA CONNECTION']:
-            return 'WARNING'
-        else:
-            # Check if it's a connection mismatch
-            expected_device = connection.get('expectedDevice')
-            expected_port = connection.get('expectedPort') 
-            actual_device = connection.get('actualDevice')
-            actual_port = connection.get('actualPort')
-            
-            if (expected_device and actual_device and 
-                (expected_device != actual_device or expected_port != actual_port)):
-                return 'FAILED'
-            else:
-                return 'WARNING'
 
     def get_stats_from_html(self, html_filename):
         """Extract statistics from HTML analysis files using specific element IDs"""

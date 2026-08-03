@@ -2363,7 +2363,12 @@
         
         // Init
         window.onload = async function() {
-            if (!await LLDPqAuth.check()) return;
+            if (!await LLDPqAuth.checkWithRetry()) {
+                if (LLDPqAuth.lastCheckTransient) {
+                    showPageError('Auth check unreachable — reload the page to retry.');
+                }
+                return;
+            }
             clearPageError();
             await Promise.all([loadDeviceList(), checkScanStatus()]);
         };

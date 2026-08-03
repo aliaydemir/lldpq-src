@@ -829,6 +829,70 @@ def _atomic_write(path, content):
         raise
 
 
+HARDWARE_HISTORY_FILE = "monitor-results/hardware_history.json"
+HARDWARE_HISTORY_RETENTION_SECONDS = 24 * 3600
+HARDWARE_HISTORY_MAX_ENTRIES = 200
+
+
+def update_hardware_history(device_grades, history_path=HARDWARE_HISTORY_FILE,
+                            now=None):
+    """Append one graded entry per device and prune the 24h rolling window.
+
+    This file is the producer feed behind its three consumers (the history
+    enrichment above, check_alerts.get_device_hardware_status and
+    ai_correlate._collect_hardware), so entries carry the per-device keyed
+    ISO ``timestamp`` and ``overall_grade`` fields those readers parse.
+    ``device_grades`` maps device -> (overall_grade, raw sample epoch).
+    """
+    now = time.time() if now is None else float(now)
+    history = {}
+    try:
+        with open(history_path, "r") as f:
+            data = json.load(f)
+        existing = data.get("hardware_history", {})
+        if isinstance(existing, dict):
+            history = existing
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️  Warning: rebuilding unreadable hardware_history.json: {e}")
+
+    cutoff = now - HARDWARE_HISTORY_RETENTION_SECONDS
+    pruned = {}
+    for device, entries in history.items():
+        if not isinstance(entries, list):
+            continue
+        kept = [
+            entry for entry in entries
+            if isinstance(entry, dict)
+            and (_parse_history_timestamp(entry.get("timestamp")) or 0) >= cutoff
+        ]
+        if kept:
+            pruned[device] = kept
+
+    for device, (overall_grade, sample_epoch) in device_grades.items():
+        timestamp = datetime.fromtimestamp(
+            sample_epoch, tz=timezone.utc
+        ).isoformat()
+        entries = pruned.setdefault(str(device), [])
+        if entries and entries[-1].get("timestamp") == timestamp:
+            # Re-analyzing the same raw sample updates the grade in place
+            # instead of duplicating the entry.
+            entries[-1]["overall_grade"] = overall_grade
+        else:
+            entries.append({
+                "device": str(device),
+                "timestamp": timestamp,
+                "overall_grade": overall_grade,
+            })
+        del entries[:-HARDWARE_HISTORY_MAX_ENTRIES]
+
+    _atomic_write(history_path, json.dumps(
+        {"hardware_history": pruned, "last_update": int(now)},
+        separators=(",", ":"),
+    ) + "\n")
+
+
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
@@ -2162,7 +2226,7 @@ def generate_hardware_html():
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
+    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""
@@ -2228,6 +2292,22 @@ def generate_hardware_html():
         coverage_status,
         generated_at=generated_at,
     )
+
+    # Persist the per-device grade history feed. Best-effort: the published
+    # report above stays authoritative even if the history cannot be written.
+    try:
+        device_grades = {}
+        for device_info in all_devices:
+            name = device_info['device']
+            raw_file = os.path.join(hardware_data_dir, f"{name}_hardware.txt")
+            try:
+                sample_epoch = os.path.getmtime(raw_file)
+            except OSError:
+                sample_epoch = generated_at
+            device_grades[name] = (device_info['health_grade'], sample_epoch)
+        update_hardware_history(device_grades, now=generated_at)
+    except Exception as e:
+        print(f"⚠️  Warning: could not update hardware_history.json: {e}")
 
     print(f"Hardware analysis HTML generated with {total_devices} devices!")
     print(f"   - Excellent: {len(summary['excellent_devices'])}")

@@ -1094,7 +1094,7 @@
         <div class="info-section" id="card-interfaceTable">
             <h3>
                 <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z"/></svg>
-                Top Interfaces by Utilization
+                Top Interfaces by Throughput
             </h3>
             <table class="interface-table" id="interfaceTable">
                 <thead>
@@ -1103,14 +1103,13 @@
                         <th>Interface</th>
                         <th>TX Rate</th>
                         <th>RX Rate</th>
-                        <th>Utilization</th>
                         <th>Errors</th>
                         <th>Drops</th>
                     </tr>
                 </thead>
                 <tbody id="interfaceTableBody">
                     <tr>
-                        <td colspan="7" style="text-align: center; color: #888; padding: 30px;">
+                        <td colspan="6" style="text-align: center; color: #888; padding: 30px;">
                             Waiting for telemetry data...
                         </td>
                     </tr>
@@ -1201,7 +1200,7 @@
                     <input type="checkbox" id="toggle-interfaceTable" checked onchange="saveChartPreferences()">
                     <div>
                         <label for="toggle-interfaceTable">Interface Table</label>
-                        <div class="chart-desc">Top interfaces by utilization (table view)</div>
+                        <div class="chart-desc">Top interfaces by throughput (table view)</div>
                     </div>
                 </div>
                 <!-- Advanced metrics (hidden by default) -->
@@ -1408,6 +1407,7 @@
         let allDevices = [];
         let prometheusUrl = '';
         let refreshInterval = null;
+        let autoRefreshInFlight = false;
         let dashboardUpdateGeneration = 0;
         let dashboardUpdateChain = Promise.resolve();
         let totalThroughputChart = null;
@@ -1766,14 +1766,25 @@
         function startAutoRefresh() {
             stopAutoRefresh();
             refreshInterval = setInterval(async () => {
+                // Single-flight: skip this tick if the previous cycle is still
+                // running (fcgiwrap is single-worker; do not pile up CGI calls).
+                if (autoRefreshInFlight) return;
+                autoRefreshInFlight = true;
                 const refreshEl = document.getElementById('refreshIndicator');
                 refreshEl.classList.add('active');
-                // checkPrometheusConnection() refreshes the dashboard when up,
-                // flips the status dot to Disconnected when Prometheus is gone,
-                // and stops this loop + redirects on session expiry (401/403).
-                await checkPrometheusConnection();
+                try {
+                    // checkPrometheusConnection() refreshes the dashboard when up,
+                    // flips the status dot to Disconnected when Prometheus is gone,
+                    // and stops this loop + redirects on session expiry (401/403).
+                    await checkPrometheusConnection();
+                    // Wait for the dashboard batch it queued so the guard covers
+                    // the whole cycle, not just the status probe.
+                    await dashboardUpdateChain;
+                } finally {
+                    autoRefreshInFlight = false;
+                }
                 setTimeout(() => refreshEl.classList.remove('active'), 1000);
-            }, 10000);  // 10 second refresh
+            }, 30000);  // 30 second refresh
         }
         
         function updateDashboard() {
@@ -2129,63 +2140,100 @@
         async function updateInterfaceTable(device) {
             const deviceFilter = device !== 'all' ? `{net_host_name="${device}"}` : '';
             const isSingleDevice = device !== 'all';
-            
+
             // Update table title based on selection
             const titleEl = document.querySelector('#interfaceTable').closest('.info-section')?.querySelector('h3');
             if (titleEl) {
                 titleEl.innerHTML = isSingleDevice
-                    ? '<svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z"/></svg> All Interfaces by Utilization'
-                    : '<svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z"/></svg> Top Interfaces by Utilization';
+                    ? '<svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z"/></svg> All Interfaces by Throughput'
+                    : '<svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-1 9h-4v4h-2v-4H9V9h4V5h2v4h4v2z"/></svg> Top Interfaces by Throughput';
             }
-            
-            // For single device: get all interfaces. For all devices: top 20
-            const query = isSingleDevice
-                ? `rate(cumulus_nvswitch_interface_if_in_octets${deviceFilter}[5m]) + rate(cumulus_nvswitch_interface_if_out_octets${deviceFilter}[5m])`
-                : `topk(20, rate(cumulus_nvswitch_interface_if_in_octets${deviceFilter}[5m]) + rate(cumulus_nvswitch_interface_if_out_octets${deviceFilter}[5m]))`;
-            
-            const result = await queryPrometheus(query);
+
             const tbody = document.getElementById('interfaceTableBody');
-            
-            if (!result.success || !result.data?.result || result.data.result.length === 0) {
+            const showWaiting = () => {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="7" style="text-align: center; color: #888; padding: 30px;">
+                        <td colspan="6" style="text-align: center; color: #888; padding: 30px;">
                             Waiting for telemetry data...
                         </td>
                     </tr>
                 `;
+            };
+
+            // For all devices: rank fabric-wide server-side first (like Top Talkers),
+            // then scope the per-direction queries to the winners so instant queries
+            // never pull every interface of the fabric.
+            let scopeFilter = deviceFilter;
+            let selectedKeys = null;
+            if (!isSingleDevice) {
+                const rankResult = await queryPrometheus('topk(20, sum by (interface, net_host_name) (rate(cumulus_nvswitch_interface_if_in_octets[5m]) + rate(cumulus_nvswitch_interface_if_out_octets[5m])))');
+                if (!rankResult.success || !rankResult.data?.result || rankResult.data.result.length === 0) {
+                    showWaiting();
+                    return;
+                }
+                // Escape regex metachars for the PromQL matcher (\\ so PromQL string
+                // unescaping still leaves one backslash for the regex engine)
+                const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&');
+                const hosts = [...new Set(rankResult.data.result.map(r => r.metric.net_host_name).filter(Boolean))];
+                const ifaces = [...new Set(rankResult.data.result.map(r => r.metric.interface).filter(Boolean))];
+                selectedKeys = new Set(rankResult.data.result.map(r => `${r.metric.net_host_name || '-'}|${r.metric.interface || '-'}`));
+                scopeFilter = `{net_host_name=~"${hosts.map(escapeRe).join('|')}",interface=~"${ifaces.map(escapeRe).join('|')}"}`;
+            }
+
+            // Per-direction rates plus the same error/drop metrics the charts above use
+            const [txResult, rxResult, errResult, dropResult] = await Promise.all([
+                queryPrometheus(`sum by (interface, net_host_name) (rate(cumulus_nvswitch_interface_if_out_octets${scopeFilter}[5m]))`),
+                queryPrometheus(`sum by (interface, net_host_name) (rate(cumulus_nvswitch_interface_if_in_octets${scopeFilter}[5m]))`),
+                queryPrometheus(`sum by (interface, net_host_name) (rate(cumulus_nvswitch_interface_if_in_errors${scopeFilter}[5m]) + rate(cumulus_nvswitch_interface_if_out_errors${scopeFilter}[5m]))`),
+                queryPrometheus(`sum by (interface, net_host_name) (rate(cumulus_nvswitch_interface_ether_stats_drop_events${scopeFilter}[5m]))`)
+            ]);
+
+            // Merge the series on device|interface
+            const rows = new Map();
+            const mergeInto = (result, field) => {
+                if (!result.success || !result.data?.result) return;
+                for (const series of result.data.result) {
+                    const key = `${series.metric.net_host_name || '-'}|${series.metric.interface || '-'}`;
+                    if (selectedKeys && !selectedKeys.has(key)) continue;
+                    if (!rows.has(key)) {
+                        rows.set(key, {
+                            device: series.metric.net_host_name || '-',
+                            iface: series.metric.interface || '-',
+                            tx: 0, rx: 0, errors: 0, drops: 0
+                        });
+                    }
+                    rows.get(key)[field] = parseFloat(series.value?.[1] || 0);
+                }
+            };
+            mergeInto(txResult, 'tx');
+            mergeInto(rxResult, 'rx');
+            mergeInto(errResult, 'errors');
+            mergeInto(dropResult, 'drops');
+
+            if (rows.size === 0) {
+                showWaiting();
                 return;
             }
-            
+
+            // Sort by combined throughput, highest first
+            const list = Array.from(rows.values()).sort((a, b) => (b.tx + b.rx) - (a.tx + a.rx));
+
             let html = '';
-            for (const iface of result.data.result) {
-                const deviceName = iface.metric.net_host_name || '-';
-                const ifName = iface.metric.interface || '-';
-                const bytesPerSec = parseFloat(iface.value?.[1] || 0);
-                const mbps = (bytesPerSec * 8 / 1000000).toFixed(2);
-                
-                // Simulate utilization (would need interface speed for real calc)
-                const utilization = Math.min(100, (bytesPerSec * 8 / 10000000000) * 100).toFixed(1);
-                const utilClass = utilization > 80 ? 'critical' : utilization > 60 ? 'warning' : '';
-                
+            for (const row of list) {
+                const txMbps = (row.tx * 8 / 1000000).toFixed(2);
+                const rxMbps = (row.rx * 8 / 1000000).toFixed(2);
                 html += `
                     <tr>
-                        <td>${deviceName}</td>
-                        <td style="font-family: monospace;">${ifName}</td>
-                        <td>${mbps} Mbps</td>
-                        <td>${mbps} Mbps</td>
-                        <td>
-                            <div class="utilization-bar ${utilClass}">
-                                <div class="fill" style="width: ${utilization}%"></div>
-                            </div>
-                            <span style="font-size: 11px; color: #888;">${utilization}%</span>
-                        </td>
-                        <td>0</td>
-                        <td>0</td>
+                        <td>${row.device}</td>
+                        <td style="font-family: monospace;">${row.iface}</td>
+                        <td>${txMbps} Mbps</td>
+                        <td>${rxMbps} Mbps</td>
+                        <td>${row.errors.toFixed(1)}/s</td>
+                        <td>${row.drops.toFixed(1)}/s</td>
                     </tr>
                 `;
             }
-            
+
             tbody.innerHTML = html;
         }
         
@@ -2628,7 +2676,91 @@
             log.appendChild(entry);
             log.scrollTop = log.scrollHeight;
         }
-        
+
+        // Read an NDJSON response incrementally, invoking onLine for each complete line
+        async function readNdjsonStream(response, onLine) {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            if (!response.body) throw new Error('Streaming not supported by this response');
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (line.trim()) onLine(line);
+                }
+            }
+            buffer += decoder.decode();
+            if (buffer.trim()) onLine(buffer);
+        }
+
+        // Stream check-telemetry-capability NDJSON: one line per device, then a
+        // final {done:true,...} summary. Throws (so callers ABORT) on transport
+        // failure, backend errors, or a missing done-line — support is never assumed.
+        async function streamCapabilityCheck(devices) {
+            const capResponse = await fetch('/fabric-api.sh?action=check-telemetry-capability', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ devices })
+            });
+            let doneLine = null;
+            await readNdjsonStream(capResponse, line => {
+                let msg;
+                try { msg = JSON.parse(line); } catch (e) { return; }
+                if (msg.done) { doneLine = msg; return; }
+                if (msg.success === false) throw new Error(msg.error || 'Capability check failed');
+                if (!msg.device) return;
+                if (msg.status === 'supported') {
+                    addLogEntry('Telemetry export supported', 'success', msg.device);
+                } else if (msg.status === 'unsupported') {
+                    addLogEntry('Skipped: OTLP export not supported', 'info', msg.device);
+                } else {
+                    addLogEntry(`Check failed: ${msg.detail || 'unknown error'}`, 'error', msg.device);
+                }
+            });
+            if (!doneLine) throw new Error('Capability check ended without a summary');
+            return doneLine;
+        }
+
+        // Stream run-telemetry-commands NDJSON, rendering per-device results live.
+        // Returns {success, failed} counts (from the backend summary when present).
+        async function streamTelemetryCommands(devices, commands, successLabel) {
+            const response = await fetch('/fabric-api.sh?action=run-telemetry-commands', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ devices, commands })
+            });
+            let successCount = 0;
+            let errorCount = 0;
+            let summary = null;
+            await readNdjsonStream(response, line => {
+                let result;
+                try { result = JSON.parse(line); } catch (e) { return; }
+                if (result.complete) {
+                    // Final summary from backend
+                    summary = result;
+                } else if (result.device) {
+                    // Individual device result
+                    if (result.success) {
+                        successCount++;
+                        addLogEntry(successLabel, 'success', result.device);
+                    } else if (result.error && result.error.includes('Stale revision')) {
+                        errorCount++;
+                        addLogEntry('Failed: Pending config exists - run "nv config detach" on device', 'error', result.device);
+                    } else {
+                        errorCount++;
+                        addLogEntry(`Failed: ${result.error || 'Unknown error'}`, 'error', result.device);
+                    }
+                }
+            });
+            if (summary) return { success: summary.success, failed: summary.failed };
+            return { success: successCount, failed: errorCount };
+        }
+
         async function enableTelemetry() {
             const collectorIP = document.getElementById('collectorIP').value.trim();
             const collectorPort = document.getElementById('collectorPort').value.trim() || '4317';
@@ -2712,35 +2844,28 @@
             
             let supportedDevices = [];
             let unsupportedDevices = [];
-            
+            let checkErrorDevices = [];
+
             try {
-                const capResponse = await fetch('/fabric-api.sh?action=check-telemetry-capability', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ devices: selectedDevices })
-                });
-                
-                const capData = await capResponse.json();
-                
-                if (capData.success) {
-                    supportedDevices = capData.supported || [];
-                    unsupportedDevices = capData.unsupported || [];
-                    addLogEntry(`${supportedDevices.length} supported, ${unsupportedDevices.length} unsupported`, 'info');
-                    
-                    // Log unsupported devices
-                    unsupportedDevices.forEach(d => {
-                        addLogEntry('Skipped: OTLP export not supported', 'info', d);
-                    });
-                } else {
-                    // Fallback to selected devices if check fails
-                    addLogEntry('Capability check failed, trying selected devices...', 'error');
-                    supportedDevices = selectedDevices;
+                const capData = await streamCapabilityCheck(selectedDevices);
+                supportedDevices = capData.supported || [];
+                unsupportedDevices = capData.unsupported || [];
+                checkErrorDevices = capData.errors || [];
+                let capSummary = `${supportedDevices.length} supported, ${unsupportedDevices.length} unsupported`;
+                if (checkErrorDevices.length > 0) {
+                    capSummary += `, ${checkErrorDevices.length} check failed`;
                 }
+                addLogEntry(capSummary, 'info');
             } catch (error) {
-                addLogEntry('Capability check failed, trying selected devices...', 'error');
-                supportedDevices = selectedDevices;
+                // Never assume support when the check itself failed - abort
+                addLogEntry(`Capability check failed: ${error.message}`, 'error');
+                addLogEntry('Aborting: cannot verify which devices support telemetry export', 'error');
+                document.getElementById('progressTitle').textContent = 'Capability Check Failed';
+                document.getElementById('progressSpinner').style.display = 'none';
+                showNotification('Capability check failed - aborted', 'error');
+                return;
             }
-            
+
             if (supportedDevices.length === 0) {
                 addLogEntry('No devices support telemetry export', 'error');
                 document.getElementById('progressTitle').textContent = 'No Supported Devices';
@@ -2770,41 +2895,11 @@
             let successCount = 0;
             let errorCount = 0;
             
-            // Process only supported devices
+            // Process only supported devices, rendering per-device progress live
             try {
-                const response = await fetch('/fabric-api.sh?action=run-telemetry-commands', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        devices: supportedDevices,
-                        commands: commands
-                    })
-                });
-                
-                const text = await response.text();
-                const lines = text.trim().split('\n');
-                
-                for (const line of lines) {
-                    try {
-                        const result = JSON.parse(line);
-                        if (result.complete) {
-                            // Final summary from backend
-                            successCount = result.success;
-                            errorCount = result.failed;
-                        } else if (result.device) {
-                            // Individual device result
-                            if (result.success) {
-                                addLogEntry('Telemetry enabled', 'success', result.device);
-                            } else if (result.error && result.error.includes('Stale revision')) {
-                                addLogEntry('Failed: Pending config exists - run "nv config detach" on device', 'error', result.device);
-                            } else {
-                                addLogEntry(`Failed: ${result.error || 'Unknown error'}`, 'error', result.device);
-                            }
-                        }
-                    } catch (e) {
-                        // Skip malformed lines
-                    }
-                }
+                const counts = await streamTelemetryCommands(supportedDevices, commands, 'Telemetry enabled');
+                successCount = counts.success;
+                errorCount = counts.failed;
             } catch (error) {
                 addLogEntry(`Error: ${error.message}`, 'error');
                 errorCount = supportedDevices.length;
@@ -2855,34 +2950,27 @@
             
             let supportedDevices = [];
             let unsupportedDevices = [];
-            
+
             try {
-                const capResponse = await fetch('/fabric-api.sh?action=check-telemetry-capability', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ devices: selectedDevices })
-                });
-                
-                const capData = await capResponse.json();
-                
-                if (capData.success) {
-                    supportedDevices = capData.supported || [];
-                    unsupportedDevices = capData.unsupported || [];
-                    addLogEntry(`${supportedDevices.length} supported, ${unsupportedDevices.length} unsupported`, 'info');
-                    
-                    // Log unsupported devices
-                    unsupportedDevices.forEach(d => {
-                        addLogEntry('Skipped: OTLP export not supported', 'info', d);
-                    });
-                } else {
-                    addLogEntry('Capability check failed, trying selected devices...', 'error');
-                    supportedDevices = selectedDevices;
+                const capData = await streamCapabilityCheck(selectedDevices);
+                supportedDevices = capData.supported || [];
+                unsupportedDevices = capData.unsupported || [];
+                const checkErrorDevices = capData.errors || [];
+                let capSummary = `${supportedDevices.length} supported, ${unsupportedDevices.length} unsupported`;
+                if (checkErrorDevices.length > 0) {
+                    capSummary += `, ${checkErrorDevices.length} check failed`;
                 }
+                addLogEntry(capSummary, 'info');
             } catch (error) {
-                addLogEntry('Capability check failed, trying selected devices...', 'error');
-                supportedDevices = selectedDevices;
+                // Never assume support when the check itself failed - abort
+                addLogEntry(`Capability check failed: ${error.message}`, 'error');
+                addLogEntry('Aborting: cannot verify which devices support telemetry export', 'error');
+                document.getElementById('progressTitle').textContent = 'Capability Check Failed';
+                document.getElementById('progressSpinner').style.display = 'none';
+                showNotification('Capability check failed - aborted', 'error');
+                return;
             }
-            
+
             let successCount = 0;
             let errorCount = 0;
             const skippedCount = unsupportedDevices.length;
@@ -2904,38 +2992,9 @@
                 ];
                 
                 try {
-                    const response = await fetch('/fabric-api.sh?action=run-telemetry-commands', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            devices: supportedDevices,
-                            commands: commands
-                        })
-                    });
-                    
-                    const text = await response.text();
-                    const lines = text.trim().split('\n');
-                    
-                    for (const line of lines) {
-                        try {
-                            const result = JSON.parse(line);
-                            if (result.complete) {
-                                successCount = result.success;
-                                errorCount = result.failed;
-                            } else if (result.device) {
-                                if (result.success) {
-                                    addLogEntry('Telemetry disabled', 'success', result.device);
-                                } else if (result.error && result.error.includes('Stale revision')) {
-                                    addLogEntry('Failed: Pending config exists - run "nv config detach" on device', 'error', result.device);
-                                } else {
-                                    addLogEntry(`Failed: ${result.error || 'Unknown error'}`, 'error', result.device);
-                                }
-                            }
-                        } catch (e) {
-                            // Skip malformed lines
-                        }
-                    }
-                    
+                    const counts = await streamTelemetryCommands(supportedDevices, commands, 'Telemetry disabled');
+                    successCount = counts.success;
+                    errorCount = counts.failed;
                 } catch (error) {
                     addLogEntry(`Error: ${error.message}`, 'error');
                 }

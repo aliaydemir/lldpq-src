@@ -688,6 +688,58 @@ class BERAnalyzer:
                 pass
         return ok
 
+    def clear_stale_shard_current(self, processed_hosts) -> bool:
+        """Empty the persisted current snapshot of unrefreshed shards.
+
+        save_ber_history only rewrites hosts carrying current-run evidence,
+        so a device without a current collection would keep serving its old
+        snapshot; shard consumers (alerts, AI context) must see the same as
+        the monolith rebuild did: history survives, current does not.
+        """
+        shard_dir = os.path.join(self.data_dir, HISTORY_DIR_NAME)
+        try:
+            shard_names = sorted(os.listdir(shard_dir))
+        except FileNotFoundError:
+            return True
+        stale = [
+            name[: -len(".json")]
+            for name in shard_names
+            if name.endswith(".json")
+            and name[: -len(".json")] not in processed_hosts
+        ]
+
+        def clear_one(host: str) -> Optional[str]:
+            path = os.path.join(shard_dir, f"{host}.json")
+            try:
+                with open(path, "r") as f:
+                    shard = json.load(f)
+            except FileNotFoundError:
+                return None
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                return f"{host}: {type(exc).__name__}: {exc}"
+            if not isinstance(shard, dict) or not shard.get("current"):
+                return None
+            shard["current"] = {}
+            shard["updated_at"] = time.time()
+            try:
+                self._atomic_json_write(path, shard)
+                return None
+            except Exception as exc:
+                return f"{host}: {type(exc).__name__}: {exc}"
+
+        errors: List[str] = []
+        if stale:
+            workers = max(1, min(8, os.cpu_count() or 2, len(stale)))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for error in executor.map(clear_one, stale):
+                    if error is not None:
+                        errors.append(error)
+        if errors:
+            print("BER shard current-snapshot reconcile failed: "
+                  + "; ".join(errors))
+            return False
+        return True
+
     def _bound_port_history(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Retain trend inputs, recent context, and the latest L1 baseline."""
         if len(entries) <= self.MAX_HISTORY_ENTRIES_PER_PORT:
@@ -2935,7 +2987,7 @@ class BERAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260801-tf-4"></script>
+    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

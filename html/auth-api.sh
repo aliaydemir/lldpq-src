@@ -325,8 +325,23 @@ case "$ACTION" in
         
         # Hash new password
         NEW_HASH=$(hash_password "$NEW_PASSWORD")
-        
+
         RESULT=$(auth_users_mutate change-password "$TARGET_USER" "$NEW_HASH")
+        MUTATION_STATUS=$?
+
+        # An admin reset of ANOTHER user must invalidate that user's active
+        # sessions (same sweep as delete-user); a self change keeps this one.
+        if [ "$MUTATION_STATUS" -eq 0 ] && [ "$TARGET_USER" != "$CURRENT_USER" ]; then
+            for session_file in "$SESSIONS_DIR"/*; do
+                if [ -f "$session_file" ]; then
+                    SESSION_USER=$(sed -n '2p' "$session_file" 2>/dev/null)
+                    if [ "$SESSION_USER" = "$TARGET_USER" ]; then
+                        rm -f "$session_file"
+                    fi
+                fi
+            done
+        fi
+
         json_response "$RESULT"
         ;;
     

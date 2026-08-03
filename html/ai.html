@@ -2153,6 +2153,18 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // ===================== ANALYSIS =====================
+// Cron analyze failures are otherwise invisible (detached run); get-analysis
+// returns the wrapper's last-attempt record so the UI can warn about a
+// failure newer than the shown report.
+function lastAttemptWarning(data) {
+    const attempt = data && data.last_attempt;
+    if (!attempt || attempt.ok !== false) return '';
+    if (!(Number(attempt.ts) > Number(data.timestamp || 0))) return '';
+    const when = attempt.ts ? new Date(attempt.ts * 1000).toLocaleString() : 'unknown time';
+    return 'Last autonomous analysis failed at ' + when
+        + (attempt.error ? ': ' + attempt.error : '');
+}
+
 async function loadAnalysisBadge() {
     // Own "Last Analysis" button (hidden via its inline style until a fresh
     // persisted analysis exists) — a separate control, so a click can never
@@ -2167,6 +2179,19 @@ async function loadAnalysisBadge() {
             label.textContent = stamp
                 ? 'Last ' + stamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                 : 'Last Analysis';
+            btn.title = 'Show the last saved hourly analysis (no new run, no cost)';
+            // A reused report refreshed its timestamp without new LLM text;
+            // show when the analysis text itself was generated.
+            if (data.reused && data.generated_at) {
+                label.textContent += ' (reused)';
+                btn.title = 'Report reused; analysis text generated at '
+                    + new Date(data.generated_at * 1000).toLocaleString();
+            }
+            const warn = lastAttemptWarning(data);
+            if (warn) {
+                label.textContent += ' (!)';
+                btn.title = warn;
+            }
         }
         btn.style.display = '';
     } else {
@@ -2187,8 +2212,14 @@ async function showPersistedAnalysis(event) {
     const suggestions = document.getElementById('suggestions');
     if (suggestions) suggestions.remove();
     const stamp = data.timestamp ? new Date(data.timestamp * 1000) : null;
+    // Distinguish a reused steady-state report from freshly generated text.
+    const generated = (data.reused && data.generated_at)
+        ? new Date(data.generated_at * 1000) : null;
     addMessage('system', 'Last autonomous fabric health analysis' +
-        (stamp ? ` (${stamp.toLocaleString()})` : '') + ':');
+        (stamp ? ` (${stamp.toLocaleString()})` : '') +
+        (generated ? ` — reused, text generated ${generated.toLocaleString()}` : '') + ':');
+    const attemptWarn = lastAttemptWarning(data);
+    if (attemptWarn) addMessage('system', 'Warning: ' + attemptWarn);
     addMessage('assistant', data.analysis, {
         evidence: data.evidence,
         confidence: data.confidence,
@@ -2350,6 +2381,11 @@ function handleSuggestionKey(event, element) {
 }
 
 function sendPrompt(fullPrompt) {
+    // Never overwrite the operator's draft while a request is running.
+    if (isStreaming || isAnalysisRunning) {
+        showToast('Wait for the current response to finish', 'info');
+        return;
+    }
     document.getElementById('chatInput').value = fullPrompt;
     sendMessage();
 }

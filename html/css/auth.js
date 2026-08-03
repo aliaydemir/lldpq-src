@@ -21,10 +21,12 @@ const LLDPqAuth = {
     user: null,
     role: null,
     hostname: 'lldpq',
+    lastCheckTransient: false,
     
     // Check if user is authenticated
     async check() {
         let data = null;
+        this.lastCheckTransient = false;
         try {
             const response = await fetch('/auth-api?action=check');
             data = await response.json();
@@ -33,6 +35,7 @@ const LLDPqAuth = {
             // request). Do NOT redirect to login — the session may still be valid.
             // The caller handles the false return by aborting its own action.
             console.error('Auth check failed:', e);
+            this.lastCheckTransient = true;
             return false;
         }
 
@@ -52,6 +55,21 @@ const LLDPqAuth = {
         }
     },
     
+    // Page-load auth gate with retries. Only transient failures (network
+    // error, 5xx/non-JSON reply from a busy fcgiwrap) are retried; a clean
+    // authenticated:false verdict redirects to login via check() and is
+    // never retried. Returns the final check() result.
+    async checkWithRetry(attempts = 3, backoffMs = 1000) {
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            const ok = await this.check();
+            if (ok || !this.lastCheckTransient) return ok;
+            if (attempt < attempts) {
+                await new Promise(resolve => setTimeout(resolve, backoffMs * attempt));
+            }
+        }
+        return false;
+    },
+
     // Redirect to login page (break out of iframe to avoid nested app shell)
     redirectToLogin() {
         const topWin = this.getTopWindow();

@@ -272,9 +272,11 @@ def _load_ansible_devices():
                     parts = shlex.split(line, comments=True, posix=True)
                 except ValueError:
                     continue
-                # Keep the Console inventory aligned with fabric-api.sh: host rows
-                # shown by that API carry at least one inline Ansible variable.
-                if not parts or not any("=" in part for part in parts[1:]):
+                # Keep the Console inventory aligned with fabric-api.sh list-devices:
+                # bare hostname rows (vars living in host_vars/) count as hosts too,
+                # so accept them; their address falls back to the hostname itself or
+                # to devices.yaml in resolve_target().
+                if not parts or "=" in parts[0]:
                     continue
                 hostname = parts[0]
                 variables = {}
@@ -304,12 +306,15 @@ def resolve_target(target):
     sudo = [] if _current_user() == lldpq_user else ["sudo", "-u", lldpq_user]
     if target == HOST_TARGET:
         return ("LLDPq host (%s)" % lldpq_user, sudo + ["/bin/bash", "-l"])
-    # Match the Fabric device list: a non-empty Ansible inventory is authoritative;
-    # devices.yaml is used only when no usable Ansible hosts were found.
-    devices = _load_ansible_devices()
-    if not devices:
-        devices = _load_devices()
-    dev = devices.get((target or "").lower())
+    # Match the Fabric device list: the Ansible inventory is authoritative, but
+    # devices.yaml fills the gaps PER-TARGET — both for hosts missing from the
+    # inventory and for bare inventory rows whose address is just the hostname.
+    key = (target or "").lower()
+    dev = _load_ansible_devices().get(key)
+    if dev is None or dev[0].lower() == key:
+        yaml_dev = _load_devices().get(key)
+        if yaml_dev:
+            dev = yaml_dev
     if not dev:
         return (None, None)
     ip, duser = dev
