@@ -504,19 +504,40 @@
     }
 
     // A socket that closed with 1006 before ever opening was rejected during the
-    // HTTP upgrade. Probe auth once: an expired session goes back to login, anything
-    // else is a bridge-side rejection (unknown target / capacity) worth no retries.
+    // HTTP upgrade, and the browser cannot read the status behind it. Ask the
+    // bridge to re-run the same admission checks over plain HTTP so the operator
+    // is told which check failed instead of a list of guesses.
     async function handlePreOpenRejection(sess) {
+        let data = null;
         try {
-            const resp = await fetch('/auth-api?action=check');
-            const data = await resp.json();
-            if (!data || !data.authenticated) {
-                if (window.LLDPqAuth) LLDPqAuth.redirectToLogin();
-                else window.location.href = '/login.html';
+            const resp = await fetch(
+                `/console-ws/probe?target=${encodeURIComponent(sess.target)}&sid=${encodeURIComponent(sess.sid)}`,
+                { cache: 'no-store' });
+            try {
+                data = await resp.json();
+            } catch (e) {
+                // Reached the web server but not a bridge that speaks to us
+                showReconnect(sess, `was refused with HTTP ${resp.status} by the web server, which could not get an answer from the console service`);
                 return;
             }
-        } catch (e) { /* probe failed — fall through to the manual reconnect box */ }
-        showReconnect(sess, 'was rejected by the console service (unknown target, session capacity reached, or the service is unavailable)');
+        } catch (e) {
+            // The probe travels the same path as the socket, so losing it too
+            // means the bridge itself is unreachable rather than unwilling.
+            showReconnect(sess, 'could not reach the console service — it is stopped, or the web server cannot proxy to it');
+            return;
+        }
+        if (!data || data.reason === 'auth') {
+            if (window.LLDPqAuth) LLDPqAuth.redirectToLogin();
+            else window.location.href = '/login.html';
+            return;
+        }
+        if (data.ok) {
+            // Admission would succeed right now, so the upgrade itself is what
+            // failed: a proxy in front is not passing the WebSocket handshake.
+            showReconnect(sess, 'was rejected during the WebSocket handshake, although the console service would accept it — check the /console-ws proxy');
+            return;
+        }
+        showReconnect(sess, `was rejected: ${data.message || 'the console service gave no reason'}`);
     }
     function scheduleReconnect(sess, detail) {
         if (sess.closing) return;

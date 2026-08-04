@@ -820,6 +820,55 @@ def _session_limit_status(token):
     return None
 
 
+def probe_admission(cookie_header, target, sid):
+    """(http_status, payload) for the same admission checks the upgrade runs.
+
+    A failed WebSocket upgrade reaches the browser as a bare 1006 with no
+    status line, so the page cannot tell "not an admin" from "service is full".
+    This plain-HTTP twin answers that question without creating a session.
+    """
+    ok, user, role, token = _authenticate_admin(cookie_header)
+    if not ok:
+        # A valid session with the wrong role still reports its role
+        if role:
+            return ("403 Forbidden", {
+                "ok": False, "reason": "role",
+                "message": "the console requires an admin account, and this "
+                           "session is signed in with the %s role" % role})
+        return ("401 Unauthorized", {
+            "ok": False, "reason": "auth",
+            "message": "your session has expired"})
+
+    existing = SESSIONS.get(sid) if sid else None
+    if existing is not None and existing.get("closing"):
+        existing = None
+    if existing is not None:
+        if existing.get("token") != token or existing.get("user") != user:
+            return ("403 Forbidden", {
+                "ok": False, "reason": "session_owner",
+                "message": "this session id belongs to a different login; "
+                           "close the tab and open a new session"})
+        if str(existing.get("target", "")).casefold() != (target or "").casefold():
+            return ("409 Conflict", {
+                "ok": False, "reason": "session_target",
+                "message": "this session id is already attached to another "
+                           "device; close the tab and open a new session"})
+        return ("200 OK", {"ok": True, "reason": "attachable", "message": ""})
+
+    _label, argv = resolve_target(target)
+    if not argv:
+        return ("404 Not Found", {
+            "ok": False, "reason": "unknown_target",
+            "message": "it is in neither the Ansible inventory nor "
+                       "devices.yaml, so no address can be resolved for it"})
+    limit_status = _session_limit_status(token)
+    if limit_status:
+        status, text = limit_status
+        return (status, {"ok": False, "reason": "capacity",
+                         "message": text.lower()})
+    return ("200 OK", {"ok": True, "reason": "ready", "message": ""})
+
+
 def _valid_websocket_key(key):
     try:
         return len(base64.b64decode(key.encode("ascii"), validate=True)) == 16
@@ -851,6 +900,17 @@ async def handle(reader, writer):
         writer.write(("HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"
                       "Connection: close\r\n%sContent-Length: %d\r\n\r\n" %
                       (code, extra_headers, len(body))).encode("ascii") + body)
+        try:
+            await writer.drain()
+        except (ConnectionError, RuntimeError, OSError):
+            pass
+
+    async def http_json(code, payload):
+        body = json.dumps(payload).encode("utf-8")
+        writer.write(("HTTP/1.1 %s\r\nContent-Type: application/json\r\n"
+                      "Cache-Control: no-store\r\nConnection: close\r\n"
+                      "Content-Length: %d\r\n\r\n" %
+                      (code, len(body))).encode("ascii") + body)
         try:
             await writer.drain()
         except (ConnectionError, RuntimeError, OSError):
@@ -906,6 +966,19 @@ async def handle(reader, writer):
         log_target = _sanitize_log(target, 128)
         sid = (query.get("sid") or [""])[0]
         kill_only = (query.get("kill") or [""])[0] == "1"
+
+        # Plain-HTTP admission probe. The page calls this after an upgrade was
+        # refused, because a pre-open 1006 carries no status the browser can read.
+        if request_url.path.rstrip("/").endswith("/probe"):
+            status, payload = probe_admission(
+                headers.get("cookie", ""), target,
+                sid if _SID_RE.fullmatch(sid) else "")
+            if not payload.get("ok"):
+                audit("PROBE ip=%s target=%s (%s)" %
+                      (peer_ip, log_target, payload.get("reason", "?")))
+            await http_json(status, payload)
+            return
+
         if not _SID_RE.fullmatch(sid):
             await http_reject("400 Bad Request", "invalid session id")
             return
