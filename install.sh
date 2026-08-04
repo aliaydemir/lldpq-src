@@ -995,6 +995,35 @@ include "${hosts_file}";
 DHCPEOF
 }
 
+# dhcpd is AppArmor-confined on Debian/Ubuntu and may only read a small set of
+# paths, /tmp not among them: a candidate parked there is refused on permissions
+# long before its syntax is judged. Validate next to the real configuration
+# instead, as root, and repeat whatever the validator said — a silent
+# "failed validation" leaves an operator with nothing to act on.
+validate_dhcp_candidate() {
+    local validator="$1" candidate="$2" conf_dir="$3"
+    local staged rc=0 output
+
+    staged="$conf_dir/.lldpq-validate.$$.conf"
+    if ! root_run mkdir -p "$conf_dir" || ! root_run cp "$candidate" "$staged"; then
+        echo "  [!] Could not stage a DHCP config for validation under $conf_dir" >&2
+        root_run rm -f "$staged" 2>/dev/null || true
+        return 1
+    fi
+    output=$(root_run "$validator" -t -cf "$staged" 2>&1) || rc=$?
+    root_run rm -f "$staged" 2>/dev/null || true
+    if (( rc != 0 )) && [[ -n "$output" ]]; then
+        printf '%s\n' "$output" | sed -e "s|$staged|$candidate|g" -e 's/^/      /' >&2
+    fi
+    return "$rc"
+}
+
+discard_dhcp_validation_hosts() {
+    local validation_hosts="$1" hosts_file="$2"
+    [[ -n "$validation_hosts" && "$validation_hosts" != "$hosts_file" ]] || return 0
+    root_run rm -f "$validation_hosts" 2>/dev/null || true
+}
+
 # Return codes: 0 = created/replaced, 10 = existing LLDPq config kept,
 # 11 = existing foreign config preserved because no explicit opt-in was given.
 is_lldpq_managed_dhcp_config() {
@@ -1033,7 +1062,7 @@ prepare_default_dhcp_config() {
             echo "  [!] dhcpd validator not found; existing LLDPq config was not accepted" >&2
             return 12
         fi
-        if ! "$validator" -t -cf "$conf_file" >/dev/null 2>&1; then
+        if ! validate_dhcp_candidate "$validator" "$conf_file" "$(dirname "$conf_file")"; then
             echo "  [!] Existing LLDPq DHCP config is invalid; leaving it unchanged" >&2
             return 12
         fi
@@ -1048,30 +1077,40 @@ prepare_default_dhcp_config() {
     fi
 
     temp_file=$(mktemp "${TMPDIR:-/tmp}/lldpq-dhcp.XXXXXX")
+    # The candidate names its include by absolute path, and dhcpd must be able
+    # to read that too, so a stand-in for a not-yet-created hosts file belongs
+    # beside the real one rather than in /tmp.
     validation_hosts="$hosts_file"
     if [[ ! -e "$hosts_file" ]]; then
-        validation_hosts=$(mktemp "${TMPDIR:-/tmp}/lldpq-dhcp-hosts.XXXXXX")
+        validation_hosts="$(dirname "$hosts_file")/.lldpq-validate-hosts.$$"
+        if ! root_run mkdir -p "$(dirname "$hosts_file")" || \
+           ! root_run touch "$validation_hosts" || \
+           ! root_run chmod 644 "$validation_hosts"; then
+            echo "  [!] Could not stage a DHCP hosts include for validation" >&2
+            rm -f "$temp_file"
+            root_run rm -f "$validation_hosts" 2>/dev/null || true
+            return 1
+        fi
     fi
     render_default_dhcp_config "$temp_file" "$server_ip" "$validation_hosts"
 
-    if command -v "$validator" >/dev/null 2>&1; then
-        if ! "$validator" -t -cf "$temp_file" >/dev/null 2>&1; then
-            echo "  [!] Generated DHCP config failed validation; existing config was not changed" >&2
-            rm -f "$temp_file"
-            [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
-            return 1
-        fi
-    else
+    if ! command -v "$validator" >/dev/null 2>&1; then
         echo "  [!] dhcpd validator not found; refusing to activate an unvalidated config" >&2
         rm -f "$temp_file"
-        [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
+        discard_dhcp_validation_hosts "$validation_hosts" "$hosts_file"
+        return 1
+    fi
+    if ! validate_dhcp_candidate "$validator" "$temp_file" "$(dirname "$conf_file")"; then
+        echo "  [!] Generated DHCP config failed validation; existing config was not changed" >&2
+        rm -f "$temp_file"
+        discard_dhcp_validation_hosts "$validation_hosts" "$hosts_file"
         return 1
     fi
 
-    # The validation-only include may live in /tmp.  Render the exact final
-    # include path only after syntax validation succeeds.
+    # Render the exact final include path only after validation succeeded, so
+    # the placeholder above never reaches the activated configuration.
     render_default_dhcp_config "$temp_file" "$server_ip" "$hosts_file"
-    [[ "$validation_hosts" != "$hosts_file" ]] && rm -f "$validation_hosts"
+    discard_dhcp_validation_hosts "$validation_hosts" "$hosts_file"
 
     if ! root_run mkdir -p "$(dirname "$conf_file")" "$(dirname "$hosts_file")"; then
         rm -f "$temp_file"
