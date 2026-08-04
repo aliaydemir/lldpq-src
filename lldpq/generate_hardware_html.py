@@ -19,6 +19,7 @@ import statistics
 import tempfile
 import time
 from datetime import datetime, timezone
+import analysis_events
 import export_artifacts
 from collection_freshness import (
     is_current_collection,
@@ -893,6 +894,255 @@ def update_hardware_history(device_grades, history_path=HARDWARE_HISTORY_FILE,
     ) + "\n")
 
 
+# ============== System watchdog (reboot / service-restart) ==============
+# The collector nests a SYS_WATCHDOG sub-section inside HARDWARE_DATA
+# (collection_bundle.py validates a fixed top-level layout, so private
+# sub-markers travel as ordinary body lines).  A device that reboots and
+# returns within the 10-minute cycle triggers nothing else: carrier and BGP
+# counters reset and their analyzers silently re-baseline.
+
+SYS_WATCHDOG_STATE_FILE = "monitor-results/system-watchdog-state.json"
+SYS_WATCHDOG_START_MARKER = "===SYS_WATCHDOG_START==="
+SYS_WATCHDOG_END_MARKER = "===SYS_WATCHDOG_END==="
+SYS_WATCHDOG_ERROR_MARKER = "__LLDPQ_SYS_WATCHDOG_ERROR__"
+# An uptime this close to the elapsed poll interval is clock skew, not
+# evidence of a restart.
+SYS_WATCHDOG_REBOOT_SKEW_SECONDS = 120
+SYS_WATCHDOG_EVENTS_MAX_PER_HOST = 50
+SYS_WATCHDOG_EVENT_RETENTION_SECONDS = 24 * 3600
+# Units whose restart is forwarding-critical (Timeline severity; the alert
+# side applies the same split).
+SYS_WATCHDOG_CRITICAL_UNITS = ("frr.service", "switchd.service")
+
+
+def parse_sys_watchdog(content):
+    """Parse the SYS_WATCHDOG sub-section out of one raw hardware sample.
+
+    Returns None when the sub-section is absent (pre-upgrade raw file).
+    Otherwise {"uptime_seconds": float|None, "services": {unit: int}|None}
+    where a None field means that command failed on the device and its
+    baselines must not move.
+    """
+    text = str(content or "")
+    if SYS_WATCHDOG_START_MARKER not in text:
+        return None
+    section = text.partition(SYS_WATCHDOG_START_MARKER)[2]
+    section = section.partition(SYS_WATCHDOG_END_MARKER)[0]
+
+    uptime_seconds = None
+    if SYS_WATCHDOG_ERROR_MARKER + ":UPTIME" not in section:
+        match = re.search(
+            r"^UPTIME_SECONDS:\s*([0-9]+(?:\.[0-9]+)?)\s*$",
+            section, re.MULTILINE,
+        )
+        if match:
+            uptime_seconds = float(match.group(1))
+
+    services = None
+    if SYS_WATCHDOG_ERROR_MARKER + ":SERVICES" not in section:
+        # systemctl show blocks are blank-line separated; units missing on a
+        # platform simply produce empty/absent blocks.
+        services = {}
+        for block in re.split(r"\n\s*\n", section):
+            unit_match = re.search(r"^Id=(\S+)\s*$", block, re.MULTILINE)
+            restarts_match = re.search(
+                r"^NRestarts=(\d+)\s*$", block, re.MULTILINE)
+            if unit_match and restarts_match:
+                services[unit_match.group(1)] = int(restarts_match.group(1))
+    return {"uptime_seconds": uptime_seconds, "services": services}
+
+
+def evaluate_sys_watchdog_sample(previous, sample, sample_ts):
+    """Evaluate one host sample against its persisted baseline.
+
+    Returns ``(new_host_state, events)``.  No events on first sight, and a
+    missing/malformed field never advances its own baseline.  A reboot
+    suppresses this cycle's service-restart events: systemd counters reset
+    on boot, so the reboot event subsumes them.
+    """
+    previous = previous if isinstance(previous, dict) else None
+    state = dict(previous or {})
+    events = []
+    rebooted = False
+
+    uptime_now = sample.get("uptime_seconds")
+    if isinstance(uptime_now, (int, float)) and not isinstance(uptime_now, bool):
+        prev_wall_ts = None
+        if previous is not None:
+            try:
+                prev_wall_ts = float(previous.get("wall_ts"))
+            except (TypeError, ValueError):
+                prev_wall_ts = None
+        if (prev_wall_ts is not None
+                and uptime_now < (sample_ts - prev_wall_ts)
+                - SYS_WATCHDOG_REBOOT_SKEW_SECONDS):
+            rebooted = True
+            events.append({
+                "ts": int(sample_ts),
+                "kind": "reboot",
+                "uptime_seconds": round(float(uptime_now), 1),
+            })
+        state["uptime_seconds"] = round(float(uptime_now), 1)
+        state["wall_ts"] = int(sample_ts)
+
+    services_now = sample.get("services")
+    if isinstance(services_now, dict):
+        baseline = previous.get("services") if previous is not None else None
+        if isinstance(baseline, dict) and not rebooted:
+            for unit, count in sorted(services_now.items()):
+                try:
+                    delta = int(count) - int(baseline[unit])
+                except (KeyError, TypeError, ValueError):
+                    continue  # unit newly appeared: baseline only
+                if delta > 0:
+                    events.append({
+                        "ts": int(sample_ts),
+                        "kind": "service-restart",
+                        "unit": str(unit),
+                        "count": int(delta),
+                    })
+                # delta < 0: package reinstall / systemd reload; re-baseline
+                # silently.
+        state["services"] = {
+            str(unit): int(count) for unit, count in services_now.items()
+            if isinstance(count, int) and not isinstance(count, bool)
+        }
+    return state, events
+
+
+def _sys_watchdog_timeline_event(host, event):
+    """Timeline record (analysis_events shape) for one watchdog event."""
+    if event.get("kind") == "reboot":
+        uptime_minutes = int(float(event.get("uptime_seconds") or 0) // 60)
+        return {
+            "ts": event["ts"],
+            "severity": "warning",
+            "device": host,
+            "object": "system",
+            "kind": "device-reboot",
+            "detail": "Device rebooted (uptime %dm); counter resets expected "
+                      "(carrier/BGP/service baselines)" % uptime_minutes,
+        }
+    unit = str(event.get("unit") or "?")
+    return {
+        "ts": event["ts"],
+        "severity": (
+            "critical" if unit in SYS_WATCHDOG_CRITICAL_UNITS else "warning"
+        ),
+        "device": host,
+        "object": unit,
+        "kind": "service-restart",
+        "detail": "Service restart: %s x%d on %s" % (
+            unit, int(event.get("count") or 0), host),
+    }
+
+
+def update_system_watchdog(samples, expected_hosts,
+                           state_path=SYS_WATCHDOG_STATE_FILE, now=None):
+    """Detect reboots/service restarts and persist per-host baselines.
+
+    ``samples`` maps host -> (parsed watchdog sample, sample epoch); callers
+    pass only hosts with a CURRENT collection, so stale hosts keep their
+    baselines untouched.  Hosts no longer in ``expected_hosts`` (retired
+    from inventory) are pruned.  Returns (hosts_state, timeline_events).
+    """
+    now = time.time() if now is None else float(now)
+    document = {}
+    try:
+        with open(state_path, "r", encoding="utf-8") as handle:
+            document = json.load(handle)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"⚠️  Warning: rebuilding unreadable watchdog state: {e}")
+    hosts = document.get("hosts") if isinstance(document, dict) else None
+    hosts = dict(hosts) if isinstance(hosts, dict) else {}
+
+    timeline_events = []
+    cutoff = now - SYS_WATCHDOG_EVENT_RETENTION_SECONDS
+    for host in sorted(samples):
+        sample, sample_ts = samples[host]
+        if not isinstance(sample, dict):
+            continue
+        state, events = evaluate_sys_watchdog_sample(
+            hosts.get(host), sample, sample_ts
+        )
+        kept = [
+            event for event in (state.get("events") or [])
+            if isinstance(event, dict)
+            and isinstance(event.get("ts"), (int, float))
+            and not isinstance(event.get("ts"), bool)
+            and float(event["ts"]) >= cutoff
+        ] + events
+        state["events"] = kept[-SYS_WATCHDOG_EVENTS_MAX_PER_HOST:]
+        hosts[host] = state
+        timeline_events.extend(
+            _sys_watchdog_timeline_event(host, event) for event in events
+        )
+
+    if expected_hosts is not None:
+        expected = set(expected_hosts)
+        # An empty inventory view (broken assets snapshot, scoped run with
+        # nothing collected) must not wipe every baseline.
+        if expected:
+            for host in list(hosts):
+                if host not in expected:
+                    del hosts[host]
+
+    _atomic_write(state_path, json.dumps(
+        {"version": 1, "hosts": hosts, "last_update": int(now)},
+        separators=(",", ":"),
+    ) + "\n")
+    return hosts, timeline_events
+
+
+def _format_ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return "%dm ago" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh ago" % (seconds // 3600)
+    return "%dd ago" % (seconds // 86400)
+
+
+def sys_watchdog_annotations(host_state, now=None):
+    """(reboot_text, restarts_text) for a device row from 24h of events."""
+    now = time.time() if now is None else float(now)
+    events = (host_state or {}).get("events") \
+        if isinstance(host_state, dict) else None
+    reboot_ts = None
+    restarts = {}
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        try:
+            ts = float(event.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if now - ts > SYS_WATCHDOG_EVENT_RETENTION_SECONDS:
+            continue
+        if event.get("kind") == "reboot":
+            reboot_ts = ts if reboot_ts is None else max(reboot_ts, ts)
+        elif event.get("kind") == "service-restart":
+            unit = str(event.get("unit") or "?")
+            try:
+                count = int(event.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if count > 0:
+                restarts[unit] = restarts.get(unit, 0) + count
+    reboot_text = (
+        "Rebooted %s" % _format_ago(now - reboot_ts)
+        if reboot_ts is not None else None
+    )
+    restarts_text = ", ".join(
+        "%s x%d" % (unit, restarts[unit]) for unit in sorted(restarts)
+    ) or None
+    return reboot_text, restarts_text
+
+
 def calculate_device_health_grade(device_name, device_data):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
@@ -1099,6 +1349,34 @@ def generate_hardware_html():
     else:
         all_expected_hosts = set(collected_hosts)
     missing_hosts = sorted(all_expected_hosts - collected_hosts)
+
+    # System watchdog: reboot / service-restart detection from the current
+    # raw samples' SYS_WATCHDOG sub-section. Best-effort like the history
+    # feed: the published report stays authoritative even if this fails.
+    watchdog_hosts = {}
+    try:
+        watchdog_samples = {}
+        for filename in current_device_files:
+            watchdog_device = filename.removesuffix('_hardware.txt')
+            raw_file = os.path.join(hardware_data_dir, filename)
+            try:
+                with open(raw_file, "r", encoding="utf-8",
+                          errors="ignore") as source:
+                    watchdog_sample = parse_sys_watchdog(source.read())
+                sample_ts = os.path.getmtime(raw_file)
+            except OSError:
+                continue
+            if watchdog_sample is None:
+                continue  # pre-upgrade raw file: no watchdog section yet
+            watchdog_samples[watchdog_device] = (watchdog_sample, sample_ts)
+        watchdog_hosts, watchdog_timeline = update_system_watchdog(
+            watchdog_samples, all_expected_hosts
+        )
+        # Timeline sidecar (best-effort; publish_events never raises).
+        analysis_events.publish_events(
+            "monitor-results", "system", watchdog_timeline)
+    except Exception as e:
+        print(f"⚠️  Warning: system watchdog detection failed: {e}")
 
     # Data age reflects the newest raw sample on disk, not the moment this
     # report happens to be regenerated, so a stale collection reads as stale.
@@ -1478,6 +1756,24 @@ def generate_hardware_html():
         if psu_in_w is not None and psu_out_w is not None:
             psu_in_out_str = f"{psu_in_w:.1f}W / {psu_out_w:.1f}W"
 
+        # Watchdog annotations: reboot/service-restart markers follow the
+        # status-dot style (no text content, so column sorting is unchanged).
+        watchdog_reboot, watchdog_restarts = sys_watchdog_annotations(
+            watchdog_hosts.get(device_name)
+        )
+        watchdog_bits = []
+        if watchdog_reboot:
+            watchdog_bits.append(watchdog_reboot)
+        if watchdog_restarts:
+            watchdog_bits.append(f"service restarts: {watchdog_restarts}")
+        if watchdog_bits:
+            watchdog_title = html.escape("; ".join(watchdog_bits), quote=True)
+            watchdog_suffix = (
+                f'<span class="status-dot warning" title="{watchdog_title}"></span>'
+            )
+        else:
+            watchdog_suffix = ''
+
         # Get model information from assets
         device_label = html.escape(str(canonical(device_name)))
         device_key = html.escape(str(device_name), quote=True)
@@ -1516,11 +1812,13 @@ def generate_hardware_html():
             "psu_in": round(psu_in_w, 1) if psu_in_w is not None else None,
             "psu_out": round(psu_out_w, 1) if psu_out_w is not None else None,
             "fans": fan_details,
+            "rebooted": watchdog_reboot,
+            "service_restarts": watchdog_restarts,
         }
 
         html_content += f"""
                 <tr class="hw-row" data-device-key="{device_key}" data-status="{health_grade.lower()}" onclick="toggleHwDetails(this)">
-                    <td>{device_label}</td>
+                    <td>{device_label}{watchdog_suffix}</td>
                     <td><span class="{health_badge_class}">{health_grade.upper()}</span></td>
                     <td>{cpu_temp_str}{cpu_cell_suffix}</td>
                     <td>{asic_temp_str}{asic_cell_suffix}</td>
@@ -1649,6 +1947,9 @@ def generate_hardware_html():
                 ['PSU Power In / Out', (d.psu_in === null || d.psu_in === undefined)
                     ? '—' : hwEsc(d.psu_in) + 'W / ' + fmtNum(d.psu_out, 'W')],
             ];
+            // System-watchdog annotations only render for affected devices.
+            if (d.rebooted) { rows.push(['Rebooted', hwEsc(d.rebooted)]); }
+            if (d.service_restarts) { rows.push(['Service restarts', hwEsc(d.service_restarts)]); }
             const sensorRows = rows.map(function(r) {
                 return '<div class="kv"><span>' + r[0] + '</span><span>' + r[1] + '</span></div>';
             }).join('');

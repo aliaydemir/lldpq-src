@@ -137,6 +137,10 @@ def severity_for(anomaly):
     domain = str(anomaly.get("domain") or "")
     status = _norm_status(anomaly.get("status"))
     if domain == "bgp":
+        if str(anomaly.get("metric") or "") == "session_flaps":
+            # Like the flap domain: a session that already re-established
+            # never invents a critical grade from configurable thresholds.
+            return "WARNING"
         # Any persisted non-established session state is a hard failure.
         return "INFO" if _bgp_state_established(status) else "CRITICAL"
     if domain == "log":
@@ -146,6 +150,11 @@ def severity_for(anomaly):
     if domain == "flap":
         # Grading thresholds are configurable and not persisted in
         # flap_history.json; like the timeline, never invent a critical grade.
+        return "WARNING"
+    if domain == "system":
+        # Watchdog events (reboot / service restart) describe conditions
+        # that already completed: the device is back up and the service is
+        # running again, so a critical grade is never invented here.
         return "WARNING"
     if domain == "pfc_ecn":
         return "WARNING" if status == "loss" else "INFO"
@@ -197,7 +206,7 @@ def _current_bgp_stats(document):
     return normalized
 
 
-def _collect_bgp(mr_dir):
+def _collect_bgp(mr_dir, now=None):
     document = _load_json(os.path.join(mr_dir, "bgp_history.json"))
     current_stats = _current_bgp_stats(document)
     anomalies = []
@@ -215,6 +224,48 @@ def _collect_bgp(mr_dir):
             anomalies.append(_anomaly(
                 "bgp", device, interface, "session_state", state, state,
                 "BGP neighbor %s not established (state %s)" % (neighbor, state),
+                "bgp_history.json",
+            ))
+
+    # Session flaps recorded by the analyzer's counter/uptime detector.
+    # Each event carries its own timestamp, so freshness is gated per record
+    # like the other age-gated sources.
+    reference = _reference_time(now)
+    flap_events = (
+        document.get("flap_events") if isinstance(document, dict) else None
+    )
+    for device in sorted(flap_events if isinstance(flap_events, dict) else {}):
+        events = flap_events[device]
+        if not isinstance(events, list):
+            continue
+        sessions = {}
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            stamp = _number(event.get("ts"))
+            count = _integer(event.get("count"))
+            if stamp is None or count is None or count <= 0:
+                continue
+            if reference - stamp > STALE_RECORD_SECONDS:
+                continue
+            if stamp - reference > CLOCK_SKEW_SECONDS:
+                continue
+            key = (
+                str(event.get("vrf") or "default"),
+                str(event.get("neighbor") or "?"),
+            )
+            entry = sessions.setdefault(key, {"count": 0, "estimated": False})
+            entry["count"] += count
+            if event.get("estimated"):
+                entry["estimated"] = True
+        for vrf, neighbor in sorted(sessions):
+            entry = sessions[(vrf, neighbor)]
+            anomalies.append(_anomaly(
+                "bgp", device, neighbor, "session_flaps", entry["count"],
+                "flapping",
+                "BGP session %s (vrf %s) flapped %d time(s) recently%s" % (
+                    neighbor, vrf, entry["count"],
+                    " [estimated]" if entry["estimated"] else ""),
                 "bgp_history.json",
             ))
     return anomalies
@@ -480,6 +531,64 @@ def _collect_hardware(mr_dir, now=None):
     return anomalies
 
 
+def _collect_system_watchdog(mr_dir, now=None):
+    """Reboot / service-restart events from the hardware-side watchdog.
+
+    Events carry their own timestamps, so freshness is gated per record
+    (STALE_RECORD_SECONDS) like the other age-gated sources.
+    """
+    reference = _reference_time(now)
+    document = _load_json(os.path.join(mr_dir, "system-watchdog-state.json"))
+    hosts = (document or {}).get("hosts")
+    anomalies = []
+    for device in sorted(hosts if isinstance(hosts, dict) else {}):
+        host_state = hosts[device]
+        events = (
+            host_state.get("events") if isinstance(host_state, dict) else None
+        )
+        if not isinstance(events, list):
+            continue
+        reboot_stamp = None
+        reboot_uptime = None
+        restarts = {}
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            stamp = _number(event.get("ts"))
+            if stamp is None or reference - stamp > STALE_RECORD_SECONDS:
+                continue
+            if stamp - reference > CLOCK_SKEW_SECONDS:
+                continue
+            kind = str(event.get("kind") or "")
+            if kind == "reboot":
+                if reboot_stamp is None or stamp > reboot_stamp:
+                    reboot_stamp = stamp
+                    reboot_uptime = _number(event.get("uptime_seconds"))
+            elif kind == "service-restart":
+                unit = str(event.get("unit") or "")
+                count = _integer(event.get("count"))
+                if unit and count and count > 0:
+                    restarts[unit] = restarts.get(unit, 0) + count
+        if reboot_stamp is not None:
+            detail = "Device rebooted between samples"
+            if reboot_uptime is not None:
+                detail = "Device rebooted (uptime %dm)" % max(
+                    0, int(reboot_uptime // 60))
+            anomalies.append(_anomaly(
+                "system", device, None, "reboot", reboot_uptime, "warning",
+                detail, "system-watchdog-state.json",
+            ))
+        for unit in sorted(restarts):
+            count = restarts[unit]
+            anomalies.append(_anomaly(
+                "system", device, unit, "service_restart", count, "warning",
+                "Service %s restarted %d time(s) between samples" % (
+                    unit, count),
+                "system-watchdog-state.json",
+            ))
+    return anomalies
+
+
 def _collect_logs(mr_dir, now=None):
     path = os.path.join(mr_dir, "log_summary.json")
     document = _load_json(path)
@@ -525,6 +634,7 @@ _COLLECTORS = (
     _collect_flaps,
     _collect_pfc_ecn,
     _collect_hardware,
+    _collect_system_watchdog,
     _collect_logs,
 )
 
@@ -532,7 +642,8 @@ _COLLECTORS = (
 # window, which is anchored to producer time); they receive the reference
 # clock and gate on record age (STALE_RECORD_SECONDS).
 _AGE_GATED_COLLECTORS = (
-    _collect_ber, _collect_pfc_ecn, _collect_hardware, _collect_logs,
+    _collect_bgp, _collect_ber, _collect_pfc_ecn, _collect_hardware,
+    _collect_system_watchdog, _collect_logs,
 )
 
 
@@ -678,7 +789,8 @@ def _single_kind(members):
     domains = {str(item.get("domain") or "") for item in members}
     if domains == {"bgp"}:
         return "protocol"
-    if domains <= {"bgp", "optical", "ber", "flap", "pfc_ecn", "hardware", "log"}:
+    if domains <= {"bgp", "optical", "ber", "flap", "pfc_ecn", "hardware",
+                   "system", "log"}:
         return "device-local"
     return "other"
 

@@ -2999,7 +2999,7 @@ EOF
     # BOUNDED_CMD_COUNT must track the number of _lldpq_run_bounded calls in
     # the remote collector below; each one can hold a wedged device for up to
     # MONITOR_COMMAND_TIMEOUT_SECONDS before its own timeout fires.
-    local BOUNDED_CMD_COUNT=49
+    local BOUNDED_CMD_COUNT=52
     # Umbrella must cover every per-section budget it forwards plus the sum
     # of the per-command bounds and fixed slack, so a wedged-but-reachable
     # device finishes as a bounded slow collection instead of being killed
@@ -3075,6 +3075,7 @@ EOF
         : > "$_lldpq_snapshot_dir/neigh"
         : > "$_lldpq_snapshot_dir/fdb"
         : > "$_lldpq_snapshot_dir/bgp-summary"
+        : > "$_lldpq_snapshot_dir/bgp-summary-json"
         : > "$_lldpq_snapshot_dir/evpn-vni"
         : > "$_lldpq_snapshot_dir/vlan"
         _lldpq_link_status=1
@@ -3082,6 +3083,7 @@ EOF
         _lldpq_neigh_status=1
         _lldpq_fdb_status=1
         _lldpq_bgp_status=1
+        _lldpq_bgp_json_status=1
         _lldpq_evpn_vni_status=1
         _lldpq_vlan_status=1
 
@@ -3108,6 +3110,12 @@ EOF
             _lldpq_run_bounded sudo vtysh -c "show bgp vrf all sum" \
                 > "$_lldpq_snapshot_dir/bgp-summary" 2>/dev/null
             _lldpq_bgp_status=$?
+            # Session-flap detection source: monotonic connectionsDropped
+            # counters and per-peer uptime, sampled in the same generation
+            # as the text summary above.
+            _lldpq_run_bounded sudo vtysh -c "show bgp vrf all summary json" \
+                > "$_lldpq_snapshot_dir/bgp-summary-json" 2>/dev/null
+            _lldpq_bgp_json_status=$?
         fi
         if _lldpq_scope_selected bgp || _lldpq_scope_selected duplicate; then
             _lldpq_run_bounded sudo vtysh -c "show evpn vni" \
@@ -3308,6 +3316,19 @@ EOF
         else
             echo "__LLDPQ_COLLECTION_ERROR__:BGP_SUMMARY"
         fi
+        # Flap-detection JSON sub-section.  It lives INSIDE the BGP_DATA
+        # markers because collection_bundle.py validates a fixed top-level
+        # section layout; process_bgp_data splits it back out.  The failure
+        # marker is deliberately NOT a __LLDPQ_COLLECTION_ERROR__ line: that
+        # prefix outside the per-section allowlist would fail the whole
+        # bundle, while a JSON-only failure must stay a flap-feature gap.
+        echo "===BGP_JSON_START==="
+        if [ "$_lldpq_bgp_json_status" -eq 0 ]; then
+            cat "$_lldpq_snapshot_dir/bgp-summary-json"
+        else
+            echo "__LLDPQ_BGP_JSON_ERROR__"
+        fi
+        echo "===BGP_JSON_END==="
         fi
         echo "===BGP_DATA_END==="
         _lldpq_timing_end BGP_DATA
@@ -4065,6 +4086,30 @@ EOF
             echo "No CPU info"
         fi
         echo "CPU_CORES: $(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo 2>/dev/null || echo 0)"
+        # System watchdog sub-section (reboot + service-restart detection).
+        # It lives INSIDE the HARDWARE_DATA markers because
+        # collection_bundle.py validates a fixed top-level section layout;
+        # generate_hardware_html.py splits it back out.  The failure markers
+        # are deliberately NOT __LLDPQ_COLLECTION_ERROR__ lines: that prefix
+        # outside the per-section allowlist would fail the whole bundle,
+        # while a watchdog-only failure must stay a watchdog-feature gap.
+        echo "===SYS_WATCHDOG_START==="
+        _watchdog_output=$(_lldpq_run_bounded cat /proc/uptime 2>/dev/null)
+        _watchdog_status=$?
+        if [ "$_watchdog_status" -eq 0 ] && [ -n "$_watchdog_output" ]; then
+            echo "UPTIME_SECONDS:${_watchdog_output%% *}"
+        else
+            echo "__LLDPQ_SYS_WATCHDOG_ERROR__:UPTIME"
+        fi
+        _watchdog_output=$(_lldpq_run_bounded systemctl show frr switchd nvued clagd -p Id,NRestarts 2>/dev/null)
+        _watchdog_status=$?
+        if [ "$_watchdog_status" -eq 0 ] && [ -n "$_watchdog_output" ]; then
+            echo "SERVICE_RESTARTS:"
+            printf "%s\n" "$_watchdog_output"
+        else
+            echo "__LLDPQ_SYS_WATCHDOG_ERROR__:SERVICES"
+        fi
+        echo "===SYS_WATCHDOG_END==="
         fi
         echo "===HARDWARE_DATA_END==="
         _lldpq_timing_end HARDWARE_DATA

@@ -68,6 +68,10 @@ thresholds:
   # Network monitoring
   network:
     bgp_down_minutes: 5       # Minutes - BGP neighbor down threshold
+    bgp_flaps_warning: 1      # Count - BGP session flaps in 1 hour (warning)
+    bgp_flaps_critical: 3     # Count - BGP session flaps in 1 hour (critical)
+    bgp_update_storm_warning: 30   # Msgs/min - BGP updates received per session (warning; keepalive noise is ~0.2/min)
+    bgp_update_storm_critical: 120 # Msgs/min - BGP updates received per session (critical)
     link_flaps_per_hour: 10   # Count - Link flaps in 1 hour (warning)
     link_flaps_critical: 20   # Count - Link flaps in 1 hour (critical)
     optical_power_margin: 3   # dBm - Minimum optical power margin
@@ -102,6 +106,9 @@ alert_strategy:
     - "cpu_temp_critical"            # CPU over 85°C (hardware failure risk)
     - "asic_temp_critical"           # ASIC over 105°C (switch could fail)
     - "bgp_neighbors_down"           # BGP down (network connectivity lost)
+    - "bgp_session_flaps"            # BGP sessions dropping and re-establishing between samples
+    - "device_reboot"                # Device rebooted between samples (counter resets expected)
+    - "service_restart"              # Service restarted between samples (frr/switchd are critical)
     - "fan_critical_failure"         # Fan stopped (cooling failure)
   # Note: These would bypass summary mode and send individual device alerts (not implemented yet)
 

@@ -135,6 +135,9 @@ class BGPNeighbor:
     vrf: str = "default"
     address_family: str = "unknown"
     down_since: Optional[float] = None
+    flaps_24h: int = 0
+    flaps_estimated: bool = False
+    msg_rcvd_per_min: Optional[float] = None
 
 @dataclass
 class EVPNStats:
@@ -168,14 +171,35 @@ class BGPAnalyzer:
         # Keep them disabled unless an operator explicitly opts in via env.
         "low_prefix_threshold": 0,
         "message_ratio_threshold": 0.0,
+        "bgp_flaps_warning": 1,            # Session flaps in 1 hour (warning)
+        "bgp_flaps_critical": 3,           # Session flaps in 1 hour (critical)
+        # Update-storm rates are msgs/min received per session; keepalive
+        # noise is ~0.2/min, so these are unambiguous.
+        "bgp_update_storm_warning": 30,
+        "bgp_update_storm_critical": 120,
         "history_retention_hours": 24       # Keep 24 hours of historical data
     }
-    
+
+    # Flap events stay SPARSE (only non-zero deltas), 24h-windowed and capped
+    # per host so bgp_history.json keeps its counters-only scale.
+    FLAP_EVENTS_MAX_PER_HOST = 200
+    # Uptime-fallback margin: a parsed uptime this close to the elapsed poll
+    # interval is clock skew, not evidence of a session reset.
+    FLAP_UPTIME_SKEW_SECONDS = 60
+    # Update-storm rates over a window shorter than this are dominated by
+    # sampling noise (a single burst reads as a huge per-minute rate).
+    STORM_MIN_ELAPSED_SECONDS = 120
+
     def __init__(self, data_dir="monitor-results"):
         self.data_dir = data_dir
         self.bgp_history = {}  # hostname -> BGP historical data
         self.current_bgp_stats = {}  # hostname -> current BGP neighbors
         self.cycle_events = []  # down-count transitions THIS run (Timeline)
+        # Session-flap tracking (slim: 3 ints per peer, sparse events only).
+        self.flap_baselines = {}  # hostname -> {"vrf|neighbor": {dropped, established, ts}}
+        self.flap_events = {}  # hostname -> [{ts, vrf, neighbor, count, estimated?}]
+        self.update_storms = {}  # hostname -> [{ts, vrf, neighbor, rate, severity}]
+        self.cycle_msg_rates = {}  # THIS run only: hostname -> {"vrf|neighbor": msgs/min}
         self.current_evpn_stats = {}  # hostname -> EVPN statistics
         self.thresholds = self.DEFAULT_THRESHOLDS.copy()
         self.collection_coverage = {
@@ -212,6 +236,15 @@ class BGPAnalyzer:
                     value = float(network.get("bgp_down_minutes", self.thresholds["bgp_down_minutes"]))
                     if value >= 0:
                         self.thresholds["bgp_down_minutes"] = value
+                    for flap_key in ("bgp_flaps_warning", "bgp_flaps_critical",
+                                     "bgp_update_storm_warning",
+                                     "bgp_update_storm_critical"):
+                        raw_flap = network.get(flap_key)
+                        if raw_flap is None:
+                            continue
+                        flap_value = float(raw_flap)
+                        if flap_value >= 0:
+                            self.thresholds[flap_key] = flap_value
                     break
                 except (OSError, TypeError, ValueError, AttributeError):
                     continue
@@ -242,6 +275,16 @@ class BGPAnalyzer:
                 saved_coverage = data.get("collection_coverage")
                 if isinstance(saved_coverage, dict):
                     self.collection_coverage.update(saved_coverage)
+                # Flap sidecar keys are optional (pre-upgrade history files).
+                flap_baselines = data.get("flap_baselines")
+                if isinstance(flap_baselines, dict):
+                    self.flap_baselines = flap_baselines
+                flap_events = data.get("flap_events")
+                if isinstance(flap_events, dict):
+                    self.flap_events = flap_events
+                update_storms = data.get("update_storms")
+                if isinstance(update_storms, dict):
+                    self.update_storms = update_storms
 
                 # One-time trim of the legacy schema, which embedded the full
                 # neighbor list in every history snapshot: drop it so the next
@@ -264,6 +307,9 @@ class BGPAnalyzer:
                 "bgp_history": self.bgp_history,
                 "current_bgp_stats": self.current_bgp_stats,
                 "collection_coverage": self.collection_coverage,
+                "flap_baselines": self.flap_baselines,
+                "flap_events": self.flap_events,
+                "update_storms": self.update_storms,
                 "last_update": time.time()
             }
             # Atomic write: a mid-write kill must never truncate the history
@@ -308,11 +354,34 @@ class BGPAnalyzer:
                         continue
                 
                 self.bgp_history[hostname] = filtered_entries
-                
+
                 # Remove hostname if no history left
                 if not self.bgp_history[hostname]:
                     del self.bgp_history[hostname]
-    
+
+        # Flap/storm sidecar keys follow the same retention: events keep a
+        # 24h window with a per-host cap, and baselines for hosts whose
+        # history fully expired (or that were retired) are dropped with them.
+        for event_map in (self.flap_events, self.update_storms):
+            for hostname in list(event_map.keys()):
+                events = [
+                    event for event in (event_map.get(hostname) or [])
+                    if isinstance(event, dict)
+                    and isinstance(event.get("ts"), (int, float))
+                    and not isinstance(event.get("ts"), bool)
+                    and current_time - float(event["ts"]) <= retention_seconds
+                ]
+                events.sort(key=lambda event: float(event["ts"]))
+                if len(events) > self.FLAP_EVENTS_MAX_PER_HOST:
+                    events = events[-self.FLAP_EVENTS_MAX_PER_HOST:]
+                if events:
+                    event_map[hostname] = events
+                else:
+                    del event_map[hostname]
+        for hostname in list(self.flap_baselines.keys()):
+            if hostname not in self.bgp_history:
+                del self.flap_baselines[hostname]
+
     def parse_bgp_output(self, bgp_data: str) -> List[BGPNeighbor]:
         """Parse BGP neighbor output from vtysh command"""
         neighbors = []
@@ -564,19 +633,361 @@ class BGPAnalyzer:
                     return timedelta(hours=hours, minutes=minutes, seconds=seconds)
             
             return None
-            
+
         except Exception:
             return None
-    
+
+    @staticmethod
+    def flap_peer_key(vrf, neighbor_name, interface=None):
+        """Session key shared by the text and JSON summary parsers.
+
+        The text summary may render an unnumbered peer as hostname(swp1)
+        while the JSON peers map keys the same session by its interface
+        name; both collapse to "<vrf>|<interface-or-name>".
+        """
+        name = interface or neighbor_name
+        return "%s|%s" % (vrf or "default", name)
+
+    def flap_severity(self, count):
+        """Map a flap count to critical/warning per thresholds, else None."""
+        if count >= self.thresholds["bgp_flaps_critical"]:
+            return "critical"
+        if count >= self.thresholds["bgp_flaps_warning"]:
+            return "warning"
+        return None
+
+    def storm_severity(self, rate_per_min):
+        """Map an update inflow rate to critical/warning per thresholds."""
+        if rate_per_min >= self.thresholds["bgp_update_storm_critical"]:
+            return "critical"
+        if rate_per_min >= self.thresholds["bgp_update_storm_warning"]:
+            return "warning"
+        return None
+
+    def _flap_peer_record(self, peer):
+        """Session facts for flap detection from one JSON peer entry."""
+        state = str(peer.get("state") or "").strip().lower()
+        uptime_seconds = None
+        uptime_msec = peer.get("peerUptimeMsec")
+        if isinstance(uptime_msec, (int, float)) and not isinstance(uptime_msec, bool):
+            uptime_seconds = float(uptime_msec) / 1000.0
+        else:
+            parsed = self.parse_uptime(str(peer.get("peerUptime") or ""))
+            if parsed is not None:
+                uptime_seconds = parsed.total_seconds()
+
+        def counter(name):
+            value = peer.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value if value >= 0 else None
+
+        return {
+            "state": state,
+            "admin_down": (
+                "admin" in state or "shut" in state
+                or bool(peer.get("adminShutDown"))
+            ),
+            "uptime_never": (
+                str(peer.get("peerUptime") or "").strip().lower() == "never"
+            ),
+            "uptime_seconds": uptime_seconds,
+            # FRR versions differ: the connection counters are OPTIONAL.
+            "dropped": counter("connectionsDropped"),
+            "established": counter("connectionsEstablished"),
+            "msg_rcvd": counter("msgRcvd"),
+        }
+
+    @staticmethod
+    def _merge_flap_peer_records(target, other):
+        """Merge the same session seen in several address families."""
+        if other["state"] == "established":
+            target["state"] = other["state"]
+        target["admin_down"] = target["admin_down"] or other["admin_down"]
+        target["uptime_never"] = target["uptime_never"] and other["uptime_never"]
+        for field in ("uptime_seconds", "dropped", "established", "msg_rcvd"):
+            if other[field] is not None:
+                target[field] = (
+                    other[field] if target[field] is None
+                    else max(target[field], other[field])
+                )
+
+    def parse_bgp_summary_json(self, json_text):
+        """Parse ``show bgp vrf all summary json`` into per-session records.
+
+        Returns {"<vrf>|<neighbor>": record} or None when the document is
+        unusable.  Peers keyed identically in several address families are
+        one session and are merged.
+        """
+        try:
+            data = json.loads(json_text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        peers_by_key = {}
+        for top_key, block in data.items():
+            if not isinstance(block, dict):
+                continue
+            if isinstance(block.get("peers"), dict):
+                # Single-VRF form: the top-level keys are address families.
+                af_blocks = [(str(block.get("vrfName") or "default"), block)]
+            else:
+                # "vrf all" form: VRF name -> address-family blocks.
+                af_blocks = [
+                    (str(af_block.get("vrfName") or top_key), af_block)
+                    for af_block in block.values()
+                    if isinstance(af_block, dict)
+                    and isinstance(af_block.get("peers"), dict)
+                ]
+            for vrf, af_block in af_blocks:
+                for peer_name, peer in af_block["peers"].items():
+                    if not isinstance(peer, dict):
+                        continue
+                    record = self._flap_peer_record(peer)
+                    key = self.flap_peer_key(vrf, str(peer_name))
+                    existing = peers_by_key.get(key)
+                    if existing is None:
+                        peers_by_key[key] = record
+                    else:
+                        self._merge_flap_peer_records(existing, record)
+        return peers_by_key
+
+    def update_bgp_flap_stats(self, hostname, bgp_json_data, now=None):
+        """Detect session flaps for one CURRENT host from the JSON summary.
+
+        Counter path: delta of monotonic connectionsDropped against the
+        persisted baseline (negative delta = FRR restart / clear bgp:
+        re-baseline, no flap).  Uptime fallback (counters absent): a peer
+        Established at both samples whose uptime is shorter than the elapsed
+        poll interval reset at least once.  An absent or unparseable JSON
+        document (old collector, JSON-only command failure) changes nothing:
+        baselines never advance on missing data.  Returns this cycle's flap
+        count.
+        """
+        if not bgp_json_data:
+            return 0
+        peers = self.parse_bgp_summary_json(bgp_json_data)
+        if peers is None:
+            return 0
+        now = time.time() if now is None else now
+        baselines = self.flap_baselines.setdefault(hostname, {})
+        events = self.flap_events.setdefault(hostname, [])
+        cycle_flaps = 0
+        storms = []
+        for key, record in peers.items():
+            vrf, _, neighbor = key.partition("|")
+            baseline = baselines.get(key) \
+                if isinstance(baselines.get(key), dict) else None
+            if record["dropped"] is not None:
+                new_baseline = {
+                    "dropped": record["dropped"],
+                    "established": (
+                        record["established"]
+                        if record["established"] is not None else 0
+                    ),
+                    "ts": int(now),
+                }
+            else:
+                # Counterless FRR: keep a was-established flag so the uptime
+                # fallback can prove "Established at both samples".
+                new_baseline = {
+                    "established": 1 if record["state"] == "established" else 0,
+                    "ts": int(now),
+                }
+
+            flaps = 0
+            estimated = False
+            skip_events = (
+                baseline is None          # first sight: baseline only
+                or record["admin_down"]   # admin action, not a flap
+                or record["uptime_never"] # never established
+            )
+            if not skip_events and record["dropped"] is not None:
+                if "dropped" in baseline:
+                    try:
+                        previous_dropped = int(baseline.get("dropped"))
+                        previous_established = int(
+                            baseline.get("established") or 0
+                        )
+                    except (TypeError, ValueError):
+                        previous_dropped = None
+                    if previous_dropped is not None:
+                        delta = record["dropped"] - previous_dropped
+                        counter_reset = delta < 0 or (
+                            record["established"] is not None
+                            and record["established"] < previous_established
+                        )
+                        if not counter_reset and delta > 0:
+                            flaps = delta
+                # else: counters appeared for the first time; baseline only.
+            elif not skip_events and "dropped" not in baseline:
+                try:
+                    elapsed = now - float(baseline.get("ts") or now)
+                except (TypeError, ValueError):
+                    elapsed = 0.0
+                was_established = bool(baseline.get("established"))
+                if (
+                    record["state"] == "established"
+                    and was_established
+                    and record["uptime_seconds"] is not None
+                    and elapsed > self.FLAP_UPTIME_SKEW_SECONDS
+                    and record["uptime_seconds"]
+                    < elapsed - self.FLAP_UPTIME_SKEW_SECONDS
+                ):
+                    flaps = 1
+                    estimated = True
+            # else: counters vanished against a counter baseline; re-baseline.
+
+            if flaps > 0:
+                event = {
+                    "ts": int(now),
+                    "vrf": vrf,
+                    "neighbor": neighbor,
+                    "count": int(flaps),
+                }
+                if estimated:
+                    event["estimated"] = True
+                events.append(event)
+                cycle_flaps += int(flaps)
+                severity = self.flap_severity(flaps) or "warning"
+                self.cycle_events.append({
+                    "ts": int(now),
+                    "severity": severity,
+                    "device": hostname,
+                    "object": neighbor,
+                    "kind": "bgp-session-flap",
+                    "detail": "BGP session flap: %s vrf %s %s (%d drop%s)%s" % (
+                        hostname, vrf, neighbor, flaps,
+                        "" if flaps == 1 else "s",
+                        " [estimated]" if estimated else ""),
+                })
+
+            # Update-storm evaluation: msgRcvd inflow rate against the same
+            # baseline.  The msg_rcvd key is optional and self-describing
+            # like the counter/counterless modes: a pre-upgrade baseline
+            # without it only re-baselines.  Skipped (re-baseline only) on
+            # first sight, counter decrease (session reset), a flap this
+            # cycle, or an elapsed window too short to rate meaningfully.
+            if record["msg_rcvd"] is not None:
+                new_baseline["msg_rcvd"] = record["msg_rcvd"]
+                previous_msg = None
+                if baseline is not None and "msg_rcvd" in baseline:
+                    try:
+                        previous_msg = int(baseline["msg_rcvd"])
+                    except (TypeError, ValueError):
+                        previous_msg = None
+                msg_elapsed = 0.0
+                if baseline is not None:
+                    try:
+                        msg_elapsed = now - float(baseline.get("ts") or now)
+                    except (TypeError, ValueError):
+                        msg_elapsed = 0.0
+                if (previous_msg is not None and flaps == 0
+                        and msg_elapsed >= self.STORM_MIN_ELAPSED_SECONDS
+                        and record["msg_rcvd"] >= previous_msg):
+                    rate = (record["msg_rcvd"] - previous_msg) \
+                        / (msg_elapsed / 60.0)
+                    self.cycle_msg_rates.setdefault(hostname, {})[key] = \
+                        round(rate, 1)
+                    storm_severity = self.storm_severity(rate)
+                    if storm_severity is not None:
+                        storms.append({
+                            "ts": int(now),
+                            "vrf": vrf,
+                            "neighbor": neighbor,
+                            "rate": round(rate, 1),
+                            "severity": storm_severity,
+                        })
+                        self.cycle_events.append({
+                            "ts": int(now),
+                            "severity": storm_severity,
+                            "device": hostname,
+                            "object": neighbor,
+                            "kind": "bgp-update-storm",
+                            "detail": "BGP update storm: %s vrf %s %s "
+                                      "(%.1f msgs/min received)" % (
+                                          hostname, vrf, neighbor, rate),
+                        })
+            baselines[key] = new_baseline
+
+        # Sessions that disappeared from this current collection are pruned
+        # so retired peers cannot hold baseline entries forever.
+        for key in list(baselines.keys()):
+            if key not in peers:
+                del baselines[key]
+
+        # Keep the events list bounded within the run as well (the loader
+        # applies the same 24h window and per-host cap).
+        retention_seconds = self.thresholds["history_retention_hours"] * 3600
+        events[:] = [
+            event for event in events
+            if float(event.get("ts") or 0) >= now - retention_seconds
+        ]
+        if len(events) > self.FLAP_EVENTS_MAX_PER_HOST:
+            del events[:len(events) - self.FLAP_EVENTS_MAX_PER_HOST]
+        if not events:
+            self.flap_events.pop(hostname, None)
+
+        # Storm hits follow the same sparse window/cap contract.
+        if storms:
+            self.update_storms.setdefault(hostname, []).extend(storms)
+        storm_events = self.update_storms.get(hostname)
+        if storm_events is not None:
+            storm_events[:] = [
+                event for event in storm_events
+                if float(event.get("ts") or 0) >= now - retention_seconds
+            ]
+            if len(storm_events) > self.FLAP_EVENTS_MAX_PER_HOST:
+                del storm_events[
+                    :len(storm_events) - self.FLAP_EVENTS_MAX_PER_HOST]
+            if not storm_events:
+                self.update_storms.pop(hostname, None)
+        return cycle_flaps
+
+    def neighbor_flap_stats(self, hostname, vrf, neighbor_name,
+                            interface=None, now=None):
+        """(flaps_24h, any_estimated) for one session from stored events."""
+        now = time.time() if now is None else now
+        cutoff = now - self.thresholds["history_retention_hours"] * 3600
+        key = self.flap_peer_key(vrf, neighbor_name, interface)
+        total = 0
+        estimated = False
+        for event in self.flap_events.get(hostname) or []:
+            if not isinstance(event, dict):
+                continue
+            try:
+                ts = float(event.get("ts") or 0)
+                count = int(event.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts < cutoff or count <= 0:
+                continue
+            if self.flap_peer_key(
+                event.get("vrf"), str(event.get("neighbor") or "")
+            ) != key:
+                continue
+            total += count
+            if event.get("estimated"):
+                estimated = True
+        return total, estimated
+
     def update_bgp_stats(
         self,
         hostname: str,
         bgp_data: str,
         previous_stats: Optional[Dict[str, Any]] = None,
+        bgp_json_data: Optional[str] = None,
     ):
         """Update BGP statistics for a device"""
         neighbors = self.parse_bgp_output(bgp_data)
         current_time = time.time()
+
+        # Session-flap detection from the same-generation JSON summary.
+        # None (old raw file / JSON-only failure) leaves baselines untouched.
+        cycle_flap_count = self.update_bgp_flap_stats(
+            hostname, bgp_json_data, now=current_time
+        )
 
         if previous_stats is None:
             previous_stats = self.current_bgp_stats.get(hostname, {})
@@ -636,6 +1047,19 @@ class BGPAnalyzer:
         # Update current stats (convert enums to strings for JSON serialization)
         neighbor_dicts = []
         for neighbor in neighbors:
+            # current_bgp_stats is the non-slim side: give the web export and
+            # alerting a cheap per-neighbor 24h flap view.
+            neighbor.flaps_24h, neighbor.flaps_estimated = \
+                self.neighbor_flap_stats(
+                    hostname, neighbor.vrf, neighbor.neighbor_name,
+                    neighbor.interface, now=current_time,
+                )
+            # This cycle's msgRcvd inflow rate (None when not evaluable):
+            # row-details display only, never a table column or export field.
+            neighbor.msg_rcvd_per_min = self.cycle_msg_rates.get(
+                hostname, {}
+            ).get(self.flap_peer_key(
+                neighbor.vrf, neighbor.neighbor_name, neighbor.interface))
             neighbor_dict = neighbor.__dict__.copy()
             neighbor_dict['state'] = get_enum_value(neighbor.state)
             neighbor_dicts.append(neighbor_dict)
@@ -674,6 +1098,7 @@ class BGPAnalyzer:
             "down_count": len([n for n in neighbors if n.state != BGPState.ESTABLISHED]),
             "warning_neighbors": warning_neighbors,
             "critical_neighbors": critical_neighbors,
+            "flap_count": int(cycle_flap_count),
         }
 
         # Timeline sidecar: device-level down-count transitions between the
@@ -939,7 +1364,25 @@ class BGPAnalyzer:
             1 for stats in self.current_bgp_stats.values()
             if stats.get("data_status") == "unknown"
         )
-        
+        # Sum SESSION flap events, not per-neighbor rows: the table renders
+        # one row per (vrf, address-family, peer), so a session carrying both
+        # ipv4-unicast and l2vpn-evpn would be counted twice through rows.
+        flap_cutoff_24h = (
+            time.time() - self.thresholds["history_retention_hours"] * 3600
+        )
+        total_flaps_24h = 0
+        for hostname in self.current_bgp_stats:
+            for event in self.flap_events.get(hostname) or []:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    ts = float(event.get("ts") or 0)
+                    count = int(event.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts >= flap_cutoff_24h and count > 0:
+                    total_flaps_24h += count
+
         # Get problem neighbors
         problem_neighbors = []
         healthy_neighbors = 0
@@ -971,6 +1414,7 @@ class BGPAnalyzer:
             "critical_neighbors": total_critical,
             "stale_devices": stale_devices,
             "unknown_devices": unknown_devices,
+            "flaps_24h": total_flaps_24h,
             "problem_neighbors": problem_neighbors,
             "health_ratio": (
                 healthy_neighbors / total_neighbors * 100
@@ -983,7 +1427,9 @@ class BGPAnalyzer:
     def detect_bgp_anomalies(self) -> List[Dict[str, Any]]:
         """Detect BGP anomalies and problems"""
         anomalies = []
-        
+        flap_window_seconds = 3600
+        flap_cutoff = time.time() - flap_window_seconds
+
         for hostname, stats in self.current_bgp_stats.items():
             data_status = stats.get("data_status")
             if data_status in {"stale", "unknown"}:
@@ -1101,7 +1547,110 @@ class BGPAnalyzer:
                         },
                         "action": "Review message flow only if this directional ratio is expected to be balanced",
                     })
-        
+
+            # Session flaps within the alerting window (thresholds are
+            # flaps-per-hour; the table's 24h column is display only).
+            flap_sessions = {}
+            for event in self.flap_events.get(hostname) or []:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    ts = float(event.get("ts") or 0)
+                    count = int(event.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts < flap_cutoff or count <= 0:
+                    continue
+                session = (
+                    str(event.get("vrf") or "default"),
+                    str(event.get("neighbor") or "?"),
+                )
+                entry = flap_sessions.setdefault(
+                    session, {"count": 0, "estimated": False}
+                )
+                entry["count"] += count
+                if event.get("estimated"):
+                    entry["estimated"] = True
+            for (vrf, neighbor_name) in sorted(flap_sessions):
+                entry = flap_sessions[(vrf, neighbor_name)]
+                severity = self.flap_severity(entry["count"])
+                if severity is None:
+                    continue
+                anomalies.append({
+                    "device": hostname,
+                    "neighbor": neighbor_name,
+                    "type": "BGP_SESSION_FLAPS",
+                    "severity": severity,
+                    "message": (
+                        f"BGP session flapped {entry['count']} time(s) "
+                        "in the last hour"
+                        + (" (estimated from uptime regression)"
+                           if entry["estimated"] else "")
+                    ),
+                    "details": {
+                        "vrf": vrf,
+                        "count": entry["count"],
+                        "estimated": entry["estimated"],
+                        "window_seconds": flap_window_seconds,
+                        "flaps_warning": self.thresholds["bgp_flaps_warning"],
+                        "flaps_critical": self.thresholds["bgp_flaps_critical"],
+                    },
+                    "action": (
+                        f"Check link stability and BGP timers for {neighbor_name}; "
+                        "the session re-established between samples"
+                    ),
+                })
+
+            # Update storms within the same alerting window: a session can
+            # stay Established while its peer floods route churn; only the
+            # msgRcvd rate makes that visible.
+            storm_sessions = {}
+            for event in self.update_storms.get(hostname) or []:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    ts = float(event.get("ts") or 0)
+                    rate = float(event.get("rate") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if ts < flap_cutoff or rate <= 0:
+                    continue
+                session = (
+                    str(event.get("vrf") or "default"),
+                    str(event.get("neighbor") or "?"),
+                )
+                storm_sessions[session] = max(
+                    storm_sessions.get(session, 0.0), rate
+                )
+            for (vrf, neighbor_name) in sorted(storm_sessions):
+                rate = storm_sessions[(vrf, neighbor_name)]
+                severity = self.storm_severity(rate)
+                if severity is None:
+                    continue
+                anomalies.append({
+                    "device": hostname,
+                    "neighbor": neighbor_name,
+                    "type": "BGP_UPDATE_STORM",
+                    "severity": severity,
+                    "message": (
+                        f"BGP update storm: {rate:g} msgs/min received "
+                        "between samples"
+                    ),
+                    "details": {
+                        "vrf": vrf,
+                        "rate_per_min": rate,
+                        "window_seconds": flap_window_seconds,
+                        "storm_warning":
+                            self.thresholds["bgp_update_storm_warning"],
+                        "storm_critical":
+                            self.thresholds["bgp_update_storm_critical"],
+                    },
+                    "action": (
+                        f"Check for route churn behind {neighbor_name}; "
+                        "sustained UPDATE floods burn CPU and delay convergence"
+                    ),
+                })
+
         return anomalies
     
     def export_bgp_data_for_web(self, output_file: str):
@@ -1180,6 +1729,15 @@ class BGPAnalyzer:
         else:
             problem_card_class = "card-excellent"
             problem_metric_class = "bgp-excellent"
+        flaps_24h_total = int(summary.get('flaps_24h', 0) or 0)
+        if flaps_24h_total > 0:
+            flaps_card_class = "card-warning"
+            flaps_metric_class = "bgp-warning"
+        else:
+            flaps_card_class = "card-excellent"
+            flaps_metric_class = "bgp-excellent"
+        flap_warning_threshold = self.thresholds["bgp_flaps_warning"]
+        flap_critical_threshold = self.thresholds["bgp_flaps_critical"]
         
         html_content = f"""
 <!DOCTYPE html>
@@ -1565,6 +2123,10 @@ class BGPAnalyzer:
                     <div class="metric {problem_metric_class}" id="down-neighbors">{problem_neighbors}</div>
                     <div class="metric-label">Down/Problem</div>
                 </div>
+                <div class="summary-card {flaps_card_class}" id="flaps-card" data-metric-key="bgp_flaps_24h" data-metric-value="{flaps_24h_total}">
+                    <div class="metric {flaps_metric_class}" id="bgp-flaps-24h">{flaps_24h_total}</div>
+                    <div class="metric-label">Session Flaps (24h)</div>
+                </div>
                 <div class="summary-card card-warning" id="stale-devices-card" data-metric-key="bgp_stale_devices" data-metric-value="{summary['stale_devices']}">
                     <div class="metric bgp-warning" id="stale-devices">{summary['stale_devices']}</div>
                     <div class="metric-label">Stale Collections</div>
@@ -1770,6 +2332,7 @@ class BGPAnalyzer:
                     <th class="sortable" data-column="7" data-type="ratio">Messages RX/TX <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="8" data-type="ratio">Queue In/Out <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="9" data-type="bgp-health">Health <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="10" data-type="flaps">Flaps (24h) <span class="sort-arrow"></span></th>
                 </tr>
                 </thead>
                 <tbody id="bgp-data">
@@ -1831,6 +2394,25 @@ class BGPAnalyzer:
             display_address_family = html.escape(str(address_family), quote=True)
             display_uptime = html.escape(str(neighbor.uptime))
 
+            flaps_24h = int(neighbor.flaps_24h or 0)
+            flaps_display = f"~{flaps_24h}" if neighbor.flaps_estimated else str(flaps_24h)
+            flaps_title = (
+                ' title="estimated from uptime regression"'
+                if neighbor.flaps_estimated else ''
+            )
+            if flaps_24h >= flap_critical_threshold:
+                flaps_cell = (
+                    f'<span class="badge badge-red"{flaps_title}>{flaps_display}</span>'
+                )
+            elif flaps_24h >= flap_warning_threshold:
+                flaps_cell = (
+                    f'<span class="badge badge-orange"{flaps_title}>{flaps_display}</span>'
+                )
+            elif neighbor.flaps_estimated:
+                flaps_cell = f'<span{flaps_title}>{flaps_display}</span>'
+            else:
+                flaps_cell = flaps_display
+
             down_since_display = "—"
             if neighbor.down_since:
                 try:
@@ -1860,6 +2442,12 @@ class BGPAnalyzer:
                 "messages_sent": neighbor.messages_sent,
                 "in_queue": neighbor.in_queue,
                 "out_queue": neighbor.out_queue,
+                "flaps_24h": flaps_display,
+                "msg_rate_per_min": (
+                    neighbor.msg_rcvd_per_min
+                    if isinstance(neighbor.msg_rcvd_per_min, (int, float))
+                    else None
+                ),
             }
 
             html_content += f"""
@@ -1874,6 +2462,7 @@ class BGPAnalyzer:
             <td>{neighbor.messages_received}/{neighbor.messages_sent}</td>
             <td>{neighbor.in_queue}/{neighbor.out_queue}</td>
             <td><span class="{health_badge_class}">{health_val.upper()}</span></td>
+            <td>{flaps_cell}</td>
         </tr>
 """
 
@@ -1891,7 +2480,7 @@ class BGPAnalyzer:
                     "an empty neighbor set."
                 )
             html_content += (
-                f'        <tr class="empty-row"><td colspan="10">{empty_msg}</td></tr>\n'
+                f'        <tr class="empty-row"><td colspan="11">{empty_msg}</td></tr>\n'
             )
 
         html_content += """
@@ -1980,6 +2569,8 @@ class BGPAnalyzer:
                 kvRow('Prefixes RX / TX', d.prefixes_received + ' / ' + d.prefixes_sent) +
                 kvRow('Messages RX / TX', d.messages_received + ' / ' + d.messages_sent) +
                 kvRow('Queue In / Out', d.in_queue + ' / ' + d.out_queue) +
+                kvRow('Flaps (24h)', d.flaps_24h == null ? '0' : d.flaps_24h) +
+                kvRow('Updates RX (msgs/min)', d.msg_rate_per_min == null ? 'n/a' : d.msg_rate_per_min) +
                 kvRow('Description', d.description) +
                 '</div></div>';
         }
@@ -2000,7 +2591,7 @@ class BGPAnalyzer:
             if (!detail) return;
             const tr = document.createElement('tr');
             tr.className = 'detail-row';
-            tr.innerHTML = '<td colspan="10">' + buildBgpDetailPanel(detail) + '</td>';
+            tr.innerHTML = '<td colspan="11">' + buildBgpDetailPanel(detail) + '</td>';
             row.parentNode.insertBefore(tr, row.nextSibling);
         }
 
@@ -2499,6 +3090,9 @@ class BGPAnalyzer:
                     case 'ratio':
                         result = compareRatio(aVal, bVal);
                         break;
+                    case 'flaps':
+                        result = compareFlaps(aVal, bVal);
+                        break;
                     case 'string':
                     default:
                         result = aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' });
@@ -2596,8 +3190,14 @@ class BGPAnalyzer:
                 const parts = ratio.split('/');
                 return parseInt(parts[0]) || 0;
             };
-            
+
             return getRatioValue(a) - getRatioValue(b);
+        }
+
+        function compareFlaps(a, b) {
+            // Estimated counts render with a leading '~'; sort numerically.
+            const getFlapValue = (value) => parseInt(String(value).replace('~', '')) || 0;
+            return getFlapValue(a) - getFlapValue(b);
         }
 
         // Run Analysis Function
@@ -2703,7 +3303,8 @@ class BGPAnalyzer:
                     'Prefixes RX/TX',
                     'Messages RX/TX',
                     'Queue In/Out',
-                    'Health'
+                    'Health',
+                    'Flaps (24h)'
                 ];
                 
                 let csvContent = headers.join(',') + '\\n';
@@ -2747,7 +3348,8 @@ class BGPAnalyzer:
                                 cells[6].textContent.trim(), // Prefixes RX/TX
                                 cells[7].textContent.trim(), // Messages RX/TX
                                 cells[8].textContent.trim(), // Queue In/Out
-                                cells[9].textContent.trim()  // Health
+                                cells[9].textContent.trim(), // Health
+                                cells[10] ? cells[10].textContent.trim() : '0' // Flaps (24h)
                             ];
                             
                             // Escape commas and quotes in data
@@ -2882,6 +3484,7 @@ class BGPAnalyzer:
             "critical_neighbors": summary["critical_neighbors"],
             "stale_devices": summary["stale_devices"],
             "unknown_devices": summary["unknown_devices"],
+            "flaps_24h": flaps_24h_total,
             "health_percent": health_percent,
         }
         evpn_summary_payload = {
@@ -2913,10 +3516,19 @@ class BGPAnalyzer:
             key: value for key, value in bgp_summary_payload.items()
             if key not in ("domain", "generated_at", "collection_status")
         }
+        # The export registry (export_artifacts.EXPORT_SCHEMAS["bgp"]) rejects
+        # keys outside its ordered column tuple; flaps_24h and the storm rate
+        # are page/alerting data and stay out of the machine export until the
+        # registry gains the columns.
+        export_rows = [
+            {key: value for key, value in row.items()
+             if key not in ("flaps_24h", "msg_rate_per_min")}
+            for row in row_details.values()
+        ]
         export_artifacts.write_export(
             os.path.dirname(os.path.abspath(output_file)),
             "bgp",
-            list(row_details.values()),
+            export_rows,
             export_counts,
             coverage_status,
             generated_at=generated_at,

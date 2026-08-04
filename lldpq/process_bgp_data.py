@@ -25,6 +25,33 @@ from collection_freshness import (
 
 COLLECTION_ERROR_MARKER = "__LLDPQ_COLLECTION_ERROR__:"
 
+# Session-flap JSON sub-section emitted inside the BGP_DATA markers by
+# monitor.sh.  Its failure marker is deliberately not a collection-error
+# line (see the collector comment), so a JSON-only failure degrades to
+# "no flap detection this cycle" instead of failing the bundle.
+BGP_JSON_START_MARKER = "===BGP_JSON_START==="
+BGP_JSON_END_MARKER = "===BGP_JSON_END==="
+BGP_JSON_ERROR_MARKER = "__LLDPQ_BGP_JSON_ERROR__"
+
+
+def split_bgp_sections(bgp_data):
+    """Split one raw BGP file into (summary_text, json_text).
+
+    json_text is None when the sub-section is absent (pre-upgrade raw file),
+    empty, or carries the JSON-only failure marker; the flap detector then
+    skips this host without advancing its baselines.
+    """
+    if BGP_JSON_START_MARKER not in bgp_data:
+        return bgp_data, None
+    before, _, rest = bgp_data.partition(BGP_JSON_START_MARKER)
+    json_text, _, after = rest.partition(BGP_JSON_END_MARKER)
+    summary_text = before + after
+    json_text = json_text.strip()
+    if not json_text or BGP_JSON_ERROR_MARKER in json_text:
+        return summary_text, None
+    return summary_text, json_text
+
+
 def parse_data_file(filepath):
     """Parse data file"""
     try:
@@ -204,8 +231,11 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
                 continue
             processed_hosts.add(hostname)
             
-            # Parse BGP data file
-            bgp_data = parse_data_file(filepath)
+            # Parse BGP data file; the flap-detection JSON travels inside the
+            # same section and is split back out before text-summary checks.
+            bgp_data, bgp_json_data = split_bgp_sections(
+                parse_data_file(filepath)
+            )
 
             collection_problem = get_collection_problem(
                 filepath, hostname, assets_file, asset_statuses
@@ -236,6 +266,7 @@ def process_bgp_data_files(data_dir="monitor-results/bgp-data"):
                 hostname,
                 bgp_data,
                 previous_current_stats.get(hostname),
+                bgp_json_data=bgp_json_data,
             )
             bgp_analyzer.current_bgp_stats[hostname].update({
                 "data_status": "current",

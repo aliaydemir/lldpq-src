@@ -160,7 +160,12 @@ class LLDPqAlerts:
         self._flap_history_error = None
         self._bgp_history_loaded = False
         self._bgp_current_stats = None
+        self._bgp_flap_events = None
+        self._bgp_update_storms = None
         self._bgp_history_error = None
+        self._watchdog_loaded = False
+        self._watchdog_hosts = None
+        self._watchdog_error = None
         self._inventory_devices = None
         self._asset_rows_loaded = False
         self._asset_rows = None
@@ -839,6 +844,109 @@ class LLDPqAlerts:
                 "RECOVERED", device, alert_type, current_state
             )
 
+    def check_system_watchdog_alerts(self, device):
+        """Reboot / service-restart alerts from the hardware-side watchdog.
+
+        Both alert types are one-shot by construction: only events stamped
+        by the current cycle assert WARNING/CRITICAL, so the state machine
+        returns to OK on the next clean cycle.
+        """
+        if not self.config.get('alert_types', {}).get('system_alerts', True):
+            return
+        events = self.get_device_watchdog_events(device)
+        if events is None:
+            return
+        send_recovery = self.config.get('frequency', {}).get(
+            'send_recovery', True
+        )
+
+        reboot = None
+        for event in events:
+            if event.get("kind") == "reboot":
+                reboot = event
+        current_state = "WARNING" if reboot is not None else "OK"
+        alert_type = "device_reboot"
+        last_state = self.get_alert_state(device, alert_type)
+        if current_state == "OK" and last_state == "UNKNOWN":
+            # New alert type: establish a healthy baseline silently so an
+            # upgrade cannot emit one false recovery per inventory device.
+            self.record_state_without_delivery(device, alert_type, current_state)
+        elif current_state == "OK" and not send_recovery:
+            self.record_state_without_delivery(device, alert_type, current_state)
+        elif self.should_send_alert(device, alert_type, current_state):
+            if current_state == "WARNING":
+                try:
+                    uptime_minutes = int(
+                        float(reboot.get("uptime_seconds") or 0) // 60)
+                except (TypeError, ValueError):
+                    uptime_minutes = 0
+                self.send_stateful_notification(
+                    f"⚠️ Device Rebooted",
+                    f"Device rebooted (uptime {uptime_minutes}m); "
+                    "counter resets expected (carrier/BGP/service baselines)",
+                    "WARNING", device, alert_type, current_state
+                )
+            elif current_state == "OK":
+                self.send_stateful_notification(
+                    f"Device Uptime Normal",
+                    f"No reboot detected in the current cycle",
+                    "RECOVERED", device, alert_type, current_state
+                )
+
+        # Service restarts. frr/switchd carry the forwarding plane; a reboot
+        # in the same cycle already suppressed these events at the detector
+        # (systemd counters reset on boot).
+        critical_restarts = []
+        warning_restarts = []
+        for event in events:
+            if event.get("kind") != "service-restart":
+                continue
+            unit = str(event.get("unit") or "?")
+            try:
+                count = int(event.get("count") or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count <= 0:
+                continue
+            label = f"{unit} x{count}"
+            if unit in ("frr.service", "switchd.service"):
+                critical_restarts.append(label)
+            else:
+                warning_restarts.append(label)
+
+        if critical_restarts:
+            current_state = "CRITICAL"
+        elif warning_restarts:
+            current_state = "WARNING"
+        else:
+            current_state = "OK"
+        alert_type = "service_restart"
+        last_state = self.get_alert_state(device, alert_type)
+        if current_state == "OK" and last_state == "UNKNOWN":
+            self.record_state_without_delivery(device, alert_type, current_state)
+        elif current_state == "OK" and not send_recovery:
+            self.record_state_without_delivery(device, alert_type, current_state)
+        elif self.should_send_alert(device, alert_type, current_state):
+            if current_state == "CRITICAL":
+                self.send_stateful_notification(
+                    f"🔥 Critical Service Restart",
+                    "Service restarts detected: "
+                    f"{', '.join(critical_restarts + warning_restarts)}",
+                    "CRITICAL", device, alert_type, current_state
+                )
+            elif current_state == "WARNING":
+                self.send_stateful_notification(
+                    f"⚠️ Service Restart",
+                    f"Service restarts detected: {', '.join(warning_restarts)}",
+                    "WARNING", device, alert_type, current_state
+                )
+            elif current_state == "OK":
+                self.send_stateful_notification(
+                    f"Services Stable",
+                    f"No service restarts in the current cycle",
+                    "RECOVERED", device, alert_type, current_state
+                )
+
     def check_network_alerts(self, device):
         """Check network-related alerts (BGP, flaps, BER and optical)."""
         if not self.config.get('alert_types', {}).get('network_alerts', True):
@@ -876,7 +984,120 @@ class LLDPqAlerts:
                     "All BGP neighbors established",
                     "RECOVERED", device, "bgp_neighbors", current_state
                 )
-        
+
+        # A session that dropped and re-established BETWEEN samples looks
+        # Established at both reads; only the analyzer's counter/uptime flap
+        # events make it visible.
+        bgp_flap_counts = self.get_device_bgp_flap_counts(
+            device, window_seconds=3600
+        )
+        if bgp_flap_counts is not None:
+            high_flap_sessions = []
+            critical_flap_sessions = []
+
+            thresholds = self.config.get('thresholds', {}).get('network', {})
+            try:
+                bgp_flap_warning = float(thresholds.get('bgp_flaps_warning', 1))
+                bgp_flap_critical = float(thresholds.get('bgp_flaps_critical', 3))
+            except (TypeError, ValueError):
+                print("    ❌ Invalid BGP-flap thresholds; using 1/3")
+                self.had_error = True
+                bgp_flap_warning, bgp_flap_critical = 1, 3
+
+            for session, flap_count in sorted(bgp_flap_counts.items()):
+                if flap_count >= bgp_flap_critical:
+                    critical_flap_sessions.append(f"{session}: {flap_count}")
+                elif flap_count >= bgp_flap_warning:
+                    high_flap_sessions.append(f"{session}: {flap_count}")
+
+            if critical_flap_sessions:
+                current_state = "CRITICAL"
+            elif high_flap_sessions:
+                current_state = "WARNING"
+            else:
+                current_state = "OK"
+
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(
+                    device, "bgp_session_flaps", current_state)
+            elif self.should_send_alert(device, "bgp_session_flaps", current_state):
+                if current_state == "CRITICAL":
+                    self.send_stateful_notification(
+                        f"⚡ Critical BGP Session Flapping",
+                        f"Sessions with excessive flaps: {', '.join(critical_flap_sessions)}",
+                        "CRITICAL", device, "bgp_session_flaps", current_state
+                    )
+                elif current_state == "WARNING":
+                    self.send_stateful_notification(
+                        f"⚠️ BGP Session Flapping",
+                        f"Sessions with flaps: {', '.join(high_flap_sessions)}",
+                        "WARNING", device, "bgp_session_flaps", current_state
+                    )
+                elif current_state == "OK":
+                    self.send_stateful_notification(
+                        f"BGP Sessions Stabilized",
+                        f"All BGP sessions stable",
+                        "RECOVERED", device, "bgp_session_flaps", current_state
+                    )
+
+        # A session can stay Established while its peer floods route churn;
+        # only the analyzer's msgRcvd inflow rate makes that visible.
+        bgp_storm_rates = self.get_device_bgp_update_storms(
+            device, window_seconds=3600
+        )
+        if bgp_storm_rates is not None:
+            high_storm_sessions = []
+            critical_storm_sessions = []
+
+            thresholds = self.config.get('thresholds', {}).get('network', {})
+            try:
+                storm_warning = float(
+                    thresholds.get('bgp_update_storm_warning', 30))
+                storm_critical = float(
+                    thresholds.get('bgp_update_storm_critical', 120))
+            except (TypeError, ValueError):
+                print("    ❌ Invalid BGP update-storm thresholds; using 30/120")
+                self.had_error = True
+                storm_warning, storm_critical = 30, 120
+
+            for session, rate in sorted(bgp_storm_rates.items()):
+                if rate >= storm_critical:
+                    critical_storm_sessions.append(f"{session}: {rate:g}/min")
+                elif rate >= storm_warning:
+                    high_storm_sessions.append(f"{session}: {rate:g}/min")
+
+            if critical_storm_sessions:
+                current_state = "CRITICAL"
+            elif high_storm_sessions:
+                current_state = "WARNING"
+            else:
+                current_state = "OK"
+
+            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+            if current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(
+                    device, "bgp_update_storm", current_state)
+            elif self.should_send_alert(device, "bgp_update_storm", current_state):
+                if current_state == "CRITICAL":
+                    self.send_stateful_notification(
+                        f"⚡ Critical BGP Update Storm",
+                        f"Sessions with UPDATE floods: {', '.join(critical_storm_sessions)}",
+                        "CRITICAL", device, "bgp_update_storm", current_state
+                    )
+                elif current_state == "WARNING":
+                    self.send_stateful_notification(
+                        f"⚠️ BGP Update Storm",
+                        f"Sessions with high update rates: {', '.join(high_storm_sessions)}",
+                        "WARNING", device, "bgp_update_storm", current_state
+                    )
+                elif current_state == "OK":
+                    self.send_stateful_notification(
+                        f"BGP Update Rates Normal",
+                        f"All BGP sessions below storm thresholds",
+                        "RECOVERED", device, "bgp_update_storm", current_state
+                    )
+
         # carrier_changes is cumulative. Use the analyzer's timestamped deltas
         # rather than counting lines in the raw snapshot.
         flap_counts = self.get_device_flap_counts(device, window_seconds=3600)
@@ -1428,6 +1649,7 @@ class LLDPqAlerts:
             try:
                 self.check_hardware_alerts(device)
                 self.check_system_alerts(device)
+                self.check_system_watchdog_alerts(device)
                 self.check_network_alerts(device)
                 self.check_log_alerts(device)
             except Exception as exc:
@@ -2191,6 +2413,16 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             current_stats = bgp_data.get("current_bgp_stats", {})
             if not isinstance(current_stats, dict):
                 raise ValueError("current_bgp_stats must be an object")
+            # Same single parse also indexes the sparse session-flap and
+            # update-storm events (absent in pre-upgrade history files).
+            flap_events = bgp_data.get("flap_events", {})
+            if not isinstance(flap_events, dict):
+                raise ValueError("flap_events must be an object")
+            update_storms = bgp_data.get("update_storms", {})
+            if not isinstance(update_storms, dict):
+                raise ValueError("update_storms must be an object")
+            self._bgp_flap_events = flap_events
+            self._bgp_update_storms = update_storms
             self._bgp_current_stats = current_stats
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             self._bgp_history_error = exc
@@ -2242,6 +2474,154 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             print(f"    ❌ Error reading BGP status for {device}: {exc}")
             self.had_error = True
             return "unknown"
+
+    def get_device_bgp_flap_counts(self, device, window_seconds=3600):
+        """Per-session BGP flap counts inside the window, or None.
+
+        Events come from the flap_events index of the run-cached
+        bgp_history.json parse; each event carries its own timestamp, so
+        stale entries simply age out of the window.
+        """
+        current_stats, load_error = self._load_bgp_current_stats()
+        if load_error is not None or current_stats is None:
+            return None
+        device_bgp = current_stats.get(device)
+        if not isinstance(device_bgp, dict) or not device_bgp:
+            return None
+        if device_bgp.get("data_status", "current") in {"stale", "unknown"}:
+            return None
+        try:
+            now = time.time()
+            window = max(float(window_seconds), 0)
+            cutoff = now - window
+            counts = {}
+            events = (self._bgp_flap_events or {}).get(device, [])
+            if not isinstance(events, list):
+                raise ValueError(f"invalid BGP flap events for {device}")
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError(f"invalid BGP flap event for {device}")
+                timestamp = float(event.get("ts") or 0)
+                flap_count = int(event.get("count") or 0)
+                if not math.isfinite(timestamp) or timestamp > now + 300:
+                    raise ValueError(f"invalid BGP flap timestamp for {device}")
+                if timestamp >= cutoff and flap_count > 0:
+                    session = "%s/%s" % (
+                        event.get("vrf") or "default",
+                        event.get("neighbor") or "?",
+                    )
+                    counts[session] = counts.get(session, 0) + flap_count
+            return counts
+        except (ValueError, TypeError) as exc:
+            print(f"    ❌ Could not evaluate BGP flaps for {device}: {exc}")
+            self.had_error = True
+            return None
+
+    def get_device_bgp_update_storms(self, device, window_seconds=3600):
+        """Per-session peak update rate (msgs/min) inside the window, or None.
+
+        Storm entries come from the update_storms index of the run-cached
+        bgp_history.json parse; no additional file reads.
+        """
+        current_stats, load_error = self._load_bgp_current_stats()
+        if load_error is not None or current_stats is None:
+            return None
+        device_bgp = current_stats.get(device)
+        if not isinstance(device_bgp, dict) or not device_bgp:
+            return None
+        if device_bgp.get("data_status", "current") in {"stale", "unknown"}:
+            return None
+        try:
+            now = time.time()
+            window = max(float(window_seconds), 0)
+            cutoff = now - window
+            rates = {}
+            events = (self._bgp_update_storms or {}).get(device, [])
+            if not isinstance(events, list):
+                raise ValueError(f"invalid BGP update storms for {device}")
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError(f"invalid BGP update storm for {device}")
+                timestamp = float(event.get("ts") or 0)
+                rate = float(event.get("rate") or 0)
+                if not math.isfinite(timestamp) or timestamp > now + 300:
+                    raise ValueError(
+                        f"invalid BGP update storm timestamp for {device}")
+                if timestamp >= cutoff and rate > 0:
+                    session = "%s/%s" % (
+                        event.get("vrf") or "default",
+                        event.get("neighbor") or "?",
+                    )
+                    rates[session] = max(rates.get(session, 0.0), rate)
+            return rates
+        except (ValueError, TypeError) as exc:
+            print(f"    ❌ Could not evaluate BGP update storms for {device}: {exc}")
+            self.had_error = True
+            return None
+
+    def _load_system_watchdog(self):
+        """Run-cached parse of system-watchdog-state.json (may be absent)."""
+        if self._watchdog_loaded:
+            return self._watchdog_hosts, self._watchdog_error
+        self._watchdog_loaded = True
+        state_file = self.monitor_results / "system-watchdog-state.json"
+        if not state_file.exists():
+            # Pre-upgrade installation: the watchdog never ran. Not an error.
+            return None, None
+        try:
+            with open(state_file, 'r') as f:
+                payload = json.load(f)
+            hosts = payload.get("hosts") if isinstance(payload, dict) else None
+            if not isinstance(hosts, dict):
+                raise ValueError("watchdog state hosts must be an object")
+            self._watchdog_hosts = hosts
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            self._watchdog_error = exc
+        return self._watchdog_hosts, self._watchdog_error
+
+    def get_device_watchdog_events(self, device):
+        """Current-cycle watchdog events for a device, or None.
+
+        Only events stamped by the host's newest processed sample count:
+        older events already alerted in their own cycle, which is what makes
+        the reboot alert one-shot (WARNING for one cycle, OK on the next).
+        """
+        hosts, load_error = self._load_system_watchdog()
+        if load_error is not None:
+            print(f"    ❌ Error reading watchdog state for {device}: {load_error}")
+            self.had_error = True
+            return None
+        if hosts is None:
+            return None
+        host_state = hosts.get(device)
+        if not isinstance(host_state, dict):
+            return None
+        try:
+            wall_ts = float(host_state.get("wall_ts") or 0)
+            if not math.isfinite(wall_ts) or wall_ts <= 0:
+                return None
+            now = time.time()
+            if now - wall_ts > self.get_data_max_age_seconds():
+                # Stale collection: assert nothing, like the other domains.
+                return None
+            events = host_state.get("events") or []
+            if not isinstance(events, list):
+                raise ValueError(f"invalid watchdog events for {device}")
+            fresh = []
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError(f"invalid watchdog event for {device}")
+                timestamp = float(event.get("ts") or 0)
+                if not math.isfinite(timestamp) or timestamp > now + 300:
+                    raise ValueError(
+                        f"invalid watchdog timestamp for {device}")
+                if timestamp >= wall_ts:
+                    fresh.append(event)
+            return fresh
+        except (ValueError, TypeError) as exc:
+            print(f"    ❌ Could not evaluate watchdog events for {device}: {exc}")
+            self.had_error = True
+            return None
 
     def get_device_asset_status(self, device):
         """Get asset status for a device"""
@@ -2870,6 +3250,7 @@ def main():
         try:
             alerts.check_hardware_alerts(device)
             alerts.check_system_alerts(device)
+            alerts.check_system_watchdog_alerts(device)
             alerts.check_network_alerts(device)
             alerts.check_log_alerts(device)
         except Exception as exc:
