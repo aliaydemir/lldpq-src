@@ -1106,7 +1106,117 @@ def inventory_shared_lock():
         lock.close()
 
 
-def _load_canonical_inventory_bindings_unlocked():
+def _devices_yaml_targets():
+    """(ip, hostname) for every device LLDPq monitors, from devices.yaml."""
+    targets = []
+    path = os.path.join(LLDPQ_DIR, 'devices.yaml')
+    try:
+        import yaml
+        with open(path, 'r', encoding='utf-8') as handle:
+            raw = yaml.safe_load(handle) or {}
+        entries = raw.get('devices', raw)
+        if not isinstance(entries, dict):
+            return targets
+    except Exception:
+        return targets
+    for ip, info in entries.items():
+        if ip in ('defaults', 'endpoint_hosts'):
+            continue
+        if isinstance(info, dict):
+            hostname = str(info.get('hostname', '') or '').strip()
+        elif isinstance(info, str):
+            hostname = info.strip().split('@')[0].strip()
+        else:
+            hostname = str(info or '').strip()
+        if hostname:
+            targets.append((str(ip).strip(), hostname))
+    return targets
+
+
+def _monitored_device_macs():
+    """hostname (lowercased) -> management MAC, as collected by assets.sh.
+
+    Only the MAC is imported. assets.sh rewrites spaces in the serial to '-'
+    while the on-device guard compares dmidecode's raw output, so importing a
+    serial from here could fail a device whose MAC already proves its identity.
+    """
+    macs = {}
+    try:
+        with open(os.path.join(WEB_ROOT, 'device-cache.json'), 'r',
+                  encoding='utf-8') as handle:
+            cache = json.load(handle)
+    except Exception:
+        return macs
+    if not isinstance(cache, dict):
+        return macs
+    for hostname, info in cache.items():
+        if not isinstance(info, dict):
+            continue
+        mac = normalize_identity_mac(info.get('mac', ''))
+        if mac:
+            macs[str(hostname).strip().lower()] = mac
+    return macs
+
+
+def supplement_with_monitored_devices(canonical):
+    """Give a DHCP-free fabric an identity source for the fail-closed guard.
+
+    Upgrade and base-config targets are chosen from devices.yaml, but identity
+    used to come only from DHCP records, so a site that never used LLDPq's
+    DHCP/ZTP could not authorize any of the devices it monitors.  LLDPq's own
+    asset collection already reads each device's management MAC over SSH, which
+    is the exact value remote_identity_guard_shell() re-checks on the box.
+
+    DHCP/inventory records stay authoritative and nothing here is written back.
+    """
+    targets = _devices_yaml_targets()
+    if not targets:
+        return canonical
+    macs = _monitored_device_macs()
+    known_hostnames = {b['hostname'].lower() for b in canonical}
+    known_ips = {b['ip'] for b in canonical if b['ip']}
+    # A MAC claimed by two records makes identity ambiguous; first claim wins
+    used_macs = {b['mac'] for b in canonical if b['mac'] != '-'}
+
+    for binding in canonical:
+        if binding['mac'] != '-' or binding['serial']:
+            continue
+        mac = macs.get(binding['hostname'].lower(), '')
+        if mac and mac not in used_macs:
+            binding['mac'] = mac
+            used_macs.add(mac)
+
+    merged = list(canonical)
+    for raw_ip, hostname in targets:
+        if len(merged) >= 10000:
+            break
+        if hostname.lower() in known_hostnames or raw_ip in known_ips:
+            continue
+        if not is_valid_provision_hostname(hostname):
+            continue
+        try:
+            ip = str(ipaddress.IPv4Address(raw_ip))
+        except ipaddress.AddressValueError:
+            continue
+        if ip in known_ips:
+            continue
+        mac = macs.get(hostname.lower(), '')
+        if mac in used_macs:
+            mac = ''
+        # Devices with no known MAC are still listed: the caller then reports
+        # the missing identity instead of claiming the device is unknown.
+        merged.append({
+            'hostname': hostname, 'mac': mac or '-', 'ip': ip, 'serial': '',
+            'role': '', 'inv_status': 'monitored', 'dhcp': False,
+        })
+        known_hostnames.add(hostname.lower())
+        known_ips.add(ip)
+        if mac:
+            used_macs.add(mac)
+    return merged
+
+
+def _load_canonical_inventory_bindings_unlocked(include_monitored=False):
     bindings = []
     if os.path.exists(INVENTORY_FILE):
         with open(INVENTORY_FILE, 'r', encoding='utf-8') as handle:
@@ -1117,13 +1227,21 @@ def _load_canonical_inventory_bindings_unlocked():
             binding for binding in parse_dhcp_hosts(get_dhcp_hosts_path())
             if not binding.get('commented')
         ]
-    return normalize_inventory_bindings(bindings)
+    normalized = normalize_inventory_bindings(bindings)
+    if include_monitored:
+        normalized = supplement_with_monitored_devices(normalized)
+    return normalized
 
 
-def load_canonical_inventory_bindings():
-    """Read a normalized inventory snapshot under the shared inventory lock."""
+def load_canonical_inventory_bindings(include_monitored=False):
+    """Read a normalized inventory snapshot under the shared inventory lock.
+
+    Callers that authorize a device mutation pass include_monitored=True.  The
+    discovery sweep deliberately does not: it classifies what is already in the
+    inventory against what it finds on the wire.
+    """
     with inventory_shared_lock():
-        return _load_canonical_inventory_bindings_unlocked()
+        return _load_canonical_inventory_bindings_unlocked(include_monitored)
 
 
 def canonicalize_inventory_target(device, bindings=None):
@@ -1137,7 +1255,7 @@ def canonicalize_inventory_target(device, bindings=None):
     except ipaddress.AddressValueError as exc:
         raise ValueError(f'Invalid device IP: {raw_ip}') from exc
     if bindings is None:
-        bindings = load_canonical_inventory_bindings()
+        bindings = load_canonical_inventory_bindings(include_monitored=True)
     binding = next((
         item for item in bindings
         if item.get('hostname', '').lower() == hostname.lower()
@@ -4430,7 +4548,7 @@ def device_mutation_lock(ip):
 def canonical_device_mutation(device):
     """Pin current inventory assignment and serialize one device mutation."""
     with inventory_shared_lock():
-        bindings = _load_canonical_inventory_bindings_unlocked()
+        bindings = _load_canonical_inventory_bindings_unlocked(include_monitored=True)
         canonical = canonicalize_inventory_target(device, bindings)
         with device_mutation_lock(canonical['ip']):
             yield canonical
@@ -4879,7 +4997,7 @@ def action_upgrade_precheck():
     if not isinstance(devices, list):
         error_json('Upgrade devices must be a list')
     try:
-        inventory = load_canonical_inventory_bindings()
+        inventory = load_canonical_inventory_bindings(include_monitored=True)
     except Exception as exc:
         error_json(f'Could not load current inventory: {exc}')
     canonical_devices = []
@@ -6166,7 +6284,7 @@ def action_upgrade_start():
     if not isinstance(devices, list):
         error_json('Upgrade devices must be a list')
     try:
-        inventory = load_canonical_inventory_bindings()
+        inventory = load_canonical_inventory_bindings(include_monitored=True)
     except Exception as exc:
         error_json(f'Could not load current inventory: {exc}')
     for d in devices:
@@ -7388,7 +7506,7 @@ def action_deploy_generated_config():
         error_json("Cannot determine server IP for config download")
 
     try:
-        inventory = load_canonical_inventory_bindings()
+        inventory = load_canonical_inventory_bindings(include_monitored=True)
     except Exception as exc:
         error_json(f'Could not load current inventory: {exc}')
     by_target = {
