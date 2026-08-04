@@ -787,7 +787,9 @@ function onProviderChange(userInitiated) {
         const _s = document.getElementById('cfgSearchModel');
         const _f = document.getElementById('cfgFallbackModel');
         if (userInitiated || !_m.value) _m.value = 'aws/anthropic/bedrock-claude-opus-5';
-        if (userInitiated || !_f.value) _f.value = 'aws/anthropic/bedrock-claude-opus-5';
+        // Fallback must be a DIFFERENT model than the primary, or it cannot
+        // rescue primary-model failures; Sonnet is the cheaper same-family tier.
+        if (userInitiated || !_f.value) _f.value = 'aws/anthropic/bedrock-claude-sonnet-5';
         if (userInitiated || !_s.value) _s.value = 'perplexity/perplexity/sonar-pro';
     }
 }

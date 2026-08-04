@@ -2005,6 +2005,37 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
     return message
 
 
+def _stage_validation_file(path, content):
+    """Write a validation stand-in, escalating only when the dir is root-owned."""
+    try:
+        with open(path, 'w') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o644)
+        return
+    except PermissionError:
+        pass
+    result = subprocess.run(['sudo', 'tee', path], input=content,
+                            capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise RuntimeError('Could not stage a DHCP candidate for validation')
+    subprocess.run(['sudo', 'chmod', '644', path],
+                   capture_output=True, text=True, timeout=5)
+
+
+def _discard_validation_file(path):
+    try:
+        os.unlink(path)
+        return
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        pass
+    subprocess.run(['sudo', 'rm', '-f', path],
+                   capture_output=True, text=True, timeout=5)
+
+
 def validate_dhcp_config_candidate(conf_content, hosts_content=None,
                                    live_hosts_path=None, require_binary=True):
     """Syntax-check a complete DHCP candidate without touching live files."""
@@ -2013,14 +2044,20 @@ def validate_dhcp_config_candidate(conf_content, hosts_content=None,
         if require_binary:
             raise RuntimeError('dhcpd executable is not installed')
         return
-    with tempfile.TemporaryDirectory(prefix='lldpq-dhcp-validate-') as temp_dir:
+    # dhcpd is AppArmor-confined on Debian/Ubuntu and may only read a small
+    # set of paths, /tmp not among them: a candidate parked there is refused
+    # on permissions before its syntax is judged. Stage beside the live
+    # configuration instead (same approach as install.sh validate_dhcp_candidate).
+    conf_dir = os.path.dirname(
+        os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf')
+    ) or '/etc/dhcp'
+    tag = '.lldpq-validate-api.%d' % os.getpid()
+    staged_conf = os.path.join(conf_dir, tag + '.conf')
+    staged_hosts = os.path.join(conf_dir, tag + '.hosts')
+    try:
         rendered = conf_content
         if hosts_content is not None and live_hosts_path:
-            staged_hosts = os.path.join(temp_dir, 'dhcpd.hosts')
-            with open(staged_hosts, 'w') as handle:
-                handle.write(hosts_content)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _stage_validation_file(staged_hosts, hosts_content)
             include_pattern = r'include\s+"' + re.escape(live_hosts_path) + r'"\s*;'
             rendered, count = re.subn(
                 include_pattern,
@@ -2029,16 +2066,17 @@ def validate_dhcp_config_candidate(conf_content, hosts_content=None,
             )
             if count == 0:
                 raise RuntimeError('DHCP config does not include the managed hosts file')
-        staged_conf = os.path.join(temp_dir, 'dhcpd.conf')
-        with open(staged_conf, 'w') as handle:
-            handle.write(rendered)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _stage_validation_file(staged_conf, rendered)
         result = subprocess.run([dhcpd, '-t', '-cf', staged_conf],
                                 capture_output=True, text=True, timeout=20)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout or 'dhcpd validation failed').strip()
+            detail = detail.replace(staged_conf, 'dhcpd.conf (candidate)')
+            detail = detail.replace(staged_hosts, 'dhcpd.hosts (candidate)')
             raise RuntimeError('DHCP validation failed: ' + detail[:500])
+    finally:
+        _discard_validation_file(staged_conf)
+        _discard_validation_file(staged_hosts)
 
 
 def validate_dhcp_hosts_candidate(hosts_content, live_hosts_path):
