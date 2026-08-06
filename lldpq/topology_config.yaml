@@ -42,39 +42,69 @@ topology: minimal  # [full] or [minimal]
 
 device_categories:
 
-  # Super-spines (top tier)
-  - pattern: "sspine"
+  # Firewalls discovered via LLDP
+  - pattern: "fw"
     layer: 1
-    icon: "switch"
-
-  # Spines
-  - pattern: "spine"
-    layer: 3
-    icon: "switch"
+    icon: "firewall"
 
   # Border leaves (fabric edge)
   - pattern: "border"
-    layer: 5
+    layer: 2
     icon: "router"
 
+  # Super-spines (top tier)
+  - pattern: "ns-sspine"
+    layer: 3
+    icon: "switch"
+
+  # Spines
+  - pattern: "ns-spine"
+    layer: 4
+    icon: "switch"
+
   # Leaves
-  - pattern: "leaf"
-    layer: 7
+  - pattern: "ns-leaf"
+    layer: 5
+    icon: "switch"
+
+
+
+  # Spines
+  - pattern: "oobm-spine"
+    layer: 11
+    icon: "switch"
+
+  # Leaves
+  - pattern: "oobm-leaf"
+    layer: 12
     icon: "switch"
 
   # Out-of-band top-of-rack (access tier)
-  - pattern: "oob-tor"
-    layer: 9
+  - pattern: "oobm-tor"
+    layer: 12
     icon: "switch"
 
-  # Firewalls discovered via LLDP
-  - pattern: "fw"
-    layer: 11
-    icon: "firewall"
+
+
+  # Super-spines (top tier)
+  - pattern: "ew-sspine"
+    layer: 21
+    icon: "switch"
+
+  # Spines
+  - pattern: "ew-spine"
+    layer: 22
+    icon: "switch"
+
+  # Leaves
+  - pattern: "ew-leaf"
+    layer: 23
+    icon: "switch"
+
 
 # Default category for unmatched devices (servers / BMC / endpoints)
 default:
-  layer: 29
+  layer: 30
   icon: "host"
 
 # Special conditional rules for devices with complex logic.
