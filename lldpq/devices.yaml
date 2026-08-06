@@ -61,14 +61,14 @@ devices:
   192.168.200.162: border-02 @border_leaf
 
   # ---- OUT-OF-BAND (OOB) fabric - SN5600 / SN2201 ----
-  192.168.200.171: oob-spine-01 @oob_spine
-  192.168.200.172: oob-spine-02 @oob_spine
-  192.168.200.181: oob-leaf-01 @oob_leaf
-  192.168.200.182: oob-leaf-02 @oob_leaf
-  192.168.200.191: oob-tor-01 @oob_tor
-  192.168.200.192: oob-tor-02 @oob_tor
-  192.168.200.193: oob-tor-03 @oob_tor
-  192.168.200.194: oob-tor-04 @oob_tor
+  192.168.200.171: oobm-spine-01 @oob_spine
+  192.168.200.172: oobm-spine-02 @oob_spine
+  192.168.200.181: oobm-leaf-01 @oob_leaf
+  192.168.200.182: oobm-leaf-02 @oob_leaf
+  192.168.200.191: oobm-tor-01 @oob_tor
+  192.168.200.192: oobm-tor-02 @oob_tor
+  192.168.200.193: oobm-tor-03 @oob_tor
+  192.168.200.194: oobm-tor-04 @oob_tor
 
 # =============================================================================
 # ENDPOINT HOSTS - extra hostnames/patterns for topology visualization
