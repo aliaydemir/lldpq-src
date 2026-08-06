@@ -25,6 +25,12 @@ topology: minimal  # [full] or [minimal]
 #   - "border|edge"     matches devices containing "border" OR "edge"
 #   - "^dc[12]-spine"   matches dc1-spine-01, dc2-spine-02, etc.
 #
+# The first matching pattern wins, so list the more specific name before the
+# more general one it contains ("sspine" before "spine").
+#
+# Layer: lower number = higher in the diagram (super-spine top, ToR bottom).
+# Gaps between layer numbers leave room to insert a tier without renumbering.
+#
 # Possible icons:
 #
 # - switch    🔀
@@ -36,44 +42,59 @@ topology: minimal  # [full] or [minimal]
 
 device_categories:
 
-  - pattern: "inband-fw"
+  # Super-spines (top tier)
+  - pattern: "sspine"
     layer: 1
-    icon: "firewall"
-
-  - pattern: "border"
-    layer: 2
     icon: "switch"
 
+  # Spines
   - pattern: "spine"
     layer: 3
     icon: "switch"
 
-  - pattern: "leaf"
-    layer: 4
-    icon: "switch"
-
-  - pattern: "oob-fw"
+  # Border leaves (fabric edge)
+  - pattern: "border"
     layer: 5
-    icon: "firewall"
+    icon: "router"
 
-  - pattern: "core"
-    layer: 6
-    icon: "switch"
-
-  - pattern: "switch"
+  # Leaves
+  - pattern: "leaf"
     layer: 7
     icon: "switch"
 
-# Default category for unmatched devices
-default:
-  layer: 9
-  icon: "server"
-
-# Special conditional rules for devices with complex logic
-special_rules:
-  - pattern: "LF"
-    type: "even_odd_suffix"
-    even_layer: 8
-    odd_layer: 7
+  # Out-of-band top-of-rack (access tier)
+  - pattern: "oob-tor"
+    layer: 9
     icon: "switch"
-    description: "LF devices: even numbers -> layer 8, odd numbers -> layer 7"
+
+  # Firewalls discovered via LLDP
+  - pattern: "fw"
+    layer: 11
+    icon: "firewall"
+
+# Default category for unmatched devices (servers / BMC / endpoints)
+default:
+  layer: 29
+  icon: "host"
+
+# Special conditional rules for devices with complex logic.
+#
+# These are evaluated BEFORE device_categories, and the pattern is a substring
+# regex matched case-insensitively, so a short pattern catches far more than it
+# appears to. Keep them commented out unless a site actually needs one.
+#
+# special_rules:
+#   # Split a rack row into two visual sub-rows by even/odd device number
+#   - pattern: "^rack-lf-"
+#     type: "even_odd_suffix"
+#     even_layer: 8
+#     odd_layer: 7
+#     icon: "switch"
+#     description: "even numbers -> layer 8, odd numbers -> layer 7"
+#
+#   # Draw one family as a single staggered band; number_regex picks the digits
+#   - pattern: "^gb300-"
+#     type: "stagger"
+#     layer: 30
+#     number_regex: "gb300-\\d+-(\\d+)"
+#     icon: "host"

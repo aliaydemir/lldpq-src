@@ -18,18 +18,26 @@
 #
 # ROLES (optional):
 #   Add @role to group devices. Examples:
-#     10.10.100.10: Spine1 @spine
-#     10.10.100.12: Leaf1 @leaf
+#     192.168.200.111: ew-spine-01 @compute_spine
+#     192.168.200.121: ew-leaf-01 @compute_leaf
 #
 #   Usage:
-#     zzh               → type "@spine" to filter
-#     pping -r spine    → ping only @spine devices
-#     send-cmd -r spine → execute on @spine devices only
-#     --roles           → list all available roles (pping/send-cmd)
+#     zzh                      → type "@compute_spine" to filter
+#     pping -r compute_spine   → ping only @compute_spine devices
+#     send-cmd -r compute_leaf → execute on @compute_leaf devices only
+#     --roles                  → list all available roles (pping/send-cmd)
+#
+#   Matching the role names to the Ansible inventory group names keeps one
+#   vocabulary across LLDPq and the automation that configures the fabric.
 #
 # SSH REQUIREMENTS:
 #   - SSH key auth configured (use send-keys.sh)
 #   - Sudo privileges on devices (use sudo-fix.sh)
+#
+# SAMPLE FABRIC:
+#   The devices below describe a three-fabric reference lab (east-west compute,
+#   north-south converged, out-of-band management) so a fresh installation has
+#   a coherent example to read. Replace them with the real inventory.
 #
 # =======================================================
 
@@ -38,24 +46,57 @@ defaults:
 
 devices:
 
-  10.10.100.101: Border1 @border
-  10.10.100.102: Border2 @border
-  10.10.100.252: Core1 @core
-  10.10.100.253: Core2 @core
-  10.10.100.10: Spine1 @spine
-  10.10.100.11: Spine2 @spine
-  10.10.100.12: Leaf1 @leaf
-  10.10.100.13: Leaf2 @leaf
-  10.10.100.20: Switch1 @access
-  10.10.100.21: Switch2 @access
-  10.10.100.210: inband-fw @firewall
-  10.10.100.212: oob-fw @firewall
+  # ---- EAST-WEST (compute) fabric ----
+  192.168.200.101: ew-sspine-01 @compute_super_spine
+  192.168.200.102: ew-sspine-02 @compute_super_spine
+  192.168.200.111: ew-spine-01 @compute_spine
+  192.168.200.112: ew-spine-02 @compute_spine
+  192.168.200.121: ew-leaf-01 @compute_leaf
+  192.168.200.122: ew-leaf-02 @compute_leaf
+  192.168.200.123: ew-leaf-03 @compute_leaf
+  192.168.200.124: ew-leaf-04 @compute_leaf
 
-  # Example: Custom username override
-  # 192.168.1.10:
-  #   hostname: AdminSwitch01
-  #   username: admin
-  #   role: mgmt
+  # ---- NORTH-SOUTH (converged) fabric ----
+  192.168.200.131: ns-sspine-01 @ns_super_spine
+  192.168.200.132: ns-sspine-02 @ns_super_spine
+  192.168.200.141: ns-spine-01 @ns_spine
+  192.168.200.142: ns-spine-02 @ns_spine
+  192.168.200.151: ns-leaf-01 @ns_leaf
+  192.168.200.152: ns-leaf-02 @ns_leaf
+  192.168.200.161: border-01 @border_leaf
+  192.168.200.162: border-02 @border_leaf
+
+  # ---- OUT-OF-BAND (OOB) fabric ----
+  192.168.200.171: oob-spine-01 @oob_spine
+  192.168.200.172: oob-spine-02 @oob_spine
+  192.168.200.181: oob-leaf-01 @oob_leaf
+  192.168.200.182: oob-leaf-02 @oob_leaf
+  192.168.200.191: oob-tor-01 @oob_tor
+  192.168.200.192: oob-tor-02 @oob_tor
+  192.168.200.193: oob-tor-03 @oob_tor
+  192.168.200.194: oob-tor-04 @oob_tor
+
+  # ---- External / simulated devices (firewalls, WAN edge) ----
+  192.168.200.211: external-fw-01 @external_fw
+  192.168.200.212: external-fw-02 @external_fw
+
+  # ---- Compute servers: extended format overrides the default username ----
+  192.168.200.221:
+    hostname: gpu-srv-01
+    username: ubuntu
+    role: gpu
+  192.168.200.222:
+    hostname: gpu-srv-02
+    username: ubuntu
+    role: gpu
+  192.168.200.223:
+    hostname: gpu-srv-03
+    username: ubuntu
+    role: gpu
+  192.168.200.224:
+    hostname: gpu-srv-04
+    username: ubuntu
+    role: gpu
 
 # =============================================================================
 # ENDPOINT HOSTS - Extra Hostnames for Topology Visualization
@@ -86,6 +127,11 @@ devices:
 #   If a hostname exists in both assets.ini and endpoint_hosts, the assets.ini
 #   data takes precedence for device details (IP, MAC, Serial, Model, Version).
 #   Patterns are matched against devices discovered via LLDP neighbor data.
+#
+#   Listing a name here also makes topology.dot links that reference it count as
+#   real: a designed link is only reported as a missing cable when both of its
+#   endpoints are known devices. Placeholder nodes that stand in for stub ports
+#   should therefore stay out of this list.
 #
 # =============================================================================
 

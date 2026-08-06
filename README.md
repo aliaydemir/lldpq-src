@@ -919,12 +919,12 @@ defaults:
   username: cumulus
 
 devices:
-  10.10.100.10: Spine1            # simple: IP: Hostname
-  10.10.100.11: Spine2 @spine     # with role: IP: Hostname @role
-  10.10.100.12:                   # extended format
-    hostname: Leaf1
-    username: admin
-    role: leaf
+  192.168.200.111: ew-spine-01                  # simple: IP: Hostname
+  192.168.200.121: ew-leaf-01 @compute_leaf     # with role: IP: Hostname @role
+  192.168.200.221:                              # extended format
+    hostname: gpu-srv-01
+    username: ubuntu
+    role: gpu
 ```
 
 roles are optional tags for grouping. They are used for:
