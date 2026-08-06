@@ -3,10 +3,12 @@
 #
 # =============================================================================
 # devices.yaml - LLDPq Network Device Configuration
-# =======================================================
+# =============================================================================
 #
 # PURPOSE:
-#   Central device configuration for LLDPq. Used by pping, zzh, send-cmd, get-conf.
+#   Central device list for LLDPq tooling (pping, zzh, send-cmd, get-conf) and
+#   topology validation. Hostnames must match topology.dot; management IPs must
+#   match the ones the Ansible inventory configures.
 #
 # FORMAT:
 #   IP: Hostname                    # simple
@@ -16,37 +18,29 @@
 #     username: custom_user
 #     role: role_name
 #
-# ROLES (optional):
-#   Add @role to group devices. Examples:
-#     192.168.200.111: ew-spine-01 @compute_spine
-#     192.168.200.121: ew-leaf-01 @compute_leaf
-#
-#   Usage:
-#     zzh                      → type "@compute_spine" to filter
-#     pping -r compute_spine   → ping only @compute_spine devices
-#     send-cmd -r compute_leaf → execute on @compute_leaf devices only
-#     --roles                  → list all available roles (pping/send-cmd)
-#
-#   Matching the role names to the Ansible inventory group names keeps one
-#   vocabulary across LLDPq and the automation that configures the fabric.
+# ROLES (keep them equal to the Ansible inventory group names):
+#   zzh                   -> type "@compute_leaf" to filter
+#   pping -r oob_tor      -> ping only @oob_tor devices
+#   send-cmd -r tan_spine -> run only on @tan_spine devices
+#   --roles               -> list all available roles
 #
 # SSH REQUIREMENTS:
 #   - SSH key auth configured (use send-keys.sh)
 #   - Sudo privileges on devices (use sudo-fix.sh)
 #
 # SAMPLE FABRIC:
-#   The devices below describe a three-fabric reference lab (east-west compute,
-#   north-south converged, out-of-band management) so a fresh installation has
-#   a coherent example to read. Replace them with the real inventory.
-#
-# =======================================================
+#   The devices below describe a three-fabric reference lab. Only switches are
+#   listed: servers and firewalls are reached through endpoint_hosts instead,
+#   because LLDPq collects with switch commands. Replace them with the real
+#   inventory.
+# =============================================================================
 
 defaults:
   username: cumulus
 
 devices:
 
-  # ---- EAST-WEST (compute) fabric ----
+  # ---- EAST-WEST (Compute) fabric - SN5600 ----
   192.168.200.101: ew-sspine-01 @compute_super_spine
   192.168.200.102: ew-sspine-02 @compute_super_spine
   192.168.200.111: ew-spine-01 @compute_spine
@@ -56,17 +50,17 @@ devices:
   192.168.200.123: ew-leaf-03 @compute_leaf
   192.168.200.124: ew-leaf-04 @compute_leaf
 
-  # ---- NORTH-SOUTH (converged) fabric ----
-  192.168.200.131: ns-sspine-01 @ns_super_spine
-  192.168.200.132: ns-sspine-02 @ns_super_spine
-  192.168.200.141: ns-spine-01 @ns_spine
-  192.168.200.142: ns-spine-02 @ns_spine
-  192.168.200.151: ns-leaf-01 @ns_leaf
-  192.168.200.152: ns-leaf-02 @ns_leaf
+  # ---- NORTH-SOUTH (Converged) fabric - SN5600 / SN4700 ----
+  192.168.200.131: ns-sspine-01 @tan_super_spine
+  192.168.200.132: ns-sspine-02 @tan_super_spine
+  192.168.200.141: ns-spine-01 @tan_spine
+  192.168.200.142: ns-spine-02 @tan_spine
+  192.168.200.151: ns-leaf-01 @tan_leaf
+  192.168.200.152: ns-leaf-02 @tan_leaf
   192.168.200.161: border-01 @border_leaf
   192.168.200.162: border-02 @border_leaf
 
-  # ---- OUT-OF-BAND (OOB) fabric ----
+  # ---- OUT-OF-BAND (OOB) fabric - SN5600 / SN2201 ----
   192.168.200.171: oob-spine-01 @oob_spine
   192.168.200.172: oob-spine-02 @oob_spine
   192.168.200.181: oob-leaf-01 @oob_leaf
@@ -76,73 +70,33 @@ devices:
   192.168.200.193: oob-tor-03 @oob_tor
   192.168.200.194: oob-tor-04 @oob_tor
 
-  # ---- External / simulated devices (firewalls, WAN edge) ----
-  192.168.200.211: external-fw-01 @external_fw
-  192.168.200.212: external-fw-02 @external_fw
-
-  # ---- Compute servers: extended format overrides the default username ----
-  192.168.200.221:
-    hostname: gpu-srv-01
-    username: ubuntu
-    role: gpu
-  192.168.200.222:
-    hostname: gpu-srv-02
-    username: ubuntu
-    role: gpu
-  192.168.200.223:
-    hostname: gpu-srv-03
-    username: ubuntu
-    role: gpu
-  192.168.200.224:
-    hostname: gpu-srv-04
-    username: ubuntu
-    role: gpu
-
 # =============================================================================
-# ENDPOINT HOSTS - Extra Hostnames for Topology Visualization
+# ENDPOINT HOSTS - extra hostnames/patterns for topology visualization
 # =============================================================================
 #
-# PURPOSE:
-#   Define additional hostnames for topology generation that may not be present
-#   in assets.ini. Used by generate_topology.py and generate_topology_full.py
-#   to ensure all network devices are included in the topology visualization.
+# Devices that appear in topology.dot but are not monitored above. A designed
+# link is only checked when both of its endpoints are known, so anything named
+# here becomes eligible for validation.
 #
-# FORMAT:
-#   - One hostname per line (as YAML list)
-#   - Patterns with '*' are supported (wildcard matching)
-#   - Patterns must be quoted (YAML requirement)
-#
-# USAGE:
-#   - Add device hostnames that should appear in topology but aren't in assets.ini
-#   - Useful for devices that can't be monitored but exist in LLDP neighbor data
-#   - Helps create complete network topology visualization
-#   - Use patterns to match multiple devices at once
+# An exact name is added to the topology whether or not LLDP reports it, while
+# a pattern only matches devices that LLDP actually discovered as neighbours.
+# Prefer exact names for hosts that may not run lldpd, such as servers.
 #
 # PATTERN EXAMPLES:
-#   - "*dgx*"      → all devices containing "dgx"
-#   - "leaf-*"     → all devices starting with "leaf-"
-#   - "*-gpu"      → all devices ending with "-gpu"
+#   - "*dgx*"      -> all devices containing "dgx"
+#   - "leaf-*"     -> all devices starting with "leaf-"
+#   - "*-gpu"      -> all devices ending with "-gpu"
 #
-# NOTE:
-#   If a hostname exists in both assets.ini and endpoint_hosts, the assets.ini
-#   data takes precedence for device details (IP, MAC, Serial, Model, Version).
-#   Patterns are matched against devices discovered via LLDP neighbor data.
-#
-#   Listing a name here also makes topology.dot links that reference it count as
-#   real: a designed link is only reported as a missing cable when both of its
-#   endpoints are known devices. Placeholder nodes that stand in for stub ports
-#   should therefore stay out of this list.
-#
+# Patterns anchor at both ends, so "*-fw" matches a host named exactly
+# "site-fw" but not "external-fw-01".
 # =============================================================================
 
 endpoint_hosts:
-  # Exact hostnames
-  # - border-router-01
-  # - external-switch-01
-  # - firewall-01
+  # Compute servers: listed exactly, since they may not advertise LLDP
+  - gpu-srv-01
+  - gpu-srv-02
+  - gpu-srv-03
+  - gpu-srv-04
 
-  # Patterns - match devices discovered via LLDP
-  # - "dgx*"          # all devices starting with "dgx"
-  # - "*dgx*"         # all devices containing "dgx"
-  # - "*-oob*"        # all devices containing "-oob"
-  # - "*-gpu"         # all devices ending with "-gpu"
+  # Firewalls, discovered through the LLDP neighbours of the border leaves
+  - "*fw*"

@@ -15,22 +15,16 @@
  *   GraphViz DOT format - defines network connections as graph edges
  *   "DeviceA":"InterfaceX" -- "DeviceB":"InterfaceY"
  *
- * USAGE:
- *   - Topology validation: Compare LLDP discoveries vs expected design
- *   - Missing link detection: Identify cables not connected as designed
- *   - Network documentation: Visual representation of intended topology
- *   - Change management: Track topology modifications over time
- *
- * VALIDATION LOGIC:
- *   - LLDP matches DOT: connection is correct
- *   - LLDP missing from DOT: unexpected connection found
- *   - DOT missing from LLDP: expected connection not found (missing cable)
- *
  * SYNTAX:
  *   graph "NETWORK_NAME" {
  *     "Hostname1":"Interface1" -- "Hostname2":"Interface2"
  *     "Leaf01":"swp49" -- "Spine01":"swp1"
  *   }
+ *
+ * VALIDATION LOGIC:
+ *   - LLDP matches DOT: connection is correct
+ *   - LLDP missing from DOT: unexpected connection found
+ *   - DOT missing from LLDP: expected connection not found (missing cable)
  *
  * MAINTENANCE:
  *   - Add new connections when cables are installed
@@ -44,47 +38,26 @@
  *
  *   A link is only checked when both of its endpoints are known devices, so
  *   ports facing equipment outside the fabric are best left out entirely.
- *   Naming a placeholder peer would either be ignored or, once that name is
- *   listed under endpoint_hosts, produce a permanent missing-cable alarm.
+ *   Devices that are not monitored but should still be validated belong in
+ *   endpoint_hosts in devices.yaml.
  *
  * =============================================================================
  */
 
-graph "FABRIC" {
+graph "cl-auto-17" {
 
-# ============================================================
-#  SAMPLE FABRIC - replace these links with the real cabling
-#
-#  EW  (compute)    numbered /31 underlay
-#  NS  (converged)  unnumbered + EVPN, ports broken out 2x (swpNsX)
-#  OOB (management) unnumbered + EVPN
-#
-#  Ports that face equipment outside the fabric (border WAN uplinks, OOB
-#  BMC and console ports) carry a host_vars configuration but no link
-#  statement here, so they stay unvalidated instead of always failing.
-# ============================================================
-
-# ============================================================
-#  EW (Compute) fabric - numbered /31 underlay
-# ============================================================
-
-# leaf -> spine (4 rail-leaves, each dual-homed to both spines)
-"ew-leaf-01":"swp1"  -- "ew-spine-01":"swp1"     # 10.254.0.0/31
-"ew-leaf-01":"swp2"  -- "ew-spine-02":"swp1"     # 10.254.0.2/31
-"ew-leaf-02":"swp1"  -- "ew-spine-01":"swp2"     # 10.254.0.4/31
-"ew-leaf-02":"swp2"  -- "ew-spine-02":"swp2"     # 10.254.0.6/31
-"ew-leaf-03":"swp1"  -- "ew-spine-01":"swp5"     # 10.254.0.8/31
-"ew-leaf-03":"swp2"  -- "ew-spine-02":"swp5"     # 10.254.0.10/31
-"ew-leaf-04":"swp1"  -- "ew-spine-01":"swp6"     # 10.254.0.12/31
-"ew-leaf-04":"swp2"  -- "ew-spine-02":"swp6"     # 10.254.0.14/31
-
-# spine -> super-spine
-"ew-spine-01":"swp3" -- "ew-sspine-01":"swp1"    # 10.254.1.0/31
-"ew-spine-01":"swp4" -- "ew-sspine-02":"swp1"    # 10.254.1.2/31
-"ew-spine-02":"swp3" -- "ew-sspine-01":"swp2"    # 10.254.1.4/31
-"ew-spine-02":"swp4" -- "ew-sspine-02":"swp2"    # 10.254.1.6/31
-
-# GPU servers - rail-optimized (server ethN -> rail-N leaf, one NIC per rail)
+"ew-leaf-01":"swp1" -- "ew-spine-01":"swp1"
+"ew-leaf-01":"swp2" -- "ew-spine-02":"swp1"
+"ew-leaf-02":"swp1" -- "ew-spine-01":"swp2"
+"ew-leaf-02":"swp2" -- "ew-spine-02":"swp2"
+"ew-leaf-03":"swp1" -- "ew-spine-01":"swp5"
+"ew-leaf-03":"swp2" -- "ew-spine-02":"swp5"
+"ew-leaf-04":"swp1" -- "ew-spine-01":"swp6"
+"ew-leaf-04":"swp2" -- "ew-spine-02":"swp6"
+"ew-spine-01":"swp3" -- "ew-sspine-01":"swp1"
+"ew-spine-01":"swp4" -- "ew-sspine-02":"swp1"
+"ew-spine-02":"swp3" -- "ew-sspine-01":"swp2"
+"ew-spine-02":"swp4" -- "ew-sspine-02":"swp2"
 "gpu-srv-01":"eth1" -- "ew-leaf-01":"swp10"
 "gpu-srv-01":"eth2" -- "ew-leaf-02":"swp10"
 "gpu-srv-01":"eth3" -- "ew-leaf-03":"swp10"
@@ -101,59 +74,32 @@ graph "FABRIC" {
 "gpu-srv-04":"eth2" -- "ew-leaf-02":"swp13"
 "gpu-srv-04":"eth3" -- "ew-leaf-03":"swp13"
 "gpu-srv-04":"eth4" -- "ew-leaf-04":"swp13"
-
-# ============================================================
-#  NS (Converged) fabric - unnumbered + EVPN (breakout 2x -> sN)
-# ============================================================
-
-# leaf -> spine (swp41 -> spine-01, swp42 -> spine-02)
 "ns-leaf-01":"swp41s0" -- "ns-spine-01":"swp1s0"
 "ns-leaf-01":"swp42s0" -- "ns-spine-02":"swp1s0"
 "ns-leaf-02":"swp41s0" -- "ns-spine-01":"swp1s1"
 "ns-leaf-02":"swp42s0" -- "ns-spine-02":"swp1s1"
-
-# border -> spine (swp1 -> spine-01, swp2 -> spine-02)
 "border-01":"swp1" -- "ns-spine-01":"swp2s0"
 "border-01":"swp2" -- "ns-spine-02":"swp2s0"
 "border-02":"swp1" -- "ns-spine-01":"swp2s1"
 "border-02":"swp2" -- "ns-spine-02":"swp2s1"
-
-# spine -> super-spine
 "ns-spine-01":"swp3s0" -- "ns-sspine-01":"swp1s0"
 "ns-spine-01":"swp3s1" -- "ns-sspine-02":"swp1s0"
 "ns-spine-02":"swp3s0" -- "ns-sspine-01":"swp1s1"
 "ns-spine-02":"swp3s1" -- "ns-sspine-02":"swp1s1"
-
-# border -> super-spine (swp5 -> sspine-01, swp6 -> sspine-02)
 "border-01":"swp5" -- "ns-sspine-01":"swp2s0"
 "border-01":"swp6" -- "ns-sspine-02":"swp2s0"
 "border-02":"swp5" -- "ns-sspine-01":"swp2s1"
 "border-02":"swp6" -- "ns-sspine-02":"swp2s1"
-
-# border MLAG peer-link
 "border-01":"swp31" -- "border-02":"swp31"
 "border-01":"swp32" -- "border-02":"swp32"
-
-# External firewalls dual-homed via the border MLAG bonds (VLAN 2000 -> exit VRF)
-# external-fw-01 -> bond_fw01 (border swp10), external-fw-02 -> bond_fw02 (border swp11)
 "border-01":"swp10" -- "external-fw-01":"swp1"
 "border-02":"swp10" -- "external-fw-01":"swp2"
 "border-01":"swp11" -- "external-fw-02":"swp1"
 "border-02":"swp11" -- "external-fw-02":"swp2"
-
-# border-01/02 swp25 face the WAN edge, which sits outside this fabric.
-# Deliberately left out - see the note at the top of the file.
-
-# ============================================================
-#  OOB fabric - unnumbered + EVPN (oob VRF)
-#  leaf + tor uplink swp49 -> oob-spine-01, swp51 -> oob-spine-02
-# ============================================================
-
 "oob-leaf-01":"swp49" -- "oob-spine-01":"swp1s0"
 "oob-leaf-01":"swp51" -- "oob-spine-02":"swp1s0"
 "oob-leaf-02":"swp49" -- "oob-spine-01":"swp1s1"
 "oob-leaf-02":"swp51" -- "oob-spine-02":"swp1s1"
-
 "oob-tor-01":"swp49" -- "oob-spine-01":"swp2s0"
 "oob-tor-01":"swp51" -- "oob-spine-02":"swp2s0"
 "oob-tor-02":"swp49" -- "oob-spine-01":"swp2s1"
@@ -162,17 +108,5 @@ graph "FABRIC" {
 "oob-tor-03":"swp51" -- "oob-spine-02":"swp3s0"
 "oob-tor-04":"swp49" -- "oob-spine-01":"swp3s1"
 "oob-tor-04":"swp51" -- "oob-spine-02":"swp3s1"
-
-# OOB spine <-> spine interconnect
-"oob-spine-01":"swp4s0" -- "oob-spine-02":"swp4s0"
-"oob-spine-01":"swp4s1" -- "oob-spine-02":"swp4s1"
-
-# The OOB access edge (BMC on VLAN 601/602, console on 604) attaches to
-# equipment outside this fabric, so oob-leaf-01/02 swp1, oob-tor-01
-# swp1/swp19/swp37 and the equivalent ToR access ports carry no link here.
-#
-# To validate that access layer as well, cable the real endpoints and list
-# them under endpoint_hosts in devices.yaml so the links count, for example:
-#   "oob-tor-01":"swp1" -- "bmc-01":"eth1"
 
 }
