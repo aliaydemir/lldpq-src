@@ -1,14 +1,11 @@
-# Copyright (c) 2024 LLDPq Project
-# Licensed under MIT License - see LICENSE file for details
-#
 # =============================================================================
-# devices.yaml - LLDPq Network Device Configuration
+# devices.yaml - LLDPq Network Device Configuration (cl-auto-17)
 # =============================================================================
 #
 # PURPOSE:
 #   Central device list for LLDPq tooling (pping, zzh, send-cmd, get-conf) and
-#   topology validation. Hostnames must match topology.dot; management IPs must
-#   match the ones the Ansible inventory configures.
+#   topology validation. Management IPs match inventory host_vars (192.168.200.0/24)
+#   and the AIR topology (topology.dot).
 #
 # FORMAT:
 #   IP: Hostname                    # simple
@@ -18,21 +15,11 @@
 #     username: custom_user
 #     role: role_name
 #
-# ROLES (keep them equal to the Ansible inventory group names):
-#   zzh                   -> type "@compute_leaf" to filter
-#   pping -r oob_tor      -> ping only @oob_tor devices
+# ROLES (match inventory.ini groups):
+#   zzh               -> type "@compute_leaf" to filter
+#   pping -r oob_tor  -> ping only @oob_tor devices
 #   send-cmd -r tan_spine -> run only on @tan_spine devices
-#   --roles               -> list all available roles
-#
-# SSH REQUIREMENTS:
-#   - SSH key auth configured (use send-keys.sh)
-#   - Sudo privileges on devices (use sudo-fix.sh)
-#
-# SAMPLE FABRIC:
-#   The devices below describe a three-fabric reference lab. Only switches are
-#   listed: servers and firewalls are reached through endpoint_hosts instead,
-#   because LLDPq collects with switch commands. Replace them with the real
-#   inventory.
+#   --roles           -> list all available roles
 # =============================================================================
 
 defaults:
@@ -40,23 +27,50 @@ defaults:
 
 devices:
 
-  # ---- EAST-WEST (Compute) fabric - SN5600 ----
-  192.168.200.101: ew-sspine-01 @compute_super_spine
-  192.168.200.102: ew-sspine-02 @compute_super_spine
-  192.168.200.111: ew-spine-01 @compute_spine
-  192.168.200.112: ew-spine-02 @compute_spine
-  192.168.200.121: ew-leaf-01 @compute_leaf
-  192.168.200.122: ew-leaf-02 @compute_leaf
-  192.168.200.123: ew-leaf-03 @compute_leaf
-  192.168.200.124: ew-leaf-04 @compute_leaf
 
-  # ---- NORTH-SOUTH (Converged) fabric - SN5600 / SN4700 ----
+  # ---- EAST-WEST (Compute) fabric, plane 1 - SN5600 ----
+  192.168.200.101: ew-p1-spine-01 @compute_p1_spine
+  192.168.200.102: ew-p1-spine-02 @compute_p1_spine
+  192.168.200.103: ew-p1-spine-03 @compute_p1_spine
+  192.168.200.104: ew-p1-spine-04 @compute_p1_spine
+  192.168.200.105: ew-p1-leaf-01 @compute_p1_leaf
+  192.168.200.106: ew-p1-leaf-02 @compute_p1_leaf
+  192.168.200.107: ew-p1-leaf-03 @compute_p1_leaf
+  192.168.200.108: ew-p1-leaf-04 @compute_p1_leaf
+  192.168.200.109: ew-p1-leaf-05 @compute_p1_leaf
+  192.168.200.110: ew-p1-leaf-06 @compute_p1_leaf
+  192.168.200.111: ew-p1-leaf-07 @compute_p1_leaf
+  192.168.200.112: ew-p1-leaf-08 @compute_p1_leaf
+
+  # ---- EAST-WEST (Compute) fabric, plane 2 - SN5600 ----
+  192.168.200.113: ew-p2-spine-01 @compute_p2_spine
+  192.168.200.114: ew-p2-spine-02 @compute_p2_spine
+  192.168.200.115: ew-p2-spine-03 @compute_p2_spine
+  192.168.200.116: ew-p2-spine-04 @compute_p2_spine
+  192.168.200.117: ew-p2-leaf-01 @compute_p2_leaf
+  192.168.200.118: ew-p2-leaf-02 @compute_p2_leaf
+  192.168.200.119: ew-p2-leaf-03 @compute_p2_leaf
+  192.168.200.120: ew-p2-leaf-04 @compute_p2_leaf
+  192.168.200.121: ew-p2-leaf-05 @compute_p2_leaf
+  192.168.200.122: ew-p2-leaf-06 @compute_p2_leaf
+  192.168.200.123: ew-p2-leaf-07 @compute_p2_leaf
+  192.168.200.124: ew-p2-leaf-08 @compute_p2_leaf
+
+  # ---- NORTH-SOUTH (Converged) fabric - SN5600 ----
   192.168.200.131: ns-sspine-01 @tan_super_spine
   192.168.200.132: ns-sspine-02 @tan_super_spine
   192.168.200.141: ns-spine-01 @tan_spine
   192.168.200.142: ns-spine-02 @tan_spine
+  192.168.200.143: ns-spine-03 @tan_spine
+  192.168.200.144: ns-spine-04 @tan_spine
   192.168.200.151: ns-leaf-01 @tan_leaf
   192.168.200.152: ns-leaf-02 @tan_leaf
+  192.168.200.153: ns-leaf-03 @tan_leaf
+  192.168.200.154: ns-leaf-04 @tan_leaf
+  192.168.200.155: ns-leaf-05 @tan_leaf
+  192.168.200.156: ns-leaf-06 @tan_leaf
+  192.168.200.157: ns-leaf-07 @tan_leaf
+  192.168.200.158: ns-leaf-08 @tan_leaf
   192.168.200.161: border-01 @border_leaf
   192.168.200.162: border-02 @border_leaf
 
@@ -73,30 +87,9 @@ devices:
 # =============================================================================
 # ENDPOINT HOSTS - extra hostnames/patterns for topology visualization
 # =============================================================================
-#
-# Devices that appear in topology.dot but are not monitored above. A designed
-# link is only checked when both of its endpoints are known, so anything named
-# here becomes eligible for validation.
-#
-# An exact name is added to the topology whether or not LLDP reports it, while
-# a pattern only matches devices that LLDP actually discovered as neighbours.
-# Prefer exact names for hosts that may not run lldpd, such as servers.
-#
-# PATTERN EXAMPLES:
-#   - "*dgx*"      -> all devices containing "dgx"
-#   - "leaf-*"     -> all devices starting with "leaf-"
-#   - "*-gpu"      -> all devices ending with "-gpu"
-#
-# Patterns anchor at both ends, so "*-fw" matches a host named exactly
-# "site-fw" but not "external-fw-01".
-# =============================================================================
-
+# The firewalls stay out of the managed list on purpose: they are external
+# devices we do not own. They appear here only so LLDPq draws them as endpoints.
 endpoint_hosts:
-  # Compute servers: listed exactly, since they may not advertise LLDP
-  - gpu-srv-01
-  - gpu-srv-02
-  - gpu-srv-03
-  - gpu-srv-04
-
-  # Firewalls, discovered through the LLDP neighbours of the border leaves
-  - "*fw*"
+  - "gpu-srv-*"         # GPU servers on the EW rails
+  - "cpu-srv-*"         # CPU servers on the NS leaf pairs
+  - "external-fw-*"     # firewalls discovered via LLDP
