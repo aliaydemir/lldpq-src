@@ -59,6 +59,7 @@ devices:
   # ---- NORTH-SOUTH (Converged) fabric - SN5600 ----
   192.168.200.131: ns-sspine-01 @tan_super_spine
   192.168.200.132: ns-sspine-02 @tan_super_spine
+  192.168.200.133: ns-sspine-03 @tan_super_spine
   192.168.200.141: ns-spine-01 @tan_spine
   192.168.200.142: ns-spine-02 @tan_spine
   192.168.200.143: ns-spine-03 @tan_spine

@@ -45,6 +45,7 @@
  */
 
 graph "cl-auto-17" {
+
 # ---- fabric cabling ----
 "ew-p1-leaf-01":"swp1"  --  "ew-p1-spine-01":"swp1"
 "ew-p1-leaf-01":"swp2"  --  "ew-p1-spine-02":"swp1"
@@ -400,22 +401,26 @@ graph "cl-auto-17" {
 "ns-leaf-08":"swp44s0"  --  "ns-spine-04":"swp5s1"
 "ns-spine-01":"swp3s0"  --  "ns-sspine-01":"swp1s0"
 "ns-spine-01":"swp3s1"  --  "ns-sspine-02":"swp1s0"
+"ns-spine-01":"swp3s2"  --  "ns-sspine-03":"swp1s0"
 "ns-spine-02":"swp3s0"  --  "ns-sspine-01":"swp1s1"
 "ns-spine-02":"swp3s1"  --  "ns-sspine-02":"swp1s1"
+"ns-spine-02":"swp3s2"  --  "ns-sspine-03":"swp1s1"
 "ns-spine-03":"swp3s0"  --  "ns-sspine-01":"swp2s0"
 "ns-spine-03":"swp3s1"  --  "ns-sspine-02":"swp2s0"
+"ns-spine-03":"swp3s2"  --  "ns-sspine-03":"swp2s0"
 "ns-spine-04":"swp3s0"  --  "ns-sspine-01":"swp2s1"
 "ns-spine-04":"swp3s1"  --  "ns-sspine-02":"swp2s1"
+"ns-spine-04":"swp3s2"  --  "ns-sspine-03":"swp2s1"
 "border-01":"swp5"  --  "ns-sspine-01":"swp3s0"
 "border-01":"swp6"  --  "ns-sspine-02":"swp3s0"
+"border-01":"swp9"  --  "ns-sspine-03":"swp3s0"
 "border-02":"swp5"  --  "ns-sspine-01":"swp3s1"
 "border-02":"swp6"  --  "ns-sspine-02":"swp3s1"
+"border-02":"swp9"  --  "ns-sspine-03":"swp3s1"
 "border-01":"swp31"  --  "border-02":"swp31"
 "border-01":"swp32"  --  "border-02":"swp32"
 "border-01":"swp10"  --  "external-fw-01":"swp1"
 "border-02":"swp10"  --  "external-fw-01":"swp2"
-"border-01":"swp11"  --  "external-fw-02":"swp1"
-"border-02":"swp11"  --  "external-fw-02":"swp2"
 "cpu-srv-01":"eth1"  --  "ns-leaf-01":"swp20"
 "cpu-srv-01":"eth2"  --  "ns-leaf-02":"swp20"
 "cpu-srv-02":"eth1"  --  "ns-leaf-01":"swp21"
