@@ -42,65 +42,79 @@ topology: minimal  # [full] or [minimal]
 
 device_categories:
 
-  # Firewalls discovered via LLDP
-  - pattern: "fw"
-    layer: 1
-    icon: "firewall"
-
-  # Border leaves (fabric edge)
-  - pattern: "border"
-    layer: 2
-    icon: "router"
-
-  # Super-spines (top tier)
-  - pattern: "ns-sspine"
-    layer: 3
-    icon: "switch"
-
-  # Spines
-  - pattern: "ns-spine"
-    layer: 4
-    icon: "switch"
-
-  # Leaves
-  - pattern: "ns-leaf"
-    layer: 5
-    icon: "switch"
-
-
-
-  # Spines
-  - pattern: "oobm-spine"
-    layer: 11
-    icon: "switch"
-
-  # Leaves
+  # OOB Leaves
   - pattern: "oobm-leaf"
-    layer: 12
+    layer: 1
     icon: "switch"
 
   # Out-of-band top-of-rack (access tier)
   - pattern: "oobm-tor"
-    layer: 12
+    layer: 1
+    icon: "switch"
+
+  # OOB Spines
+  - pattern: "oobm-spine"
+    layer: 3
     icon: "switch"
 
 
 
-  # Super-spines (top tier)
-  - pattern: "ew-sspine"
+  # Firewalls discovered via LLDP
+  - pattern: "fw"
+    layer: 11
+    icon: "firewall"
+
+  # Border leaves (fabric edge)
+  - pattern: "border"
+    layer: 12
+    icon: "router"
+
+
+
+  # NS Super-spines (top tier)
+  - pattern: "ns-sspine"
+    layer: 13
+    icon: "switch"
+
+  # NS Spines
+  - pattern: "ns-spine"
+    layer: 14
+    icon: "switch"
+
+  # NS Leaves
+  - pattern: "ns-leaf"
+    layer: 15
+    icon: "switch"
+
+  # NS CPU-Server
+  - pattern: "cpu"
+    layer: 17
+    icon: "host"
+
+
+
+  # EW Spines
+  - pattern: "ew-p1-spine"
     layer: 21
     icon: "switch"
 
-  # Spines
-  - pattern: "ew-spine"
-    layer: 22
+  - pattern: "ew-p2-spine"
+    layer: 21
     icon: "switch"
 
-  # Leaves
-  - pattern: "ew-leaf"
+  # EW Leaves
+  - pattern: "ew-p1-leaf"
     layer: 23
     icon: "switch"
 
+  - pattern: "ew-p2-leaf"
+    layer: 23
+    icon: "switch"
+
+  # EW GPU-Server
+  - pattern: "gpu"
+    layer: 25
+    icon: "server"
 
 # Default category for unmatched devices (servers / BMC / endpoints)
 default:
