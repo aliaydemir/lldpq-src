@@ -3979,6 +3979,16 @@ EOF
         # =====================================================================
         echo "===HARDWARE_DATA_START==="
         if _lldpq_scope_selected hardware; then
+        # A virtualised switch has no ASIC die, no PSU rails and no CPU thermal
+        # diode. Publish the platform class so the analyzer can tell "absent by
+        # design" from "this sensor failed" instead of grading the whole sample
+        # unknown. systemd-detect-virt prints "none" on physical hardware.
+        _platform_virt=""
+        if command -v systemd-detect-virt >/dev/null 2>&1; then
+            _platform_virt=$(systemd-detect-virt 2>/dev/null || true)
+        fi
+        [ -n "$_platform_virt" ] || _platform_virt="unknown"
+        echo "PLATFORM_VIRT: $_platform_virt"
         echo "HARDWARE_HEALTH:"
         if command -v sensors >/dev/null 2>&1; then
             _hardware_output=$(_lldpq_run_bounded sensors 2>/dev/null)

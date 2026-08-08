@@ -685,6 +685,35 @@ def hardware_missing_telemetry_markers(device_name):
     return markers
 
 
+def hardware_platform_is_virtual(device_name):
+    """True when this sample came from a virtualised switch.
+
+    A virtual switch has no ASIC die, no PSU rails and no CPU thermal diode, so
+    those readings are absent by design rather than by failure. Grading them as
+    missing telemetry marks an otherwise healthy lab fabric entirely Unknown.
+
+    Detection stays fail-closed: anything unrecognised is treated as physical,
+    so a real switch with a broken sensor keeps reporting an incomplete sample.
+    """
+    hardware_file = f"monitor-results/hardware-data/{device_name}_hardware.txt"
+    try:
+        with open(hardware_file, "r", encoding="utf-8", errors="ignore") as source:
+            content = source.read()
+    except OSError:
+        return False
+
+    # The collector asks the device itself; "none" means physical hardware.
+    declared = re.search(r'^PLATFORM_VIRT:\s*(\S+)\s*$', content, re.MULTILINE)
+    if declared:
+        return declared.group(1).strip().lower() not in ("none", "unknown")
+
+    # Samples collected before that marker existed: the virtual switch driver
+    # registers its own sensor adapter, which no physical platform exposes.
+    return bool(re.search(
+        r'^\s*cumulus_vx\w*-', content, re.MULTILINE | re.IGNORECASE
+    ))
+
+
 def normalize_load_per_core(cpu_load, cpu_cores):
     """Return the 5-minute load average divided by logical CPU cores."""
     if (isinstance(cpu_load, bool) or
@@ -1153,20 +1182,25 @@ def calculate_device_health_grade(device_name, device_data):
     # otherwise mask a current MEMORY/CPU_LOAD error with an older value.
     missing_markers = hardware_missing_telemetry_markers(device_name)
     required_telemetry_missing = bool(missing_markers - {"sensors"})
-    
+
+    # On a virtualised switch the thermal, ASIC and PSU readings below do not
+    # exist to be collected. Grade whatever the platform does report instead of
+    # declaring the sample incomplete; physical switches are unaffected.
+    platform_is_virtual = hardware_platform_is_virtual(device_name)
+
     # CPU Temperature grade
     cpu_temp, asic_temp = parse_temperature_from_hardware_file(device_name)
     cpu_grade = grade_high_is_bad(cpu_temp, "cpu_temp_c")
     if cpu_grade:
         health_grades.append(cpu_grade)
-    else:
+    elif not platform_is_virtual:
         required_telemetry_missing = True
     
     # ASIC Temperature grade
     asic_grade = grade_high_is_bad(asic_temp, "asic_temp_c")
     if asic_grade:
         health_grades.append(asic_grade)
-    else:
+    elif not platform_is_virtual:
         required_telemetry_missing = True
     
     parsed_resources = {}
@@ -1206,7 +1240,7 @@ def calculate_device_health_grade(device_name, device_data):
     psu_grade = grade_low_is_bad(psu_efficiency, "psu_efficiency_percent")
     if psu_grade:
         health_grades.append(psu_grade)
-    else:
+    elif not platform_is_virtual:
         required_telemetry_missing = True
     
     # Fan status grade (relative to each fan's own cohort baseline)
@@ -1635,10 +1669,17 @@ def generate_hardware_html():
         device_data = device_info['data']
         health_grade = device_info['health_grade']  # Already calculated in summary
         
-        # Extract key metrics for display
+        # Extract key metrics for display. On a virtualised switch the readings
+        # a hypervisor cannot provide are shown as a dash rather than "N/A", so
+        # an absent component is not read as a failed sensor.
+        platform_is_virtual = hardware_platform_is_virtual(device_name)
+        absent_metric = (
+            '<span title="Not present on a virtualized platform">&mdash;</span>'
+            if platform_is_virtual else "N/A"
+        )
         cpu_temp, asic_temp = parse_temperature_from_hardware_file(device_name)
-        cpu_temp_str = f"{cpu_temp:.1f}°C" if cpu_temp is not None else "N/A"
-        asic_temp_str = f"{asic_temp:.1f}°C" if asic_temp is not None else "N/A"
+        cpu_temp_str = f"{cpu_temp:.1f}°C" if cpu_temp is not None else absent_metric
+        asic_temp_str = f"{asic_temp:.1f}°C" if asic_temp is not None else absent_metric
         
         # Prefer values from JSON resources; otherwise parse from raw hardware file
         memory_usage = device_data.get("resources", {}).get("memory", {}).get("usage_percent", None)
@@ -1752,7 +1793,7 @@ def generate_hardware_html():
 
         # Compute PSU IN/OUT numbers for display
         psu_in_w, psu_out_w = parse_psu_power_in_out_from_hardware_file(device_name)
-        psu_in_out_str = "N/A"
+        psu_in_out_str = absent_metric
         if psu_in_w is not None and psu_out_w is not None:
             psu_in_out_str = f"{psu_in_w:.1f}W / {psu_out_w:.1f}W"
 
@@ -1794,7 +1835,7 @@ def generate_hardware_html():
             cpu_load_str = "N/A"
         psu_efficiency_str = (
             f"{psu_efficiency:.1f}%"
-            if psu_efficiency_parsed is not None else "N/A"
+            if psu_efficiency_parsed is not None else absent_metric
         )
 
         device_details[str(device_name)] = {
