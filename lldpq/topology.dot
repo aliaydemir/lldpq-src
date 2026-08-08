@@ -421,6 +421,9 @@ graph "cl-auto-17" {
 "border-01":"swp32"  --  "border-02":"swp32"
 "border-01":"swp10"  --  "external-fw-01":"swp1"
 "border-02":"swp10"  --  "external-fw-01":"swp2"
+# The firewall also plays the WAN edge for ns-leaf-01's dual-stack "edge" VRF,
+# on a routed link rather than the border trunk.
+"external-fw-01":"swp3"  --  "ns-leaf-01":"swp11"
 "cpu-srv-01":"eth1"  --  "ns-leaf-01":"swp20"
 "cpu-srv-01":"eth2"  --  "ns-leaf-02":"swp20"
 "cpu-srv-02":"eth1"  --  "ns-leaf-01":"swp21"
