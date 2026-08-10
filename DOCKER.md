@@ -42,12 +42,12 @@ curl -O https://aliaydemir.com/lldpq-arm64.tar.gz   # ARM64  (Apple Silicon Mac,
 
 sudo docker load < lldpq-amd64.tar.gz   # or lldpq-arm64.tar.gz
 
-# Evaluation mode: publish only the web UI, and only on host loopback
+# Evaluation mode: publish the web UI on every host interface
 
 sudo docker run -d --name lldpq \
   --privileged \
   --restart unless-stopped \
-  -p 127.0.0.1:8080:80 \
+  -p 0.0.0.0:8080:80 \
   -e LLDPQ_DHCP_MODE=disabled \
   -e DHCP_AUTOSTART=false \
   lldpq:latest
@@ -59,12 +59,33 @@ sudo docker exec -it -u lldpq lldpq bash
 
 
 
-Open `http://127.0.0.1:8080` on the Docker host. For remote access, forward the
-loopback port through the Docker host's normal SSH service, then open the same
-URL locally:
+Open `http://<docker-host>:8080` from a workstation on the management network.
+
+Management networks frequently permit SSH to the host but block HTTP, so the
+page never loads even though the container is healthy. Forward the port through
+the SSH session you already have and open the UI locally instead:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 admin@docker-host
+ssh -L 8080:127.0.0.1:8080 cumulus@cumulus-sw-mgmt
+```
+
+Then browse `http://127.0.0.1:8080`. The `127.0.0.1` in that command is resolved
+on the Docker host, so the forward reaches the published port over the host's own
+loopback and needs no firewall change. Publish with `-p 127.0.0.1:8080:80`
+instead when the tunnel should be the only way in.
+
+On a Cumulus switch, direct access additionally needs the control-plane ACL to
+permit the port. An SSH tunnel does not, because its traffic arrives on the SSH
+port. Pick an unused rule ID and review the pending NVUE diff before applying:
+
+```bash
+rule=200
+web_port=8080
+nv set acl acl-default-whitelist rule "$rule" match ip tcp dest-port "$web_port"
+nv set acl acl-default-whitelist rule "$rule" action permit
+nv config diff
+# Run only if the diff contains no unrelated pending changes:
+nv config apply -y
 ```
 
 The bridge/port-mapping command above is portable across Linux and Docker
@@ -81,15 +102,41 @@ dedicated Linux provisioning mode below for that workflow. See Docker's
 > trusted-source firewall/ACL protects it. Prefer `docker exec` for shell
 > access. The web defaults are `admin/admin` and `operator/operator`; change
 > both immediately from **User Management**. Do not submit login or switch
-> credentials over plaintext HTTP on an untrusted or routed network; keep the
-> loopback/SSH-tunnel path or put LLDPq behind a TLS reverse proxy and a
-> source-restricted firewall.
+> credentials over plaintext HTTP on an untrusted or routed network. Publishing
+> on every interface as shown above reaches as far as the host's own firewall or
+> ACL allows, so restrict the port to trusted management sources, or bind the
+> publish to loopback and use the SSH tunnel, or put LLDPq behind a TLS reverse
+> proxy.
 
 The commands above run LLDPq in **non-persistent monitoring mode** for
 evaluation. Recreating that container loses configuration, SSH keys, and
 results. Use a persistent deployment below before entering real inventory or
 device credentials. DHCP/ONIE provisioning is disabled unless the explicit
 Linux host-network mode is selected.
+
+### Removing the evaluation container
+
+Because this container keeps nothing outside itself, removing it and its image
+leaves the host as it was:
+
+```bash
+sudo docker rm -f lldpq
+sudo docker rmi lldpq:latest
+```
+
+Anything created on the switch by hand still has to be undone separately, such
+as the control-plane ACL rule above:
+
+```bash
+nv unset acl acl-default-whitelist rule 200
+nv config diff
+# Run only if the diff contains no unrelated pending changes:
+nv config apply -y
+```
+
+A persistent or Compose deployment stores data in named volumes that survive
+`docker rm`, so use [Removing LLDPq completely](#removing-lldpq-completely)
+instead of the two commands above.
 
 ## Host-network monitoring with host-managed config (advanced)
 
@@ -104,6 +151,18 @@ exposes the LLDPq web service on host TCP/80 and the container SSH service on
 TCP/2033; there is no Docker port-publishing boundary, and both host ports must
 be free. This monitoring example explicitly keeps DHCP disabled—use the
 dedicated provisioning Compose file for physical-L2 DHCP/ONIE.
+
+The console bridge also binds host loopback TCP/8765, which Cumulus Linux
+already uses for its own NVUE REST API. Sharing the host network on a switch
+therefore fails at startup with `console port 127.0.0.1:8765 is already owned by
+another process`, and the restart policy turns that into a crash loop. Move the
+bridge to a free port with `CONSOLE_PTY_PORT`; the entrypoint repoints the web
+console route to match, so nothing else needs changing:
+
+```yaml
+    environment:
+      CONSOLE_PTY_PORT: "18765"
+```
 
 Set the host config directory and create the two externally managed volumes
 before the first start:
@@ -219,7 +278,7 @@ recreation and does not publish the internal SSH service:
 sudo docker run -d --name lldpq \
   --privileged \
   --restart unless-stopped \
-  -p 127.0.0.1:8080:80 \
+  -p 0.0.0.0:8080:80 \
   -e LLDPQ_DHCP_MODE=disabled \
   -e DHCP_AUTOSTART=false \
   -v lldpq-data:/home/lldpq/lldpq/monitor-results \
@@ -296,8 +355,8 @@ checkout directory and optional Compose project name for later operations.
 
 ## First-time setup
 
-Complete these steps through the loopback/SSH-tunnel path above, or through a
-TLS reverse proxy restricted to trusted management sources:
+Complete these steps over the SSH tunnel above, a source-restricted management
+network, or a TLS reverse proxy:
 
 1. Login as admin.
 2. Either upload/activate the P2P/IPAM design on **Inventory** and preview the
@@ -318,23 +377,14 @@ LLDPq needs only the switch hostnames and management IPs; SSH keys are
 generated and distributed from the web UI. Docker deployments work on common
 Linux distributions, Cumulus Linux, and Docker Desktop on macOS.
 
-On a Cumulus Docker host, keep the loopback binding and use an SSH tunnel when
-possible. If direct management-network access is required, bind the container
-port to the host's specific management IP (not every interface), choose an
-unused ACL rule ID, and permit only the trusted source prefix. The following
-example uses documentation addresses; replace all three values and review the
-entire pending NVUE diff before applying it:
+On a Cumulus Docker host, direct access needs the control-plane ACL rule shown
+in [Quick start](#quick-start). Where the management network blocks HTTP, the
+SSH tunnel from that section reaches the UI without any ACL or firewall change.
+To narrow direct access to one source prefix, add a source match to the same
+rule:
 
 ```bash
-rule=200
-trusted_cidr=192.0.2.0/24
-web_port=8080
-nv set acl acl-default-whitelist rule "$rule" match ip source-ip "$trusted_cidr"
-nv set acl acl-default-whitelist rule "$rule" match ip tcp dest-port "$web_port"
-nv set acl acl-default-whitelist rule "$rule" action permit
-nv config diff
-# Run only if the diff contains no unrelated pending changes:
-nv config apply -y
+nv set acl acl-default-whitelist rule 200 match ip source-ip 10.0.0.0/24
 ```
 
 
@@ -609,7 +659,7 @@ cat "$backup/container-options.txt"
 extra_args=(
   --privileged
   --restart unless-stopped
-  -p 127.0.0.1:8080:80
+  -p 0.0.0.0:8080:80
   -e LLDPQ_DHCP_MODE=disabled
   -e DHCP_AUTOSTART=false
 )

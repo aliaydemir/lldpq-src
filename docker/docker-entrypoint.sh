@@ -1798,6 +1798,30 @@ CONSOLE_LOG_FILE=/var/log/lldpq/console.log
 CONSOLE_RESTART_DELAY=1
 CONSOLE_READY_DELAY=0.2
 
+# Switch platforms already serve their own REST API on 8765, so a container
+# sharing the host network cannot take that port. console-pty reads this
+# variable itself; the readiness probes and the nginx route have to follow it.
+CONSOLE_PTY_PORT="${CONSOLE_PTY_PORT:-8765}"
+case "$CONSOLE_PTY_PORT" in
+    ''|*[!0-9]*)
+        echo "ERROR: CONSOLE_PTY_PORT must be a port number: '$CONSOLE_PTY_PORT'" >&2
+        exit 1
+        ;;
+esac
+if [ "$CONSOLE_PTY_PORT" -lt 1 ] || [ "$CONSOLE_PTY_PORT" -gt 65535 ]; then
+    echo "ERROR: CONSOLE_PTY_PORT is out of range: $CONSOLE_PTY_PORT" >&2
+    exit 1
+fi
+export CONSOLE_PTY_PORT
+# Keep the web route pointing at the bridge wherever it was moved to. Rewriting
+# from whatever the file currently holds keeps a restart with a new value correct.
+if ! sed -i -E \
+    "s|(proxy_pass http://127\.0\.0\.1:)[0-9]+(;)|\1${CONSOLE_PTY_PORT}\2|" \
+    /etc/nginx/sites-available/lldpq; then
+    echo "ERROR: could not point the console route at port $CONSOLE_PTY_PORT" >&2
+    exit 1
+fi
+
 _stop_console_bridge() {
     if [ -n "${console_bridge_pid:-}" ]; then
         kill "$console_bridge_pid" 2>/dev/null || true
@@ -1826,14 +1850,14 @@ _supervise_console_bridge() {
 }
 
 _console_port_ready() {
-    (exec 3<>/dev/tcp/127.0.0.1/8765) 2>/dev/null
+    (exec 3<>"/dev/tcp/127.0.0.1/$CONSOLE_PTY_PORT") 2>/dev/null
 }
 
 _console_service_ready() {
     local response status body
     response=$(curl --silent --show-error --max-time 1 \
         --write-out $'\n%{http_code}' \
-        'http://127.0.0.1:8765/' 2>/dev/null) || return 1
+        "http://127.0.0.1:${CONSOLE_PTY_PORT}/" 2>/dev/null) || return 1
     status=${response##*$'\n'}
     body=${response%$'\n'*}
     [ "$status" = "400" ] && [ "$body" = "invalid session id" ]
@@ -1857,18 +1881,20 @@ _wait_for_console_bridge() {
 # www-data. Do not report the application ready until its TCP listener exists.
 mkdir -p /var/log/lldpq 2>/dev/null && chown www-data:www-data /var/log/lldpq 2>/dev/null || true
 if _console_port_ready; then
-    echo "ERROR: console port 127.0.0.1:8765 is already owned by another process" >&2
+    echo "ERROR: console port 127.0.0.1:${CONSOLE_PTY_PORT} is already owned by another process" >&2
+    echo "       Set CONSOLE_PTY_PORT to a free port, for example:" >&2
+    echo "       docker run ... -e CONSOLE_PTY_PORT=18765 ..." >&2
     exit 1
 fi
 _supervise_console_bridge &
 CONSOLE_SUPERVISOR_PID=$!
 if ! _wait_for_console_bridge; then
-    echo "ERROR: console-pty did not become ready on 127.0.0.1:8765" >&2
+    echo "ERROR: console-pty did not become ready on 127.0.0.1:${CONSOLE_PTY_PORT}" >&2
     kill "$CONSOLE_SUPERVISOR_PID" 2>/dev/null || true
     wait "$CONSOLE_SUPERVISOR_PID" 2>/dev/null || true
     exit 1
 fi
-echo "  ✓ console-pty (127.0.0.1:8765)"
+echo "  ✓ console-pty (127.0.0.1:${CONSOLE_PTY_PORT})"
 
 # Start nginx (foreground - keeps container alive)
 echo "  ✓ nginx (port 80)"
