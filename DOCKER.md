@@ -19,9 +19,11 @@ For native Linux installation and application features, see the
 - [File transfer and shell access](#file-transfer-and-shell-access)
 - [Useful Docker commands](#useful-docker-commands)
 
+
+
 ## Quick start
 
-No installation needed. Download the pre-built Docker image and run:
+No installation needed: download the pre-built Docker image and run it.
 
 The examples use `sudo` for a typical Linux Docker Engine; omit it when the
 Docker CLI already runs as your user, as is usual with Docker Desktop.
@@ -30,6 +32,9 @@ Docker CLI already runs as your user, as is usual with Docker Desktop.
 > release-published SHA-256/signature before loading the archive, or build from
 > a reviewed source revision. A filename, HTTPS download, or the image's
 > `lldpq:latest` tag alone does not authenticate its contents.
+
+Downloading and loading the image is the same everywhere; only the run command
+differs between a Linux server and a switch.
 
 ```bash
 # Download — pick the right architecture
@@ -41,9 +46,14 @@ curl -O https://aliaydemir.com/lldpq-arm64.tar.gz   # ARM64  (Apple Silicon Mac,
 # Load image
 
 sudo docker load < lldpq-amd64.tar.gz   # or lldpq-arm64.tar.gz
+```
 
-# Evaluation mode: publish the web UI on every host interface
+### On a Linux server
 
+Bridge networking publishes the web UI on a host port of your choosing, which
+keeps the container's other services unreachable from the network:
+
+```bash
 sudo docker run -d --name lldpq \
   --privileged \
   --restart unless-stopped \
@@ -57,8 +67,6 @@ sudo docker run -d --name lldpq \
 sudo docker exec -it -u lldpq lldpq bash
 ```
 
-
-
 Open `http://<docker-host>:8080` from a workstation on the management network.
 
 Management networks frequently permit SSH to the host but block HTTP, so the
@@ -66,7 +74,7 @@ page never loads even though the container is healthy. Forward the port through
 the SSH session you already have and open the UI locally instead:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 cumulus@cumulus-sw-mgmt
+ssh -L 8080:127.0.0.1:8080 admin@docker-host-IP
 ```
 
 Then browse `http://127.0.0.1:8080`. The `127.0.0.1` in that command is resolved
@@ -74,13 +82,46 @@ on the Docker host, so the forward reaches the published port over the host's ow
 loopback and needs no firewall change. Publish with `-p 127.0.0.1:8080:80`
 instead when the tunnel should be the only way in.
 
-On a Cumulus switch, direct access additionally needs the control-plane ACL to
-permit the port. An SSH tunnel does not, because its traffic arrives on the SSH
-port. Pick an unused rule ID and review the pending NVUE diff before applying:
+### On a Cumulus switch
+
+Docker's bridge networking is not always usable on a switch. Depending on how
+the platform manages netfilter, the container starts and reports healthy while
+receiving no address and publishing no port, so `-p` leads nowhere and nothing
+answers. Share the host network instead.
+
+One port has to move first: the console bridge listens on TCP/8765, which
+Cumulus already serves its own NVUE REST API on. Without `CONSOLE_PTY_PORT` the
+entrypoint stops at `console port 127.0.0.1:8765 is already owned by another process` and the restart policy turns that into a crash loop.
+
+```bash
+sudo docker run -d --name lldpq \
+  --privileged \
+  --restart unless-stopped \
+  --network host \
+  -e CONSOLE_PTY_PORT=18765 \
+  -e LLDPQ_DHCP_MODE=disabled \
+  -e DHCP_AUTOSTART=false \
+  lldpq:latest
+```
+
+The web UI is now on the switch's own **TCP/80**, not 8080, and the container's
+SSH service takes TCP/2033; both host ports must be free. Confirm the start
+before looking for the page, because the entrypoint runs for some seconds before
+nginx is the last service to come up:
+
+```bash
+sleep 30
+sudo docker logs --tail 20 lldpq
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1/
+```
+
+Direct access then needs the control-plane ACL to permit the port; an SSH tunnel
+does not, because its traffic arrives on the SSH port. Pick an unused rule ID and
+review the pending NVUE diff before applying:
 
 ```bash
 rule=200
-web_port=8080
+web_port=80
 nv set acl acl-default-whitelist rule "$rule" match ip tcp dest-port "$web_port"
 nv set acl acl-default-whitelist rule "$rule" action permit
 nv config diff
@@ -88,19 +129,27 @@ nv config diff
 nv config apply -y
 ```
 
-The bridge/port-mapping command above is portable across Linux and Docker
-Desktop. Docker Desktop 4.34+ also offers opt-in host networking at Layer 4,
-but it still cannot provide LLDPq's physical-L2 DHCP/ONIE service. Use the
-dedicated Linux provisioning mode below for that workflow. See Docker's
+Where HTTP is blocked, tunnel to that port instead and browse
+`http://127.0.0.1:8080` as before:
+
+```bash
+ssh -L 8080:127.0.0.1:80 cumulus@cumulus-sw-mgmt
+```
+
+The bridge/port-mapping command in the first block is portable across Linux and
+Docker Desktop; the host-network variant is Linux only. Docker Desktop 4.34+
+also offers opt-in host networking at Layer 4, but it still cannot provide
+LLDPq's physical-L2 DHCP/ONIE service. Use the dedicated Linux provisioning mode
+below for that workflow. See Docker's
 [host-network driver documentation](https://docs.docker.com/engine/network/drivers/host/).
 
 > **Critical security boundary:** the image runs with `--privileged`. It also
 > starts an internal SSH service whose `lldpq` user has passwordless sudo, and
 > the current entrypoint resets that user's password to the known value
-> `lldpq` on every start. The recommended bridge command deliberately does not
-> publish TCP/2033. Do not expose port 2033 or use host networking unless a
-> trusted-source firewall/ACL protects it. Prefer `docker exec` for shell
-> access. The web defaults are `admin/admin` and `operator/operator`; change
+> `lldpq` on every start. The bridge command deliberately does not publish
+> TCP/2033, but host networking exposes it by definition: on a switch, permit
+> only the web port in the control-plane ACL and never add a rule for 2033.
+> Prefer `docker exec` for shell access. The web defaults are `admin/admin` and `operator/operator`; change
 > both immediately from **User Management**. Do not submit login or switch
 > credentials over plaintext HTTP on an untrusted or routed network. Publishing
 > on every interface as shown above reaches as far as the host's own firewall or
@@ -154,8 +203,7 @@ dedicated provisioning Compose file for physical-L2 DHCP/ONIE.
 
 The console bridge also binds host loopback TCP/8765, which Cumulus Linux
 already uses for its own NVUE REST API. Sharing the host network on a switch
-therefore fails at startup with `console port 127.0.0.1:8765 is already owned by
-another process`, and the restart policy turns that into a crash loop. Move the
+therefore fails at startup with `console port 127.0.0.1:8765 is already owned by another process`, and the restart policy turns that into a crash loop. Move the
 bridge to a free port with `CONSOLE_PTY_PORT`; the entrypoint repoints the web
 console route to match, so nothing else needs changing:
 
@@ -234,23 +282,23 @@ sudo docker logs --tail 100 lldpq
 Important boundaries of this reduced layout:
 
 - all host files are writable bind mounts; startup normalizes several
-  ownership/mode values (especially SSH keys and user/config files), which can
-  change numeric ownership or permissions on the host
+ownership/mode values (especially SSH keys and user/config files), which can
+change numeric ownership or permissions on the host
 - `devices.yaml` and topology direct mounts retain the journaled compatibility
-  path because `lldpq-provision-state` is a real volume
+path because `lldpq-provision-state` is a real volume
 - direct `/etc/lldpq.conf` and `/etc/lldpq-users.conf` mounts are legacy
-  host-managed files; atomic UI changes to runtime settings/users may be
-  refused. Use `lldpq-system-config` and `lldpq-app-config` from the recommended
-  persistent deployment when the web UI should own those files
+host-managed files; atomic UI changes to runtime settings/users may be
+refused. Use `lldpq-system-config` and `lldpq-app-config` from the recommended
+persistent deployment when the web UI should own those files
 - the mounted `lldpq.conf` must already contain valid `LLDPQ_DIR`,
-  `LLDPQ_USER`, and `WEB_ROOT` assignments; startup fails closed rather than
-  replacing an incomplete host-owned file
+`LLDPQ_USER`, and `WEB_ROOT` assignments; startup fails closed rather than
+replacing an incomplete host-owned file
 - only monitor results, AI state and Provision recovery state survive
-  recreation here. Active login sessions, LLDP results, alert deduplication,
-  job queues, collected configs/history, uploaded images and generated files
-  are not persisted
+recreation here. Active login sessions, LLDP results, alert deduplication,
+job queues, collected configs/history, uploaded images and generated files
+are not persisted
 - Compose external volumes must already exist; a missing bind source must not
-  be allowed to become a host directory accidentally
+be allowed to become a host directory accidentally
 
 Use the same `compose.yaml` and `LLDPQ_CONFIG_DIR` for every update, rollback
 and removal. `docker compose down -v` does not remove the two external volumes
@@ -360,7 +408,7 @@ network, or a TLS reverse proxy:
 
 1. Login as admin.
 2. Either upload/activate the P2P/IPAM design on **Inventory** and preview the
-   generated `devices.yaml`, or open **Assets → Edit Devices** and enter switch
+  generated `devices.yaml`, or open **Assets → Edit Devices** and enter switch
    hostnames/management IPs manually (see the
    [devices.yaml format](README.md#devicesyaml-format)).
 3. Open **Assets → SSH Setup**.
@@ -472,6 +520,8 @@ project structure.
 > ship inside the image (html CGIs + nginx site + lldpq modules are COPY'd at
 > build time), so picking them up requires an image rebuild/update — there is
 > no html bind mount to hot-patch.
+
+
 
 ### Compose deployments
 
