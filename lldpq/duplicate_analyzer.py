@@ -72,6 +72,11 @@ DEFAULT_DAD_WINDOW_SEC = 180
 MAC_OBSERVER_STATE_VERSION = 1
 MAC_OBSERVER_STATE_TTL_SEC = 7 * 86400
 LOOP_MIN_MACS = 10             # >= this many MACs flapping between the SAME endpoint pair (no dup IP) = likely L2 loop
+# Two MACs answering for one address is the ordinary two-device duplicate. From
+# three upwards a pile of devices shares one address (a factory-default left in
+# a broadcast domain, or overlapping IPAM), which is a different problem and the
+# highest-value finding on the page -- name it instead of leaving it to sorting.
+IP_CLUSTER_MIN_MACS = 3
 STALE_AGE_SEC = 7 * 86400      # a quiesced dup whose EVPN sequence has not moved for this long = aged/stale
                                # (collapsed out of the main list; still available via the "aged" toggle)
 
@@ -1287,6 +1292,39 @@ class DuplicateAnalyzer:
         distinct class and never merged into the confirmed counters."""
         return bool(rec.get("arp_observed")) and not self._is_confirmed_ip(rec)
 
+    def _is_listed_ip(self, rec):
+        """The rows the IP table shows: authoritative FRR findings plus the
+        distinct lower-confidence cross-device ARP observations."""
+        return self._is_confirmed_ip(rec) or self._is_arp_observed_ip(rec)
+
+    def _is_multi_mac_ip(self, rec):
+        """True when several distinct MACs answer for one address.
+
+        This is the field that separates a contested address from an endpoint
+        that merely moves: two devices cannot both own an address, whereas one
+        device re-registering from several places is only mobility. Gateway
+        rows repeat one SVI address across switches by design, so they are
+        counted as expected configuration rather than as a claim.
+        """
+        return (self._is_listed_ip(rec) and not self._is_router_only_ip(rec)
+                and len(rec["macs"]) >= 2)
+
+    def _is_single_mac_ip(self, rec):
+        """True when one MAC answers for the address in all evidence held.
+
+        Nothing is contesting the address; FRR latched the row on how often
+        that one endpoint moved, so it must not be read as a conflict.
+        """
+        return self._is_listed_ip(rec) and len(rec["macs"]) < 2
+
+    @staticmethod
+    def _ip_reporting_hosts(rec):
+        """Switches that reported the address (FRR duplicate rows + kernel ARP
+        observers). How widely one address is seen separates a fabric-wide
+        cluster from a local pair."""
+        return set(rec.get("authoritative_hosts") or ()) | \
+            set(rec.get("arp_hosts") or ())
+
     def _arp_responder_split(self, rec):
         """Split an IP's responder MACs into endpoints and routed interfaces.
 
@@ -1358,6 +1396,15 @@ class DuplicateAnalyzer:
         endpoint_on_svi_ips = [
             r for r in self.ip_dups.values() if self._is_endpoint_on_svi_ip(r)
         ]
+        # Triage of the listed IP rows by how many distinct MACs answer for the
+        # address. Gateway rows belong to neither: they are several switch
+        # interfaces repeating one address on purpose.
+        multi_mac_ips = [
+            r for r in self.ip_dups.values() if self._is_multi_mac_ip(r)
+        ]
+        single_mac_ips = [
+            r for r in self.ip_dups.values() if self._is_single_mac_ip(r)
+        ]
         macs = list(self.mac_dups.values())
         confirmed_macs = [r for r in macs if self._is_confirmed_mac(r)]
         dad_macs = [r for r in macs if self._is_mac_dad(r)]
@@ -1386,6 +1433,11 @@ class DuplicateAnalyzer:
             # case: an endpoint sitting on one of those addresses.
             "ip_gateway_expected": len(gateway_ips),
             "ip_endpoint_on_svi": len(endpoint_on_svi_ips),
+            # The triage an operator asks of this page first: is the address
+            # itself contested, or is a single endpoint just moving? Neither
+            # counter includes the gateway rows above.
+            "ip_multi_mac": len(multi_mac_ips),
+            "ip_single_mac": len(single_mac_ips),
             # Backwards-compatible mac_total now means confirmed simultaneous
             # conflict; mobility and DAD evidence have their own counters.
             "mac_total": mac_total,
@@ -1549,11 +1601,11 @@ class DuplicateAnalyzer:
 
         # ---- IP duplicate rows (authoritative FRR findings + the distinct
         # lower-confidence cross-device ARP observations)
-        ip_rows = sorted((r for r in self.ip_dups.values()
-                          if self._is_confirmed_ip(r) or self._is_arp_observed_ip(r)),
+        ip_rows = sorted((r for r in self.ip_dups.values() if self._is_listed_ip(r)),
                          key=lambda r: (sev_rank.get(r["severity"], 3), -(r["seq"]), -(r["events"])))
         ip_html = []
         for r in ip_rows:
+            mac_count = len(r["macs"])
             macs = "<br>".join(html.escape(m) for m in sorted(r["macs"])) or "&mdash;"
             owner_parts = []
             for p in sorted(r["ports"]):
@@ -1596,23 +1648,33 @@ class DuplicateAnalyzer:
                 # Every responder is a routed switch interface: one SVI address
                 # repeated across the switches carrying this VLAN.
                 note = ("Expected &mdash; anycast/VRR gateway address answered "
-                        "by switch interfaces on %d switches" % len(r["macs"]))
+                        "by switch interfaces on %d switches" % mac_count)
             elif self._is_arp_observed_ip(r):
                 # Cross-device ARP saw >=2 MACs for this IP, but no current FRR
                 # DAD row confirms it: report it distinctly, without claiming
                 # an authoritative finding.
-                note = "Observed &mdash; cross-device ARP (not FRR-confirmed)"
+                detail = "cross-device ARP, not FRR-confirmed"
                 if any(VIRTUAL_GW_MAC_RE.match(m) for m in r["macs"]):
-                    note += (" <span class='dim'>(virtual gateway MAC &mdash; "
-                             "likely anycast/VRR, expected on multiple switches)</span>")
-            elif len(r["macs"]) >= 2:
-                note = "Confirmed &mdash; IP conflict"
+                    detail += ("; virtual gateway MAC &mdash; likely "
+                               "anycast/VRR, expected on multiple switches")
+                note = ("Observed &mdash; duplicate address, %d distinct MACs "
+                        "claim it <span class='dim'>(%s)</span>"
+                        % (mac_count, detail))
+            elif mac_count >= 2:
+                note = ("Confirmed &mdash; duplicate address, %d distinct MACs "
+                        "claim it" % mac_count)
                 if r["severity"] != "CRITICAL":
                     note += " <span class='dim'>(quiesced)</span>"
             elif r["flagged"]:
-                note = "Confirmed &mdash; EVPN DAD"
+                # FRR flagged the address, yet a single MAC answers for it in
+                # every sample held: the trigger was how often that endpoint
+                # moved, so this is mobility and not a contested address.
+                detail = "no second claimant in the collected evidence"
                 if r["severity"] != "CRITICAL":
-                    note += " <span class='dim'>(quiesced / latched)</span>"
+                    detail += "; quiesced / latched"
+                note = ("Endpoint mobility &mdash; EVPN DAD, a single MAC "
+                        "answers for this address "
+                        "<span class='dim'>(%s)</span>" % detail)
             elif r.get("mobility"):
                 # One MAC, one owner at this instant, but a very high EVPN mobility sequence: the
                 # SAME MAC/IP is rapidly re-registering between locations (a flapping endpoint), not
@@ -1642,6 +1704,7 @@ class DuplicateAnalyzer:
                 "vni": self._vni_export(r),
                 "address": r["ip"],
                 "macs": " ".join(sorted(r["macs"])) or None,
+                "mac_count": mac_count,
                 "hosts": " ".join(sorted(canonical(h) for h in r["local_hosts"])) or None,
                 "local_ports": " ".join(sorted(
                     "%s:%s" % (canonical(p.split(":", 1)[0]), p.split(":", 1)[1])
@@ -1655,18 +1718,21 @@ class DuplicateAnalyzer:
                 "note": _export_note(note),
             })
             ip_html.append(
-                "<tr data-sev='%d' data-kind='%s' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<tr data-sev='%d' data-kind='%s' data-mac-count='%d' data-devices='%s'%s><td data-sort='%d'>%s</td><td>%s</td><td class='mono'>%s</td><td class='mono'>%s</td>"
+                "<td class='mono' data-sort='%d'>%d</td>"
                 "<td class='mono'>%s</td><td class='mono'>%s</td><td class='mono' data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td data-sort='%d'>%s</td><td>%s</td></tr>" % (
-                    sev_rank.get(r["severity"], 3), kind,
+                    sev_rank.get(r["severity"], 3), kind, mac_count,
                     html.escape(" ".join(sorted(devs))), rowcls,
                     sev_rank.get(r["severity"], 3), self._sev_badge(r["severity"]), vlanvni,
-                    html.escape(r["ip"]), macs, owner, vteps,
+                    html.escape(r["ip"]), macs,
+                    mac_count, mac_count,
+                    owner, vteps,
                     r["seq"] or 0, self._seq_cell(r["seq"], r["delta"]),
                     int(r["recency"]) if r["recency"] is not None else 2**31,
                     self._ago(r["recency"]),
                     r["events"] or 0, r["events"] or "&mdash;", note))
         if not ip_html:
-            ip_html.append(_empty_row(10, "No duplicate IPs detected"))
+            ip_html.append(_empty_row(11, "No duplicate IPs detected"))
 
         # ---- MAC duplicate rows
         # Port map from related duplicate IPs: for a duplicate MAC the "other end" is often a
@@ -1810,6 +1876,14 @@ class DuplicateAnalyzer:
         cards = [
             ("card-critical", s["ip_active"], "ACTIVE IP DUPLICATES", "active"),
             ("card-warning", s["ip_quiesced"], "QUIESCED IP DUPLICATES", "quiesced"),
+            # The triage split: only the first of these two is an address that
+            # two devices are fighting over.
+            ("card-critical" if s["ip_multi_mac"] else "card-excellent",
+             s["ip_multi_mac"], "ADDRESS CLAIMED BY 2+ MACS",
+             "multi-mac" if s["ip_multi_mac"] else ""),
+            ("card-info" if s["ip_single_mac"] else "card-excellent",
+             s["ip_single_mac"], "SINGLE MAC (MOBILITY ONLY)",
+             "single-mac" if s["ip_single_mac"] else ""),
             ("card-critical" if s["confirmed_mac_total"] else "card-excellent",
              s["confirmed_mac_total"], "CONFIRMED MAC CONFLICTS",
              "mac" if s["confirmed_mac_total"] else ""),
@@ -1835,8 +1909,7 @@ class DuplicateAnalyzer:
             for c, v, l, act in cards)
 
         stale_count = sum(1 for r in self.ip_dups.values()
-                          if (self._is_confirmed_ip(r) or self._is_arp_observed_ip(r))
-                          and r.get("stale")) + \
+                          if self._is_listed_ip(r) and r.get("stale")) + \
                       sum(1 for r in self.mac_dups.values() if r.get("stale"))
         aged_btn = ("" if not stale_count else
                     "<button id='agedBtn' class='btn btn-secondary' onclick='toggleAged()' "
@@ -1851,6 +1924,31 @@ class DuplicateAnalyzer:
                      "switches &mdash; intended configuration'>"
                      "Show expected (%d)</button>" % expected_count)
 
+        # One address answered by an unusual number of distinct MACs, and seen
+        # by many switches, is the strongest single finding on this page, yet in
+        # a few hundred flat rows it reads like any other. Name it where the
+        # APIPA section already names its totals.
+        widest = None
+        for r in self.ip_dups.values():
+            if not self._is_multi_mac_ip(r) or len(r["macs"]) < IP_CLUSTER_MIN_MACS:
+                continue
+            rank = (len(r["macs"]), len(self._ip_reporting_hosts(r)), r["ip"])
+            if widest is None or rank > widest[0]:
+                widest = (rank, r)
+        ip_headline = ""
+        if widest is not None:
+            rec = widest[1]
+            vni = self._vni_export(rec)
+            where = "vlan %s" % html.escape(rec["vlan"])
+            if vni:
+                where += " / VNI %s" % html.escape(vni)
+            ip_headline = (" &mdash; widest claim: %s (%s) answered by %d "
+                           "distinct MACs" % (
+                               html.escape(rec["ip"]), where, len(rec["macs"])))
+            reporters = len(self._ip_reporting_hosts(rec))
+            if reporters:
+                ip_headline += ", reported by %d switch(es)" % reporters
+
         html_doc = _PAGE_TEMPLATE
         # collection_status was computed up front (used for the empty-state
         # gate); the visible banner and the machine-summary div reuse it.
@@ -1860,6 +1958,8 @@ class DuplicateAnalyzer:
             ' data-confirmed-ip-active="%d"'
             ' data-ip-quiesced="%d"'
             ' data-ip-arp-observed="%d"'
+            ' data-ip-multi-mac="%d"'
+            ' data-ip-single-mac="%d"'
             ' data-confirmed-mac-total="%d"'
             ' data-mac-dad-total="%d"'
             ' data-mac-mobility-active="%d"'
@@ -1876,6 +1976,7 @@ class DuplicateAnalyzer:
             collection_status,
             s["confirmed_ip_active"], s["ip_quiesced"],
             s["ip_arp_observed"],
+            s["ip_multi_mac"], s["ip_single_mac"],
             s["confirmed_mac_total"], s["mac_dad_total"],
             s["mac_mobility_active"], s["mac_mobility_total"],
             s["coverage_expected"], s["coverage_current"],
@@ -1911,6 +2012,7 @@ class DuplicateAnalyzer:
                 ) % (s["coverage_current"], s["coverage_expected"], fail_txt)
         html_doc = html_doc.replace("__MACHINE_SUMMARY__", machine_summary)
         html_doc = html_doc.replace("__COVERAGE_BANNER__", coverage_banner)
+        html_doc = html_doc.replace("__IP_HEADLINE__", ip_headline)
         html_doc = html_doc.replace("__NOW__", html.escape(now))
         html_doc = html_doc.replace("__AGED_BTN__", aged_btn)
         html_doc = html_doc.replace("__STALE_COUNT__", str(stale_count))
@@ -1922,6 +2024,7 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__APIPA_SIGHTINGS__", "{:,}".format(s["apipa_sightings"]))
         html_doc = html_doc.replace("__DAD_NOTE__", dad_note)
         html_doc = html_doc.replace("__SEQ_WARN__", str(SEQ_WARN))
+        html_doc = html_doc.replace("__CLUSTER_MIN__", str(IP_CLUSTER_MIN_MACS))
         html_doc = html_doc.replace("__SEQ_STORM__", "{:,}".format(SEQ_STORM))
         html_doc = html_doc.replace("__LOOP_MIN__", str(LOOP_MIN_MACS))
         html_doc = html_doc.replace("__CARDS__", cards_html)
@@ -1943,6 +2046,8 @@ class DuplicateAnalyzer:
             "confirmed_ip_active": s["confirmed_ip_active"],
             "ip_quiesced": s["ip_quiesced"],
             "ip_arp_observed": s["ip_arp_observed"],
+            "ip_multi_mac": s["ip_multi_mac"],
+            "ip_single_mac": s["ip_single_mac"],
             "confirmed_mac_total": s["confirmed_mac_total"],
             "mac_dad_total": s["mac_dad_total"],
             "mac_mobility_active": s["mac_mobility_active"],
@@ -2093,10 +2198,10 @@ __COVERAGE_BANNER__
   <div class="section-content"><div class="summary-grid">__CARDS__</div></div>
 </div>
 <div class="dashboard-section">
-  <div class="section-header">Duplicate IPs (per VLAN / VNI)</div>
+  <div class="section-header">Duplicate IPs (per VLAN / VNI)__IP_HEADLINE__</div>
   <div class="section-content">
     <table class="dup-table" id="ipt" data-filterable>
-      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
+      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Distinct MACs</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
       <tbody>__IP_ROWS__</tbody>
     </table>
   </div>
@@ -2164,9 +2269,21 @@ __COVERAGE_BANNER__
       the configured <code>moves / window</code> rate; for example <code>+2</code> is below the default
       <code>5 moves / 180s</code> policy and is not a simultaneous duplicate. A stable single-owner entry
       is retained as history only when its sequence is extreme (&ge; __SEQ_STORM__).
+      <h4>Distinct MACs column (IP table)</h4>
+      How many different MACs answer for the address, which is what separates a duplicate address from a
+      moving endpoint. <b>2 or more</b> = two devices claim one address (a genuine conflict); <b>1</b> = a
+      single endpoint that FRR flagged for how often it moved, not a contested address. The column sorts
+      numerically, and the two summary cards filter the table to each side of that split; gateway rows
+      belong to neither, since a VRR/anycast address is answered by several switch interfaces by design.
+      An address answered by &ge; __CLUSTER_MIN__ MACs is named in the section header above the table &mdash;
+      that is a group of devices sharing one address (a factory default left in place, or overlapping IPAM),
+      not a pair to reconcile.
       <h4>Note column &mdash; conflict vs flapping (IP table)</h4>
-      <b>Confirmed &mdash; IP conflict</b> &mdash; 2+ distinct MACs claim the same IP (two devices), or
-      EVPN/zebra flagged it. <b>Flapping endpoint (EVPN mobility)</b> &mdash; a <i>single</i> MAC/IP whose
+      <b>Confirmed &mdash; duplicate address</b> &mdash; 2+ distinct MACs claim the same IP (two devices).
+      <b>Endpoint mobility &mdash; EVPN DAD, a single MAC</b> &mdash; EVPN/zebra flagged the address, but only
+      one MAC answers for it across every observer, the zebra log and the retained history: the move rate
+      tripped DAD, nothing is claiming the address.
+      <b>Flapping endpoint (EVPN mobility)</b> &mdash; a <i>single</i> MAC/IP whose
       mobility sequence is very high: the same endpoint is rapidly re-registering between locations (e.g. a
       BMC dual-pathed / not bonded), NOT two devices sharing an address. "active" = climbing now, "settled" =
       high but flat. A flapping endpoint often also shows an APIPA (169.254) address because the churn breaks DHCP.
@@ -2209,7 +2326,7 @@ function sortTable(tid, col, numeric) {
 ['ipt','mact','apt'].forEach(function(tid){
   var t=document.getElementById(tid); if(!t) return;
   Array.prototype.forEach.call(t.tHead.rows[0].cells, function(th, i){
-    var num = /Count|Seq|Event|Severity/i.test(th.innerText);
+    var num = /Count|Seq|Event|Severity|Distinct/i.test(th.innerText);
     th.addEventListener('click', function(){ sortTable(tid, i, num); });
   });
 });
@@ -2254,6 +2371,24 @@ function cardFilter(kind, card){
     revealAgedIfNeeded(matched);
     document.getElementById('ipt').scrollIntoView({behavior:'smooth', block:'start'});
     setFilterInfo((kind==='active'?'Active':'Quiesced')+' IP duplicates');
+  } else if(kind==='multi-mac'||kind==='single-mac'){
+    if(card) card.classList.add('active');
+    var matched=[];
+    Array.prototype.slice.call(document.querySelectorAll('#ipt tbody tr')).forEach(function(r){
+      if(r.querySelector('.empty')) return;
+      // Gateway rows repeat one address across switch interfaces by design, so
+      // they belong to neither side of this split.
+      var n=parseInt(r.getAttribute('data-mac-count'),10)||0;
+      var m=(r.getAttribute('data-kind')!=='gateway') &&
+        (kind==='multi-mac' ? n>=2 : n<2);
+      r.style.display = m ? '' : 'none';
+      if(m) matched.push(r);
+    });
+    revealAgedIfNeeded(matched);
+    document.getElementById('ipt').scrollIntoView({behavior:'smooth', block:'start'});
+    setFilterInfo(kind==='multi-mac'
+      ? 'Addresses claimed by 2+ distinct MACs'
+      : 'Addresses with a single MAC (endpoint mobility)');
   } else if(kind==='mac'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
     if(card) card.classList.add('active');
     var matched=[];
