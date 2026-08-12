@@ -1256,6 +1256,11 @@ class DuplicateAnalyzer:
                  (rec["delta"] is not None and rec["delta"] > 0)
         if active:
             return "CRITICAL"
+        # An address answered only by routed switch interfaces is an anycast/VRR
+        # gateway, not two devices colliding. Keep the row for reference but stop
+        # it from spending a warning, unless its sequence says it is really moving.
+        if self._is_router_only_ip(rec) and rec["seq"] < SEQ_WARN:
+            return "OK"
         # Settled: a confirmed conflict (2+ MACs) or an EVPN-flagged / high-seq entry that is NOT
         # moving right now is a QUIESCED duplicate -- real, but no longer flapping (e.g. storage VIP
         # pools that have rebalanced and settled). Worth listing, not an active fire.
@@ -1282,6 +1287,45 @@ class DuplicateAnalyzer:
         distinct class and never merged into the confirmed counters."""
         return bool(rec.get("arp_observed")) and not self._is_confirmed_ip(rec)
 
+    def _arp_responder_split(self, rec):
+        """Split an IP's responder MACs into endpoints and routed interfaces.
+
+        A MAC that the local bridge FDB places behind a swp/bond port belongs to
+        something plugged into the fabric. A MAC that answers for an address yet
+        sits behind no port is a switch's own routed interface.
+        """
+        endpoints = {
+            mac for mac in rec["macs"]
+            if self.fdb_local.get((rec["vlan"], mac))
+        }
+        return endpoints, set(rec["macs"]) - endpoints
+
+    def _is_router_only_ip(self, rec):
+        """True when every responder is a routed switch interface.
+
+        A VRR/anycast gateway repeats one SVI address on every switch carrying
+        the VLAN, so several switch interfaces answer for it by design. That is
+        indistinguishable from a conflict by MAC count alone, which is why these
+        rows dominated the page while describing intended configuration.
+        """
+        if rec.get("flagged") or len(rec["macs"]) < 2:
+            return False
+        endpoints, routers = self._arp_responder_split(rec)
+        return not endpoints and len(routers) >= 2
+
+    def _is_endpoint_on_svi_ip(self, rec):
+        """True when an endpoint answers for an address a switch interface owns.
+
+        One responder is behind an access port and another is behind none, so a
+        device is using a fabric SVI/gateway address. Unlike the generic
+        cross-device ARP observation this is self-evidencing, and it is the case
+        worth waking someone for.
+        """
+        if len(rec["macs"]) < 2:
+            return False
+        endpoints, routers = self._arp_responder_split(rec)
+        return bool(endpoints) and bool(routers)
+
     @staticmethod
     def _is_confirmed_mac(rec):
         return bool(rec.get("confirmed_conflict"))
@@ -1301,8 +1345,18 @@ class DuplicateAnalyzer:
         confirmed_ips = [r for r in self.ip_dups.values() if self._is_confirmed_ip(r)]
         ip_active = sum(1 for r in confirmed_ips if r.get("severity") == "CRITICAL")
         ip_quiesced = sum(1 for r in confirmed_ips if r.get("severity") == "WARNING")
+        # An anycast/VRR gateway address answered by several switch interfaces is
+        # intended configuration, so it is counted apart from real observations
+        # instead of filling the page with findings nobody can act on.
+        gateway_ips = [
+            r for r in self.ip_dups.values() if self._is_router_only_ip(r)
+        ]
         arp_observed_ips = [
-            r for r in self.ip_dups.values() if self._is_arp_observed_ip(r)
+            r for r in self.ip_dups.values()
+            if self._is_arp_observed_ip(r) and not self._is_router_only_ip(r)
+        ]
+        endpoint_on_svi_ips = [
+            r for r in self.ip_dups.values() if self._is_endpoint_on_svi_ip(r)
         ]
         macs = list(self.mac_dups.values())
         confirmed_macs = [r for r in macs if self._is_confirmed_mac(r)]
@@ -1328,6 +1382,10 @@ class DuplicateAnalyzer:
             # distinct, lower-confidence class; it never inflates ip_active/
             # ip_quiesced/ip_total.
             "ip_arp_observed": len(arp_observed_ips),
+            # Gateway addresses expected on several switches, and the opposite
+            # case: an endpoint sitting on one of those addresses.
+            "ip_gateway_expected": len(gateway_ips),
+            "ip_endpoint_on_svi": len(endpoint_on_svi_ips),
             # Backwards-compatible mac_total now means confirmed simultaneous
             # conflict; mobility and DAD evidence have their own counters.
             "mac_total": mac_total,
@@ -1520,7 +1578,26 @@ class DuplicateAnalyzer:
                     devs.add(h)
             all_devices |= devs
             kind = "arp-observed" if self._is_arp_observed_ip(r) else "confirmed"
-            if self._is_arp_observed_ip(r):
+            if self._is_router_only_ip(r):
+                # Its own class, so a gateway address never answers a filter
+                # that counts real duplicates.
+                kind = "gateway"
+            if self._is_endpoint_on_svi_ip(r):
+                # One responder is behind an access port, another behind none:
+                # a device is using an address a switch interface owns. The FDB
+                # evidence stands on its own, so do not hedge it as "observed".
+                endpoints, _routers = self._arp_responder_split(r)
+                note = ("Confirmed &mdash; an endpoint is using a fabric "
+                        "gateway/SVI address")
+                note += (" <span class='dim'>(%s behind a local port; move the "
+                         "endpoint off this address)</span>"
+                         % html.escape(", ".join(sorted(endpoints))))
+            elif self._is_router_only_ip(r):
+                # Every responder is a routed switch interface: one SVI address
+                # repeated across the switches carrying this VLAN.
+                note = ("Expected &mdash; anycast/VRR gateway address answered "
+                        "by switch interfaces on %d switches" % len(r["macs"]))
+            elif self._is_arp_observed_ip(r):
                 # Cross-device ARP saw >=2 MACs for this IP, but no current FRR
                 # DAD row confirms it: report it distinctly, without claiming
                 # an authoritative finding.

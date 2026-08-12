@@ -91,6 +91,9 @@ export LLDPQ_DIR LLDPQ_USER WEB_ROOT AI_STATE_DIR INVENTORY_KEEP
 export DIRECT_WRITE_STATE_DIR SETUP_SAFETY AI_GENERATE PARSE_DEVICES TOPOLOGY_EDGES
 export TOPOLOGY_FILE TOPOLOGY_CONFIG_FILE DEVICES_FILE INVENTORY_LOCK
 export ACTION KIND QS_VERSION QS_MODE QS_SCOPE QS_MGMT POST_DATA_FILE CONTENT_TYPE
+# Uploaded designs are checked against the VLAN profiles the fabric is built
+# from, so a host cannot be handed a switch's own gateway/SVI address.
+export ANSIBLE_DIR
 
 python3 << 'PYTHON_END'
 import base64
@@ -119,6 +122,7 @@ TOPOLOGY_FILE = os.environ.get('TOPOLOGY_FILE', '')
 TOPOLOGY_CONFIG_FILE = os.environ.get('TOPOLOGY_CONFIG_FILE', '')
 DEVICES_FILE = os.environ.get('DEVICES_FILE', '')
 INVENTORY_LOCK = os.environ.get('INVENTORY_LOCK', '')
+ANSIBLE_DIR = os.environ.get('ANSIBLE_DIR', '')
 ACTION = os.environ.get('ACTION', '')
 KIND = os.environ.get('KIND', '')
 QS_VERSION = os.environ.get('QS_VERSION', '')
@@ -424,6 +428,77 @@ def infer_kind(filename, given):
     return ''
 
 
+def fabric_owned_addresses():
+    """{address: "VLAN 7 even_ip"} for addresses the switches assign themselves.
+
+    A VRR pair takes three addresses per VLAN: the shared virtual IP plus one for
+    each switch. Handing any of them to a host puts a device on an address the
+    fabric already answers for, which only surfaces much later as a duplicate-IP
+    finding instead of as the planning mistake it is.
+    """
+    ansible_dir = (ANSIBLE_DIR or '').strip()
+    if not ansible_dir or ansible_dir.lower() == 'none':
+        return {}
+    path = os.path.join(ansible_dir, 'inventory', 'group_vars', 'all',
+                        'vlan_profiles.yaml')
+    try:
+        import yaml
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = yaml.safe_load(handle) or {}
+    except Exception:
+        return {}
+    profiles = data.get('vlan_profiles')
+    if not isinstance(profiles, dict):
+        return {}
+    owned = {}
+    for profile in profiles.values():
+        vlans = (profile or {}).get('vlans')
+        if not isinstance(vlans, dict):
+            continue
+        for vlan_id, vlan in vlans.items():
+            if not isinstance(vlan, dict):
+                continue
+            for key in ('vrr_vip', 'even_ip', 'odd_ip'):
+                raw = vlan.get(key)
+                if not raw:
+                    continue
+                addr = str(raw).split('/')[0].strip()
+                try:
+                    ipaddress.ip_address(addr)
+                except ValueError:
+                    continue
+                owned.setdefault(addr, 'VLAN %s %s' % (vlan_id, key))
+    return owned
+
+
+def warn_on_fabric_owned_addresses(design):
+    """Append a warning per host address that collides with a switch's own."""
+    if not isinstance(design, dict):
+        return
+    owned = fabric_owned_addresses()
+    if not owned:
+        return
+    collisions = []
+    for host in design.get('hosts') or []:
+        hostname = (host or {}).get('hostname') or '(unnamed)'
+        for assignment in (host or {}).get('assignments') or []:
+            addr = (assignment or {}).get('ip')
+            role = owned.get(addr)
+            if role:
+                collisions.append('%s %s (%s) is %s' % (
+                    hostname,
+                    (assignment or {}).get('role_or_interface') or 'address',
+                    addr, role))
+    if not collisions:
+        return
+    warnings = design.setdefault('warnings', [])
+    warnings.append(
+        'design assigns %d address(es) that the switches configure on '
+        'themselves; a device on one of these collides with the fabric: %s'
+        % (len(collisions), '; '.join(collisions[:10])
+           + ('; ...' if len(collisions) > 10 else '')))
+
+
 def parse_design(kind, filename, filebytes):
     suffix = os.path.splitext(filename)[1].lower()
     if suffix in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
@@ -436,7 +511,9 @@ def parse_design(kind, filename, filebytes):
                 import ai_p2p as _p
                 return _p.parse_workbook(tmp)
             import ai_ipam as _i
-            return _i.parse_workbook(tmp)
+            design = _i.parse_workbook(tmp)
+            warn_on_fabric_owned_addresses(design)
+            return design
         finally:
             if tmp:
                 try:
@@ -452,6 +529,7 @@ def parse_design(kind, filename, filebytes):
         if not (isinstance(obj, dict) and (obj.get('format') == 'ipam'
                 or 'fabric' in obj or 'hosts' in obj or 'subnets' in obj)):
             raise ValueError('IPAM JSON must be a parsed ai_ipam design')
+        warn_on_fabric_owned_addresses(obj)
         return obj
     raise ValueError('unsupported file type %r (expected .xlsx/.xlsm/.json)' % suffix)
 
