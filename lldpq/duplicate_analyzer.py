@@ -1624,7 +1624,16 @@ class DuplicateAnalyzer:
                 note = "&mdash;"
             if r.get("stale"):
                 note += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
-            rowcls = " class='stale-row'" if r.get("stale") else ""
+            # A gateway address answered by several switch interfaces is intended
+            # configuration. Collapse it the way an aged row is collapsed: this
+            # page is read to find problems, and rows announcing that nothing is
+            # wrong compete for attention with the findings under them.
+            rowclasses = []
+            if r.get("stale"):
+                rowclasses.append("stale-row")
+            if self._is_router_only_ip(r):
+                rowclasses.append("expected-row")
+            rowcls = (" class='%s'" % " ".join(rowclasses)) if rowclasses else ""
             export_rows.append({
                 "finding_type": "ip",
                 "severity": r["severity"],
@@ -1833,6 +1842,14 @@ class DuplicateAnalyzer:
                     "<button id='agedBtn' class='btn btn-secondary' onclick='toggleAged()' "
                     "title='Quiesced duplicates with no EVPN movement for &ge;%dd'>Show aged (%d)</button>"
                     % (STALE_AGE_SEC // 86400, stale_count))
+        expected_count = sum(1 for r in self.ip_dups.values()
+                             if self._is_router_only_ip(r))
+        aged_btn += ("" if not expected_count else
+                     "<button id='expectedBtn' class='btn btn-secondary' "
+                     "onclick='toggleExpected()' title='Anycast/VRR gateway "
+                     "addresses answered by switch interfaces on several "
+                     "switches &mdash; intended configuration'>"
+                     "Show expected (%d)</button>" % expected_count)
 
         html_doc = _PAGE_TEMPLATE
         # collection_status was computed up front (used for the empty-state
@@ -1897,6 +1914,7 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__NOW__", html.escape(now))
         html_doc = html_doc.replace("__AGED_BTN__", aged_btn)
         html_doc = html_doc.replace("__STALE_COUNT__", str(stale_count))
+        html_doc = html_doc.replace("__EXPECTED_COUNT__", str(expected_count))
         html_doc = html_doc.replace("__STALE_DAYS__", str(STALE_AGE_SEC // 86400))
         html_doc = html_doc.replace("__CFG__", html.escape(cfg_txt))
         html_doc = html_doc.replace("__APIPA_CRIT__", str(APIPA_CRITICAL))
@@ -1994,6 +2012,8 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
 .pdesc { display:block; color:#c8964a; font-size:10px; font-style:italic; margin-top:1px; white-space:nowrap; }
 tr.stale-row { opacity:0.55; }
 body:not(.show-aged) tr.stale-row { display:none !important; }
+tr.expected-row { opacity:0.55; }
+body:not(.show-expected) tr.expected-row { display:none !important; }
 .empty { text-align:center; color:#76b900; padding:18px; }
 .empty.empty-stale { color:#ffb74d; }
 .coverage-banner { margin:0 0 16px; padding:9px 12px; background:#35270f; color:#ffb74d; border:1px solid #6d511d; border-radius:6px; font-size:13px; }
@@ -2170,6 +2190,8 @@ __COVERAGE_BANNER__
 var DUP_DEVICES = __DEVICES__;
 var AGED_COUNT = __STALE_COUNT__;
 function toggleAged(){ var on=document.body.classList.toggle('show-aged'); var b=document.getElementById('agedBtn'); if(b){ b.textContent = on ? 'Hide aged' : ('Show aged ('+AGED_COUNT+')'); } }
+var EXPECTED_COUNT = __EXPECTED_COUNT__;
+function toggleExpected(){ var on=document.body.classList.toggle('show-expected'); var b=document.getElementById('expectedBtn'); if(b){ b.textContent = on ? 'Hide expected' : ('Show expected ('+EXPECTED_COUNT+')'); } }
 function sortKey(cell){ if(!cell) return ''; var v=cell.getAttribute('data-sort'); return v!==null ? v : (cell.innerText||'').trim(); }
 function sortTable(tid, col, numeric) {
   var t = document.getElementById(tid), tb = t.tBodies[0];
@@ -2208,8 +2230,12 @@ function showAllDup(){
 function revealAgedIfNeeded(rows){
   // A summary-card count includes aged (stale) rows, which are collapsed by
   // default; reveal them so the filtered view matches the number on the card.
-  if(document.body.classList.contains('show-aged')) return;
-  if(rows.some(function(r){ return r.classList.contains('stale-row'); })) toggleAged();
+  if(!document.body.classList.contains('show-aged')
+     && rows.some(function(r){ return r.classList.contains('stale-row'); })) toggleAged();
+  // Expected gateway rows are collapsed the same way. A search for a device
+  // that only appears in one of them must not come back empty-handed.
+  if(!document.body.classList.contains('show-expected')
+     && rows.some(function(r){ return r.classList.contains('expected-row'); })) toggleExpected();
 }
 function cardFilter(kind, card){
   document.querySelectorAll('.summary-card').forEach(function(c){ c.classList.remove('active'); });
@@ -2298,6 +2324,7 @@ function tableCSV(tid){
   Array.prototype.slice.call(t.tBodies[0].rows).forEach(function(r){
     if(r.style.display==='none' || r.querySelector('.empty')) return;
     if(r.classList.contains('stale-row') && !document.body.classList.contains('show-aged')) return;
+    if(r.classList.contains('expected-row') && !document.body.classList.contains('show-expected')) return;
     rows.push(Array.prototype.slice.call(r.cells).map(function(c){ return (c.innerText||'').trim().replace(/\\s+/g,' '); }));
   });
   return rows;

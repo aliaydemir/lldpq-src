@@ -162,6 +162,43 @@ class GatewayAddressTests(unittest.TestCase):
         self.add_arp_row("10.2.243.60", [SWITCH_A, SWITCH_B])
         self.assertIn("data-kind='gateway'", self.render())
 
+    # ---------- collapsed out of the default view ----------
+    def test_a_gateway_row_is_collapsed_like_an_aged_row(self):
+        """The page is read to find problems, not to be told nothing is wrong."""
+        self.add_arp_row("10.2.243.60", [SWITCH_A, SWITCH_B])
+        page = self.render()
+        self.assertIn("expected-row", page)
+        self.assertIn(
+            "body:not(.show-expected) tr.expected-row { display:none !important; }",
+            page)
+
+    def test_a_toggle_offers_the_collapsed_rows_with_a_count(self):
+        self.add_arp_row("10.2.243.60", [SWITCH_A, SWITCH_B])
+        self.add_arp_row("10.2.235.252", [SWITCH_A, SWITCH_B])
+        page = self.render()
+        self.assertIn("Show expected (2)", page)
+        self.assertIn("var EXPECTED_COUNT = 2;", page)
+
+    def test_no_toggle_appears_when_there_is_nothing_to_reveal(self):
+        self.add_arp_row(
+            "10.2.243.60", [SWITCH_A, ENDPOINT],
+            behind_ports={ENDPOINT: ("leaf-02", "swp8")},
+        )
+        page = self.render()
+        self.assertNotIn("id='expectedBtn'", page)
+        self.assertIn("var EXPECTED_COUNT = 0;", page)
+
+    def test_a_real_conflict_is_never_collapsed(self):
+        self.add_arp_row(
+            "10.2.243.60", [SWITCH_A, ENDPOINT],
+            behind_ports={ENDPOINT: ("leaf-02", "swp8")},
+        )
+        page = self.render()
+        row = [line for line in page.splitlines()
+               if "10.2.243.60" in line and "<tr" in line]
+        self.assertTrue(row, "conflict row not rendered")
+        self.assertNotIn("expected-row", row[0])
+
 
 if __name__ == "__main__":
     unittest.main()
