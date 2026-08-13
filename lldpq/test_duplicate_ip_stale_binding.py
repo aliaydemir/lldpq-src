@@ -250,6 +250,10 @@ class StaleBindingTests(unittest.TestCase):
         ip = "192.0.2.50"
         self.observe(OBSERVER, self.neigh_line(ip, INCUMBENT, "REACHABLE"))
         self.observe(PEER, self.neigh_line(ip, CONTENDER, "STALE"))
+        # Both are plugged into the fabric, so this is host versus host and not
+        # the gateway address that two port-less responders would describe.
+        self.analyzer.fdb_local[(VLAN, INCUMBENT)] = {OBSERVER: "swp3"}
+        self.analyzer.fdb_local[(VLAN, CONTENDER)] = {PEER: "swp4"}
         self.analyzer._merge_arp_conflicts()
 
         self.analyzer._finalize()

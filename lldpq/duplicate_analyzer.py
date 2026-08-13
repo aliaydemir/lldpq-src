@@ -1427,6 +1427,13 @@ class DuplicateAnalyzer:
         # it from spending a warning, unless its sequence says it is really moving.
         if self._is_router_only_ip(rec) and rec["seq"] < SEQ_WARN:
             return "OK"
+        # The mirror of that demotion. An endpoint answering for an address a
+        # switch interface owns is a real conflict even when only one side is
+        # still speaking -- and the quiet side is usually the endpoint, which
+        # took the address and then lost the ARP race. Without this the finding
+        # falls through to OK the moment its second MAC stops claiming.
+        if self._is_endpoint_on_svi_ip(rec):
+            return "WARNING"
         # Settled: a confirmed conflict (2+ MACs) or an EVPN-flagged / high-seq entry that is NOT
         # moving right now is a QUIESCED duplicate -- real, but no longer flapping (e.g. storage VIP
         # pools that have rebalanced and settled). Worth listing, not an active fire.
@@ -1494,17 +1501,25 @@ class DuplicateAnalyzer:
             set(rec.get("arp_hosts") or ())
 
     def _arp_responder_split(self, rec):
-        """Split an IP's current claimant MACs into endpoints and routed interfaces.
+        """Split this collection's responders into endpoints and routed interfaces.
 
         A MAC that the local bridge FDB places behind a swp/bond port belongs to
         something plugged into the fabric. A MAC that answers for an address yet
         sits behind no port is a switch's own routed interface.
+
+        Every MAC this collection binds to the address is partitioned, including
+        the ones held only in a STALE neighbour entry. What kind of thing a MAC
+        is does not depend on how recently it spoke: a VRR peer's SVI is idle by
+        nature, so its entry is STALE most of the time, and dropping it here
+        made a two-switch gateway address look like a lone responder. Liveness
+        is the claim count's question, asked separately over rec["macs"].
         """
+        responders = set(rec["macs"]) | self._stale_binding_macs(rec)
         endpoints = {
-            mac for mac in rec["macs"]
+            mac for mac in responders
             if self.fdb_local.get((rec["vlan"], mac))
         }
-        return endpoints, set(rec["macs"]) - endpoints
+        return endpoints, responders - endpoints
 
     def _is_router_only_ip(self, rec):
         """True when every responder is a routed switch interface.
@@ -1514,7 +1529,7 @@ class DuplicateAnalyzer:
         indistinguishable from a conflict by MAC count alone, which is why these
         rows dominated the page while describing intended configuration.
         """
-        if rec.get("flagged") or len(rec["macs"]) < 2:
+        if rec.get("flagged"):
             return False
         endpoints, routers = self._arp_responder_split(rec)
         return not endpoints and len(routers) >= 2
@@ -1525,10 +1540,9 @@ class DuplicateAnalyzer:
         One responder is behind an access port and another is behind none, so a
         device is using a fabric SVI/gateway address. Unlike the generic
         cross-device ARP observation this is self-evidencing, and it is the case
-        worth waking someone for.
+        worth waking someone for -- including when the squatting endpoint has
+        gone quiet, which is what a switch that lost the ARP race looks like.
         """
-        if len(rec["macs"]) < 2:
-            return False
         endpoints, routers = self._arp_responder_split(rec)
         return bool(endpoints) and bool(routers)
 
@@ -1825,16 +1839,25 @@ class DuplicateAnalyzer:
                 # a device is using an address a switch interface owns. The FDB
                 # evidence stands on its own, so do not hedge it as "observed".
                 endpoints, _routers = self._arp_responder_split(r)
+                detail = ("%s behind a local port; move the endpoint off this "
+                          "address" % html.escape(", ".join(sorted(endpoints))))
+                if endpoints & stale_bind:
+                    # Named from the wider responder set, so say plainly that
+                    # the squatter has gone quiet -- otherwise the note points
+                    # at a MAC the claim count does not mention.
+                    detail += ("; its binding is stale, so it may already have "
+                               "stopped answering")
                 note = ("Confirmed &mdash; an endpoint is using a fabric "
-                        "gateway/SVI address")
-                note += (" <span class='dim'>(%s behind a local port; move the "
-                         "endpoint off this address)</span>"
-                         % html.escape(", ".join(sorted(endpoints))))
+                        "gateway/SVI address <span class='dim'>(%s)</span>"
+                        % detail)
             elif self._is_router_only_ip(r):
                 # Every responder is a routed switch interface: one SVI address
-                # repeated across the switches carrying this VLAN.
+                # repeated across the switches carrying this VLAN. Counted over
+                # the responders, not the claimants -- an idle VRR peer's SVI is
+                # usually STALE, and it is still one of the interfaces.
+                _endpoints, routers = self._arp_responder_split(r)
                 note = ("Expected &mdash; anycast/VRR gateway address answered "
-                        "by switch interfaces on %d switches" % mac_count)
+                        "by switch interfaces on %d switches" % len(routers))
             elif self._is_arp_observed_ip(r):
                 # Cross-device ARP saw >=2 MACs for this IP, but no current FRR
                 # DAD row confirms it: report it distinctly, without claiming
