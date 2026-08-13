@@ -757,7 +757,9 @@ The complete version-1 registry is:
   `flaps_5m`, `flaps_1h`, `flaps_12h`, `flaps_24h`, `total_transitions`
 - **Optical:** `device`, `interface`, `health`, `rx_power_dbm`,
   `tx_power_dbm`, `temperature_c`, `link_margin_db`, `voltage_v`,
-  `bias_current_ma`, `rx_lanes`, `tx_lanes`, `bias_lanes`, `anomalies`
+  `bias_current_ma`, `rx_lanes`, `tx_lanes`, `bias_lanes`, `anomalies`,
+  `inactive_lanes` (channels the module exposes but does not light: no
+  optical power and no laser bias current, so they are not graded)
 - **BER:** `device`, `interface`, `neighbor_device`, `neighbor_port`, `status`,
   `sample_status`, `raw_ber`, `effective_ber`, `frame_error_density`,
   `symbol_errors`, `symbol_error_delta`, `delta_packets`, `delta_rx_errors`,

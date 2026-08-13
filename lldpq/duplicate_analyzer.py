@@ -965,6 +965,32 @@ class DuplicateAnalyzer:
         ts = self.new_state.get("%s:%s" % (kind, key), {}).get("ts")
         return (time.time() - ts) if ts else None
 
+    @staticmethod
+    def _quiet_marker(rec):
+        """The dim suffix saying how long a row has actually sat still.
+
+        A note can say a finding is flat while the row stays in the default
+        view, because "flat" means the sequence did not move between the last
+        two collections and "aged" means it has not moved for STALE_AGE_SEC.
+        Two windows, and only the second one was written down anywhere.
+
+        Aged rows already carry "(aged Nd)" and get nothing here: one marker
+        per row. The wording describes the measurement rather than the
+        endpoint, because the clock starts when the entry is first seen -- a
+        switch that rebooted this morning reports a few hours of quiet on a MAC
+        that has been settled for months.
+        """
+        qa = rec.get("quiet_age")
+        if rec.get("stale") or qa is None:
+            return ""
+        if qa < 3600:
+            span = "&lt;1h"
+        elif qa < 86400:
+            span = "%dh" % int(qa // 3600)
+        else:
+            span = "%dd" % int(qa // 86400)
+        return " <span class='dim'>(no movement observed for %s)</span>" % span
+
     def _dad_policy(self, host):
         """Return the configured DAD move threshold for one observer."""
         cfg = self.dup_config.get(host, {})
@@ -1914,6 +1940,7 @@ class DuplicateAnalyzer:
                 note = "&mdash;"
             if r.get("stale"):
                 note += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
+            note += self._quiet_marker(r)
             # A gateway address answered by several switch interfaces is intended
             # configuration. Collapse it the way an aged row is collapsed: this
             # page is read to find problems, and rows announcing that nothing is
@@ -2025,6 +2052,7 @@ class DuplicateAnalyzer:
             note_html = html.escape(note)
             if r.get("stale"):
                 note_html += " <span class='dim'>(aged %dd)</span>" % int((r.get("quiet_age") or 0) // 86400)
+            note_html += self._quiet_marker(r)
             rowcls = " class='stale-row'" if r.get("stale") else ""
             devs = set(r["local"].keys())
             for v in r["vteps"]:
@@ -2488,7 +2516,11 @@ __COVERAGE_BANNER__
       A positive MAC &#916; below policy is movement context, not proof of a duplicate.<br>
       <b>Aged</b> &mdash; a quiesced duplicate whose sequence has not moved for &ge;__STALE_DAYS__ days is
       collapsed out of the list (use <i>Show aged</i> to reveal). These persist in FRR until the address is
-      removed / re-learned or its DAD flag is cleared &mdash; the tool only mirrors that state.<br>
+      removed / re-learned or its DAD flag is cleared &mdash; the tool only mirrors that state.
+      Rows below that threshold carry <i>(no movement observed for N)</i> instead, which is why a note can
+      call a finding flat while the row stays in the default view: <i>flat</i> compares the last two
+      collections, <i>aged</i> needs __STALE_DAYS__ days of them. That clock starts when this tool first sees
+      the entry, so a short figure can mean a recent first sighting rather than recent churn.<br>
       APIPA &mdash; the headline counts <b>unique</b> DHCP-failed endpoints; the table counts sightings per
       switch+VLAN (EVPN syncs each neighbour to every VTEP, so one endpoint appears on many switches).
       CRITICAL when &ge; __APIPA_CRIT__ sightings on one switch+VLAN, else WARNING.

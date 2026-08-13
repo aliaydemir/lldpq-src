@@ -73,7 +73,7 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
     "optical": (
         "device", "interface", "health", "rx_power_dbm", "tx_power_dbm",
         "temperature_c", "link_margin_db", "voltage_v", "bias_current_ma",
-        "rx_lanes", "tx_lanes", "bias_lanes", "anomalies",
+        "rx_lanes", "tx_lanes", "bias_lanes", "anomalies", "inactive_lanes",
     ),
     "ber": (
         "device", "interface", "neighbor_device", "neighbor_port", "status",

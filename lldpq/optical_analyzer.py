@@ -44,6 +44,17 @@ SHARD_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
 INLINE_ROW_CAP = 5000
 
+# Per-port evidence the expandable rows render (raw sample, lane identities,
+# the lanes grading set aside).  It is rebuilt from every collection and no
+# shard consumer reads it, so it stays out of the persisted current snapshot.
+SIDECAR_ONLY_STAT_KEYS = frozenset({
+    "raw_data",
+    "rx_power_lane_ids",
+    "tx_power_lane_ids",
+    "bias_current_lane_ids",
+    "inactive_lanes",
+})
+
 try:
     import yaml
 except ImportError:
@@ -143,6 +154,11 @@ class OpticalAnalyzer:
     # healthy-looking average.
     DARK_POWER_DBM = -35.0
     NEGATIVE_INFINITY_FLOOR_DBM = -40.0
+    # Laser bias tells a lane that is dark because it broke apart from a lane
+    # that is dark because it was never equipped: a driven laser sits in the
+    # milliamp range, an unequipped channel reports 0.000 mA.  The floor only
+    # absorbs driver rounding, so no real bias reading can look undriven.
+    LASER_OFF_BIAS_MA = 0.1
     # Match the optical media standard reported by common ethtool/NVUE
     # variants, for example ``100G Base-DR`` and ``100GBASE-DR``.  The lane
     # suffix describes optical lanes (DR4/SR4/etc.), not the host electrical
@@ -275,10 +291,10 @@ class OpticalAnalyzer:
     def _host_bucket(self, host: str) -> Dict[str, Dict[str, Any]]:
         """This host's slice of the in-memory history/current state.
 
-        The persisted current snapshot drops raw_data: the expandable-row
-        evidence lives in the optical-details/ sidecars, and no machine
-        consumer of the shards reads it.  The in-memory current keeps it (the
-        detail sidecars are built from there).
+        The persisted current snapshot drops the sidecar-only keys: that
+        expandable-row evidence lives in the optical-details/ sidecars, and no
+        machine consumer of the shards reads it.  The in-memory current keeps
+        it (the detail sidecars are built from there).
         """
         prefix = f"{host}:"
         return {
@@ -290,7 +306,7 @@ class OpticalAnalyzer:
             "current": {
                 port: {
                     key: value for key, value in stats.items()
-                    if key != "raw_data"
+                    if key not in SIDECAR_ONLY_STAT_KEYS
                 }
                 for port, stats in self.current_optical_stats.items()
                 if port.startswith(prefix)
@@ -521,19 +537,23 @@ class OpticalAnalyzer:
         bias_readings = []
 
         number = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)'
-        power_value = rf'(?P<value>-?inf|{number})'
+        # Both halves of a power reading are captured.  The dBm field is what
+        # the report displays, but the mW field is the one that cannot be
+        # spelled ambiguously, and an unlit lane is recognised from it.
+        power_value = (rf'(?P<milliwatts>-?inf|{number})\s*mW\s*/\s*'
+                       rf'(?P<value>-?inf|{number})\s*dBm')
         rx_pattern = re.compile(
             rf'(?:ch-(?P<nvue_lane>\d+)-rx-power|'
             rf'(?:Rcvr|Receiver)\s+signal\s+(?:avg|average)\s+optical\s+power'
             rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
-            rf'\s*:\s*(?:-?inf|{number})\s*mW\s*/\s*{power_value}\s*dBm',
+            rf'\s*:\s*{power_value}',
             re.IGNORECASE,
         )
         tx_pattern = re.compile(
             rf'(?:ch-(?P<nvue_lane>\d+)-tx-power|'
             rf'(?:Transmit\s+avg\s+optical\s+power|Laser\s+output\s+power)'
             rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
-            rf'\s*:\s*(?:-?inf|{number})\s*mW\s*/\s*{power_value}\s*dBm',
+            rf'\s*:\s*{power_value}',
             re.IGNORECASE,
         )
         bias_pattern = re.compile(
@@ -549,6 +569,16 @@ class OpticalAnalyzer:
             return int(value) if value is not None else len(readings) + 1
 
         def power_from_match(match):
+            """One lane's power in dBm, with no light floored consistently.
+
+            Collectors spell an unlit lane as ``-inf dBm``, but some render a
+            finite placeholder next to ``0.0000 mW``.  Zero milliwatts is no
+            light whatever the dBm column says, so it is read first.
+            """
+            milliwatts = match.group('milliwatts').lower()
+            if milliwatts == '-inf' or (milliwatts != 'inf'
+                                        and float(milliwatts) == 0.0):
+                return self.NEGATIVE_INFINITY_FLOOR_DBM
             value = match.group('value').lower()
             if value == '-inf':
                 return self.NEGATIVE_INFINITY_FLOOR_DBM
@@ -731,6 +761,75 @@ class OpticalAnalyzer:
             if selected:
                 self._set_lane_readings(optical_params, metric, selected)
 
+    def _select_in_service_lanes(self, optical_params: Dict[str, Any]) -> None:
+        """Grade only the lanes whose laser is in service.
+
+        A pluggable answers for one diagnostic channel per cage lane, not per
+        lane the module actually lights: a QSFP-DD cage reports eight channels
+        for a module wired with four, and the spare channels read 0 mW /
+        ``-inf`` dBm, floored to -40 here.  Graded with the rest they made the
+        worst lane of a healthy 400G port -40 dBm, so the row said CRITICAL
+        and asked an operator to replace a working cable.
+
+        Zero does not mean the same thing everywhere.  A hardware sensor
+        reading 0 C was never read (no powered component is that cold), while
+        a fan tray reading all zeros has genuinely stopped; here it is the
+        bias current that settles it.  A dark lane drawing no bias current is
+        a laser that is not driven, so the lane was never in service and must
+        not be graded.  A dark lane that IS drawing bias is a lit laser whose
+        light never arrived: a real fault, and it stays CRITICAL.
+
+        When a dark lane carries no bias reading at all, the fallback is
+        narrower — it is set aside only because another lane of the same
+        module is carrying light.  Nothing is ever set aside when that would
+        leave no lane to grade, so a module that is dark everywhere is still
+        reported as such.
+        """
+        metrics = ('rx_power', 'tx_power', 'bias_current')
+        readings = {}
+        for metric in metrics:
+            lanes_key = (f'_{metric}_lanes_dbm' if metric != 'bias_current'
+                         else '_bias_current_lanes_ma')
+            readings[metric] = list(zip(
+                optical_params.get(f'_{metric}_lane_ids') or [],
+                optical_params.get(lanes_key) or [],
+            ))
+
+        power_by_lane: Dict[int, List[float]] = {}
+        for metric in ('rx_power', 'tx_power'):
+            for lane, value in readings[metric]:
+                power_by_lane.setdefault(lane, []).append(value)
+        bias_by_lane = dict(readings['bias_current'])
+
+        optical_params['_inactive_lane_ids'] = []
+        # A single-lane sample has no healthy peer to be judged against, and
+        # one lane is the whole port: it is always graded.
+        if len(set(power_by_lane) | set(bias_by_lane)) < 2:
+            return
+
+        carrying_light = {
+            lane for lane, values in power_by_lane.items()
+            if any(value > self.DARK_POWER_DBM for value in values)
+        }
+        inactive = set()
+        for lane in power_by_lane:
+            if lane in carrying_light:
+                continue
+            bias = bias_by_lane.get(lane)
+            if bias is None:
+                if carrying_light:
+                    inactive.add(lane)
+            elif bias <= self.LASER_OFF_BIAS_MA:
+                inactive.add(lane)
+        if not inactive or not set(power_by_lane) - inactive:
+            return
+
+        for metric in metrics:
+            kept = [item for item in readings[metric] if item[0] not in inactive]
+            if len(kept) != len(readings[metric]):
+                self._set_lane_readings(optical_params, metric, kept)
+        optical_params['_inactive_lane_ids'] = sorted(inactive)
+
     def calculate_link_margin(self, rx_power_dbm: float) -> float:
         """Calculate optical link margin"""
         if rx_power_dbm is None:
@@ -878,7 +977,11 @@ class OpticalAnalyzer:
             return False
 
         self._select_breakout_lane(port_name, optical_params)
-        
+        # After the interface owns its lanes, and never before: a breakout
+        # sub-interface whose own lane is dark is still that interface's
+        # verdict, not a spare channel to set aside.
+        self._select_in_service_lanes(optical_params)
+
         health = self.assess_optical_health(optical_params)
 
         # Calculate additional metrics
@@ -904,6 +1007,12 @@ class OpticalAnalyzer:
             'rx_power_lanes_dbm': optical_params.get('_rx_power_lanes_dbm', []),
             'tx_power_lanes_dbm': optical_params.get('_tx_power_lanes_dbm', []),
             'bias_current_lanes_ma': optical_params.get('_bias_current_lanes_ma', []),
+            # Lane identities travel with the values so the report labels the
+            # lane it actually assessed instead of counting array positions.
+            'rx_power_lane_ids': optical_params.get('_rx_power_lane_ids', []),
+            'tx_power_lane_ids': optical_params.get('_tx_power_lane_ids', []),
+            'bias_current_lane_ids': optical_params.get('_bias_current_lane_ids', []),
+            'inactive_lanes': optical_params.get('_inactive_lane_ids', []),
             'link_margin_db': link_margin_db,
             'last_updated': time.time(),
             'raw_data': optical_data[:500]  # Store first 500 chars for debugging
@@ -1174,6 +1283,12 @@ class OpticalAnalyzer:
                 ),
                 'bias_lanes': ' '.join(
                     str(value) for value in (stats.get('bias_current_lanes_ma') or [])
+                ),
+                # The lane columns carry graded lanes only, so the lanes that
+                # were found out of service are named rather than dropped
+                # silently from the machine-readable snapshot.
+                'inactive_lanes': ' '.join(
+                    str(lane) for lane in (stats.get('inactive_lanes') or [])
                 ),
                 'anomalies': '; '.join(
                     f"{str(item.get('severity', '')).upper()}: {item.get('message', '')}"
@@ -1502,6 +1617,10 @@ class OpticalAnalyzer:
                 'rx_lanes': stats.get('rx_power_lanes_dbm') or [],
                 'tx_lanes': stats.get('tx_power_lanes_dbm') or [],
                 'bias_lanes': stats.get('bias_current_lanes_ma') or [],
+                'rx_lane_ids': stats.get('rx_power_lane_ids') or [],
+                'tx_lane_ids': stats.get('tx_power_lane_ids') or [],
+                'bias_lane_ids': stats.get('bias_current_lane_ids') or [],
+                'inactive_lanes': stats.get('inactive_lanes') or [],
                 'rx_lane': port.get('rx_power_lane'),
                 'tx_lane': port.get('tx_power_lane'),
                 'bias_lane': port.get('bias_current_lane'),
@@ -1662,7 +1781,7 @@ class OpticalAnalyzer:
                     <tr><th>Parameter</th><th>Min Threshold</th><th>Max Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Received power on active optical lanes only (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm); media-declared inactive placeholder channels are excluded</td></tr>
+                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Received power on in-service optical lanes only (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm); media-declared placeholder channels and lanes with no light and no laser bias current are excluded</td></tr>
                     <tr><td>TX Power</td><td>{self.thresholds['tx_power_min_dbm']} dBm</td><td>{self.thresholds['tx_power_max_dbm']} dBm</td><td>Transmitted optical power range</td></tr>
                     <tr><td>Temperature</td><td>{self.thresholds['temperature_min_c']}°C</td><td>{self.thresholds['temperature_max_c']}°C</td><td>SFP/QSFP operating temperature</td></tr>
                     <tr><td>Voltage</td><td>{self.thresholds['voltage_min_v']}V</td><td>{self.thresholds['voltage_max_v']}V</td><td>Supply voltage range</td></tr>
@@ -1730,9 +1849,12 @@ class OpticalAnalyzer:
             );
         }
 
-        function laneText(values, unit) {
+        // Lane identity comes from the sample, not from the array position:
+        // the values listed here are the assessed lanes, which on a
+        // breakout interface or a partly equipped module are not lanes 1..N.
+        function laneText(values, unit, ids) {
             if (!values || !values.length) return 'N/A';
-            return values.map((v, i) => 'L' + (i + 1) + ': ' +
+            return values.map((v, i) => 'L' + ((ids && ids[i]) ?? (i + 1)) + ': ' +
                 (typeof v === 'number' ? v.toFixed(2) : esc(v)) + unit).join('  ');
         }
 
@@ -1775,14 +1897,21 @@ class OpticalAnalyzer:
             inner += '<div class="detail-lanes">';
             inner += '<div class="detail-lane-card"><div class="detail-lane-title">RX Power (worst L' +
                 esc(data.rx_lane ?? '-') + ')</div><div class="detail-lane-values">' +
-                esc(laneText(data.rx_lanes, ' dBm')) + '</div></div>';
+                esc(laneText(data.rx_lanes, ' dBm', data.rx_lane_ids)) + '</div></div>';
             inner += '<div class="detail-lane-card"><div class="detail-lane-title">TX Power (worst L' +
                 esc(data.tx_lane ?? '-') + ')</div><div class="detail-lane-values">' +
-                esc(laneText(data.tx_lanes, ' dBm')) + '</div></div>';
+                esc(laneText(data.tx_lanes, ' dBm', data.tx_lane_ids)) + '</div></div>';
             inner += '<div class="detail-lane-card"><div class="detail-lane-title">Bias Current (worst L' +
                 esc(data.bias_lane ?? '-') + ')</div><div class="detail-lane-values">' +
-                esc(laneText(data.bias_lanes, ' mA')) + '</div></div>';
+                esc(laneText(data.bias_lanes, ' mA', data.bias_lane_ids)) + '</div></div>';
             inner += '</div>';
+
+            const inactive = data.inactive_lanes || [];
+            if (inactive.length) {
+                inner += '<div class="detail-empty">Not in service, excluded from grading: ' +
+                    esc(inactive.map(l => 'L' + l).join(', ')) +
+                    ' (no light and no laser bias current).</div>';
+            }
 
             if (data.raw) {
                 inner += '<details class="detail-raw"><summary>Raw diagnostics (truncated)</summary>' +
