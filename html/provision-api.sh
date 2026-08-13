@@ -188,6 +188,18 @@ PROVISION_TRANSACTION_FILE = os.environ.get(
 DHCP_OPERATION_LOCK_FILE = os.environ.get(
     'LLDPQ_DHCP_OPERATION_LOCK_FILE', f'{WEB_ROOT}/.dhcp-operation.lock'
 )
+# The validation candidates are staged beside the live DHCP configuration (see
+# validate_dhcp_config_candidate) and /etc/dhcp is root-owned, so www-data
+# reaches them through sudo. Their names are therefore fixed: sudoers can name
+# a fixed path exactly, while a PID-derived one would need a wildcard grant.
+# install.sh lists both paths beside its other tee entries; renaming either
+# here without renaming it there breaks every save that validates DHCP.
+DHCP_VALIDATION_CONF_NAME = '.lldpq-validate.conf'
+DHCP_VALIDATION_HOSTS_NAME = '.lldpq-validate.hosts'
+DHCP_VALIDATION_LOCK_FILE = os.environ.get(
+    'LLDPQ_DHCP_VALIDATION_LOCK_FILE', f'{WEB_ROOT}/.dhcp-validate.lock'
+)
+DHCP_VALIDATION_LOCK_WAIT_SECONDS = 10
 DHCP_DESIRED_STATE_FILE = os.environ.get(
     'LLDPQ_DHCP_DESIRED_STATE_FILE',
     '/var/lib/lldpq/provision-state/dhcp-desired-state',
@@ -403,6 +415,44 @@ def run_with_dhcp_operation_lock(callback):
             'error_code': 'dhcp_busy',
             'error': 'Another DHCP operation is already in progress',
         })
+
+
+@contextmanager
+def dhcp_validation_lock():
+    """Give one request at a time the fixed-name DHCP validation candidate.
+
+    Its own lock, not the DHCP operation lock: a save already holds that one
+    while it validates, and flock would refuse the second descriptor.
+    """
+    os.makedirs(os.path.dirname(DHCP_VALIDATION_LOCK_FILE) or '.', exist_ok=True)
+    handle = open(DHCP_VALIDATION_LOCK_FILE, 'a+')
+    try:
+        try:
+            os.chmod(DHCP_VALIDATION_LOCK_FILE, 0o664)
+        except OSError:
+            pass
+        deadline = time.monotonic() + DHCP_VALIDATION_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                # Waiting is safe; validating someone else's candidate is not.
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        'Another DHCP validation is already in progress; '
+                        'retry in a moment'
+                    )
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        handle.close()
 
 
 def fsync_directory(path, strict=False):
@@ -2019,7 +2069,18 @@ def _stage_validation_file(path, content):
     result = subprocess.run(['sudo', 'tee', path], input=content,
                             capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
-        raise RuntimeError('Could not stage a DHCP candidate for validation')
+        # Almost always an installation that predates the grant for this exact
+        # path, so name the entry the operator has to restore.
+        message = (
+            f'Could not stage the DHCP validation candidate at {path}: the '
+            f'sudoers grant on this host is missing "/usr/bin/tee {path}" '
+            'in /etc/sudoers.d/www-data-provision. Re-run install.sh, or add '
+            'that one entry, and save again.'
+        )
+        detail = (result.stderr or result.stdout or '').strip().splitlines()
+        if detail:
+            message += f' (sudo said: {detail[-1].strip()[:200]})'
+        raise RuntimeError(message)
     subprocess.run(['sudo', 'chmod', '644', path],
                    capture_output=True, text=True, timeout=5)
 
@@ -2051,32 +2112,35 @@ def validate_dhcp_config_candidate(conf_content, hosts_content=None,
     conf_dir = os.path.dirname(
         os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf')
     ) or '/etc/dhcp'
-    tag = '.lldpq-validate-api.%d' % os.getpid()
-    staged_conf = os.path.join(conf_dir, tag + '.conf')
-    staged_hosts = os.path.join(conf_dir, tag + '.hosts')
-    try:
-        rendered = conf_content
-        if hosts_content is not None and live_hosts_path:
-            _stage_validation_file(staged_hosts, hosts_content)
-            include_pattern = r'include\s+"' + re.escape(live_hosts_path) + r'"\s*;'
-            rendered, count = re.subn(
-                include_pattern,
-                'include "' + staged_hosts + '";',
-                rendered,
-            )
-            if count == 0:
-                raise RuntimeError('DHCP config does not include the managed hosts file')
-        _stage_validation_file(staged_conf, rendered)
-        result = subprocess.run([dhcpd, '-t', '-cf', staged_conf],
-                                capture_output=True, text=True, timeout=20)
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or 'dhcpd validation failed').strip()
-            detail = detail.replace(staged_conf, 'dhcpd.conf (candidate)')
-            detail = detail.replace(staged_hosts, 'dhcpd.hosts (candidate)')
-            raise RuntimeError('DHCP validation failed: ' + detail[:500])
-    finally:
-        _discard_validation_file(staged_conf)
-        _discard_validation_file(staged_hosts)
+    staged_conf = os.path.join(conf_dir, DHCP_VALIDATION_CONF_NAME)
+    staged_hosts = os.path.join(conf_dir, DHCP_VALIDATION_HOSTS_NAME)
+    # Fixed names are what makes the sudoers grant narrow, so hold the lock
+    # across staging, dhcpd -t and cleanup: without it two concurrent saves
+    # would judge each other's candidate.
+    with dhcp_validation_lock():
+        try:
+            rendered = conf_content
+            if hosts_content is not None and live_hosts_path:
+                _stage_validation_file(staged_hosts, hosts_content)
+                include_pattern = r'include\s+"' + re.escape(live_hosts_path) + r'"\s*;'
+                rendered, count = re.subn(
+                    include_pattern,
+                    'include "' + staged_hosts + '";',
+                    rendered,
+                )
+                if count == 0:
+                    raise RuntimeError('DHCP config does not include the managed hosts file')
+            _stage_validation_file(staged_conf, rendered)
+            result = subprocess.run([dhcpd, '-t', '-cf', staged_conf],
+                                    capture_output=True, text=True, timeout=20)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or 'dhcpd validation failed').strip()
+                detail = detail.replace(staged_conf, 'dhcpd.conf (candidate)')
+                detail = detail.replace(staged_hosts, 'dhcpd.hosts (candidate)')
+                raise RuntimeError('DHCP validation failed: ' + detail[:500])
+        finally:
+            _discard_validation_file(staged_conf)
+            _discard_validation_file(staged_hosts)
 
 
 def validate_dhcp_hosts_candidate(hosts_content, live_hosts_path):

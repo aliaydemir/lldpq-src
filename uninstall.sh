@@ -2871,6 +2871,7 @@ for f in \
     /etc/dhcp/dhcpd.conf.lldpq-root-stage \
     /etc/dhcp/dhcpd.hosts.lldpq-root-stage \
     /etc/dhcp/dhcpd.host.lldpq-root-stage \
+    /etc/dhcp/.lldpq-validate.conf /etc/dhcp/.lldpq-validate.hosts \
     /etc/default/isc-dhcp-server.lldpq-root-stage \
     /etc/rsyslog.d/10-lldpq-dhcp.conf; do
     if [[ -e "$f" || -L "$f" ]]; then
@@ -2942,6 +2943,7 @@ verify_absent "LLDPq auth/lock/staging" \
     /etc/dhcp/dhcpd.conf.lldpq-root-stage \
     /etc/dhcp/dhcpd.hosts.lldpq-root-stage \
     /etc/dhcp/dhcpd.host.lldpq-root-stage \
+    /etc/dhcp/.lldpq-validate.conf /etc/dhcp/.lldpq-validate.hosts \
     /etc/default/isc-dhcp-server.lldpq-root-stage \
     /etc/rsyslog.d/10-lldpq-dhcp.conf || true
 verify_absent "Private LLDPq state" /var/lib/lldpq || true
@@ -3033,6 +3035,7 @@ WEB_TARGETS=(
     "$WEB_ROOT/ai-analysis.json" "$WEB_ROOT/ai-learnings.json"
     "$WEB_ROOT/ai-analysis-snapshot.json"
     "$WEB_ROOT/.inventory.lock" "$WEB_ROOT/.dhcp-operation.lock"
+    "$WEB_ROOT/.dhcp-validate.lock"
 )
 WEB_DIRS=(
     "$WEB_ROOT/css" "$WEB_ROOT/png" "$WEB_ROOT/topology"
