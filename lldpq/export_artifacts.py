@@ -64,6 +64,7 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "macs", "hosts", "local_ports", "vteps", "sequence", "delta",
         "events", "stale", "count", "note", "mac_count",
         "historical_macs", "historical_mac_count",
+        "stale_binding_macs", "stale_binding_mac_count",
     ),
     "flap": (
         "device", "interface", "status", "flaps_30s", "flaps_1m", "flaps_5m",

@@ -18,9 +18,11 @@ the shape is what the page has to make visible.
 Anycast/VRR gateway addresses are answered by several switch interfaces by
 design and belong to neither class; the tests keep them out of both counters.
 
-The count is of the claimants in the collection being rendered. Its companion
-file, test_duplicate_ip_claim_window, holds the tests that keep older evidence
-out of it.
+The count is of the claimants in the collection being rendered. Two companion
+files hold the tests that keep everything else out of it:
+test_duplicate_ip_claim_window for evidence from earlier collections, and
+test_duplicate_ip_stale_binding for bindings this collection has but no switch
+is refreshing.
 """
 
 import json

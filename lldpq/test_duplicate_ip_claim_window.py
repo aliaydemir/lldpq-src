@@ -21,7 +21,9 @@ expires per MAC.
 
 These tests fail if any of that evidence reaches the headline count, the
 summary split, the section header or the export again, and if the retained
-memory starts growing without bound a second time.
+memory starts growing without bound a second time. Which of the present
+collection's own neighbour entries count as a claim is the companion question,
+in test_duplicate_ip_stale_binding.
 """
 
 import json
@@ -95,11 +97,15 @@ class ClaimWindowTests(unittest.TestCase):
             "ports": {}, "macs": {m: seen for m in earlier}, "ts": seen,
         }
 
-    def add_neighbour(self, ip, mac_hosts, *, analyzer=None):
-        """This cycle's neighbour tables: which switches bind which MAC."""
+    def add_neighbour(self, ip, mac_hosts, *, states=None, analyzer=None):
+        """This cycle's neighbour tables: which switches bind which MAC, and in
+        which NUD state (REACHABLE unless the caller says otherwise)."""
         analyzer = analyzer or self.analyzer
+        states = states or {}
         for address, hosts in mac_hosts.items():
             analyzer.arp_pairs.setdefault((VLAN, ip), {})[address] = set(hosts)
+            analyzer.arp_states[(VLAN, ip, address)] = {
+                states.get(address, "REACHABLE")}
 
     def render(self, analyzer=None):
         analyzer = analyzer or self.analyzer

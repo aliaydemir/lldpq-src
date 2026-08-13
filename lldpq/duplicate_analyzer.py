@@ -13,14 +13,17 @@ network, grouped per VLAN/VNI. Combines several signals collected by monitor.sh
   * bridge fdb show                        -> same MAC LOCAL on >=2 switches (non-EVPN + location)
   * ip -4 neigh show                       -> APIPA (169.254/16 = DHCP failed) + IP<->multi-MAC
 
-Each duplicate-IP record keeps two MAC sets, because they answer two different
-questions. rec["macs"] holds the MACs that claim the address in the collection
-being rendered -- the FRR duplicate rows, the neighbour tables and the EVPN
-ARP cache of THIS cycle -- and is the only set the page counts. Everything else
-the address has ever been associated with inside the retained window (zebra-log
+Each duplicate-IP record keeps its MACs in separate sets, because they answer
+different questions. rec["macs"] holds the MACs that claim the address in the
+collection being rendered -- the FRR duplicate rows, the EVPN ARP cache, and the
+neighbour entries a switch is still maintaining -- and is the only set the page
+counts. A binding whose every neighbour entry is STALE goes to
+rec["stale_macs"]: the switch has stopped hearing from that endpoint, which is
+what the losing side of a duplicate address looks like. Everything else the
+address has been associated with inside the retained window (zebra-log
 contenders, MACs carried over from earlier collections) lands in
-rec["evidence_macs"], which resolves owner ports and contending VTEPs but is
-never presented as a live claim.
+rec["evidence_macs"]. Both of the latter resolve owner ports and contending
+VTEPs, and both are shown apart from the count, never as a live claim.
 
 IP severity keeps authoritative DAD rows separate from historical context. MAC
 severity additionally compares per-switch mobility samples against the configured
@@ -61,6 +64,20 @@ VIRTUAL_GW_MAC_RE = re.compile(
     re.I,
 )
 IPV4_RE = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+# Kernel neighbour (NUD) states that mean the switch is holding this binding
+# now: confirmed by traffic, being re-confirmed, statically set, or maintained
+# by the control plane (EVPN-synced entries are NOARP).
+NEIGH_LIVE_STATES = frozenset((
+    "REACHABLE", "PERMANENT", "NOARP", "DELAY", "PROBE",
+))
+# States that do not support a present claim. STALE is the important one: the
+# switch has not heard from that endpoint recently, so it may well be the party
+# that already lost the address, and counting it says two endpoints are fighting
+# over the address when only one is answering. FAILED/INCOMPLETE/NONE carry no
+# confirmed binding at all.
+NEIGH_WEAK_STATES = frozenset(("STALE", "FAILED", "INCOMPLETE", "NONE"))
+# The NUD state follows the lladdr, after any flags ("extern_learn", "router").
+_NEIGH_TAIL_RE = re.compile(r'\blladdr\s+' + MAC_RE.pattern + r'\s+(.*)$')
 SEQ_RE = re.compile(r'(\d+)\s*/\s*(\d+)\s*$')
 LOG_RE = re.compile(
     r'(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[.\d]*[+\-]\d{2}:?\d{2})'
@@ -178,6 +195,7 @@ class DuplicateAnalyzer:
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}   (kernel view: VLAN only)
         self.if_desc = {}              # (host, port) -> interface description (ifalias)
         self.arp_pairs = {}            # (vlan, ip) -> {mac -> set(hosts)}   (kernel view: VLAN only)
+        self.arp_states = {}           # (vlan, ip, mac) -> set(NUD states seen fabric-wide)
         self.mac_mob = {}              # (vni, mac) -> {seq, seq_by_host, hosts, vteps, ports, vni}
         self.ip_mob = {}               # (vni, ip)  -> {seq, macs, vteps, vni}
         self.log_events = {}           # (vni, ip) -> {'count': int, 'latest': dt, 'macs': set, 'vteps': set}
@@ -609,11 +627,13 @@ class DuplicateAnalyzer:
                 rec["vteps"].add(vtep)
 
     def _blank_ip(self, vlan, vni, ip):
-        # "macs" = claimants in the collection being rendered; "evidence_macs" =
-        # the wider retained evidence (log contenders, earlier collections) that
-        # locates ports and VTEPs but is not a live claim.
+        # "macs" = claimants in the collection being rendered; "stale_macs" =
+        # bindings this cycle holds only in a STALE neighbour entry;
+        # "evidence_macs" = the wider retained evidence (log contenders, earlier
+        # collections). The last two locate ports and VTEPs, but neither is a
+        # live claim.
         return {"vlan": vlan, "vni": str(vni), "ip": ip, "macs": set(), "seq": 0,
-                "evidence_macs": set(),
+                "evidence_macs": set(), "stale_macs": set(),
                 "flagged": False, "local_hosts": set(), "vteps": set(),
                 "authoritative_hosts": set(),
                 "authoritative_macs": set(),
@@ -791,6 +811,34 @@ class DuplicateAnalyzer:
             if vlan and mac_m:
                 mac = mac_m.group(1).lower()
                 self.arp_pairs.setdefault((vlan, ip), {}).setdefault(mac, set()).add(host)
+                states = self._neigh_states(line)
+                if states:
+                    self.arp_states.setdefault((vlan, ip, mac), set()).update(states)
+
+    @staticmethod
+    def _neigh_states(line):
+        """The NUD state word(s) on one 'ip neigh' line, ignoring flags."""
+        tail = _NEIGH_TAIL_RE.search(line)
+        if not tail:
+            return set()
+        return {
+            word for word in tail.group(1).split()
+            if word in NEIGH_LIVE_STATES or word in NEIGH_WEAK_STATES
+        }
+
+    def _neigh_binding_is_current(self, vlan, ip, mac):
+        """True when some switch holds this address at this MAC right now.
+
+        A binding whose every sighting is STALE (or unresolved) is not counted
+        as a claim: the switch stopped hearing from that endpoint, which is
+        exactly what the losing side of a duplicate address looks like. An
+        entry whose state we cannot read is trusted, so an unfamiliar output
+        format silently drops evidence in neither direction.
+        """
+        states = self.arp_states.get((vlan, ip, mac))
+        if not states:
+            return True
+        return bool(states & NEIGH_LIVE_STATES)
 
     def _merge_arp_conflicts(self):
         """Add IP duplicates seen via cross-device ARP (>=2 distinct MACs) that EVPN
@@ -806,9 +854,12 @@ class DuplicateAnalyzer:
             if rec is None:
                 rec = self._blank_ip(vlan, vni, ip)
                 self.ip_dups[(vni, ip)] = rec
+            # Switches disagreeing about one address is what makes this a finding
+            # worth listing, whatever state their entries are in. Whether each
+            # MAC counts as a live claim is a separate question, answered for
+            # every record by _fold_current_claims.
             rec["arp_observed"] = True
-            for mac, hosts in mac_hosts.items():
-                rec["macs"].add(mac)
+            for hosts in mac_hosts.values():
                 rec["arp_hosts"].update(hosts)
 
     def _fold_current_claims(self, rec):
@@ -820,26 +871,44 @@ class DuplicateAnalyzer:
         cache. Both are samples of this cycle, so a MAC found there claims the
         address now -- unlike the zebra log and the retained cross-cycle
         memory, which describe MACs that claimed it at some point earlier.
+
+        A neighbour entry that is STALE everywhere is the exception: it records
+        a binding the switch has stopped confirming, so it is kept as evidence
+        (rec["stale_macs"]) instead of being counted as a claimant.
         """
         for mac, hosts in self.arp_pairs.get((rec["vlan"], rec["ip"]), {}).items():
-            rec["macs"].add(mac)
             rec["arp_hosts"].update(hosts)
+            if self._neigh_binding_is_current(rec["vlan"], rec["ip"], mac):
+                rec["macs"].add(mac)
+            else:
+                rec["stale_macs"].add(mac)
         mob = self.ip_mob.get((rec["vni"], rec["ip"]))
         if mob:
             rec["macs"].update(mob["macs"])
 
     @staticmethod
     def _evidence_macs(rec):
-        """Claimants plus the retained lower-confidence evidence: the zebra-log
-        contenders and the MACs carried over from earlier collections. Locating
-        a device may need any of them; counting claimants must not."""
-        return set(rec["macs"]) | set(rec.get("evidence_macs") or ())
+        """Every MAC associated with the address: the claimants plus the lower-
+        confidence evidence -- stale neighbour bindings, zebra-log contenders,
+        and MACs carried over from earlier collections. Locating a device may
+        need any of them; counting claimants must not."""
+        return (set(rec["macs"]) | set(rec.get("evidence_macs") or ())
+                | set(rec.get("stale_macs") or ()))
+
+    @staticmethod
+    def _stale_binding_macs(rec):
+        """MACs this collection holds for the address only in a STALE (or
+        unresolved) neighbour entry. The switch has stopped hearing from them,
+        so they are reported apart from the live claimants rather than added
+        to them -- a stale end may already have lost the address."""
+        return set(rec.get("stale_macs") or ()) - set(rec["macs"])
 
     @classmethod
     def _historical_macs(cls, rec):
         """MACs held only as history -- seen with this address inside the
-        retained window, not claiming it in the collection being rendered."""
-        return cls._evidence_macs(rec) - set(rec["macs"])
+        retained window, not bound to it in the collection being rendered."""
+        return (cls._evidence_macs(rec) - set(rec["macs"])
+                - cls._stale_binding_macs(rec))
 
     # --------------------------------------------------------------- finalize
     def _recency(self, latest):
@@ -1279,7 +1348,10 @@ class DuplicateAnalyzer:
                         ports[h] = pt
                         rec["ports"].add("%s:%s" % (h, pt))
             rec["evidence_macs"].update(remembered)
-            for mac in rec["macs"]:
+            # Stamped alongside the claimants: a stale binding is still
+            # something this collection saw, so it should decay from here on
+            # its own clock rather than vanish the moment the entry ages out.
+            for mac in set(rec["macs"]) | set(rec["stale_macs"]):
                 remembered[mac] = now_ts
             self.new_ip_state[key] = {
                 "ports": ports, "macs": remembered, "ts": now_ts,
@@ -1394,7 +1466,8 @@ class DuplicateAnalyzer:
         device re-registering from several places is only mobility. Only the
         present collection's claimants count -- an operator reads this as "that
         many machines are fighting over the address right now", so the log
-        history and the retained cross-cycle evidence must stay out of it.
+        history, the retained cross-cycle evidence and the bindings no switch is
+        refreshing any more must all stay out of it.
         Gateway rows repeat one SVI address across switches by design, so they
         are counted as expected configuration rather than as a claim.
         """
@@ -1406,8 +1479,9 @@ class DuplicateAnalyzer:
 
         Nothing is contesting the address now; FRR latched the row on how often
         that one endpoint moved, so it must not be read as a conflict. The
-        address may still have a history of other MACs, which the row reports
-        separately rather than counting as claimants.
+        address may still have a history of other MACs, or a stale binding a
+        switch has not refreshed, both of which the row reports separately
+        rather than counting as claimants.
         """
         return self._is_listed_ip(rec) and len(rec["macs"]) < 2
 
@@ -1702,7 +1776,15 @@ class DuplicateAnalyzer:
         for r in ip_rows:
             mac_count = len(r["macs"])
             historical = self._historical_macs(r)
+            stale_bind = self._stale_binding_macs(r)
             macs = "<br>".join(html.escape(m) for m in sorted(r["macs"])) or "&mdash;"
+            if stale_bind:
+                # A switch still lists the address at this MAC, but only in a
+                # STALE entry, so it is shown as the weaker evidence it is: an
+                # endpoint the switch has stopped hearing from is as likely to
+                # have lost the address as to be fighting over it.
+                macs += ("<span class='machist'>+%d stale binding%s</span>"
+                         % (len(stale_bind), "" if len(stale_bind) == 1 else "s"))
             if historical:
                 # Named as history and kept out of the count above it: these
                 # held the address earlier in the window, and a page that adds
@@ -1761,10 +1843,21 @@ class DuplicateAnalyzer:
                 if any(VIRTUAL_GW_MAC_RE.match(m) for m in r["macs"]):
                     detail += ("; virtual gateway MAC &mdash; likely "
                                "anycast/VRR, expected on multiple switches")
-                note = ("Observed &mdash; duplicate address, %d distinct MACs "
-                        "claim it in this collection "
-                        "<span class='dim'>(%s)</span>"
-                        % (mac_count, detail))
+                if mac_count >= 2:
+                    note = ("Observed &mdash; duplicate address, %d distinct "
+                            "MACs claim it in this collection "
+                            "<span class='dim'>(%s)</span>"
+                            % (mac_count, detail))
+                else:
+                    # The switches disagree, which is why the row is here, but
+                    # the disagreement rests on a binding nobody is refreshing.
+                    # Say so instead of counting it as a second live claimant.
+                    note = ("Observed &mdash; switches disagree on this "
+                            "address: %d MAC claims it in this collection and "
+                            "%d hold%s it only in a stale entry "
+                            "<span class='dim'>(%s)</span>"
+                            % (mac_count, len(stale_bind),
+                               "s" if len(stale_bind) == 1 else "", detail))
             elif mac_count >= 2:
                 note = ("Confirmed &mdash; duplicate address, %d distinct MACs "
                         "claim it in this collection" % mac_count)
@@ -1776,6 +1869,9 @@ class DuplicateAnalyzer:
                 # this is mobility and not a contested address. Earlier
                 # claimants are named as history, never folded into the count.
                 detail = "no second claimant in this collection"
+                if stale_bind:
+                    detail += ("; %d MAC(s) hold it only in a stale entry"
+                               % len(stale_bind))
                 if historical:
                     detail += ("; %d other MAC(s) held it in the last %dh"
                                % (len(historical), IP_EVIDENCE_TTL_SEC // 3600))
@@ -1814,10 +1910,13 @@ class DuplicateAnalyzer:
                 "address": r["ip"],
                 "macs": " ".join(sorted(r["macs"])) or None,
                 "mac_count": mac_count,
-                # Same split the table shows: claimants in this collection, and
-                # separately what the retained window remembers.
+                # Same split the table shows: claimants in this collection, then
+                # the bindings no switch is refreshing, then what the retained
+                # window remembers.
                 "historical_macs": " ".join(sorted(historical)) or None,
                 "historical_mac_count": len(historical),
+                "stale_binding_macs": " ".join(sorted(stale_bind)) or None,
+                "stale_binding_mac_count": len(stale_bind),
                 "hosts": " ".join(sorted(canonical(h) for h in r["local_hosts"])) or None,
                 "local_ports": " ".join(sorted(
                     "%s:%s" % (canonical(p.split(":", 1)[0]), p.split(":", 1)[1])
@@ -2231,8 +2330,9 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
 .mono { font-family:'Consolas','Courier New',monospace; font-size:12px; }
 .dim { color:#888; font-size:11px; }
 .pdesc { display:block; color:#c8964a; font-size:10px; font-style:italic; margin-top:1px; white-space:nowrap; }
-/* Retained history under a MAC list: dim, so it reads as context rather than
-   as more claimants. .pdesc's amber is reserved for attached-device names. */
+/* Stale bindings and retained history under a MAC list: dim and on their own
+   lines, so they read as context rather than as more claimants. .pdesc's amber
+   is reserved for attached-device names. */
 .machist { display:block; color:#888; font-size:10px; font-style:italic; margin-top:3px; }
 tr.stale-row { opacity:0.55; }
 body:not(.show-aged) tr.stale-row { display:none !important; }
@@ -2393,12 +2493,18 @@ __COVERAGE_BANNER__
       duplicate address from a moving endpoint. <b>2 or more</b> = that many devices claim one address
       right now (a genuine conflict); <b>1</b> = a single endpoint that FRR flagged for how often it
       moved, not a contested address. It counts only what this cycle's samples bind to the address:
-      the FRR duplicate rows, the switches' neighbour tables and the EVPN ARP cache. FRR's duplicate
+      the FRR duplicate rows, the EVPN ARP cache, and neighbour entries a switch is actually
+      maintaining (<code>REACHABLE</code>, <code>DELAY</code>, <code>PROBE</code>,
+      <code>PERMANENT</code>, or the <code>NOARP</code> entries EVPN installs). FRR's duplicate
       list names the MAC that tripped detection on each switch rather than the incumbent it displaced,
       so the second party to a conflict is often visible only in the neighbour tables.<br>
+      A MAC whose only support is a <code>STALE</code> neighbour entry is <b>not</b> counted, and shows
+      under the MAC list as <i>+N stale binding</i>. STALE means the switch has not heard from that
+      endpoint recently, so it may well be the side that already lost the address &mdash; counting it
+      would report two endpoints fighting over an address only one of them is answering for.<br>
       MACs that held the address earlier in the retained window &mdash; zebra-log contenders and MACs
-      carried over from previous collections &mdash; are shown under the MAC list as
-      <i>+N seen earlier</i> and are deliberately excluded: they locate the devices involved, but adding
+      carried over from previous collections &mdash; are shown as <i>+N seen earlier</i> and are
+      likewise excluded: they locate the devices involved, but adding
       them in would answer "who has ever used this address" when the question is who is using it now.
       The column sorts numerically, and the two summary cards filter the table to each side of that split;
       gateway rows belong to neither, since a VRR/anycast address is answered by several switch interfaces
