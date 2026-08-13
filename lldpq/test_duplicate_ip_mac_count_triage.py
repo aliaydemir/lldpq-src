@@ -17,6 +17,10 @@ the shape is what the page has to make visible.
 
 Anycast/VRR gateway addresses are answered by several switch interfaces by
 design and belong to neither class; the tests keep them out of both counters.
+
+The count is of the claimants in the collection being rendered. Its companion
+file, test_duplicate_ip_claim_window, holds the tests that keep older evidence
+out of it.
 """
 
 import json
@@ -26,6 +30,8 @@ import unittest
 from pathlib import Path
 
 from duplicate_analyzer import DuplicateAnalyzer, IP_CLUSTER_MIN_MACS
+
+MAC_COUNT_HEADER = "Claiming MACs (now)"
 
 # A factory default left in place: one address, many devices, seen fabric-wide.
 DEFAULT_ADDRESS = "192.0.2.123"
@@ -131,11 +137,11 @@ class MacCountTriageTests(unittest.TestCase):
         return re.findall(r"<th>(.*?)</th>", head)
 
     def mac_count_cell(self, page, row):
-        column = self.ip_headers(page).index("Distinct MACs")
+        column = self.ip_headers(page).index(MAC_COUNT_HEADER)
         return re.findall(r"<td[^>]*>(.*?)</td>", row)[column]
 
     def mac_count_cells(self, page):
-        """The Distinct MACs cell of every rendered row, as written."""
+        """The claiming-MAC-count cell of every rendered row, as written."""
         return [self.mac_count_cell(page, row) for row in self.ip_rows(page)]
 
     # ---------- classification ----------
@@ -273,8 +279,9 @@ class MacCountTriageTests(unittest.TestCase):
 
         numeric = re.search(
             r"var num\s*=\s*/([^/]+)/i\.test\(th\.innerText\)", page).group(1)
-        self.assertTrue(re.search(numeric, "Distinct MACs", re.I),
-                        "the Distinct MACs header is not sorted numerically")
+        self.assertTrue(re.search(numeric, MAC_COUNT_HEADER, re.I),
+                        "the %s header is not sorted numerically"
+                        % MAC_COUNT_HEADER)
 
         cells = self.mac_count_cells(page)
         self.assertEqual(str(DEFAULT_ADDRESS_MACS),

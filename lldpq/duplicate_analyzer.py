@@ -13,6 +13,15 @@ network, grouped per VLAN/VNI. Combines several signals collected by monitor.sh
   * bridge fdb show                        -> same MAC LOCAL on >=2 switches (non-EVPN + location)
   * ip -4 neigh show                       -> APIPA (169.254/16 = DHCP failed) + IP<->multi-MAC
 
+Each duplicate-IP record keeps two MAC sets, because they answer two different
+questions. rec["macs"] holds the MACs that claim the address in the collection
+being rendered -- the FRR duplicate rows, the neighbour tables and the EVPN
+ARP cache of THIS cycle -- and is the only set the page counts. Everything else
+the address has ever been associated with inside the retained window (zebra-log
+contenders, MACs carried over from earlier collections) lands in
+rec["evidence_macs"], which resolves owner ports and contending VTEPs but is
+never presented as a live claim.
+
 IP severity keeps authoritative DAD rows separate from historical context. MAC
 severity additionally compares per-switch mobility samples against the configured
 DAD move-rate policy; a small positive delta alone is not a CRITICAL conflict.
@@ -79,6 +88,12 @@ LOOP_MIN_MACS = 10             # >= this many MACs flapping between the SAME end
 IP_CLUSTER_MIN_MACS = 3
 STALE_AGE_SEC = 7 * 86400      # a quiesced dup whose EVPN sequence has not moved for this long = aged/stale
                                # (collapsed out of the main list; still available via the "aged" toggle)
+# How long a MAC that is no longer claiming an address stays in that address's
+# retained evidence. The memory exists so a fast flapper's other end can still be
+# located when one collection catches only one side; it must expire per MAC,
+# because a rolling union that only ever grows turns a two-device conflict into
+# "every MAC this address has ever had" (one factory-default address reached 425).
+IP_EVIDENCE_TTL_SEC = 6 * 3600
 
 
 def _atomic_write(path, content):
@@ -594,7 +609,11 @@ class DuplicateAnalyzer:
                 rec["vteps"].add(vtep)
 
     def _blank_ip(self, vlan, vni, ip):
+        # "macs" = claimants in the collection being rendered; "evidence_macs" =
+        # the wider retained evidence (log contenders, earlier collections) that
+        # locates ports and VTEPs but is not a live claim.
         return {"vlan": vlan, "vni": str(vni), "ip": ip, "macs": set(), "seq": 0,
+                "evidence_macs": set(),
                 "flagged": False, "local_hosts": set(), "vteps": set(),
                 "authoritative_hosts": set(),
                 "authoritative_macs": set(),
@@ -792,6 +811,36 @@ class DuplicateAnalyzer:
                 rec["macs"].add(mac)
                 rec["arp_hosts"].update(hosts)
 
+    def _fold_current_claims(self, rec):
+        """Add every MAC this collection binds to the address to its claim set.
+
+        FRR's duplicate list names the MAC that tripped detection on each
+        switch, not the incumbent it displaced, so the second party to a
+        conflict usually appears only in the neighbour tables or the EVPN ARP
+        cache. Both are samples of this cycle, so a MAC found there claims the
+        address now -- unlike the zebra log and the retained cross-cycle
+        memory, which describe MACs that claimed it at some point earlier.
+        """
+        for mac, hosts in self.arp_pairs.get((rec["vlan"], rec["ip"]), {}).items():
+            rec["macs"].add(mac)
+            rec["arp_hosts"].update(hosts)
+        mob = self.ip_mob.get((rec["vni"], rec["ip"]))
+        if mob:
+            rec["macs"].update(mob["macs"])
+
+    @staticmethod
+    def _evidence_macs(rec):
+        """Claimants plus the retained lower-confidence evidence: the zebra-log
+        contenders and the MACs carried over from earlier collections. Locating
+        a device may need any of them; counting claimants must not."""
+        return set(rec["macs"]) | set(rec.get("evidence_macs") or ())
+
+    @classmethod
+    def _historical_macs(cls, rec):
+        """MACs held only as history -- seen with this address inside the
+        retained window, not claiming it in the collection being rendered."""
+        return cls._evidence_macs(rec) - set(rec["macs"])
+
     # --------------------------------------------------------------- finalize
     def _recency(self, latest):
         if not latest:
@@ -816,6 +865,30 @@ class DuplicateAnalyzer:
         if prev_seq is None or seq < prev_seq:   # reset/boot -> no meaningful delta
             return None
         return seq - prev_seq
+
+    @staticmethod
+    def _remembered_macs(prev, now_ts):
+        """MACs kept from earlier collections for this address, as {mac: seen}.
+
+        Entries older than the retained window are dropped here rather than
+        carried forward. Accepts the older list form, whose members share the
+        record's single timestamp.
+        """
+        stored = (prev or {}).get("macs")
+        floor = now_ts - IP_EVIDENCE_TTL_SEC
+        if isinstance(stored, dict):
+            pairs = stored.items()
+        else:
+            pairs = ((mac, (prev or {}).get("ts", 0)) for mac in (stored or []))
+        out = {}
+        for mac, seen in pairs:
+            try:
+                seen = float(seen)
+            except (TypeError, ValueError):
+                continue
+            if seen >= floor:
+                out[mac] = seen
+        return out
 
     def _quiet_age(self, kind, key):
         """Seconds since this entry's EVPN sequence last changed (moved), from persisted state.
@@ -1049,12 +1122,15 @@ class DuplicateAnalyzer:
             rec["events"] = ev["count"] if ev else 0
             rec["latest"] = ev["latest"] if ev else None
             if ev:
-                rec["macs"].update(ev["macs"])
+                # Log contenders are history: the events span the whole
+                # collected log window, so they say who claimed the address at
+                # some point, not who claims it now.
+                rec["evidence_macs"].update(ev["macs"])
                 rec["vteps"].update(ev["vteps"])
             rec["recency"] = self._recency(rec["latest"])
             rec["delta"] = self._seq_delta("ip", "%s|%s" % (rec["vni"], ip), rec["seq"])
             # owner port from FDB local for any of its MACs
-            for mac in rec["macs"]:
+            for mac in self._evidence_macs(rec):
                 for h, port in self.fdb_local.get((rec["vlan"], mac), {}).items():
                     rec["local_hosts"].add(h)
                     rec["ports"].add("%s:%s" % (h, port))
@@ -1133,19 +1209,24 @@ class DuplicateAnalyzer:
             ip = rec["ip"]
             evm = self.log_events.get((rec["vni"], ip)) or self.log_events.get((rec["vlan"], ip))
             if evm:
-                # The zebra log carries the OTHER contender MAC(s) for this IP. Merge them so a
+                # The zebra log carries the OTHER contender MAC(s) for this IP. Retain them so a
                 # mobility/arp-detected IP dup (which only knows the currently-winning MAC) still
-                # links to the conflicting device -> its port resolves below.
-                rec["macs"].update(evm["macs"])
+                # links to the conflicting device -> its port resolves below. They stay out of the
+                # claim set: the log window is hours deep, and on a churning address it names far
+                # more MACs than are answering for it at any one moment.
+                rec["evidence_macs"].update(evm["macs"])
                 rec["vteps"].update(evm["vteps"])
                 if not rec["events"]:
                     rec["events"] = evm["count"]
                 if rec["latest"] is None:
                     rec["latest"] = evm["latest"]
                     rec["recency"] = self._recency(evm["latest"])
+            # Every record exists by now (mobility can create one above), so this is where the
+            # rest of the current collection's binding evidence joins the claim set.
+            self._fold_current_claims(rec)
             # Resolve owner ports from FDB for ALL macs now assembled. Mobility/log-detected IP dups
             # are added AFTER the early port pass, so without this they carry no port at all.
-            for mac in rec["macs"]:
+            for mac in self._evidence_macs(rec):
                 for h, port in self.fdb_local.get((rec["vlan"], mac), {}).items():
                     rec["local_hosts"].add(h)
                     rec["ports"].add("%s:%s" % (h, port))
@@ -1187,14 +1268,22 @@ class DuplicateAnalyzer:
                     h, pt = p.split(":", 1)
                     ports[h] = pt
             prev = self.prev_ip_state.get(key, {})
-            if prev.get("ts", 0) >= now_ts - 21600:   # remember for up to 6h
+            # Each remembered MAC carries its own last-seen stamp and expires on
+            # its own. Re-saving the merged set under one stamp instead made the
+            # entry immortal: every cycle rewrote the whole union and reset the
+            # clock, so an address accumulated every MAC it had ever seen.
+            remembered = self._remembered_macs(prev, now_ts)
+            if prev.get("ts", 0) >= now_ts - IP_EVIDENCE_TTL_SEC:
                 for h, pt in (prev.get("ports") or {}).items():
                     if h not in ports:
                         ports[h] = pt
                         rec["ports"].add("%s:%s" % (h, pt))
-                for m in (prev.get("macs") or []):
-                    rec["macs"].add(m)
-            self.new_ip_state[key] = {"ports": ports, "macs": sorted(rec["macs"]), "ts": now_ts}
+            rec["evidence_macs"].update(remembered)
+            for mac in rec["macs"]:
+                remembered[mac] = now_ts
+            self.new_ip_state[key] = {
+                "ports": ports, "macs": remembered, "ts": now_ts,
+            }
             rec["severity"] = self._ip_sev(rec)
 
         # Cross-link only current authoritative IP evidence.  Mobility/log/history
@@ -1298,22 +1387,27 @@ class DuplicateAnalyzer:
         return self._is_confirmed_ip(rec) or self._is_arp_observed_ip(rec)
 
     def _is_multi_mac_ip(self, rec):
-        """True when several distinct MACs answer for one address.
+        """True when several distinct MACs claim one address in this collection.
 
         This is the field that separates a contested address from an endpoint
         that merely moves: two devices cannot both own an address, whereas one
-        device re-registering from several places is only mobility. Gateway
-        rows repeat one SVI address across switches by design, so they are
-        counted as expected configuration rather than as a claim.
+        device re-registering from several places is only mobility. Only the
+        present collection's claimants count -- an operator reads this as "that
+        many machines are fighting over the address right now", so the log
+        history and the retained cross-cycle evidence must stay out of it.
+        Gateway rows repeat one SVI address across switches by design, so they
+        are counted as expected configuration rather than as a claim.
         """
         return (self._is_listed_ip(rec) and not self._is_router_only_ip(rec)
                 and len(rec["macs"]) >= 2)
 
     def _is_single_mac_ip(self, rec):
-        """True when one MAC answers for the address in all evidence held.
+        """True when one MAC claims the address in the present collection.
 
-        Nothing is contesting the address; FRR latched the row on how often
-        that one endpoint moved, so it must not be read as a conflict.
+        Nothing is contesting the address now; FRR latched the row on how often
+        that one endpoint moved, so it must not be read as a conflict. The
+        address may still have a history of other MACs, which the row reports
+        separately rather than counting as claimants.
         """
         return self._is_listed_ip(rec) and len(rec["macs"]) < 2
 
@@ -1326,7 +1420,7 @@ class DuplicateAnalyzer:
             set(rec.get("arp_hosts") or ())
 
     def _arp_responder_split(self, rec):
-        """Split an IP's responder MACs into endpoints and routed interfaces.
+        """Split an IP's current claimant MACs into endpoints and routed interfaces.
 
         A MAC that the local bridge FDB places behind a swp/bond port belongs to
         something plugged into the fabric. A MAC that answers for an address yet
@@ -1396,9 +1490,9 @@ class DuplicateAnalyzer:
         endpoint_on_svi_ips = [
             r for r in self.ip_dups.values() if self._is_endpoint_on_svi_ip(r)
         ]
-        # Triage of the listed IP rows by how many distinct MACs answer for the
-        # address. Gateway rows belong to neither: they are several switch
-        # interfaces repeating one address on purpose.
+        # Triage of the listed IP rows by how many distinct MACs claim the
+        # address in this collection. Gateway rows belong to neither: they are
+        # several switch interfaces repeating one address on purpose.
         multi_mac_ips = [
             r for r in self.ip_dups.values() if self._is_multi_mac_ip(r)
         ]
@@ -1434,8 +1528,9 @@ class DuplicateAnalyzer:
             "ip_gateway_expected": len(gateway_ips),
             "ip_endpoint_on_svi": len(endpoint_on_svi_ips),
             # The triage an operator asks of this page first: is the address
-            # itself contested, or is a single endpoint just moving? Neither
-            # counter includes the gateway rows above.
+            # itself contested right now, or is a single endpoint just moving?
+            # Both count only claimants in the present collection, and neither
+            # includes the gateway rows above.
             "ip_multi_mac": len(multi_mac_ips),
             "ip_single_mac": len(single_mac_ips),
             # Backwards-compatible mac_total now means confirmed simultaneous
@@ -1606,7 +1701,16 @@ class DuplicateAnalyzer:
         ip_html = []
         for r in ip_rows:
             mac_count = len(r["macs"])
+            historical = self._historical_macs(r)
             macs = "<br>".join(html.escape(m) for m in sorted(r["macs"])) or "&mdash;"
+            if historical:
+                # Named as history and kept out of the count above it: these
+                # held the address earlier in the window, and a page that adds
+                # them together answers "who has ever used this address" when
+                # the operator asked "who is using it now".
+                macs += ("<span class='machist'>+%d seen earlier (last %dh)"
+                         "</span>"
+                         % (len(historical), IP_EVIDENCE_TTL_SEC // 3600))
             owner_parts = []
             for p in sorted(r["ports"]):
                 if ":" in p:
@@ -1617,7 +1721,7 @@ class DuplicateAnalyzer:
             owner = "<br>".join(owner_parts) or \
                     ("<br>".join(html.escape(h) for h in sorted(r["local_hosts"])) or "&mdash;")
             ip_ports = {}
-            for _m in r["macs"]:
+            for _m in self._evidence_macs(r):
                 for _h, _p in self.fdb_local.get((r["vlan"], _m), {}).items():
                     ip_ports[_h] = _p
             vteps = self._vtep_cell(r["vteps"], r["local_hosts"], ip_ports)
@@ -1658,18 +1762,23 @@ class DuplicateAnalyzer:
                     detail += ("; virtual gateway MAC &mdash; likely "
                                "anycast/VRR, expected on multiple switches")
                 note = ("Observed &mdash; duplicate address, %d distinct MACs "
-                        "claim it <span class='dim'>(%s)</span>"
+                        "claim it in this collection "
+                        "<span class='dim'>(%s)</span>"
                         % (mac_count, detail))
             elif mac_count >= 2:
                 note = ("Confirmed &mdash; duplicate address, %d distinct MACs "
-                        "claim it" % mac_count)
+                        "claim it in this collection" % mac_count)
                 if r["severity"] != "CRITICAL":
                     note += " <span class='dim'>(quiesced)</span>"
             elif r["flagged"]:
-                # FRR flagged the address, yet a single MAC answers for it in
-                # every sample held: the trigger was how often that endpoint
-                # moved, so this is mobility and not a contested address.
-                detail = "no second claimant in the collected evidence"
+                # FRR flagged the address, yet a single MAC claims it in this
+                # collection: the trigger was how often that endpoint moved, so
+                # this is mobility and not a contested address. Earlier
+                # claimants are named as history, never folded into the count.
+                detail = "no second claimant in this collection"
+                if historical:
+                    detail += ("; %d other MAC(s) held it in the last %dh"
+                               % (len(historical), IP_EVIDENCE_TTL_SEC // 3600))
                 if r["severity"] != "CRITICAL":
                     detail += "; quiesced / latched"
                 note = ("Endpoint mobility &mdash; EVPN DAD, a single MAC "
@@ -1705,6 +1814,10 @@ class DuplicateAnalyzer:
                 "address": r["ip"],
                 "macs": " ".join(sorted(r["macs"])) or None,
                 "mac_count": mac_count,
+                # Same split the table shows: claimants in this collection, and
+                # separately what the retained window remembers.
+                "historical_macs": " ".join(sorted(historical)) or None,
+                "historical_mac_count": len(historical),
                 "hosts": " ".join(sorted(canonical(h) for h in r["local_hosts"])) or None,
                 "local_ports": " ".join(sorted(
                     "%s:%s" % (canonical(p.split(":", 1)[0]), p.split(":", 1)[1])
@@ -1877,12 +1990,13 @@ class DuplicateAnalyzer:
             ("card-critical", s["ip_active"], "ACTIVE IP DUPLICATES", "active"),
             ("card-warning", s["ip_quiesced"], "QUIESCED IP DUPLICATES", "quiesced"),
             # The triage split: only the first of these two is an address that
-            # two devices are fighting over.
+            # two devices are fighting over, and both are counted from this
+            # collection's claimants so the number means "right now".
             ("card-critical" if s["ip_multi_mac"] else "card-excellent",
-             s["ip_multi_mac"], "ADDRESS CLAIMED BY 2+ MACS",
+             s["ip_multi_mac"], "CLAIMED NOW BY 2+ MACS",
              "multi-mac" if s["ip_multi_mac"] else ""),
             ("card-info" if s["ip_single_mac"] else "card-excellent",
-             s["ip_single_mac"], "SINGLE MAC (MOBILITY ONLY)",
+             s["ip_single_mac"], "SINGLE CLAIMANT (MOBILITY)",
              "single-mac" if s["ip_single_mac"] else ""),
             ("card-critical" if s["confirmed_mac_total"] else "card-excellent",
              s["confirmed_mac_total"], "CONFIRMED MAC CONFLICTS",
@@ -1924,10 +2038,12 @@ class DuplicateAnalyzer:
                      "switches &mdash; intended configuration'>"
                      "Show expected (%d)</button>" % expected_count)
 
-        # One address answered by an unusual number of distinct MACs, and seen
+        # One address claimed by an unusual number of distinct MACs, and seen
         # by many switches, is the strongest single finding on this page, yet in
         # a few hundred flat rows it reads like any other. Name it where the
-        # APIPA section already names its totals.
+        # APIPA section already names its totals. Ranked on this collection's
+        # claimants only: ranking on retained evidence promoted whichever
+        # address had simply been in the list longest.
         widest = None
         for r in self.ip_dups.values():
             if not self._is_multi_mac_ip(r) or len(r["macs"]) < IP_CLUSTER_MIN_MACS:
@@ -1942,8 +2058,8 @@ class DuplicateAnalyzer:
             where = "vlan %s" % html.escape(rec["vlan"])
             if vni:
                 where += " / VNI %s" % html.escape(vni)
-            ip_headline = (" &mdash; widest claim: %s (%s) answered by %d "
-                           "distinct MACs" % (
+            ip_headline = (" &mdash; widest claim: %s (%s) claimed in this "
+                           "collection by %d distinct MACs" % (
                                html.escape(rec["ip"]), where, len(rec["macs"])))
             reporters = len(self._ip_reporting_hosts(rec))
             if reporters:
@@ -2115,6 +2231,9 @@ table.dup-table { width:100%; border-collapse:collapse; font-size:13px; }
 .mono { font-family:'Consolas','Courier New',monospace; font-size:12px; }
 .dim { color:#888; font-size:11px; }
 .pdesc { display:block; color:#c8964a; font-size:10px; font-style:italic; margin-top:1px; white-space:nowrap; }
+/* Retained history under a MAC list: dim, so it reads as context rather than
+   as more claimants. .pdesc's amber is reserved for attached-device names. */
+.machist { display:block; color:#888; font-size:10px; font-style:italic; margin-top:3px; }
 tr.stale-row { opacity:0.55; }
 body:not(.show-aged) tr.stale-row { display:none !important; }
 tr.expected-row { opacity:0.55; }
@@ -2201,7 +2320,7 @@ __COVERAGE_BANNER__
   <div class="section-header">Duplicate IPs (per VLAN / VNI)__IP_HEADLINE__</div>
   <div class="section-content">
     <table class="dup-table" id="ipt" data-filterable>
-      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Distinct MACs</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
+      <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>IP</th><th>MAC(s)</th><th>Claiming MACs (now)</th><th>Owner (local)</th><th>Conflict VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Last Dup Event</th><th>Events</th><th>Note</th></tr></thead>
       <tbody>__IP_ROWS__</tbody>
     </table>
   </div>
@@ -2269,20 +2388,29 @@ __COVERAGE_BANNER__
       the configured <code>moves / window</code> rate; for example <code>+2</code> is below the default
       <code>5 moves / 180s</code> policy and is not a simultaneous duplicate. A stable single-owner entry
       is retained as history only when its sequence is extreme (&ge; __SEQ_STORM__).
-      <h4>Distinct MACs column (IP table)</h4>
-      How many different MACs answer for the address, which is what separates a duplicate address from a
-      moving endpoint. <b>2 or more</b> = two devices claim one address (a genuine conflict); <b>1</b> = a
-      single endpoint that FRR flagged for how often it moved, not a contested address. The column sorts
-      numerically, and the two summary cards filter the table to each side of that split; gateway rows
-      belong to neither, since a VRR/anycast address is answered by several switch interfaces by design.
-      An address answered by &ge; __CLUSTER_MIN__ MACs is named in the section header above the table &mdash;
-      that is a group of devices sharing one address (a factory default left in place, or overlapping IPAM),
-      not a pair to reconcile.
+      <h4>Claiming MACs (now) column (IP table)</h4>
+      How many different MACs claim the address <b>in this collection</b>, which is what separates a
+      duplicate address from a moving endpoint. <b>2 or more</b> = that many devices claim one address
+      right now (a genuine conflict); <b>1</b> = a single endpoint that FRR flagged for how often it
+      moved, not a contested address. It counts only what this cycle's samples bind to the address:
+      the FRR duplicate rows, the switches' neighbour tables and the EVPN ARP cache. FRR's duplicate
+      list names the MAC that tripped detection on each switch rather than the incumbent it displaced,
+      so the second party to a conflict is often visible only in the neighbour tables.<br>
+      MACs that held the address earlier in the retained window &mdash; zebra-log contenders and MACs
+      carried over from previous collections &mdash; are shown under the MAC list as
+      <i>+N seen earlier</i> and are deliberately excluded: they locate the devices involved, but adding
+      them in would answer "who has ever used this address" when the question is who is using it now.
+      The column sorts numerically, and the two summary cards filter the table to each side of that split;
+      gateway rows belong to neither, since a VRR/anycast address is answered by several switch interfaces
+      by design. An address claimed by &ge; __CLUSTER_MIN__ MACs at once is named in the section header
+      above the table &mdash; that is a group of devices sharing one address (a factory default left in
+      place, or overlapping IPAM), not a pair to reconcile.
       <h4>Note column &mdash; conflict vs flapping (IP table)</h4>
-      <b>Confirmed &mdash; duplicate address</b> &mdash; 2+ distinct MACs claim the same IP (two devices).
-      <b>Endpoint mobility &mdash; EVPN DAD, a single MAC</b> &mdash; EVPN/zebra flagged the address, but only
-      one MAC answers for it across every observer, the zebra log and the retained history: the move rate
-      tripped DAD, nothing is claiming the address.
+      <b>Confirmed &mdash; duplicate address</b> &mdash; 2+ distinct MACs claim the same IP in this
+      collection (that many devices).
+      <b>Endpoint mobility &mdash; EVPN DAD, a single MAC</b> &mdash; EVPN/zebra flagged the address, but
+      only one MAC claims it in this collection: the move rate tripped DAD, nothing is contesting the
+      address now. Any earlier claimant is named in the same note rather than counted.
       <b>Flapping endpoint (EVPN mobility)</b> &mdash; a <i>single</i> MAC/IP whose
       mobility sequence is very high: the same endpoint is rapidly re-registering between locations (e.g. a
       BMC dual-pathed / not bonded), NOT two devices sharing an address. "active" = climbing now, "settled" =
@@ -2326,7 +2454,7 @@ function sortTable(tid, col, numeric) {
 ['ipt','mact','apt'].forEach(function(tid){
   var t=document.getElementById(tid); if(!t) return;
   Array.prototype.forEach.call(t.tHead.rows[0].cells, function(th, i){
-    var num = /Count|Seq|Event|Severity|Distinct/i.test(th.innerText);
+    var num = /Count|Seq|Event|Severity|Distinct|Claiming/i.test(th.innerText);
     th.addEventListener('click', function(){ sortTable(tid, i, num); });
   });
 });
@@ -2387,8 +2515,8 @@ function cardFilter(kind, card){
     revealAgedIfNeeded(matched);
     document.getElementById('ipt').scrollIntoView({behavior:'smooth', block:'start'});
     setFilterInfo(kind==='multi-mac'
-      ? 'Addresses claimed by 2+ distinct MACs'
-      : 'Addresses with a single MAC (endpoint mobility)');
+      ? 'Addresses claimed by 2+ distinct MACs in this collection'
+      : 'Addresses with a single claiming MAC (endpoint mobility)');
   } else if(kind==='mac'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
     if(card) card.classList.add('active');
     var matched=[];
