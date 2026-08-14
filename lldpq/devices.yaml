@@ -80,6 +80,12 @@ devices:
   192.168.200.172: oobm-spine-02 @oob_spine
   192.168.200.181: oobm-leaf-01 @oob_leaf
   192.168.200.182: oobm-leaf-02 @oob_leaf
+  192.168.200.183: oobm-leaf-03 @oob_leaf
+  192.168.200.184: oobm-leaf-04 @oob_leaf
+  192.168.200.185: oobm-leaf-05 @oob_leaf
+  192.168.200.186: oobm-leaf-06 @oob_leaf
+  192.168.200.187: oobm-leaf-07 @oob_leaf
+  192.168.200.188: oobm-leaf-08 @oob_leaf
   192.168.200.191: oobm-tor-01 @oob_tor
   192.168.200.192: oobm-tor-02 @oob_tor
   192.168.200.193: oobm-tor-03 @oob_tor
@@ -92,5 +98,6 @@ devices:
 # devices we do not own. They appear here only so LLDPq draws them as endpoints.
 endpoint_hosts:
   - "gpu-srv-*"         # GPU servers on the EW rails
-  - "cpu-srv-*"         # CPU servers on the NS leaf pairs
+  - "cpu-srv-*"         # CPU servers on the ns-leaf-05/06 pair
+  - "storage-*"         # storage devices on the ns-leaf-07/08 pair
   - "external-fw-*"     # firewalls discovered via LLDP

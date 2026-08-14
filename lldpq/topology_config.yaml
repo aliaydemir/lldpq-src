@@ -47,17 +47,15 @@ device_categories:
     layer: 1
     icon: "switch"
 
-  # Out-of-band top-of-rack (access tier)
-  - pattern: "oobm-tor"
-    layer: 1
-    icon: "switch"
-
   # OOB Spines
   - pattern: "oobm-spine"
-    layer: 3
+    layer: 2
     icon: "switch"
 
-
+  # Out-of-band top-of-rack (access tier)
+  - pattern: "oobm-tor"
+    layer: 3
+    icon: "switch"
 
   # Firewalls discovered via LLDP
   - pattern: "fw"
@@ -68,8 +66,6 @@ device_categories:
   - pattern: "border"
     layer: 12
     icon: "router"
-
-
 
   # NS Super-spines (top tier)
   - pattern: "ns-sspine"
@@ -91,7 +87,10 @@ device_categories:
     layer: 17
     icon: "host"
 
-
+  # NS Storage-Server
+  - pattern: "storage"
+    layer: 17
+    icon: "host"
 
   # EW Spines
   - pattern: "ew-p1-spine"
