@@ -5366,9 +5366,22 @@ sudo chmod 664 "$LLDPQ_INSTALL_DIR/tracking.yaml" 2>/dev/null || true
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/notifications.yaml" 2>/dev/null || true
 sudo find "$LLDPQ_INSTALL_DIR" -name '*.sh' -exec chmod 755 {} +
 sudo find "$LLDPQ_INSTALL_DIR" -name '*.py' -exec chmod 755 {} +
-sudo mkdir -p "$LLDPQ_INSTALL_DIR/monitor-results/fabric-tables"
-sudo chmod 750 "$LLDPQ_INSTALL_DIR/monitor-results"
-sudo chmod 750 "$LLDPQ_INSTALL_DIR/monitor-results/fabric-tables"
+# Runtime data trees. A fresh install has none of these in the copied source,
+# so the recursive chown above cannot reach them and `sudo mkdir` would leave
+# them root-owned with the CLI user locked out. Create them first, then apply
+# the shared ownership explicitly: cron writes here as $LLDPQ_USER while the
+# web UI writes as www-data, so the group needs write, not just read.
+sudo mkdir -p "$LLDPQ_INSTALL_DIR/monitor-results/fabric-tables" \
+    "$LLDPQ_INSTALL_DIR/lldp-results" \
+    "$LLDPQ_INSTALL_DIR/alert-states"
+for _runtime_item in monitor-results lldp-results alert-states; do
+    sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/$_runtime_item"
+    sudo find "$LLDPQ_INSTALL_DIR/$_runtime_item" -type d -exec chmod 775 {} +
+    sudo find "$LLDPQ_INSTALL_DIR/$_runtime_item" -type f -exec chmod 664 {} +
+done
+unset _runtime_item
+sudo chown "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/assets.ini" 2>/dev/null || true
+sudo chmod 664 "$LLDPQ_INSTALL_DIR/assets.ini" 2>/dev/null || true
 
 # Set default ACL so new files/directories also get group read permission
 if command -v setfacl &> /dev/null; then
@@ -5386,7 +5399,10 @@ chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
-    chmod -R 750 "$(git rev-parse --show-toplevel)/monitor-results" 2>/dev/null || true
+    find "$(git rev-parse --show-toplevel)/monitor-results" -type d \
+        -exec chmod 775 {} + 2>/dev/null || true
+    find "$(git rev-parse --show-toplevel)/monitor-results" -type f \
+        -exec chmod 664 {} + 2>/dev/null || true
 fi
 HOOKEOF
     sudo chmod +x "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge"
@@ -6636,7 +6652,10 @@ chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
-    chmod -R 750 "$(git rev-parse --show-toplevel)/monitor-results" 2>/dev/null || true
+    find "$(git rev-parse --show-toplevel)/monitor-results" -type d \
+        -exec chmod 775 {} + 2>/dev/null || true
+    find "$(git rev-parse --show-toplevel)/monitor-results" -type f \
+        -exec chmod 664 {} + 2>/dev/null || true
 fi
 HOOKEOF
     chmod +x .git/hooks/post-merge

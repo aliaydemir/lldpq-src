@@ -6,6 +6,7 @@
 __pycache__
 .cache
 .vscode
+AGENTS.md
 IMPROVEMENT_PLAN.md
 .playwright-cli/
 tests/
