@@ -467,6 +467,49 @@ dedicated Compose file supplies the complete guarded configuration. Docker
 Desktop on macOS cannot provide this physical-L2 DHCP/ONIE mode; use it for
 monitoring only.
 
+The single `DHCP_INTERFACE` / `PROVISION_SERVER_IP` host-network model is
+unchanged by multi-pool DHCP: exactly one listen interface, one `dhcpd.conf`,
+one `dhcpd.hosts` and one include. **Provision → DHCP Server** manages up to 8
+pools inside that one `dhcpd.conf`. Pool 1 is the directly attached pool and its
+subnet must contain an IPv4 address of `DHCP_INTERFACE`; a save that moves it off
+that subnet is rejected, also while DHCP is stopped, because `dhcpd -t` performs
+no network operation and cannot catch it.
+
+Pools 2 to 8 serve clients in a different VLAN/subnet. Their broadcasts never
+reach the untagged listen interface, so such a pool only works when the
+gateway/SVI serving that subnet is configured with a DHCP relay (helper address)
+pointing at the container host's provisioning address; `dhcpd` then selects the
+pool by matching the relay's `giaddr` against that pool's sibling `subnet`
+declaration. LLDPq does not configure and does not verify that relay—it is an
+external prerequisite, and the UI never reports a verified relay state.
+
+Provisioning is per pool and is switched by the ZTP provision URL alone. A pool
+with an empty URL advertises none of option 239 (`cumulus-provision-url`),
+option 72 (`www-server`) or option 114 (`default-url`); 72 and 114 drive ONIE's
+network-install discovery, so they are withheld together with 239 rather than
+letting an ONIE device in a non-provisioning subnet install from the LLDPq
+server. Only pool 1 receives a default provision URL, and only when the
+entrypoint renders the initial template.
+
+On start, the entrypoint migrates the provisioning server reference in an
+existing `dhcpd.conf` by updating only the option occurrences that are already
+there, preserving each URL's scheme, port, path, query and fragment. It never
+synthesises those options into a pool that has provisioning switched off, and a
+configuration in which every pool has provisioning off is valid and does not
+block DHCP from starting.
+
+`/etc/default/isc-dhcp-server` is written with the `INTERFACESv4` key that
+Ubuntu/Debian's `isc-dhcp-server` honours, plus an empty `INTERFACESv6`; a
+legacy `INTERFACES` value is still read as a fallback.
+
+This mode does not support configuring the relay on the gateway from LLDPq,
+multiple DHCP listen interfaces or 802.1Q trunk mode, several IP subnets on the
+same L2 (ISC `shared-network` semantics), IPv6 (`subnet6`), or a per-pool
+discovery range. Only the first pool's subnet feeds the default discovery range;
+add any further range to the Discovery Range field by hand. See
+[DHCP Server Tab](README.md#dhcp-server-tab) for the generated configuration
+shape and the save-time validation.
+
 > **Host-network warning:** provisioning mode also exposes the container's
 > plaintext web service on TCP/80 and its internal SSH service on TCP/2033.
 > Restrict both at the host/network boundary to the exact provisioning and

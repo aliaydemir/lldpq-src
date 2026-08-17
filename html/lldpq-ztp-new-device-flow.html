@@ -165,7 +165,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
     <div class="phase-header">
         <div class="phase-num">1</div>
         <div class="phase-title">Physical Connection & DHCP</div>
-        <div class="phase-source">dhcpd.conf &bull; dhcpd.hosts</div>
+        <div class="phase-source">dhcpd.conf (up to 8 pools) &bull; dhcpd.hosts</div>
     </div>
     <div class="steps">
         <div class="step active">
@@ -173,23 +173,50 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
             <div class="step-desc">The switch's management interface sends a DHCP DISCOVER broadcast on the OOB network.</div>
         </div>
         <div class="step decision">
-            <div class="step-title">DHCP Server receives request — binding lookup</div>
+            <div class="step-title">DHCP Server picks the pool — directly attached or relayed</div>
+            <div class="step-desc"><span class="step-code">dhcpd.conf</span> holds up to 8 pools, written as sibling top-level <span class="step-code">subnet</span> blocks. Each block is preceded by a marker comment <span class="step-code">#LLDPQ pool name="..."</span> carrying its display name; a block without that marker gets a positional name (Pool-1, Pool-2, …).<br>
+            The pools are deliberately <strong>not</strong> wrapped in a <span class="step-code">shared-network</span> — that would tell dhcpd the subnets share one wire and could hand out a lease from the wrong subnet.</div>
+            <div class="step-file">provision-api.sh → render_dhcp_conf()</div>
+        </div>
+        <div class="branch">
+            <div class="branch-path yes">
+                <div class="branch-label">Same VLAN as LLDPq → pool 1</div>
+                <div class="branch-text">The broadcast arrives untagged on the single DHCP listen interface, <span class="step-code">giaddr</span> is <span class="step-code">0.0.0.0</span>, and dhcpd answers from <strong>pool 1</strong>.<br>
+                Pool 1 is the primary, directly attached pool: its subnet <strong>must</strong> contain an IPv4 address of that listen interface. A save that would move it off that subnet is rejected — also while DHCP is stopped, since <span class="step-code">dhcpd -t</span> does no network operation and cannot catch it.</div>
+            </div>
+            <div class="branch-path no">
+                <div class="branch-label">Another VLAN → relayed pool 2–8</div>
+                <div class="branch-text">A DHCP broadcast in another VLAN never reaches the untagged listen interface. It only arrives if the <strong>gateway/SVI serving that subnet is configured with a DHCP relay (helper address) pointing at LLDPq's IP</strong>; dhcpd then selects the pool by matching the relay's <span class="step-code">giaddr</span> against that pool's sibling <span class="step-code">subnet</span> declaration.<br>
+                <strong>LLDPq does not configure and does not verify that relay</strong> — it is an external prerequisite. The pool card shows the derived LLDPq target IP and an explicit "Relay status is not verified" label; it never shows a green/OK relay state.<br>
+                The pool's <span class="step-code">option routers</span> and the relay's <span class="step-code">giaddr</span> are usually the same SVI, but the DHCP protocol does not require it and LLDPq does not force them to match.</div>
+            </div>
+        </div>
+        <div class="step decision">
+            <div class="step-title">Binding lookup inside the selected pool</div>
             <div class="step-desc">ISC DHCP server checks <span class="step-code">dhcpd.hosts</span> for a MAC → IP static reservation.<br>
-            Format: <span class="step-code">host HOSTNAME {hardware ethernet MAC; fixed-address IP; option host-name "HOSTNAME";}</span></div>
+            Format: <span class="step-code">host HOSTNAME {hardware ethernet MAC; fixed-address IP; option host-name "HOSTNAME";}</span><br>
+            The declarations are flat — no enclosing <span class="step-code">group { }</span> block and no per-host provisioning option — so each reservation inherits its options from the <span class="step-code">subnet</span> block that contains its <span class="step-code">fixed-address</span>.</div>
             <div class="step-file">provision-api.sh → generate_dhcp_hosts()</div>
         </div>
         <div class="branch">
             <div class="branch-path yes">
                 <div class="branch-label">MAC found in dhcpd.hosts</div>
-                <div class="branch-text">Switch gets its <strong>reserved IP + hostname + ZTP URL</strong> via DHCP options.<br>
+                <div class="branch-text">Switch gets its <strong>reserved IP + hostname</strong>, plus whatever ZTP options its own pool advertises.<br>
                 Option 239 (cumulus-provision-url) → <span class="step-code">http://server/cumulus-ztp.sh</span></div>
             </div>
             <div class="branch-path no">
                 <div class="branch-label">MAC not found (new/unknown device)</div>
-                <div class="branch-text">Switch gets an IP from the <strong>dynamic range</strong> (e.g., .210–.249).<br>
-                Still receives ZTP URL via the subnet-level option 239.<br>
+                <div class="branch-text">Switch gets an IP from that pool's <strong>dynamic range</strong> (e.g., .210–.249).<br>
+                Still receives the ZTP URL via the pool-level option 239.<br>
                 This is only temporary — generated config applies a <strong>static management IP</strong> after ZTP, freeing the dynamic lease.</div>
             </div>
+        </div>
+        <div class="step warn">
+            <div class="step-title">Per-pool ZTP — the provision URL is the only switch</div>
+            <div class="step-desc">A pool with an <strong>empty</strong> ZTP provision URL advertises <strong>none</strong> of option 239 (<span class="step-code">cumulus-provision-url</span>), option 72 (<span class="step-code">www-server</span>) or option 114 (<span class="step-code">default-url</span>).<br>
+            72 and 114 drive ONIE's network-install discovery, so they are withheld together with 239 — otherwise an ONIE device in a non-provisioning subnet would try to install from the LLDPq server.<br>
+            A newly added pool starts with an empty URL, i.e. provisioning <strong>off</strong>. Only pool 1 gets a default provision URL, and only when a fresh install or the Docker entrypoint renders the initial template; a URL that was emptied explicitly is preserved by later saves and never auto-refilled.</div>
+            <div class="step-file">provision-api.sh → render_dhcp_conf() pool options</div>
         </div>
         <div class="step active">
             <div class="step-title">Switch has an IP address and can reach the LLDPq server</div>
@@ -440,7 +467,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
             <div class="step-title">Admin clicks Save</div>
             <div class="step-desc">
                 <strong>1.</strong> <span class="step-code">inventory.json</span> — all bindings (including planned) written<br>
-                <strong>2.</strong> <span class="step-code">dhcpd.hosts</span> — only entries with valid MAC + dhcp=true<br>
+                <strong>2.</strong> <span class="step-code">dhcpd.hosts</span> — only entries with valid MAC + dhcp=true. Refused if such an entry falls outside every pool or inside a pool's dynamic range; entries with dhcp=false are exempt<br>
                 <strong>3.</strong> <span class="step-code">devices.yaml</span> — add/update/remove synced entries (system-wide inventory)<br>
                 <strong>4.</strong> Optional: restart DHCP server (confirm modal)
             </div>
@@ -514,7 +541,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
     <div style="margin-bottom: 20px; padding: 15px; background: #1e1e1e; border-left: 3px solid #ff9800; border-radius: 4px;">
         <div style="font-weight: 600; color: #ff9800; margin-bottom: 6px;">A. New device with NO DHCP binding (unknown MAC)</div>
         <div style="font-size: 12px; color: #bbb; line-height: 1.8;">
-            <strong>Phase 1:</strong> Device gets a <strong>dynamic IP</strong> from DHCP range (e.g., .210–.249). Still receives ZTP URL via subnet option 239.<br>
+            <strong>Phase 1:</strong> Device gets a <strong>dynamic IP</strong> from the answering pool's range (e.g., .210–.249). Still receives the ZTP URL via that pool's option 239, provided the pool has a provision URL.<br>
             <strong>Phase 2:</strong> ZTP runs normally — OS check, password, SSH key. <span style="color:#4caf50;">Works fine.</span><br>
             <strong>Phase 3:</strong> Discovery finds it as <span style="color:#4caf50;">Provisioned</span> + <span style="color:#42a5f5;">Not in Inventory</span>.<br>
             <strong>Phase 4:</strong> <span style="color:#f44336;">Post-provision SKIPPED</span> — <span class="step-code">has_binding</span> is false. No base config, no hostname set, no marker.<br>
@@ -674,7 +701,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
     </div>
 
     <!-- ALT 9: EXISTING SWITCH OS UPGRADE -->
-    <div style="padding: 15px; background: #1e1e1e; border-left: 3px solid #ce93d8; border-radius: 4px;">
+    <div style="margin-bottom: 20px; padding: 15px; background: #1e1e1e; border-left: 3px solid #ce93d8; border-radius: 4px;">
         <div style="font-weight: 600; color: #ce93d8; margin-bottom: 6px;">I. Existing switch OS upgrade (with config preservation)</div>
         <div style="font-size: 12px; color: #bbb; line-height: 1.8;">
             <strong>When:</strong> An already-provisioned switch needs an OS upgrade (e.g., 5.11 → 5.14).<br>
@@ -687,6 +714,21 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
             <strong>Method 2 — Manual SSH (per-switch):</strong><br>
             &nbsp;&nbsp;<span class="step-code">sudo onie-install -fa -i http://server/cumulus-linux-5.14.0.bin -z http://server/cumulus-ztp.sh -t http://server/generated_config_folder/{hostname}.yaml && sudo reboot</span><br><br>
             <strong>Config preservation:</strong> The <span class="step-code">-t</span> flag restores the NVUE startup.yaml from the generated config. No manual config restore needed. No Ansible deploy needed.
+        </div>
+    </div>
+
+    <!-- ALT 10: RELAYED POOL -->
+    <div style="padding: 15px; background: #1e1e1e; border-left: 3px solid #ff9800; border-radius: 4px;">
+        <div style="font-weight: 600; color: #ff9800; margin-bottom: 6px;">J. Device in another VLAN (relayed pool 2–8)</div>
+        <div style="font-size: 12px; color: #bbb; line-height: 1.8;">
+            <strong>When:</strong> Switches are cabled into an OOB subnet other than the one LLDPq's DHCP listen interface sits in.<br>
+            <strong>External prerequisite:</strong> the gateway/SVI serving that subnet must relay (helper-address) DHCP to LLDPq's IP. Without it the pool never sees a packet, because the broadcast stays in its own VLAN. <span style="color:#ff9800;">LLDPq neither configures nor verifies this — relay status is never shown as OK.</span><br>
+            <strong>Pool selection:</strong> dhcpd matches the relay's <span class="step-code">giaddr</span> against the pool's <span class="step-code">subnet</span> declaration and answers from that pool's range, options and reservations.<br>
+            <strong>ZTP:</strong> off unless that pool has its own provision URL. A new pool starts empty, so a relayed subnet stays provisioning-free until an admin fills the URL in.<br>
+            <strong>Discovery:</strong> unchanged — only the first pool's subnet feeds the default Discovery Range. To scan a relayed subnet, add its range to the Discovery Range field, which accepts comma-separated ranges (within the existing 1500-address total limit).<br>
+            <strong>Removing a pool:</strong> pool 1 cannot be removed, and removing an extra pool is refused while it still holds DHCP-enabled reservations. Removal does not revoke leases already handed out — a client keeps its address until the lease expires and then finds nothing. Discovery Range entries and the gateway's relay configuration must be cleaned up by hand.<br>
+            <strong>Not supported:</strong> configuring the relay from LLDPq, multiple DHCP listen interfaces or 802.1Q trunk mode, several IP subnets on the same L2 (ISC <span class="step-code">shared-network</span> semantics), IPv6 (<span class="step-code">subnet6</span>), per-pool discovery range.<br>
+            <span style="color:#888; font-size:11px;">Code: provision-api.sh → validate_primary_pool_is_directly_attached() + validate_removed_pools() + render_dhcp_conf(); provision.html → relayed pool callout</span>
         </div>
     </div>
 </div>
@@ -747,10 +789,16 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
         </thead>
         <tbody>
             <tr style="border-bottom: 1px solid #2d2d2d;">
+                <td style="padding: 8px; font-family: monospace; color: #76b900;">/etc/dhcp/dhcpd.conf</td>
+                <td style="padding: 8px;">DHCP Config Save</td>
+                <td style="padding: 8px;">dhcpd, DHCP Server tab, Save Bindings validation</td>
+                <td style="padding: 8px;">Up to 8 pools as sibling subnet blocks with per-pool ZTP options</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #2d2d2d;">
                 <td style="padding: 8px; font-family: monospace; color: #76b900;">/etc/dhcp/dhcpd.hosts</td>
-                <td style="padding: 8px;">Save Bindings</td>
+                <td style="padding: 8px;">Save Bindings, DHCP Config Save</td>
                 <td style="padding: 8px;">dhcpd, Discovery fallback</td>
-                <td style="padding: 8px;">MAC → IP static reservations</td>
+                <td style="padding: 8px;">Flat MAC → IP static reservations; options inherited from the containing subnet</td>
             </tr>
             <tr style="border-bottom: 1px solid #2d2d2d;">
                 <td style="padding: 8px; font-family: monospace; color: #76b900;">inventory.json</td>

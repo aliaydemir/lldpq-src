@@ -3049,8 +3049,7 @@
                 if (!authenticated) {
                     if (LLDPqAuth.lastCheckTransient) {
                         const updated = document.getElementById('last-updated-time');
-                        if (updated) updated.textContent =
-                            'Auth check unreachable — reload the page to retry.';
+                        if (updated) updated.textContent = LLDPqAuth.lastCheckMessage();
                     }
                     return;
                 }

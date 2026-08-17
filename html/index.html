@@ -1007,8 +1007,7 @@
             if (!isAuth) {
                 if (LLDPqAuth.lastCheckTransient) {
                     const menuContainer = document.getElementById('user-menu-container');
-                    if (menuContainer) menuContainer.textContent =
-                        'Auth check unreachable — reload the page to retry.';
+                    if (menuContainer) menuContainer.textContent = LLDPqAuth.lastCheckMessage();
                 }
                 return;
             }

@@ -319,6 +319,22 @@ finally:
 PYTHON_SET_LLDPQ_CONF
 }
 
+_read_isc_dhcp_interface() {
+    # INTERFACESv4 is authoritative; the bare INTERFACES fallback keeps files
+    # written before that fix readable until their next save.
+    local file=/etc/default/isc-dhcp-server key value
+    [ -f "$file" ] || return 0
+    for key in INTERFACESv4 INTERFACES; do
+        value=$(sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
+            "$file" | head -n 1)
+        value=${value%% *}
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+}
+
 _set_isc_dhcp_interfaces() {
     local interface="$1" direct_mount=false target
     target=$(readlink -f /etc/default/isc-dhcp-server 2>/dev/null || \
@@ -338,7 +354,7 @@ interface = sys.argv[2]
 direct_mount = sys.argv[3] == "true"
 if not interface or any(character in interface for character in ('\x00', '\n', '\r', '"')):
     raise SystemExit("invalid DHCP interface value")
-desired = f'INTERFACES="{interface}"\n'.encode("utf-8")
+desired = f'INTERFACESv4="{interface}"\nINTERFACESv6=""\n'.encode("utf-8")
 current = path.read_bytes()
 if current == desired:
     raise SystemExit(0)
@@ -1027,19 +1043,17 @@ class "onie-vendor-classes" {
   option vivso.iana 01:01:01;
 }
 
-# OOB Management subnet
-shared-network OOB {
-  subnet ${subnet} netmask 255.255.255.0 {
-    range ${subnet%.*}.210 ${subnet%.*}.249;
-    option routers ${gateway};
-    option domain-name "example.com";
-    option domain-name-servers ${gateway};
-    option www-server ${server_ip};
-    option default-url "http://${server_ip}/";
-    option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
-    default-lease-time 172800;
-    max-lease-time     345600;
-  }
+#LLDPQ pool name="Pool-1"
+subnet ${subnet} netmask 255.255.255.0 {
+  range ${subnet%.*}.210 ${subnet%.*}.249;
+  option routers ${gateway};
+  option domain-name "example.com";
+  option domain-name-servers ${gateway};
+  option www-server ${server_ip};
+  option default-url "http://${server_ip}/";
+  option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
+  default-lease-time 172800;
+  max-lease-time     345600;
 }
 
 include "/etc/dhcp/dhcpd.hosts";
@@ -1173,8 +1187,14 @@ def without_comments(text):
             in_comment = True
     return ''.join(output), quoted
 
-def rewrite(source, destination, require_all):
-    counts = {"www-server": 0, "default-url": 0, "cumulus-provision-url": 0}
+def rewrite(source, destination):
+    """Repoint the server host of the provisioning options that are present.
+
+    Each occurrence is rewritten from its own value, so per-pool differences
+    survive and a pool whose ZTP URL is empty keeps emitting no options at all:
+    a config where every pool has provisioning off is valid and must not have
+    options synthesised into it.
+    """
     text = source.read_text(encoding="utf-8")
     searchable, quoted = without_comments(text)
     output = []
@@ -1184,7 +1204,6 @@ def rewrite(source, destination, require_all):
         if quoted[match.start()]:
             continue
         name = match.group("name").lower()
-        counts[name] += 1
         value_start, value_end = match.span("value")
         value = text[value_start:value_end].strip()
         if name == "www-server":
@@ -1220,17 +1239,10 @@ def rewrite(source, destination, require_all):
         output.append(replacement)
         cursor = value_end
     output.append(text[cursor:])
-    if require_all:
-        invalid = [name for name, count in counts.items() if count < 1]
-        if invalid:
-            raise SystemExit(
-                "managed DHCP option missing: "
-                + ", ".join(f"{name}={counts[name]}" for name in invalid)
-            )
     destination.write_text("".join(output), encoding="utf-8")
 
-rewrite(config_source, config_destination, True)
-rewrite(hosts_source, hosts_destination, False)
+rewrite(config_source, config_destination)
+rewrite(hosts_source, hosts_destination)
 PYTHON
     then
         rm -f "$candidate" "$hosts_candidate"
@@ -1593,20 +1605,16 @@ def url_addresses(value):
         }
 
 try:
-    main_counts = {
-        'www-server': 0,
-        'default-url': 0,
-        'cumulus-provision-url': 0,
-    }
-    for path_index, path in enumerate(paths):
+    # A pool provisions only while its ZTP URL is set, so a config where every
+    # pool has it empty carries none of these options and is still valid. Every
+    # option that IS present must point at this server.
+    for path in paths:
         text = path.read_text(encoding='utf-8')
         searchable, quoted = without_comments(text)
         for match in directive.finditer(searchable):
             if quoted[match.start()]:
                 continue
             name = match.group(1).lower()
-            if path_index == 0:
-                main_counts[name] += 1
             value_start, value_end = match.span(2)
             value = text[value_start:value_end].strip()
             number = text.count('\n', 0, match.start()) + 1
@@ -1619,9 +1627,6 @@ try:
                     raise ValueError(f'{location}: malformed {name}')
                 if expected not in url_addresses(value[1:-1]):
                     raise ValueError(f'{location}: {name} targets another server')
-    missing = [name for name, count in main_counts.items() if count == 0]
-    if missing:
-        raise ValueError('main config is missing: ' + ', '.join(missing))
 except (OSError, ValueError) as exc:
     print(f'LLDPq: invalid DHCP provisioning override: {exc}', file=sys.stderr)
     raise SystemExit(1)
@@ -1675,7 +1680,7 @@ fi
 
 # Write a legacy default only outside explicit provisioning mode. The runtime
 # guard still blocks any actual bridge-mode start.
-if [ "$LLDPQ_DHCP_MODE" != "host" ] && ! grep -q '^INTERFACES=' /etc/default/isc-dhcp-server 2>/dev/null; then
+if [ "$LLDPQ_DHCP_MODE" != "host" ] && [ -z "$(_read_isc_dhcp_interface)" ]; then
     _set_isc_dhcp_interfaces eth0
 fi
 
@@ -1714,10 +1719,8 @@ touch /var/log/lldpq/dhcpd.log
 chown www-data:www-data /var/log/lldpq/dhcpd.log
 chmod 664 /var/log/lldpq/dhcpd.log
 if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
-    DHCP_IFACE="eth0"
-    if [ -f /etc/default/isc-dhcp-server ]; then
-        DHCP_IFACE=$(grep '^INTERFACES=' /etc/default/isc-dhcp-server 2>/dev/null | sed 's/INTERFACES="//;s/"//' || echo "eth0")
-    fi
+    DHCP_IFACE=$(_read_isc_dhcp_interface)
+    DHCP_IFACE="${DHCP_IFACE:-eth0}"
     mkdir -p /var/log/lldpq 2>/dev/null
     # -d keeps dhcpd in the foreground logging to stderr; redirect to a file so the logs
     # survive (no syslog/journald in the container) and the Provision UI can tail them.

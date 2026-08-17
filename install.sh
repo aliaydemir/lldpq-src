@@ -976,19 +976,17 @@ class "onie-vendor-classes" {
   option vivso.iana 01:01:01;
 }
 
-# OOB Management subnet
-shared-network OOB {
-  subnet ${subnet} netmask 255.255.255.0 {
-    range ${subnet%.*}.210 ${subnet%.*}.249;
-    option routers ${gateway};
-    option domain-name "example.com";
-    option domain-name-servers ${gateway};
-    option www-server ${server_ip};
-    option default-url "http://${server_ip}/";
-    option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
-    default-lease-time 172800;
-    max-lease-time     345600;
-  }
+#LLDPQ pool name="Pool-1"
+subnet ${subnet} netmask 255.255.255.0 {
+  range ${subnet%.*}.210 ${subnet%.*}.249;
+  option routers ${gateway};
+  option domain-name "example.com";
+  option domain-name-servers ${gateway};
+  option www-server ${server_ip};
+  option default-url "http://${server_ip}/";
+  option cumulus-provision-url "http://${server_ip}/cumulus-ztp.sh";
+  default-lease-time 172800;
+  max-lease-time     345600;
 }
 
 include "${hosts_file}";

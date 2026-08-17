@@ -22,20 +22,28 @@ const LLDPqAuth = {
     role: null,
     hostname: 'lldpq',
     lastCheckTransient: false,
+    lastCheckStatus: 0,
+    lastCheckReason: '',
     
     // Check if user is authenticated
     async check() {
         let data = null;
         this.lastCheckTransient = false;
+        this.lastCheckStatus = 0;
+        this.lastCheckReason = '';
         try {
             const response = await fetch('/auth-api?action=check');
-            data = await response.json();
+            // Recorded before the body is parsed so a non-JSON reply can still
+            // name which link of the nginx → fcgiwrap → auth-api.sh chain failed.
+            this.lastCheckStatus = response.status;
+            data = JSON.parse(await response.text());
         } catch (e) {
             // Network error or server busy (e.g. fcgiwrap busy with a long-running
             // request). Do NOT redirect to login — the session may still be valid.
             // The caller handles the false return by aborting its own action.
             console.error('Auth check failed:', e);
             this.lastCheckTransient = true;
+            this.lastCheckReason = this.describeCheckFailure(this.lastCheckStatus);
             return false;
         }
 
@@ -68,6 +76,39 @@ const LLDPqAuth = {
             }
         }
         return false;
+    },
+
+    // A transient auth check tells the page nothing beyond "not now", so an
+    // operator cannot separate a stopped CGI backend from a missing nginx route
+    // or an unreachable server. Name the failing link instead, the way the
+    // Console pre-open probe reports its own admission failures.
+    describeCheckFailure(status) {
+        if (!status) return 'Cannot reach the LLDPq web server';
+        if (status === 502 || status === 503) {
+            return `The web server cannot reach the CGI backend (HTTP ${status}) — ` +
+                'fcgiwrap is stopped, or its socket is unreachable by nginx';
+        }
+        if (status === 504) {
+            return `The CGI backend did not answer in time (HTTP ${status})`;
+        }
+        if (status === 404) {
+            return 'The web server has no route for /auth-api (HTTP 404) — ' +
+                'the LLDPq nginx site is not enabled, or a proxy strips the path';
+        }
+        if (status === 403) {
+            return 'The web server refused /auth-api (HTTP 403) — ' +
+                'check the ownership and mode of auth-api.sh in the web root';
+        }
+        if (status >= 500) {
+            return `The auth API failed on the server (HTTP ${status}) — ` +
+                'see the nginx error log';
+        }
+        return `The auth API replied HTTP ${status} without valid JSON`;
+    },
+
+    // Sentence for a page to display once checkWithRetry() has given up.
+    lastCheckMessage() {
+        return `${this.lastCheckReason || 'Cannot reach the LLDPq web server'}. Reload the page to retry.`;
     },
 
     // Redirect to login page (break out of iframe to avoid nested app shell)

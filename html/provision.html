@@ -950,51 +950,34 @@
 <div class="tab-content" id="tab-dhcpd">
     <div class="section-title">DHCP Server Configuration</div>
     <div class="section-desc">Subnet, IP range, gateway, DNS and ZTP settings. Changes require DHCP restart.</div>
+    <div id="dhcpConfigErrorBanner" style="display: none; padding: 12px 15px; margin-bottom: 15px; background: #2a1616; border: 1px solid #f44336; border-left: 4px solid #f44336; border-radius: 6px;">
+        <div style="color: #f44336; font-size: 13px; font-weight: 600; margin-bottom: 5px;">DHCP configuration cannot be managed from this page</div>
+        <div id="dhcpConfigErrorText" style="color: #e6a5a5; font-size: 12px; line-height: 1.5;"></div>
+        <div style="color: #888; font-size: 11px; margin-top: 6px;">Saving is disabled: writing from here would rewrite the existing dhcpd.conf. Resolve the file manually, then press Reload.</div>
+    </div>
     <div style="padding: 15px; background: #1e1e1e; border-radius: 6px; border: 1px solid #3c3c3c; margin-bottom: 20px;">
         <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;">
             <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">SUBNET</label>
-                <input type="text" class="form-input" id="dhcpSubnet" style="width: 100%;" placeholder="192.168.100.0">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">NETMASK</label>
-                <input type="text" class="form-input" id="dhcpNetmask" style="width: 100%;" placeholder="255.255.255.0">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DYNAMIC RANGE START</label>
-                <input type="text" class="form-input" id="dhcpRangeStart" style="width: 100%;" placeholder="192.168.100.210">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DYNAMIC RANGE END</label>
-                <input type="text" class="form-input" id="dhcpRangeEnd" style="width: 100%;" placeholder="192.168.100.249">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">GATEWAY (ROUTER)</label>
-                <input type="text" class="form-input" id="dhcpGateway" style="width: 100%;" placeholder="192.168.100.1">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DNS SERVER</label>
-                <input type="text" class="form-input" id="dhcpDNS" style="width: 100%;" placeholder="192.168.100.1">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DOMAIN NAME</label>
-                <input type="text" class="form-input" id="dhcpDomain" style="width: 100%;" placeholder="example.com">
-            </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">ZTP PROVISION URL</label>
-                <input type="text" class="form-input" id="dhcpProvisionURL" style="width: 100%;" placeholder="http://192.168.100.200/cumulus-ztp.sh">
-            </div>
-            <div>
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">LISTEN INTERFACE</label>
-                <select class="form-input" id="dhcpInterface" style="width: 100%;"><option value="">Loading...</option></select>
+                <select class="form-input" id="dhcpInterface" style="width: 100%;" onchange="refreshDhcpRelayInfo()"><option value="">Loading...</option></select>
+                <div style="font-size: 10px; color: #666; margin-top: 3px;">Applies to the whole DHCP server.</div>
             </div>
-            <div>
-                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DEFAULT LEASE TIME (sec)</label>
-                <input type="text" class="form-input" id="dhcpLeaseTime" style="width: 100%;" placeholder="172800">
+            <div id="dhcpRelayTargetWrap" style="display: none;">
+                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">RELAY TARGET</label>
+                <select class="form-input" id="dhcpRelayTarget" style="width: 100%;" onchange="refreshDhcpRelayInfo()"></select>
+                <div style="font-size: 10px; color: #666; margin-top: 3px;">Address relays should point at. Display only.</div>
             </div>
         </div>
+        <div id="dhcpPoolList" style="margin-top: 15px; display: flex; flex-direction: column; gap: 12px;"></div>
+        <div style="margin-top: 12px; display: flex; gap: 10px; align-items: center;">
+            <button class="btn btn-secondary btn-sm" id="btnDhcpAddPool" onclick="addDHCPPool()">
+                <svg viewBox="0 0 24 24"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+                Add Pool
+            </button>
+            <span id="dhcpPoolCount" style="font-size: 11px; color: #666;"></span>
+        </div>
         <div style="margin-top: 15px; display: flex; gap: 10px;">
-            <button class="btn btn-primary btn-sm" onclick="saveDHCPConfig()">
+            <button class="btn btn-primary btn-sm" id="btnSaveDhcpConfig" onclick="saveDHCPConfig()">
                 <svg viewBox="0 0 24 24"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm-5 16c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm3-10H5V5h10v4z"/></svg>
                 Save Config &amp; Restart DHCP
             </button>
@@ -1013,10 +996,11 @@
                 <th style="width: 200px;">Hostname</th>
                 <th style="width: 160px;">MAC Address</th>
                 <th style="width: 140px;">IP Address</th>
+                <th style="width: 140px;">Pool</th>
                 <th style="width: 80px;">Status</th>
             </tr></thead>
             <tbody id="dhcp-hosts-tbody">
-                <tr><td colspan="4" style="text-align: center; color: #666; padding: 20px;">Click Refresh to load</td></tr>
+                <tr><td colspan="5" style="text-align: center; color: #666; padding: 20px;">Click Refresh to load</td></tr>
             </tbody>
         </table>
     </div>
@@ -1197,7 +1181,7 @@
             <div style="flex: 1; min-width: 300px;">
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">PUBLIC KEY</label>
                 <div style="display: flex; gap: 8px;">
-                    <input type="text" class="form-input" id="ztpSSHKey" readonly style="flex:1; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; background:#252526;" placeholder="No key generated yet...">
+                    <input type="text" class="form-input" id="ztpSSHKey" readonly autocomplete="off" style="flex:1; font-family:'Cascadia Code','Consolas',monospace; font-size:11px; background:#252526;" placeholder="No key generated yet...">
                     <button class="btn btn-secondary btn-sm" onclick="copySSHKey()" title="Copy public key">Copy</button>
                 </div>
             </div>
@@ -1229,18 +1213,21 @@
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px;">
             <div>
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">TARGET OS VERSION</label>
-                <input type="text" class="form-input" id="ztpTargetOS" style="width: 100%;" placeholder="e.g. 5.14.0">
+                <input type="text" class="form-input" id="ztpTargetOS" autocomplete="off" style="width: 100%;" placeholder="e.g. 5.14.0">
             </div>
             <div>
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">DEFAULT PASSWORD</label>
-                <div style="position: relative;">
-                    <input type="password" class="form-input" id="ztpPassword" style="width: 100%; padding-right: 36px;" placeholder="Default password" autocomplete="off">
-                    <button onclick="togglePasswordVisibility()" style="position:absolute; right:4px; top:50%; transform:translateY(-50%); background:none; border:none; color:#888; cursor:pointer; padding:4px;" title="Show/Hide" id="pwToggle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
-                </div>
+                <!-- Own form: keeps the only password field on this page out of the
+                     implicit form that holds every other input, so a password
+                     manager cannot treat an unrelated field as the username slot. -->
+                <form onsubmit="return false;" autocomplete="off" style="position: relative;">
+                    <input type="password" class="form-input" id="ztpPassword" style="width: 100%; padding-right: 36px;" placeholder="Default password" autocomplete="new-password">
+                    <button type="button" onclick="togglePasswordVisibility()" style="position:absolute; right:4px; top:50%; transform:translateY(-50%); background:none; border:none; color:#888; cursor:pointer; padding:4px;" title="Show/Hide" id="pwToggle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
+                </form>
             </div>
             <div>
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">IMAGE SERVER IP</label>
-                <input type="text" class="form-input input-ip" id="ztpImageServer" oninput="syncUpgradeServerIPFromZTP()" style="width: 100%;" placeholder="e.g. 192.168.100.200">
+                <input type="text" class="form-input input-ip" id="ztpImageServer" oninput="syncUpgradeServerIPFromZTP()" autocomplete="off" style="width: 100%;" placeholder="e.g. 192.168.100.200">
             </div>
         </div>
         <button class="btn btn-secondary btn-sm" style="margin-top: 10px;" onclick="applyQuickSettings()">Apply to Script</button>
@@ -1363,16 +1350,16 @@
         </div>
         <div>
             <label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">TARGET VERSION</label>
-            <input type="text" class="form-input" id="upgradeTargetVersion" oninput="renderUpgradeTable()" style="width:100%;" placeholder="e.g. 5.16.1">
+            <input type="text" class="form-input" id="upgradeTargetVersion" oninput="renderUpgradeTable()" autocomplete="off" style="width:100%;" placeholder="e.g. 5.16.1">
         </div>
         <div>
             <label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">IMAGE SERVER IP</label>
-            <input type="text" class="form-input input-ip" id="upgradeServerIP" readonly style="width:100%; background:#252526;" placeholder="Uses ZTP Image Server IP">
+            <input type="text" class="form-input input-ip" id="upgradeServerIP" readonly autocomplete="off" style="width:100%; background:#252526;" placeholder="Uses ZTP Image Server IP">
             <div id="upgradeServerInfo" style="font-size:11px;color:#666;margin-top:4px;">Uses ZTP Quick Settings IMAGE SERVER IP</div>
         </div>
         <div>
             <label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">BATCH SIZE</label>
-            <input type="number" class="form-input" id="upgradeBatchSize" min="1" max="100" value="1" style="width:100%;">
+            <input type="number" class="form-input" id="upgradeBatchSize" min="1" max="100" value="1" autocomplete="off" style="width:100%;">
         </div>
     </div>
 
@@ -1486,15 +1473,15 @@
         <h3 id="modalTitle">Add Binding</h3>
         <div class="modal-field">
             <label>Hostname</label>
-            <input type="text" id="modalHostname" placeholder="e.g. leaf-01">
+            <input type="text" id="modalHostname" placeholder="e.g. leaf-01" autocomplete="off">
         </div>
         <div class="modal-field">
             <label>MAC Address</label>
-            <input type="text" id="modalMAC" class="mono" placeholder="Leave empty if unknown (Planned)" oninput="formatMAC(this)">
+            <input type="text" id="modalMAC" class="mono" placeholder="Leave empty if unknown (Planned)" oninput="formatMAC(this)" autocomplete="off">
         </div>
         <div class="modal-field">
             <label>IP Address</label>
-            <input type="text" id="modalIP" class="mono" placeholder="e.g. 192.168.100.11">
+            <input type="text" id="modalIP" class="mono" placeholder="e.g. 192.168.100.11" autocomplete="off">
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
             <div class="modal-field" style="margin-bottom:0;">
@@ -2216,42 +2203,331 @@ async function _dhcpServiceAction(action) {
 // ===================== DHCP HOSTS (read-only) =====================
 async function loadDHCPHosts() {
     const tbody = document.getElementById('dhcp-hosts-tbody');
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666;padding:20px;">Loading...</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;padding:20px;">Loading...</td></tr>';
     const data = await apiCall('get-dhcp-hosts');
     if (!data.success) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#f44336;padding:20px;">' + (data.error || 'Failed to load') + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#f44336;padding:20px;">' + (data.error || 'Failed to load') + '</td></tr>';
         return;
     }
     document.getElementById('dhcp-hosts-file').textContent = data.file || '';
     const bindings = data.bindings || [];
     if (bindings.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#666;padding:20px;">No bindings found</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#666;padding:20px;">No bindings found</td></tr>';
         return;
     }
     tbody.innerHTML = bindings.map(b => `<tr style="${b.commented ? 'opacity:0.4;' : ''}">
         <td>${escHtml(b.hostname)}</td>
         <td style="font-family:monospace;font-size:12px;">${escHtml(b.mac)}</td>
         <td style="font-family:monospace;">${escHtml(b.ip)}</td>
+        <td>${b.pool ? escHtml(b.pool) : '<span style="color:#555;">&mdash;</span>'}</td>
         <td>${b.commented ? '<span style="color:#888;">Disabled</span>' : '<span style="color:#76b900;">Active</span>'}</td>
     </tr>`).join('');
 }
 
 // ===================== DHCP CONFIG =====================
+const DHCP_POOL_FIELDS = ['name', 'subnet', 'netmask', 'range_start', 'range_end',
+                          'gateway', 'dns', 'domain', 'provision_url', 'lease_time'];
+const DHCP_POOL_NAME_MAX = 64;
+const DHCP_POOL_NAME_RE = /^[A-Za-z0-9 ._-]+$/;
+let _dhcpInterfaces = [];
+let _dhcpMaxPools = 8;
+let _dhcpConfigError = '';
+
+function ipToInt(value) {
+    const parts = String(value == null ? '' : value).trim().split('.');
+    if (parts.length !== 4) return null;
+    let result = 0;
+    for (const part of parts) {
+        if (!/^\d{1,3}$/.test(part)) return null;
+        const octet = Number(part);
+        if (octet > 255) return null;
+        result = result * 256 + octet;
+    }
+    return result;
+}
+
+function ipInSubnet(ip, subnet, netmask) {
+    const address = ipToInt(ip);
+    const network = ipToInt(subnet);
+    const mask = ipToInt(netmask);
+    if (address === null || network === null || mask === null) return false;
+    // A non-contiguous mask would make the comparison below meaningless.
+    const inverted = (~mask) >>> 0;
+    if ((((inverted + 1) & inverted) >>> 0) !== 0) return false;
+    return ((address & mask) >>> 0) === ((network & mask) >>> 0);
+}
+
+function dhcpPoolCards() {
+    return Array.from(document.querySelectorAll('#dhcpPoolList [data-pool-index]'));
+}
+
+function dhcpPoolField(card, field) {
+    const el = card ? card.querySelector(`[data-field="${field}"]`) : null;
+    return el ? el.value.trim() : '';
+}
+
+function dhcpZtpBadgeAttrs(enabled) {
+    const color = enabled ? '#76b900' : '#888';
+    return `style="font-size: 10px; color: ${color}; border: 1px solid ${color}; border-radius: 3px; padding: 1px 6px;"`;
+}
+
+function setDhcpZtpBadge(card, enabled) {
+    const badge = card ? card.querySelector('[data-field="ztpBadge"]') : null;
+    if (!badge) return;
+    badge.textContent = 'ZTP: ' + (enabled ? 'on' : 'off');
+    const color = enabled ? '#76b900' : '#888';
+    badge.style.color = color;
+    badge.style.borderColor = color;
+}
+
+function dhcpPoolCell(label, field, value, placeholder, handler, hint) {
+    return `<div>
+                <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">${label}</label>
+                <input type="text" class="form-input" data-field="${field}" style="width: 100%;" autocomplete="off" placeholder="${escHtml(placeholder)}" value="${escHtml(String(value == null ? '' : value))}"${handler ? ' ' + handler : ''}>
+                ${hint ? `<div style="font-size: 10px; color: #666; margin-top: 3px;">${hint}</div>` : ''}
+            </div>`;
+}
+
+function dhcpPoolCardHtml(index, pool) {
+    const p = pool || {};
+    const isPrimary = index === 0;
+    const name = String(p.name || '') || `Pool-${index + 1}`;
+    const url = String(p.provision_url || '');
+    const badge = isPrimary
+        ? '<span style="font-size: 10px; color: #76b900; border: 1px solid #76b900; border-radius: 3px; padding: 1px 6px;">Primary / directly attached</span>'
+        : '<span style="font-size: 10px; color: #ff9800; border: 1px solid #ff9800; border-radius: 3px; padding: 1px 6px;">Relayed</span>';
+    const callout = isPrimary ? '' : `<div style="margin-bottom: 10px; padding: 10px 12px; background: #241c10; border: 1px solid #ff9800; border-radius: 4px;">
+            <div style="font-size: 12px; font-weight: 600; color: #ff9800; margin-bottom: 4px;">Relayed pool / external relay required</div>
+            <div data-field="relayLine" style="font-size: 11px; color: #ffb74d; line-height: 1.5;"></div>
+            <div style="font-size: 11px; color: #888; margin-top: 4px;">LLDPq neither configures nor checks that relay. <span style="color: #ff9800;">Relay status is not verified.</span></div>
+        </div>`;
+    const subnetHint = isPrimary
+        ? 'Must contain an IPv4 address of the listen interface.'
+        : 'Subnet of the relayed VLAN.';
+    return `<div data-pool-index="${index}" style="padding: 12px; background: #252526; border: 1px solid #3c3c3c; border-radius: 6px;">
+        <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px;">
+            <span data-field="ordinal" style="font-size: 11px; color: #666;">POOL ${index + 1}</span>
+            <span data-field="nameLabel" style="font-size: 13px; font-weight: 600; color: #d4d4d4;">${escHtml(name)}</span>
+            ${badge}
+            <span data-field="ztpBadge" ${dhcpZtpBadgeAttrs(!!url)}>ZTP: ${url ? 'on' : 'off'}</span>
+            ${isPrimary ? '' : '<button class="btn btn-danger btn-sm" style="margin-left: auto;" onclick="removeDHCPPool(this)">Remove</button>'}
+        </div>
+        ${callout}
+        <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;">
+            ${dhcpPoolCell('POOL NAME', 'name', name, `Pool-${index + 1}`, 'oninput="onDHCPPoolNameInput(this)"')}
+            ${dhcpPoolCell('SUBNET', 'subnet', p.subnet || '', '192.168.100.0', 'oninput="onDHCPPoolNetworkInput(this)"', subnetHint)}
+            ${dhcpPoolCell('NETMASK', 'netmask', p.netmask || '', '255.255.255.0', 'oninput="onDHCPPoolNetworkInput(this)"')}
+            ${dhcpPoolCell('DYNAMIC RANGE START', 'range_start', p.range_start || '', '192.168.100.210', '', 'Leave both range fields empty for reservations only.')}
+            ${dhcpPoolCell('DYNAMIC RANGE END', 'range_end', p.range_end || '', '192.168.100.249')}
+            ${dhcpPoolCell('GATEWAY (ROUTER)', 'gateway', p.gateway || '', '192.168.100.1')}
+            ${dhcpPoolCell('DNS SERVER', 'dns', p.dns || '', '192.168.100.1')}
+            ${dhcpPoolCell('DOMAIN NAME', 'domain', p.domain || '', 'example.com')}
+            ${dhcpPoolCell('ZTP PROVISION URL', 'provision_url', url, 'http://192.168.100.200/cumulus-ztp.sh', 'oninput="onDHCPPoolUrlInput(this)"', 'Empty means no provisioning options are sent for this pool: ZTP is off.')}
+            ${dhcpPoolCell('DEFAULT LEASE TIME (sec)', 'lease_time', p.lease_time || '', '172800')}
+        </div>
+    </div>`;
+}
+
+function renderDHCPPoolCards(pools) {
+    const list = document.getElementById('dhcpPoolList');
+    if (!list) return;
+    list.innerHTML = pools.map((pool, index) => dhcpPoolCardHtml(index, pool)).join('');
+    updateDHCPPoolCount();
+    refreshDhcpRelayInfo();
+}
+
+function reindexDHCPPoolCards() {
+    dhcpPoolCards().forEach((card, index) => {
+        card.setAttribute('data-pool-index', String(index));
+        const ordinal = card.querySelector('[data-field="ordinal"]');
+        if (ordinal) ordinal.textContent = `POOL ${index + 1}`;
+    });
+}
+
+function updateDHCPPoolCount() {
+    const count = dhcpPoolCards().length;
+    const info = document.getElementById('dhcpPoolCount');
+    if (info) info.textContent = `${count} of ${_dhcpMaxPools} pools`;
+    const btn = document.getElementById('btnDhcpAddPool');
+    if (btn) btn.disabled = count >= _dhcpMaxPools;
+}
+
+function nextDHCPPoolName() {
+    const cards = dhcpPoolCards();
+    let highest = 0;
+    cards.forEach(card => {
+        const match = /^Pool-(\d+)$/.exec(dhcpPoolField(card, 'name'));
+        if (match) highest = Math.max(highest, Number(match[1]));
+    });
+    return `Pool-${highest > 0 ? highest + 1 : cards.length + 1}`;
+}
+
+function onDHCPPoolNameInput(input) {
+    const card = input.closest('[data-pool-index]');
+    if (!card) return;
+    const label = card.querySelector('[data-field="nameLabel"]');
+    if (!label) return;
+    const index = Number(card.getAttribute('data-pool-index')) || 0;
+    label.textContent = input.value.trim() || `Pool ${index + 1}`;
+}
+
+function onDHCPPoolNetworkInput(input) {
+    if (input.closest('[data-pool-index="0"]')) refreshDhcpRelayInfo();
+}
+
+function onDHCPPoolUrlInput(input) {
+    setDhcpZtpBadge(input.closest('[data-pool-index]'), !!input.value.trim());
+}
+
+function dhcpRelayCandidates() {
+    const sel = document.getElementById('dhcpInterface');
+    const ifaceName = sel ? sel.value.trim() : '';
+    const entry = _dhcpInterfaces.find(i => i && i.name === ifaceName);
+    const primary = dhcpPoolCards()[0];
+    if (!entry || !primary) return [];
+    const subnet = dhcpPoolField(primary, 'subnet');
+    const netmask = dhcpPoolField(primary, 'netmask') || '255.255.255.0';
+    const addresses = (Array.isArray(entry.ips) && entry.ips.length)
+        ? entry.ips : (entry.ip ? [entry.ip] : []);
+    const candidates = [];
+    addresses.forEach(cidr => {
+        const ip = String(cidr).split('/')[0].trim();
+        if (ipToInt(ip) === null) return;
+        if (!ipInSubnet(ip, subnet, netmask)) return;
+        if (candidates.indexOf(ip) === -1) candidates.push(ip);
+    });
+    return candidates;
+}
+
+function dhcpRelayTargetValue(candidates) {
+    const list = candidates || dhcpRelayCandidates();
+    if (list.length === 1) return list[0];
+    if (list.length === 0) return '';
+    // Several interface addresses sit inside pool 1: the operator picks one.
+    const sel = document.getElementById('dhcpRelayTarget');
+    const chosen = sel ? sel.value.trim() : '';
+    return list.indexOf(chosen) === -1 ? '' : chosen;
+}
+
+function refreshDhcpRelayInfo() {
+    const candidates = dhcpRelayCandidates();
+    const wrap = document.getElementById('dhcpRelayTargetWrap');
+    const sel = document.getElementById('dhcpRelayTarget');
+    if (wrap && sel) {
+        const key = candidates.join(',');
+        if (sel.getAttribute('data-candidates') !== key) {
+            const chosen = candidates.indexOf(sel.value.trim()) === -1 ? '' : sel.value.trim();
+            sel.innerHTML = ['<option value="">Select one...</option>'].concat(
+                candidates.map(ip => `<option value="${escHtml(ip)}"${ip === chosen ? ' selected' : ''}>${escHtml(ip)}</option>`)
+            ).join('');
+            sel.value = chosen;
+            sel.setAttribute('data-candidates', key);
+        }
+        wrap.style.display = candidates.length > 1 ? '' : 'none';
+    }
+    const target = dhcpRelayTargetValue(candidates);
+    let line, color;
+    if (target) {
+        line = `Configure the gateway serving this subnet to relay (helper-address) DHCP requests to LLDPq at <strong style="font-family: monospace;">${escHtml(target)}</strong>.`;
+        color = '#ffb74d';
+    } else if (candidates.length > 1) {
+        line = 'The listen interface has several addresses inside pool 1. Choose the one relays must point at under RELAY TARGET above.';
+        color = '#ff9800';
+    } else {
+        line = 'The relay target cannot be derived until pool 1 contains an IPv4 address of the selected listen interface. Saving is rejected until then.';
+        color = '#ff9800';
+    }
+    document.querySelectorAll('#dhcpPoolList [data-field="relayLine"]').forEach(el => {
+        el.innerHTML = line;
+        el.style.color = color;
+    });
+}
+
+function applyDhcpConfigError() {
+    const banner = document.getElementById('dhcpConfigErrorBanner');
+    const text = document.getElementById('dhcpConfigErrorText');
+    const save = document.getElementById('btnSaveDhcpConfig');
+    if (text) text.textContent = _dhcpConfigError;
+    if (banner) banner.style.display = _dhcpConfigError ? '' : 'none';
+    if (save) save.disabled = !!_dhcpConfigError;
+}
+
+function addDHCPPool() {
+    if (dhcpPoolCards().length >= _dhcpMaxPools) {
+        showToast(`At most ${_dhcpMaxPools} DHCP pools are supported`, 'error');
+        return;
+    }
+    const target = dhcpRelayTargetValue();
+    const where = target
+        ? `LLDPq at <strong style="font-family: monospace;">${escHtml(target)}</strong>`
+        : 'LLDPq &mdash; but the relay target cannot be derived yet, because pool 1 does not contain an IPv4 address of the selected listen interface';
+    const message = 'This adds a pool for a <strong>different VLAN</strong>.<br><br>'
+        + `Clients in that VLAN can only reach LLDPq if the gateway serving the new subnet is configured to relay (helper-address) DHCP to ${where}.<br><br>`
+        + 'That relay lives outside LLDPq: LLDPq neither configures it nor verifies that it works.<br><br>'
+        + 'The new pool starts with provisioning disabled, because its ZTP provision URL is empty. Nothing is written until you press Save.';
+    showConfirmModal('Add Relayed Pool', message, () => {
+        const list = document.getElementById('dhcpPoolList');
+        if (!list) return;
+        const index = dhcpPoolCards().length;
+        if (index >= _dhcpMaxPools) {
+            showToast(`At most ${_dhcpMaxPools} DHCP pools are supported`, 'error');
+            return;
+        }
+        list.insertAdjacentHTML('beforeend', dhcpPoolCardHtml(index, {
+            name: nextDHCPPoolName(),
+            netmask: '255.255.255.0',
+        }));
+        updateDHCPPoolCount();
+        refreshDhcpRelayInfo();
+    }, 'Add Relayed Pool');
+}
+
+function removeDHCPPool(btn) {
+    const card = btn.closest('[data-pool-index]');
+    if (!card) return;
+    const index = dhcpPoolCards().indexOf(card);
+    const name = dhcpPoolField(card, 'name') || `Pool ${index + 1}`;
+    const subnet = dhcpPoolField(card, 'subnet');
+    const message = `Remove <strong>${escHtml(name)}</strong>${subnet ? ' (' + escHtml(subnet) + ')' : ''} from the DHCP configuration?<br><br>`
+        + 'Active leases in that subnet are <strong>not</strong> revoked: a client keeps its address until the lease expires, and then finds nothing.<br><br>'
+        + 'If you added that subnet to the Discovery Range by hand, remove it there manually.<br><br>'
+        + 'The relay (helper-address) configuration created for it on the gateway should also be removed manually if it is no longer needed.<br><br>'
+        + 'The card disappears immediately, but nothing is written until you press Save.';
+    showConfirmModal('Delete DHCP Pool', message, () => {
+        card.remove();
+        reindexDHCPPoolCards();
+        updateDHCPPoolCount();
+        refreshDhcpRelayInfo();
+    }, 'Delete Pool');
+}
+
 async function loadDHCPConfig() {
     // Use cached data from loadDiscoverySettings() if available, otherwise fetch
     const data = _cachedDhcpConfig || await apiCall('get-dhcp-config');
     _cachedDhcpConfig = null;  // clear cache after first use so Reload button works
     if (data.success) {
-        document.getElementById('dhcpSubnet').value = data.subnet || '';
-        document.getElementById('dhcpNetmask').value = data.netmask || '';
-        document.getElementById('dhcpRangeStart').value = data.range_start || '';
-        document.getElementById('dhcpRangeEnd').value = data.range_end || '';
-        document.getElementById('dhcpGateway').value = data.gateway || '';
-        document.getElementById('dhcpDNS').value = data.dns || '';
-        document.getElementById('dhcpDomain').value = data.domain || '';
-        document.getElementById('dhcpProvisionURL').value = data.provision_url || '';
-        document.getElementById('dhcpLeaseTime').value = data.lease_time || '';
-        
+        _dhcpInterfaces = Array.isArray(data.interfaces) ? data.interfaces : [];
+        const maxPools = parseInt(data.max_pools, 10);
+        _dhcpMaxPools = maxPools > 0 ? maxPools : 8;
+        _dhcpConfigError = String(data.config_error || '');
+
+        let pools = Array.isArray(data.pools) ? data.pools.slice() : [];
+        if (pools.length === 0 && data.subnet) {
+            pools = [{
+                name: '',
+                subnet: data.subnet,
+                netmask: data.netmask,
+                range_start: data.range_start,
+                range_end: data.range_end,
+                gateway: data.gateway,
+                dns: data.dns,
+                domain: data.domain,
+                provision_url: data.provision_url,
+                lease_time: data.lease_time,
+            }];
+        }
+        if (pools.length === 0) pools = [{}];
+
         // Discovery range and post-provision settings
         document.getElementById('discoveryRange').value = data.discovery_range || '';
         document.getElementById('autoBaseConfig').checked = data.auto_base_config !== false;
@@ -2271,32 +2547,47 @@ async function loadDHCPConfig() {
         } else {
             sel.innerHTML = `<option value="${escHtml(currentIface)}" selected>${escHtml(currentIface)}</option>`;
         }
+
+        renderDHCPPoolCards(pools);
+        applyDhcpConfigError();
     }
 }
 
 async function saveDHCPConfig() {
+    if (_dhcpConfigError) {
+        showToast('Cannot save: ' + _dhcpConfigError, 'error');
+        return;
+    }
+    const cards = dhcpPoolCards();
+    if (cards.length === 0) {
+        showToast('At least one DHCP pool is required', 'error');
+        return;
+    }
+    const pools = [];
+    for (let index = 0; index < cards.length; index++) {
+        const pool = {};
+        DHCP_POOL_FIELDS.forEach(field => { pool[field] = dhcpPoolField(cards[index], field); });
+        const label = pool.name || `Pool ${index + 1}`;
+        if (pool.name && (pool.name.length > DHCP_POOL_NAME_MAX || !DHCP_POOL_NAME_RE.test(pool.name))) {
+            showToast(`${label}: name may be at most ${DHCP_POOL_NAME_MAX} characters and contain only letters, digits, spaces, "-", "_" and "."`, 'error');
+            return;
+        }
+        if (!pool.subnet || !pool.netmask || !pool.gateway) {
+            showToast(`${label}: Subnet, Netmask and Gateway are required`, 'error');
+            return;
+        }
+        pools.push(pool);
+    }
+
     const config = {
-        subnet: document.getElementById('dhcpSubnet').value.trim(),
-        netmask: document.getElementById('dhcpNetmask').value.trim(),
-        range_start: document.getElementById('dhcpRangeStart').value.trim(),
-        range_end: document.getElementById('dhcpRangeEnd').value.trim(),
-        gateway: document.getElementById('dhcpGateway').value.trim(),
-        dns: document.getElementById('dhcpDNS').value.trim(),
-        domain: document.getElementById('dhcpDomain').value.trim(),
-        provision_url: document.getElementById('dhcpProvisionURL').value.trim(),
+        pools: pools,
         interface: document.getElementById('dhcpInterface').value.trim(),
-        lease_time: document.getElementById('dhcpLeaseTime').value.trim(),
         discovery_range: document.getElementById('discoveryRange').value.trim(),
         auto_base_config: document.getElementById('autoBaseConfig').checked,
         auto_ztp_disable: document.getElementById('autoZtpDisable').checked,
         auto_set_hostname: document.getElementById('autoSetHostname').checked,
         scan_interval: parseInt(document.getElementById('scanInterval').value) || 0,
     };
-
-    if (!config.subnet || !config.netmask || !config.gateway) {
-        showToast('Subnet, Netmask and Gateway are required', 'error');
-        return;
-    }
 
     if (!beginDhcpServiceOperation()) {
         showToast('Another DHCP operation is already in progress', 'error');
@@ -3790,8 +4081,8 @@ function renderSerialMapping() {
     tbody.innerHTML = serialMappings.map((m, i) => {
         const hasConfig = configSet.has(m.hostname);
         return `<tr>
-            <td><input type="text" class="form-input" value="${escHtml(m.serial)}" onchange="serialMappings[${i}].serial=this.value;document.getElementById('serialMappingStatus').textContent='Unsaved changes — click Save';document.getElementById('serialMappingStatus').style.color='#ff8c00';" style="width:100%;font-family:'Cascadia Code','Consolas',monospace;font-size:12px;" placeholder="Serial number"></td>
-            <td><input type="text" class="form-input" value="${escHtml(m.hostname)}" onchange="serialMappings[${i}].hostname=this.value;document.getElementById('serialMappingStatus').textContent='Unsaved changes — click Save';document.getElementById('serialMappingStatus').style.color='#ff8c00';" style="width:100%;font-size:12px;" placeholder="Hostname"></td>
+            <td><input type="text" class="form-input" value="${escHtml(m.serial)}" onchange="serialMappings[${i}].serial=this.value;document.getElementById('serialMappingStatus').textContent='Unsaved changes — click Save';document.getElementById('serialMappingStatus').style.color='#ff8c00';" autocomplete="off" style="width:100%;font-family:'Cascadia Code','Consolas',monospace;font-size:12px;" placeholder="Serial number"></td>
+            <td><input type="text" class="form-input" value="${escHtml(m.hostname)}" onchange="serialMappings[${i}].hostname=this.value;document.getElementById('serialMappingStatus').textContent='Unsaved changes — click Save';document.getElementById('serialMappingStatus').style.color='#ff8c00';" autocomplete="off" style="width:100%;font-size:12px;" placeholder="Hostname"></td>
             <td style="text-align:center;">${hasConfig ? '<span style="color:#76b900;" title="Config available">&#10004;</span>' : '<span style="color:#666;" title="No config file">&#8212;</span>'}</td>
             <td style="text-align:center;"><button class="btn btn-sm" onclick="serialMappings.splice(${i},1);renderSerialMapping();document.getElementById('serialMappingStatus').textContent='Unsaved changes — click Save';document.getElementById('serialMappingStatus').style.color='#ff8c00';" style="color:#ff4444;background:none;border:none;cursor:pointer;font-size:16px;" title="Remove">&times;</button></td>
         </tr>`;

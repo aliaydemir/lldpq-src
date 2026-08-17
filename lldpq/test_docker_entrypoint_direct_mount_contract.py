@@ -218,7 +218,9 @@ class DockerEntrypointDirectMountContractTests(unittest.TestCase):
     def test_isc_defaults_direct_mount_is_noop_or_fails_before_mutation(self):
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "isc-dhcp-server"
-            target.write_text('INTERFACES="eth0"\n', encoding="utf-8")
+            target.write_text(
+                'INTERFACESv4="eth0"\nINTERFACESv6=""\n', encoding="utf-8"
+            )
             target.chmod(0o664)
             before = target.read_bytes(), target.stat().st_ino, target.stat().st_mode
 
@@ -248,7 +250,9 @@ class DockerEntrypointDirectMountContractTests(unittest.TestCase):
             result = self._run_set_isc_default(target, "eno1", direct=False)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(target.read_bytes(), b'INTERFACES="eno1"\n')
+            self.assertEqual(
+                target.read_bytes(), b'INTERFACESv4="eno1"\nINTERFACESv6=""\n'
+            )
             self.assertNotEqual(target.stat().st_ino, before_inode)
             self.assertEqual(target.stat().st_mode & 0o7777, 0o664)
             self.assertIn("os.fsync(handle.fileno())", self.set_isc_default_program)

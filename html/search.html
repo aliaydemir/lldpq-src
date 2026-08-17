@@ -2365,7 +2365,7 @@
         window.onload = async function() {
             if (!await LLDPqAuth.checkWithRetry()) {
                 if (LLDPqAuth.lastCheckTransient) {
-                    showPageError('Auth check unreachable — reload the page to retry.');
+                    showPageError(LLDPqAuth.lastCheckMessage());
                 }
                 return;
             }

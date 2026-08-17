@@ -1288,6 +1288,11 @@ installer preserves it—even with `-y`. To replace it deliberately, use
 the original is saved beside it as a timestamped
 `.pre-lldpq-*.bak` file before activation.
 
+A freshly rendered `dhcpd.conf` holds one pool, `Pool-1`, with a default ZTP
+provision URL. Further pools are added from
+[Provision → DHCP Server](#dhcp-server-tab), which also documents the marker
+comments, the legacy `shared-network` unwrapping and the per-pool ZTP options.
+
 The uninstaller can clean known system components from a partial installation
 without recursively deleting an unrecognized install directory. After
 verifying that guarded path manually, `./uninstall.sh --force-partial` also
@@ -1825,7 +1830,7 @@ lifecycle management. It contains these tabs:
 | **Discover** | Scan a subnet for devices and run post-provision actions. |
 | **Inventory** | Manage hostname, MAC, IP, serial, role, status, DHCP selection, and static bindings; import/export CSV and rebuild `devices.yaml`. |
 | **Handover** | Classify switches as Commissioning or Handed Over without changing inventory or collection. |
-| **DHCP Server** | Configure and inspect the DHCP service, static reservations, and logs. |
+| **DHCP Server** | Configure and inspect the DHCP service, its pools, static reservations, and logs. |
 | **ZTP** | Manage the provisioning SSH key, quick settings, OS images, serial mappings, generated NVUE configs, and ZTP script. |
 | **Upgrade** | Upgrade already-running switches with candidate discovery, prechecks, batching, verification, and queue controls. |
 | **Base Config** | Deploy the standard base configuration files to selected devices. |
@@ -1882,7 +1887,9 @@ retained as commented entries.
 
 Placeholder MAC values can be used until the physical device is known. Saving
 DHCP selections writes the guarded desired state; service activation remains
-an explicit DHCP Server action.
+an explicit DHCP Server action. A save is refused when a DHCP-enabled row falls
+outside every configured pool or inside a pool's dynamic range; rows with DHCP
+turned off are exempt.
 
 ### Handover Tab
 
@@ -1904,10 +1911,89 @@ page.
 
 Manage the DHCP server for automated IP assignment to new switches:
 
-- **DHCP Configuration**: subnet, range, gateway, DNS, lease time, ZTP URL — all editable from web UI
+- **DHCP Pools**: up to 8 pools, each its own card with name, subnet, netmask, dynamic range, gateway, DNS, domain, ZTP provision URL and lease time
 - **Interface Selection**: dropdown with detected interfaces and their IPs
-- **Static Reservations**: read-only view of the MAC-to-IP reservations currently rendered from `dhcpd.hosts`
+- **Static Reservations**: read-only view of the MAC-to-IP reservations currently rendered from `dhcpd.hosts`, with the pool each reservation falls into
 - **Service Control**: Start / Restart / Stop buttons with live status indicator
+
+Pool 1 is the primary, directly attached pool: its subnet must contain an IPv4
+address of the single configured DHCP listen interface. The API enforces this on
+every save, including saves made while the DHCP service is stopped, because
+`dhcpd -t` performs no network operation and cannot catch it. A save that would
+move pool 1 off the listen interface's subnet is rejected.
+
+Pools 2 to 8 are relayed pools: they serve clients in a different VLAN/subnet. A
+DHCP broadcast in another VLAN never reaches LLDPq's untagged listen interface,
+so such a pool only works when the gateway/SVI serving that subnet is configured
+with a DHCP relay (helper address) pointing at LLDPq's address. `dhcpd` then
+selects the pool by matching the relay's `giaddr` against that pool's sibling
+`subnet` declaration.
+
+LLDPq does not configure and does not verify that relay; it is an external
+prerequisite. Each relayed pool card carries a persistent "Relayed pool /
+external relay required" callout with the derived LLDPq target address and an
+explicit "Relay status is not verified" label, and never reports a verified
+relay state. The pool's `option routers` and the relay's `giaddr` are usually
+the same SVI, but the DHCP protocol does not require it and LLDPq does not force
+them to match.
+
+Provisioning is per pool and is switched by the provision URL alone. An empty
+ZTP provision URL means that pool advertises none of DHCP option 239
+(`cumulus-provision-url`), option 72 (`www-server`) or option 114
+(`default-url`). Options 72 and 114 drive ONIE's network-install discovery, so
+they are withheld together with 239; otherwise an ONIE device in a
+non-provisioning subnet would try to install from the LLDPq server. A newly
+added pool starts with an empty URL, so provisioning is off. Only pool 1 gets a
+default provision URL, and only when a fresh install or the Docker entrypoint
+renders the initial template; a URL that was emptied explicitly is preserved by
+later saves and is never auto-refilled.
+
+`dhcpd.conf` remains the single source of truth. Pools are written as sibling
+top-level `subnet` blocks, each preceded by a machine-written marker comment
+`#LLDPQ pool name="..."` that carries the pool's display name; a block without
+that marker gets a positional name (`Pool-1`, `Pool-2`, ...). Pools are
+deliberately not wrapped in a `shared-network`, which would tell `dhcpd` the
+subnets share one wire and could hand out a lease from the wrong subnet. The
+legacy `shared-network OOB { subnet ... }` wrapper that every pre-multi-pool
+installation has is read and unwrapped automatically on the first save. If an
+existing `shared-network` block holds more than one subnet, or carries options
+at shared-network scope, LLDPq refuses to rewrite the file and asks for manual
+review rather than silently flattening a shape that can carry real same-L2
+semantics.
+
+`/etc/dhcp/dhcpd.hosts` is flat: bare `host { ... }` declarations with no
+enclosing `group { }` block and no per-host provisioning option. Every
+reservation inherits its options from the `subnet` block that contains its
+`fixed-address`, so a reservation in a non-provisioning pool correctly gets no
+ZTP options. Both save paths (Inventory Save and DHCP Config Save) regenerate
+the file, so an older grouped file migrates to the flat shape on the first save.
+
+Saving is refused when pools overlap; when pool 1 does not contain a
+listen-interface address; when a pool's dynamic range covers its gateway, the
+provisioning server address or one of its own reservations; when a DHCP-enabled
+reservation falls outside every pool or inside a pool's dynamic range; or when a
+pool that still has DHCP-enabled reservations is removed. Records with DHCP
+turned off in Inventory are exempt from the reservation checks, since
+monitored-only supplements legitimately live outside the pools. Error messages
+name the affected pools and hostnames. The same reservation checks run on
+Inventory Save and on DHCP Config Save.
+
+Pool 1 cannot be removed. Removing an extra pool does not revoke leases already
+handed out from it: a client keeps its address until the lease expires and then
+finds nothing. If that subnet's range had been added to the Discovery Range by
+hand, it must be cleaned up manually, as must the relay/helper configuration on
+the gateway.
+
+Discovery is deliberately unchanged. Only the first pool's subnet feeds the
+default Discovery Range; extra pools are not scanned automatically. To have a
+second range scanned, add it to the existing Discovery Range field, which
+already accepts comma-separated ranges within the existing 1500-address total
+limit.
+
+Not supported in this release: configuring the relay on the gateway from LLDPq,
+multiple DHCP listen interfaces or 802.1Q trunk mode, several IP subnets on the
+same L2 (ISC `shared-network` semantics), IPv6 (`subnet6`), and a per-pool
+discovery range.
 
 Native installs can serve DHCP directly. Docker deployments must use the
 explicit Linux host-network provisioning mode described in [Docker DHCP/ONIE
@@ -1956,7 +2042,12 @@ Deploy standard switch tools and configs to selected devices:
 
 ```
 New switch powers on
-  → DHCP assigns IP (from dhcpd.conf + dhcpd.hosts bindings)
+  → DHCP assigns IP (from the matching dhcpd.conf pool + dhcpd.hosts bindings)
+      - Pool 1 answers clients on the listen interface's own subnet
+      - Pools 2-8 answer only requests forwarded by an external DHCP relay,
+        selected by the relay's giaddr
+      - ZTP options (239, 72, 114) come only from pools that have a
+        provision URL
   → ZTP script runs automatically (cumulus-ztp.sh):
       - Check/upgrade OS version (onie-install if needed)
       - Change default password

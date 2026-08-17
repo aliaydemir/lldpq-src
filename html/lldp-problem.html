@@ -268,7 +268,7 @@
             if (!await LLDPqAuth.checkWithRetry()) {
                 if (LLDPqAuth.lastCheckTransient) {
                     document.getElementById('metinAlani-1').textContent =
-                        'Auth check unreachable — reload the page to retry.';
+                        LLDPqAuth.lastCheckMessage();
                 }
                 return;
             }
