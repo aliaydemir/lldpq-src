@@ -12,3 +12,4 @@ IMPROVEMENT_PLAN.md
 tests/
 output/
 .pytest_cache/
+.regress-check/
