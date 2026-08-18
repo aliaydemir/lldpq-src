@@ -5387,6 +5387,51 @@ if command -v setfacl &> /dev/null; then
     echo "    Default ACL set (new files will inherit group read permission)"
 fi
 
+# The install tree grants www-data access through the group, but that is worth
+# nothing unless www-data can also walk every parent directory leading to it.
+# Recent Ubuntu releases create home directories as 0750 owned by the user's
+# own group, which hides the whole tree from CGI while `ls` as the install user
+# still looks perfectly correct. Grant search permission to www-data alone, and
+# only on the components that are actually closed, so no other local account
+# gains anything.
+ensure_web_traversal() {
+    local target="$1" component path
+    local -a components=()
+    path="$target"
+    while [[ -n "$path" && "$path" != "/" ]]; do
+        components=("$path" "${components[@]}")
+        path=$(dirname "$path")
+    done
+    for component in "${components[@]}"; do
+        if sudo -u www-data test -x "$component" 2>/dev/null; then
+            continue
+        fi
+        if ! sudo setfacl -m u:www-data:x "$component"; then
+            echo "[!] Could not grant www-data search access to $component" >&2
+            return 1
+        fi
+        echo "    Granted www-data search access to $component"
+    done
+    return 0
+}
+
+echo "  - Checking web access to $LLDPQ_INSTALL_DIR"
+if ! ensure_web_traversal "$LLDPQ_INSTALL_DIR"; then
+    echo "[!] The web UI cannot reach $LLDPQ_INSTALL_DIR" >&2
+    exit 1
+fi
+
+# Prove the web user can read the tree instead of assuming the ownership, mode
+# and ACL work above added up. Without this check the failure stays invisible
+# until the Setup page reports a missing device parser.
+if ! sudo -u www-data test -x "$LLDPQ_INSTALL_DIR" || \
+   ! sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/parse_devices.py"; then
+    echo "[!] www-data cannot read $LLDPQ_INSTALL_DIR/parse_devices.py" >&2
+    echo "    Setup would report: Canonical device parser is missing" >&2
+    exit 1
+fi
+echo "    Web user can read the install tree"
+
 # Update git hooks if .git exists (update mode preserves .git from backup restore later)
 if [[ -d "$LLDPQ_INSTALL_DIR/.git" ]]; then
     echo "  - Updating git hooks..."
@@ -6742,6 +6787,28 @@ if [[ "$INSTALL_MODE" == "update" ]] && \
 fi
 
 # ============================================================================
+# VERIFY WEB API
+# ============================================================================
+# A finished file copy is not the same as a working web UI. An fcgiwrap socket
+# that never came up, or an nginx site that was never enabled, leaves every
+# static page loading while every CGI route fails. In the browser that reads as
+# "Auth check unreachable" with nothing pointing back at the installer, so probe
+# the one endpoint the whole UI depends on before declaring success.
+_api_warning=""
+echo "  - Verifying the web API responds..."
+_api_port=$(grep -ohm1 '^[[:space:]]*listen[[:space:]]\+[0-9]\+' \
+    /etc/nginx/sites-enabled/lldpq 2>/dev/null | grep -o '[0-9]\+' || true)
+_api_port=${_api_port:-80}
+_api_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+    "http://127.0.0.1:${_api_port}/auth-api?action=check" 2>/dev/null || echo "000")
+if [[ "$_api_status" == "200" ]]; then
+    echo "    Authentication API responded on port $_api_port"
+else
+    _api_warning="The authentication API did not answer (HTTP $_api_status)"
+    echo "[!] $_api_warning" >&2
+fi
+
+# ============================================================================
 # COMPLETE
 # ============================================================================
 echo ""
@@ -6752,6 +6819,16 @@ else
     echo "LLDPq Installation Complete!"
 fi
 echo "=================================="
+if [[ -n "$_api_warning" ]]; then
+    echo ""
+    echo "[!] $_api_warning"
+    echo "    The web UI will show 'Auth check unreachable' until this is fixed."
+    echo "    Check these on this host:"
+    echo "      systemctl status fcgiwrap fcgiwrap.socket nginx"
+    echo "      ls -l /var/run/fcgiwrap.socket"
+    echo "      ls -l /etc/nginx/sites-enabled/"
+    echo "      curl -i http://127.0.0.1:${_api_port}/auth-api?action=check"
+fi
 echo ""
 echo "  Web interface: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost')"
 echo ""
