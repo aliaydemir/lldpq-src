@@ -5421,16 +5421,40 @@ if ! ensure_web_traversal "$LLDPQ_INSTALL_DIR"; then
     exit 1
 fi
 
-# Prove the web user can read the tree instead of assuming the ownership, mode
-# and ACL work above added up. Without this check the failure stays invisible
-# until the Setup page reports a missing device parser.
+# Provision and Setup replace devices.yaml atomically: a temporary file is
+# created next to it and renamed over the target, which needs write permission
+# on the directory itself, not just on the file. Mode 750 with group www-data
+# grants read and traverse only, so the rename fails and the operator is told
+# the target is root-owned - a message that sends them after the wrong problem.
+# Grant the write to www-data alone rather than widening the mode, and note that
+# this adds no capability: the sudoers policy below already lets www-data run
+# bash as $LLDPQ_USER. Must stay after every chmod above, because chmod
+# recalculates the ACL mask and would clip this entry back to r-x.
+if ! sudo setfacl -m u:www-data:rwx "$LLDPQ_INSTALL_DIR"; then
+    echo "[!] Could not grant www-data write access to $LLDPQ_INSTALL_DIR" >&2
+    exit 1
+fi
+
+# Prove the web user can read *and* stage files, instead of assuming the
+# ownership, mode and ACL work above added up. Without these checks both
+# failures stay invisible until the UI reports something misleading: a missing
+# device parser for the read side, a root-owned target for the write side.
 if ! sudo -u www-data test -x "$LLDPQ_INSTALL_DIR" || \
    ! sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/parse_devices.py"; then
     echo "[!] www-data cannot read $LLDPQ_INSTALL_DIR/parse_devices.py" >&2
     echo "    Setup would report: Canonical device parser is missing" >&2
     exit 1
 fi
-echo "    Web user can read the install tree"
+_web_write_probe="$LLDPQ_INSTALL_DIR/.lldpq-web-write-probe"
+sudo rm -f "$_web_write_probe"
+if ! sudo -u www-data touch "$_web_write_probe" 2>/dev/null; then
+    echo "[!] www-data cannot create files in $LLDPQ_INSTALL_DIR" >&2
+    echo "    Saving devices.yaml from the web UI would fail" >&2
+    exit 1
+fi
+sudo rm -f "$_web_write_probe"
+unset _web_write_probe
+echo "    Web user can read and write the install tree"
 
 # Update git hooks if .git exists (update mode preserves .git from backup restore later)
 if [[ -d "$LLDPQ_INSTALL_DIR/.git" ]]; then
@@ -5439,6 +5463,11 @@ if [[ -d "$LLDPQ_INSTALL_DIR/.git" ]]; then
 #!/bin/bash
 # Fix permissions after git pull/merge (preserve group read access for www-data)
 chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
+# The chmod above recalculates the ACL mask, which clips the web user's write
+# grant back to r-x and breaks atomic devices.yaml saves until the next install.
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:www-data:rwx "$(git rev-parse --show-toplevel)" 2>/dev/null || true
+fi
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
@@ -6692,6 +6721,11 @@ EOF
 #!/bin/bash
 # Fix permissions after git pull/merge (preserve group read access for www-data)
 chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
+# The chmod above recalculates the ACL mask, which clips the web user's write
+# grant back to r-x and breaks atomic devices.yaml saves until the next install.
+if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:www-data:rwx "$(git rev-parse --show-toplevel)" 2>/dev/null || true
+fi
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then

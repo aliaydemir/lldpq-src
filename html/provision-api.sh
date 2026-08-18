@@ -503,6 +503,7 @@ def atomic_write_text(path, content, mode=0o664):
         raise direct_file_mount_error(logical_path)
 
     tmp_path = None
+    primary_error = None
     try:
         fd, tmp_path = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path),
                                         suffix='.tmp', dir=directory)
@@ -533,7 +534,8 @@ def atomic_write_text(path, content, mode=0o664):
                 raise OSError(f'Atomic replacement metadata mismatch for {path}')
         fsync_directory(directory)
         return
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        primary_error = exc
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         tmp_path = None
@@ -555,9 +557,15 @@ def atomic_write_text(path, content, mode=0o664):
         '/etc/default/isc-dhcp-server',
     }
     if logical_path not in privileged_targets:
+        # This fallback is reached for *any* failure of the primary path, so
+        # naming a single presumed cause here is what previously sent operators
+        # after a root-owned file that was never root-owned. Report the real
+        # errno and the directory the rename needs.
         raise OSError(
-            f'Atomic replacement is not permitted for root-owned target {path}'
-        )
+            f'Could not atomically replace {path}: {primary_error}. '
+            f'A temporary file is staged in {directory} and renamed over the '
+            f'target, so {directory} must be writable by this user.'
+        ) from primary_error
     root_stage = logical_path + '.lldpq-root-stage'
     fd, staged = tempfile.mkstemp(prefix='lldpq-write-', suffix='.tmp')
     try:
