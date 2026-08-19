@@ -55,7 +55,7 @@ fi
 
 recover_lldp_outputs() {
     local recovery_marker="$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery"
-    sudo python3 - "$recovery_marker" "$SCRIPT_DIR" <<'PYTHON'
+    "${LLDPQ_PRIV[@]}" python3 - "$recovery_marker" "$SCRIPT_DIR" <<'PYTHON'
 import hashlib
 import json
 import os
@@ -165,8 +165,10 @@ try:
     )
     if marker != expected_marker:
         fail("LLDP recovery marker is outside the installation result tree")
-    # Production publication runs under sudo. The descriptor remains open
-    # until removal so path swaps cannot change which authority was trusted.
+    # The descriptor remains open until removal so path swaps cannot change
+    # which authority was trusted. Ownership is compared against this process's
+    # own euid, so a marker written by the commit is only ever trusted by a
+    # recovery running at the same privilege.
     payload = trusted_read_authority()
     if set(payload) != {"version", "status", "web_root", "records"}:
         fail("LLDP recovery marker has an unexpected schema")
@@ -300,6 +302,27 @@ PYTHON
 }
 
 mkdir -p "$SCRIPT_DIR/lldp-results" || exit 1
+
+# Local publication stages temporary siblings inside the result directories, so
+# it only needs privilege when this account cannot write to them. Decide that
+# once here and substitute the decision at every publication site: retrying an
+# individual command under sudo would leak the temporary a failed mktemp already
+# created and could re-apply a half-applied move. Escalation is never
+# interactive, because the web trigger runs from cron where a bare sudo has no
+# tty and fails immediately. The recovery journal below records the euid that
+# owns it and refuses a marker owned by anyone else, so recovery and the commit
+# that writes it must make the same decision - hence before recovery, not after
+# the runtime configuration is parsed.
+declare -a LLDPQ_PRIV=()
+if [[ ! -w "$SCRIPT_DIR/lldp-results" ]]; then
+    if sudo -n true 2>/dev/null; then
+        LLDPQ_PRIV=(sudo -n)
+    else
+        echo "Error: $SCRIPT_DIR/lldp-results is not writable by $(id -un) and passwordless sudo is unavailable" >&2
+        exit 1
+    fi
+fi
+
 if [[ -e "$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery" ||
       -L "$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery" ]]; then
     echo "Recovering interrupted LLDP publication..." >&2
@@ -331,6 +354,12 @@ if [[ -z "${WEB_ROOT:-}" ]]; then
     unset LLDPQ_CONFIG_ASSIGNMENTS
 fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
+# The decision above was taken before $WEB_ROOT was known. Report the second
+# publication target now rather than letting every write fail one by one.
+if [[ ${#LLDPQ_PRIV[@]} -eq 0 && ! -w "$WEB_ROOT" ]]; then
+    echo "Error: $WEB_ROOT is not writable by $(id -un) and passwordless sudo is unavailable" >&2
+    exit 1
+fi
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 # The tuning defaults near the top of this script were computed before the
 # runtime configuration was loaded, so LLDP_MAX_PARALLEL from /etc/lldpq.conf
@@ -373,19 +402,19 @@ trap 'exit 143' TERM
 
 publish_web_file() {
     local source_file="$1" destination_file="$2" temp_file
-    temp_file=$(sudo mktemp "$(dirname "$destination_file")/.lldpq-publish.XXXXXXXXXX") || return 1
-    if ! sudo cp "$source_file" "$temp_file" ||
-       ! sudo chown "${LLDPQ_USER:-$(whoami)}:www-data" "$temp_file" ||
-       ! sudo chmod 664 "$temp_file" ||
-       ! sudo mv -fT "$temp_file" "$destination_file"; then
-        sudo rm -f "$temp_file" 2>/dev/null || true
+    temp_file=$("${LLDPQ_PRIV[@]}" mktemp "$(dirname "$destination_file")/.lldpq-publish.XXXXXXXXXX") || return 1
+    if ! "${LLDPQ_PRIV[@]}" cp "$source_file" "$temp_file" ||
+       ! "${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER:-$(whoami)}:www-data" "$temp_file" ||
+       ! "${LLDPQ_PRIV[@]}" chmod 664 "$temp_file" ||
+       ! "${LLDPQ_PRIV[@]}" mv -fT "$temp_file" "$destination_file"; then
+        "${LLDPQ_PRIV[@]}" rm -f "$temp_file" 2>/dev/null || true
         return 1
     fi
 }
 
 commit_lldp_outputs() {
     local recovery_marker="$SCRIPT_DIR/lldp-results/.lldpq-lldp-recovery"
-    sudo python3 - "$LLDPQ_USER" "$recovery_marker" "$WEB_ROOT" \
+    "${LLDPQ_PRIV[@]}" python3 - "$LLDPQ_USER" "$recovery_marker" "$WEB_ROOT" \
         "$collection_dir/lldp_results.ini" "$SCRIPT_DIR/lldp-results/lldp_results.ini" \
         "$raw_problems" "$SCRIPT_DIR/lldp-results/raw-problems-lldp_results.ini" \
         "$problems" "$SCRIPT_DIR/lldp-results/problems-lldp_results.ini" \
@@ -1133,7 +1162,7 @@ echo "Publishing LLDP generation..."
 # Match the installer's ownership for this web-served archive. A plain mkdir
 # leaves a recreated directory as root:root, which locks both the collector and
 # the web UI out of it; install -d also repairs an already-wrong mode in place.
-sudo install -d -o "$LLDPQ_USER" -g www-data -m 775 "$WEB_ROOT/hstr" || exit 1
+"${LLDPQ_PRIV[@]}" install -d -o "$LLDPQ_USER" -g www-data -m 775 "$WEB_ROOT/hstr" || exit 1
 if [[ -f "$WEB_ROOT/problems-lldp_results.ini" ]]; then
     # Name the archive after the archived report's own "Created on" header so
     # the label archive.html renders matches the content; fall back to the
@@ -1195,7 +1224,7 @@ while IFS= read -r -d '' file; do
 done < <(find . -type f -name "*.ini" -mtime -1 -print0)
 while IFS= read -r -d '' file; do
     [[ -n "${keep_files[$file]:-}" ]] && continue
-    sudo rm -- "$file"
+    "${LLDPQ_PRIV[@]}" rm -- "$file"
 done < <(find . -type f -name "*.ini" -print0)
 
 # Show timing

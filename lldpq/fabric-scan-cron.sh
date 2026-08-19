@@ -7,6 +7,23 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
 fi
 
 CACHE_FILE="$WEB_ROOT/fabric-scan-cache.json"
+CACHE_DIR=$(dirname "$CACHE_FILE")
+
+# Publication stages a sibling temporary inside the cache directory and renames
+# it, so it only needs privilege when this account cannot write to that
+# directory. Decide once, before the playbook runs: the previous check tested the
+# cache file itself, which is the wrong object for a create-and-rename and took
+# the escalating branch whenever the file was merely absent. Escalation is never
+# interactive because this runs from cron, where a bare sudo has no tty.
+declare -a LLDPQ_PRIV=()
+if [[ ! -w "$CACHE_DIR" ]]; then
+    if sudo -n true 2>/dev/null; then
+        LLDPQ_PRIV=(sudo -n)
+    else
+        echo "fabric-scan-cron: $CACHE_DIR is not writable by $(id -un) and passwordless sudo is unavailable" >&2
+        exit 1
+    fi
+fi
 
 cd "$ANSIBLE_DIR" || exit 1
 
@@ -55,13 +72,8 @@ done <<< "$OUTPUT"
 # Write JSON cache atomically so web readers never observe a partial file
 TIMESTAMP=$(date +%s)000
 TMP_FILE="$CACHE_FILE.tmp.$$"
-if [[ -w "$CACHE_FILE" ]]; then
-    echo "{\"timestamp\":$TIMESTAMP,\"pendingDevices\":[$PENDING]}" > "$TMP_FILE"
-    chmod 664 "$TMP_FILE"
-    mv -f "$TMP_FILE" "$CACHE_FILE"
-else
-    echo "{\"timestamp\":$TIMESTAMP,\"pendingDevices\":[$PENDING]}" | sudo tee "$TMP_FILE" > /dev/null
-    sudo chown "${LLDPQ_USER:-$(whoami)}:www-data" "$TMP_FILE"
-    sudo chmod 664 "$TMP_FILE"
-    sudo mv -f "$TMP_FILE" "$CACHE_FILE"
-fi
+echo "{\"timestamp\":$TIMESTAMP,\"pendingDevices\":[$PENDING]}" | \
+    "${LLDPQ_PRIV[@]}" tee "$TMP_FILE" > /dev/null
+"${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER:-$(whoami)}:www-data" "$TMP_FILE"
+"${LLDPQ_PRIV[@]}" chmod 664 "$TMP_FILE"
+"${LLDPQ_PRIV[@]}" mv -f "$TMP_FILE" "$CACHE_FILE"

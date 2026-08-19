@@ -196,6 +196,11 @@ if cp --help 2>&1 | grep -- '--reflink' >/dev/null; then
     CP_REFLINK_ARGS=(--reflink=auto)
 fi
 
+# Prefix for every local publication command. The single decision that can put
+# an escalation in here is taken once, after $WEB_ROOT is known and before any
+# publication runs; unprivileged is the default that a healthy install uses.
+declare -a LLDPQ_PRIV=()
+
 # === TUNING PARAMETERS ===
 SSH_TIMEOUT=60   # SSH connection timeout in seconds
 apply_monitor_tuning() {
@@ -996,24 +1001,24 @@ publish_web_report_marker() {
 
     [[ -d "$web_dir" ]] || return 0
     web_parent=$(dirname "$web_marker") || return 1
-    sudo mkdir -p "$web_parent" 2>/dev/null || return 1
+    "${LLDPQ_PRIV[@]}" mkdir -p "$web_parent" 2>/dev/null || return 1
 
     if [[ -e "$web_marker" || -L "$web_marker" ]] &&
        [[ "$source_marker" -ef "$web_marker" ]]; then
-        sudo chown "${LLDPQ_USER:-$(id -un)}:www-data" "$source_marker" \
-            2>/dev/null && sudo chmod 0640 "$source_marker" 2>/dev/null
+        "${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER:-$(id -un)}:www-data" "$source_marker" \
+            2>/dev/null && "${LLDPQ_PRIV[@]}" chmod 0640 "$source_marker" 2>/dev/null
         return $?
     fi
 
-    web_temporary=$(sudo mktemp \
+    web_temporary=$("${LLDPQ_PRIV[@]}" mktemp \
         "$web_parent/$(basename "$web_marker").tmp.XXXXXXXX" 2>/dev/null) || \
         return 1
-    if ! sudo cp -- "$source_marker" "$web_temporary" 2>/dev/null ||
-       ! sudo chown "${LLDPQ_USER:-$(id -un)}:www-data" "$web_temporary" \
+    if ! "${LLDPQ_PRIV[@]}" cp -- "$source_marker" "$web_temporary" 2>/dev/null ||
+       ! "${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER:-$(id -un)}:www-data" "$web_temporary" \
             2>/dev/null ||
-       ! sudo chmod 0640 "$web_temporary" 2>/dev/null ||
-       ! sudo mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
-        sudo rm -f -- "$web_temporary" 2>/dev/null || true
+       ! "${LLDPQ_PRIV[@]}" chmod 0640 "$web_temporary" 2>/dev/null ||
+       ! "${LLDPQ_PRIV[@]}" mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
+        "${LLDPQ_PRIV[@]}" rm -f -- "$web_temporary" 2>/dev/null || true
         return 1
     fi
     return 0
@@ -1118,12 +1123,12 @@ prune_orphaned_publish_stages() {
     local stale_stage
     [[ -d "$WEB_ROOT/monitor-results" ]] || return 0
     while IFS= read -r -d '' stale_stage; do
-        if sudo rm -rf -- "$stale_stage"; then
+        if "${LLDPQ_PRIV[@]}" rm -rf -- "$stale_stage"; then
             echo "Removed orphaned publish stage: $stale_stage"
         else
             echo "Warning: could not remove orphaned publish stage: $stale_stage" >&2
         fi
-    done < <(sudo find "$WEB_ROOT" -mindepth 1 -maxdepth 1 \
+    done < <("${LLDPQ_PRIV[@]}" find "$WEB_ROOT" -mindepth 1 -maxdepth 1 \
         -name '.monitor-results.new.*' -mmin +120 -print0 2>/dev/null)
     return 0
 }
@@ -1143,7 +1148,7 @@ complete_report_state() {
     fi
 
     if [[ -d "$WEB_ROOT/monitor-results" ]]; then
-        sudo rm -f "$WEB_ROOT/monitor-results/$status_marker_relative" \
+        "${LLDPQ_PRIV[@]}" rm -f "$WEB_ROOT/monitor-results/$status_marker_relative" \
             2>/dev/null || return 1
     fi
     # Source is the alert authority; clear it last so alerts remain fail-closed
@@ -1324,7 +1329,7 @@ PYTHON
 
 atomic_exchange_paths() {
     local first=$1 second=$2
-    sudo python3 - "$first" "$second" <<'PYTHON'
+    "${LLDPQ_PRIV[@]}" python3 - "$first" "$second" <<'PYTHON'
 import ctypes
 import os
 import sys
@@ -1369,14 +1374,14 @@ activate_monitor_results_stage() {
         atomic_exchange_paths "$stage_dir" "$destination_dir" 2>/dev/null
         exchange_status=$?
         if [[ "$exchange_status" -eq 0 ]]; then
-            if ! sudo rm -rf "$stage_dir"; then
+            if ! "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir"; then
                 echo "Warning: previous monitor web tree remains at $stage_dir" >&2
             fi
             return 0
         fi
         if [[ "$exchange_status" -ne 2 ]]; then
             echo "Atomic monitor web activation failed (status $exchange_status)" >&2
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
 
@@ -1385,26 +1390,26 @@ activate_monitor_results_stage() {
         old_term=$(trap -p TERM)
         trap '' HUP INT TERM
         backup_dir="${stage_dir}.previous"
-        if ! sudo mv -T "$destination_dir" "$backup_dir"; then
+        if ! "${LLDPQ_PRIV[@]}" mv -T "$destination_dir" "$backup_dir"; then
             restore_publish_traps
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
 
-    if ! sudo mv -T "$stage_dir" "$destination_dir"; then
+    if ! "${LLDPQ_PRIV[@]}" mv -T "$stage_dir" "$destination_dir"; then
         if [[ -n "$backup_dir" ]]; then
-            if ! sudo mv -T "$backup_dir" "$destination_dir" 2>/dev/null; then
+            if ! "${LLDPQ_PRIV[@]}" mv -T "$backup_dir" "$destination_dir" 2>/dev/null; then
                 echo "CRITICAL: monitor web rollback is retained at $backup_dir" >&2
             fi
             restore_publish_traps
         fi
-        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi
 
     if [[ -n "$backup_dir" ]]; then
-        if ! sudo rm -rf "$backup_dir"; then
+        if ! "${LLDPQ_PRIV[@]}" rm -rf "$backup_dir"; then
             echo "Warning: previous monitor web tree remains at $backup_dir" >&2
         fi
         restore_publish_traps
@@ -1414,17 +1419,17 @@ activate_monitor_results_stage() {
 
 normalize_web_stage_permissions() {
     local stage_dir=$1
-    if ! sudo chown -R "${LLDPQ_USER:-$(whoami)}:www-data" "$stage_dir" ||
-       ! sudo find "$stage_dir" -type d -exec chmod 775 {} + ||
-       ! sudo find "$stage_dir" -type f -exec chmod 664 {} +; then
+    if ! "${LLDPQ_PRIV[@]}" chown -R "${LLDPQ_USER:-$(whoami)}:www-data" "$stage_dir" ||
+       ! "${LLDPQ_PRIV[@]}" find "$stage_dir" -type d -exec chmod 775 {} + ||
+       ! "${LLDPQ_PRIV[@]}" find "$stage_dir" -type f -exec chmod 664 {} +; then
         return 1
     fi
     if [[ -f "$stage_dir/.lldpq-stale" ]] &&
-       ! sudo chmod 0640 "$stage_dir/.lldpq-stale"; then
+       ! "${LLDPQ_PRIV[@]}" chmod 0640 "$stage_dir/.lldpq-stale"; then
         return 1
     fi
     if [[ -d "$stage_dir/.analysis-state" ]] &&
-       ! sudo find "$stage_dir/.analysis-state" -type f -exec chmod 640 {} +; then
+       ! "${LLDPQ_PRIV[@]}" find "$stage_dir/.analysis-state" -type f -exec chmod 640 {} +; then
         return 1
     fi
     return 0
@@ -1438,16 +1443,16 @@ publish_full_monitor_results() {
     # Copy into a complete sibling tree first. A failed/partial copy never
     # touches the currently served directory. This also self-heals the legacy
     # Docker layout where destination_dir is a symlink to source_dir.
-    stage_dir=$(sudo mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
-    if ! sudo cp -a "${CP_REFLINK_ARGS[@]}" -- "$source_dir/." "$stage_dir/"; then
-        sudo rm -rf "$stage_dir" 2>/dev/null || true
+    stage_dir=$("${LLDPQ_PRIV[@]}" mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
+    if ! "${LLDPQ_PRIV[@]}" cp -a "${CP_REFLINK_ARGS[@]}" -- "$source_dir/." "$stage_dir/"; then
+        "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi
 
     if [[ "$SKIP_OPTICAL" == "true" ]]; then
         # Keep the private history for a future enabled run, but never republish
         # an old aggregate/history as though it belonged to this skipped run.
-        if ! sudo rm -rf "$stage_dir/optical_history.json" \
+        if ! "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir/optical_history.json" \
                 "$stage_dir/optical-history" \
                 "$stage_dir/optical-analysis.html" \
                 "$stage_dir/optical-details" \
@@ -1456,7 +1461,7 @@ publish_full_monitor_results() {
                 "$stage_dir/export/optical.json.sha256" \
                 "$stage_dir/export/optical.csv" \
                 "$stage_dir/export/optical.csv.sha256" ||
-           ! sudo tee "$stage_dir/optical-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/optical-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Optical Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1465,7 +1470,7 @@ publish_full_monitor_results() {
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
@@ -1473,7 +1478,7 @@ EOF
     if [[ "$SKIP_DUPLICATE" == "true" ]]; then
         # Analyzer state (dup-data/) stays private for a future enabled run;
         # never republish an old aggregate as though it belonged to this run.
-        if ! sudo rm -f "$stage_dir/duplicate-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -f "$stage_dir/duplicate-analysis.html" \
                 "$stage_dir/dup-data/dup_seq_state.json" \
                 "$stage_dir/dup-data/dup_ip_state.json" \
                 "$stage_dir/summary/duplicate-summary.json" \
@@ -1481,7 +1486,7 @@ EOF
                 "$stage_dir/export/duplicate.json.sha256" \
                 "$stage_dir/export/duplicate.csv" \
                 "$stage_dir/export/duplicate.csv.sha256" ||
-           ! sudo tee "$stage_dir/duplicate-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/duplicate-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Duplicate IP/MAC Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1490,19 +1495,19 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
 
     if [[ "$SKIP_EVPN_MH" == "true" ]]; then
-        if ! sudo rm -f "$stage_dir/evpn-mh-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -f "$stage_dir/evpn-mh-analysis.html" \
                 "$stage_dir/summary/evpn-mh-summary.json" \
                 "$stage_dir/export/evpn-mh.json" \
                 "$stage_dir/export/evpn-mh.json.sha256" \
                 "$stage_dir/export/evpn-mh.csv" \
                 "$stage_dir/export/evpn-mh.csv.sha256" ||
-           ! sudo tee "$stage_dir/evpn-mh-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/evpn-mh-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>EVPN Multihoming Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1511,7 +1516,7 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
@@ -1519,7 +1524,7 @@ EOF
     if [[ "$SKIP_PFC_ECN" == "true" ]]; then
         # pfc_ecn_baseline.json and pfc-ecn-history/ stay private so a future
         # enabled run resumes its deltas; the web stage must not carry them.
-        if ! sudo rm -rf "$stage_dir/pfc-ecn-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir/pfc-ecn-analysis.html" \
                 "$stage_dir/pfc_ecn_baseline.json" \
                 "$stage_dir/pfc-ecn-history" \
                 "$stage_dir/summary/pfc-ecn-summary.json" \
@@ -1527,7 +1532,7 @@ EOF
                 "$stage_dir/export/pfc-ecn.json.sha256" \
                 "$stage_dir/export/pfc-ecn.csv" \
                 "$stage_dir/export/pfc-ecn.csv.sha256" ||
-           ! sudo tee "$stage_dir/pfc-ecn-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/pfc-ecn-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>PFC/ECN Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1536,7 +1541,7 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
@@ -1545,7 +1550,7 @@ EOF
         # Baselines/state (config-drift-data/, config_drift_history.json)
         # stay private so a future enabled run resumes its diffs; the web
         # stage must not carry them or republish an old report.
-        if ! sudo rm -rf "$stage_dir/config-drift-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir/config-drift-analysis.html" \
                 "$stage_dir/config_drift_history.json" \
                 "$stage_dir/config-drift-data" \
                 "$stage_dir/summary/config-drift-summary.json" \
@@ -1553,7 +1558,7 @@ EOF
                 "$stage_dir/export/config-drift.json.sha256" \
                 "$stage_dir/export/config-drift.csv" \
                 "$stage_dir/export/config-drift.csv.sha256" ||
-           ! sudo tee "$stage_dir/config-drift-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/config-drift-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Config Drift Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1562,7 +1567,7 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
@@ -1570,7 +1575,7 @@ EOF
     if [[ "$SKIP_ROUTES" == "true" ]]; then
         # Route history shards / event state stay private for a future
         # enabled run; never republish an old aggregate as current.
-        if ! sudo rm -rf "$stage_dir/routes-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir/routes-analysis.html" \
                 "$stage_dir/routes_events.json" \
                 "$stage_dir/routes-history" \
                 "$stage_dir/summary/routes-summary.json" \
@@ -1578,7 +1583,7 @@ EOF
                 "$stage_dir/export/routes.json.sha256" \
                 "$stage_dir/export/routes.csv" \
                 "$stage_dir/export/routes.csv.sha256" ||
-           ! sudo tee "$stage_dir/routes-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/routes-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Routes Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1587,19 +1592,19 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
 
     if [[ "$SKIP_FABRIC_CHECK" == "true" ]]; then
-        if ! sudo rm -f "$stage_dir/fabric-check-analysis.html" \
+        if ! "${LLDPQ_PRIV[@]}" rm -f "$stage_dir/fabric-check-analysis.html" \
                 "$stage_dir/summary/fabric-check-summary.json" \
                 "$stage_dir/export/fabric-check.json" \
                 "$stage_dir/export/fabric-check.json.sha256" \
                 "$stage_dir/export/fabric-check.csv" \
                 "$stage_dir/export/fabric-check.csv.sha256" ||
-           ! sudo tee "$stage_dir/fabric-check-analysis.html" >/dev/null <<'EOF'
+           ! "${LLDPQ_PRIV[@]}" tee "$stage_dir/fabric-check-analysis.html" >/dev/null <<'EOF'
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Fabric Check Analysis - Skipped</title>
 <link rel="stylesheet" type="text/css" href="/css/styles2.css"></head>
@@ -1608,13 +1613,13 @@ EOF
 </body></html>
 EOF
         then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     fi
 
     if ! normalize_web_stage_permissions "$stage_dir"; then
-        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi
     activate_monitor_results_stage "$stage_dir" "$destination_dir"
@@ -1792,10 +1797,10 @@ PYTHON
     fi
 
     select_scope_web_overlays || return 1
-    stage_dir=$(sudo mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
-    if ! sudo cp -a "${CP_REFLINK_ARGS[@]}" -- \
+    stage_dir=$("${LLDPQ_PRIV[@]}" mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
+    if ! "${LLDPQ_PRIV[@]}" cp -a "${CP_REFLINK_ARGS[@]}" -- \
             "$destination_dir/." "$stage_dir/"; then
-        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi
 
@@ -1805,41 +1810,41 @@ PYTHON
         if [[ -f "$source_path" && ! -L "$source_path" ]]; then
             if [[ ! -s "$source_path" ]]; then
                 echo "Empty scoped artifact: $relative" >&2
-                sudo rm -rf "$stage_dir" 2>/dev/null || true
+                "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
                 return 1
             fi
         elif [[ -d "$source_path" && ! -L "$source_path" ]]; then
             if find "$source_path" -type l -print -quit | grep -q .; then
                 echo "Scoped artifact contains a symlink: $relative" >&2
-                sudo rm -rf "$stage_dir" 2>/dev/null || true
+                "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
                 return 1
             fi
         else
             echo "Missing or unsafe scoped artifact: $relative" >&2
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
-        if ! sudo rm -rf -- "$stage_path" ||
-           ! sudo mkdir -p -- "$(dirname "$stage_path")" ||
-           ! sudo cp -a "${CP_REFLINK_ARGS[@]}" -- \
+        if ! "${LLDPQ_PRIV[@]}" rm -rf -- "$stage_path" ||
+           ! "${LLDPQ_PRIV[@]}" mkdir -p -- "$(dirname "$stage_path")" ||
+           ! "${LLDPQ_PRIV[@]}" cp -a "${CP_REFLINK_ARGS[@]}" -- \
                 "$source_path" "$stage_path"; then
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     done
 
     # The full-run authority remains byte-for-byte unchanged in a scoped run.
     for protected in "${protected_files[@]}"; do
-        if ! sudo cmp -s -- \
+        if ! "${LLDPQ_PRIV[@]}" cmp -s -- \
                 "$destination_dir/$protected" "$stage_dir/$protected"; then
             echo "Scoped publication changed protected authority: $protected" >&2
-            sudo rm -rf "$stage_dir" 2>/dev/null || true
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
             return 1
         fi
     done
 
     if ! normalize_web_stage_permissions "$stage_dir"; then
-        sudo rm -rf "$stage_dir" 2>/dev/null || true
+        "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi
     activate_monitor_results_stage "$stage_dir" "$destination_dir"
@@ -4668,6 +4673,23 @@ if [[ "$MONITOR_SCOPE" == "fabric-check" && "$SKIP_FABRIC_CHECK" == "true" ]]; t
     exit 2
 fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
+
+# Publication stages a complete sibling tree inside $WEB_ROOT and swaps it in,
+# so it only needs privilege when this account cannot write there. Decide once
+# and substitute the decision at every publication site: retrying an individual
+# command under sudo would leak the stage directory a failed mktemp -d already
+# created and could re-apply a half-applied tree move, which is exactly the
+# rollback the staged swap exists to guarantee. Escalation is never interactive,
+# because the web trigger runs from cron where a bare sudo has no tty and fails
+# immediately.
+if [[ ! -w "$WEB_ROOT" ]]; then
+    if sudo -n true 2>/dev/null; then
+        LLDPQ_PRIV=(sudo -n)
+    else
+        echo "Error: $WEB_ROOT is not writable by $(id -un) and passwordless sudo is unavailable" >&2
+        exit 1
+    fi
+fi
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 prune_orphaned_publish_stages
 load_devices "$SCRIPT_DIR/parse_devices.py" || exit 1

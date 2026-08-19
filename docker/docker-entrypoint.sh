@@ -622,6 +622,12 @@ if [ ! -f "$MONITOR_WEB_DIR/.lldpq-current.json" ] && \
     fi
 fi
 
+# The web root itself, not only the managed children below: the collectors
+# publish atomically by creating a temporary sibling directly inside it, which
+# needs write permission on the directory. Keeps the container at parity with
+# install.sh, where a bind-mounted web root arrives owned by the host.
+install -d -o lldpq -g www-data -m 775 /var/www/html
+
 for dir in "$MONITOR_SOURCE_DIR" \
            /home/lldpq/lldpq/monitor-results/fabric-tables \
            /home/lldpq/lldpq/lldp-results \

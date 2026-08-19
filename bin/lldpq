@@ -26,6 +26,20 @@ fi
 [[ -n "${WEB_ROOT:-}" ]] || lldpq_fatal "WEB_ROOT is empty"
 LLDPQ_USER="${LLDPQ_USER:-$(id -un)}"
 
+# Marker publication stages a sibling temporary inside the web tree and renames
+# it, so it only needs privilege when this account cannot write there. Decide
+# once and substitute the decision at every publication site; escalation is
+# never interactive, because the scheduled invocation runs from cron where a
+# bare sudo has no tty and fails immediately.
+declare -a LLDPQ_PRIV=()
+if [[ ! -w "$WEB_ROOT" ]]; then
+    if sudo -n true 2>/dev/null; then
+        LLDPQ_PRIV=(sudo -n)
+    else
+        lldpq_fatal "$WEB_ROOT is not writable by $LLDPQ_USER and passwordless sudo is unavailable"
+    fi
+fi
+
 # Parse flags: lldpq - (verbose, including per-analyzer timing),
 # lldpq -s (skip optical).
 QUIET=true
@@ -134,21 +148,21 @@ publish_web_pipeline_marker() {
     # single inode but still enforce the web-reader contract explicitly.
     if [[ -e "$web_marker" || -L "$web_marker" ]] && \
        [[ "$source_marker" -ef "$web_marker" ]]; then
-        sudo chown "$LLDPQ_USER:www-data" "$source_marker" 2>/dev/null && \
-            sudo chmod 0640 "$source_marker" 2>/dev/null
+        "${LLDPQ_PRIV[@]}" chown "$LLDPQ_USER:www-data" "$source_marker" 2>/dev/null && \
+            "${LLDPQ_PRIV[@]}" chmod 0640 "$source_marker" 2>/dev/null
         return $?
     fi
 
     # Build the public marker beside its destination, set final metadata while
     # it is still private, then expose it with one same-filesystem rename. This
-    # prevents nginx from observing partial content or a root-only sudo-cp file.
-    web_temporary=$(sudo mktemp "$web_dir/.lldpq-stale.tmp.XXXXXXXX" 2>/dev/null) || \
+    # prevents nginx from observing partial content or a root-only copy.
+    web_temporary=$("${LLDPQ_PRIV[@]}" mktemp "$web_dir/.lldpq-stale.tmp.XXXXXXXX" 2>/dev/null) || \
         return 1
-    if ! sudo cp -- "$source_marker" "$web_temporary" 2>/dev/null || \
-       ! sudo chown "$LLDPQ_USER:www-data" "$web_temporary" 2>/dev/null || \
-       ! sudo chmod 0640 "$web_temporary" 2>/dev/null || \
-       ! sudo mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
-        sudo rm -f -- "$web_temporary" 2>/dev/null || true
+    if ! "${LLDPQ_PRIV[@]}" cp -- "$source_marker" "$web_temporary" 2>/dev/null || \
+       ! "${LLDPQ_PRIV[@]}" chown "$LLDPQ_USER:www-data" "$web_temporary" 2>/dev/null || \
+       ! "${LLDPQ_PRIV[@]}" chmod 0640 "$web_temporary" 2>/dev/null || \
+       ! "${LLDPQ_PRIV[@]}" mv -fT -- "$web_temporary" "$web_marker" 2>/dev/null; then
+        "${LLDPQ_PRIV[@]}" rm -f -- "$web_temporary" 2>/dev/null || true
         return 1
     fi
     return 0

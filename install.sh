@@ -5065,6 +5065,12 @@ sudo chmod 664 "$WEB_ROOT/VERSION"
 
 echo "  - Setting permissions on web directories"
 sudo chmod o+rx /var/www 2>/dev/null || true
+# $WEB_ROOT itself, not only its managed children below: the collectors publish
+# atomically by creating a temporary sibling directly inside this directory,
+# which needs write permission on the directory and not just on the files.
+# $LLDPQ_USER is already in www-data, so the shared group grants that with no
+# privilege escalation, and nginx keeps the read+traverse the same group gives.
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 775 "$WEB_ROOT"
 sudo chown -R "$LLDPQ_USER:www-data" "$WEB_ROOT/"
 sudo find "$WEB_ROOT" -type d -exec chmod 775 {} +
 sudo find "$WEB_ROOT" -type f -exec chmod 664 {} +
@@ -5099,6 +5105,30 @@ if [ ! -f "$WEB_ROOT/serial-mapping.txt" ]; then
 fi
 sudo chown "$LLDPQ_USER:www-data" "$WEB_ROOT/serial-mapping.txt"
 sudo chmod 664 "$WEB_ROOT/serial-mapping.txt"
+
+# Prove the collector account can stage and remove a file in $WEB_ROOT rather
+# than assuming the ownership above added up. check-lldp.sh, monitor.sh and
+# get-configs.sh publish by creating a temporary sibling in this directory and
+# renaming it over the target; the web-triggered path runs from cron as
+# $LLDPQ_USER, where nothing can answer an interactive privilege prompt. Without
+# this proof the failure only appears much later as a bare exit status in the UI.
+echo "  - Checking collector write access to $WEB_ROOT"
+_web_root_probe="$WEB_ROOT/.lldpq-collector-write-probe"
+sudo rm -f "$_web_root_probe"
+if ! sudo -u "$LLDPQ_USER" touch "$_web_root_probe" 2>/dev/null; then
+    echo "[!] $LLDPQ_USER cannot create files in $WEB_ROOT" >&2
+    echo "    LLDP/monitor publication would fail with only an exit status" >&2
+    echo "    Expected $WEB_ROOT to be $LLDPQ_USER:www-data mode 775" >&2
+    exit 1
+fi
+if ! sudo -u "$LLDPQ_USER" rm -f "$_web_root_probe" 2>/dev/null; then
+    echo "[!] $LLDPQ_USER cannot remove files in $WEB_ROOT" >&2
+    echo "    Publication rollback and archive pruning would fail" >&2
+    exit 1
+fi
+sudo rm -f "$_web_root_probe"
+unset _web_root_probe
+echo "    Collector account can publish into $WEB_ROOT"
 
 echo "  - Copying bin/* to /usr/local/bin/"
 # Copy only regular files (a stray bin/__pycache__ directory must not abort

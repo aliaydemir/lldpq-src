@@ -12,6 +12,7 @@ Licensed under MIT License - see LICENSE file for details
 """
 import json
 import os
+import pwd
 import re
 import stat
 import shutil
@@ -46,6 +47,51 @@ try:
     from parse_devices import get_all_devices, load_devices_yaml
 except ImportError:  # Source-tree imports used by unit tests.
     from lldpq.parse_devices import get_all_devices, load_devices_yaml
+
+def web_topology_directory():
+    """Resolve the directory the legacy topology publication writes into.
+
+    Mirrors the generator's own WEB_ROOT resolution so the privilege probe below
+    tests the directory that will actually be written.
+    """
+    web_root = os.environ.get("WEB_ROOT")
+    if not web_root:
+        try:
+            with open("/etc/lldpq.conf", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("WEB_ROOT="):
+                        web_root = line.strip().split("=", 1)[1]
+                        break
+        except OSError:
+            web_root = None
+    return os.path.join(web_root or "/var/www/html", "topology")
+
+
+def local_publication_command(directory):
+    """Decide once whether the legacy topology publication has to escalate.
+
+    Any escalation is non-interactive: this runs from cron too, where a bare
+    sudo has no tty and fails immediately rather than prompting.
+    """
+    if os.access(directory, os.W_OK):
+        return []
+    probe = subprocess.run(
+        ["sudo", "-n", "true"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if probe.returncode == 0:
+        return ["sudo", "-n"]
+    try:
+        account = pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        account = f"uid {os.geteuid()}"
+    raise RuntimeError(
+        f"{directory} is not writable by {account} and passwordless sudo "
+        "is unavailable"
+    )
+
 
 def load_topology_config(config_path="topology_config.yaml"):
     """Load topology configuration to determine which script to use"""
@@ -636,7 +682,8 @@ def main():
                 output_file_path, os.path.join(input_folder, "lldp_results.ini")
             )
         subprocess.run(
-            ["sudo", "python3", generate_topology_script, input_folder,
+            [*local_publication_command(web_topology_directory()),
+             "python3", generate_topology_script, input_folder,
              '--topology-file', topology_snapshot_path],
             check=True,
             cwd=script_dir,

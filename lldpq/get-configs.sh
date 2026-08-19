@@ -133,11 +133,16 @@ guard_child_path() {
     esac
 }
 
+# Applies the single privilege decision taken after the runtime configuration is
+# loaded. A scalar rather than an array prefix because this script runs with
+# `set -u`, where an empty array expansion is not portable.
+LLDPQ_PRIV_MODE=direct
+
 root_run() {
-    if [[ "${LLDPQ_TEST_NO_SUDO:-false}" == "true" ]]; then
-        "$@"
+    if [[ "$LLDPQ_PRIV_MODE" == "sudo" ]]; then
+        sudo -n "$@"
     else
-        sudo "$@"
+        "$@"
     fi
 }
 
@@ -632,6 +637,23 @@ fi
 WEB_ROOT=$(guard_managed_root "web root" "$WEB_ROOT") || exit 1
 WEB_ROOT=$(guard_web_root "$WEB_ROOT") || exit 1
 WEB_CONFIG_DIR=$(guard_child_path "$WEB_ROOT" "$WEB_ROOT/configs" "web config directory") || exit 1
+
+# Publication stages a sibling temporary inside the web root and renames it, so
+# it only needs privilege when this account cannot write there. Decide once here
+# and let root_run apply it at every site: retrying an individual command under
+# sudo would leak the temporary a failed mktemp already created and could
+# re-apply a half-applied move. Escalation is never interactive, because the
+# web-triggered path runs from cron where a bare sudo has no tty and fails
+# immediately. LLDPQ_TEST_NO_SUDO stays honoured as an explicit never-escalate
+# override for the container, which owns its whole web root already.
+if [[ "${LLDPQ_TEST_NO_SUDO:-false}" != "true" && ! -w "$WEB_ROOT" ]]; then
+    if sudo -n true 2>/dev/null; then
+        LLDPQ_PRIV_MODE=sudo
+    else
+        echo "$WEB_ROOT is not writable by $(id -un) and passwordless sudo is unavailable" >&2
+        exit 1
+    fi
+fi
 
 STAGING_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lldpq-configs.XXXXXX")
 UNREACHABLE_FILE="$STAGING_DIR/unreachable"
