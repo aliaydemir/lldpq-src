@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import ai_p2p
 import export_artifacts
 from lldp_report import LLDPReport, LLDPRow
 
@@ -29,7 +30,7 @@ DOMAIN = "lldp_results"
 CSV_HEADERS = (
     "Local Device", "Local Port", "Port Status", "Expected Neighbor",
     "Expected Port", "Active Neighbor", "Active Port", "Status",
-    "Connection Health",
+    "Connection Health", "P2P Sheet", "P2P Line", "P2P SEQ",
 )
 
 # Fresh-page default table order (html/lldp.html LLDP_STATUS_PRIORITY).
@@ -160,17 +161,53 @@ def build_payload(report: LLDPReport) -> dict[str, Any]:
     return payload
 
 
-def build_csv(report: LLDPReport) -> str:
+def _build_p2p_index(p2p_design: Any) -> dict:
+    if p2p_design is None:
+        return {}
+    try:
+        canonical = ai_p2p.load_connections(p2p_design)
+        return ai_p2p.build_port_index(canonical)
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        # P2P enrichment is optional. A stale/truncated active design must not
+        # make the already-valid LLDP report unavailable to headless clients.
+        return {}
+
+
+def _optional_csv_field(value: Any) -> str:
+    """Formula-safe RFC-4180 field that keeps missing P2P metadata blank."""
+    text = "" if value is None else str(value).strip()
+    return export_artifacts.csv_field(text) if text else ""
+
+
+def build_csv(report: LLDPReport, p2p_design: Any = None) -> str:
     """Byte-parity with the page's Download CSV of the freshly loaded table."""
     items = classified_rows(report)
+    p2p_index = _build_p2p_index(p2p_design)
     lines = [",".join(export_artifacts.csv_field(h) for h in CSV_HEADERS)]
     for row, status, health in items:
-        cells = (
+        cells = [
             row.local_device, row.local_port, row.port_status,
             row.expected_device, row.expected_port,
             row.actual_device, row.actual_port, status, health,
+        ]
+        design = ai_p2p.lookup_by_device_port(
+            p2p_index, row.local_device, row.local_port
         )
-        lines.append(",".join(export_artifacts.csv_field(cell) for cell in cells))
+        p2p_cells = (
+            (
+                design.get("sheet_name"),
+                design.get("row_number"),
+                design.get("seq"),
+            )
+            if design is not None
+            else ("", "", "")
+        )
+        lines.append(",".join(
+            [
+                *(export_artifacts.csv_field(cell) for cell in cells),
+                *(_optional_csv_field(cell) for cell in p2p_cells),
+            ]
+        ))
     return "\r\n".join(lines) + "\r\n"
 
 

@@ -9,6 +9,8 @@ export artifacts (legacy_v5 snapshot recovery, per-scope validation and
 overlay coverage).
 """
 
+import csv
+import io
 import json
 import os
 import re
@@ -21,6 +23,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 ROOT = SCRIPT_DIR.parent
+sys.path.insert(0, str(ROOT / "html"))
 
 import analysis_sidecar
 import export_artifacts
@@ -33,6 +36,8 @@ EXPORT_CGIS = tuple(
     for name in ("export-api.sh", "lldp-export-api.sh", "ai-export-api.sh")
 )
 NGINX_SITE = ROOT / "etc/nginx/sites-available/lldpq"
+LLDP_HTML = (ROOT / "html/lldp.html").read_text(encoding="utf-8")
+LLDP_EXPORT_API = (ROOT / "html/lldp-export-api.sh").read_text(encoding="utf-8")
 
 # Domains that existed when the export feature landed (legacy_v6 boundary).
 LEGACY_EXPORT_DOMAIN_FILES = tuple(
@@ -272,21 +277,30 @@ swp9 Fail exp,dev =swp19 act"dev @swp20 UP
 # within each bucket.
 GOLDEN_CSV = (
     "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
-    "Active Neighbor,Active Port,Status,Connection Health\r\n"
-    "leaf-01,swp4,DOWN,spine-01,swp13,N/A,N/A,FAILED,Local Port is DOWN\r\n"
-    "leaf-01,N/A,UP,spine-01,swp18,spine-01,swp18,FAILED,Local Port Not Defined\r\n"
-    "leaf-01,swp2,UP,spine-01,swp11,N/A,N/A,NO INFO,No LLDP Response Received\r\n"
-    "leaf-01,swp3,DOWN,spine-01,swp12,N/A,N/A,NO INFO,Local Port is DOWN\r\n"
+    "Active Neighbor,Active Port,Status,Connection Health,"
+    "P2P Sheet,P2P Line,P2P SEQ\r\n"
+    "leaf-01,swp4,DOWN,spine-01,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,\r\n"
+    "leaf-01,N/A,UP,spine-01,swp18,spine-01,swp18,FAILED,Local Port Not Defined,,,\r\n"
+    "leaf-01,swp2,UP,spine-01,swp11,N/A,N/A,NO INFO,No LLDP Response Received,,,\r\n"
+    "leaf-01,swp3,DOWN,spine-01,swp12,N/A,N/A,NO INFO,Local Port is DOWN,,,\r\n"
     "leaf-01,swp5,UP,spine-01,swp14,spine-01,swp15,WARNING,"
-    '"Port Mismatch: Expected swp14, Got swp15"\r\n'
+    '"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
     "leaf-01,swp6,UP,spine-01,swp16,spine-02,swp16,WARNING,"
-    '"Wrong Device: Expected spine-01, Got spine-02"\r\n'
-    "leaf-01,swp7,UP,spine-01,swp17,N/A,N/A,WARNING,Unexpected Connection\r\n"
+    '"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
+    "leaf-01,swp7,UP,spine-01,swp17,N/A,N/A,WARNING,Unexpected Connection,,,\r\n"
     'leaf-01,swp9,UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
-    '"Wrong Device: Expected exp,dev, Got act""dev"\r\n'
+    '"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
     "leaf-01,swp1,UP,spine-01,swp10,spine-01,swp10,SUCCESS,"
-    "LLDP Connection Verified\r\n"
+    "LLDP Connection Verified,,,\r\n"
 )
+
+
+def _csv_rows(text):
+    return list(csv.reader(io.StringIO(text, newline="")))
+
+
+def _source_between(source, start, end):
+    return source.split(start, 1)[1].split(end, 1)[0]
 
 
 class LLDPExportGoldenTests(unittest.TestCase):
@@ -296,6 +310,78 @@ class LLDPExportGoldenTests(unittest.TestCase):
 
     def test_csv_matches_download_csv_semantics(self):
         self.assertEqual(lldp_export.build_csv(self.report), GOLDEN_CSV)
+
+    def test_absent_design_keeps_blank_p2p_columns(self):
+        rows = _csv_rows(lldp_export.build_csv(self.report))
+        self.assertEqual(
+            rows[0][-3:], ["P2P Sheet", "P2P Line", "P2P SEQ"]
+        )
+        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+
+    def test_matched_design_adds_sheet_line_and_seq(self):
+        design = {"connections": [{
+            "source_name": "leaf-01", "source_port": "swp5",
+            "dest_name": "spine-01", "dest_port": "swp14",
+            "sheet_name": "GB300-9-16", "row_number": 184, "seq": "2778",
+            "connection_type": "general", "network_type": "eth",
+        }]}
+        rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
+        matched = next(row for row in rows[1:] if row[1] == "swp5")
+        self.assertEqual(matched[-3:], ["GB300-9-16", "184", "2778"])
+
+    def test_unmatched_design_keeps_p2p_columns_blank(self):
+        design = {"connections": [{
+            "source_name": "other-device", "source_port": "swp1",
+            "dest_name": "peer-device", "dest_port": "swp2",
+            "sheet_name": "Other", "row_number": 9, "seq": "10",
+            "connection_type": "general", "network_type": "eth",
+        }]}
+        rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
+        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+
+    def test_formula_like_quoted_sheet_is_guarded_and_rfc4180_escaped(self):
+        design = {"connections": [{
+            "source_name": "leaf-01", "source_port": "swp9",
+            "dest_name": "peer-device", "dest_port": "swp2",
+            "sheet_name": '=Rack,"Plan"', "row_number": 184, "seq": "2778",
+            "connection_type": "general", "network_type": "eth",
+        }]}
+        text = lldp_export.build_csv(self.report, p2p_design=design)
+        matched = next(row for row in _csv_rows(text)[1:] if row[1] == "swp9")
+        self.assertEqual(matched[-3:], ['\'=Rack,"Plan"', "184", "2778"])
+        self.assertIn('"\'=Rack,""Plan"""', text)
+
+    def test_malformed_design_gracefully_degrades_to_blank_columns(self):
+        rows = _csv_rows(
+            lldp_export.build_csv(self.report, p2p_design={"not": "a design"})
+        )
+        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+
+    def test_headless_export_uses_precise_three_part_port_match(self):
+        report = parse_lldp_report(
+            """Created on 2026-08-19 10-00-00
+========== leaf-01 ==========
+Port Status Exp-Nbr Exp-Nbr-Port Act-Nbr Act-Nbr-Port Port-Status
+----------
+swp3s4 Pass right swp49 right swp49 UP
+"""
+        )
+
+        def design_row(peer, port, sheet, line, seq):
+            return {
+                "source_name": "leaf-01", "source_port": port,
+                "dest_name": peer, "dest_port": "49",
+                "sheet_name": sheet, "row_number": line, "seq": seq,
+                "connection_type": "general", "network_type": "eth",
+            }
+
+        design = {"connections": [
+            design_row("wrong", "3/3/1", "Wrong", 11, "111"),
+            design_row("right", "3/2/1", "Right", 22, "222"),
+            design_row("proof", "1/1/4", "Proof", 33, "333"),
+        ]}
+        rows = _csv_rows(lldp_export.build_csv(report, p2p_design=design))
+        self.assertEqual(rows[1][-3:], ["Right", "22", "222"])
 
     def test_payload_counts_match_report_counts(self):
         payload = lldp_export.build_payload(self.report)
@@ -331,6 +417,77 @@ class LLDPExportGoldenTests(unittest.TestCase):
         statuses = [row["status"] for row in payload["rows"]]
         order = {"FAILED": 0, "NO INFO": 1, "WARNING": 2, "SUCCESS": 3}
         self.assertEqual(statuses, sorted(statuses, key=order.__getitem__))
+
+
+class LLDPBrowserP2PExportContractTests(unittest.TestCase):
+    def test_browser_and_headless_csv_headers_are_equal(self):
+        match = re.search(
+            r"const CSV_HEADERS = Object\.freeze\(\[(.*?)\]\);",
+            LLDP_HTML,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        browser_headers = re.findall(r"'([^']+)'", match.group(1))
+        self.assertEqual(browser_headers, list(lldp_export.CSV_HEADERS))
+
+    def test_csv_metadata_join_is_independent_of_display_toggle(self):
+        canonical = _source_between(
+            LLDP_HTML,
+            "function canonicalConnectionRow(connection)",
+            "function buildLLDPCSV(connections)",
+        )
+        join = _source_between(
+            LLDP_HTML,
+            "function activeP2pDesignFor(conn)",
+            "function kvRow(label, value, cls)",
+        )
+        self.assertIn("activeP2pDesignFor(connection)", canonical)
+        self.assertIn(
+            "lookupByDevicePort(p2pIndex, conn.localDevice, conn.localPort)",
+            join,
+        )
+        self.assertNotIn("p2pNamesOn", canonical + join)
+
+    def test_failed_design_load_reenables_download(self):
+        button = re.search(
+            r'<button id="download-csv"[^>]*>', LLDP_HTML
+        ).group(0)
+        setter = _source_between(
+            LLDP_HTML,
+            "function setP2pDesignStatus(status)",
+            "function escHtml(v)",
+        )
+        loader = _source_between(
+            LLDP_HTML,
+            "function loadP2pDesign()",
+            "function loadTransceiverInventory()",
+        )
+        download = _source_between(
+            LLDP_HTML,
+            "function downloadCSV()",
+            "// ===== Device Search Functions =====",
+        )
+        self.assertIn("disabled", button)
+        self.assertIn("button.disabled = loading", setter)
+        self.assertIn("setP2pDesignStatus('loading')", loader)
+        self.assertGreaterEqual(loader.count("setP2pDesignStatus('ready')"), 2)
+        self.assertGreaterEqual(loader.count("setP2pDesignStatus('absent')"), 2)
+        self.assertIn("if (p2pDesignStatus === 'loading') return;", download)
+
+    def test_installed_cgi_loads_active_design_best_effort(self):
+        self.assertIn(
+            'P2P_DESIGN_FILE="$WEB_ROOT/monitor-results/active-p2p.json"',
+            LLDP_EXPORT_API,
+        )
+        self.assertIn(
+            'PYTHONPATH="$LLDPQ_DIR:$WEB_ROOT${PYTHONPATH:+:$PYTHONPATH}"',
+            LLDP_EXPORT_API,
+        )
+        self.assertIn(
+            'ai_p2p.load_connections(os.environ["P2P_DESIGN_FILE"])',
+            LLDP_EXPORT_API,
+        )
+        self.assertIn("p2p_design=load_active_p2p()", LLDP_EXPORT_API)
 
 
 def _extract_array(source: str, name: str) -> list[str]:

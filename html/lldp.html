@@ -452,7 +452,7 @@
                 </svg>
                 Edit Aliases
             </button>
-            <button id="download-csv" onclick="downloadCSV()" class="btn btn-primary">
+            <button id="download-csv" onclick="downloadCSV()" class="btn btn-primary" disabled aria-busy="true">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/>
                 </svg>
@@ -1118,6 +1118,16 @@
         let xcvrInvStatus = 'loading';     // 'loading' | 'ready' | 'absent'
         let xcvrIndex = new Map();         // deviceKey | portAlias -> transceiver module
 
+        function setP2pDesignStatus(status) {
+            p2pDesignStatus = status;
+            const button = document.getElementById('download-csv');
+            if (button) {
+                const loading = status === 'loading';
+                button.disabled = loading;
+                button.setAttribute('aria-busy', loading ? 'true' : 'false');
+            }
+        }
+
         function escHtml(v) {
             return String(v == null ? '' : v).replace(/[&<>"']/g, c => (
                 { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -1320,9 +1330,10 @@
         }
 
         function loadP2pDesign() {
+            setP2pDesignStatus('loading');
             return fetch('/monitor-results/active-p2p.json', { cache: 'no-store' })
                 .then(r => r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)))
-                .then(d => { buildP2pIndex(d); p2pDesignStatus = 'ready'; })
+                .then(d => { buildP2pIndex(d); setP2pDesignStatus('ready'); })
                 .catch(() =>
                     // The static copy is missing when the publish step failed at
                     // activation time; the API serves the same active design from
@@ -1331,12 +1342,12 @@
                         .then(r => r.ok ? r.json() : Promise.reject(new Error('status ' + r.status)))
                         .then(j => {
                             if (j && j.success && j.design) {
-                                buildP2pIndex(j.design); p2pDesignStatus = 'ready';
+                                buildP2pIndex(j.design); setP2pDesignStatus('ready');
                             } else {
-                                p2pDesignStatus = 'absent'; p2pIndex = new Map();
+                                setP2pDesignStatus('absent'); p2pIndex = new Map();
                             }
                         })
-                        .catch(() => { p2pDesignStatus = 'absent'; p2pIndex = new Map(); }))
+                        .catch(() => { setP2pDesignStatus('absent'); p2pIndex = new Map(); }))
                 // A detail panel opened while the design was still loading must
                 // settle to the real status, not stay on the loading badge.
                 .then(() => refreshOpenLldpDetails());
@@ -1358,7 +1369,7 @@
                 return { code: 'no-active-design', label: 'No Active Design', badge: 'badge-gray',
                     reason: 'No active design uploaded.', design: null };
             }
-            const d = lookupByDevicePort(p2pIndex, conn.localDevice, conn.localPort);
+            const d = activeP2pDesignFor(conn);
             if (!d) {
                 return { code: 'design-unresolved', label: 'Design Unresolved', badge: 'badge-orange',
                     reason: 'No design record matches this device:port.', design: null };
@@ -1386,6 +1397,11 @@
             const actual = `${displayValue(conn.actualDevice)}:${displayValue(conn.actualPort)}`;
             return { code: 'mismatch', label: 'Mismatch', badge: 'badge-red',
                 reason: `Design expects ${expected}, live shows ${actual}.`, design: d };
+        }
+
+        function activeP2pDesignFor(conn) {
+            if (p2pDesignStatus !== 'ready') return null;
+            return lookupByDevicePort(p2pIndex, conn.localDevice, conn.localPort);
         }
 
         function kvRow(label, value, cls) {
@@ -1479,7 +1495,6 @@
             // A tab opened before the design was activated cached the 404: retry
             // once per expand and refresh the still-open panel when it lands.
             if (p2pDesignStatus === 'absent') {
-                p2pDesignStatus = 'loading';
                 loadP2pDesign().then(() => {
                     if (detail.isConnected) detail.innerHTML = lldpDetailHtml(conn);
                 });
@@ -1968,7 +1983,7 @@
         function reloadLLDPReportInPlace() {
             const preservedDevices = selectedDevices.slice();
             lldpReportReloadRetryPending = false;
-            p2pDesignStatus = 'loading';
+            setP2pDesignStatus('loading');
             xcvrInvStatus = 'loading';
             return Promise.all([loadLLDPData(), loadP2pDesign(), loadTransceiverInventory()])
                 .then(() => {
@@ -2332,22 +2347,26 @@
         // CSV Download Function
         const CSV_HEADERS = Object.freeze([
             'Local Device', 'Local Port', 'Port Status', 'Expected Neighbor', 'Expected Port',
-            'Active Neighbor', 'Active Port', 'Status', 'Connection Health'
+            'Active Neighbor', 'Active Port', 'Status', 'Connection Health',
+            'P2P Sheet', 'P2P Line', 'P2P SEQ'
         ]);
 
-        function spreadsheetSafeValue(value) {
-            const text = displayValue(value);
+        function spreadsheetSafeValue(value, blankMissing = false) {
+            const text = blankMissing
+                ? String(value == null ? '' : value).trim()
+                : displayValue(value);
             return /^\s*[=+\-@]/.test(text) ? `'${text}` : text;
         }
 
-        function csvField(value) {
-            const text = spreadsheetSafeValue(value);
+        function csvField(value, blankMissing = false) {
+            const text = spreadsheetSafeValue(value, blankMissing);
             return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
         }
 
         function canonicalConnectionRow(connection) {
             const status = determineLLDPStatus(connection);
-            return [
+            const design = activeP2pDesignFor(connection);
+            const row = [
                 connection.localDevice,
                 connection.localPort,
                 connection.portStatus,
@@ -2358,12 +2377,20 @@
                 status.status,
                 status.health
             ].map(displayValue);
+            return row.concat(design ? [
+                design.sheet_name == null ? '' : design.sheet_name,
+                design.row_number == null ? '' : design.row_number,
+                design.seq == null ? '' : design.seq
+            ] : ['', '', '']);
         }
 
         function buildLLDPCSV(connections) {
-            const lines = [CSV_HEADERS.map(csvField).join(',')];
+            const lines = [CSV_HEADERS.map(value => csvField(value)).join(',')];
+            const p2pColumnStart = CSV_HEADERS.length - 3;
             connections.forEach(connection => {
-                lines.push(canonicalConnectionRow(connection).map(csvField).join(','));
+                lines.push(canonicalConnectionRow(connection)
+                    .map((value, index) => csvField(value, index >= p2pColumnStart))
+                    .join(','));
             });
             return lines.join('\r\n') + '\r\n';
         }
@@ -2385,6 +2412,7 @@
         }
 
         function downloadCSV() {
+            if (p2pDesignStatus === 'loading') return;
             try {
                 // Get current date + active filter for filename
                 const now = new Date();

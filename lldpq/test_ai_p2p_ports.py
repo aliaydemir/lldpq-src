@@ -91,6 +91,21 @@ class ResolvePortMapTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["peer_device"], "OOB-02")
 
+    def test_precise_index_wins_over_ambiguous_three_part_alias(self):
+        conns = [
+            # 3/3/1 tolerantly includes swp3s4, but with maxZ=4 its precise
+            # group-fitted lane is swp3s8 and must not win this lookup.
+            _conn("WRONG", "49", "SP-01", "3/3/1"),
+            _conn("RIGHT", "49", "SP-01", "3/2/1"),
+            # Establish the device-wide four-subs-per-group breakout mode.
+            _conn("PROOF", "49", "SP-01", "1/1/4"),
+        ]
+        index = ai_p2p.build_port_index(conns)
+        hit = ai_p2p.lookup_by_device_port(index, "sp-01", "swp3s4")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["peer_device"], "RIGHT")
+        self.assertEqual(hit["port"], "3/2/1")
+
 
 class TopologyGenerationTests(unittest.TestCase):
     def test_three_part_ports_resolve_in_dot(self):

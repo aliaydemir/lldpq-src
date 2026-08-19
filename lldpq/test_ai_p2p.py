@@ -337,6 +337,7 @@ class ParseWorkbookTest(unittest.TestCase):
             self.assertEqual(hit["cable_type"], "MFP7E10-N07")
             self.assertEqual(hit["cable_length"], "7")
             self.assertEqual(hit["network_type"], "eth")
+        self.assertEqual({hit["row_number"] for hit in hits}, {3, 5})
         # device-only lookup returns every design row touching the device
         self.assertEqual(len(ai_p2p.lookup(self.result, "CLEAF-01")), 3)
 

@@ -58,8 +58,9 @@ if [[ ! -r "$REPORT_FILE" ]]; then
     exit 0
 fi
 
-export REPORT_FILE FORMAT
-PYTHONPATH="$LLDPQ_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 <<'PYTHON'
+P2P_DESIGN_FILE="$WEB_ROOT/monitor-results/active-p2p.json"
+export REPORT_FILE P2P_DESIGN_FILE FORMAT
+PYTHONPATH="$LLDPQ_DIR:$WEB_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 <<'PYTHON'
 import json
 import os
 import re
@@ -82,11 +83,22 @@ def respond_error(status, message):
 
 
 try:
+    import ai_p2p
     import lldp_export
     from lldp_report import LLDPReportError, load_lldp_report
 except Exception:
     respond_error("500 Internal Server Error", "LLDP export support is unavailable")
     raise SystemExit(0)
+
+
+def load_active_p2p():
+    try:
+        return ai_p2p.load_connections(os.environ["P2P_DESIGN_FILE"])
+    except (OSError, TypeError, UnicodeError, ValueError):
+        # The design join is optional enrichment. Missing, unreadable, or
+        # malformed active P2P data degrades to the same blank columns.
+        return None
+
 
 try:
     report = load_lldp_report(os.environ["REPORT_FILE"])
@@ -99,7 +111,9 @@ common = [NO_STORE, f"X-LLDPQ-Report-Created: {created}"]
 
 try:
     if os.environ.get("FORMAT") == "csv":
-        body = lldp_export.build_csv(report).encode("utf-8")
+        body = lldp_export.build_csv(
+            report, p2p_design=load_active_p2p()
+        ).encode("utf-8")
         stamp = re.sub(r"[^0-9A-Za-z._-]", "_", created)
         headers = [
             "Content-Type: text/csv; charset=utf-8",

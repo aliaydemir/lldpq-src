@@ -803,10 +803,100 @@ def _meta_of(record):
         "network_type": record.get("network_type", ""),
         "connection_type": record.get("connection_type", ""),
     }
+    if "row_number" in record and record["row_number"] is not None:
+        meta["row_number"] = record["row_number"]
     for key in OPTIONAL_FIELDS:
         if record.get(key):
             meta[key] = record[key]
     return meta
+
+
+def _entry_of(record, side, peer):
+    entry = {
+        "device": record.get(side + "_name", ""),
+        "port": record.get(side + "_port", ""),
+        "rack": record.get(side + "_rack", ""),
+        "ru": record.get(side + "_ru", ""),
+        "transceiver": record.get(side + "_transceiver", ""),
+        "peer_device": record.get(peer + "_name", ""),
+        "peer_port": record.get(peer + "_port", ""),
+        "peer_rack": record.get(peer + "_rack", ""),
+        "peer_ru": record.get(peer + "_ru", ""),
+        "peer_transceiver": record.get(peer + "_transceiver", ""),
+        "unresolved": bool(record.get("unresolved")),
+    }
+    entry.update(_meta_of(record))
+    return entry
+
+
+def _ordered_device_keys(name):
+    """_device_keys() in input-first order, matching the browser Set."""
+    low = str(name or "").strip().lower()
+    if not low:
+        return []
+    keys = [low]
+    if "." in low:
+        short = low.split(".", 1)[0]
+        if short not in keys:
+            keys.append(short)
+    return keys
+
+
+def _ordered_port_aliases(port):
+    """_port_aliases() with the caller's exact normalized spelling first."""
+    exact = _clean_value(port).lower().replace(" ", "")
+    if not exact:
+        return []
+    return [exact, *sorted(_port_aliases(port) - {exact})]
+
+
+def build_port_index(conns):
+    """Build the browser-equivalent precise-first device/port design index.
+
+    Group-fitted OS spellings from resolve_port_map() are indexed before raw
+    design-port aliases.  setdefault preserves that precise winner when an
+    ambiguous three-part alias from another row maps to the same live port.
+    """
+    resolved = resolve_port_map(conns)
+    entries = []
+    for record in _records_of(conns):
+        if not isinstance(record, dict):
+            continue
+        for side, peer in (("source", "dest"), ("dest", "source")):
+            name = record.get(side + "_name", "")
+            port = record.get(side + "_port", "")
+            if not _ordered_device_keys(name) or not _port_aliases(port):
+                continue
+            entries.append((
+                name,
+                port,
+                resolved_os_port(resolved, name, port),
+                _entry_of(record, side, peer),
+            ))
+
+    index = {}
+
+    def add(name, port, entry):
+        for device_key in _ordered_device_keys(name):
+            for port_key in _port_aliases(port):
+                index.setdefault((device_key, port_key), entry)
+
+    for name, _port, resolved_port, entry in entries:
+        if resolved_port:
+            add(name, resolved_port, entry)
+    for name, port, _resolved_port, entry in entries:
+        add(name, port, entry)
+    return index
+
+
+def lookup_by_device_port(index, device, port):
+    """Return one precise-first entry from build_port_index(), or None."""
+    for device_key in _ordered_device_keys(device):
+        for port_key in _ordered_port_aliases(port):
+            found = index.get((device_key, port_key))
+            if found is not None:
+                return found
+    return None
 
 
 def lookup(conns, device, port=None):
@@ -825,21 +915,7 @@ def lookup(conns, device, port=None):
                 continue
             if want_ports is not None and not (_port_aliases(record.get(side + "_port", "")) & want_ports):
                 continue
-            entry = {
-                "device": name,
-                "port": record.get(side + "_port", ""),
-                "rack": record.get(side + "_rack", ""),
-                "ru": record.get(side + "_ru", ""),
-                "transceiver": record.get(side + "_transceiver", ""),
-                "peer_device": record.get(peer + "_name", ""),
-                "peer_port": record.get(peer + "_port", ""),
-                "peer_rack": record.get(peer + "_rack", ""),
-                "peer_ru": record.get(peer + "_ru", ""),
-                "peer_transceiver": record.get(peer + "_transceiver", ""),
-                "unresolved": bool(record.get("unresolved")),
-            }
-            entry.update(_meta_of(record))
-            results.append(entry)
+            results.append(_entry_of(record, side, peer))
             break  # one match per record even if device appears on both sides
     return results
 
