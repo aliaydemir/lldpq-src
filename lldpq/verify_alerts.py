@@ -4,7 +4,7 @@ LLDPq Alert System - Test script for Slack webhook configuration
 Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
 This script sends test alerts to verify Slack webhook configuration.
-Usage: python3 test_alerts.py
+Usage: python3 verify_alerts.py
 """
 
 import yaml
