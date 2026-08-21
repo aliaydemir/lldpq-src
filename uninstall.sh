@@ -3041,7 +3041,7 @@ WEB_DIRS=(
     "$WEB_ROOT/css" "$WEB_ROOT/png" "$WEB_ROOT/topology"
     "$WEB_ROOT/configs" "$WEB_ROOT/hstr" "$WEB_ROOT/monitor-results"
     "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads" "$WEB_ROOT/monaco"
-    "$WEB_ROOT/__pycache__"
+    "$WEB_ROOT/__pycache__" "$WEB_ROOT/.locks"
 )
 
 if $WEB_ROOT_CLEANABLE; then

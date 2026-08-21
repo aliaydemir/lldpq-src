@@ -156,7 +156,15 @@ LLDPQ_REF_SCAN_DEF='def _iter_inventory_var_files(_inventory_base, _include_grou
     import glob as _rglob
     import os as _ros
     _hv_dir = _ros.path.join(_inventory_base, "host_vars")
-    _files = _rglob.glob(_ros.path.join(_hv_dir, "*.yaml")) + _rglob.glob(_ros.path.join(_hv_dir, "*.yml"))
+    # a host may carry both extensions; .yaml wins when both exist
+    _files = []
+    _seen_stems = set()
+    for _hp in _rglob.glob(_ros.path.join(_hv_dir, "*.yaml")) + _rglob.glob(_ros.path.join(_hv_dir, "*.yml")):
+        _hstem = _ros.path.splitext(_ros.path.basename(_hp))[0]
+        if _hstem in _seen_stems:
+            continue
+        _seen_stems.add(_hstem)
+        _files.append(_hp)
     if _include_group_vars:
         _files += _rglob.glob(_ros.path.join(_inventory_base, "group_vars", "**", "*.yaml"), recursive=True)
         _files += _rglob.glob(_ros.path.join(_inventory_base, "group_vars", "**", "*.yml"), recursive=True)
@@ -840,11 +848,16 @@ ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
 
 # Collect all unique VRFs from all devices
+# (host_vars may use either extension; .yaml wins when both exist)
 vrfs = {}
 parse_errors = {}
+seen_hosts = set()
 
 for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
     hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+    if hostname in seen_hosts:
+        continue
+    seen_hosts.add(hostname)
     
     try:
         with open(host_file, 'r') as f:
@@ -1345,9 +1358,15 @@ if 'vrfs' not in host_data:
     host_data['vrfs'] = {}
 
 # Find VRF configs from other devices
+# (host_vars may use either extension; .yaml wins when both exist)
 all_vrf_configs = {}
 _harvest_errors = {}
+_seen_hosts = set()
 for hf in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
+    _stem = os.path.splitext(os.path.basename(hf))[0]
+    if _stem in _seen_hosts:
+        continue
+    _seen_hosts.add(_stem)
     try:
         with open(hf, 'r') as f:
             hd = yaml.load(f) or {}
@@ -1432,6 +1451,7 @@ unassign_vrf() {
     python3 << PYTHON
 $LLDPQ_JSON_EXCEPTHOOK_DEF
 $LLDPQ_MODE_FLOOR_DEF
+$LLDPQ_REF_SCAN_DEF
 import json
 import re
 from ruamel.yaml import YAML
@@ -1499,22 +1519,29 @@ except:
     if os.path.exists(_tmp_path): os.unlink(_tmp_path)
     raise
 
-# Check if any other devices still have this VRF
-import glob
+# Check if any other devices still have this VRF. group_vars can also
+# define vrfs (same coverage as the shared ref scanners): a group-level
+# definition keeps the VRF alive, so it must block the leak cleanup too.
+inventory_base = os.path.join(ansible_dir, 'inventory')
 remaining_devices = 0
-for hf in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
+group_vars_refs = []
+for hf in _iter_inventory_var_files(inventory_base):
     try:
         with open(hf, 'r') as f:
             hd = yaml.load(f) or {}
-        if vrf_name in hd.get('vrfs', {}):
-            remaining_devices += 1
+        if hasattr(hd, 'get') and vrf_name in (hd.get('vrfs') or {}):
+            if os.path.dirname(hf) == host_vars_dir:
+                remaining_devices += 1
+            else:
+                group_vars_refs.append(os.path.relpath(hf, inventory_base))
     except:
         pass
 
 # Only remove VRF from bgp_profiles.yaml if this was the LAST device
+# and no group_vars file still defines the VRF
 leaking_removed = False
 _leak_cleanup_error = None
-if remaining_devices == 0:
+if remaining_devices == 0 and not group_vars_refs:
     try:
         if os.path.exists(bgp_profiles_file):
             with open(bgp_profiles_file, 'r') as f:
@@ -1549,6 +1576,9 @@ if remaining_devices == 0:
         _leak_cleanup_error = str(e)
 
 result = {'success': True, 'leaking_removed': leaking_removed, 'remaining_devices': remaining_devices}
+if group_vars_refs:
+    result['group_vars_definitions'] = group_vars_refs
+    result['warning'] = 'VRF is still defined in group_vars; leaking references were kept: ' + ', '.join(group_vars_refs)
 if _leak_cleanup_error:
     result['leaking_cleanup_failed'] = True
     result['warning'] = f'leak cleanup failed: {_leak_cleanup_error}'
@@ -1564,6 +1594,7 @@ delete_vrf_global() {
     python3 << PYTHON
 $LLDPQ_JSON_EXCEPTHOOK_DEF
 $LLDPQ_MODE_FLOOR_DEF
+$LLDPQ_REF_SCAN_DEF
 import json
 from ruamel.yaml import YAML
 yaml = YAML()
@@ -1613,15 +1644,31 @@ for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os
             except:
                 if os.path.exists(_tmp_path): os.unlink(_tmp_path)
                 raise
-            hostname = os.path.basename(host_file).replace('.yaml', '').replace('.yml', '')
+            hostname = os.path.basename(host_file).rsplit('.', 1)[0]
             devices_updated.append(hostname)
     except Exception as e:
         file_errors[os.path.basename(host_file)] = str(e)
 
+# group_vars can also define vrfs (same coverage as the shared ref
+# scanners): a group-level definition keeps the VRF alive, so the from_vrf
+# leak entries must be kept and the untouched files surfaced instead.
+inventory_base = os.path.join(ansible_dir, 'inventory')
+group_vars_refs = []
+for gv in _iter_inventory_var_files(inventory_base):
+    if os.path.dirname(gv) == host_vars_dir:
+        continue
+    try:
+        with open(gv, 'r') as f:
+            gd = yaml.load(f) or {}
+        if hasattr(gd, 'get') and vrf_name in (gd.get('vrfs') or {}):
+            group_vars_refs.append(os.path.relpath(gv, inventory_base))
+    except:
+        pass
+
 # Remove VRF from bgp_profiles.yaml (leaking references)
 leaking_removed = False
 try:
-    if os.path.exists(bgp_profiles_file):
+    if not group_vars_refs and os.path.exists(bgp_profiles_file):
         with open(bgp_profiles_file, 'r') as f:
             bgp_data = yaml.load(f) or {}
 
@@ -1656,6 +1703,9 @@ result = {
     'devices_updated': devices_updated,
     'leaking_removed': leaking_removed
 }
+if group_vars_refs:
+    result['group_vars_definitions'] = group_vars_refs
+    result['warning'] = 'VRF is still defined in group_vars; leaking references were kept: ' + ', '.join(group_vars_refs)
 if file_errors:
     result['file_errors'] = file_errors
     result['error'] = 'Some files failed to update: ' + ', '.join(file_errors.keys())
@@ -1676,12 +1726,17 @@ ansible_dir = os.environ.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
 
 # Collect all VRFs from all devices
+# (host_vars may use either extension; .yaml wins when both exist)
 vrfs = {}
 unique_devices = set()
 parse_errors = {}
+seen_hosts = set()
 
 for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
     hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+    if hostname in seen_hosts:
+        continue
+    seen_hosts.add(hostname)
     
     try:
         with open(host_file, 'r') as f:
@@ -1749,10 +1804,15 @@ for vlan_name, vlan_data in vlan_profiles.items():
 vlan_device_map = {vlan_name: [] for vlan_name in vlan_profiles.keys()}
 unique_devices = set()
 parse_errors = {}
+seen_hosts = set()
 
 # Scan all host_vars files for vlan_templates
+# (host_vars may use either extension; .yaml wins when both exist)
 for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
     hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+    if hostname in seen_hosts:
+        continue
+    seen_hosts.add(hostname)
     
     try:
         with open(host_file, 'r') as f:
@@ -1836,10 +1896,16 @@ if os.path.exists(vlan_profiles_file):
 ports = []
 devices = set()
 parse_errors = {}
+# (host_vars may use either extension; .yaml wins when both exist,
+# because "foo.yaml" sorts before "foo.yml")
+seen_hosts = set()
 
 for host_file in sorted(glob.glob(os.path.join(host_vars_dir, '*.yaml')) +
                         glob.glob(os.path.join(host_vars_dir, '*.yml'))):
     hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+    if hostname in seen_hosts:
+        continue
+    seen_hosts.add(hostname)
     try:
         with open(host_file, 'r') as f:
             host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
@@ -2341,7 +2407,9 @@ create_port_profile() {
     read_post_body
     export POST_DATA
     python3 << PYTHON
+$LLDPQ_JSON_EXCEPTHOOK_DEF
 $LLDPQ_MODE_FLOOR_DEF
+$LLDPQ_VALIDATORS_DEF
 import json
 import re
 from ruamel.yaml import YAML
@@ -2402,13 +2470,21 @@ if description:
 
 if sw_port_mode == 'access':
     if access_vlan:
-        profile_entry['access_vlan'] = int(access_vlan)
+        access_vlan = _v_int_range(access_vlan, 1, 4094)
+        if access_vlan is None:
+            print(json.dumps({'success': False, 'error': 'Invalid access VLAN (must be 1-4094)'}))
+            sys.exit(0)
+        profile_entry['access_vlan'] = access_vlan
     profile_entry['stp_bpduguard'] = stp_bpduguard
     profile_entry['stp_portadminedge'] = stp_portadminedge
     profile_entry['stp_portautoedgedisable'] = stp_portautoedgedisable
 elif sw_port_mode == 'trunk':
     if native_vlan:
-        profile_entry['trunk_untagged'] = int(native_vlan)
+        native_vlan = _v_int_range(native_vlan, 1, 4094)
+        if native_vlan is None:
+            print(json.dumps({'success': False, 'error': 'Invalid native VLAN (must be 1-4094)'}))
+            sys.exit(0)
+        profile_entry['trunk_untagged'] = native_vlan
     if trunk_allowed_vlan_all:
         profile_entry['trunk_allowed_vlan_all'] = True
     elif trunk_allowed_vlans:
@@ -2436,7 +2512,9 @@ update_port_profile() {
     read_post_body
     export POST_DATA
     python3 << PYTHON
+$LLDPQ_JSON_EXCEPTHOOK_DEF
 $LLDPQ_MODE_FLOOR_DEF
+$LLDPQ_VALIDATORS_DEF
 $LLDPQ_REF_SCAN_DEF
 import json
 import re
@@ -2513,7 +2591,11 @@ if description is not None:
 
 if sw_port_mode == 'access':
     if access_vlan:
-        profile_entry['access_vlan'] = int(access_vlan)
+        access_vlan = _v_int_range(access_vlan, 1, 4094)
+        if access_vlan is None:
+            print(json.dumps({'success': False, 'error': 'Invalid access VLAN (must be 1-4094)'}))
+            sys.exit(0)
+        profile_entry['access_vlan'] = access_vlan
     else:
         profile_entry.pop('access_vlan', None)
     profile_entry['stp_bpduguard'] = True if stp_bpduguard is None else stp_bpduguard
@@ -2528,7 +2610,11 @@ elif sw_port_mode == 'trunk':
     # all > range > list (swp_ports.j2), and a stale range would shadow the edit.
     profile_entry.pop('trunk_allowed_vlan_range', None)
     if native_vlan:
-        profile_entry['trunk_untagged'] = int(native_vlan)
+        native_vlan = _v_int_range(native_vlan, 1, 4094)
+        if native_vlan is None:
+            print(json.dumps({'success': False, 'error': 'Invalid native VLAN (must be 1-4094)'}))
+            sys.exit(0)
+        profile_entry['trunk_untagged'] = native_vlan
     else:
         profile_entry.pop('trunk_untagged', None)
     # The modal payload is authoritative for trunk membership: drop both keys
@@ -2619,6 +2705,7 @@ delete_port_profile() {
     read_post_body
     export POST_DATA
     python3 << PYTHON
+$LLDPQ_JSON_EXCEPTHOOK_DEF
 $LLDPQ_MODE_FLOOR_DEF
 $LLDPQ_REF_SCAN_DEF
 import json
@@ -4163,7 +4250,13 @@ try:
     all_prefix_lists = {}  # Store prefix lists for second pass
     
     # Single pass: collect both route_map mapping AND prefix_lists
-    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+    # (host_vars may use either extension; .yaml wins when both exist)
+    _seen_hosts = set()
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        _stem = os.path.splitext(os.path.basename(yaml_file))[0]
+        if _stem in _seen_hosts:
+            continue
+        _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
                 device_data = yaml.load(f, Loader=yaml.CSafeLoader)
@@ -4193,11 +4286,15 @@ try:
         except:
             continue
     
-    # Now match prefix_lists with route_maps (no file I/O needed)
+    # Now match prefix_lists with route_maps (no file I/O needed).
+    # Same shape guards as check-subnet-leak: tolerate empty prefix-lists
+    # and non-dict bookkeeping entries such as 'type' (ipv6 lists).
     for pl_name, pl_entries in all_prefix_lists.items():
-        if pl_name in route_map_to_target:
+        if pl_name in route_map_to_target and isinstance(pl_entries, dict):
             target_vrf = route_map_to_target[pl_name]
             for seq, entry in pl_entries.items():
+                if not isinstance(entry, dict):
+                    continue
                 subnet = entry.get('match', '')
                 if subnet and subnet not in leaked_subnets:
                     leaked_subnets[subnet] = {
@@ -4247,8 +4344,14 @@ try:
     leaked_to = None
     route_map_found = None
     all_prefix_list_matches = []  # Store all matches to check after we have route_map mapping
-    
-    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+
+    # host_vars may use either extension; .yaml wins when both exist
+    _seen_hosts = set()
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        _stem = os.path.splitext(os.path.basename(yaml_file))[0]
+        if _stem in _seen_hosts:
+            continue
+        _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
                 device_data = yaml.load(f, Loader=yaml.CSafeLoader)
@@ -4330,8 +4433,14 @@ try:
             }
     
     # Scan host_vars to find which VRF uses which profile
+    # (host_vars may use either extension; .yaml wins when both exist)
     vrf_profile_map = {}  # vrf_name -> profile_name
-    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+    _seen_hosts = set()
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        _stem = os.path.splitext(os.path.basename(yaml_file))[0]
+        if _stem in _seen_hosts:
+            continue
+        _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
                 device_data = yaml.load(f, Loader=yaml.CSafeLoader)
@@ -4416,8 +4525,14 @@ errors = []
 try:
     # Pass 1: load and validate every host_vars file, compute the new content
     # in memory; nothing is written until every target file staged cleanly
+    # (host_vars may use either extension; .yaml wins when both exist)
     _loaded = []
-    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+    _seen_hosts = set()
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        _stem = os.path.splitext(os.path.basename(yaml_file))[0]
+        if _stem in _seen_hosts:
+            continue
+        _seen_hosts.add(_stem)
         with open(yaml_file, 'r') as f:
             content = f.read()
             device_data = yaml.load(content)
@@ -4469,7 +4584,7 @@ try:
     _staged_writes = []
     _staged_hosts = []
     for yaml_file, device_data in _loaded:
-        hostname = os.path.basename(yaml_file).replace('.yaml', '')
+        hostname = os.path.basename(yaml_file).rsplit('.', 1)[0]
 
         if not device_data:
             continue
@@ -4581,8 +4696,14 @@ errors = []
 try:
     # Pass 1: load every host_vars file and compute the new content in
     # memory; nothing is written until every target file staged cleanly
+    # (host_vars may use either extension; .yaml wins when both exist)
     _loaded = []
-    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml"):
+    _seen_hosts = set()
+    for yaml_file in glob.glob(f"{host_vars_dir}/*.yaml") + glob.glob(f"{host_vars_dir}/*.yml"):
+        _stem = os.path.splitext(os.path.basename(yaml_file))[0]
+        if _stem in _seen_hosts:
+            continue
+        _seen_hosts.add(_stem)
         with open(yaml_file, 'r') as f:
             content = f.read()
             device_data = yaml.load(content)
@@ -4591,7 +4712,7 @@ try:
     _staged_writes = []
     _staged_hosts = []
     for yaml_file, device_data in _loaded:
-        hostname = os.path.basename(yaml_file).replace('.yaml', '')
+        hostname = os.path.basename(yaml_file).rsplit('.', 1)[0]
 
         if not device_data:
             continue
@@ -5577,8 +5698,18 @@ try:
             if 'subinterfaces' not in host_data['interfaces'][parent_if]:
                 host_data['interfaces'][parent_if]['subinterfaces'] = {}
             
-            subif = host_data['interfaces'][parent_if]['subinterfaces'].get(sub_id, {})
-            
+            # YAML keys subinterfaces as int (unquoted) or str; edit whichever
+            # form exists so the update cannot land in a duplicate parallel key
+            _subs = host_data['interfaces'][parent_if]['subinterfaces']
+            sub_key = sub_id
+            if sub_id not in _subs:
+                try:
+                    if int(sub_id) in _subs:
+                        sub_key = int(sub_id)
+                except ValueError:
+                    pass
+            subif = _subs.get(sub_key, {})
+
             # Update VLAN ID
             vlan_id = data.get('vlan_id', '')
             if vlan_id:
@@ -5608,7 +5739,7 @@ try:
             elif 'vrf' in subif:
                 del subif['vrf']
             
-            host_data['interfaces'][parent_if]['subinterfaces'][sub_id] = subif
+            host_data['interfaces'][parent_if]['subinterfaces'][sub_key] = subif
             
             # Update parent description
             if description:
@@ -6308,6 +6439,20 @@ try:
             print(json.dumps({'success': False, 'error': f'Subinterface {interface} already belongs to VRF {_owner}; refusing to overwrite it'}))
             sys.exit(0)
 
+        # A bare local_ip (the UI strips the prefix for display) must not
+        # shrink an existing non-/31 subnet: keep the current subinterface's
+        # prefix length; the /31 default only applies when there is no
+        # existing entry (same semantics as add-external-peer)
+        if '/' not in str(local_ip) and hasattr(_cur, 'get'):
+            _cur_ip = str(_cur.get('ip', '') or '')
+            if '/' in _cur_ip:
+                _cand = f"{local_ip}/{_cur_ip.rsplit('/', 1)[1]}"
+                try:
+                    ipaddress.ip_interface(_cand)
+                    local_ip_norm = _cand
+                except ValueError:
+                    pass
+
         # When the interface field changed, drop the old subinterface in the
         # same write so no stale L3 config (and its IP) is left behind.
         if original_interface and original_interface != interface and '.' in original_interface and original_interface != 'lo':
@@ -6483,12 +6628,17 @@ try:
                             break
     
     # Find all devices with vtep.state: true
+    # (host_vars may use either extension; .yaml wins when both exist)
     vtep_devices = []
     load_errors = {}
+    seen_hosts = set()
 
-    for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')):
-        hostname = os.path.basename(host_file).replace('.yaml', '')
-        
+    for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
+        hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+        if hostname in seen_hosts:
+            continue
+        seen_hosts.add(hostname)
+
         try:
             with open(host_file, 'r') as f:
                 host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
@@ -6529,6 +6679,7 @@ PYTHON
 import json
 import yaml  # PyYAML - faster for read-only operations
 import os
+import sys
 import glob
 import ipaddress
 
@@ -6591,103 +6742,138 @@ try:
                 })
     
     # Load all devices and find those using external profiles
+    # (host_vars may use either extension; .yaml wins when both exist)
     peers = []
     devices = []
+    load_errors = {}
+    seen_hosts = set()
     host_vars_dir = os.path.join(ansible_dir, 'inventory', 'host_vars')
-    
-    for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')):
-        hostname = os.path.basename(host_file).replace('.yaml', '')
-        
-        with open(host_file, 'r') as f:
-            host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
-        
-        # Check VRFs for external BGP profiles
-        vrfs = host_data.get('vrfs', {})
-        interfaces = host_data.get('interfaces', {})
-        has_external = False
-        
-        for vrf_name, vrf_config in vrfs.items():
-            bgp_config = vrf_config.get('bgp', {})
-            profile_name = bgp_config.get('bgp_profile', '')
-            
-            if profile_name in profiles_with_external:
-                has_external = True
-                
-                for ext_pg in profiles_with_external[profile_name]:
-                    peers_data = ext_pg['peers']
-                    
-                    for peer_ip, peer_info in peers_data.items():
-                        local_ip = ''
-                        interface_name = ''
-                        
-                        # Non-IP peer keys (e.g. BGP unnumbered interface names) skip subnet matching
-                        try:
-                            peer_addr = ipaddress.ip_address(str(peer_ip))
-                        except ValueError:
-                            peer_addr = None
 
-                        # 1) Check subinterfaces (swpX.VLAN)
-                        if peer_addr:
-                            for if_name, if_config in interfaces.items():
-                                subinterfaces = if_config.get('subinterfaces', {})
-                                for sub_id, sub_config in subinterfaces.items():
-                                    sub_ip = sub_config.get('ip', '')
-                                    sub_vrf = sub_config.get('vrf', '')
+    for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os.path.join(host_vars_dir, '*.yml')):
+        hostname = os.path.basename(host_file).rsplit('.', 1)[0]
+        if hostname in seen_hosts:
+            continue
+        seen_hosts.add(hostname)
 
-                                    if sub_vrf == vrf_name and sub_ip and '/' in sub_ip:
-                                        if peer_addr in ipaddress.ip_network(sub_ip, strict=False):
-                                            local_ip = sub_ip
-                                            interface_name = f"{if_name}.{sub_id}"
-                                            break
-                                if local_ip:
-                                    break
+        # Per-file guard (same degradation as list-vtep-devices): one broken
+        # host_vars file must not blank the whole Fabric Exit page
+        try:
+            with open(host_file, 'r') as f:
+                host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            if not isinstance(host_data, dict):
+                host_data = {}
 
-                        # 2) Check direct interface IPs (subnet match)
-                        if not local_ip and peer_addr:
-                            for if_name, if_config in interfaces.items():
-                                if_ip = if_config.get('ip', '')
-                                if not if_ip or '/' not in if_ip:
-                                    continue
-                                if_vrf = if_config.get('vrf', 'default')
-                                if if_vrf != vrf_name:
-                                    continue
-                                if peer_addr in ipaddress.ip_network(if_ip, strict=False):
-                                    local_ip = if_ip
-                                    interface_name = if_name
-                                    break
-                        
-                        # 3) Fallback to update_source (eBGP multihop / loopback)
-                        if not local_ip and ext_pg.get('update_source', ''):
-                            local_ip = ext_pg['update_source']
-                            interface_name = 'lo'
-                        
-                        peers.append({
-                            'device': hostname,
-                            'vrf': vrf_name,
-                            'bgp_profile': profile_name,
-                            'peer_group': ext_pg['pg_name'],
-                            'interface': interface_name,
-                            'local_ip': local_ip.split('/')[0] if local_ip else '',
-                            'remote_peer': str(peer_ip),
-                            'weight': peer_info.get('weight'),
-                            'policy_name': peer_info.get('policy_name'),
-                            'policy_direction': peer_info.get('policy_direction'),
-                            'soft_reconfiguration': peer_info.get('soft_reconfiguration', False),
-                            'bfd_enabled': ext_pg['bfd_enabled']
-                        })
-        
-        if has_external:
-            devices.append({'hostname': hostname})
-    
+            # Check VRFs for external BGP profiles (hand-edited files may
+            # carry null-valued stanzas, hence the isinstance guards)
+            vrfs = host_data.get('vrfs') or {}
+            interfaces = host_data.get('interfaces') or {}
+            if not isinstance(vrfs, dict):
+                vrfs = {}
+            if not isinstance(interfaces, dict):
+                interfaces = {}
+            has_external = False
+
+            for vrf_name, vrf_config in vrfs.items():
+                if not isinstance(vrf_config, dict):
+                    continue
+                bgp_config = vrf_config.get('bgp') or {}
+                profile_name = bgp_config.get('bgp_profile', '') if isinstance(bgp_config, dict) else ''
+
+                if profile_name in profiles_with_external:
+                    has_external = True
+
+                    for ext_pg in profiles_with_external[profile_name]:
+                        peers_data = ext_pg['peers']
+
+                        for peer_ip, peer_info in peers_data.items():
+                            local_ip = ''
+                            interface_name = ''
+
+                            # Non-IP peer keys (e.g. BGP unnumbered interface names) skip subnet matching
+                            try:
+                                peer_addr = ipaddress.ip_address(str(peer_ip))
+                            except ValueError:
+                                peer_addr = None
+
+                            # 1) Check subinterfaces (swpX.VLAN)
+                            if peer_addr:
+                                for if_name, if_config in interfaces.items():
+                                    if not isinstance(if_config, dict):
+                                        continue
+                                    subinterfaces = if_config.get('subinterfaces') or {}
+                                    if not isinstance(subinterfaces, dict):
+                                        continue
+                                    for sub_id, sub_config in subinterfaces.items():
+                                        if not isinstance(sub_config, dict):
+                                            continue
+                                        sub_ip = sub_config.get('ip', '')
+                                        sub_vrf = sub_config.get('vrf', '')
+
+                                        if sub_vrf == vrf_name and sub_ip and '/' in sub_ip:
+                                            if peer_addr in ipaddress.ip_network(sub_ip, strict=False):
+                                                local_ip = sub_ip
+                                                interface_name = f"{if_name}.{sub_id}"
+                                                break
+                                    if local_ip:
+                                        break
+
+                            # 2) Check direct interface IPs (subnet match)
+                            if not local_ip and peer_addr:
+                                for if_name, if_config in interfaces.items():
+                                    if not isinstance(if_config, dict):
+                                        continue
+                                    if_ip = if_config.get('ip', '')
+                                    if not if_ip or '/' not in if_ip:
+                                        continue
+                                    if_vrf = if_config.get('vrf', 'default')
+                                    if if_vrf != vrf_name:
+                                        continue
+                                    if peer_addr in ipaddress.ip_network(if_ip, strict=False):
+                                        local_ip = if_ip
+                                        interface_name = if_name
+                                        break
+
+                            # 3) Fallback to update_source (eBGP multihop / loopback)
+                            if not local_ip and ext_pg.get('update_source', ''):
+                                local_ip = ext_pg['update_source']
+                                interface_name = 'lo'
+
+                            peers.append({
+                                'device': hostname,
+                                'vrf': vrf_name,
+                                'bgp_profile': profile_name,
+                                'peer_group': ext_pg['pg_name'],
+                                'interface': interface_name,
+                                'local_ip': local_ip.split('/')[0] if local_ip else '',
+                                'local_ip_cidr': local_ip if local_ip else '',
+                                'remote_peer': str(peer_ip),
+                                'weight': peer_info.get('weight'),
+                                'policy_name': peer_info.get('policy_name'),
+                                'policy_direction': peer_info.get('policy_direction'),
+                                'soft_reconfiguration': peer_info.get('soft_reconfiguration', False),
+                                'bfd_enabled': ext_pg['bfd_enabled']
+                            })
+
+            if has_external:
+                devices.append({'hostname': hostname})
+        except (yaml.YAMLError, OSError, AttributeError) as e:
+            # Surface per-file failures so partial results are visibly partial
+            sys.stderr.write(f'list-external-peers: {os.path.basename(host_file)}: {e}\n')
+            load_errors[os.path.basename(host_file)] = str(e)
+
     # Sort peers by device, then vrf
     peers.sort(key=lambda x: (x['device'], x['vrf'], x['remote_peer']))
-    
-    print(json.dumps({
+
+    _resp = {
         'success': True,
         'peers': peers,
         'devices': devices,
         'bgp_profiles': {k: {'has_external': True, 'bfd_enabled': any(pg['bfd_enabled'] for pg in v)} for k, v in profiles_with_external.items()}
-    }))
+    }
+    if load_errors:
+        _resp['errors'] = load_errors
+        _resp['warning'] = 'Some host_vars files could not be parsed: ' + ', '.join(load_errors)
+    print(json.dumps(_resp))
 
 except Exception as e:
     import traceback
@@ -6699,6 +6885,14 @@ PYTHON
         # Parse the query inside the quoted Python block.  Interpolating a
         # decoded device name into Python source made malformed query values a
         # code-injection and parser-confusion boundary.
+        if [[ -x /usr/local/bin/lldpq-config ]]; then
+            eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
+        fi
+        # Freshness window honors /etc/lldpq.conf; export only when set so
+        # the heredoc's own default stays authoritative otherwise.
+        if [[ -n "${MONITOR_DATA_MAX_AGE_MINUTES:-}" ]]; then
+            export MONITOR_DATA_MAX_AGE_MINUTES
+        fi
         python3 << 'PYTHON'
 import json
 import math
@@ -7874,7 +8068,11 @@ for device in devices:
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
-max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
+try:
+    max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
+except ValueError:
+    # A manual non-numeric conf edit must not kill the whole action
+    max_workers = 25
 max_workers = max(1, min(max_workers, 50))
 
 supported = []
@@ -8064,7 +8262,11 @@ if not commands:
 lldpq_conf = read_lldpq_conf()
 ansible_dir = lldpq_conf.get('ANSIBLE_DIR', os.path.expanduser('~/ansible'))
 lldpq_user = lldpq_conf.get('LLDPQ_USER', os.environ.get('USER', 'root'))
-max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
+try:
+    max_workers = int(lldpq_conf.get('TELEMETRY_MAX_PARALLEL', '25') or 25)
+except ValueError:
+    # A manual non-numeric conf edit must not kill the whole action
+    max_workers = 25
 max_workers = max(1, min(max_workers, 50))
 
 # Validate commands - only allow telemetry-related nv commands
@@ -10951,67 +11153,6 @@ except subprocess.TimeoutExpired:
 except Exception as e:
     print(json.dumps({'success': False, 'error': str(e)}))
 PYTHON_END
-        ;;
-    refresh-assets)
-        # Queue a real Assets refresh through the same job-file mechanism as
-        # /trigger-assets: bin/lldpq-trigger consumes $ASSETS_JOB_DIR/*.request.
-        # (The old /tmp/.assets_refresh_trigger file had no consumer, so this
-        # action used to claim success while doing nothing.)
-        ASSETS_JOB_DIR="${LLDPQ_ASSETS_JOB_DIR:-/var/lib/lldpq/assets-jobs}"
-        if ! mkdir -p -m 2770 "$ASSETS_JOB_DIR" 2>/dev/null; then
-            echo '{"success": false, "error": "Assets job directory is unavailable"}'
-            exit 0
-        fi
-        chmod 2770 "$ASSETS_JOB_DIR" 2>/dev/null || true
-        _ASSETS_TOKEN=""
-        if [[ -r /proc/sys/kernel/random/uuid ]]; then
-            _ASSETS_TOKEN=$(tr -d '-' < /proc/sys/kernel/random/uuid 2>/dev/null || true)
-        fi
-        if [[ ! "$_ASSETS_TOKEN" =~ ^[a-f0-9]{32}$ ]] && [[ -r /dev/urandom ]]; then
-            _ASSETS_TOKEN=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' || true)
-        fi
-        if [[ ! "$_ASSETS_TOKEN" =~ ^[a-f0-9]{32}$ ]]; then
-            echo '{"success": false, "error": "Could not allocate an Assets job token"}'
-            exit 0
-        fi
-        _ASSETS_CREATED=$(date +%s)
-        # Same status/request field format trigger-assets.sh publishes; the
-        # status file must exist before the request so a fast worker never
-        # sees an untracked request.
-        _ASSETS_STATUS_TMP=$(mktemp "$ASSETS_JOB_DIR/.${_ASSETS_TOKEN}.status.XXXXXXXX" 2>/dev/null) || _ASSETS_STATUS_TMP=""
-        if [[ -z "$_ASSETS_STATUS_TMP" ]] || ! {
-            printf 'token=%s\n' "$_ASSETS_TOKEN"
-            printf 'state=queued\n'
-            printf 'created_at=%s\n' "$_ASSETS_CREATED"
-            printf 'updated_at=%s\n' "$(date +%s)"
-            printf 'started_at=0\n'
-            printf 'completed_at=0\n'
-            printf 'attempt=0\n'
-            printf 'exit_code=\n'
-            printf 'next_retry_at=0\n'
-            printf 'retry_scheduled=false\n'
-            printf 'worker_pid=0\n'
-            printf 'reason=Waiting for the Assets worker\n'
-        } > "$_ASSETS_STATUS_TMP" 2>/dev/null || \
-           ! chmod 0660 "$_ASSETS_STATUS_TMP" 2>/dev/null || \
-           ! mv -f "$_ASSETS_STATUS_TMP" "$ASSETS_JOB_DIR/$_ASSETS_TOKEN.status" 2>/dev/null; then
-            rm -f "$_ASSETS_STATUS_TMP" 2>/dev/null || true
-            echo '{"success": false, "error": "Could not create Assets job status"}'
-            exit 0
-        fi
-        _ASSETS_REQUEST_TMP=$(mktemp "$ASSETS_JOB_DIR/.${_ASSETS_TOKEN}.request.XXXXXXXX" 2>/dev/null) || _ASSETS_REQUEST_TMP=""
-        if [[ -z "$_ASSETS_REQUEST_TMP" ]] || ! {
-            printf 'token=%s\n' "$_ASSETS_TOKEN"
-            printf 'created_at=%s\n' "$_ASSETS_CREATED"
-        } > "$_ASSETS_REQUEST_TMP" 2>/dev/null || \
-           ! chmod 0660 "$_ASSETS_REQUEST_TMP" 2>/dev/null || \
-           ! mv -f "$_ASSETS_REQUEST_TMP" "$ASSETS_JOB_DIR/$_ASSETS_TOKEN.request" 2>/dev/null; then
-            rm -f "$_ASSETS_REQUEST_TMP" 2>/dev/null || true
-            echo '{"success": false, "error": "Could not queue the Assets job"}'
-            exit 0
-        fi
-        printf '{"success": true, "token": "%s", "message": "Assets refresh queued. Poll /trigger-assets?token=%s for completion."}\n' \
-            "$_ASSETS_TOKEN" "$_ASSETS_TOKEN"
         ;;
     "ansible-status")
         # Check if Ansible is configured and available

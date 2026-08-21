@@ -264,7 +264,17 @@ class BGPAnalyzer:
                     self.thresholds[key] = value
             except ValueError:
                 continue
-    
+
+        # A critical boundary below warning would make the grading ambiguous.
+        self.thresholds["bgp_flaps_critical"] = max(
+            self.thresholds["bgp_flaps_critical"],
+            self.thresholds["bgp_flaps_warning"],
+        )
+        self.thresholds["bgp_update_storm_critical"] = max(
+            self.thresholds["bgp_update_storm_critical"],
+            self.thresholds["bgp_update_storm_warning"],
+        )
+
     def load_bgp_history(self):
         """Load historical BGP data"""
         try:
@@ -991,6 +1001,15 @@ class BGPAnalyzer:
 
         if previous_stats is None:
             previous_stats = self.current_bgp_stats.get(hostname, {})
+        if (
+            isinstance(previous_stats, dict)
+            and previous_stats.get("data_status") in ("stale", "unknown")
+        ):
+            # A stale/unknown placeholder carries neighbors=[] and keeps the
+            # real prior stats under last_known_stats; unwrap it so down_since
+            # carries over a missed collection instead of re-stamping to now
+            # (which would downgrade CRITICAL to WARNING on recovery).
+            previous_stats = previous_stats.get("last_known_stats") or {}
         previous_neighbors = {}
         if isinstance(previous_stats, dict):
             for item in previous_stats.get("neighbors", []):
@@ -3429,7 +3448,7 @@ class BGPAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>

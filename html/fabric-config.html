@@ -3361,17 +3361,21 @@
             modal.dataset.profileName = profileName;
 
             const affectedList = document.getElementById('affected-devices-list');
+            const deleteBtn = document.getElementById('btn-confirm-delete');
+            deleteBtn.disabled = false;
             affectedList.innerHTML = `<div style="color: #888;">Checking device usage...</div>`;
             modal.classList.add('visible');
 
             // Find all devices using this VLAN via the per-host vlan report
             let affectedDevices = [];
+            let parseErrors = {};
             try {
                 const response = await fetch('/fabric-api.sh?action=get-vlan-report');
                 const data = await response.json();
                 if (data.success && data.vlan_device_map) {
                     affectedDevices = data.vlan_device_map[profileName] || [];
                 }
+                parseErrors = data.parse_errors || {};
             } catch (e) {
                 affectedList.innerHTML = `<div style="color: #888;">Unable to determine device usage.</div>`;
                 return;
@@ -3379,6 +3383,25 @@
 
             // Ignore stale response if a different profile was opened meanwhile
             if (modal.dataset.profileName !== profileName) return;
+
+            // Unparseable host_vars files were skipped by the report, so the usage
+            // scan is incomplete: the VLAN may still be in use there. Block the
+            // delete instead of showing a false "no devices" reassurance.
+            const badFiles = Object.keys(parseErrors);
+            if (badFiles.length > 0) {
+                deleteBtn.disabled = true;
+                affectedList.innerHTML = `
+                    <div style="color: #ff6b6b; font-weight: bold; margin-bottom: 8px;">
+                        ⚠️ Cannot verify usage: ${badFiles.length} host_vars file(s) failed to parse:
+                    </div>
+                    <div style="display: flex; flex-wrap: wrap; gap: 5px; justify-content: center;">
+                        ${badFiles.slice(0, 10).map(f => `<span class="badge badge-orange">${escapeHtml(f)}</span>`).join('')}
+                        ${badFiles.length > 10 ? `<span class="badge badge-gray">+${badFiles.length - 10} more</span>` : ''}
+                    </div>
+                    <div style="color: #888; font-size: 12px; margin-top: 8px;">Fix these files before deleting — the VLAN may still be in use on them.</div>
+                `;
+                return;
+            }
 
             // Update affected devices list
             if (affectedDevices.length > 0) {
@@ -4086,6 +4109,11 @@
                     return;
                 }
                 
+                // Out-of-band parse warning: the VRF list may be incomplete
+                const warnHtml = data.warning
+                    ? `<div style="color: #ff9800; font-size: 12px; margin-bottom: 10px;">⚠ ${escapeHtml(data.warning)}</div>`
+                    : '';
+
                 const allVrfs = data.vrfs || [];
                 const deviceConfig = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(selectedDevice)}`).then(r => r.json());
                 const currentVrfs = deviceConfig.success && deviceConfig.config.vrfs ? Object.keys(deviceConfig.config.vrfs) : [];
@@ -4094,11 +4122,11 @@
                 const availableVrfs = allVrfs.filter(v => !currentVrfs.includes(v.name));
                 
                 if (availableVrfs.length === 0) {
-                    listDiv.innerHTML = '<div style="color: #888; padding: 20px; text-align: center;">All VRFs are already assigned to this device, or no VRF templates exist.</div>';
+                    listDiv.innerHTML = warnHtml + '<div style="color: #888; padding: 20px; text-align: center;">All VRFs are already assigned to this device, or no VRF templates exist.</div>';
                     return;
                 }
                 
-                listDiv.innerHTML = `
+                listDiv.innerHTML = warnHtml + `
                     <div class="vlan-checkbox-list">
                         ${availableVrfs.map(v => `
                             <label class="vlan-checkbox-item">
@@ -4306,6 +4334,10 @@
                         devicesHtml += `</div>`;
                     } else {
                         devicesHtml = '<div style="color: #888; font-size: 13px;">No devices are currently using this VRF.</div>';
+                    }
+                    if (reportData.warning) {
+                        // Out-of-band parse warning: the device list may be incomplete
+                        devicesHtml += `<div style="color: #ff9800; font-size: 12px; margin-top: 8px;">⚠ ${escapeHtml(reportData.warning)}</div>`;
                     }
                 }
             } catch (e) {

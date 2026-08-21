@@ -166,5 +166,26 @@ class AgeDoesNotChangeCountsTests(unittest.TestCase):
             self.assertNotIn("original_severity", entry)
 
 
+class CsvExportContractTests(unittest.TestCase):
+    """The CSV export must exclude rows the table-filter funnels hid.
+
+    table-filter.js hides rows via the tf-hidden class, never via
+    style.display, so the downloadCSV row predicate must check that class
+    (alongside the log-details exclusion) or the export silently includes
+    devices — and their full message dumps — the operator filtered out.
+    """
+
+    def test_the_download_predicate_excludes_tf_hidden_rows(self):
+        source = (SCRIPT_DIR / "process_log_data.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "if (row.style.display !== 'none' &&\n"
+            "                        !row.classList.contains('tf-hidden') &&\n"
+            "                        !row.classList.contains('log-details')) {",
+            source,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

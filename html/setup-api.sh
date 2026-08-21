@@ -477,6 +477,15 @@ def ensure_ssh_key_lock():
     fcntl.flock(descriptor, fcntl.LOCK_EX)
     _SSH_KEY_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
 
+def ensure_restore_locks():
+    """Restores replace/retire collector SSH keys, and restore_bundle's
+    lock-first recovery can replay a retained key transaction before the new
+    bundle is even parsed, so backup-import unconditionally extends the shared
+    order to config -> inventory -> ssh-key (mirroring a key-bearing export
+    and serializing against the fan-outs that hold only the ssh-key lock)."""
+    ensure_backup_locks()
+    ensure_ssh_key_lock()
+
 def release_configuration_lock():
     """Drop the global configuration lock before a long per-device fan-out.
 
@@ -1802,9 +1811,9 @@ PIDFILE="__PID__"
 JOB_ID="__JOB__"
 START_TIME=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null || true)
 if [[ "$START_TIME" =~ ^[1-9][0-9]*$ ]]; then
-    printf '%s %s %s\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
+    printf '%s %s %s\\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
 else
-    printf '%s %s\n' "$JOB_ID" "$$" > "$PIDFILE"
+    printf '%s %s\\n' "$JOB_ID" "$$" > "$PIDFILE"
 fi
 cleanup_update_job() { rc=$?; exec 8>"${ACTIVE%.active}.start.lock"; if flock -x 8; then current=$(cat "$ACTIVE/job_id" 2>/dev/null || true); if [ "$current" = "$JOB_ID" ]; then rm -f "$PIDFILE" "$ACTIVE/job_id" "$ACTIVE/created"; rmdir "$ACTIVE" 2>/dev/null || true; fi; fi; trap - EXIT; exit "$rc"; }
 trap cleanup_update_job EXIT
@@ -1842,7 +1851,7 @@ LOG="__LOG__"
   exit "$install_rc"
 ) >> "$LOG" 2>&1
 rc=$?
-printf '__LLDPQ_DONE__:%s\n' "$rc" >> "$LOG"
+printf '__LLDPQ_DONE__:%s\\n' "$rc" >> "$LOG"
 exit "$rc"
 '''
     script = (SCRIPT.replace('__URL__', url)
@@ -1947,9 +1956,9 @@ PIDFILE="__PID__"
 JOB_ID="__JOB__"
 START_TIME=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null || true)
 if [[ "$START_TIME" =~ ^[1-9][0-9]*$ ]]; then
-    printf '%s %s %s\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
+    printf '%s %s %s\\n' "$JOB_ID" "$$" "$START_TIME" > "$PIDFILE"
 else
-    printf '%s %s\n' "$JOB_ID" "$$" > "$PIDFILE"
+    printf '%s %s\\n' "$JOB_ID" "$$" > "$PIDFILE"
 fi
 cleanup_update_job() { rc=$?; case "${TARBALL:-}" in /tmp/lldpq-upload-src.*.tar.gz) rm -f -- "$TARBALL";; esac; exec 8>"${ACTIVE%.active}.start.lock"; if flock -x 8; then current=$(cat "$ACTIVE/job_id" 2>/dev/null || true); if [ "$current" = "$JOB_ID" ]; then rm -f "$PIDFILE" "$ACTIVE/job_id" "$ACTIVE/created"; rmdir "$ACTIVE" 2>/dev/null || true; fi; fi; trap - EXIT; exit "$rc"; }
 trap cleanup_update_job EXIT
@@ -1979,7 +1988,7 @@ max_total_bytes = 1024 * 1024 * 1024
 seen = set()
 
 def safe_parts(name):
-    if not isinstance(name, str) or not name or "\\" in name or "\x00" in name:
+    if not isinstance(name, str) or not name or "\\\\" in name or "\\x00" in name:
         raise ValueError("archive contains an unsafe member name")
     path = pathlib.PurePosixPath(name)
     parts = tuple(part for part in path.parts if part not in ("", "."))
@@ -2062,7 +2071,7 @@ PYSAFE
   exit "$install_rc"
 ) >> "$LOG" 2>&1
 rc=$?
-printf '__LLDPQ_DONE__:%s\n' "$rc" >> "$LOG"
+printf '__LLDPQ_DONE__:%s\\n' "$rc" >> "$LOG"
 exit "$rc"
 '''
     script = (SCRIPT.replace('__TARBALL__', tarball)
@@ -2527,7 +2536,7 @@ if action == 'backup-import':
         result = importer.restore_bundle(
             b64, lldpq_user=lldpq_user, lldpq_dir=lldpq_dir, web_root=web_root,
             pref_keys=LLDPQ_PREF_KEYS, validate_cron=valid_cron_schedule,
-            acquire_lock=ensure_backup_locks,
+            acquire_lock=ensure_restore_locks,
         )
     except Exception as exc:
         print(json.dumps({'success': False, 'error': 'Backup restore failed: ' + str(exc)[:300]}))

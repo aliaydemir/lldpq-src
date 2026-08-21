@@ -21,6 +21,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRYPOINT = ROOT / "docker" / "docker-entrypoint.sh"
+DOCKERFILE = ROOT / "docker" / "Dockerfile"
 NGINX_SITE = ROOT / "etc" / "nginx" / "sites-available" / "lldpq"
 CONSOLE_PTY = ROOT / "lldpq" / "console-pty.py"
 
@@ -119,6 +120,60 @@ class ConsolePortContractTest(unittest.TestCase):
         self.assertEqual(
             len(re.findall(r'proxy_pass http://127\.0\.0\.1:\d+;', rewritten)), 1
         )
+
+
+class ServiceWatchdogContractTest(unittest.TestCase):
+    """Pins the fcgiwrap/cron watchdog and the container health probe.
+
+    Only console-pty was supervised; nginx as PID 1 kept the container
+    "running" while a dead fcgiwrap turned every CGI API into a 502 and a
+    dead cron silently stopped all scheduled collection, with no HEALTHCHECK
+    to surface either.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
+        cls.dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+
+    def test_the_watchdog_checks_both_daemons_by_exact_name(self):
+        """pgrep -x cannot be fooled by substring matches (e.g. cron in a path)."""
+        parts = self.entrypoint.split("_supervise_services()")
+        self.assertEqual(len(parts), 2, "watchdog function is missing")
+        watchdog = parts[1]
+        self.assertIn("pgrep -x fcgiwrap", watchdog)
+        self.assertIn("pgrep -x cron", watchdog)
+
+    def test_the_watchdog_runs_in_the_background_before_nginx(self):
+        start = self.entrypoint.find("_supervise_services &")
+        self.assertNotEqual(start, -1, "watchdog is never started")
+        self.assertLess(start, self.entrypoint.find("exec nginx"))
+
+    def test_restarts_reuse_the_exact_startup_commands(self):
+        """Once at startup, once in the watchdog restart helper."""
+        self.assertEqual(
+            self.entrypoint.count('/usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &'),
+            2,
+        )
+        self.assertEqual(self.entrypoint.count("service cron start"), 2)
+
+    def test_a_restart_storm_is_capped_instead_of_looping_forever(self):
+        self.assertIn("WATCHDOG_STORM_LIMIT=5", self.entrypoint)
+        self.assertIn("WATCHDOG_STORM_WINDOW=60", self.entrypoint)
+        self.assertIn("CRITICAL: fcgiwrap", self.entrypoint)
+        self.assertIn("CRITICAL: cron", self.entrypoint)
+
+    def test_a_capped_service_never_kills_the_container(self):
+        """nginx PID 1 semantics: the watchdog gives up quietly, no exit."""
+        watchdog = self.entrypoint.split("_supervise_services()")[1]
+        watchdog = watchdog.split("_supervise_services &")[0]
+        self.assertNotRegex(watchdog, r"(?m)^\s*exit 1\b")
+
+    def test_the_healthcheck_exercises_nginx_fcgiwrap_and_a_cgi(self):
+        """auth-api?action=check answers 200 JSON with no session cookie."""
+        self.assertIn("HEALTHCHECK", self.dockerfile)
+        self.assertIn("auth-api?action=check", self.dockerfile)
+        self.assertIn('grep -q \'"authenticated"\'', self.dockerfile)
 
 
 if __name__ == "__main__":

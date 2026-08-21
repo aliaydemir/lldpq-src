@@ -106,8 +106,14 @@ def main():
         # Anchor to this script's own directory: a relative cwd only resolves
         # when the caller happens to run from the install tree.
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        result = subprocess.run([sys.executable,
-                               os.path.join(script_dir, "generate_hardware_html.py")],
+        generator_cmd = [sys.executable,
+                         os.path.join(script_dir, "generate_hardware_html.py")]
+        if all_devices_unavailable:
+            # The generator writes export/hardware.{json,csv} (with digest
+            # sidecars) itself, so the all-unreachable verdict must ride
+            # along instead of being patched in after the fact.
+            generator_cmd.append("--collection-unavailable")
+        result = subprocess.run(generator_cmd,
                               capture_output=True, text=True, cwd=script_dir,
                               timeout=300)
         if result.returncode == 0:

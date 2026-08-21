@@ -119,6 +119,7 @@ WEB_ASSETS_TMP=""
 WEB_CACHE_TMP=""
 LOCAL_FINAL_TMP=""
 ROLLBACK_TMP=""
+pids=()
 
 remove_managed_file() {
     local path=$1
@@ -130,6 +131,17 @@ remove_managed_file() {
 }
 
 cleanup() {
+    local pid
+    # If the parent is interrupted, stop and reap every collection worker
+    # before the staging directory is removed. Otherwise an orphaned SSH job
+    # can wake up later and write into a path that cleanup already deleted.
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    pids=()
     remove_managed_file "${WEB_ASSETS_TMP:-}"
     remove_managed_file "${WEB_CACHE_TMP:-}"
     remove_managed_file "${ROLLBACK_TMP:-}"
@@ -328,7 +340,7 @@ for ip in "${device_ips[@]}"; do
     read -r user host <<< "${devices[$ip]}"
     printf '%s\t%s\n' "$host" "$ip" >> "$INVENTORY_FILE"
     row_file=$(printf '%s/%06d.row' "$ROWS_DIR" "$index")
-    process_one "$ip" "$user" "$host" "$row_file" &
+    process_one "$ip" "$user" "$host" "$row_file" 9>&- &
     pids+=("$!")
     index=$((index + 1))
 
@@ -342,6 +354,7 @@ done
 for pid in "${pids[@]}"; do
     wait "$pid" || worker_failed=true
 done
+pids=()
 if [[ "$worker_failed" == "true" ]]; then
     echo "assets: one or more collection workers failed" >&2
     exit 1

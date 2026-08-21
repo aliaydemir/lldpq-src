@@ -1121,6 +1121,7 @@
         let portProfiles = {};
         let deletingPortProfile = null;
         let sortState = { column: 'id', dir: 'asc' };
+        let parseWarning = '';  // out-of-band warning: some host_vars files failed to parse
 
         // Escape any server/user supplied string before injecting into innerHTML
         function escapeHtml(value) {
@@ -1162,6 +1163,10 @@
                 const leakData = await leakResponse.json();
                 const portData = await portResponse.json();
                 
+                // Both reports skip unparseable host_vars files and flag it via
+                // a 'warning' field: surface it so partial results are visible
+                parseWarning = [data.warning, leakData.warning].filter(Boolean).join(' ');
+
                 if (leakData.success) {
                     leakedSubnets = leakData.leaked_subnets || {};
                 }
@@ -1338,9 +1343,12 @@
         // Render table
         function renderTable() {
             const vlanNames = Object.keys(vlanProfiles);
+            const warnHtml = parseWarning
+                ? `<div style="color: #ffb74d; font-size: 12px; padding: 8px 12px; margin-bottom: 10px; background: rgba(255, 152, 0, 0.1); border-left: 3px solid #ff9800; border-radius: 4px;">⚠ ${escapeHtml(parseWarning)} Device usage may be incomplete.</div>`
+                : '';
             
             if (vlanNames.length === 0) {
-                document.getElementById('content-area').innerHTML = '<div class="no-data">No VLAN profiles found.</div>';
+                document.getElementById('content-area').innerHTML = warnHtml + '<div class="no-data">No VLAN profiles found.</div>';
                 return;
             }
             
@@ -1374,7 +1382,7 @@
 
             const sortCls = (col) => 'sortable' + (sortState.column === col ? ' ' + sortState.dir : '');
 
-            let html = `
+            let html = warnHtml + `
                 <table class="data-table" id="vlan-table">
                     <thead>
                         <tr>
@@ -2798,6 +2806,6 @@
 
         document.addEventListener('DOMContentLoaded', init);
     </script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 </body>
 </html>

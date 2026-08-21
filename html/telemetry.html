@@ -2115,22 +2115,33 @@
                 return;
             }
             
-            // Get timestamps from first result
-            const timestamps = results[0].values.map(v => {
-                const date = new Date(v[0] * 1000);
+            const shown = results.slice(0, 20);
+
+            // Align series by timestamp: union of all timestamps so unequal-length
+            // series land on the right X position instead of pairing by index
+            const tsSet = new Set();
+            shown.forEach(result => result.values.forEach(v => tsSet.add(v[0])));
+            const tsAxis = [...tsSet].sort((a, b) => a - b);
+
+            const timestamps = tsAxis.map(ts => {
+                const date = new Date(ts * 1000);
                 return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
             });
-            
-            const datasets = results.slice(0, 20).map((result, idx) => ({
-                label: result.metric.net_host_name || result.metric.interface || `Series ${idx + 1}`,
-                data: result.values.map(v => parseFloat(v[1]) || 0),
-                borderColor: chartColors[idx % chartColors.length],
-                backgroundColor: chartColors[idx % chartColors.length] + '20',
-                fill: false,
-                tension: 0.3,
-                pointRadius: 0,
-                borderWidth: 2
-            }));
+
+            const datasets = shown.map((result, idx) => {
+                const byTs = new Map(result.values.map(v => [v[0], parseFloat(v[1]) || 0]));
+                return {
+                    label: result.metric.net_host_name || result.metric.interface || `Series ${idx + 1}`,
+                    data: tsAxis.map(ts => byTs.has(ts) ? byTs.get(ts) : null),
+                    borderColor: chartColors[idx % chartColors.length],
+                    backgroundColor: chartColors[idx % chartColors.length] + '20',
+                    fill: false,
+                    tension: 0.3,
+                    pointRadius: 0,
+                    borderWidth: 2,
+                    spanGaps: true
+                };
+            });
             
             chart.data.labels = timestamps;
             chart.data.datasets = datasets;

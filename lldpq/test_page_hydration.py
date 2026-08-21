@@ -102,7 +102,7 @@ class TableFilterFastPathTests(unittest.TestCase):
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             if "table-filter.js?v=" in text and \
-                    "table-filter.js?v=20260803-tf-5" not in text:
+                    "table-filter.js?v=20260821-tf-6" not in text:
                 stale.append(path.name)
         self.assertEqual(stale, [],
                          "stale table-filter.js cache version references")
@@ -117,7 +117,7 @@ class TableFilterFastPathTests(unittest.TestCase):
                 continue
             text = path.read_text(encoding="utf-8", errors="replace")
             if "lifecycle-scope.js?v=" in text and \
-                    "lifecycle-scope.js?v=20260803-1" not in text:
+                    "lifecycle-scope.js?v=20260821-1" not in text:
                 stale.append(path.name)
         self.assertEqual(stale, [],
                          "stale lifecycle-scope.js cache version references")

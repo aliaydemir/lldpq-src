@@ -19,14 +19,15 @@ chmod 700 "$SESSIONS_DIR" 2>/dev/null
 # Get action from query string
 ACTION=$(echo "$QUERY_STRING" | sed -n 's/.*action=\([^&]*\).*/\1/p')
 
-# Read POST data if present
+# Read POST data if present (-r: keep literal backslashes from scripted clients)
 if [ "$REQUEST_METHOD" = "POST" ]; then
-    read -n "$CONTENT_LENGTH" POST_DATA
+    read -r -n "$CONTENT_LENGTH" POST_DATA
 fi
 
-# Function to get POST parameter
+# Function to get POST parameter (f2-: keep '=' inside values; unquote_plus:
+# form-encoding sends '+' for space)
 get_post_param() {
-    echo "$POST_DATA" | tr '&' '\n' | grep "^$1=" | cut -d'=' -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))"
+    echo "$POST_DATA" | tr '&' '\n' | grep "^$1=" | cut -d'=' -f2- | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote_plus(sys.stdin.read().strip()))"
 }
 
 # Function to generate random token
@@ -67,7 +68,10 @@ print(json.dumps(request, separators=(",", ":")))') || {
 
 # Function to get cookie
 get_cookie() {
-    echo "$HTTP_COOKIE" | tr ';' '\n' | grep "lldpq_session=" | cut -d'=' -f2 | tr -d ' '
+    # Anchor to the exact cookie name and take the first match only, so a
+    # stale scoped cookie (e.g. old_lldpq_session or a Path-scoped duplicate)
+    # cannot pollute the extracted token.
+    echo "$HTTP_COOKIE" | tr ';' '\n' | grep -E '^[[:space:]]*lldpq_session=' | head -n1 | cut -d'=' -f2- | tr -d ' '
 }
 
 valid_token() {

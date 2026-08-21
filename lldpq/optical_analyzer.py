@@ -705,7 +705,13 @@ class OpticalAnalyzer:
                     value > self.thresholds['rx_power_warning_high_dbm']):
                 return (2, max(low + self.thresholds['link_margin_min_db'] - value,
                                value - self.thresholds['rx_power_warning_high_dbm']))
-            return (1, -min(value - low, high - value))
+            # Healthy band: rank by distance to the boundaries that would be
+            # violated next (margin floor / warning high) — the same bounds
+            # tier 2 uses.  The hard (low, high) window is asymmetric, so
+            # ranking by its nearest edge could name a bright-but-safe lane
+            # worst while link_margin_db came from the dimmest lane.
+            return (1, max(low + self.thresholds['link_margin_min_db'] - value,
+                           value - self.thresholds['rx_power_warning_high_dbm']))
         if metric == 'tx_power':
             low = self.thresholds['tx_power_min_dbm']
             high = self.thresholds['tx_power_max_dbm']
@@ -2605,7 +2611,7 @@ class OpticalAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

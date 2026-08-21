@@ -121,6 +121,74 @@ class UnavailableRowHandlingTests(unittest.TestCase):
         self.assertEqual(failed_hosts, set())
 
 
+class HistorySaveFailureTests(unittest.TestCase):
+    """A failed history save is structural: the stale previous file passes
+    the size check, so the run must fail on the save result itself."""
+
+    def _result_dir(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        result_dir = Path(temporary.name) / "monitor-results"
+        result_dir.mkdir()
+        flap_dir = result_dir / "flap-data"
+        flap_dir.mkdir()
+        (flap_dir / "leaf1_carrier_transitions.txt").write_text("swp1:12\n")
+        return result_dir, flap_dir
+
+    def _apply_snapshot_mocks(self):
+        snapshot = ({"leaf1": "OK"}, 1.0, True)
+        for patcher in (
+            mock.patch.object(
+                process_flap_data, "read_asset_snapshot", return_value=snapshot
+            ),
+            mock.patch.object(
+                process_flap_data, "asset_snapshot_is_valid", return_value=True
+            ),
+            mock.patch.object(
+                process_flap_data,
+                "asset_snapshot_is_authoritative",
+                return_value=True,
+            ),
+            mock.patch.object(
+                process_flap_data, "is_current_collection", return_value=True
+            ),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_failed_save_fails_the_run(self):
+        result_dir, flap_dir = self._result_dir()
+        # The stale previous generation that used to mask overwrite failures.
+        (result_dir / "flap_history.json").write_text("{}\n")
+        self._apply_snapshot_mocks()
+        with mock.patch.object(
+            LinkFlapAnalyzer, "save_flap_history", autospec=True,
+            return_value=False,
+        ):
+            result = process_flap_data.process_carrier_transition_files(
+                str(flap_dir)
+            )
+        self.assertFalse(result)
+        self.assertFalse(
+            (result_dir / "link-flap-analysis.html").exists(),
+            "a failed save must stop the run before publishing a report",
+        )
+
+    def test_an_ownership_mismatch_does_not_fail_the_run(self):
+        result_dir, flap_dir = self._result_dir()
+        (result_dir / "flap_history.json").write_text("{}\n")
+        self._apply_snapshot_mocks()
+        with mock.patch(
+            "link_flap_analyzer.os.fchown",
+            side_effect=PermissionError("simulated ownership mismatch"),
+        ):
+            result = process_flap_data.process_carrier_transition_files(
+                str(flap_dir)
+            )
+        self.assertTrue(result)
+        self.assertTrue((result_dir / "link-flap-analysis.html").exists())
+
+
 class CollectorContractTests(unittest.TestCase):
     """The collector must not substitute 0 for a failed read."""
 

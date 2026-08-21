@@ -112,6 +112,18 @@ class FabricCheckFecTests(unittest.TestCase):
         self.assertEqual(analyzer.findings, [])
         self.assertEqual(analyzer.summary_counts()["links_fec_compared"], 1)
 
+    def test_none_and_off_fec_are_equivalent(self):
+        # Kernel ETHTOOL_FEC_NONE_BIT vs ETHTOOL_FEC_OFF_BIT: the spelling
+        # varies by driver/ethtool version, both mean no active FEC.
+        for side_a, side_b in (("None", "Off"), ("Off", "None")):
+            analyzer = self._analyze({
+                "leaf1": {"swp1": self._port(side_a, "on")},
+                "leaf2": {"swp1": self._port(side_b, "on")},
+            })
+            self.assertEqual(analyzer.findings, [])
+            self.assertEqual(
+                analyzer.summary_counts()["links_fec_compared"], 1)
+
     def test_non_comparable_fec_values_are_skipped(self):
         # A host NIC answering "Not-reported" must not fabricate a mismatch
         # against a switch that reports its real active encoding.

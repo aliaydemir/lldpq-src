@@ -111,6 +111,16 @@ class AskAiApiContractTest(unittest.TestCase):
                 ns["_pipeline_generation_state"]({"leaf1", "leaf2"})["current"]
             )
 
+    def test_operator_freshness_ceiling_is_exported_to_python(self):
+        # lldpq-config emits plain KEY=value assignments (no export); without
+        # this conditional export the heredoc's _max_collection_age_seconds
+        # always falls back to 30 minutes regardless of /etc/lldpq.conf.
+        self.assertIn(
+            'if [[ -n "${MONITOR_DATA_MAX_AGE_MINUTES:-}" ]]; then\n'
+            "    export MONITOR_DATA_MAX_AGE_MINUTES\nfi",
+            SCRIPT_TEXT,
+        )
+
     def test_partial_coverage_persists_report_but_not_trusted_snapshot(self):
         # The persist gate now also re-validates the generation right before
         # the write (a new collection may have started during the LLM ladder).
@@ -681,6 +691,252 @@ class AskAiApiContractTest(unittest.TestCase):
             row.get("context_kind") == "context-budget-notice" for row in fitted
         ))
         self.assertEqual(fitted[-1]["content"], "current question")
+
+    def test_device_list_attributes_bgp_down_to_exact_hostname(self):
+        ns = load_symbols("build_device_list")
+        ns.update({
+            "_load_json_cached": lambda _path: {"devices": {}},
+            "_mr_path": lambda *parts: "/nonexistent",
+            "_bgp_neighbor_rows": lambda _stats: [],
+            "_nonnegative_int": lambda value, default=0: (
+                int(value) if value is not None else default
+            ),
+            "_bgp_state_established": lambda _state: True,
+        })
+        devices = {
+            "10.0.0.1": {"hostname": "leaf-1", "role": "leaf"},
+            "10.0.0.10": {"hostname": "leaf-10", "role": "leaf"},
+        }
+        device_health = {
+            "leaf-1": {"status": "ok", "uptime": "5 days", "release": "5.9"},
+            "leaf-10": {"status": "down", "uptime": "?", "release": "5.9"},
+        }
+
+        # leaf-1 (healthy, BGP down) is a substring of leaf-10 (down, BGP ok):
+        # the BGP problem must land on leaf-1's own line, never leaf-10's.
+        ns["_current_bgp_stats"] = lambda _bgp: {"leaf-1": {"down_neighbors": 2}}
+        text = ns["build_device_list"](devices, device_health)
+        self.assertIn("PROBLEM DEVICES (2):", text)
+        self.assertIn("leaf-1 (10.0.0.1) role=leaf BGP_DOWN:2_sessions", text)
+        leaf10_line = next(
+            line for line in text.splitlines() if "leaf-10 (" in line
+        )
+        self.assertNotIn("BGP_DOWN", leaf10_line)
+        # The BGP-only problem device is no longer counted healthy.
+        self.assertIn("HEALTHY: 0/2 devices", text)
+        self.assertNotIn("1 leaf", text)
+
+        # Same-device merge: BGP info is appended to the existing problem line.
+        ns["_current_bgp_stats"] = lambda _bgp: {"leaf-10": {"down_neighbors": 3}}
+        text = ns["build_device_list"](devices, device_health)
+        self.assertIn("PROBLEM DEVICES (1):", text)
+        leaf10_line = next(
+            line for line in text.splitlines() if "leaf-10 (" in line
+        )
+        self.assertIn("STATUS:down", leaf10_line)
+        self.assertIn("BGP_DOWN:3_sessions", leaf10_line)
+        self.assertIn("HEALTHY: 1/2 devices (1 leaf)", text)
+
+    def test_shared_state_files_force_group_rw_after_create(self):
+        # os.open's 0o660 create mode is masked by the process umask (022 ->
+        # 0640): whichever AI_STATE identity (cron vs www-data) did not create
+        # a lazily-created lock/append file gets PermissionError, silently
+        # losing findings classification and usage accounting. Every such
+        # os.open must fchmod the descriptor back to 0o660.
+        creators = (
+            "os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o660)",
+            "LEARNINGS_EVENTS_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND",
+            "os.open(LEARNINGS_FILE + '.lock', os.O_RDWR | os.O_CREAT, 0o660)",
+            "os.open(path + '.lock', os.O_RDWR | os.O_CREAT, 0o660)",
+            "os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o660",
+        )
+        for snippet in creators:
+            with self.subTest(snippet=snippet):
+                index = PYTHON_TEXT.index(snippet)
+                self.assertIn(
+                    "os.fchmod(descriptor, 0o660)",
+                    PYTHON_TEXT[index:index + 500],
+                )
+
+    def test_chat_poll_cursor_stops_at_last_returned_event(self):
+        ns = load_symbols("action_chat_poll")
+
+        def run_poll(job_dir, events_path, cancel_path, cursor):
+            captured = {}
+
+            def capture(payload):
+                captured.update(payload)
+                raise SystemExit(0)
+
+            def refuse(message):
+                raise AssertionError(message)
+
+            ns.update({
+                "os": os,
+                "_job_request_params": lambda: {"job_id": "job-1",
+                                                "cursor": cursor},
+                "_valid_job_id": lambda _job_id: True,
+                "_job_paths": lambda _job_id: (job_dir, events_path,
+                                               cancel_path),
+                "_job_access_error": lambda _job_dir: "",
+                "_job_emit": lambda *_args, **_kwargs: None,
+                "JOB_STALL_SECONDS": 3600,
+                "error_json": refuse,
+                "result_json": capture,
+            })
+            with self.assertRaises(SystemExit):
+                ns["action_chat_poll"]()
+            return captured
+
+        with tempfile.TemporaryDirectory() as temporary:
+            events_path = os.path.join(temporary, "events.jsonl")
+            cancel_path = os.path.join(temporary, "cancel")
+            with open(events_path, "w", encoding="utf-8") as events_file:
+                for index in range(505):
+                    events_file.write(
+                        json.dumps({"event": "tool", "n": index}) + "\n"
+                    )
+            first = run_poll(temporary, events_path, cancel_path, 0)
+            self.assertEqual(len(first["events"]), 500)
+            self.assertFalse(first["done"])
+            # The cursor must not advance past the capped tail — events 501+
+            # would otherwise be skipped forever.
+            self.assertEqual(first["cursor"], 500)
+            second = run_poll(temporary, events_path, cancel_path,
+                              first["cursor"])
+            self.assertEqual([event["n"] for event in second["events"]],
+                             [500, 501, 502, 503, 504])
+            self.assertEqual(second["cursor"], 505)
+
+    def test_p2p_lookup_prefers_group_fitted_breakout_row(self):
+        import ai_p2p
+
+        ns = load_symbols(
+            "_P2P_INDEX_MEMO",
+            "_p2p_precise_entry",
+            "_fmt_design_kv",
+            "run_p2p_lookup",
+        )
+
+        def design_row(port, peer):
+            return {
+                "source_name": "SP-01", "source_port": port,
+                "dest_name": peer, "dest_port": "49",
+                "connection_type": "converged", "network_type": "eth",
+                "unresolved": False,
+            }
+
+        conns = {
+            "source_file": "design.xlsx",
+            "total_connections": 2,
+            # The ambiguous 1/2/1 row (whose tolerant aliases include swp1s0)
+            # comes first: the broad lookup would answer with peer-b.
+            "connections": [design_row("1/2/1", "peer-b"),
+                            design_row("1/1/1", "peer-a")],
+        }
+        ns.update({
+            "_p2p_module": ai_p2p,
+            "_load_active_p2p": lambda: (conns, ""),
+            "_display_alias_variants": lambda _device, _port: [],
+            "redact_secrets": lambda value: value,
+        })
+        out = ns["run_p2p_lookup"]("SP-01:swp1s0")
+        self.assertIn("1 link(s)", out)
+        self.assertIn("peer-a", out)
+        self.assertNotIn("peer-b", out)
+        # Device-wide queries still take the broad path (all links listed).
+        out = ns["run_p2p_lookup"]("SP-01")
+        self.assertIn("2 link(s)", out)
+
+    def test_diff_tool_is_registered_with_instructions_and_budget(self):
+        # The [DIFF:] tool is described to the model, parsed as an
+        # alone-on-a-line tag, billed against its own per-question budget,
+        # and stripped/neutralized everywhere the other tags are.
+        self.assertIn("=== STORED CONFIG-CHANGE DIFFS ===", PYTHON_TEXT)
+        self.assertIn("[DIFF: <device> [<count>]]", PYTHON_TEXT)
+        self.assertIn("MAX_DIFF = 2", PYTHON_TEXT)
+        self.assertRegex(PYTHON_TEXT, r"\(\?m\)\^\\s\*\\\[DIFF:")
+        # Finalize guard + visible-answer strip know the tag.
+        self.assertIn("PATH|SEARCH|P2P|IPAM|KB|DIFF):", PYTHON_TEXT)
+        self.assertIn("PATH|SEARCH|P2P|IPAM|KB|DIFF|FIX|NEXT|CONSOLE):", PYTHON_TEXT)
+        # Observed/collected data cannot forge an executable [DIFF:] tag.
+        self.assertIn("P2P|IPAM|KB|DIFF|FIX|NEXT|CONSOLE)\\s*:", PYTHON_TEXT)
+
+    def test_diff_tool_advertisement_is_gated_on_stored_history(self):
+        # Both the instructions block and the tag parser are conditional on a
+        # non-empty config_drift_history.json, mirroring the [P2P:] gating.
+        self.assertIn(
+            "if _drift_history_available:\n"
+            "    TOOL_INSTRUCTIONS += DIFF_INSTRUCTIONS",
+            PYTHON_TEXT,
+        )
+        self.assertIn(") if _drift_history_available else []", PYTHON_TEXT)
+        self.assertIn(
+            "_drift_history_available = os.path.getsize(_drift_history_path()) > 0",
+            PYTHON_TEXT,
+        )
+
+    def test_config_diff_tool_returns_stored_events_newest_first(self):
+        ns = load_symbols("DIFF_RESULT_MAX_CHARS", "run_config_diff")
+        with tempfile.TemporaryDirectory() as temporary:
+            history_path = Path(temporary) / "config_drift_history.json"
+            history_path.write_text(json.dumps({"version": 1, "events": [
+                {"ts": 100, "host": "devA", "type": "modified", "added": 1,
+                 "removed": 0, "summary": "+ nv set vrf A-OLD",
+                 "diff": ["--- previous", "+++ current", "+nv set vrf A-OLD"]},
+                {"ts": 200, "host": "devA", "type": "modified", "added": 1,
+                 "removed": 1, "summary": "+ nv set vrf A-NEW",
+                 "diff": ["-nv set vrf A-OLD", "+nv set vrf A-NEW"]},
+                # A diffless event must never consume a requested slot.
+                {"ts": 300, "host": "devA", "type": "modified", "added": 0,
+                 "removed": 0, "summary": "content changed", "diff": []},
+                {"ts": 150, "host": "devB", "type": "modified", "added": 1,
+                 "removed": 0, "summary": "+ nv set devB-only",
+                 "diff": ["+nv set devB-only"]},
+                {"ts": 500, "host": "devC", "type": "modified", "added": 400,
+                 "removed": 0, "summary": "+ mtu sweep",
+                 "diff": ["+nv set interface swp%d mtu 9216 pad-%s" % (n, "x" * 20)
+                          for n in range(400)],
+                 "diff_truncated": True},
+            ]}), encoding="utf-8")
+            ns.update({
+                "_load_json_file": lambda path: json.loads(
+                    Path(path).read_text(encoding="utf-8")),
+                "_drift_history_path": lambda: str(history_path),
+            })
+            run = ns["run_config_diff"]
+
+            out = run("devA", 2)
+            self.assertIn("2 event(s)", out)
+            # Newest first, only diff-bearing events, only the asked device.
+            self.assertLess(out.index("A-NEW"), out.index("+nv set vrf A-OLD"))
+            self.assertNotIn("devB-only", out)
+            self.assertNotIn("content changed", out)
+
+            # Unknown device -> clean one-line notice, never an error.
+            self.assertEqual(
+                run("no-such-dev", 1),
+                "no stored config-change events for no-such-dev",
+            )
+
+            # Count is clamped to 1..3 (0 and garbage -> 1; 99 -> 3).
+            clamped_low = run("devA", 0)
+            self.assertIn("1 event(s)", clamped_low)
+            self.assertIn("A-NEW", clamped_low)
+            self.assertNotIn("+nv set vrf A-OLD", clamped_low)
+            self.assertIn("1 event(s)", run("devA", "junk"))
+            self.assertIn("2 event(s)", run("devA", 99))
+
+            # Tolerant device resolution: case-insensitive, then squashed.
+            self.assertIn("A-NEW", run("DEVA", 1))
+            self.assertIn("A-NEW", run("dev-a", 1))
+
+            # The char budget truncates with an explicit marker and keeps the
+            # stored-truncation note out of scope when the budget cuts first.
+            budget = ns["DIFF_RESULT_MAX_CHARS"]
+            big = run("devC", 1)
+            self.assertLessEqual(len(big), budget + 40)
+            self.assertIn("... (truncated)", big)
 
 
 if __name__ == "__main__":

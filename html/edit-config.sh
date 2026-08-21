@@ -106,7 +106,8 @@ if not groups and devices_yaml and os.path.isfile(devices_yaml):
                 hostname = None
                 role = None
                 if isinstance(device_config, str):
-                    match = re.match(r'^(.+?)\s+@(\w+)$', device_config.strip())
+                    # Role charset must match the canonical grammar in lldpq/parse_devices.py
+                    match = re.match(r'^(.+?)\s+@([A-Za-z0-9_.-]+)$', device_config.strip())
                     if match:
                         hostname = match.group(1).strip()
                         role = match.group(2).lower()
@@ -245,6 +246,9 @@ PYEOF
     fi
     
     STDERR_FILE=$(mktemp)
+    # fcgiwrap SIGTERMs the CGI on the fastcgi timeout mid-validation; without
+    # an EXIT trap the sequential rm's below never run and the spool files leak.
+    trap 'rm -f -- "${STDERR_FILE-}"; [ -n "${TEMP_DIR:-}" ] && rm -rf -- "$TEMP_DIR"' EXIT
     # If specific devices requested, create temp dir with symlinks
     if [ -n "$DEVICES" ]; then
         TEMP_DIR=$(mktemp -d)

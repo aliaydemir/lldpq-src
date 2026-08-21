@@ -146,6 +146,25 @@ class EvpnMhAnalyzerTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "critical")
         self.assertIn("both active remote PEs are DF", rows[0]["reason"])
 
+    def test_bypass_no_df_is_not_a_conflict(self):
+        rows = correlate_snapshots({
+            "tan-leaf-06": snapshot("tan-leaf-06", df=False, bypass=True),
+            "tan-leaf-08": snapshot("tan-leaf-08", df=False, bypass=True),
+        })
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "bypass")
+        self.assertTrue(rows[0]["bypass_active"])
+        self.assertNotIn("no active PE is DF", rows[0]["reason"])
+        self.assertIn("LACP bypass active", rows[0]["reason"])
+
+    def test_active_remote_no_df_without_bypass_is_critical(self):
+        rows = correlate_snapshots({
+            "tan-leaf-06": snapshot("tan-leaf-06", df=False),
+            "tan-leaf-08": snapshot("tan-leaf-08", df=False),
+        })
+        self.assertEqual(rows[0]["status"], "critical")
+        self.assertIn("no active PE is DF", rows[0]["reason"])
+
     def test_normal_pair_is_healthy(self):
         rows = correlate_snapshots({
             "tan-leaf-06": snapshot("tan-leaf-06", df=True),

@@ -70,6 +70,8 @@ parse_query() {
     HOST=$(echo "$query" | sed -n 's/.*host=\([^&]*\).*/\1/p')
     # URL decode (handle %2C for comma, etc.)
     HOST=$(echo "$HOST" | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+    # Extract async flag (diff/generate: run as a detached background job)
+    ASYNC=$(echo "$query" | sed -n 's/.*async=\([^&]*\).*/\1/p')
 }
 
 # Output JSON response
@@ -91,6 +93,13 @@ acquire_deploy_lock() {
         return 1
     fi
     return 0
+}
+
+# Register ANSIBLE_DIR as a git safe.directory exactly once: --add appends a
+# duplicate gitconfig line on every request, so check before adding.
+ensure_safe_directory() {
+    git config --global --get-all safe.directory 2>/dev/null | grep -Fxq -- "$ANSIBLE_DIR" || \
+        git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
 }
 
 # Restore mode+owner on files rewritten via mktemp+mv so web edits never
@@ -236,7 +245,7 @@ read_file() {
         return
     fi
     
-    local content=$(cat "$full_path" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+    local content=$(cat "$full_path" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
     json_response "{\"success\": true, \"content\": $content}"
 }
 
@@ -353,28 +362,83 @@ delete_file() {
     fi
 }
 
+# Start a detached ansible-playbook job (shared by deploy/diff/generate).
+# Assumes the single-runner lock is already held on fd 9: the setsid child
+# inherits that fd, so the lock stays held until the job exits. Emits the
+# started/job_id JSON response; the caller polls action=deploy-status.
+start_ansible_job() {
+    local kind="$1" playbook="$2" limit="$3"
+
+    mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
+
+    # Sweep stale job logs (older than 1 day) so state does not grow unbounded.
+    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' -o -name '*.pid' \) -mtime +1 -delete 2>/dev/null || true
+
+    local job_id="$kind-$(date +%Y%m%d-%H%M%S)-$$"
+    local log_file="$DEPLOY_STATE_DIR/$job_id.log"
+    local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
+    local pid_file="$DEPLOY_STATE_DIR/$job_id.pid"
+
+    : > "$log_file" 2>/dev/null || {
+        json_response '{"success": false, "error": "Cannot create job log"}'
+        return
+    }
+
+    # Detach: setsid + closed stdio so the job outlives this CGI request, the
+    # nginx timeout and the browser tab. fd 9 (the lock) is intentionally left
+    # open for the child so the single-runner lock is held until it exits.
+    # The child records its own PID first so deploy-status can detect a job that
+    # died without writing an rc. The rc is written to a temp file and mv'd into
+    # place (atomic rename) so a poll can never read a half-written rc.
+    # An empty limit runs the playbook unrestricted (generate for all hosts).
+    setsid bash -c '
+        echo "$$" > "$5" 2>/dev/null
+        cd "$1" || { echo "ERROR: cannot access ansible directory: $1" >> "$2"; echo 1 > "$3.tmp"; mv -f "$3.tmp" "$3"; exit 1; }
+        if [ -n "$4" ]; then
+            ANSIBLE_FORCE_COLOR=true ansible-playbook "$6" -l "$4" >> "$2" 2>&1
+        else
+            ANSIBLE_FORCE_COLOR=true ansible-playbook "$6" >> "$2" 2>&1
+        fi
+        rc=$?
+        echo "$rc" > "$3.tmp"
+        mv -f "$3.tmp" "$3"
+        exit "$rc"
+    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$limit" "$pid_file" "$playbook" </dev/null >/dev/null 2>&1 &
+
+    json_response "{\"success\": true, \"started\": true, \"job_id\": \"$job_id\"}"
+}
+
 # Run ansible diff
 run_diff() {
     local host="$1"
-    
+
     if [ -z "$host" ]; then
         json_response '{"success": false, "error": "No host specified"}'
         return
     fi
-    
+
     # Sanitize host name
     host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
-    
+
     cd "$ANSIBLE_DIR" || {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
     }
 
     # Single-runner lock: never run diff while a deploy/generate/diff is applying
-    # config on the same switches. The lock is released when this fd closes.
+    # config on the same switches. The lock is released when this fd closes (or,
+    # for a detached job, when the job holding the inherited fd exits).
     exec 9>"$DEPLOY_LOCK"
     if ! flock -n 9; then
         json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return
+    fi
+
+    # async=1: detached job on the shared deploy-jobs mechanism, so long
+    # whole-fabric diffs survive the nginx read timeout. The synchronous path
+    # below is kept for callers that have not migrated to submit-then-poll.
+    if [ "$ASYNC" = "1" ]; then
+        start_ansible_job "diff" "playbooks/diff_switch_configs.yaml" "$host,localhost"
         return
     fi
 
@@ -384,7 +448,7 @@ run_diff() {
     local exit_code=$?
 
     # Escape output for JSON
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
 
     # Only rc=0 is success. The playbook uses ignore_unreachable, so rc=2 means
     # real host task failures (rc=4=unreachable is already tolerated internally).
@@ -414,11 +478,6 @@ run_deploy() {
         return
     fi
 
-    mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
-
-    # Sweep stale job logs (older than 1 day) so state does not grow unbounded.
-    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' -o -name '*.pid' \) -mtime +1 -delete 2>/dev/null || true
-
     # Single-runner lock: acquire it here so a concurrent request gets an
     # immediate "locked" response. The backgrounded job inherits this fd and
     # therefore keeps the lock held for its whole lifetime; the lock is released
@@ -429,42 +488,21 @@ run_deploy() {
         return
     fi
 
-    local job_id="deploy-$(date +%Y%m%d-%H%M%S)-$$"
-    local log_file="$DEPLOY_STATE_DIR/$job_id.log"
-    local rc_file="$DEPLOY_STATE_DIR/$job_id.rc"
-    local pid_file="$DEPLOY_STATE_DIR/$job_id.pid"
-
-    : > "$log_file" 2>/dev/null || {
-        json_response '{"success": false, "error": "Cannot create deploy log"}'
-        return
-    }
-
-    # Detach: setsid + closed stdio so the job outlives this CGI request, the
-    # nginx timeout and the browser tab. fd 9 (the lock) is intentionally left
-    # open for the child so the single-runner lock is held until it exits.
-    # The child records its own PID first so deploy-status can detect a job that
-    # died without writing an rc. The rc is written to a temp file and mv'd into
-    # place (atomic rename) so a poll can never read a half-written rc.
-    setsid bash -c '
-        echo "$$" > "$5" 2>/dev/null
-        cd "$1" || { echo "ERROR: cannot access ansible directory: $1" >> "$2"; echo 1 > "$3.tmp"; mv -f "$3.tmp" "$3"; exit 1; }
-        ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/deploy_switch_configs.yaml -l "$4,localhost" >> "$2" 2>&1
-        rc=$?
-        echo "$rc" > "$3.tmp"
-        mv -f "$3.tmp" "$3"
-        exit "$rc"
-    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$host" "$pid_file" </dev/null >/dev/null 2>&1 &
-
-    json_response "{\"success\": true, \"started\": true, \"job_id\": \"$job_id\"}"
+    start_ansible_job "deploy" "playbooks/deploy_switch_configs.yaml" "$host,localhost"
 }
 
-# Poll a background deploy job: tail its log and, once finished, report the
-# saved exit code (only rc=0 is success).
+# Poll a background job (deploy/diff/generate): tail its log and, once
+# finished, report the saved exit code (only rc=0 is success). An optional
+# offset=N query param makes the response carry only the log suffix past byte
+# N plus the new total_len, so 2s polls do not resend the whole log; without
+# it the full log is returned (old clients).
 deploy_status() {
     local job_id="$1"
+    local offset="$2"
 
     # Confine job id to the safe charset used when it is generated.
     job_id=$(echo "$job_id" | tr -cd '[:alnum:]-_.')
+    offset=$(echo "$offset" | tr -cd '0-9')
 
     if [ -z "$job_id" ]; then
         json_response '{"success": false, "error": "No job id specified"}'
@@ -480,9 +518,18 @@ deploy_status() {
         return
     fi
 
-    local output_json=$(cat "$log_file" 2>/dev/null | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+    # Job kind from the id prefix, used in error text only.
+    local kind
+    case "$job_id" in
+        diff-*) kind="Diff" ;;
+        generate-*) kind="Generate" ;;
+        *) kind="Deploy" ;;
+    esac
 
+    # Resolve the job state BEFORE reading the log, so the final (done) poll
+    # can never miss bytes written just before the rc appeared.
     local rc=""
+    local died=0
     if [ -f "$rc_file" ]; then
         rc=$(tr -cd '0-9' < "$rc_file")
         rc=${rc:-1}
@@ -497,20 +544,65 @@ deploy_status() {
                 rc=$(tr -cd '0-9' < "$rc_file")
                 rc=${rc:-1}
             else
-                json_response "{\"success\": false, \"done\": true, \"exit_code\": 1, \"output\": $output_json, \"error\": \"Deploy process died without writing a result\"}"
-                return
+                died=1
             fi
         fi
     fi
 
+    local job_done=0
+    if [ -n "$rc" ] || [ "$died" -eq 1 ]; then
+        job_done=1
+    fi
+
+    # Read the log once; total_len derives from the bytes actually returned so
+    # a log growing mid-read cannot desync the next poll. While the job runs,
+    # an incomplete trailing UTF-8 sequence is held back (a poll can land
+    # mid-character); the final poll flushes everything.
+    local read_meta
+    read_meta=$(LOG_FILE="$log_file" LOG_OFFSET="${offset:-0}" JOB_DONE="$job_done" python3 -c '
+import sys, json, os
+path = os.environ["LOG_FILE"]
+offset = int(os.environ.get("LOG_OFFSET") or 0)
+job_done = os.environ.get("JOB_DONE") == "1"
+try:
+    with open(path, "rb") as f:
+        f.seek(offset)
+        data = f.read()
+except Exception:
+    data = b""
+end = len(data)
+if not job_done and end > 0:
+    for back in range(1, min(4, end) + 1):
+        b = data[end - back]
+        if b & 0xC0 == 0xC0:  # lead byte of a multibyte sequence
+            seq_len = 2 if b & 0xE0 == 0xC0 else (3 if b & 0xF0 == 0xE0 else 4)
+            if back < seq_len:
+                end -= back
+            break
+        if b & 0x80 == 0:  # ASCII byte: nothing incomplete behind it
+            break
+print(offset + end)
+print(json.dumps(data[:end].decode("utf-8", errors="replace")))
+')
+    local total_len output_json
+    total_len=$(printf '%s\n' "$read_meta" | sed -n '1p')
+    output_json=$(printf '%s\n' "$read_meta" | sed -n '2p')
+    total_len=${total_len:-${offset:-0}}
+    [ -n "$output_json" ] || output_json='""'
+
+    if [ "$died" -eq 1 ]; then
+        json_response "{\"success\": false, \"done\": true, \"exit_code\": 1, \"total_len\": $total_len, \"output\": $output_json, \"error\": \"$kind process died without writing a result\"}"
+        return
+    fi
+
     if [ -n "$rc" ]; then
         if [ "$rc" -eq 0 ] 2>/dev/null; then
-            json_response "{\"success\": true, \"done\": true, \"exit_code\": $rc, \"output\": $output_json}"
+            json_response "{\"success\": true, \"done\": true, \"exit_code\": $rc, \"total_len\": $total_len, \"output\": $output_json}"
         else
-            json_response "{\"success\": false, \"done\": true, \"exit_code\": $rc, \"output\": $output_json, \"error\": \"Deploy failed with exit code $rc\"}"
+            json_response "{\"success\": false, \"done\": true, \"exit_code\": $rc, \"total_len\": $total_len, \"output\": $output_json, \"error\": \"$kind failed with exit code $rc\"}"
         fi
     else
-        json_response "{\"success\": true, \"done\": false, \"running\": true, \"output\": $output_json}"
+        json_response "{\"success\": true, \"done\": false, \"running\": true, \"total_len\": $total_len, \"output\": $output_json}"
     fi
 }
 
@@ -524,10 +616,24 @@ run_generate() {
     }
 
     # Single-runner lock shared with deploy/diff so generation cannot race a
-    # concurrent nv config apply. Released when this fd closes.
+    # concurrent nv config apply. Released when this fd closes (or, for a
+    # detached job, when the job holding the inherited fd exits).
     exec 9>"$DEPLOY_LOCK"
     if ! flock -n 9; then
         json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        return
+    fi
+
+    # async=1: detached job on the shared deploy-jobs mechanism, so long
+    # whole-fabric generates survive the nginx read timeout. The synchronous
+    # path below is kept for callers that have not migrated to submit-then-poll.
+    if [ "$ASYNC" = "1" ]; then
+        if [ -n "$host" ] && [ "$host" != "all" ]; then
+            host=$(echo "$host" | tr -cd '[:alnum:]-_,.')
+            start_ansible_job "generate" "playbooks/generate_switch_nvue_yaml_configs.yaml" "$host,localhost"
+        else
+            start_ansible_job "generate" "playbooks/generate_switch_nvue_yaml_configs.yaml" ""
+        fi
         return
     fi
 
@@ -541,9 +647,9 @@ run_generate() {
         output=$(ANSIBLE_FORCE_COLOR=true ansible-playbook playbooks/generate_switch_nvue_yaml_configs.yaml 2>&1)
     fi
     local exit_code=$?
-    
+
     # Escape output for JSON
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
     
     if [ $exit_code -eq 0 ]; then
         json_response "{\"success\": true, \"output\": $output_json}"
@@ -575,7 +681,7 @@ git_commit_push() {
     export HOME="$ANSIBLE_HOME"
     git config --global user.email "ansible-editor@lldpq.local" 2>/dev/null || true
     git config --global user.name "Ansible Editor" 2>/dev/null || true
-    git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
+    ensure_safe_directory
     
     # Stage only editor-managed paths (the EDITOR_ROOT subtree), never the whole
     # working tree, so unrelated changes elsewhere in the repo are not committed.
@@ -607,20 +713,21 @@ git_commit_push() {
         local push_output
         push_output=$(git push 2>&1)
         local push_code=$?
-        output="$output\n$push_output"
-        
+        # Join with a real newline (echo -e would mangle backslashes in git output)
+        output="$output"$'\n'"$push_output"
+
         # Fix git permissions after push
         fix_git_permissions
-        
+
         if [ $push_code -eq 0 ]; then
-            local output_json=$(echo -e "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+            local output_json=$(printf '%s\n' "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
             json_response "{\"success\": true, \"output\": $output_json}"
         else
-            local output_json=$(echo -e "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+            local output_json=$(printf '%s\n' "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
             json_response "{\"success\": false, \"output\": $output_json, \"error\": \"Push failed\"}"
         fi
     else
-        local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+        local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
         json_response "{\"success\": false, \"output\": $output_json, \"error\": \"Commit failed\"}"
     fi
 }
@@ -632,7 +739,7 @@ git_pull() {
     }
     
     export GIT_CONFIG_GLOBAL=/tmp/ansible-gitconfig
-    git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
+    ensure_safe_directory
 
     # Working-tree/.git mutation: must not overlap a running deploy/diff/generate.
     if ! acquire_deploy_lock; then
@@ -642,12 +749,12 @@ git_pull() {
     local output
     output=$(git pull 2>&1)
     local exit_code=$?
-    
+
     # Fix git permissions after pull
     fix_git_permissions
-    
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
+
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+
     if [ $exit_code -eq 0 ]; then
         json_response "{\"success\": true, \"output\": $output_json}"
     else
@@ -660,15 +767,29 @@ git_status() {
         json_response '{"success": false, "error": "Cannot access ansible directory"}'
         return
     }
-    
+
     export GIT_CONFIG_GLOBAL=/tmp/ansible-gitconfig
-    git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-    
+    ensure_safe_directory
+
+    # Capture stderr separately and honor the exit status, so git failures
+    # ("not a git repository", dubious ownership) surface as success:false
+    # instead of being folded into output and read as a clean tree.
+    local err_file="$ANSIBLE_HOME/git-status-err.$$"
     local output
-    output=$(git status 2>&1)
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
-    json_response "{\"success\": true, \"output\": $output_json}"
+    output=$(git status 2>"$err_file")
+    local exit_code=$?
+    local errors
+    errors=$(cat "$err_file" 2>/dev/null)
+    rm -f "$err_file" 2>/dev/null
+
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+
+    if [ $exit_code -eq 0 ]; then
+        json_response "{\"success\": true, \"output\": $output_json}"
+    else
+        local error_json=$(echo "$errors" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+        json_response "{\"success\": false, \"output\": $output_json, \"error\": $error_json}"
+    fi
 }
 
 git_log() {
@@ -678,13 +799,13 @@ git_log() {
     }
     
     export GIT_CONFIG_GLOBAL=/tmp/ansible-gitconfig
-    git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-    
+    ensure_safe_directory
+
     local output
     # Pretty format with fixed widths: hash | date | relative time | author | message
     output=$(git --no-pager log --graph --decorate=no --date=format:'%Y-%m-%d %H:%M' --pretty=format:'%<(8,trunc)%h │ %<(16)%ad │ %<(14)%cr │ %<(12,trunc)%an │ %s' -n 30 2>&1)
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+
     json_response "{\"success\": true, \"output\": $output_json}"
 }
 
@@ -695,12 +816,12 @@ git_diff() {
     }
     
     export GIT_CONFIG_GLOBAL=/tmp/ansible-gitconfig
-    git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-    
+    ensure_safe_directory
+
     local output
     output=$(git diff 2>&1)
-    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
-    
+    local output_json=$(echo "$output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+
     json_response "{\"success\": true, \"output\": $output_json}"
 }
 
@@ -760,7 +881,8 @@ case "$ACTION" in
         ;;
     deploy-status)
         JOB_ID=$(echo "$QUERY_STRING" | sed -n 's/.*job=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        deploy_status "$JOB_ID"
+        OFFSET=$(echo "$QUERY_STRING" | sed -n 's/.*offset=\([^&]*\).*/\1/p')
+        deploy_status "$JOB_ID" "$OFFSET"
         ;;
     git-commit)
         git_commit_push "$MESSAGE"
@@ -779,7 +901,7 @@ case "$ACTION" in
         ;;
     git-reset)
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
-        git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
+        ensure_safe_directory
 
         # Working-tree mutation: must not overlap a running deploy/diff/generate.
         acquire_deploy_lock || exit 0
@@ -801,7 +923,9 @@ case "$ACTION" in
         if [ $reset_code -eq 0 ]; then
             json_response '{"success": true, "output": "All uncommitted changes have been discarded."}'
         else
-            json_response "{\"success\": false, \"error\": \"Failed to reset: $output\"}"
+            # git stderr can be multi-line: encode it, never interpolate raw
+            error_json=$(printf '%s' "Failed to reset: $output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+            json_response "{\"success\": false, \"error\": $error_json}"
         fi
         ;;
     git-reset-file)
@@ -825,7 +949,7 @@ case "$ACTION" in
         fi
 
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
-        git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
+        ensure_safe_directory
 
         # Working-tree mutation: must not overlap a running deploy/diff/generate.
         acquire_deploy_lock || exit 0
@@ -851,7 +975,9 @@ case "$ACTION" in
         if [ $reset_code -eq 0 ]; then
             json_response '{"success": true, "output": "File reset to last commit."}'
         else
-            json_response "{\"success\": false, \"error\": \"Failed to reset file: $output\"}"
+            # git stderr can be multi-line: encode it, never interpolate raw
+            error_json=$(printf '%s' "Failed to reset file: $output" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+            json_response "{\"success\": false, \"error\": $error_json}"
         fi
         ;;
     grep)
@@ -915,14 +1041,16 @@ PYEOF
     get-modified-devices)
         # Get list of modified device hostnames from git diff
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
-        git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-        
-        # Get modified files in inventory/host_vars/ (.yaml or .yml)
+        ensure_safe_directory
+
+        # Get modified files in inventory/host_vars/ (.yaml or .yml):
+        # unstaged + staged + untracked
         modified_files=$(git diff --name-only 2>/dev/null | grep -E "inventory/host_vars/.*\.(yaml|yml)$" || true)
+        staged_files=$(git diff --cached --name-only 2>/dev/null | grep -E "inventory/host_vars/.*\.(yaml|yml)$" || true)
         untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null | grep -E "inventory/host_vars/.*\.(yaml|yml)$" || true)
 
         # Combine, extract hostnames (strip either extension), make unique
-        all_hostnames=$(echo -e "${modified_files}\n${untracked_files}" | grep -v "^$" | sed 's|.*/||; s/\.yaml$//; s/\.yml$//' | sort -u | grep -v "^$" || true)
+        all_hostnames=$(echo -e "${modified_files}\n${staged_files}\n${untracked_files}" | grep -v "^$" | sed 's|.*/||; s/\.yaml$//; s/\.yml$//' | sort -u | grep -v "^$" || true)
         
         # Build JSON array
         if [ -z "$all_hostnames" ]; then
@@ -937,23 +1065,24 @@ PYEOF
     get-modified-files)
         # Get list of ALL modified files from git diff (for editor marking)
         cd "$ANSIBLE_DIR" || { json_response '{"success": false, "error": "Cannot access ansible directory"}'; exit 0; }
-        git config --global --add safe.directory "$ANSIBLE_DIR" 2>/dev/null || true
-        
-        # Get modified files (staged and unstaged)
-        modified=$(git diff --name-only 2>/dev/null || true)
-        staged=$(git diff --cached --name-only 2>/dev/null || true)
-        untracked=$(git ls-files --others --exclude-standard 2>/dev/null || true)
-        
-        # Combine all, make unique, filter hidden
-        all_files=$(echo -e "${modified}\n${staged}\n${untracked}" | grep -v "^$" | grep -v "^\.git" | sort -u || true)
-        
-        # Build JSON array
+        ensure_safe_directory
+
+        # Get modified files (staged and unstaged). quotePath=false keeps
+        # non-ASCII paths raw instead of C-quoted (which broke the JSON below).
+        modified=$(git -c core.quotePath=false diff --name-only 2>/dev/null || true)
+        staged=$(git -c core.quotePath=false diff --cached --name-only 2>/dev/null || true)
+        untracked=$(git -c core.quotePath=false ls-files --others --exclude-standard 2>/dev/null || true)
+
+        # Combine all, make unique, filter hidden (printf: no backslash mangling)
+        all_files=$(printf '%s\n%s\n%s\n' "${modified}" "${staged}" "${untracked}" | grep -v "^$" | grep -v "^\.git" | sort -u || true)
+
+        # Build JSON array (json.dumps: quotes/backslashes in paths stay valid JSON)
         if [ -z "$all_files" ]; then
             json_response '{"success": true, "modified_files": [], "count": 0}'
         else
-            files_json=$(echo "$all_files" | while read -r f; do printf '"%s",' "$f"; done | sed 's/,$//')
+            files_json=$(echo "$all_files" | python3 -c 'import sys,json; print(json.dumps([l.strip() for l in sys.stdin.buffer.read().decode("utf-8", errors="replace").splitlines() if l.strip()]))')
             count=$(echo "$all_files" | wc -l | tr -d ' ')
-            json_response "{\"success\": true, \"modified_files\": [${files_json}], \"count\": ${count}}"
+            json_response "{\"success\": true, \"modified_files\": ${files_json}, \"count\": ${count}}"
         fi
         ;;
     image)

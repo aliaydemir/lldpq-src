@@ -43,6 +43,11 @@ def summary_metadata(report):
     return parser.summary
 
 
+def card_metric(report, card_id):
+    section = report.split(f'id="{card_id}"', 1)[1]
+    return section.split('<div class="metric">', 1)[1].split("</div>", 1)[0]
+
+
 class PfcEcnDashboardContractTests(unittest.TestCase):
     def test_complete_interval_publishes_raw_numeric_metrics(self):
         current = dict(BASE_COUNTERS)
@@ -135,6 +140,67 @@ class PfcEcnDashboardContractTests(unittest.TestCase):
         self.assertEqual(summary["data-ready-ports"], "1")
         self.assertEqual(summary["data-discard-ready-ports"], "0")
         self.assertEqual(summary["data-discard-active-ports"], "0")
+
+    def test_ecn_only_fleet_never_claims_healthy_pfc_zeros(self):
+        # A fleet whose ports expose ECN counters but no PFC pause counters
+        # never measured PFC; the summary must say "unavailable", not "0".
+        baseline = {
+            "ecn_marked_frames": 100,
+            "tx_frames": 1000,
+            "tx_uc_buffer_discards": 4,
+            "wred_discards": 5,
+        }
+        current = dict(baseline)
+        current.update({
+            "ecn_marked_frames": 110,
+            "tx_frames": 1100,
+            "rx_pause_frames": None,
+            "tx_pause_frames": None,
+        })
+        record = analyzer.build_port_record(
+            "leaf1", "swp1", current,
+            {"timestamp": 1000, "counters": baseline}, 1010,
+        )
+        self.assertEqual(record["sample_status"], "analyzed")
+        self.assertTrue(record["ecn_ready"])
+        self.assertFalse(record["pfc_ready"])
+
+        metrics = analyzer.summarize_records([record], 1, 1)
+        self.assertEqual(metrics["ready_ports"], 1)
+        self.assertEqual(metrics["ecn_ready_ports"], 1)
+        self.assertEqual(metrics["pfc_ready_ports"], 0)
+
+        report = analyzer.render_report(
+            [record], expected_hosts=1, current_hosts=1
+        )
+        summary = summary_metadata(report)
+        self.assertEqual(summary["data-ready-ports"], "1")
+        self.assertEqual(summary["data-ecn-ready-ports"], "1")
+        self.assertEqual(summary["data-pfc-ready-ports"], "0")
+        # The PFC cards get the same unavailable em-dash the row cells use;
+        # the measured ECN family renders active/ready.
+        self.assertEqual(card_metric(report, "ecn-card"), "1/1")
+        self.assertEqual(card_metric(report, "rx-card"), "&mdash;")
+        self.assertEqual(card_metric(report, "tx-card"), "&mdash;")
+
+    def test_measured_families_render_active_over_ready_counts(self):
+        current = dict(BASE_COUNTERS)
+        current.update({
+            "ecn_marked_frames": 110,
+            "tx_frames": 1100,
+            "rx_pause_frames": 205,
+            "tx_pause_frames": 303,
+        })
+        record = analyzer.build_port_record(
+            "leaf1", "swp1", current,
+            {"timestamp": 1000, "counters": BASE_COUNTERS}, 1010,
+        )
+        report = analyzer.render_report(
+            [record], expected_hosts=1, current_hosts=1
+        )
+        self.assertEqual(card_metric(report, "ecn-card"), "1/1")
+        self.assertEqual(card_metric(report, "rx-card"), "1/1")
+        self.assertEqual(card_metric(report, "tx-card"), "1/1")
 
     def test_unavailable_collection_preserves_coverage_diagnostics(self):
         report = analyzer.render_report(

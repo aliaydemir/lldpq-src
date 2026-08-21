@@ -452,8 +452,12 @@
             sockOpened = true;
             if (sess.ws !== ws || sess.closing) return;
             if (options.resetOnOpen) {
+                // Reset only the xterm display; keep sess.log so Download Log /
+                // Send to Ask-AI retain pre-reconnect output. The bridge replays
+                // its bounded buffer into the fresh terminal, so the retained
+                // log tail may repeat once after the separator — acceptable.
                 try { sess.term.reset(); } catch (e) { try { sess.term.clear(); } catch (_) {} }
-                sess.log = '';
+                if (sess.log) sess.log += `\n----- reconnected ${new Date().toISOString()} -----\n`;
             }
             sess.connected = true;
             sess.reconnectAttempts = 0;

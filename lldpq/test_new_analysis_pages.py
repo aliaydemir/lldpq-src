@@ -2,6 +2,7 @@
 """Tests for the config-drift / routes / fabric-check analyzers and their
 pipeline, trigger, menu, dashboard and nginx wiring."""
 
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -142,6 +143,13 @@ class RoutesAnalyzerTests(unittest.TestCase):
         }
         (tables / ("%s.json" % host)).write_text(json.dumps(payload))
 
+    def _summary(self, tmp, epoch):
+        tables = Path(tmp) / "monitor-results" / "fabric-tables"
+        tables.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        (tables / "summary.json").write_text(json.dumps({"timestamp": stamp}))
+
     def _run(self, tmp, now):
         analyzer = routes.RoutesAnalyzer(
             os.path.join(tmp, "monitor-results"), now=now)
@@ -186,6 +194,34 @@ class RoutesAnalyzerTests(unittest.TestCase):
             self.assertIn("tr.detail-row td", page)
             # Sorting must drop open detail panels before re-appending rows.
             self.assertIn("removeDetailRows();\n  var rows", page)
+
+    def test_stale_scan_does_not_rerecord_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = 2_000_000_000
+            self._snapshot(tmp, "Leaf1", 100)
+            self._summary(tmp, base)
+            first = self._run(tmp, now=base)
+            self.assertEqual(first.summary_counts()["events_recorded"], 0)
+
+            # fabric-scan dies; the frozen tables now show a drop, but the
+            # scan is stale: repeated analyzer runs must not record events
+            # (each would otherwise re-record the same drop with a fresh ts).
+            self._snapshot(tmp, "Leaf1", 10)
+            for offset in (5400, 6000, 6600):
+                stale = self._run(tmp, now=base + offset)
+                self.assertEqual(stale.collection_status(), "stale")
+                counts = stale.summary_counts()
+                self.assertEqual(counts["new_events"], 0)
+                self.assertEqual(counts["route_drops_24h"], 0)
+                self.assertEqual(counts["events_recorded"], 0)
+
+            # Scan recovers: the drop is detected exactly once.
+            self._summary(tmp, base + 7200)
+            fresh = self._run(tmp, now=base + 7200)
+            counts = fresh.summary_counts()
+            self.assertEqual(counts["new_events"], 1)
+            self.assertEqual(counts["route_drops_24h"], 1)
+            self.assertEqual(counts["events_recorded"], 1)
 
     def test_missing_scan_still_produces_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

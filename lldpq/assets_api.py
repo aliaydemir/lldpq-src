@@ -11,8 +11,16 @@ import time
 from typing import Any
 
 try:
+    from .collection_freshness import (
+        asset_timestamp_tolerance_seconds,
+        parse_created_timestamp,
+    )
     from .parse_devices import get_all_devices, load_devices_yaml
 except ImportError:  # Installed scripts are also imported directly from LLDPQ_DIR.
+    from collection_freshness import (
+        asset_timestamp_tolerance_seconds,
+        parse_created_timestamp,
+    )
     from parse_devices import get_all_devices, load_devices_yaml
 
 
@@ -73,7 +81,7 @@ def load_assets_payload(
     devices_path: str | os.PathLike[str],
     *,
     max_age_seconds: float = 1800,
-    timestamp_tolerance_seconds: float = 120,
+    timestamp_tolerance_seconds: float | None = None,
     now: float | None = None,
 ) -> dict[str, Any]:
     """Return a validated API payload or fail closed with ``AssetReportError``."""
@@ -81,9 +89,13 @@ def load_assets_payload(
     asset_file = Path(assets_path)
     inventory_file = Path(devices_path)
     max_age = _positive_number(max_age_seconds, "maximum Assets age")
-    tolerance = _positive_number(
-        timestamp_tolerance_seconds, "Assets timestamp tolerance"
-    )
+    if timestamp_tolerance_seconds is None:
+        # Same operator knob every assets.ini reader honors (default 120).
+        tolerance = asset_timestamp_tolerance_seconds()
+    else:
+        tolerance = _positive_number(
+            timestamp_tolerance_seconds, "Assets timestamp tolerance"
+        )
     current_time = time.time() if now is None else float(now)
 
     try:
@@ -103,8 +115,12 @@ def load_assets_payload(
         created = datetime.strptime(created_text, CREATED_FORMAT)
     except ValueError as error:
         raise AssetReportError("Assets report creation time is invalid") from error
-    created_epoch = created.timestamp()
-    if abs(metadata.st_mtime - created_epoch) > tolerance:
+    # Fold-aware shared parser: the naive Created time is ambiguous during
+    # the DST fall-back hour (see collection_freshness.parse_created_timestamp).
+    created_epoch = parse_created_timestamp(
+        created_text, metadata.st_mtime, tolerance
+    )
+    if created_epoch is None:
         raise AssetReportError("Assets report timestamp does not match its publication time")
     if created_epoch > current_time + tolerance:
         raise AssetReportError("Assets report is from the future")

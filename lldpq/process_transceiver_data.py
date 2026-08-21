@@ -15,7 +15,7 @@ import re
 import json
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import export_artifacts
 from parse_devices import get_all_devices, load_devices_yaml
@@ -313,7 +313,9 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
               + ", ".join(parse_failed), file=sys.stderr)
 
     result = {
-        'last_update': datetime.now().isoformat(),
+        # Timezone-aware UTC: the browser parses the "+00:00" offset as an
+        # absolute instant, so the stale-age check is TZ-independent.
+        'last_update': datetime.now(timezone.utc).isoformat(),
         'modules': all_modules,
         'parse_failed': parse_failed,
         'summary': {

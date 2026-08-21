@@ -24,6 +24,9 @@ Contract rules:
   analyzer must fail its tests/run, not drift the public contract).
 - Missing keys become None; values are coerced to JSON-safe scalars, never
   raised on (content problems must not take down an analyzer run).
+- CSV cells map JSON scalars deterministically: JSON null <-> CSV 'N/A',
+  JSON true/false <-> CSV 'true'/'false' (JSON spelling, not Python's
+  str(True)); everything else renders as its display text.
 - Columns are append-only across releases; consumers key on "schema_version".
 """
 
@@ -141,6 +144,10 @@ _CSV_QUOTE_RE = re.compile(r'[",\r\n]')
 
 def display_value(value: Any) -> str:
     """'' / None / 'none' / 'n/a' (trimmed, case-insensitive) -> 'N/A'."""
+    if isinstance(value, bool):
+        # Python's str(True) is 'True'; the JS original (String(true)) and
+        # the JSON rows spell booleans lowercase, so the CSV must match.
+        return "true" if value else "false"
     text = "" if value is None else str(value).strip()
     return "N/A" if text.lower() in ("", "none", "n/a") else text
 

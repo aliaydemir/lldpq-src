@@ -555,7 +555,10 @@ class _StreamingJsonParser:
                     if not stack:
                         return cursor.stop_capture()
                 elif value < 0x20:
-                    raise _JsonStreamError("invalid JSON control byte")
+                    # \t/\n/\r are legal inter-token whitespace (RFC 8259);
+                    # pretty-printed producers (json.dumps indent=2) emit them.
+                    if value not in (0x09, 0x0A, 0x0D):
+                        raise _JsonStreamError("invalid JSON control byte")
         except Exception:
             cursor.abort_capture()
             raise

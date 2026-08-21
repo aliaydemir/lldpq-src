@@ -106,6 +106,35 @@ class BerShardFunctionalTests(unittest.TestCase):
         self.assertIn("leaf1:swp1", reloaded.ber_history)
         self.assertIn("leaf1:swp1", reloaded.current_ber_stats)
 
+    def test_malformed_shard_entries_are_dropped_not_fatal(self):
+        tmp = self._tmp()
+        now = time.time()
+        shard_dir = Path(tmp) / "ber-history"
+        shard_dir.mkdir()
+        (shard_dir / "leaf1.json").write_text(json.dumps({
+            "history": {
+                "leaf1:swp1": [
+                    {"ber_value": 0.0},          # missing timestamp
+                    "not-a-dict",
+                    {"timestamp": "yesterday"},  # unparseable timestamp
+                    _record(now - 30),
+                ],
+                "leaf1:swp2": "not-a-list",
+            },
+            "current": {},
+        }))
+        (shard_dir / "leaf2.json").write_text(json.dumps({
+            "history": {"leaf2:swp1": [_record(now - 10)]},
+            "current": {},
+        }))
+        # Construction runs cleanup_old_history on the loaded shards: shape
+        # corruption must stay contained per entry/port, not raise out of
+        # BERAnalyzer() and fail the whole analyzer run.
+        analyzer = BERAnalyzer(tmp)
+        self.assertEqual(len(analyzer.ber_history["leaf1:swp1"]), 1)
+        self.assertNotIn("leaf1:swp2", analyzer.ber_history)
+        self.assertIn("leaf2:swp1", analyzer.ber_history)
+
     def test_legacy_monolith_migrates_and_retires(self):
         tmp = self._tmp()
         now = time.time()

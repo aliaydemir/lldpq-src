@@ -23,8 +23,16 @@ from pathlib import Path
 
 try:
     from .lldp_report import LLDPReportError, parse_lldp_report
+    from .collection_freshness import (
+        asset_timestamp_tolerance_seconds,
+        parse_created_timestamp,
+    )
 except ImportError:  # Direct script execution has no package context.
     from lldp_report import LLDPReportError, parse_lldp_report
+    from collection_freshness import (
+        asset_timestamp_tolerance_seconds,
+        parse_created_timestamp,
+    )
 
 
 DEFAULT_LOAD_PER_CORE_WARNING = 1.0
@@ -714,20 +722,27 @@ class LLDPqAlerts:
                     )
 
         # Check fan speeds
-        fan_matches = re.findall(r'fan\d+:\s*(\d+)\s*RPM', hardware_data, re.IGNORECASE)
+        fan_matches = re.findall(r'(fan\d+):\s*(\d+)\s*RPM', hardware_data, re.IGNORECASE)
         if fan_matches:
             fan_critical = thresholds.get('fan_rpm_critical', 3000)
             fan_warning = thresholds.get('fan_rpm_warning', 4000)
-            
+
             failed_fans = []
             warning_fans = []
-            
-            for i, rpm_str in enumerate(fan_matches, 1):
+
+            # Report the real sensor label: positional Fan{i} renumbering named
+            # the wrong FRU with non-contiguous numbering or multiple hwmon
+            # chips. A label repeated across chips gets an ordinal suffix.
+            label_counts = {}
+            for label, rpm_str in fan_matches:
+                label_counts[label] = label_counts.get(label, 0) + 1
+                if label_counts[label] > 1:
+                    label = f"{label}#{label_counts[label]}"
                 rpm = int(rpm_str)
                 if rpm < fan_critical:
-                    failed_fans.append(f"Fan{i}: {rpm} RPM")
+                    failed_fans.append(f"{label}: {rpm} RPM")
                 elif rpm < fan_warning:
-                    warning_fans.append(f"Fan{i}: {rpm} RPM")
+                    warning_fans.append(f"{label}: {rpm} RPM")
             
             if failed_fans:
                 current_state = "CRITICAL"
@@ -1300,6 +1315,15 @@ class LLDPqAlerts:
             counts = {}
             for port, interface, entries in index.get(device, []):
                 total = 0
+                window_measurable = False
+                saw_entry = False
+                # Mirror of link_flap_analyzer's rate-equivalent severity:
+                # a poll interval of one hour or longer can never fit the
+                # 1h window, so alerting would stay OK forever at a slow
+                # cadence. When no recorded interval fits the requested
+                # window, grade from the smallest wider window (12h, then
+                # 24h) scaled back to the requested window.
+                fallback_totals = {43200.0: 0, 86400.0: 0}
                 if not isinstance(entries, list):
                     raise ValueError(f"invalid flap history for {port}")
                 for entry in entries:
@@ -1309,17 +1333,35 @@ class LLDPqAlerts:
                     flap_count = int(entry[2])
                     if not math.isfinite(timestamp) or timestamp > now + 300:
                         raise ValueError(f"invalid flap timestamp for {port}")
+                    saw_entry = True
                     if len(entry) >= 5:
                         interval_seconds = max(float(entry[4]), 0.0)
                         if not math.isfinite(interval_seconds):
                             raise ValueError(f"invalid flap interval for {port}")
                         fits_window = now - timestamp + interval_seconds <= window
+                        if interval_seconds < window:
+                            window_measurable = True
+                        elif flap_count > 0:
+                            for wider in fallback_totals:
+                                if (wider > window and
+                                        now - timestamp + interval_seconds <= wider):
+                                    fallback_totals[wider] += flap_count
                     else:
                         # Legacy samples do not say which poll interval produced
                         # the delta. Never assign those deltas to a short window.
                         fits_window = window >= 3600 and timestamp >= cutoff
+                        window_measurable = True
                     if fits_window and flap_count > 0:
                         total += flap_count
+                if saw_entry and not window_measurable:
+                    for wider in sorted(fallback_totals):
+                        if fallback_totals[wider]:
+                            scaled = fallback_totals[wider] * window / wider
+                            total = (
+                                int(scaled) if float(scaled).is_integer()
+                                else round(scaled, 1)
+                            )
+                            break
                 counts[interface] = total
             return counts
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1445,15 +1487,22 @@ class LLDPqAlerts:
                 "DEVICE-NAME IP ETH0-MAC SERIAL MODEL RELEASE UPTIME "
                 "STATUS LAST-SEEN"
             )
-            if len(nonempty) < 3 or nonempty[1] != expected_header:
+            # assets.sh writes a column-padded header; compare tokens, not text.
+            if (len(nonempty) < 3 or
+                    tuple(nonempty[1].split()) != tuple(expected_header.split())):
                 raise ValueError("missing or invalid assets header")
-            created = datetime.datetime.strptime(
+            # Shared fold-aware parser: the naive Created time is ambiguous
+            # during the DST fall-back hour; also honors the shared
+            # ASSET_TIMESTAMP_TOLERANCE_SECONDS knob instead of a local 120.
+            snapshot_time = parse_created_timestamp(
                 nonempty[0].removeprefix("Created on "),
-                "%Y-%m-%d %H-%M-%S",
+                file_mtime,
+                asset_timestamp_tolerance_seconds(),
             )
-            snapshot_time = created.timestamp()
-            if abs(file_mtime - snapshot_time) > 120:
-                raise ValueError("assets Created time does not match file mtime")
+            if snapshot_time is None:
+                raise ValueError(
+                    "assets Created time is invalid or does not match file mtime"
+                )
             age = time.time() - snapshot_time
             if age < -300 or age > max_age_seconds:
                 raise ValueError("assets snapshot is stale or from the future")
@@ -3166,9 +3215,21 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             )
             # Naive legacy timestamps deliberately retain the historical local
             # timezone interpretation.  ISO headers carry their explicit offset.
-            created_time = report.created_at.timestamp()
             file_mtime = lldp_file.stat().st_mtime
-            if abs(file_mtime - created_time) > 120:
+            tolerance = asset_timestamp_tolerance_seconds()
+            if report.timestamp_is_timezone_aware:
+                created_time = report.created_at.timestamp()
+                if abs(file_mtime - created_time) > tolerance:
+                    created_time = None
+            else:
+                # Shared fold-aware parser: naive Created times are ambiguous
+                # during the DST fall-back hour (same contract as assets.ini).
+                created_time = parse_created_timestamp(
+                    report.created_at.strftime("%Y-%m-%d %H-%M-%S"),
+                    file_mtime,
+                    tolerance,
+                )
+            if created_time is None:
                 print("    ❌ lldp_results.ini Created time does not match file mtime")
                 return {}
             lldp_age = time.time() - created_time

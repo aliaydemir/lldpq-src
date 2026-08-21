@@ -155,6 +155,37 @@ def read_collection_outcomes() -> Optional[Dict[str, str]]:
     return dict(_read_collection_outcomes_cached(configured, pipeline_id))
 
 
+def asset_timestamp_tolerance_seconds() -> float:
+    """Shared mtime-vs-Created tolerance knob for every assets.ini reader."""
+    return _nonnegative_environment_number(
+        "ASSET_TIMESTAMP_TOLERANCE_SECONDS", 120.0
+    )
+
+
+def parse_created_timestamp(
+    created_text: str, snapshot_mtime: float, tolerance: float
+) -> Optional[float]:
+    """Return the accepted 'Created on' epoch, or None when it is unusable.
+
+    assets.sh writes naive local wall-clock time, which is ambiguous during
+    the DST fall-back hour: strptime().timestamp() always resolves fold=0
+    and is 3600s off for the repeated hour's second pass. Accept whichever
+    fold interpretation matches the file mtime within tolerance and use the
+    closer one as the canonical created time.
+    """
+    try:
+        parsed = datetime.strptime(created_text, "%Y-%m-%d %H-%M-%S")
+    except ValueError:
+        return None
+    created = min(
+        (parsed.replace(fold=fold).timestamp() for fold in (0, 1)),
+        key=lambda candidate: abs(snapshot_mtime - candidate),
+    )
+    if abs(snapshot_mtime - created) > tolerance:
+        return None
+    return created
+
+
 def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float, bool]:
     """Return validated hostname statuses, snapshot mtime, and file presence.
 
@@ -171,15 +202,13 @@ def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float
 
     created_at = None
     header_index = None
+    timestamp_tolerance = asset_timestamp_tolerance_seconds()
     for index, line in enumerate(lines):
         match = CREATED_PATTERN.fullmatch(line.strip())
         if match and created_at is None:
-            try:
-                created_at = datetime.strptime(
-                    match.group(1), "%Y-%m-%d %H-%M-%S"
-                ).timestamp()
-            except ValueError:
-                created_at = None
+            created_at = parse_created_timestamp(
+                match.group(1), snapshot_mtime, timestamp_tolerance
+            )
         if tuple(line.split()) == ASSET_HEADER:
             header_index = index
             break
@@ -187,13 +216,9 @@ def read_asset_snapshot(path: str = "assets.ini") -> Tuple[Dict[str, str], float
     if created_at is None or header_index is None:
         return AssetStatusMap(), snapshot_mtime, True
 
-    timestamp_tolerance = _nonnegative_environment_number(
-        "ASSET_TIMESTAMP_TOLERANCE_SECONDS", 120.0
-    )
     now = time.time()
     if (
-        abs(snapshot_mtime - created_at) > timestamp_tolerance
-        or created_at > now + timestamp_tolerance
+        created_at > now + timestamp_tolerance
         or now - created_at > max_data_age_seconds()
     ):
         return AssetStatusMap(), snapshot_mtime, True

@@ -28,6 +28,19 @@ except Exception:
     def canonical(_n):
         return _n
 
+def _flap_rate_text(flap_analyzer, port_info):
+    """Describe the value the severity was actually graded from.
+
+    At a slow poll cadence the displayed flap_1_hr bucket stays 0 while
+    grading runs on the rate-equivalent from the wider window; the port
+    cache (filled by get_flap_summary) carries both grading inputs."""
+    cached = flap_analyzer._port_cache.get(port_info['port'], {})
+    if cached.get('hourly_measured', True):
+        return f"{port_info['counters']['flap_1_hr']} flaps in last hour"
+    rate = cached.get('hourly_rate', 0.0)
+    value = int(rate) if float(rate).is_integer() else round(rate, 1)
+    return f"~{value} flaps/hour averaged over the wider window"
+
 def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     """Process carrier transition files and update flap detector"""
     data_dir = os.path.abspath(data_dir)
@@ -198,8 +211,12 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     if flap_analyzer.check_flapping():
         print("link flapping detected!")
     
-    # Save updated flap history
-    flap_analyzer.save_flap_history()
+    # Save updated flap history. A failed save is a structural failure: the
+    # stale previous flap_history.json would keep passing the size check below
+    # while every later cycle computes deltas against a frozen baseline.
+    if not flap_analyzer.save_flap_history():
+        print("Flap history could not be saved")
+        return False
     history_file = os.path.join(result_dir, "flap_history.json")
     if not os.path.isfile(history_file) or os.path.getsize(history_file) == 0:
         print("Flap history could not be saved")
@@ -233,12 +250,12 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
     if summary['critical_ports']:
         print("\nCritical Flapping Ports:")
         for port in summary['critical_ports']:
-            print(f"    {port['port']}: {port['counters']['flap_1_hr']} flaps in last hour")
-    
+            print(f"    {port['port']}: {_flap_rate_text(flap_analyzer, port)}")
+
     if summary['warning_ports']:
         print("\nWarning Flapping Ports:")
         for port in summary['warning_ports'][:5]:  # Show top 5
-            print(f"    {port['port']}: {port['counters']['flap_1_hr']} flaps in last hour")
+            print(f"    {port['port']}: {_flap_rate_text(flap_analyzer, port)}")
     
     # Algorithm status
     total_problematic = len(summary['critical_ports']) + len(summary['warning_ports'])

@@ -33,6 +33,14 @@ Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/P
 swp1            4      65002     100     100        0    0    0 01:02:03            5        5 leaf01
 """
 
+DOWN_SUMMARY = """
+IPv4 Unicast Summary:
+BGP router identifier 10.0.0.1, local AS number 65001 vrf-id 0
+
+Neighbor        V         AS MsgRcvd MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+swp1            4      65002     100     100        0    0    0    never       Active        0 leaf01
+"""
+
 
 def summary_json(state="Established", uptime="01:02:03", uptime_msec=3723000,
                  dropped=None, established=None, vrf="default", peer="swp1",
@@ -358,6 +366,84 @@ class BgpFlapDetectionTests(unittest.TestCase):
         neighbor = self.analyzer.current_bgp_stats["tor-a"]["neighbors"][0]
         self.assertEqual("leaf01(swp1)", neighbor["neighbor_name"])
         self.assertEqual(1, neighbor["flaps_24h"])
+
+    def test_inverted_flap_thresholds_are_clamped(self):
+        # flap_severity checks critical first: an inverted config
+        # (warning > critical) would silently kill the warning tier.
+        config = Path(self.tmp.name) / "notifications.yaml"
+        config.write_text(
+            "thresholds:\n  network:\n"
+            "    bgp_flaps_warning: 5\n"
+            "    bgp_flaps_critical: 2\n",
+            encoding="utf-8")
+        with mock.patch.dict(
+            "os.environ", {"LLDPQ_NOTIFICATIONS_FILE": str(config)}
+        ):
+            analyzer = BGPAnalyzer(self.tmp.name)
+        self.assertEqual(5, analyzer.thresholds["bgp_flaps_warning"])
+        self.assertEqual(5, analyzer.thresholds["bgp_flaps_critical"])
+        self.assertIsNone(analyzer.flap_severity(4))
+        self.assertEqual("critical", analyzer.flap_severity(5))
+
+    def test_inverted_storm_thresholds_are_clamped(self):
+        # storm_severity checks critical first: an inverted config
+        # (warning > critical) would silently kill the warning tier.
+        config = Path(self.tmp.name) / "notifications.yaml"
+        config.write_text(
+            "thresholds:\n  network:\n"
+            "    bgp_update_storm_warning: 80\n"
+            "    bgp_update_storm_critical: 40\n",
+            encoding="utf-8")
+        with mock.patch.dict(
+            "os.environ", {"LLDPQ_NOTIFICATIONS_FILE": str(config)}
+        ):
+            analyzer = BGPAnalyzer(self.tmp.name)
+        self.assertEqual(80, analyzer.thresholds["bgp_update_storm_warning"])
+        self.assertEqual(80, analyzer.thresholds["bgp_update_storm_critical"])
+        self.assertIsNone(analyzer.storm_severity(79))
+        self.assertEqual("critical", analyzer.storm_severity(80))
+
+
+class BgpStaleRecoveryCarryoverTests(unittest.TestCase):
+    """down_since must survive a stale/missed collection cycle.
+
+    mark_collection_unavailable publishes a placeholder with neighbors=[]
+    and the real prior stats under last_known_stats; on the recovery cycle
+    process_bgp_data_files passes that placeholder as previous_stats, so
+    update_bgp_stats must unwrap it or a still-down neighbor gets
+    down_since re-stamped to now (CRITICAL downgraded to WARNING).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.analyzer = BGPAnalyzer(self.tmp.name)
+
+    def test_down_since_survives_stale_collection_gap(self):
+        # Cycle 1: neighbor down; shift down_since past the bgp_down_minutes
+        # boundary so the neighbor is due CRITICAL on the recovery cycle.
+        self.analyzer.update_bgp_stats("tor-a", DOWN_SUMMARY)
+        t0 = time.time() - 600
+        self.analyzer.current_bgp_stats["tor-a"]["neighbors"][0][
+            "down_since"] = t0
+
+        # Cycle 2: collection missed; a stale placeholder replaces the stats.
+        process_bgp_data.mark_collection_unavailable(
+            self.analyzer, "tor-a",
+            self.analyzer.current_bgp_stats["tor-a"], "collection_stale")
+        placeholder = self.analyzer.current_bgp_stats["tor-a"]
+        self.assertEqual("stale", placeholder["data_status"])
+        self.assertEqual([], placeholder["neighbors"])
+
+        # Cycle 3 (recovery): the placeholder is what process_bgp_data_files
+        # passes as previous_stats; down_since must carry over from
+        # last_known_stats and the neighbor must grade CRITICAL, not the
+        # transient WARNING a re-stamped down_since would produce.
+        self.analyzer.update_bgp_stats("tor-a", DOWN_SUMMARY, placeholder)
+        stats = self.analyzer.current_bgp_stats["tor-a"]
+        self.assertEqual(t0, stats["neighbors"][0]["down_since"])
+        self.assertEqual(1, stats["critical_neighbors"])
+        self.assertEqual(0, stats["warning_neighbors"])
 
 
 class BgpUpdateStormTests(unittest.TestCase):

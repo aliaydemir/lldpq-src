@@ -151,6 +151,19 @@ class CsvSemanticsTests(unittest.TestCase):
         )
         self.assertEqual(text, "device,status\r\nleaf-01,N/A\r\n")
 
+    def test_booleans_render_json_spelled(self):
+        # JSON true/false <-> CSV 'true'/'false' (not Python's str(True));
+        # JSON null <-> CSV 'N/A' stays as-is for existing consumers.
+        self.assertEqual(export_artifacts.display_value(True), "true")
+        self.assertEqual(export_artifacts.display_value(False), "false")
+        self.assertEqual(export_artifacts.csv_field(True), "true")
+        self.assertEqual(export_artifacts.csv_field(False), "false")
+        text = export_artifacts.render_csv(
+            ("esi", "orphan"),
+            [{"esi": "es-1", "orphan": True}, {"esi": "es-2", "orphan": False}],
+        )
+        self.assertEqual(text, "esi,orphan\r\nes-1,true\r\nes-2,false\r\n")
+
 
 class HttpExportContractTests(unittest.TestCase):
     def test_dynamic_405_advertises_allowed_methods(self):

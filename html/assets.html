@@ -585,6 +585,7 @@
     <!-- jQuery and Select2 for device search -->
     <script src="/css/jquery-3.5.1.min.js"></script>
     <script src="/css/select2.min.js"></script>
+    <script src="/css/job-poll.js?v=20260821-1"></script>
 
 <script>
     function assetText(value, fallback = '') {
@@ -981,29 +982,9 @@
     }
     // Refresh Assets Function.  Elapsed time is never considered completion;
     // only the status belonging to the opaque token returned by this request
-    // may reload the report.
-    const ASSETS_JOB_STORAGE_KEY = 'lldpq.activeAssetsJobToken';
-    let activeAssetsJobToken = null;
-    let assetsPollGeneration = 0;
-    let assetsPollTimer = null;
+    // may reload the report.  The polling state machine and timers live in
+    // the shared css/job-poll.js module; this page supplies the UI callbacks.
     let assetsStatusNotification = null;
-
-    function setStoredAssetsToken(token) {
-        try {
-            if (token) sessionStorage.setItem(ASSETS_JOB_STORAGE_KEY, token);
-            else sessionStorage.removeItem(ASSETS_JOB_STORAGE_KEY);
-        } catch (_) {
-            // The live poll still works when private storage is unavailable.
-        }
-    }
-
-    function getStoredAssetsToken() {
-        try {
-            return sessionStorage.getItem(ASSETS_JOB_STORAGE_KEY) || '';
-        } catch (_) {
-            return '';
-        }
-    }
 
     function setAssetsButton(state, enabled) {
         const button = document.getElementById('refresh-assets');
@@ -1070,17 +1051,7 @@
     }
 
     function dismissAssetsTracking() {
-        assetsPollGeneration += 1;
-        activeAssetsJobToken = null;
-        if (assetsPollTimer) {
-            clearTimeout(assetsPollTimer);
-            assetsPollTimer = null;
-        }
-        setStoredAssetsToken('');
-        setAssetsButton('idle', true);
-        updateAssetsNotification('queued', 'Assets Tracking Dismissed',
-            'Stopped tracking the previous refresh request.',
-            'You can start a new refresh whenever you are ready.');
+        assetsJob.dismiss();
     }
 
     function showAssetsDismissAction() {
@@ -1102,176 +1073,93 @@
         assetsStatusNotification.append(document.createElement('br'), action);
     }
 
-    function scheduleAssetsStatusPoll(token, generation, delayMs) {
-        if (token !== activeAssetsJobToken || generation !== assetsPollGeneration) return;
-        if (assetsPollTimer) clearTimeout(assetsPollTimer);
-        assetsPollTimer = setTimeout(() => pollAssetsJob(token, generation), delayMs);
-    }
-
-    async function pollAssetsJob(token, generation) {
-        if (token !== activeAssetsJobToken || generation !== assetsPollGeneration) return;
-        try {
-            const response = await fetch(`/trigger-assets?token=${encodeURIComponent(token)}`, {
-                method: 'GET',
-                cache: 'no-store',
-                headers: {
-                    'Accept': 'application/json',
-                    'Cache-Control': 'no-cache'
-                }
-            });
-            const data = await response.json();
-            if (data.status === 'error' && data.message === 'Assets job was not found') {
-                setStoredAssetsToken('');
-                activeAssetsJobToken = null;
-                assetsPollGeneration += 1;
-                setAssetsButton('failure', true);
-                updateAssetsNotification('failure', 'Assets Job Is No Longer Available',
-                    data.message, 'Start a new refresh to create a fresh tracked request.');
-                return;
-            }
-            if (!response.ok || data.status === 'error') {
-                throw new Error(data.error || data.message || `Status request failed (${response.status})`);
-            }
-            if (data.token !== token || token !== activeAssetsJobToken ||
-                generation !== assetsPollGeneration) {
-                return;
-            }
-
-            const reason = data.reason || 'Waiting for Assets status';
-            if (data.status === 'success') {
-                setStoredAssetsToken('');
-                updateAssetsNotification('success', '✅ Assets Refresh Complete',
-                    'The matching Assets report was published.', 'Loading the new report...');
-                setAssetsButton('running', false);
-                location.reload();
-                return;
-            }
-
-            const nowSeconds = Math.floor(Date.now() / 1000);
-            const statusAge = data.updated_at ? nowSeconds - data.updated_at : 0;
-            const retryOverdue = data.status === 'failure' && data.retry_scheduled &&
-                data.next_retry_at && nowSeconds - data.next_retry_at > 300;
-            const queueStalled = data.status === 'queued' && statusAge > 1800;
-            const queueDelayed = data.status === 'queued' && statusAge > 120 && !queueStalled;
-            const workerStalled = (data.status === 'running' && statusAge > 3600) ||
-                queueStalled || retryOverdue;
-            if (queueDelayed) {
-                // lldpq-trigger serializes LLDP and Assets work.  A large LLDP
-                // request may therefore keep a healthy Assets token queued for
-                // more than two minutes; delay alone is not a job failure.
+    const assetsJob = window.LLDPqJobPoll.create({
+        triggerUrl: '/trigger-assets',
+        storageKey: 'lldpq.activeAssetsJobToken',
+        jobLabel: 'Assets',
+        jobNotFoundMessage: 'Assets job was not found',
+        waitingReason: 'Waiting for Assets status',
+        callbacks: {
+            onTracked() {
                 setAssetsButton('queued', false);
-                updateAssetsNotification('queued', 'Assets Refresh Still Queued', reason,
-                    'The worker may be completing an earlier analysis. This request remains tracked.');
+                updateAssetsNotification('queued', 'Assets Refresh Queued',
+                    'The request was accepted and is waiting for the Assets worker.',
+                    'This page refreshes only after confirmed success.');
                 showAssetsDismissAction();
-                scheduleAssetsStatusPoll(token, generation, 15000);
-                return;
-            }
-            if (workerStalled) {
-                // A dead worker can leave a token queued/running indefinitely.
-                // Enable retry and offer an explicit escape from tracking so the
-                // Refresh button can never be disabled permanently.
-                setAssetsButton('failure', true);
-                updateAssetsNotification('failure', 'Assets Worker Appears Stalled', reason,
-                    'No timely lifecycle update was received. The report was not treated as complete.');
-                showAssetsDismissAction();
-                scheduleAssetsStatusPoll(token, generation, 15000);
-                return;
-            }
-            if (data.status === 'running') {
-                setAssetsButton('running', false);
-                updateAssetsNotification('running', 'Assets Refresh Running', reason,
-                    `Attempt ${data.attempt || 1}; this page refreshes only after confirmed success.`);
-                scheduleAssetsStatusPoll(token, generation, 2000);
-                return;
-            }
-            if (data.status === 'queued') {
+            },
+            onQueued(reason) {
                 setAssetsButton('queued', false);
                 updateAssetsNotification('queued', 'Assets Refresh Queued', reason,
                     'Waiting for the matching request to start.');
                 showAssetsDismissAction();
-                const queuedDelay = data.next_retry_at
-                    ? Math.max(2000, Math.min(10000, data.next_retry_at * 1000 - Date.now() + 500))
-                    : 2000;
-                scheduleAssetsStatusPoll(token, generation, queuedDelay);
-                return;
-            }
-            if (data.status === 'failure') {
+            },
+            onQueueDelayed(reason) {
+                setAssetsButton('queued', false);
+                updateAssetsNotification('queued', 'Assets Refresh Still Queued', reason,
+                    'The worker may be completing an earlier analysis. This request remains tracked.');
+                showAssetsDismissAction();
+            },
+            onStalled(reason) {
+                setAssetsButton('failure', true);
+                updateAssetsNotification('failure', 'Assets Worker Appears Stalled', reason,
+                    'No timely lifecycle update was received. The report was not treated as complete.');
+                showAssetsDismissAction();
+            },
+            onRunning(reason, data) {
+                setAssetsButton('running', false);
+                updateAssetsNotification('running', 'Assets Refresh Running', reason,
+                    `Attempt ${data.attempt || 1}; this page refreshes only after confirmed success.`);
+            },
+            onFailure(reason, data) {
                 setAssetsButton('failure', true);
                 const retryDetail = data.retry_scheduled
                     ? `Automatic retry is scheduled (attempt ${data.attempt || 1}). You may start a newer request.`
                     : `Request ended after attempt ${data.attempt || 0}.`;
                 updateAssetsNotification('failure', 'Assets Refresh Failed', reason, retryDetail);
-                if (data.retry_scheduled) {
-                    const retryDelay = data.next_retry_at
-                        ? Math.max(5000, Math.min(30000, data.next_retry_at * 1000 - Date.now() + 1000))
-                        : 10000;
-                    scheduleAssetsStatusPoll(token, generation, retryDelay);
-                } else {
-                    setStoredAssetsToken('');
-                    activeAssetsJobToken = null;
-                }
-                return;
+            },
+            onSuccess() {
+                updateAssetsNotification('success', '✅ Assets Refresh Complete',
+                    'The matching Assets report was published.', 'Loading the new report...');
+                setAssetsButton('running', false);
+                location.reload();
+            },
+            onJobMissing(data) {
+                setAssetsButton('failure', true);
+                updateAssetsNotification('failure', 'Assets Job Is No Longer Available',
+                    data.message, 'Start a new refresh to create a fresh tracked request.');
+            },
+            onPollError(error) {
+                console.error('❌ Error reading Assets job status:', error);
+                setAssetsButton('failure', true);
+                updateAssetsNotification('failure', 'Assets Status Unavailable', error.message,
+                    'The report has not been treated as complete; status will be checked again.');
+            },
+            onSubmitStart() {
+                setAssetsButton('queued', false);
+            },
+            onSubmitted(token) {
+                console.log('✅ Assets job queued:', token);
+            },
+            onSubmitError(error) {
+                console.error('❌ Error starting Assets refresh:', error);
+                setAssetsButton('failure', true);
+                updateAssetsNotification('failure', 'Could Not Start Assets Refresh', error.message,
+                    'No report was treated as newly completed.');
+            },
+            onDismissed() {
+                setAssetsButton('idle', true);
+                updateAssetsNotification('queued', 'Assets Tracking Dismissed',
+                    'Stopped tracking the previous refresh request.',
+                    'You can start a new refresh whenever you are ready.');
             }
-            throw new Error(`Unknown Assets job state: ${data.status}`);
-        } catch (error) {
-            if (token !== activeAssetsJobToken || generation !== assetsPollGeneration) return;
-            console.error('❌ Error reading Assets job status:', error);
-            setAssetsButton('failure', true);
-            updateAssetsNotification('failure', 'Assets Status Unavailable', error.message,
-                'The report has not been treated as complete; status will be checked again.');
-            scheduleAssetsStatusPoll(token, generation, 5000);
         }
-    }
-
-    function trackAssetsJob(token) {
-        if (!/^[a-f0-9]{32}$/.test(token)) return false;
-        activeAssetsJobToken = token;
-        assetsPollGeneration += 1;
-        const generation = assetsPollGeneration;
-        setStoredAssetsToken(token);
-        setAssetsButton('queued', false);
-        updateAssetsNotification('queued', 'Assets Refresh Queued',
-            'The request was accepted and is waiting for the Assets worker.',
-            'This page refreshes only after confirmed success.');
-        showAssetsDismissAction();
-        scheduleAssetsStatusPoll(token, generation, 250);
-        return true;
-    }
-
-    async function refreshAssets() {
-        assetsPollGeneration += 1;
-        activeAssetsJobToken = null;
-        if (assetsPollTimer) clearTimeout(assetsPollTimer);
-        setAssetsButton('queued', false);
-        try {
-            const response = await fetch('/trigger-assets', {
-                method: 'POST',
-                cache: 'no-store',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Cache-Control': 'no-cache'
-                }
-            });
-            const data = await response.json();
-            if (!response.ok || data.status !== 'started' ||
-                !/^[a-f0-9]{32}$/.test(data.token || '')) {
-                throw new Error(data.error || data.message || 'Trigger failed');
-            }
-            console.log('✅ Assets job queued:', data.token);
-            trackAssetsJob(data.token);
-        } catch (error) {
-            console.error('❌ Error starting Assets refresh:', error);
-            setStoredAssetsToken('');
-            setAssetsButton('failure', true);
-            updateAssetsNotification('failure', 'Could Not Start Assets Refresh', error.message,
-                'No report was treated as newly completed.');
-        }
-    }
-
-    window.addEventListener('DOMContentLoaded', () => {
-        const pendingToken = getStoredAssetsToken();
-        if (/^[a-f0-9]{32}$/.test(pendingToken)) trackAssetsJob(pendingToken);
     });
+
+    function refreshAssets() {
+        assetsJob.submit();
+    }
+
+    window.addEventListener('DOMContentLoaded', () => assetsJob.retrackStored());
 
     function canonicalAssetCellText(cell) {
         if (!cell) return '';
@@ -2094,6 +1982,6 @@ function retrySSHSetup() {
 </div>
 
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 </body>
 </html>

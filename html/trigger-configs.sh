@@ -24,7 +24,15 @@ if [ "$REQUEST_METHOD" != "POST" ]; then
 fi
 
 # The lldpq-trigger daemon runs as LLDPQ_USER and handles the actual collection.
-TRIGGER_FILE="/tmp/.configs_web_trigger"
+# The token lives under /var/lib/lldpq instead of sticky /tmp so an
+# unprivileged local user cannot pre-create the fixed filename and pin the
+# rename below to EPERM.
+TRIGGER_DIR="/var/lib/lldpq/triggers"
+if ! mkdir -p -m 2770 "$TRIGGER_DIR" 2>/dev/null; then
+    echo '{"status": "error", "message": "Trigger directory is unavailable"}'
+    exit 1
+fi
+TRIGGER_FILE="$TRIGGER_DIR/.configs_web_trigger"
 TRIGGER_NOW=$(date +%s%N 2>/dev/null || true)
 [[ "$TRIGGER_NOW" =~ ^[0-9]+$ ]] || TRIGGER_NOW="$(date +%s)000000000"
 TRIGGER_VALUE="${TRIGGER_NOW}.$$.$RANDOM"

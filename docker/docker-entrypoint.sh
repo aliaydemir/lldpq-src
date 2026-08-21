@@ -833,6 +833,7 @@ mkdir -p /var/lib/lldpq/ai
 mkdir -p /var/lib/lldpq/provision-jobs
 mkdir -p /var/lib/lldpq/lldp-jobs
 mkdir -p /var/lib/lldpq/assets-jobs
+mkdir -p /var/lib/lldpq/triggers
 # Keep the persistent Provision state out of the broad runtime-state chown.
 # In particular, config-write recovery journals must retain their lldpq owner
 # across container recreation.  Do not recursively rewrite unrelated files in
@@ -847,12 +848,14 @@ chown lldpq:www-data /var/lib/lldpq/ai
 chown lldpq:www-data /var/lib/lldpq/provision-jobs
 chown lldpq:www-data /var/lib/lldpq/lldp-jobs
 chown lldpq:www-data /var/lib/lldpq/assets-jobs
+chown lldpq:www-data /var/lib/lldpq/triggers
 chmod 700 /var/lib/lldpq/sessions
 chmod 775 /var/lib/lldpq/upgrade-jobs
 chmod 2770 /var/lib/lldpq/ai
 chmod 2770 /var/lib/lldpq/provision-jobs
 chmod 2770 /var/lib/lldpq/lldp-jobs
 chmod 2770 /var/lib/lldpq/assets-jobs
+chmod 2770 /var/lib/lldpq/triggers
 
 _prepare_shared_lock_files /var/lib/lldpq/ssh-key.lock
 
@@ -1904,6 +1907,78 @@ if ! _wait_for_console_bridge; then
     exit 1
 fi
 echo "  ✓ console-pty (127.0.0.1:${CONSOLE_PTY_PORT})"
+
+# Watchdog for the fire-and-forget daemons. The console supervisor above only
+# owns console-pty; nginx as PID 1 keeps the container alive even when
+# fcgiwrap dies (every CGI API answers 502) or cron dies (all scheduled
+# collection silently stops). Poll liveness by exact daemon name and restart
+# with the same commands used at startup. A daemon that dies more than
+# WATCHDOG_STORM_LIMIT times inside WATCHDOG_STORM_WINDOW seconds is abandoned
+# with a CRITICAL log instead of restarting forever; the container stays up.
+WATCHDOG_POLL_DELAY=$CONSOLE_RESTART_DELAY
+WATCHDOG_STORM_LIMIT=5
+WATCHDOG_STORM_WINDOW=60
+
+_restart_fcgiwrap() {
+    rm -f -- "$FCGIWRAP_SOCKET"
+    /usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &
+    local _fcgiwrap_attempt
+    for _fcgiwrap_attempt in {1..50}; do
+        [ -S "$FCGIWRAP_SOCKET" ] && break
+        sleep 0.1
+    done
+    chown www-data:www-data "$FCGIWRAP_SOCKET" 2>/dev/null || true
+    chmod 660 "$FCGIWRAP_SOCKET" 2>/dev/null || true
+}
+
+_restart_cron() {
+    service cron start > /dev/null 2>&1
+}
+
+_supervise_services() {
+    local now
+    local fcgiwrap_deaths=0 fcgiwrap_window_start=0 fcgiwrap_abandoned=false
+    local cron_deaths=0 cron_window_start=0 cron_abandoned=false
+    trap 'exit 0' TERM INT
+
+    while true; do
+        sleep "$WATCHDOG_POLL_DELAY"
+
+        if [ "$fcgiwrap_abandoned" != true ] && ! pgrep -x fcgiwrap >/dev/null 2>&1; then
+            now=$(date +%s)
+            if [ $((now - fcgiwrap_window_start)) -gt "$WATCHDOG_STORM_WINDOW" ]; then
+                fcgiwrap_window_start=$now
+                fcgiwrap_deaths=0
+            fi
+            fcgiwrap_deaths=$((fcgiwrap_deaths + 1))
+            if [ "$fcgiwrap_deaths" -gt "$WATCHDOG_STORM_LIMIT" ]; then
+                fcgiwrap_abandoned=true
+                echo "CRITICAL: fcgiwrap died more than ${WATCHDOG_STORM_LIMIT} times in ${WATCHDOG_STORM_WINDOW}s; not restarting it again (container stays up)" >&2
+            else
+                echo "  ⚠ fcgiwrap died; restarting (${fcgiwrap_deaths}/${WATCHDOG_STORM_LIMIT} within ${WATCHDOG_STORM_WINDOW}s)" >&2
+                _restart_fcgiwrap
+            fi
+        fi
+
+        if [ "$cron_abandoned" != true ] && ! pgrep -x cron >/dev/null 2>&1; then
+            now=$(date +%s)
+            if [ $((now - cron_window_start)) -gt "$WATCHDOG_STORM_WINDOW" ]; then
+                cron_window_start=$now
+                cron_deaths=0
+            fi
+            cron_deaths=$((cron_deaths + 1))
+            if [ "$cron_deaths" -gt "$WATCHDOG_STORM_LIMIT" ]; then
+                cron_abandoned=true
+                echo "CRITICAL: cron died more than ${WATCHDOG_STORM_LIMIT} times in ${WATCHDOG_STORM_WINDOW}s; not restarting it again (container stays up)" >&2
+            else
+                echo "  ⚠ cron died; restarting (${cron_deaths}/${WATCHDOG_STORM_LIMIT} within ${WATCHDOG_STORM_WINDOW}s)" >&2
+                _restart_cron
+            fi
+        fi
+    done
+}
+
+_supervise_services &
 
 # Start nginx (foreground - keeps container alive)
 echo "  ✓ nginx (port 80)"

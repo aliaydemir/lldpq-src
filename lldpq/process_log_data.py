@@ -1434,9 +1434,13 @@ class LogAnalyzer:
 
                 const visibleDevices = [];
                 
-                // Process each visible row (skip log-details rows)
+                // Process each visible row (skip log-details rows).
+                // table-filter.js funnels hide rows via the tf-hidden class, never via
+                // style.display; the export must honor both so it matches the visible table.
                 rows.forEach(row => {
-                    if (row.style.display !== 'none' && !row.classList.contains('log-details')) {
+                    if (row.style.display !== 'none' &&
+                        !row.classList.contains('tf-hidden') &&
+                        !row.classList.contains('log-details')) {
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 6) {
                             visibleDevices.push({
@@ -1504,7 +1508,7 @@ class LogAnalyzer:
         }
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

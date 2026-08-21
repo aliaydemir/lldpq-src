@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -17,10 +19,13 @@ from unittest import mock
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from assets_api import AssetReportError, load_assets_payload
 from collection_freshness import (
     AssetStatusMap,
     _read_collection_outcomes_cached,
     is_current_collection,
+    parse_created_timestamp,
+    read_asset_snapshot,
     read_collection_outcomes,
 )
 import process_hardware_data
@@ -327,6 +332,121 @@ process_device 192.0.2.10 user leaf1
         self.assertLess(cleanup.index('wait "$pid"'), cleanup.index("rm -f"))
         self.assertIn('tmp.${BASHPID:-$$}', CHECK_LLDP)
         self.assertIn('collection_pids+=("$!")', CHECK_LLDP)
+
+
+class AssetSnapshotDstTests(unittest.TestCase):
+    """assets.sh writes naive local 'Created on' times, ambiguous during the
+    DST fall-back hour: fold-aware parsing must keep the repeated hour's
+    second-pass snapshots current instead of blacking out every host."""
+
+    AMBIGUOUS_LOCAL = "2026-11-01 01-30-00"
+
+    def setUp(self):
+        original = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+
+        def restore():
+            if original is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = original
+            time.tzset()
+
+        self.addCleanup(restore)
+        ambiguous = datetime.strptime(self.AMBIGUOUS_LOCAL, "%Y-%m-%d %H-%M-%S")
+        self.first_pass = ambiguous.timestamp()
+        self.second_pass = ambiguous.replace(fold=1).timestamp()
+        # Guard: the zone must really repeat this hour (fold=1 is EST).
+        self.assertEqual(3600.0, self.second_pass - self.first_pass)
+
+    def write_assets(self, directory):
+        assets = Path(directory) / "assets.ini"
+        assets.write_text(
+            f"Created on {self.AMBIGUOUS_LOCAL}\n"
+            "\n"
+            "DEVICE-NAME IP ETH0-MAC SERIAL MODEL RELEASE UPTIME "
+            "STATUS LAST-SEEN\n"
+            "switch01 10.0.0.1 aa:bb:cc:dd:ee:ff MT12345 MSN3700 "
+            "5.9.2 1_day OK 2026-11-01_01:29\n",
+            encoding="utf-8",
+        )
+        return assets
+
+    def environment(self, assets):
+        return {
+            "LLDPQ_ASSETS_FILE": str(assets),
+            "LLDPQ_DEVICES_FILE": str(assets.parent / "devices.yaml"),
+            "ASSET_TIMESTAMP_TOLERANCE_SECONDS": "120",
+            "MONITOR_DATA_MAX_AGE_MINUTES": "30",
+        }
+
+    def test_parse_created_timestamp_prefers_closer_fold(self):
+        self.assertEqual(self.first_pass, parse_created_timestamp(
+            self.AMBIGUOUS_LOCAL, self.first_pass + 30, 120.0
+        ))
+        self.assertEqual(self.second_pass, parse_created_timestamp(
+            self.AMBIGUOUS_LOCAL, self.second_pass - 30, 120.0
+        ))
+        self.assertIsNone(parse_created_timestamp(
+            self.AMBIGUOUS_LOCAL, self.second_pass + 7200, 120.0
+        ))
+        self.assertIsNone(parse_created_timestamp(
+            "garbage", self.first_pass, 120.0
+        ))
+
+    def test_second_pass_snapshot_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = self.write_assets(temporary)
+            os.utime(assets, (self.second_pass, self.second_pass))
+            with (
+                mock.patch.dict(os.environ, self.environment(assets)),
+                mock.patch("time.time", return_value=self.second_pass + 60),
+            ):
+                statuses, _mtime, available = read_asset_snapshot()
+            self.assertTrue(available)
+            self.assertTrue(statuses.snapshot_valid)
+            self.assertEqual({"switch01": "OK"}, dict(statuses))
+
+    def test_skew_beyond_both_folds_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = self.write_assets(temporary)
+            skewed = self.second_pass + 7200.0
+            os.utime(assets, (skewed, skewed))
+            with (
+                mock.patch.dict(os.environ, self.environment(assets)),
+                mock.patch("time.time", return_value=skewed + 60),
+            ):
+                statuses, _mtime, available = read_asset_snapshot()
+            self.assertTrue(available)
+            self.assertFalse(statuses.snapshot_valid)
+            self.assertEqual({}, dict(statuses))
+
+    def test_assets_api_accepts_second_pass_snapshot(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            assets = self.write_assets(temporary)
+            devices = Path(temporary) / "devices.yaml"
+            devices.write_text(
+                'devices:\n  10.0.0.1: "switch01 @cumulus"\n',
+                encoding="utf-8",
+            )
+            os.utime(assets, (self.second_pass, self.second_pass))
+            os.utime(devices, (self.second_pass - 60, self.second_pass - 60))
+            with mock.patch.dict(os.environ, {
+                "ASSET_TIMESTAMP_TOLERANCE_SECONDS": "120",
+            }):
+                payload = load_assets_payload(
+                    assets, devices, now=self.second_pass + 60,
+                )
+                self.assertTrue(payload["success"])
+                self.assertEqual(1, payload["total"])
+
+                skewed = self.second_pass + 7200.0
+                os.utime(assets, (skewed, skewed))
+                with self.assertRaisesRegex(
+                    AssetReportError, "does not match its publication time"
+                ):
+                    load_assets_payload(assets, devices, now=skewed + 60)
 
 
 if __name__ == "__main__":

@@ -451,6 +451,14 @@ def build_port_record(
 ) -> Dict[str, Any]:
     previous_counters = previous.get("counters", {}) if isinstance(previous, Mapping) else {}
     previous_timestamp = previous.get("timestamp") if isinstance(previous, Mapping) else None
+    # Counter families advance their baselines independently, so a counter can
+    # carry an older baseline than the port's newest sample.  Legacy baselines
+    # have no per-counter map; every counter falls back to the port timestamp.
+    counter_timestamps = (
+        previous.get("counter_timestamps") if isinstance(previous, Mapping) else None
+    )
+    if not isinstance(counter_timestamps, Mapping):
+        counter_timestamps = {}
     duration = (
         timestamp - float(previous_timestamp)
         if isinstance(previous_timestamp, (int, float)) and timestamp > previous_timestamp
@@ -459,16 +467,19 @@ def build_port_record(
     deltas: Dict[str, Optional[int]] = {}
     rates: Dict[str, Optional[float]] = {}
     reset_counters: List[str] = []
-    missing_baseline: List[str] = []
 
     for name in COUNTER_PATHS:
         current = counters.get(name)
         old = previous_counters.get(name) if isinstance(previous_counters, Mapping) else None
-        if current is None or old is None or duration is None:
+        old_timestamp = counter_timestamps.get(name, previous_timestamp)
+        counter_duration = (
+            timestamp - float(old_timestamp)
+            if isinstance(old_timestamp, (int, float)) and timestamp > old_timestamp
+            else None
+        )
+        if current is None or old is None or counter_duration is None:
             deltas[name] = None
             rates[name] = None
-            if current is not None and old is None:
-                missing_baseline.append(name)
             continue
         if current < old:
             deltas[name] = None
@@ -477,24 +488,25 @@ def build_port_record(
             continue
         delta = current - old
         deltas[name] = delta
-        rates[name] = delta / duration
+        rates[name] = delta / counter_duration
 
     ecn_present = all(counters.get(name) is not None for name in ECN_COUNTERS)
     pfc_present = all(counters.get(name) is not None for name in PFC_COUNTERS)
     # A port is analyzable when at least one counter family is fully present;
     # the missing family stays unavailable instead of hiding the collected one.
     exact = ecn_present or pfc_present
+    # Readiness is per family as well: every counter of the family produced a
+    # usable delta.  A family on its first (or freshly returned) baseline is
+    # not ready, but it must not demote the other family's valid deltas.
+    ecn_ready = all(deltas.get(name) is not None for name in ECN_COUNTERS)
+    pfc_ready = all(deltas.get(name) is not None for name in PFC_COUNTERS)
     if collection_status != "ok":
         sample_status = "collection_error"
     elif not exact:
         sample_status = "missing"
     elif any(name in reset_counters for name in REQUIRED_COUNTERS):
         sample_status = "counter_reset"
-    elif (
-        previous is None
-        or duration is None
-        or any(name in missing_baseline for name in REQUIRED_COUNTERS)
-    ):
+    elif not (ecn_ready or pfc_ready):
         sample_status = "first_sample"
     else:
         sample_status = "analyzed"
@@ -544,12 +556,57 @@ def build_port_record(
         "sample_status": sample_status,
         "signal": signal,
         "exact": exact,
+        "ecn_ready": ecn_ready,
+        "pfc_ready": pfc_ready,
         "counters": dict(counters),
         "deltas": deltas,
         "rates": rates,
         "reset_counters": reset_counters,
         "ecn_share_percent": ecn_share,
         "loss_delta": loss_delta,
+    }
+
+
+def _advance_baseline(
+    previous: Optional[Mapping[str, Any]],
+    hostname: str,
+    interface: str,
+    counters: Mapping[str, Optional[int]],
+    timestamp: float,
+) -> Dict[str, Any]:
+    """Advance a port baseline counter by counter.
+
+    A sample carrying only one counter family must not erase the other
+    family's baseline: unmeasured counters keep their previous value and
+    timestamp, so when the missing family returns only that family restarts
+    while the measured family's deltas stay valid.  Legacy baselines (no
+    counter_timestamps map) date every kept counter at the old port timestamp.
+    """
+    merged_counters: Dict[str, int] = {}
+    merged_timestamps: Dict[str, float] = {}
+    if isinstance(previous, Mapping):
+        previous_counters = previous.get("counters")
+        previous_timestamp = previous.get("timestamp")
+        previous_timestamps = previous.get("counter_timestamps")
+        if not isinstance(previous_timestamps, Mapping):
+            previous_timestamps = {}
+        if isinstance(previous_counters, Mapping):
+            for name in COUNTER_PATHS:
+                value = _counter_number(previous_counters.get(name))
+                stamp = previous_timestamps.get(name, previous_timestamp)
+                if value is not None and isinstance(stamp, (int, float)):
+                    merged_counters[name] = value
+                    merged_timestamps[name] = float(stamp)
+    for name, value in counters.items():
+        if value is not None:
+            merged_counters[name] = value
+            merged_timestamps[name] = timestamp
+    return {
+        "hostname": hostname,
+        "interface": interface,
+        "timestamp": timestamp,
+        "counters": merged_counters,
+        "counter_timestamps": merged_timestamps,
     }
 
 
@@ -905,6 +962,15 @@ def summarize_records(
     return {
         "total_ports": total,
         "ready_ports": ready,
+        # Per-family readiness: a family with zero ready ports was never
+        # measured this interval, so its activity counts are not evidence of
+        # health and must not be presented as authoritative zeros.
+        "ecn_ready_ports": sum(
+            bool(row.get("ecn_ready")) for row in analyzed_records
+        ),
+        "pfc_ready_ports": sum(
+            bool(row.get("pfc_ready")) for row in analyzed_records
+        ),
         "ecn_active_ports": sum(
             (row["deltas"].get("ecn_marked_frames") or 0) > 0
             for row in analyzed_records
@@ -945,12 +1011,20 @@ def render_report(
     total = metrics["total_ports"]
     exact = sum(bool(row.get("exact")) for row in records)
     ready = metrics["ready_ports"]
+    ecn_ready = metrics["ecn_ready_ports"]
+    pfc_ready = metrics["pfc_ready_ports"]
     ecn_active = metrics["ecn_active_ports"]
     rx_active = metrics["pfc_rx_active_ports"]
     tx_active = metrics["pfc_tx_active_ports"]
     discard_ready = metrics["discard_ready_ports"]
     loss_active = metrics["discard_active_ports"]
     incomplete = total - ready
+    # Family cards show active/ready for the measured family; a family with
+    # zero ready ports was never measured, and "0" would be a healthy-looking
+    # lie, so it gets the same unavailable em-dash the row cells use.
+    ecn_card_metric = f"{ecn_active:,}/{ecn_ready:,}" if ecn_ready else "&mdash;"
+    rx_card_metric = f"{rx_active:,}/{pfc_ready:,}" if pfc_ready else "&mdash;"
+    tx_card_metric = f"{tx_active:,}/{pfc_ready:,}" if pfc_ready else "&mdash;"
     device_coverage = (
         f"{current_hosts}/{expected_hosts}"
         if expected_hosts is not None and current_hosts is not None
@@ -987,7 +1061,9 @@ def render_report(
         f'{failure_metadata}'
         f' data-interval-status="{interval_status}"'
         f' data-total-ports="{total}" data-ready-ports="{ready}"'
+        f' data-ecn-ready-ports="{ecn_ready}"'
         f' data-ecn-active-ports="{ecn_active}"'
+        f' data-pfc-ready-ports="{pfc_ready}"'
         f' data-pfc-rx-active-ports="{rx_active}"'
         f' data-pfc-tx-active-ports="{tx_active}"'
         f' data-discard-ready-ports="{discard_ready}"'
@@ -1196,9 +1272,9 @@ tr.detail-row td{{padding:0;white-space:normal;text-align:left;background:#20202
 <div id="devices-card" class="summary-card card-info" data-card-filter="all" data-filter-label="All reporting devices" role="button" tabindex="0" aria-pressed="false"><div class="metric">{device_coverage}</div><div class="metric-label">Devices reporting</div></div>
 <div id="ports-card" class="summary-card card-good" data-card-filter="all" data-filter-label="All checked ports" role="button" tabindex="0" aria-pressed="false"><div class="metric">{total:,}</div><div class="metric-label">Ports checked</div></div>
 <div id="exact-card" class="summary-card card-good" data-card-filter="exact" data-filter-label="Counters available" role="button" tabindex="0" aria-pressed="false"><div class="metric">{exact:,}/{total:,}</div><div class="metric-label">Counters available</div></div>
-<div id="ecn-card" class="summary-card card-good" data-card-filter="ecn" data-filter-label="Ports marking ECN" role="button" tabindex="0" aria-pressed="false"><div class="metric">{ecn_active:,}</div><div class="metric-label">Ports marking ECN</div><div class="metric-caption">Since previous sample</div></div>
-<div id="rx-card" class="summary-card card-warning" data-card-filter="rx" data-filter-label="Paused by peer (PFC RX)" role="button" tabindex="0" aria-pressed="false"><div class="metric">{rx_active:,}</div><div class="metric-label">Paused by peer (PFC RX)</div><div class="metric-caption">Since previous sample</div></div>
-<div id="tx-card" class="summary-card card-warning" data-card-filter="tx" data-filter-label="Asked peer to pause (PFC TX)" role="button" tabindex="0" aria-pressed="false"><div class="metric">{tx_active:,}</div><div class="metric-label">Asked peer to pause (PFC TX)</div><div class="metric-caption">Since previous sample</div></div>
+<div id="ecn-card" class="summary-card card-good" data-card-filter="ecn" data-filter-label="Ports marking ECN" role="button" tabindex="0" aria-pressed="false"><div class="metric">{ecn_card_metric}</div><div class="metric-label">Ports marking ECN</div><div class="metric-caption">Active / measured since previous sample</div></div>
+<div id="rx-card" class="summary-card card-warning" data-card-filter="rx" data-filter-label="Paused by peer (PFC RX)" role="button" tabindex="0" aria-pressed="false"><div class="metric">{rx_card_metric}</div><div class="metric-label">Paused by peer (PFC RX)</div><div class="metric-caption">Active / measured since previous sample</div></div>
+<div id="tx-card" class="summary-card card-warning" data-card-filter="tx" data-filter-label="Asked peer to pause (PFC TX)" role="button" tabindex="0" aria-pressed="false"><div class="metric">{tx_card_metric}</div><div class="metric-label">Asked peer to pause (PFC TX)</div><div class="metric-caption">Active / measured since previous sample</div></div>
 <div id="loss-card" class="summary-card card-critical" data-card-filter="loss" data-filter-label="Ports with discards" role="button" tabindex="0" aria-pressed="false"><div class="metric">{loss_active:,}</div><div class="metric-label">Ports with discards</div><div class="metric-caption">Since previous sample</div></div>
 <div id="attention-card" class="summary-card {'card-warning' if incomplete else 'card-good'}" data-card-filter="attention" data-filter-label="Needs attention" role="button" tabindex="0" aria-pressed="false"><div class="metric">{incomplete:,}</div><div class="metric-label">Needs attention</div><div class="metric-caption">Missing, reset, or awaiting sample</div></div>
 </div></div></section>
@@ -1759,7 +1835,7 @@ async function runAnalysis() {{
 }}
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body></html>'''
 
@@ -1922,6 +1998,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
                 del baselines[key]
         for interface, entry in sorted(physical_ports.items()):
             key = f"{hostname}:{interface}"
+            previous_baseline = baselines.get(key)
             if entry.get("status") == "ok":
                 payload = entry.get("payload", {})
                 counters = extract_counters(payload, lossless_priority)
@@ -1930,19 +2007,14 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             else:
                 counters = {name: None for name in COUNTER_PATHS}
             record = build_port_record(
-                hostname, interface, counters, baselines.get(key), timestamp,
+                hostname, interface, counters, previous_baseline, timestamp,
                 str(entry.get("status", "error")),
             )
             records.append(record)
             if entry.get("status") == "ok" and any(value is not None for value in counters.values()):
-                baselines[key] = {
-                    "hostname": hostname,
-                    "interface": interface,
-                    "timestamp": timestamp,
-                    "counters": {
-                        name: value for name, value in counters.items() if value is not None
-                    },
-                }
+                baselines[key] = _advance_baseline(
+                    previous_baseline, hostname, interface, counters, timestamp
+                )
             new_history_by_host.setdefault(hostname, {}).setdefault(
                 key, []
             ).append(_history_record(record))
@@ -2099,6 +2171,8 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             "coverage_current": len(hosts_with_ports) if snapshot_valid else None,
             "total_ports": metrics["total_ports"],
             "ready_ports": metrics["ready_ports"],
+            "ecn_ready_ports": metrics["ecn_ready_ports"],
+            "pfc_ready_ports": metrics["pfc_ready_ports"],
             "ecn_active_ports": metrics["ecn_active_ports"],
             "pfc_rx_active_ports": metrics["pfc_rx_active_ports"],
             "pfc_tx_active_ports": metrics["pfc_tx_active_ports"],

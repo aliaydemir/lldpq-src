@@ -977,21 +977,16 @@
         async function silentGitScan() {
             lastAutoScanTime = Date.now();
             try {
-                const response = await fetch('/ansible-api.sh?action=git-status');
+                // Plumbing-based endpoint (unstaged + staged + untracked), not a
+                // regex scrape of human git-status text (which collapses on
+                // untracked dirs and mis-parses renames).
+                const response = await fetch('/ansible-api.sh?action=get-modified-devices');
                 const data = await response.json();
-                
-                if (data.success && data.output) {
-                    const output = data.output;
-                    const newPendingDevices = new Set();
-                    
-                    // Parse git status output for inventory/ changes only
-                    for (const line of output.split('\n')) {
-                        const hostVarsMatch = line.match(/inventory\/host_vars\/([^\/]+)\.ya?ml/);
-                        if (hostVarsMatch) {
-                            newPendingDevices.add(hostVarsMatch[1]);
-                        }
-                    }
-                    
+
+                if (data.success && Array.isArray(data.modified_devices)) {
+                    const newPendingDevices = new Set(
+                        data.modified_devices.filter(h => h && h !== 'all'));
+
                     // Git results replace only the git-derived set; devices
                     // marked by a Fabric Scan are never cleared by a git scan.
                     const previousUnion = modifiedDevices;
@@ -1162,39 +1157,37 @@
         async function quickGitScan() {
             try {
                 console.log('[quickGitScan] Starting...');
-                const response = await fetch('/ansible-api.sh?action=git-status');
+                // Pending devices come from the plumbing-based endpoint (unstaged
+                // + staged + untracked), not from scraping human git-status text.
+                const response = await fetch('/ansible-api.sh?action=get-modified-devices');
                 const data = await response.json();
                 console.log('[quickGitScan] API response:', data.success ? 'success' : 'failed');
-                
-                if (data.success && data.output) {
-                    const output = data.output;
-                    console.log('[quickGitScan] Git output lines:', output.split('\n').length);
-                    const gitPendingDevices = new Set();
+
+                if (data.success && Array.isArray(data.modified_devices)) {
+                    const gitPendingDevices = new Set(
+                        data.modified_devices.filter(h => h && h !== 'all'));
                     const modifiedGroups = new Set();
-                    
-                    // Parse git status output for modified files in inventory/
-                    const lines = output.split('\n');
-                    
-                    for (const line of lines) {
-                        // Match host_vars file changes
-                        const hostMatch = line.match(/inventory\/host_vars\/([^\/\s]+)\.ya?ml/);
-                        if (hostMatch) {
-                            const hostname = hostMatch[1];
-                            if (hostname && hostname !== 'all') {
-                                gitPendingDevices.add(hostname);
+
+                    // group_vars changes still come from git status (the device
+                    // endpoint carries no group info); banner only, best-effort.
+                    try {
+                        const stResp = await fetch('/ansible-api.sh?action=git-status');
+                        const stData = await stResp.json();
+                        if (stData.success && stData.output) {
+                            for (const line of stData.output.split('\n')) {
+                                const groupMatch = line.match(/inventory\/group_vars\/([^\/\s]+)/);
+                                if (groupMatch) {
+                                    modifiedGroups.add(groupMatch[1]);
+                                }
                             }
                         }
-                        
-                        // Match group_vars file changes
-                        const groupMatch = line.match(/inventory\/group_vars\/([^\/\s]+)/);
-                        if (groupMatch) {
-                            modifiedGroups.add(groupMatch[1]);
-                        }
+                    } catch (e) {
+                        console.warn('[quickGitScan] group_vars check failed:', e.message);
                     }
-                    
+
                     console.log('[quickGitScan] Detected host_vars devices:', Array.from(gitPendingDevices));
                     console.log('[quickGitScan] Detected group_vars:', Array.from(modifiedGroups));
-                    
+
                     // Update only the git-derived set and re-union: never clear
                     // devices marked modified by a Fabric Scan / scan cache.
                     gitModifiedDevices = gitPendingDevices;
@@ -1747,8 +1740,11 @@
             `;
         }
         
-        async function ansibleApiCall(action, hosts) {
+        async function ansibleApiCall(action, hosts, background = false) {
             const params = new URLSearchParams({ action });
+            // async=1: run diff/generate as a detached background job (returns
+            // {started, job_id} to poll) instead of a synchronous response.
+            if (background) params.append('async', '1');
             // Whole-fabric host lists overflow the URL limit (nginx 414): the
             // backend accepts the same comma-joined list as POST body JSON for
             // these actions, with the action kept in the query string.
@@ -1765,6 +1761,62 @@
             const response = await fetch(`/ansible-api?${params}`);
             return await response.json();
         }
+
+        // Poll a background diff/generate job until done, returning a result
+        // shaped like the old synchronous response ({success, output, error}).
+        // Uses byte offsets (server-reported total_len) so each 2s poll only
+        // transfers the new log suffix.
+        async function pollJobResult(jobId) {
+            let offset = 0;
+            let fullLog = '';
+            let pollErrors = 0;
+            while (true) {
+                let resp, data;
+                try {
+                    resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}&offset=${offset}`);
+                    data = await resp.json();
+                    pollErrors = 0;
+                } catch (e) {
+                    pollErrors++;
+                    if (pollErrors >= DEPLOY_POLL_MAX_ERRORS) {
+                        return { success: false, output: fullLog, error: 'Error polling job status: ' + e.message + '. The job keeps running in the background.' };
+                    }
+                    await sleep(DEPLOY_POLL_INTERVAL);
+                    continue;
+                }
+
+                if (resp.status === 401 || resp.status === 403) {
+                    return { success: false, output: fullLog, error: 'Session expired. Log in again; the job keeps running in the background.' };
+                }
+
+                // Unknown/expired job (not running, not done, no success)
+                if (!data.success && !data.running && !data.done) {
+                    return { success: false, output: fullLog, error: data.error || 'Unknown or expired job' };
+                }
+
+                fullLog += data.output || '';
+                offset = (typeof data.total_len === 'number') ? data.total_len : offset + (data.output || '').length;
+
+                if (data.done) {
+                    return { success: !!data.success, output: fullLog, error: data.error, exit_code: data.exit_code };
+                }
+
+                await sleep(DEPLOY_POLL_INTERVAL);
+            }
+        }
+
+        // Submit diff/generate as a detached background job and poll it to
+        // completion, so long whole-fabric runs survive the nginx read timeout.
+        // Returns the old synchronous response shape.
+        async function runAnsibleJob(action, hosts) {
+            const result = await ansibleApiCall(action, hosts, true);
+            if (result && result.locked) return result;
+            if (result && result.started && result.job_id) {
+                return await pollJobResult(result.job_id);
+            }
+            // Fallback: backend returned a synchronous result
+            return result;
+        }
         
         async function runGenerate() {
             const selected = getSelectedDevices();
@@ -1780,8 +1832,8 @@
             appendOutput(`Devices: ${hosts}\n`);
             
             try {
-                const result = await ansibleApiCall('generate', hosts);
-                
+                const result = await runAnsibleJob('generate', hosts);
+
                 if (result.success) {
                     appendOutput('Generation completed successfully!', 'success');
                     appendFormattedOutput(result.output || '');
@@ -1949,11 +2001,11 @@
             appendOutput(`Devices: ${hosts}\n`);
             
             try {
-                const result = await ansibleApiCall('diff', hosts);
-                
+                const result = await runAnsibleJob('diff', hosts);
+
                 if (result.success) {
                     const output = result.output || '';
-                    
+
                     // Check for changes
                     const hasChanges = output.includes('With changes:');
                     const changesMatch = output.match(/With changes:\s*(\d+)/);
@@ -2001,8 +2053,8 @@
             appendOutput('Running diff against all devices to detect pending changes...\n');
             
             try {
-                const result = await ansibleApiCall('diff', hosts);
-                
+                const result = await runAnsibleJob('diff', hosts);
+
                 if (result.success) {
                     const output = result.output || '';
                     const cleanedOutput = parseAnsiOutput(output);
@@ -2078,15 +2130,16 @@
                     appendOutput('\n--- Full Diff Output ---\n');
                     appendFormattedOutput(output);
                     
-                    // Show diff modal popup (same as runDiff)
+                    // Show diff modal popup (same as runDiff); pass the scanned
+                    // device list so "Devices Checked" reflects the real count
                     const summary = extractDiffSummary(output);
                     if (summary) {
-                        showDiffModal(summary, pendingCount);
+                        showDiffModal(summary, pendingCount, Array.from(allDevices));
                     } else {
-                        const fallbackMsg = pendingCount > 0 
+                        const fallbackMsg = pendingCount > 0
                             ? `${pendingCount} device(s) have configuration changes.\n\nCheck the output panel for details.`
                             : 'All devices are in sync with Ansible configurations.';
-                        showDiffModal(fallbackMsg, pendingCount);
+                        showDiffModal(fallbackMsg, pendingCount, Array.from(allDevices));
                     }
                 } else {
                     appendOutput('Scan failed!', 'error');
@@ -2170,13 +2223,16 @@
         }
 
         // Poll deploy-status until done, streaming the growing log into the output area.
+        // Uses byte offsets (server-reported total_len): each poll only transfers
+        // the new log suffix; the full log is accumulated locally for the recap.
         async function pollDeployStatus(jobId, selected) {
-            let lastLen = 0;
+            let offset = 0;
+            let fullLog = '';
             let pollErrors = 0;
             while (true) {
                 let resp, data;
                 try {
-                    resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}`);
+                    resp = await fetch(`/ansible-api?action=deploy-status&job=${encodeURIComponent(jobId)}&offset=${offset}`);
                     data = await resp.json();
                     pollErrors = 0;
                 } catch (e) {
@@ -2210,14 +2266,15 @@
                 }
 
                 const out = data.output || '';
-                if (out.length > lastLen) {
-                    appendFormattedOutput(out.slice(lastLen));
-                    lastLen = out.length;
+                if (out) {
+                    appendFormattedOutput(out);
+                    fullLog += out;
                 }
+                offset = (typeof data.total_len === 'number') ? data.total_len : offset + out.length;
 
                 if (data.done) {
                     localStorage.removeItem(DEPLOY_JOB_KEY);
-                    finalizeDeploy(data, selected, out);
+                    finalizeDeploy(data, selected, fullLog);
                     return;
                 }
 

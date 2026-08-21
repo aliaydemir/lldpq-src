@@ -13,6 +13,7 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
+LLDPQ_DIR="${LLDPQ_DIR:-$SCRIPT_DIR}"
 
 source "$SCRIPT_DIR/load_devices.sh"
 if ! load_devices "$SCRIPT_DIR/parse_devices.py"; then
@@ -28,8 +29,10 @@ RESULT_DIR="$SCRIPT_DIR/monitor-results"
 TRANSCEIVER_DIR="$RESULT_DIR/transceiver-data"
 INVENTORY_JSON="$RESULT_DIR/transceiver_inventory.json"
 WEB_MONITOR_DIR="$WEB_ROOT/monitor-results"
-LOCK_FILE="$RESULT_DIR/collect-transceiver-fw.lock"
-LAST_RUN_FILE="$RESULT_DIR/.collect-transceiver-fw-last-run"
+# Lock and last-run gate live at the LLDPQ_DIR root: monitor.sh publishes
+# monitor-results with cp -a, so anything in that tree leaks into the web tree.
+LOCK_FILE="$LLDPQ_DIR/.collect-transceiver-fw.lock"
+LAST_RUN_FILE="$LLDPQ_DIR/.collect-transceiver-fw-last-run"
 TRANSCEIVER_FW_MIN_INTERVAL="${TRANSCEIVER_FW_MIN_INTERVAL:-1800}"
 case "$TRANSCEIVER_FW_MIN_INTERVAL" in
     ''|*[!0-9]*) TRANSCEIVER_FW_MIN_INTERVAL=1800 ;;
@@ -46,9 +49,23 @@ if ! flock -n 9; then
     exit 1
 fi
 
+# Pre-relocation runs kept the lock and last-run gate inside monitor-results.
+# Adopt the old timestamp so an upgrade does not reset the min-interval gate,
+# then drop the old files best-effort so they stop leaking into the web tree.
+OLD_LAST_RUN_FILE="$RESULT_DIR/.collect-transceiver-fw-last-run"
+if [ -f "$OLD_LAST_RUN_FILE" ] && [ ! -f "$LAST_RUN_FILE" ]; then
+    cp "$OLD_LAST_RUN_FILE" "$LAST_RUN_FILE" 2>/dev/null || true
+fi
+rm -f "$OLD_LAST_RUN_FILE" "$RESULT_DIR/collect-transceiver-fw.lock" 2>/dev/null || true
+
 now=$(date +%s)
 last_run=0
 [ -f "$LAST_RUN_FILE" ] && last_run=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo 0)
+# Empty/garbage content (e.g. a torn write) must not error the -gt test:
+# treat it as gate-unknown and proceed; the write below repairs the file.
+case "$last_run" in
+    ''|*[!0-9]*) last_run=0 ;;
+esac
 if [ "$TRANSCEIVER_FW_MIN_INTERVAL" -gt 0 ] && [ "$last_run" -gt 0 ] && [ $((now - last_run)) -lt "$TRANSCEIVER_FW_MIN_INTERVAL" ]; then
     wait_left=$((TRANSCEIVER_FW_MIN_INTERVAL - (now - last_run)))
     echo "ERROR: Last transceiver firmware collection was too recent. Wait ${wait_left}s or set TRANSCEIVER_FW_MIN_INTERVAL=0." >&2
@@ -88,7 +105,10 @@ case "$MAX_PARALLEL" in
 esac
 
 mkdir -p "$TRANSCEIVER_DIR"
-STATUS_DIR=$(mktemp -d "$RESULT_DIR/transceiver-status.XXXXXX")
+# Stage outside monitor-results: monitor.sh publishes that tree with cp -a,
+# so a live stage dir there either fails the publish mid-copy (rolling back
+# a healthy generation) or leaks into the web tree.
+STATUS_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lldpq-transceiver-status.XXXXXX") || exit 1
 trap 'rm -rf "$STATUS_DIR"' EXIT
 
 status_file_for() {
@@ -108,7 +128,10 @@ write_status() {
 write_transceiver_marker() {
     local hostname=$1
     local reason=$2
-    printf '# %s\n' "$reason" > "$TRANSCEIVER_DIR/${hostname}_transceiver.txt"
+    local target="$TRANSCEIVER_DIR/${hostname}_transceiver.txt"
+    local tmp_target="$TRANSCEIVER_DIR/.${hostname}_transceiver.txt.tmp"
+    # Stage next to the target, then rename so a torn file is never published.
+    printf '# %s\n' "$reason" > "$tmp_target" && mv -f "$tmp_target" "$target" || rm -f "$tmp_target"
 }
 
 is_unknown_model() {
@@ -151,6 +174,7 @@ collect_fw() {
     local hostname=$3
     local known_model=${4:-}
     local outfile="$TRANSCEIVER_DIR/${hostname}_transceiver.txt"
+    local tmp_outfile="$TRANSCEIVER_DIR/.${hostname}_transceiver.txt.tmp"
     local output
     local ssh_status
     local first_line
@@ -296,7 +320,8 @@ REMOTE_SCRIPT
     esac
 
     if [ -n "$output" ]; then
-        printf '%s\n' "$output" > "$outfile"
+        # Stage next to the target, then rename so a torn file is never published.
+        printf '%s\n' "$output" > "$tmp_outfile" && mv -f "$tmp_outfile" "$outfile" || rm -f "$tmp_outfile"
         write_status "$hostname" "ok" "$(printf '%s\n' "$output" | wc -l | xargs)"
         echo "  $hostname: $(echo "$output" | wc -l) modules"
     else
@@ -446,7 +471,9 @@ if [ ! -d "$RESULT_DIR/optical-data" ]; then
     exit 1
 fi
 
-echo "$now" > "$LAST_RUN_FILE"
+# Atomic tmp+rename: ENOSPC/kill mid-write must not leave an empty file that
+# would bypass the min-interval gate on the next run.
+echo "$now" > "${LAST_RUN_FILE}.tmp" && mv -f "${LAST_RUN_FILE}.tmp" "$LAST_RUN_FILE" || rm -f "${LAST_RUN_FILE}.tmp"
 echo "Collecting transceiver firmware versions..."
 queued=0
 pids=()

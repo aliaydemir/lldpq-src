@@ -19,6 +19,26 @@ import os
 from datetime import datetime
 from collections import defaultdict
 
+# Matches the " [IPv4 Unicast]"/" [L2VPN EVPN]" suffix appended when a
+# session appears in more than one address family.
+AF_SUFFIX_RE = re.compile(r'\s*\[[^][]*\]$')
+
+def normalize_neighbor_name(raw):
+    """Strip display decorations from an exported Neighbor cell.
+
+    The BGP CSV's Neighbor column is bgp_analyzer's display string, not a
+    bare device name: unnumbered peers render as "host(swp31)", non-default
+    VRF sessions as "vrf / host", and multi-AF sessions carry an
+    " [IPv4 Unicast]"-style suffix.  Plain hostnames and numbered peer IPs
+    pass through unchanged.
+    """
+    name = AF_SUFFIX_RE.sub('', raw.strip())
+    if ' / ' in name:
+        name = name.split(' / ', 1)[1]
+    if '(' in name:
+        name = name.split('(', 1)[0]
+    return name.strip()
+
 def parse_bgp_report(csv_path):
     """Parse BGP report and return devices, links, and down states."""
     devices = set()
@@ -76,7 +96,7 @@ def parse_bgp_report(csv_path):
             if 'cfw' in neighbor_raw.lower():
                 continue
 
-            neighbor = neighbor_raw.strip().casefold()
+            neighbor = normalize_neighbor_name(neighbor_raw).casefold()
             local_port = neighbor
             if interface_col is not None and len(row) > interface_col:
                 interface = row[interface_col].strip()
@@ -90,9 +110,13 @@ def parse_bgp_report(csv_path):
                 device_neighbors[device].add(neighbor)
                 device_neighbors[neighbor].add(device)
             elif state == 'IDLE':
-                down_idle.append((device, local_port))
+                # Multi-AF rows collapse to the same pair after
+                # normalization; keep a single entry per session.
+                if (device, local_port) not in down_idle:
+                    down_idle.append((device, local_port))
             elif state == 'ACTIVE':
-                down_active.append((device, neighbor))
+                if (device, neighbor) not in down_active:
+                    down_active.append((device, neighbor))
     
     return devices, established_links, down_idle, down_active, device_neighbors
 

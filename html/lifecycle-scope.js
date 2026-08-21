@@ -510,6 +510,10 @@
         if (state.scope === 'all' || !isDownloadControl(event.target)) return;
         var table = scopedTableForPath();
         if (!table) return;
+        // The observer's 40ms debounce may not have classified rows rendered
+        // just before this click (chunked renderers); run the same classify
+        // pass synchronously so the snapshot below is complete.
+        applyNow();
         var path = location.pathname.toLowerCase();
         if (path.endsWith('/transceiver.html')) {
             event.preventDefault();
@@ -613,6 +617,6 @@
         'display:none!important}';
     document.head.appendChild(style);
     document.addEventListener('click', prepareScopedCSV, true);
-    window.LLDPqLifecycleScope = { apply: scheduleApply, currentScope: currentScope };
+    window.LLDPqLifecycleScope = { apply: scheduleApply, applyNow: applyNow, currentScope: currentScope };
     load();
 }());

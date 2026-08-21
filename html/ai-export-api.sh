@@ -3,7 +3,9 @@
 #
 # Streams /var/lib/lldpq/ai/analysis.json verbatim (the "analysis" field is
 # the markdown report body; jq -r .analysis renders it).  Only the latest
-# report exists — the AI pipeline overwrites this file each run.
+# report exists — the AI pipeline overwrites this file each run.  Before the
+# first run the file is a seeded {} (install.sh / docker), reported as 503
+# so automation can tell "no report yet" from an actual report.
 #
 # DELIBERATELY UNAUTHENTICATED (no auth-guard.sh): exposing the last analysis
 # to automation without a browser session is the point of this endpoint.
@@ -44,6 +46,38 @@ fi
 if [[ ! -r "$ANALYSIS_FILE" ]]; then
     json_error "500 Internal Server Error" "AI analysis file is not readable by the web service"
 fi
+
+# install.sh and the docker image seed analysis.json with {} so the file
+# exists before the first pipeline run; existence alone cannot mean "report
+# available".  Every persisted report carries top-level "timestamp" and
+# "analysis" (ai-api.sh action_analyze), so their absence is the seeded
+# empty state — signalled like lldp-export-api.sh signals an unpublished
+# report (503 + Retry-After) rather than served as a 200 {}.
+REPORT_SHAPE=$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    print("invalid")
+    raise SystemExit
+if isinstance(data, dict) and "timestamp" in data and "analysis" in data:
+    print("ok")
+else:
+    print("empty")
+' "$ANALYSIS_FILE")
+case "$REPORT_SHAPE" in
+    ok) ;;
+    empty)
+        printf 'Status: 503 Service Unavailable\n'
+        printf 'Content-Type: application/json; charset=UTF-8\n'
+        printf 'Cache-Control: no-store, no-cache, must-revalidate, max-age=0\n'
+        printf 'Retry-After: 60\n\n'
+        printf '%s\n' '{"success": false, "status": "no-report", "error": "No AI analysis has been generated yet; wait for the first analysis run"}'
+        exit 0
+        ;;
+    *) json_error "500 Internal Server Error" "AI analysis file is not valid JSON" ;;
+esac
 
 MTIME_UTC=$(date -u -r "$ANALYSIS_FILE" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown")
 

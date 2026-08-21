@@ -70,7 +70,17 @@ esac
 
 # Publish one atomic latest-value request for lldpq-trigger. The legacy token-
 # only format remains readable by the daemon as scope=all.
-TRIGGER_FILE="${LLDPQ_MONITOR_TRIGGER_FILE:-/tmp/.monitor_web_trigger}"
+# The token lives under /var/lib/lldpq instead of sticky /tmp so an
+# unprivileged local user cannot pre-create the fixed filename and pin the
+# rename below to EPERM. TRANSITION: an old daemon never reads this path, but
+# the CGI and daemon ship together and the per-minute cron re-exec picks up
+# the new daemon, so a just-upgraded host loses at most one minute of clicks.
+TRIGGER_DIR="/var/lib/lldpq/triggers"
+if ! mkdir -p -m 2770 "$TRIGGER_DIR" 2>/dev/null; then
+    echo '{"status":"error","message":"Trigger directory is unavailable"}'
+    exit 1
+fi
+TRIGGER_FILE="${LLDPQ_MONITOR_TRIGGER_FILE:-$TRIGGER_DIR/.monitor_web_trigger}"
 TRIGGER_NOW=$(date +%s%N 2>/dev/null || true)
 [[ "$TRIGGER_NOW" =~ ^[0-9]+$ ]] || TRIGGER_NOW="$(date +%s)000000000"
 # The numeric sentinel keeps the request acceptable to an older daemon during

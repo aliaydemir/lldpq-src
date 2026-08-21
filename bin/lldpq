@@ -215,13 +215,6 @@ run_command() {
     fi
 }
 
-wait_until_not_running() {
-    script_name="$1"
-    while pgrep -f "$script_name" >/dev/null; do
-        sleep 10
-    done
-}
-
 # Mark the complete generation as collecting before its first mutable input is
 # gathered.  monitor.sh replaces this marker with its own in-progress state and
 # clears it only after a successful, atomic report publication.  With the
@@ -243,7 +236,6 @@ fi
 if [[ "$SKIP_ASSETS" == "true" ]]; then
     log_notice "Asset discovery skipped by configuration (SKIP_ASSETS=true)."
 else
-    wait_until_not_running "assets.sh"
     if ! run_command ./assets.sh; then
         if [[ "$SKIP_MONITOR" != "true" ]]; then
             mark_pipeline_reports_stale "asset discovery failed before monitoring" || true
@@ -268,7 +260,6 @@ if [[ "$SKIP_LLDP" == "true" ]]; then
     # failed run must not fail a run that never touched LLDP.
     log_notice "LLDP collection skipped by configuration (SKIP_LLDP=true)."
 else
-    wait_until_not_running "check-lldp.sh"
     if ! run_command ./check-lldp.sh; then
         if [[ "$SKIP_MONITOR" != "true" ]]; then
             mark_pipeline_reports_stale "LLDP collection failed before monitoring" || true
@@ -319,7 +310,6 @@ if [[ "$SKIP_FABRIC_SCAN" == "true" ]]; then
     fabric_status=0
     log_notice "Fabric scan skipped by configuration (SKIP_FABRIC_SCAN=true)."
 else
-    wait_until_not_running "fabric-scan.sh"
     run_command ./fabric-scan.sh
     fabric_status=$?
     if [[ $fabric_status -ne 0 ]]; then

@@ -23,6 +23,12 @@ if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     eval "$("$LLDPQ_CONFIG_HELPER" 2>/dev/null)" || true
 fi
 
+# lldpq-config emits plain assignments (no export); export the freshness
+# ceiling so the invoked ai-api.sh and its Python heredoc inherit it.
+if [[ -n "${MONITOR_DATA_MAX_AGE_MINUTES:-}" ]]; then
+    export MONITOR_DATA_MAX_AGE_MINUTES
+fi
+
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
 # Only run if AI is configured (provider + model set)

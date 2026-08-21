@@ -123,6 +123,97 @@ class ObservedPrioritiesTests(unittest.TestCase):
         self.assertEqual(analyzer.observed_priorities(payload), set())
 
 
+class FamilyBaselineTests(unittest.TestCase):
+    """Counter families keep and advance their baselines independently.
+
+    A sample that carries only one family (a switch answering pfc-stats but
+    not egress-queue-stats, or vice versa) must not erase the other family's
+    baseline, and a returning family must not demote the family that had a
+    baseline all along to first_sample.
+    """
+
+    FULL = {
+        "ecn_marked_frames": 50,
+        "tx_frames": 500,
+        "tx_uc_buffer_discards": 1,
+        "wred_discards": 2,
+        "rx_pause_frames": 102,
+        "tx_pause_frames": 203,
+    }
+
+    def test_pfc_only_baseline_keeps_pause_deltas_on_full_sample(self):
+        record = analyzer.build_port_record(
+            "leaf1", "swp1", dict(self.FULL),
+            {
+                "timestamp": 1000,
+                "counters": {"rx_pause_frames": 100, "tx_pause_frames": 200},
+            },
+            1600,
+        )
+        # Only the newly-returning ECN family is on its first sample; the
+        # PFC family that had a baseline keeps its valid deltas.
+        self.assertEqual(record["sample_status"], "analyzed")
+        self.assertTrue(record["pfc_ready"])
+        self.assertFalse(record["ecn_ready"])
+        self.assertEqual(record["deltas"]["rx_pause_frames"], 2)
+        self.assertEqual(record["deltas"]["tx_pause_frames"], 3)
+        self.assertIsNone(record["deltas"]["ecn_marked_frames"])
+        self.assertEqual(record["signal"], "pfc")
+
+    def test_one_family_sample_merges_into_the_baseline_per_family(self):
+        baseline = analyzer._advance_baseline(
+            None, "leaf1", "swp1", self.FULL, 1000
+        )
+        pfc_only = {name: None for name in analyzer.COUNTER_PATHS}
+        pfc_only.update({"rx_pause_frames": 105, "tx_pause_frames": 210})
+        merged = analyzer._advance_baseline(
+            baseline, "leaf1", "swp1", pfc_only, 1600
+        )
+        # The unmeasured ECN family keeps its previous value and timestamp.
+        self.assertEqual(merged["counters"]["ecn_marked_frames"], 50)
+        self.assertEqual(merged["counter_timestamps"]["ecn_marked_frames"], 1000)
+        self.assertEqual(merged["counters"]["rx_pause_frames"], 105)
+        self.assertEqual(merged["counter_timestamps"]["rx_pause_frames"], 1600)
+
+        full = dict(self.FULL)
+        full.update({
+            "ecn_marked_frames": 62,
+            "tx_frames": 620,
+            "rx_pause_frames": 110,
+            "tx_pause_frames": 220,
+        })
+        record = analyzer.build_port_record("leaf1", "swp1", full, merged, 2200)
+        self.assertEqual(record["sample_status"], "analyzed")
+        self.assertTrue(record["ecn_ready"])
+        self.assertTrue(record["pfc_ready"])
+        # Deltas and rates span each family's own baseline window.
+        self.assertEqual(record["deltas"]["ecn_marked_frames"], 12)
+        self.assertAlmostEqual(record["rates"]["ecn_marked_frames"], 12 / 1200)
+        self.assertEqual(record["deltas"]["rx_pause_frames"], 5)
+        self.assertAlmostEqual(record["rates"]["rx_pause_frames"], 5 / 600)
+
+    def test_legacy_baseline_without_counter_timestamps_still_loads(self):
+        record = analyzer.build_port_record(
+            "leaf1", "swp1", dict(self.FULL),
+            {
+                "timestamp": 1000,
+                "counters": {
+                    "ecn_marked_frames": 40,
+                    "tx_frames": 400,
+                    "tx_uc_buffer_discards": 1,
+                    "wred_discards": 2,
+                    "rx_pause_frames": 100,
+                    "tx_pause_frames": 200,
+                },
+            },
+            1600,
+        )
+        self.assertEqual(record["sample_status"], "analyzed")
+        self.assertEqual(record["deltas"]["ecn_marked_frames"], 10)
+        self.assertEqual(record["deltas"]["rx_pause_frames"], 2)
+        self.assertAlmostEqual(record["rates"]["rx_pause_frames"], 2 / 600)
+
+
 class PriorityReportingTests(unittest.TestCase):
     def _record(self):
         return analyzer.build_port_record(

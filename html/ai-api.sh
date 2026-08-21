@@ -101,6 +101,11 @@ export AI_FALLBACK_MODEL AI_STATE_DIR
 export AI_CONTEXT_WINDOW_TOKENS AI_FALLBACK_CONTEXT_WINDOW_TOKENS
 export AI_SEARCH_MODEL AI_SEARCH_URL AI_SEARCH_KEY
 export POST_DATA POST_DATA_FILE ACTION AI_WORKER_JOB AI_ANALYZE_WORKER_JOB
+# lldpq-config emits plain KEY=value assignments (no export), so the optional
+# freshness ceiling must be exported explicitly to reach the Python heredoc.
+if [[ -n "${MONITOR_DATA_MAX_AGE_MINUTES:-}" ]]; then
+    export MONITOR_DATA_MAX_AGE_MINUTES
+fi
 
 python3 << 'PYTHON_SCRIPT'
 import json
@@ -426,7 +431,7 @@ _BEARER_RE = re.compile(r'(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)(\S+)')
 _URI_CREDENTIAL_RE = re.compile(r'(?i)(https?://[^\s/@:]+:)([^\s/@]+)(@)')
 _URL_KEY_RE = re.compile(r'(?i)([?&](?:key|api[-_]?key|token)=)[^&\s]+')
 _TOOL_TAG_RE = re.compile(
-    r'\[(DRYRUN|RUNALL|RUN|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|FIX|NEXT|CONSOLE)\s*:',
+    r'\[(DRYRUN|RUNALL|RUN|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|DIFF|FIX|NEXT|CONSOLE)\s*:',
     re.IGNORECASE,
 )
 _OBSERVATION_BOUNDARY_RE = re.compile(
@@ -949,6 +954,9 @@ def _job_emit(event, events_path=None):
         payload.setdefault('ts', round(time.time(), 3))
         line = json.dumps(payload) + '\n'
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o660)
+        # O_CREAT's 0o660 is masked by the process umask (022 -> 0640); force
+        # the group-rw contract the shared job dir relies on.
+        os.fchmod(descriptor, 0o660)
         try:
             os.write(descriptor, line.encode('utf-8'))
         finally:
@@ -2611,6 +2619,12 @@ def _append_learning_event(event):
         descriptor = os.open(
             LEARNINGS_EVENTS_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o660
         )
+        try:
+            # umask masks the create mode (022 -> 0640); EPERM if the other
+            # AI_STATE identity already owns the file — keep appending then.
+            os.fchmod(descriptor, 0o660)
+        except OSError:
+            pass
         with os.fdopen(descriptor, 'w') as log:
             log.write(json.dumps(event, ensure_ascii=False) + '\n')
     except Exception:
@@ -2686,6 +2700,13 @@ def _locked_learnings_update(mutate):
     import fcntl
     _ensure_state_dir()
     descriptor = os.open(LEARNINGS_FILE + '.lock', os.O_RDWR | os.O_CREAT, 0o660)
+    try:
+        # umask masks the create mode (022 -> 0640), which would deny the
+        # other AI_STATE identity O_RDWR on this lock; EPERM when a non-owner
+        # touches an already-0660 lock is fine.
+        os.fchmod(descriptor, 0o660)
+    except OSError:
+        pass
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         return mutate(load_learnings())
@@ -2969,6 +2990,13 @@ def _locked_state_file_update(path, mutate):
     import fcntl
     _ensure_state_dir()
     descriptor = os.open(path + '.lock', os.O_RDWR | os.O_CREAT, 0o660)
+    try:
+        # umask masks the create mode (022 -> 0640): a 0640 lock owned by one
+        # identity (cron vs www-data) locks the other out of O_RDWR entirely.
+        # EPERM from a non-owner on an already-0660 lock is fine.
+        os.fchmod(descriptor, 0o660)
+    except OSError:
+        pass
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         return mutate(_load_json_file(path))
@@ -3536,6 +3564,21 @@ def build_recent_changes_context(changed_devices=None):
             "Devices whose collected running config changed since the last "
             "analysis snapshot: " + ', '.join(changed_devices[:40])
         )
+        # A small change set is cheap to show in full: the drift analyzer's
+        # stored diff answers "what changed" directly (bounded per device;
+        # silently absent when no event is stored yet).
+        if len(changed_devices) <= 2 and _drift_history_available:
+            for host in changed_devices[:2]:
+                try:
+                    diff_out = run_config_diff(host, 1)
+                except Exception:
+                    continue
+                if diff_out.startswith(('no stored config-change events',
+                                        'usage:')):
+                    continue
+                if len(diff_out) > 2000:
+                    diff_out = diff_out[:2000] + '\n... (truncated)'
+                parts.append(diff_out)
     if not parts:
         return ''
     return (
@@ -4013,8 +4056,9 @@ def build_device_list(devices, device_health):
     This saves ~80% tokens for large fabrics while preserving all actionable info."""
     
     problems = []   # devices with issues — full detail
+    problem_index = {}  # exact hostname → index into problems
     healthy_by_role = {}  # role → count of healthy devices
-    
+
     for ip, dev in sorted(devices.items(), key=lambda x: x[1]['hostname']):
         h = device_health.get(dev['hostname'], {})
         status = h.get('status', 'unknown')
@@ -4038,6 +4082,7 @@ def build_device_list(devices, device_health):
         
         if has_problem:
             tags = ' '.join(issue_tags)
+            problem_index[dev['hostname']] = len(problems)
             problems.append(f"  {dev['hostname']} ({ip}) role={role} {tags} release={release} uptime={uptime}")
         else:
             healthy_by_role[role] = healthy_by_role.get(role, 0) + 1
@@ -4061,19 +4106,21 @@ def build_device_list(devices, device_health):
                         # Find this device in our list
                         dev_entry = next((f"  {d['hostname']} ({ip})" for ip, d in devices.items() if d['hostname'] == device_name), None)
                         if dev_entry:
-                            bgp_line = f"{dev_entry} BGP_DOWN:{down_count}_sessions"
-                            # Add if not already in problems
-                            if not any(device_name in p for p in problems):
-                                h = device_health.get(device_name, {})
+                            # Exact-hostname index: substring matching would tag
+                            # a prefix name's line (leaf-1 vs leaf-10).
+                            if device_name not in problem_index:
                                 ip_addr = next((ip for ip, d in devices.items() if d['hostname'] == device_name), '?')
                                 role = next((d['role'] for d in devices.values() if d['hostname'] == device_name), '?')
+                                problem_index[device_name] = len(problems)
                                 problems.append(f"  {device_name} ({ip_addr}) role={role} BGP_DOWN:{down_count}_sessions")
+                                # Counted healthy in the first pass — move it out.
+                                if healthy_by_role.get(role, 0) > 1:
+                                    healthy_by_role[role] -= 1
+                                else:
+                                    healthy_by_role.pop(role, None)
                             else:
                                 # Append BGP info to existing problem line
-                                for i, p in enumerate(problems):
-                                    if device_name in p:
-                                        problems[i] += f" BGP_DOWN:{down_count}_sessions"
-                                        break
+                                problems[problem_index[device_name]] += f" BGP_DOWN:{down_count}_sessions"
     except Exception:
         pass
     
@@ -4473,6 +4520,12 @@ def _record_provider_usage(provider, model, result):
             usage_path,
             os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o660,
         )
+        try:
+            # umask masks the create mode (022 -> 0640); both the cron and
+            # www-data identities append here. EPERM from a non-owner is fine.
+            os.fchmod(descriptor, 0o660)
+        except OSError:
+            pass
         try:
             os.write(descriptor, (record + '\n').encode())
         finally:
@@ -5138,6 +5191,38 @@ network), request it by key on its own line:
 """
 if _kb_sections_for_keys is not None:
     TOOL_INSTRUCTIONS += KB_INSTRUCTIONS
+
+
+def _drift_history_path():
+    """Config-drift event log written by process_config_drift_data.py."""
+    return _mr_path('config_drift_history.json')
+
+
+# Total [DIFF:] result budget per tag (mirrors the KB inject cap style); the
+# oldest event's diff is truncated first when the requested events exceed it.
+DIFF_RESULT_MAX_CHARS = 6000
+
+# Advertised only when the config-drift analyzer has recorded history; a
+# leftover [DIFF:] tag without the history file is ignored like [P2P:].
+DIFF_INSTRUCTIONS = """
+=== STORED CONFIG-CHANGE DIFFS ===
+To see WHAT actually changed on a device — when investigating why something
+broke or what changed recently — pull the config-drift analyzer's stored
+unified-diff excerpt(s) on its own line:
+[DIFF: <device> [<count>]]
+  - Returns the most recent stored config-change diff(s) for that device from
+    the drift history (previous vs current collected `nv config` snapshot).
+  - <count> = optional number of most recent change events, 1..3 (default 1),
+    e.g. [DIFF: tan-leaf-01 2].
+  - Local history only: costs one tool slot, never touches a device. If the
+    device has no recorded change events you get a short notice — say so.
+"""
+try:
+    _drift_history_available = os.path.getsize(_drift_history_path()) > 0
+except OSError:
+    _drift_history_available = False
+if _drift_history_available:
+    TOOL_INSTRUCTIONS += DIFF_INSTRUCTIONS
 
 
 def _policy_block_hint(command, error):
@@ -6111,6 +6196,32 @@ def _display_alias_variants(device, port):
     return variants[:6]
 
 
+# Precise-first port resolution: ai_p2p.lookup expands ambiguous three-part
+# 'X/Y/Z' design ports to every candidate lane (swp1s0 matches both 1/1/1 and
+# 1/2/1), so the group-fitted index must answer first. Single-slot memo keyed
+# by design object identity — the v2 path reuses one object for every endpoint
+# (the memoized reference keeps the identity stable, like _JSON_MEMO).
+_P2P_INDEX_MEMO = {'conns': None, 'index': None}
+
+
+def _p2p_precise_entry(conns, device, port):
+    """One group-fitted design row for device:port via ai_p2p's precise index,
+    or None (callers fall back to the broad lookup only on None)."""
+    if not port or not isinstance(conns, dict) or _p2p_module is None:
+        return None
+    build = getattr(_p2p_module, 'build_port_index', None)
+    find = getattr(_p2p_module, 'lookup_by_device_port', None)
+    if not callable(build) or not callable(find):
+        return None
+    try:
+        if _P2P_INDEX_MEMO['conns'] is not conns:
+            _P2P_INDEX_MEMO['index'] = build(conns)
+            _P2P_INDEX_MEMO['conns'] = conns
+        return find(_P2P_INDEX_MEMO['index'], device, port)
+    except Exception:
+        return None
+
+
 def run_p2p_lookup(target):
     """Design peer + cable/bundle/rack/transceiver for 'device[:port]' from the
     active P2P design. Read-only; never touches a device."""
@@ -6125,20 +6236,28 @@ def run_p2p_lookup(target):
         device, port = device.strip(), port.strip()
     else:
         device, port = raw, None
-    try:
-        entries = _p2p_module.lookup(conns, device, port or None)
-    except Exception as exc:
-        return 'P2P lookup failed: ' + redact_secrets(str(exc))
+    precise = _p2p_precise_entry(conns, device, port)
+    if precise is not None:
+        entries = [precise]
+    else:
+        try:
+            entries = _p2p_module.lookup(conns, device, port or None)
+        except Exception as exc:
+            return 'P2P lookup failed: ' + redact_secrets(str(exc))
     src = conns.get('source_file', '') if isinstance(conns, dict) else ''
     label = device + ((':' + port) if port else '')
     if not entries:
         # The design may use the P2P label for a device/port the operator named
         # by its live spelling (or vice versa) — retry via display aliases.
         for alt_dev, alt_port in _display_alias_variants(device, port):
-            try:
-                entries = _p2p_module.lookup(conns, alt_dev, alt_port or None)
-            except Exception:
-                entries = []
+            precise = _p2p_precise_entry(conns, alt_dev, alt_port)
+            if precise is not None:
+                entries = [precise]
+            else:
+                try:
+                    entries = _p2p_module.lookup(conns, alt_dev, alt_port or None)
+                except Exception:
+                    entries = []
             if entries:
                 label = '%s (alias of %s)' % (
                     alt_dev + ((':' + alt_port) if alt_port else ''), label)
@@ -6234,6 +6353,75 @@ def run_ipam_lookup(target):
             lines.append('- expected BGP (design): loopback=%s asn=%s'
                          % (match.get('loopback', ''), match.get('asn', '')))
     return '\n'.join(lines)
+
+
+def run_config_diff(device, count=1):
+    """N most recent stored config-change diffs for one device from the
+    config-drift analyzer's history log. Read-only; never touches a device."""
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(3, count))
+    target = str(device or '').strip()
+    if not target:
+        return 'usage: [DIFF: <device> [<count>]]'
+    history = _load_json_file(_drift_history_path())
+    raw_events = history.get('events') if isinstance(history, dict) else None
+    events = [event for event in raw_events if isinstance(event, dict)] \
+        if isinstance(raw_events, list) else []
+    hosts = {str(event.get('host') or '') for event in events} - {''}
+    # Tolerant resolution mirroring [RUN:] targets: exact, then
+    # case-insensitive, then dash/dot-squashed (only when unambiguous).
+    resolved = target if target in hosts else None
+    if resolved is None:
+        by_lower = {host.lower(): host for host in hosts}
+        resolved = by_lower.get(target.lower())
+    if resolved is None:
+        squashed = re.sub(r'[^a-z0-9]+', '', target.lower())
+        matches = {host for host in hosts
+                   if re.sub(r'[^a-z0-9]+', '', host.lower()) == squashed} \
+            if squashed else set()
+        if len(matches) == 1:
+            resolved = next(iter(matches))
+    if resolved is None:
+        return 'no stored config-change events for %s' % target
+    matched = sorted(
+        (event for event in events if event.get('host') == resolved
+         and any(str(line).strip() for line in (event.get('diff') or []))),
+        key=lambda event: int(event.get('ts') or 0), reverse=True,
+    )[:count]
+    if not matched:
+        return 'no stored config-change events for %s' % resolved
+    blocks = []
+    for index, event in enumerate(matched, 1):
+        ts = int(event.get('ts') or 0)
+        when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) \
+            if ts else 'unknown time'
+        diff_text = '\n'.join(str(line) for line in (event.get('diff') or []))
+        if event.get('diff_truncated'):
+            diff_text += '\n... (diff stored truncated by the analyzer)'
+        header = ('--- event %d/%d — detected %s (%s, +%s/-%s lines): %s' % (
+            index, len(matched), when, event.get('type') or 'modified',
+            event.get('added') or 0, event.get('removed') or 0,
+            str(event.get('summary') or '').strip()))
+        blocks.append(header + '\n' + diff_text)
+    parts = ['STORED CONFIG-DRIFT EVENTS for %s — %d event(s), newest first '
+             '(unified diff: previous vs current collected config):'
+             % (resolved, len(matched))]
+    used = len(parts[0])
+    for block in blocks:
+        remaining = DIFF_RESULT_MAX_CHARS - used
+        if len(block) + 2 > remaining:
+            # Budget exhausted: the oldest included event loses diff tail first.
+            if remaining > 0:
+                parts.append(block[:remaining] + '\n... (truncated)')
+            else:
+                parts.append('... (truncated)')
+            break
+        parts.append(block)
+        used += len(block) + 2
+    return '\n\n'.join(parts)
 
 
 def action_chat():
@@ -6540,6 +6728,7 @@ def action_chat():
     DISPATCH_DEVICE_CAP = 120     # total devices across all dispatches
     MAX_PROMQL = 4                # [PROMQL: ...] live telemetry queries per question
     MAX_SEARCH = 2                # [SEARCH: ...] web-research queries per question
+    MAX_DIFF = 2                  # [DIFF: ...] stored config-diff lookups per question
     # Reserve the tail of the 210s budget for the guaranteed tool-free final
     # synthesis so a slow last tool round cannot leave it a few seconds.
     FINALIZE_RESERVE_SECONDS = 45
@@ -6548,6 +6737,7 @@ def action_chat():
     dispatch_dev_total = 0
     promql_used = 0
     searches_used = 0
+    diffs_used = 0
     response = ''
     tools_used = []
     # Capability/meta questions make the model quote tag syntax as EXAMPLES;
@@ -6642,7 +6832,11 @@ def action_chat():
         kbs = re.findall(
             r'(?m)^\s*\[KB:\s*([^\]\r\n]+)\]\s*$', response or ''
         ) if _kb_sections_for_keys is not None else []
-        round_requested = sum(map(len, (runs, runalls, audits, promqls, promranges, paths, searches, dryruns, p2ps, ipams, kbs)))
+        # Stored config-drift diffs (local history only, no device access).
+        diffs = re.findall(
+            r'(?m)^\s*\[DIFF:\s*(\S+)(?:\s+(\d{1,3}))?\s*\]\s*$', response or ''
+        ) if _drift_history_available else []
+        round_requested = sum(map(len, (runs, runalls, audits, promqls, promranges, paths, searches, dryruns, p2ps, ipams, kbs, diffs)))
         if round_requested == 0 or time.monotonic() > deadline:
             if (round_requested == 0 and not phantom_nudged
                     and deadline - time.monotonic() > FINALIZE_RESERVE_SECONDS
@@ -6690,6 +6884,7 @@ def action_chat():
                 + [f"[P2P: {t}]" for t in p2ps]
                 + [f"[IPAM: {t}]" for t in ipams]
                 + [f"[KB: {t}]" for t in kbs]
+                + [f"[DIFF: {d}{(' ' + c) if c else ''}]" for d, c in diffs]
             )
             tools_used.append({
                 'dispatch': 'not-executed',
@@ -7096,6 +7291,33 @@ def action_chat():
                 'ok': kb_ok,
             })
             results.append(f"[KB: {keys_raw.strip()}]\n{out}")
+        # Stored config-drift diffs (local history file only; no device
+        # access). Diff content is collected device data: untrusted.
+        for dev_name, count_raw in diffs[:MAX_TOOLS_PER_ROUND]:
+            if (round_tools >= MAX_TOOLS_PER_ROUND or total_tools >= MAX_TOTAL_TOOLS
+                    or diffs_used >= MAX_DIFF or time.monotonic() > deadline
+                    or _job_cancelled()):
+                break
+            dev_name = dev_name.strip()
+            count = count_raw.strip() if count_raw else '1'
+            dedup_key = ('diff', dev_name.lower(), count)
+            if dedup_key in seen_this_round:
+                round_requested -= 1
+                continue
+            seen_this_round.add(dedup_key)
+            total_tools += 1
+            round_tools += 1
+            diffs_used += 1
+            out = run_config_diff(dev_name, count)
+            diff_ok = not str(out).startswith(
+                ('no stored config-change events', 'usage:')
+            )
+            tools_used.append({
+                'device': 'config-drift',
+                'command': 'stored change diff(s): %s' % dev_name[:120],
+                'ok': diff_ok,
+            })
+            results.append(f"[DIFF: {dev_name}]\n{out}")
         if round_tools < round_requested:
             tools_used.append({
                 'dispatch': 'not-executed',
@@ -7148,7 +7370,7 @@ def action_chat():
                 "Request more data only if needed; otherwise give the final answer "
                 "with no [RUN: ...] / [RUNALL: ...] / [AUDIT: ...] / [PROMQL: ...] / "
                 "[PROMQLRANGE: ...] / [PATH: ...] / [SEARCH: ...] / [P2P: ...] / "
-                "[IPAM: ...] / [KB: ...] / [DRYRUN: ...] lines."
+                "[IPAM: ...] / [KB: ...] / [DIFF: ...] / [DRYRUN: ...] lines."
             ),
             "context_group": tool_group,
             "context_pin": True,
@@ -7177,7 +7399,7 @@ def action_chat():
     # Stop request), force one final answer. Meta/capability answers are
     # exempt: their tags are illustrative examples, not pending requests.
     if (not meta_question and time.monotonic() < deadline
-            and re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB):', response or '')):
+            and re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|DIFF):', response or '')):
         # Rebuild the system message WITHOUT the tool catalog for this last
         # call; an instruction alone does not reliably stop tag emission.
         system_message['content'] = system_prompt_core
@@ -7208,7 +7430,7 @@ def action_chat():
                 "Stop using tools. Give your final answer now from the retained "
                 "results above; do not emit any data-tool lines "
                 "([RUN:]/[RUNALL:]/[AUDIT:]/[PROMQL:]/[PROMQLRANGE:]/[PATH:]/[SEARCH:]/"
-                "[P2P:]/[IPAM:]/[KB:]/[DRYRUN:]). "
+                "[P2P:]/[IPAM:]/[KB:]/[DIFF:]/[DRYRUN:]). "
                 "You MAY include [FIX: ...], [NEXT: ...] and [CONSOLE: ...] suggestions."
                 + skipped_note
             ),
@@ -7259,7 +7481,7 @@ def action_chat():
     else:
         final = '\n'.join(
             ln for ln in (response or '').splitlines()
-            if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|FIX|NEXT|CONSOLE):', ln)
+            if not re.search(r'\[(?:DRYRUN|RUN(?:ALL)?|AUDIT|PROMQLRANGE|PROMQL|PATH|SEARCH|P2P|IPAM|KB|DIFF|FIX|NEXT|CONSOLE):', ln)
         ).strip()
     
     if not final:
@@ -7495,6 +7717,7 @@ def action_chat_poll():
     done = False
     result = None
     events = []
+    resume_index = None  # first event line the 500-cap dropped, if any
     for index, line in enumerate(lines):
         try:
             event = json.loads(line)
@@ -7513,6 +7736,10 @@ def action_chat_poll():
                       'error': str(event.get('error') or 'chat job failed')}
         if index >= cursor and len(events) < 500:
             events.append(event)
+        elif index >= cursor and resume_index is None:
+            # Cap hit: remember where to resume so the cursor never advances
+            # past events that were not returned (they would be lost forever).
+            resume_index = index
     if not done:
         # Heartbeats arrive every ~15s; prolonged silence means the detached
         # worker died without a terminal event. Fail the job explicitly so
@@ -7541,7 +7768,8 @@ def action_chat_poll():
                                 'returning a result.'},
                       events_path=events_path)
     response = {"success": True, "job_id": job_id, "events": events,
-                "cursor": len(lines), "done": done,
+                "cursor": len(lines) if resume_index is None else resume_index,
+                "done": done,
                 "cancelled": os.path.exists(cancel_path)}
     if done:
         response["result"] = result
@@ -7990,13 +8218,18 @@ def _v2_installed_transceivers():
 def _v2_design_endpoint(p2p_conns, device, port):
     """(rack, ru, cable_meta, transceiver) for device:port from the active P2P
     design; empty strings when there is no design or no match. Port matching is
-    the tolerant alias match ai_p2p.lookup already implements."""
+    precise-first (group-fitted breakout index), with ai_p2p.lookup's tolerant
+    alias match as the fallback."""
     if not p2p_conns or _p2p_module is None:
         return '', '', '', ''
-    try:
-        entries = _p2p_module.lookup(p2p_conns, device, port)
-    except Exception:
-        return '', '', '', ''
+    precise = _p2p_precise_entry(p2p_conns, device, port)
+    if precise is not None:
+        entries = [precise]
+    else:
+        try:
+            entries = _p2p_module.lookup(p2p_conns, device, port)
+        except Exception:
+            return '', '', '', ''
     for entry in entries:
         rack = str(entry.get('rack') or '').strip()
         ru = str(entry.get('ru') or '').strip()

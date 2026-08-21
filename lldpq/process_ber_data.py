@@ -93,7 +93,6 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     
     processed_devices = 0
     total_interfaces_processed = 0
-    processing_errors = 0
     hosts_with_interfaces = set()
     category_failed_hosts = set()
     
@@ -175,7 +174,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 if not content:
                     print(f"⚠️  Empty file: {filename}")
-                    processing_errors += 1
+                    category_failed_hosts.add(hostname)
                     continue
 
                 if content.strip() == "__LLDPQ_COLLECTION_ERROR__:INTERFACE_COUNTERS":
@@ -186,8 +185,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                     category_failed_hosts.add(hostname)
                     continue
                 if "__LLDPQ_COLLECTION_ERROR__:" in content:
-                    print(f"❌ Unknown collection marker in {filename}")
-                    processing_errors += 1
+                    print(f"⚠️  Unknown collection marker in {filename}")
+                    category_failed_hosts.add(hostname)
                     continue
                 
                 processed_devices += 1
@@ -197,7 +196,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
                 if not interfaces:
                     print(f"⚠️  No interface data found in {filename}")
-                    processing_errors += 1
+                    category_failed_hosts.add(hostname)
                     continue
                 
                 # Process each interface with delta-based calculation
@@ -330,8 +329,13 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                 
             except Exception as e:
                 print(f"❌ Error processing {filename}: {e}")
-                processing_errors += 1
-    
+                category_failed_hosts.add(hostname)
+
+    # Per-file content problems above only degrade that host to partial
+    # coverage (category_failed_hosts, flap-analyzer precedent); returning
+    # False is reserved for structural failures (invalid asset snapshot,
+    # save/shard-write failures, zero usable data) so one bad device file
+    # cannot roll back every domain.
     if (processed_devices == 0 and not all_devices_unavailable
             and not category_failed_hosts and not missing_hosts):
         print("❌ No BER data files found to process")
@@ -480,7 +484,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     
     print(f"BER history saved")
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] BER data processing completed")
-    return processing_errors == 0
+    return True
 
 def main():
     """Main function"""

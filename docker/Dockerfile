@@ -94,7 +94,7 @@ RUN MONACO_VERSION="0.45.0" && TMP_DIR=$(mktemp -d) && \
     mkdir -p /var/www/html/monaco && \
     cp -r "$TMP_DIR/monaco/min/vs" /var/www/html/monaco/ && \
     rm -rf "$TMP_DIR" && \
-    curl -sL "https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js" \
+    curl -fsSL "https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js" \
         -o /var/www/html/css/js-yaml.min.js
 
 # Copy lldpq scripts
@@ -232,5 +232,12 @@ COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 EXPOSE 80 2033
+
+# Full-chain health probe: nginx -> fcgiwrap -> CGI. auth-api action=check is
+# deliberately session-exempt and answers 200 {"authenticated": false} without
+# a cookie, so a JSON body proves fcgiwrap serves CGI behind nginx. Probing
+# 127.0.0.1:80 works in both bridge and host-network compose modes.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -fsS 'http://127.0.0.1:80/auth-api?action=check' | grep -q '"authenticated"' || exit 1
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

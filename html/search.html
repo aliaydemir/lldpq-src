@@ -1112,9 +1112,11 @@
                     }
                     return 0;
                 }
-                
+                // Group IPs before non-IP values so the comparator stays transitive
+                if (aMatch || bMatch) return (aMatch ? -1 : 1) * direction;
+
                 // String sorting
-                return aVal.localeCompare(bVal) * direction;
+                return aVal.localeCompare(bVal, undefined, { numeric: true, sensitivity: 'base' }) * direction;
             });
             
             rows.forEach(row => tbody.appendChild(row));

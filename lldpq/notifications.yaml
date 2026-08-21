@@ -173,7 +173,7 @@ templates:
 # 1. Set enabled: true (line 37)
 # 2. Update server_url: "http://YOUR_SERVER_IP" (line 42)
 # 3. Add your Slack webhook URLs (line 43)
-# 4. Test with: python3 test_alerts.py
+# 4. Test with: python3 verify_alerts.py
 # 5. Alerts start automatically every 10 minutes via lldpq cron job
 #
 # 📊 WHAT YOU'LL GET:

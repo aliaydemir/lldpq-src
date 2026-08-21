@@ -202,10 +202,13 @@ malformed_count = 0
 for line in output.strip().split('\n'):
     if not line.strip():
         continue
-    if "permanent" in line or "self" in line:
+    # Same rule as the cached parser (lldpq/fabric-scan.sh MAC section):
+    # drop only the switch's own bridge addresses; permanent entries on
+    # physical ports stay and are tagged static below.
+    if "permanent" in line and "dev br" in line:
         continue
     parse_candidates += 1
-    
+
     parts = line.split()
     if len(parts) >= 3:
         mac = parts[0]
@@ -222,12 +225,16 @@ for line in output.strip().split('\n'):
             malformed_count += 1
             continue
         parsed_count += 1
-        
+        # Skip bridge interface entries (switch's own MACs) — same rule as
+        # lldpq/fabric-scan.sh, so live and cached results agree.
+        if iface.startswith("br"):
+            continue
+
         entry = {
             "mac": mac,
             "interface": iface,
             "vlan": vlan,
-            "type": "dynamic"
+            "type": "static" if "permanent" in line else "dynamic"
         }
         if iface in bond_members:
             entry["bond_ports"] = bond_members[iface]
@@ -411,200 +418,6 @@ print(json.dumps({
     "warnings": ([f"Skipped {malformed_count} malformed ARP entr{'y' if malformed_count == 1 else 'ies'}"]
                  if malformed_count else []),
 }))
-PYTHON
-}
-
-# Get all MAC/ARP from all devices (parallel)
-get_all_tables() {
-    local table_type="$1"  # mac or arp
-    local search="$2"
-    local records
-
-    if ! records=$(inventory_json 2>/dev/null); then
-        printf '%s\n' '{"success": false, "error": "Device inventory is invalid or unavailable"}'
-        return
-    fi
-
-    # Feed canonical normalized records on stdin; keep Python source on fd 3.
-    printf '%s' "$records" | python3 /dev/fd/3 \
-        "$table_type" "$search" "$LLDPQ_USER" 3<<'PYTHON'
-import json
-import subprocess
-import concurrent.futures
-import re
-import sys
-
-table_type = sys.argv[1]
-search = sys.argv[2].lower()
-lldpq_user = sys.argv[3]
-
-try:
-    device_list = json.load(sys.stdin)
-    if not isinstance(device_list, list) or not device_list:
-        raise ValueError("empty device inventory")
-except (TypeError, ValueError, json.JSONDecodeError) as exc:
-    print(json.dumps({"success": False, "error": f"Invalid device inventory: {exc}"}))
-    raise SystemExit(0)
-
-def get_device_table(record):
-    try:
-        ip = record['address']
-        hostname = record['hostname']
-        username = record.get('username', '')
-        target = f"{username}@{ip}" if username else ip
-        if table_type == "mac":
-            remote_script = "/usr/sbin/bridge fdb show 2>/dev/null"
-            cmd_parts = [
-                "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
-                "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
-                remote_script
-            ]
-            result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
-        else:  # arp - get ARP with interface VRF mappings
-            # Trailing exit 0 mirrors the single-device script: the loop
-            # legitimately ends with a failed test when the last interface
-            # has no master; that must not look like an SSH failure.
-            remote_script = 'if ! /usr/sbin/ip neigh show 2>/dev/null; then exit 41; fi; echo ---VRF_MAP---; /usr/sbin/ip vrf list 2>/dev/null; echo ---IFACE_VRF---; for i in /sys/class/net/*/master; do n=$(basename $(dirname $i)); m=$(readlink $i 2>/dev/null | xargs basename 2>/dev/null); [ -n "$m" ] && echo $n $m; done 2>/dev/null; exit 0'
-            cmd_parts = [
-                "sudo", "-u", lldpq_user, "timeout", "15", "ssh",
-                "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
-                remote_script
-            ]
-            result = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=20)
-        if result.returncode != 0:
-            return [], hostname
-
-        entries = []
-        if table_type == "mac":
-            for line in result.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                # Same skip set as the single-device parser: permanent AND
-                # self entries are local bridge addresses, not learned MACs.
-                if "permanent" in line or "self" in line:
-                    continue
-                parts = line.split()
-                if len(parts) >= 3:
-                    mac = parts[0]
-                    iface = ""
-                    vlan = ""
-                    for i, p in enumerate(parts):
-                        if p == "dev" and i + 1 < len(parts):
-                            iface = parts[i + 1]
-                        if p == "vlan" and i + 1 < len(parts):
-                            vlan = parts[i + 1]
-
-                    if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac) or not iface:
-                        continue
-
-                    entry = {
-                        "device": hostname,
-                        "mac": mac,
-                        "interface": iface,
-                        "vlan": vlan,
-                    }
-                    if not search or search in mac.lower() or search in iface.lower() or search in vlan.lower() or search in hostname.lower():
-                        entries.append(entry)
-        elif table_type == "arp":
-            # Parse ARP with VRF info from interface masters
-            output = result.stdout.strip()
-            if "---VRF_MAP---" not in output or "---IFACE_VRF---" not in output:
-                return [], hostname
-            sections = output.split("---VRF_MAP---")
-            arp_lines = sections[0].strip().split('\n') if sections else []
-            
-            vrf_list = set()
-            iface_to_vrf = {}
-            
-            if len(sections) > 1:
-                rest = sections[1].split("---IFACE_VRF---")
-                for line in rest[0].strip().split('\n'):
-                    if line and not line.startswith("Name") and not line.startswith("-"):
-                        parts = line.split()
-                        if parts:
-                            vrf_list.add(parts[0])
-                if len(rest) > 1:
-                    for line in rest[1].strip().split('\n'):
-                        parts = line.split()
-                        # Check if second part is a VRF (skip bridge masters like br_default)
-                        if len(parts) >= 2 and parts[1] in vrf_list:
-                            iface_to_vrf[parts[0]] = parts[1]
-            
-            for line in arp_lines:
-                if not line.strip():
-                    continue
-                parts = line.split()
-                if len(parts) < 4:
-                    continue
-                    
-                ip_addr = parts[0]
-                mac = ""
-                iface = ""
-                state = parts[-1] if parts[-1] in {
-                    "REACHABLE", "STALE", "DELAY", "PROBE", "FAILED", "PERMANENT"
-                } else ""
-                for i, p in enumerate(parts):
-                    if p == "dev" and i + 1 < len(parts):
-                        iface = parts[i + 1]
-                    if p == "lladdr" and i + 1 < len(parts):
-                        mac = parts[i + 1]
-                
-                if mac:
-                    if iface and re.search(r'-v\d+$', iface):
-                        continue
-                    vrf = iface_to_vrf.get(iface, "default")
-                    entry = {
-                        "device": hostname,
-                        "ip": ip_addr,
-                        "mac": mac,
-                        "interface": iface,
-                        "vrf": vrf,
-                        "state": state,
-                    }
-                    if (not search or search in ip_addr.lower() or
-                            search in mac.lower() or search in hostname.lower() or
-                            search in iface.lower() or search in vrf.lower()):
-                        entries.append(entry)
-        return entries, None
-    except Exception:
-        return [], str(record.get('hostname', record.get('address', 'unknown')))
-
-try:
-    all_entries = []
-    failed_devices = []
-    # Full tables are collected before filtering so exact searches cannot miss
-    # rows beyond an arbitrary head limit. Bound concurrency to cap memory.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(20, len(device_list))) as executor:
-        results = executor.map(get_device_table, device_list)
-        for entries, failed_device in results:
-            all_entries.extend(entries)
-            if failed_device:
-                failed_devices.append(failed_device)
-
-    successful_devices = len(device_list) - len(failed_devices)
-    if successful_devices == 0:
-        print(json.dumps({
-            "success": False,
-            "error": "Failed to query every configured device",
-            "failed_devices": failed_devices,
-        }))
-    else:
-        print(json.dumps({
-            "success": True,
-            "entries": all_entries[:500],
-            "total": len(all_entries),
-            "returned_total": min(len(all_entries), 500),
-            "limit": 500,
-            "truncated": len(all_entries) > 500,
-            "complete": not failed_devices,
-            "partial": bool(failed_devices),
-            "successful_device_count": successful_devices,
-            "failed_devices": failed_devices,
-            "warnings": [f"Failed to query device: {device}" for device in failed_devices],
-        }))
-
-except Exception as e:
-    print(json.dumps({"success": False, "error": str(e)}))
 PYTHON
 }
 
@@ -820,12 +633,14 @@ for line in output.strip().split('\n'):
     # Format with metric: B>* 10.10.10.1/32 [20/0] via fe80::..., swp33s0, weight 1, 01w6d20h
     # Format without metric: C>* 192.168.100.0/24 is directly connected, eth0, 01w6d20h
     
-    # First try: route with [AD/metric]
-    route_match = re.match(r'^([BCSKORIEALT])([>*\s]+)\s*(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+\[(\d+)/(\d+)\]', line)
-    
+    # First try: route with [AD/metric].  Accept any single-letter FRR code
+    # (route_codes above is not exhaustive, e.g. D=SHARP was mapped but not
+    # parsed); unknown codes are kept as-is instead of dropping the row.
+    route_match = re.match(r'^([A-Za-z])([>*\s]+)\s*(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+\[(\d+)/(\d+)\]', line)
+
     # Second try: route without [AD/metric] (connected, local)
     if not route_match:
-        route_match_simple = re.match(r'^([BCSKORIEALT])([>*\s]+)\s*(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+', line)
+        route_match_simple = re.match(r'^([A-Za-z])([>*\s]+)\s*(\d+\.\d+\.\d+\.\d+(?:/\d+)?)\s+', line)
         if route_match_simple:
             code = route_match_simple.group(1)
             prefix = route_match_simple.group(3)
@@ -1035,41 +850,6 @@ print(json.dumps({
     "best_match_order": best_match_order,
 }))
 PYTHON
-}
-
-# Get bond members for an interface
-get_bond_members() {
-    local device="$1"
-    local bond="$2"
-    
-    if [[ -z "$device" ]] || [[ -z "$bond" ]]; then
-        echo '{"success": false, "error": "Device and bond not specified"}'
-        return
-    fi
-
-    if [[ ! "$bond" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
-        echo '{"success": false, "error": "Invalid bond interface"}'
-        return
-    fi
-    
-    local ssh_target
-    if ! ssh_target=$(get_ssh_target "$device"); then
-        echo '{"success": false, "error": "Invalid or unknown device"}'
-        return
-    fi
-    local ssh_output
-    ssh_output=$(sudo -u "$LLDPQ_USER" timeout 10 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" "
-        cat /sys/class/net/$bond/bonding/slaves 2>/dev/null || echo ''
-    " 2>/dev/null)
-    
-    if [[ $? -ne 0 ]]; then
-        echo '{"success": false, "error": "Failed to get bond members"}'
-        return
-    fi
-    
-    # Convert space-separated list to JSON array
-    local members=$(echo "$ssh_output" | tr ' ' '\n' | grep -v '^$' | sed 's/^/"/;s/$/"/' | tr '\n' ',' | sed 's/,$//')
-    echo "{\"success\": true, \"members\": [$members]}"
 }
 
 # Get LLDP neighbors from a device
@@ -1309,20 +1089,26 @@ PYTHON
 run_fabric_scan() {
     local lldpq_dir="${LLDPQ_DIR:-$HOME/lldpq}"
     local scan_script="$lldpq_dir/fabric-scan.sh"
-    
+    # Word-boundary + end anchor: match live scan processes only (web launch
+    # "bash /path/fabric-scan.sh", cron launch "bash ./fabric-scan.sh"), not
+    # the cron sh -c wrapper sleeping before its dispatch, editors, or the
+    # /tmp/fabric-scan.log readers a bare substring pattern would catch.
+    local scan_pattern='(^|[ /])fabric-scan\.sh$'
+
     if [[ ! -f "$scan_script" ]]; then
         echo '{"success": false, "error": "fabric-scan.sh not found"}'
         return
     fi
-    
+
     # Check if already running
-    if pgrep -f "fabric-scan.sh" > /dev/null; then
-        echo '{"success": false, "error": "Scan already in progress"}'
+    if pgrep -f "$scan_pattern" > /dev/null; then
+        echo '{"success": false, "started": false, "reason": "already-running", "error": "Scan already in progress"}'
         return
     fi
-    
+
     # Run scan in background. The explicit operator action overrides a
-    # configured SKIP_FABRIC_SCAN (the script self-gates on the toggle).
+    # configured SKIP_FABRIC_SCAN and the min-interval freshness gate (the
+    # script self-gates on both unless forced).
     if ! cd "$lldpq_dir"; then
         echo '{"success": false, "error": "LLDPq directory is unavailable"}'
         return
@@ -1330,21 +1116,30 @@ run_fabric_scan() {
     sudo -u "$LLDPQ_USER" nohup env LLDPQ_FABRIC_SCAN_FORCE=1 bash "$scan_script" > /tmp/fabric-scan.log 2>&1 &
     local scan_pid=$!
 
-    # Confirm the detached launch actually took before reporting success: the
-    # launcher (or the scan process it started) must still be alive shortly
-    # after backgrounding. ps works regardless of the sudo uid switch.
-    local started=false
+    # Watch the launcher briefly: alive after the probe window means the scan
+    # is underway; an early exit means sudo has already propagated
+    # fabric-scan.sh's status, so reap it instead of guessing from pgrep. ps
+    # works regardless of the sudo uid switch.
+    local started=true
     for _ in 1 2 3 4 5; do
         sleep 0.2
-        if ps -p "$scan_pid" > /dev/null 2>&1 || pgrep -f "fabric-scan.sh" > /dev/null 2>&1; then
-            started=true
+        if ! ps -p "$scan_pid" > /dev/null 2>&1; then
+            started=false
             break
         fi
     done
-    if [[ "$started" == true ]]; then
-        echo '{"success": true, "message": "Fabric scan started"}'
+    local scan_rc=0
+    if [[ "$started" != true ]]; then
+        wait "$scan_pid" || scan_rc=$?
+    fi
+    if [[ "$started" == true || "$scan_rc" -eq 0 ]]; then
+        echo '{"success": true, "started": true, "message": "Fabric scan started"}'
+    elif [[ "$scan_rc" -eq 75 ]]; then
+        # fabric-scan.sh exits 75 when the pipeline lock or another scan is
+        # active: a self-gated no-op, not a launch failure.
+        echo '{"success": false, "started": false, "reason": "busy", "error": "Fabric scan skipped: LLDPq collection or another scan is currently running; try again in a few minutes"}'
     else
-        echo '{"success": false, "error": "Fabric scan failed to launch; check /tmp/fabric-scan.log on the server"}'
+        echo '{"success": false, "started": false, "reason": "launch-failed", "error": "Fabric scan failed to launch; check /tmp/fabric-scan.log on the server"}'
     fi
 }
 
@@ -2041,16 +1836,12 @@ def build_host_set(all_data, port_neighbors):
         if not bond_ports:
             continue
         
-        # Find this device in port_neighbors (try base name match)
-        device_ports = None
-        if device_base in port_neighbors:
-            device_ports = port_neighbors[device_base]
-        else:
-            for pn_key in port_neighbors:
-                if pn_key == device_base or pn_key.startswith(device_base):
-                    device_ports = port_neighbors[pn_key]
-                    break
-        
+        # port_neighbors keys are already canonical (base() of the LLDP
+        # section header), so only an exact match identifies this device.
+        # A prefix fallback would let leaf-1 absorb leaf-10's neighbors;
+        # missing key = no LLDP data for the device, not a near-match.
+        device_ports = port_neighbors.get(device_base)
+
         if not device_ports:
             continue
         
@@ -2925,64 +2716,6 @@ except Exception as e:
 PYTHON
 }
 
-# Detect VRFs that have a route to given IP on a specific device
-detect_vrfs() {
-    local device="$1"
-    local dest_ip="$2"
-    
-    python3 - "$device" "$dest_ip" <<'PYTHON'
-import json
-import os
-import ipaddress
-import sys
-
-device = sys.argv[1]
-dest_ip = sys.argv[2]
-
-lldpq_dir = os.environ.get('LLDPQ_DIR', os.path.expanduser('~/lldpq'))
-tables_dir = f"{lldpq_dir}/monitor-results/fabric-tables"
-
-def prefix_match(ip, prefix):
-    try:
-        network = ipaddress.ip_network(prefix, strict=False)
-        ip_addr = ipaddress.ip_address(ip)
-        if ip_addr in network:
-            return network.prefixlen
-        return -1
-    except:
-        return -1
-
-try:
-    filepath = os.path.join(tables_dir, f"{device}.json")
-    
-    if not os.path.exists(filepath):
-        print(json.dumps({"vrfs": ["default"]}))
-        exit()
-    
-    with open(filepath) as f:
-        data = json.load(f)
-    
-    routes = data.get('routes', {})
-    matching_vrfs = []
-    
-    for vrf, vrf_routes in routes.items():
-        for route in vrf_routes:
-            prefix = route.get('prefix', '')
-            if prefix and prefix_match(dest_ip, prefix) >= 0:
-                if vrf not in matching_vrfs:
-                    matching_vrfs.append(vrf)
-                break
-    
-    if not matching_vrfs:
-        matching_vrfs = ['default']
-    
-    print(json.dumps({"vrfs": sorted(matching_vrfs)}))
-
-except Exception as e:
-    print(json.dumps({"vrfs": ["default"], "error": str(e)}))
-PYTHON
-}
-
 # Trace path from source device to destination IP
 trace_path() {
     local dest_ip="$1"
@@ -3054,31 +2787,31 @@ def load_all_data():
     return all_data
 
 def find_device_by_nexthop(nexthop_ip, all_data, exclude_devices, vrf):
-    """Find which device has the nexthop IP as its interface."""
-    for hostname, data in all_data.items():
-        if hostname in exclude_devices:
-            continue
-        
-        # Check ARP entries - nexthop might be in ARP
-        for arp in data.get('arp', []):
-            if arp.get('ip') == nexthop_ip:
-                # This device knows about the nexthop
-                pass
-        
-        # Check routes - connected routes show interface IPs
-        routes = data.get('routes', {})
-        for vrf_name, vrf_routes in routes.items():
-            for route in vrf_routes:
+    """Find which device has the nexthop IP as its interface.
+
+    Overlapping tenant addressing means another VRF's connected subnet must
+    never resolve the hop: scan only the requested VRF, then fall back to
+    the default VRF because EVPN/VXLAN nexthops are underlay (VTEP loopback)
+    addresses that live in the default VRF.
+    """
+    scan_vrfs = [vrf] if vrf == 'default' else [vrf, 'default']
+    for scan_vrf in scan_vrfs:
+        for hostname, data in all_data.items():
+            if hostname in exclude_devices:
+                continue
+
+            # Check routes - connected routes show interface IPs
+            for route in data.get('routes', {}).get(scan_vrf, []):
                 prefix = route.get('prefix', '')
                 protocol = route.get('protocol', '')
-                
+
                 # Connected/kernel routes indicate local IPs
                 if protocol in ['kernel', 'connected', 'local']:
                     if prefix and '/' in prefix:
                         # Check if nexthop is in this connected network
                         if prefix_match(nexthop_ip, prefix) >= 0:
                             return hostname
-    
+
     return None
 
 def is_destination_local(dest_ip, device_data, vrf):
@@ -3400,12 +3133,6 @@ case "$ACTION" in
     "get-arp")
         get_arp_table "$DEVICE" "$SEARCH"
         ;;
-    "get-all-mac")
-        get_all_tables "mac" "$SEARCH"
-        ;;
-    "get-all-arp")
-        get_all_tables "arp" "$SEARCH"
-        ;;
     "get-vtep")
         get_vtep_table "$DEVICE" "$SEARCH"
         ;;
@@ -3414,10 +3141,6 @@ case "$ACTION" in
         ;;
     "get-lldp")
         get_lldp_neighbors "$DEVICE" "$SEARCH"
-        ;;
-    "get-bond-members")
-        BOND=$(echo "$QUERY_STRING" | grep -oE 'bond=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        get_bond_members "$DEVICE" "$BOND"
         ;;
     "scan-status")
         get_scan_status
@@ -3431,24 +3154,15 @@ case "$ACTION" in
     "search-cached-arp")
         search_cached_tables "arp" "$SEARCH"
         ;;
-    "search-cached-vtep")
-        search_cached_tables "vtep" "$SEARCH"
-        ;;
-    "search-cached-lldp")
-        search_cached_tables "lldp" "$SEARCH"
-        ;;
     "search-cached-routes")
         search_cached_routes "$SEARCH"
         ;;
     "trace-path")
-        IP=$(echo "$QUERY_STRING" | grep -oE 'ip=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        VRF=$(echo "$QUERY_STRING" | grep -oE 'vrf=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        SOURCE=$(echo "$QUERY_STRING" | grep -oE 'source=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
+        # Legacy hostname-source tracer, still called by ai-api.sh run_tracepath.
+        IP=$(get_query_param ip)
+        VRF=$(get_query_param vrf)
+        SOURCE=$(get_query_param source)
         trace_path "$IP" "$VRF" "$SOURCE"
-        ;;
-    "detect-vrfs")
-        IP=$(echo "$QUERY_STRING" | grep -oE 'ip=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
-        detect_vrfs "$DEVICE" "$IP"
         ;;
     "find-ip-vrf")
         IP=$(echo "$QUERY_STRING" | grep -oE 'ip=[^&]+' | cut -d= -f2 | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")

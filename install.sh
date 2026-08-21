@@ -77,6 +77,14 @@
 # │   • Initialize git repository + hooks                    │
 # └──────────────────────────────────────────────────────────┘
 
+# Non-root Debian sessions commonly omit /usr/sbin and /sbin even though apt
+# installs service binaries there.  Dependency checks must not report an
+# installed nginx/dhcpd as missing merely because the invoking shell has a
+# desktop-oriented PATH.  Put trusted system locations first while retaining
+# any explicit operator additions for optional tooling used later.
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+export PATH
+
 set -e
 
 # Root/system services and the web backup/uninstall workflows must never
@@ -3353,7 +3361,8 @@ import time
 STATE_DIR = Path("/var/lib/lldpq/update-rollback")
 MARKER = STATE_DIR / "active.json"
 LOCK = STATE_DIR / "recovery.lock"
-RUNTIME_ITEMS = ("monitor-results", "lldp-results", "alert-states", "assets.ini")
+RUNTIME_ITEMS = ("monitor-results", "lldp-results", "alert-states", "assets.ini",
+                 "uninstall-kept-data")
 
 
 def fail(message):
@@ -3835,7 +3844,8 @@ rollback_failed_update() {
     fi
     if [[ "$rollback_install_available" == "true" ]]; then
         local runtime_dir
-        for runtime_dir in monitor-results lldp-results alert-states assets.ini; do
+        for runtime_dir in monitor-results lldp-results alert-states assets.ini \
+            uninstall-kept-data; do
             # During most of the update the original runtime data lives in
             # _DATA_PRESERVE.  Do not replace it with a newly copied empty
             # runtime directory: the EXIT handler moves the preserved data
@@ -3949,7 +3959,8 @@ restore_preserved_runtime_data() {
     local runtime_dir restore_failed=false
     [[ -n "$preserve_dir" && -d "$preserve_dir" ]] || return 0
 
-    for runtime_dir in monitor-results lldp-results alert-states assets.ini; do
+    for runtime_dir in monitor-results lldp-results alert-states assets.ini \
+        uninstall-kept-data; do
         if [[ -e "$preserve_dir/$runtime_dir" || \
               -L "$preserve_dir/$runtime_dir" ]]; then
             # The pre-update preservation copy is authoritative while the
@@ -4256,20 +4267,33 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
 
         if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
             echo "Installing docker-compose..."
-            sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            echo "docker-compose installed"
+            # -f + temp staging: an HTTP error page must never land in PATH as
+            # an executable.
+            _compose_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-docker-compose.XXXXXX")
+            if curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o "$_compose_tmp"; then
+                sudo install -m 0755 -- "$_compose_tmp" /usr/local/bin/docker-compose
+                echo "docker-compose installed"
+            else
+                echo "[!] docker-compose download failed" >&2
+            fi
+            rm -f "$_compose_tmp"
         fi
 
-        if [[ -n "${TELEMETRY_ENABLED+x}" ]]; then
+        # Serialize with Setup saves: every other /etc/lldpq.conf writer takes
+        # this lock, so an unlocked edit here could silently lose a concurrent
+        # whole-file Setup save (or vice versa). Gate sed-vs-append on the file
+        # itself, not on an environment-inherited variable.
+        acquire_update_config_lock || exit 1
+        if grep -q "^TELEMETRY_ENABLED=" /etc/lldpq.conf 2>/dev/null; then
             sudo sed -i 's/^TELEMETRY_ENABLED=.*/TELEMETRY_ENABLED=true/' /etc/lldpq.conf
         else
             echo "TELEMETRY_ENABLED=true" | sudo tee -a /etc/lldpq.conf > /dev/null
         fi
 
-        if [[ -z "${PROMETHEUS_URL+x}" ]]; then
+        if ! grep -q "^PROMETHEUS_URL=" /etc/lldpq.conf 2>/dev/null; then
             echo "PROMETHEUS_URL=http://localhost:9090" | sudo tee -a /etc/lldpq.conf > /dev/null
         fi
+        release_update_config_lock
 
         echo ""
         echo "Telemetry support enabled!"
@@ -4329,15 +4353,18 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
             echo "Telemetry stack removed (containers + volumes)"
         fi
 
+        # Serialize with Setup saves; see the matching --enable-telemetry note.
+        acquire_update_config_lock || exit 1
         sudo sed -i '/^TELEMETRY_COLLECTOR_IP=/d' /etc/lldpq.conf 2>/dev/null || true
         sudo sed -i '/^TELEMETRY_COLLECTOR_PORT=/d' /etc/lldpq.conf 2>/dev/null || true
         sudo sed -i '/^TELEMETRY_COLLECTOR_VRF=/d' /etc/lldpq.conf 2>/dev/null || true
 
-        if [[ -n "${TELEMETRY_ENABLED+x}" ]]; then
+        if grep -q "^TELEMETRY_ENABLED=" /etc/lldpq.conf 2>/dev/null; then
             sudo sed -i 's/^TELEMETRY_ENABLED=.*/TELEMETRY_ENABLED=false/' /etc/lldpq.conf
         else
             echo "TELEMETRY_ENABLED=false" | sudo tee -a /etc/lldpq.conf > /dev/null
         fi
+        release_update_config_lock
 
         echo "Telemetry support disabled"
     fi
@@ -4930,7 +4957,11 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     fi
 
     _data_preserve_failed=false
-    for _d in monitor-results lldp-results alert-states assets.ini; do
+    # uninstall-kept-data is the snapshot a previous `uninstall.sh --keep-data`
+    # promised to retain; without preserving it here the rollback commit's
+    # rm -rf would silently destroy it on the first successful update.
+    for _d in monitor-results lldp-results alert-states assets.ini \
+        uninstall-kept-data; do
         if [[ -e "$LLDPQ_INSTALL_DIR/$_d" ]] && \
            ! root_run mv "$LLDPQ_INSTALL_DIR/$_d" "$_DATA_PRESERVE/" 2>/dev/null; then
             echo "[!] Could not preserve runtime data before update: $LLDPQ_INSTALL_DIR/$_d" >&2
@@ -4940,7 +4971,8 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     done
     if [[ "$_data_preserve_failed" == "true" ]]; then
         _data_restore_failed=false
-        for _d in monitor-results lldp-results alert-states assets.ini; do
+        for _d in monitor-results lldp-results alert-states assets.ini \
+            uninstall-kept-data; do
             if [[ -e "$_DATA_PRESERVE/$_d" ]] && \
                ! root_run mv "$_DATA_PRESERVE/$_d" "$LLDPQ_INSTALL_DIR/" 2>/dev/null; then
                 _data_restore_failed=true
@@ -5053,10 +5085,17 @@ fi
 echo "  - Verifying js-yaml..."
 JSYAML_VERSION="4.1.0"
 if [[ ! -f "$WEB_ROOT/css/js-yaml.min.js" ]]; then
-    sudo curl -sL "https://cdn.jsdelivr.net/npm/js-yaml@${JSYAML_VERSION}/dist/js-yaml.min.js" \
-        -o "$WEB_ROOT/css/js-yaml.min.js" || \
+    # -f + temp staging: without them an HTTP error page would be installed as
+    # the artifact and the [[ ! -f ]] guard would make the corruption permanent.
+    _jsyaml_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-js-yaml.XXXXXX")
+    if curl -fsSL "https://cdn.jsdelivr.net/npm/js-yaml@${JSYAML_VERSION}/dist/js-yaml.min.js" \
+        -o "$_jsyaml_tmp"; then
+        sudo install -m 0644 -- "$_jsyaml_tmp" "$WEB_ROOT/css/js-yaml.min.js"
+        echo "    js-yaml installed"
+    else
         echo "    [!] js-yaml download failed (will work without offline validation)"
-    echo "    js-yaml installed"
+    fi
+    rm -f "$_jsyaml_tmp"
 fi
 
 echo "  - Copying VERSION to $WEB_ROOT/"
@@ -5177,20 +5216,31 @@ if [[ -L "$_backup_helper_dir" ]] || \
     echo "[!] Refusing unsafe backup helper directory: $_backup_helper_dir" >&2
     exit 1
 fi
-if [[ ! -f lldpq/backup_import.py || -L lldpq/backup_import.py ]]; then
-    echo "[!] Packaged backup/import helper is missing or is a symlink" >&2
+if [[ ! -f lldpq/backup_import.py || -L lldpq/backup_import.py ]] || \
+   ! python3 -c 'import pathlib,sys; compile(pathlib.Path(sys.argv[1]).read_bytes(), sys.argv[1], "exec")' \
+        lldpq/backup_import.py; then
+    echo "[!] Packaged backup/import helper is missing, linked, or invalid" >&2
     exit 1
 fi
 sudo install -d -o root -g root -m 0755 "$_backup_helper_dir"
-sudo install -o root -g root -m 0755 -- \
-    lldpq/backup_import.py "$LLDPQ_BACKUP_IMPORT_HELPER"
+_backup_helper_stage="${LLDPQ_BACKUP_IMPORT_HELPER}.lldpq-new"
+sudo rm -f -- "$_backup_helper_stage"
+if ! sudo install -o root -g root -m 0755 -- \
+        lldpq/backup_import.py "$_backup_helper_stage" || \
+   ! sudo mv -fT -- "$_backup_helper_stage" "$LLDPQ_BACKUP_IMPORT_HELPER"; then
+    sudo rm -f -- "$_backup_helper_stage" 2>/dev/null || true
+    echo "[!] Could not install the root-owned backup/import helper" >&2
+    exit 1
+fi
 _backup_helper_dir_metadata=$(sudo stat -c '%u:%g:%a' -- "$_backup_helper_dir" 2>/dev/null || true)
-_backup_helper_metadata=$(sudo stat -c '%u:%g:%a' -- "$LLDPQ_BACKUP_IMPORT_HELPER" 2>/dev/null || true)
+_backup_helper_metadata=$(sudo stat -c '%u:%g:%a:%h' -- \
+    "$LLDPQ_BACKUP_IMPORT_HELPER" 2>/dev/null || true)
 if [[ -L "$_backup_helper_dir" ]] || \
    [[ "$_backup_helper_dir_metadata" != "0:0:755" ]] || \
    [[ -L "$LLDPQ_BACKUP_IMPORT_HELPER" ]] || \
    [[ ! -f "$LLDPQ_BACKUP_IMPORT_HELPER" ]] || \
-   [[ "$_backup_helper_metadata" != "0:0:755" ]]; then
+   [[ "$_backup_helper_metadata" != "0:0:755:1" ]] || \
+   ! sudo cmp -s -- lldpq/backup_import.py "$LLDPQ_BACKUP_IMPORT_HELPER"; then
     echo "[!] Root-owned backup/import helper verification failed" >&2
     exit 1
 fi
@@ -5704,34 +5754,41 @@ fi
 # ============================================================================
 step "Writing /etc/lldpq.conf..."
 
-echo "# LLDPq Configuration" | sudo tee /etc/lldpq.conf > /dev/null
-echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "LLDPQ_USER=$LLDPQ_USER" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
+# Render the complete configuration privately and publish it below with a
+# single atomic rename under the shared config lock. Per-minute cron readers
+# (lldpq-trigger, provision scheduler, fabric-scan) must never observe a
+# partially written /etc/lldpq.conf; bin/lldpq-config documents the
+# atomic-writer contract this depends on.
+_lldpq_conf_render=$(mktemp "${TMPDIR:-/tmp}/lldpq-conf-render.XXXXXX") || exit 1
+
+echo "# LLDPq Configuration" | tee "$_lldpq_conf_render" > /dev/null
+echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "LLDPQ_USER=$LLDPQ_USER" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
 _LLDPQ_HOSTNAME_TO_WRITE="${LLDPQ_HOSTNAME:-lldpq}"
 if [[ ! "$_LLDPQ_HOSTNAME_TO_WRITE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
     echo "  [!] Invalid LLDPQ_HOSTNAME; using default 'lldpq'" >&2
     _LLDPQ_HOSTNAME_TO_WRITE=lldpq
 fi
 printf 'LLDPQ_HOSTNAME=%s\n' "$_LLDPQ_HOSTNAME_TO_WRITE" | \
-    sudo tee -a /etc/lldpq.conf > /dev/null
-echo "WEB_ROOT=$WEB_ROOT" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "ANSIBLE_DIR=$ANSIBLE_DIR" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "DHCP_HOSTS_FILE=/etc/dhcp/dhcpd.hosts" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "DHCP_CONF_FILE=/etc/dhcp/dhcpd.conf" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "DHCP_LEASES_FILE=/var/lib/dhcp/dhcpd.leases" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "ZTP_SCRIPT_FILE=$WEB_ROOT/cumulus-ztp.sh" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "BASE_CONFIG_DIR=$LLDPQ_INSTALL_DIR/sw-base" | sudo tee -a /etc/lldpq.conf > /dev/null
+    tee -a "$_lldpq_conf_render" > /dev/null
+echo "WEB_ROOT=$WEB_ROOT" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "ANSIBLE_DIR=$ANSIBLE_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "DHCP_HOSTS_FILE=/etc/dhcp/dhcpd.hosts" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "DHCP_CONF_FILE=/etc/dhcp/dhcpd.conf" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "DHCP_LEASES_FILE=/var/lib/dhcp/dhcpd.leases" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "ZTP_SCRIPT_FILE=$WEB_ROOT/cumulus-ztp.sh" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "BASE_CONFIG_DIR=$LLDPQ_INSTALL_DIR/sw-base" | tee -a "$_lldpq_conf_render" > /dev/null
 _PROJECT_DIR_TO_WRITE="${PROJECT_DIR:-}"
 if [[ "$INSTALL_MODE" == "update" ]]; then
     _PROJECT_DIR_TO_WRITE="${_SAVE_PROJECT_DIR:-}"
 fi
 [[ -n "$_PROJECT_DIR_TO_WRITE" ]] && \
-    echo "PROJECT_DIR=$_PROJECT_DIR_TO_WRITE" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AUTO_BASE_CONFIG=true" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AUTO_ZTP_DISABLE=true" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "AUTO_SET_HOSTNAME=true" | sudo tee -a /etc/lldpq.conf > /dev/null
+    echo "PROJECT_DIR=$_PROJECT_DIR_TO_WRITE" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "AUTO_BASE_CONFIG=true" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "AUTO_ZTP_DISABLE=true" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "AUTO_SET_HOSTNAME=true" | tee -a "$_lldpq_conf_render" > /dev/null
 render_runtime_tuning_config \
     "${LLDPQ_CRON:-*/10 * * * *}" \
     "${GETCONF_CRON:-0 */12 * * *}" \
@@ -5752,35 +5809,35 @@ render_runtime_tuning_config \
     "${OPTICAL_PORT_TIMEOUT_SECONDS:-5}" \
     "${MONITOR_TIMING:-false}" \
     "${MONITOR_COMMAND_TIMEOUT_SECONDS:-20}" | \
-    sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TRANSCEIVER_FW_SKIP_MODELS=\"\"" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=skip" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TRANSCEIVER_FW_MAX_PARALLEL=10" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TRANSCEIVER_FW_MIN_INTERVAL=1800" | sudo tee -a /etc/lldpq.conf > /dev/null
-echo "TRANSCEIVER_FW_SSH_TIMEOUT=300" | sudo tee -a /etc/lldpq.conf > /dev/null
+    tee -a "$_lldpq_conf_render" > /dev/null
+echo "TRANSCEIVER_FW_SKIP_MODELS=\"\"" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=skip" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "TRANSCEIVER_FW_MAX_PARALLEL=10" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "TRANSCEIVER_FW_MIN_INTERVAL=1800" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "TRANSCEIVER_FW_SSH_TIMEOUT=300" | tee -a "$_lldpq_conf_render" > /dev/null
 render_ai_config \
     ollama llama3.2 "" https://api.openai.com/v1 http://localhost:11434 \
-    "" "" "" "" "" "" "" | sudo tee -a /etc/lldpq.conf > /dev/null
+    "" "" "" "" "" "" "" | tee -a "$_lldpq_conf_render" > /dev/null
 
 # Preserve telemetry settings (update mode)
 if [[ "$INSTALL_MODE" == "update" ]]; then
     [[ -n "$_SAVE_TELEMETRY_ENABLED" ]] && \
-        echo "TELEMETRY_ENABLED=$_SAVE_TELEMETRY_ENABLED" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "TELEMETRY_ENABLED=$_SAVE_TELEMETRY_ENABLED" | tee -a "$_lldpq_conf_render" > /dev/null
     [[ -n "$_SAVE_PROMETHEUS_URL" ]] && \
-        echo "PROMETHEUS_URL=$_SAVE_PROMETHEUS_URL" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "PROMETHEUS_URL=$_SAVE_PROMETHEUS_URL" | tee -a "$_lldpq_conf_render" > /dev/null
     [[ -n "$_SAVE_TELEMETRY_COLLECTOR_IP" ]] && \
-        echo "TELEMETRY_COLLECTOR_IP=$_SAVE_TELEMETRY_COLLECTOR_IP" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "TELEMETRY_COLLECTOR_IP=$_SAVE_TELEMETRY_COLLECTOR_IP" | tee -a "$_lldpq_conf_render" > /dev/null
     [[ -n "$_SAVE_TELEMETRY_COLLECTOR_PORT" ]] && \
-        echo "TELEMETRY_COLLECTOR_PORT=$_SAVE_TELEMETRY_COLLECTOR_PORT" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "TELEMETRY_COLLECTOR_PORT=$_SAVE_TELEMETRY_COLLECTOR_PORT" | tee -a "$_lldpq_conf_render" > /dev/null
     [[ -n "$_SAVE_TELEMETRY_COLLECTOR_VRF" ]] && \
-        echo "TELEMETRY_COLLECTOR_VRF=$_SAVE_TELEMETRY_COLLECTOR_VRF" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "TELEMETRY_COLLECTOR_VRF=$_SAVE_TELEMETRY_COLLECTOR_VRF" | tee -a "$_lldpq_conf_render" > /dev/null
     # Preserve discovery settings
     [[ -n "$_SAVE_DISCOVERY_RANGE" ]] && \
-        echo "DISCOVERY_RANGE=$_SAVE_DISCOVERY_RANGE" | sudo tee -a /etc/lldpq.conf > /dev/null
+        echo "DISCOVERY_RANGE=$_SAVE_DISCOVERY_RANGE" | tee -a "$_lldpq_conf_render" > /dev/null
     # Replace preserved values as data. Never interpolate group-writable config
     # into a sed program: GNU sed's `e` flag could otherwise turn a crafted
     # value into command execution during a privileged update.
-    sudo sed -i '/^AUTO_BASE_CONFIG=/d;/^AUTO_ZTP_DISABLE=/d;/^AUTO_SET_HOSTNAME=/d;/^TRANSCEIVER_FW_SKIP_MODELS=/d;/^TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=/d;/^TRANSCEIVER_FW_MAX_PARALLEL=/d;/^TRANSCEIVER_FW_MIN_INTERVAL=/d;/^TRANSCEIVER_FW_SSH_TIMEOUT=/d' /etc/lldpq.conf
+    sed -i '/^AUTO_BASE_CONFIG=/d;/^AUTO_ZTP_DISABLE=/d;/^AUTO_SET_HOSTNAME=/d;/^TRANSCEIVER_FW_SKIP_MODELS=/d;/^TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=/d;/^TRANSCEIVER_FW_MAX_PARALLEL=/d;/^TRANSCEIVER_FW_MIN_INTERVAL=/d;/^TRANSCEIVER_FW_SSH_TIMEOUT=/d' "$_lldpq_conf_render"
     render_preserved_provisioning_config \
         "$_SAVE_AUTO_BASE_CONFIG" \
         "$_SAVE_AUTO_ZTP_DISABLE" \
@@ -5789,12 +5846,12 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         "$_SAVE_TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY" \
         "$_SAVE_TRANSCEIVER_FW_MAX_PARALLEL" \
         "$_SAVE_TRANSCEIVER_FW_MIN_INTERVAL" \
-        "$_SAVE_TRANSCEIVER_FW_SSH_TIMEOUT" | sudo tee -a /etc/lldpq.conf > /dev/null
+        "$_SAVE_TRANSCEIVER_FW_SSH_TIMEOUT" | tee -a "$_lldpq_conf_render" > /dev/null
     # Preserve AI settings. Values (API key, model like "openai/gpt-5.5", URLs) often
     # contain '/', '|', '&' which break `sed s///` ("unknown option to s"), so delete
     # the freshly-written default lines and re-append the preserved values with echo
     # (safe for ANY value).
-    sudo sed -i '/^AI_PROVIDER=/d;/^AI_MODEL=/d;/^AI_FALLBACK_MODEL=/d;/^AI_CONTEXT_WINDOW_TOKENS=/d;/^AI_FALLBACK_CONTEXT_WINDOW_TOKENS=/d;/^AI_API_KEY=/d;/^AI_API_URL=/d;/^OLLAMA_URL=/d;/^AI_PROXY_URL=/d;/^AI_SEARCH_MODEL=/d;/^AI_SEARCH_URL=/d;/^AI_SEARCH_KEY=/d' /etc/lldpq.conf
+    sed -i '/^AI_PROVIDER=/d;/^AI_MODEL=/d;/^AI_FALLBACK_MODEL=/d;/^AI_CONTEXT_WINDOW_TOKENS=/d;/^AI_FALLBACK_CONTEXT_WINDOW_TOKENS=/d;/^AI_API_KEY=/d;/^AI_API_URL=/d;/^OLLAMA_URL=/d;/^AI_PROXY_URL=/d;/^AI_SEARCH_MODEL=/d;/^AI_SEARCH_URL=/d;/^AI_SEARCH_KEY=/d' "$_lldpq_conf_render"
     render_ai_config \
         "$_SAVE_AI_PROVIDER" \
         "$_SAVE_AI_MODEL" \
@@ -5807,8 +5864,24 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         "$_SAVE_AI_SEARCH_KEY" \
         "$_SAVE_AI_FALLBACK_MODEL" \
         "$_SAVE_AI_CONTEXT_WINDOW_TOKENS" \
-        "$_SAVE_AI_FALLBACK_CONTEXT_WINDOW_TOKENS" | sudo tee -a /etc/lldpq.conf > /dev/null
+        "$_SAVE_AI_FALLBACK_CONTEXT_WINDOW_TOKENS" | tee -a "$_lldpq_conf_render" > /dev/null
 fi
+
+# Publish under the shared config lock with one rename so a concurrent reader
+# sees either the old or the new file, never a torn one. The stage copy lives
+# in /etc so the final mv is a same-filesystem atomic rename.
+_lldpq_conf_stage="/etc/lldpq.conf.lldpq-install-stage"
+acquire_update_config_lock || exit 1
+if ! sudo install -o "$LLDPQ_USER" -g www-data -m 0660 -- \
+        "$_lldpq_conf_render" "$_lldpq_conf_stage" || \
+   ! sudo sync -f "$_lldpq_conf_stage" || \
+   ! sudo mv -fT -- "$_lldpq_conf_stage" /etc/lldpq.conf; then
+    release_update_config_lock
+    echo "[!] Could not publish /etc/lldpq.conf" >&2
+    exit 1
+fi
+release_update_config_lock
+rm -f "$_lldpq_conf_render"
 
 # Create cache and data files with correct permissions
 for f in device-cache.json fabric-scan-cache.json discovery-cache.json inventory.json; do
@@ -5898,362 +5971,15 @@ case "$_dhcp_status" in
         ;;
 esac
 
-# ZTP script with serial-based config resolution (if not exists)
+# ZTP script with serial-based config resolution (if not exists). The
+# canonical template is the packaged html/cumulus-ztp.sh; installing from that
+# single source avoids a duplicated inline copy that would silently drift.
 if [ ! -f "$WEB_ROOT/cumulus-ztp.sh" ]; then
-    sudo tee "$WEB_ROOT/cumulus-ztp.sh" > /dev/null << 'ZTPEOF'
-#!/bin/bash
-
-#
-# CUMULUS-AUTOPROVISIONING
-# Generated by LLDPq Provision
-# LLDPQ_ZTP_TEMPLATE_VERSION=2
-#
-
-function ping_until_reachable(){
-    local target="${1-}"
-    local max_tries=30
-    local tries=0
-
-    if [ -z "$target" ]; then
-        echo "$(date) ERROR: Image server target is empty." >&2
-        return 1
+    if [ ! -f html/cumulus-ztp.sh ]; then
+        echo "[!] Packaged ZTP template is missing: html/cumulus-ztp.sh" >&2
+        exit 1
     fi
-    while [ "$tries" -lt "$max_tries" ]; do
-        tries=$((tries+1))
-        echo "$(date) INFO: ( Attempt $tries of $max_tries ) Pinging $target Target Until Reachable."
-        if ping "$target" -c2 --no-vrf-switch >/dev/null; then
-            return 0
-        fi
-        sleep 1
-    done
-    echo "$(date) ERROR: Reached maximum number of attempts to ping the target $target ." >&2
-    return 1
-}
-
-function set_password(){
-    passwd -x 99999 cumulus &&
-        echo 'cumulus:Nvidia@123' | chpasswd
-}
-
-function get_current_release(){
-    local release_file="${1:-/etc/lsb-release}"
-    local release=""
-
-    release=$(LC_ALL=C awk -F= '
-        $1 == "DISTRIB_RELEASE" {
-            print substr($0, index($0, "=") + 1)
-            found = 1
-            exit
-        }
-        $1 == "RELEASE" { fallback = substr($0, index($0, "=") + 1) }
-        END { if (!found && fallback != "") print fallback }
-    ' "$release_file") || return 1
-    release=${release%$'\r'}
-    case "$release" in
-        \"*\") release=${release#\"}; release=${release%\"} ;;
-        \'*\') release=${release#\'}; release=${release%\'} ;;
-    esac
-    [[ "$release" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]] || return 1
-    printf '%s\n' "$release"
-}
-
-function is_valid_serial(){
-    local serial="${1-}"
-    [[ -n "$serial" && ${#serial} -le 128 && "$serial" =~ ^[[:alnum:]_.:-]+$ ]]
-}
-
-function select_hostname_from_mapping(){
-    local serial="${1-}"
-    local mapping="${2-}"
-
-    if ! is_valid_serial "$serial" || [ -z "$mapping" ]; then
-        return 2
-    fi
-
-    printf '%s\n' "$mapping" | LC_ALL=C awk -v wanted="$serial" '
-        function serial_ok(value) {
-            return length(value) > 0 && length(value) <= 128 && \
-                value ~ /^[[:alnum:]_.:-]+$/
-        }
-        function hostname_ok(value) {
-            return length(value) > 0 && length(value) <= 253 && \
-                value ~ /^[[:alnum:]][[:alnum:]_.-]*$/
-        }
-        BEGIN { wanted = tolower(wanted) }
-        { sub(/\r$/, "") }
-        /^[[:space:]]*(#|$)/ { next }
-        {
-            if (NF != 2 || !serial_ok($1) || !hostname_ok($2)) {
-                invalid = 1
-                next
-            }
-            serial_key = tolower($1)
-            hostname_key = tolower($2)
-            if (++seen_serial[serial_key] > 1 || ++seen_hostname[hostname_key] > 1) {
-                invalid = 1
-            }
-            if (serial_key == wanted) {
-                matches++
-                hostname = $2
-            }
-        }
-        END {
-            if (invalid || matches > 1) exit 2
-            if (matches == 1) {
-                print hostname
-                exit 0
-            }
-            exit 1
-        }
-    '
-}
-
-function resolve_hostname(){
-    local serial="${1-}"
-    local mapping_url="http://$IMAGE_SERVER_HOSTNAME/serial-mapping.txt"
-    local mapping=""
-
-    if ! is_valid_serial "$serial"; then
-        return 2
-    fi
-    if ! mapping=$(curl --fail --silent --show-error --connect-timeout 5 \
-        --max-time 15 --retry 2 -- "$mapping_url"); then
-        echo "Unable to download serial mapping from $mapping_url" >&2
-        return 2
-    fi
-    if [ "${#mapping}" -gt 8388608 ]; then
-        echo "Serial mapping is too large" >&2
-        return 2
-    fi
-    select_hostname_from_mapping "$serial" "$mapping"
-}
-
-function find_config_url(){
-    local hostname="${1-}"
-    local destination="${2-}"
-    local extension=""
-    local url=""
-    local candidate=""
-    local http_code=""
-    local byte_count=0
-
-    [[ -n "$hostname" && ${#hostname} -le 253 && \
-        "$hostname" =~ ^[[:alnum:]][[:alnum:]_.-]*$ ]] || return 2
-    [ -n "$destination" ] || return 2
-    candidate="${destination}.download"
-    rm -f -- "$candidate"
-
-    for extension in yaml yml; do
-        url="http://$IMAGE_SERVER_HOSTNAME/generated_config_folder/${hostname}.${extension}"
-        if ! http_code=$(curl --silent --show-error --connect-timeout 5 \
-            --max-time 60 --retry 2 --output "$candidate" \
-            --write-out '%{http_code}' -- "$url"); then
-            rm -f -- "$candidate"
-            echo "Unable to download generated config from $url" >&2
-            return 2
-        fi
-        case "$http_code" in
-            200)
-                if [ ! -s "$candidate" ]; then
-                    rm -f -- "$candidate"
-                    echo "Generated config from $url is empty" >&2
-                    return 2
-                fi
-                byte_count=$(wc -c < "$candidate") || {
-                    rm -f -- "$candidate"
-                    return 2
-                }
-                if [ "$byte_count" -gt 16777216 ]; then
-                    rm -f -- "$candidate"
-                    echo "Generated config from $url is too large" >&2
-                    return 2
-                fi
-                mv -f -- "$candidate" "$destination" || return 2
-                printf '%s\n' "$url"
-                return 0
-                ;;
-            404)
-                rm -f -- "$candidate"
-                ;;
-            *)
-                rm -f -- "$candidate"
-                echo "Generated config request failed with HTTP $http_code: $url" >&2
-                return 2
-                ;;
-        esac
-    done
-    return 1
-}
-
-function install_authorized_key(){
-    local directory="${1-}"
-    local owner="${2-}"
-    local group="${3-}"
-    local authorized_keys="$directory/authorized_keys"
-
-    [ -n "$KEY" ] || return 0
-    mkdir -p "$directory" || return 1
-    chmod 700 "$directory" || return 1
-    touch "$authorized_keys" || return 1
-    if ! grep -Fqx -- "$KEY" "$authorized_keys"; then
-        if [ -s "$authorized_keys" ] &&
-            [ "$(tail -c 1 "$authorized_keys" | wc -l)" -eq 0 ]; then
-            printf '\n' >> "$authorized_keys" || return 1
-        fi
-        printf '%s\n' "$KEY" >> "$authorized_keys" || return 1
-    fi
-    chmod 600 "$authorized_keys" || return 1
-    chown "$owner:$group" "$directory" "$authorized_keys" || return 1
-}
-
-function install_cumulus_sudoers(){
-    local target=/etc/sudoers.d/10_cumulus
-    local staged=""
-
-    staged=$(mktemp /etc/sudoers.d/.10_cumulus.XXXXXX) || return 1
-    if ! printf '%s\n' 'cumulus ALL=(ALL) NOPASSWD:ALL' > "$staged" || \
-        ! chmod 440 "$staged"; then
-        rm -f "$staged"
-        return 1
-    fi
-    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$staged" >/dev/null; then
-        rm -f "$staged"
-        return 1
-    fi
-    mv -f "$staged" "$target"
-}
-
-function apply_generated_config(){
-    local staged="${1-}"
-
-    if [ ! -s "$staged" ]; then
-        echo "Generated config is missing or empty" >&2
-        return 1
-    fi
-    command -v nv >/dev/null 2>&1 || return 1
-    if ! nv config replace "$staged" || ! nv config apply -y || ! nv config save; then
-        echo "Failed to apply generated config for ${MY_HOSTNAME-unknown}" >&2
-        return 1
-    fi
-    echo "Config applied and saved for ${MY_HOSTNAME-unknown}"
-}
-
-function init_ztp(){
-    echo "Running ZTP..."
-
-    if ! set_password; then
-        echo "Failed to set the cumulus password" >&2
-        return 1
-    fi
-    if ! install_cumulus_sudoers; then
-        echo "Failed to install the cumulus sudoers policy" >&2
-        return 1
-    fi
-
-    KEY=""
-    if [ -n "$KEY" ]; then
-        if ! install_authorized_key /root/.ssh root root || \
-            ! install_authorized_key /home/cumulus/.ssh cumulus cumulus; then
-            echo "Failed to install the SSH key" >&2
-            return 1
-        fi
-        echo "SSH key installed"
-    fi
-
-    if [ -n "${CONFIG_FILE-}" ]; then
-        echo "Applying generated config for $MY_HOSTNAME..."
-        apply_generated_config "$CONFIG_FILE" || return 1
-    fi
-    return 0
-}
-
-function main(){
-    umask 077
-
-    IMAGE_SERVER_HOSTNAME=__IMAGE_SERVER_IP__
-    CUMULUS_TARGET_RELEASE=__TARGET_OS_VERSION__
-    if ! CUMULUS_CURRENT_RELEASE=$(get_current_release); then
-        echo "Unable to determine the current Cumulus release; refusing OS install" >&2
-        return 1
-    fi
-    if ! [[ "$CUMULUS_TARGET_RELEASE" =~ ^[0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-        echo "Invalid target Cumulus release" >&2
-        return 1
-    fi
-    IMAGE_SERVER=http://$IMAGE_SERVER_HOSTNAME/cumulus-linux-$CUMULUS_TARGET_RELEASE-mlx-amd64.bin
-    ZTP_URL=http://$IMAGE_SERVER_HOSTNAME/cumulus-ztp.sh
-    IMAGE_SERVER_PING_TARGET=${IMAGE_SERVER_HOSTNAME%%:*}
-    WORK_DIR=$(mktemp -d /tmp/lldpq-ztp.XXXXXX) || return 1
-    trap 'rm -rf -- "${WORK_DIR-}"' EXIT
-
-    MY_SERIAL=$(decode-syseeprom 2>/dev/null | awk '/Serial Number/ {print $NF; exit}')
-    [ -z "$MY_SERIAL" ] && MY_SERIAL=$(onie-syseeprom -g 0x23 2>/dev/null | tr -d '[:space:]')
-    echo "Serial: $MY_SERIAL"
-
-    MY_HOSTNAME=$(resolve_hostname "$MY_SERIAL")
-    mapping_status=$?
-    case "$mapping_status" in
-        0) ;;
-        1) MY_HOSTNAME="" ;;
-        *)
-            echo "Serial mapping validation or download failed; refusing provisioning" >&2
-            return 1
-            ;;
-    esac
-    echo "Resolved hostname: $MY_HOSTNAME"
-
-    CONFIG_URL=""
-    CONFIG_FILE=""
-    if [ -n "$MY_HOSTNAME" ]; then
-        CONFIG_FILE="$WORK_DIR/startup.yaml"
-        CONFIG_URL=$(find_config_url "$MY_HOSTNAME" "$CONFIG_FILE")
-        config_status=$?
-        case "$config_status" in
-            0) echo "Config downloaded and verified: $CONFIG_URL" ;;
-            1)
-                CONFIG_URL=""
-                CONFIG_FILE=""
-                echo "No generated config found for $MY_HOSTNAME"
-                ;;
-            *)
-                echo "Generated config lookup failed; refusing provisioning" >&2
-                return 1
-                ;;
-        esac
-    else
-        echo "Serial $MY_SERIAL was not resolved; no config will be applied"
-    fi
-
-    echo "Checking if the device is running the correct version..."
-    if [ "$CUMULUS_TARGET_RELEASE" != "$CUMULUS_CURRENT_RELEASE" ]; then
-        echo "Version mismatch: $CUMULUS_CURRENT_RELEASE -> $CUMULUS_TARGET_RELEASE"
-        ping_until_reachable "$IMAGE_SERVER_PING_TARGET" || return 1
-        if [ -n "$CONFIG_FILE" ]; then
-            echo "Installing OS + config for $MY_HOSTNAME..."
-            /usr/cumulus/bin/onie-install -fa -i "$IMAGE_SERVER" -z "$ZTP_URL" \
-                -t "$CONFIG_FILE" || return 1
-        else
-            echo "Installing OS only (no config)..."
-            /usr/cumulus/bin/onie-install -fa -i "$IMAGE_SERVER" -z "$ZTP_URL" || return 1
-        fi
-        rm -rf -- "$WORK_DIR"
-        trap - EXIT
-        reboot || return 1
-    else
-        echo "Version is correct: $CUMULUS_TARGET_RELEASE"
-        init_ztp || return 1
-        rm -rf -- "$WORK_DIR"
-        trap - EXIT
-    fi
-    return 0
-}
-
-# ---- Main ----
-
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main "$@"
-fi
-ZTPEOF
+    sudo install -m 0644 html/cumulus-ztp.sh "$WEB_ROOT/cumulus-ztp.sh"
 fi
 sudo chown "$LLDPQ_USER:www-data" "$WEB_ROOT/cumulus-ztp.sh"
 sudo chmod 775 "$WEB_ROOT/cumulus-ztp.sh"
@@ -6280,6 +6006,7 @@ prepare_shared_lock_files /var/lib/lldpq/ssh-key.lock
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/lldp-jobs
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/assets-jobs
 sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/provision-jobs
+sudo install -d -o "$LLDPQ_USER" -g www-data -m 2770 /var/lib/lldpq/triggers
 # Config-write recovery authority, mirroring the Docker entrypoint. setup_safety
 # falls back to this fixed path when LLDPQ_DIRECT_WRITE_STATE_DIR is unset, so
 # direct-write recovery only works once the journal root exists. The leading
@@ -6532,7 +6259,8 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
 
     if [[ -n "$_DATA_PRESERVE" ]] && [[ -d "$_DATA_PRESERVE" ]]; then
         step "Restoring monitoring data..."
-        for _d in monitor-results lldp-results alert-states assets.ini; do
+        for _d in monitor-results lldp-results alert-states assets.ini \
+            uninstall-kept-data; do
             if [[ -e "$_DATA_PRESERVE/$_d" ]]; then
                 if ! root_run rm -rf "$LLDPQ_INSTALL_DIR/$_d" 2>/dev/null || \
                    ! root_run mv "$_DATA_PRESERVE/$_d" "$LLDPQ_INSTALL_DIR/" 2>/dev/null; then
@@ -6625,11 +6353,21 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
 
         if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
             echo "  Installing docker-compose..."
-            sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            echo "  docker-compose installed"
+            # -f + temp staging: an HTTP error page must never land in PATH as
+            # an executable.
+            _compose_tmp=$(mktemp "${TMPDIR:-/tmp}/lldpq-docker-compose.XXXXXX")
+            if curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o "$_compose_tmp"; then
+                sudo install -m 0755 -- "$_compose_tmp" /usr/local/bin/docker-compose
+                echo "  docker-compose installed"
+            else
+                echo "  [!] docker-compose download failed" >&2
+            fi
+            rm -f "$_compose_tmp"
         fi
 
+        # Serialize with Setup saves: the web UI and cron are already live at
+        # this point in a fresh install; see the --enable-telemetry note.
+        acquire_update_config_lock || exit 1
         if grep -q "^TELEMETRY_ENABLED=" /etc/lldpq.conf 2>/dev/null; then
             sudo sed -i 's/^TELEMETRY_ENABLED=.*/TELEMETRY_ENABLED=true/' /etc/lldpq.conf
         else
@@ -6639,6 +6377,7 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
         if ! grep -q "^PROMETHEUS_URL=" /etc/lldpq.conf 2>/dev/null; then
             echo "PROMETHEUS_URL=http://localhost:9090" | sudo tee -a /etc/lldpq.conf > /dev/null
         fi
+        release_update_config_lock
 
         echo ""
         echo "  Telemetry support enabled!"
@@ -6687,11 +6426,14 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
     else
         echo "  Telemetry skipped. Enable later with: ./install.sh --enable-telemetry"
 
+        # Serialize with Setup saves; see the matching --enable-telemetry note.
+        acquire_update_config_lock || exit 1
         if grep -q "^TELEMETRY_ENABLED=" /etc/lldpq.conf 2>/dev/null; then
             sudo sed -i 's/^TELEMETRY_ENABLED=.*/TELEMETRY_ENABLED=false/' /etc/lldpq.conf
         else
             echo "TELEMETRY_ENABLED=false" | sudo tee -a /etc/lldpq.conf > /dev/null
         fi
+        release_update_config_lock
     fi
 
     step "SSH Key Setup Required"
@@ -6717,6 +6459,9 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
 # Output directories (dynamic, changes frequently)
 lldp-results/
 monitor-results/
+
+# Data retained by a previous 'uninstall.sh --keep-data' (can be huge)
+uninstall-kept-data/
 
 # Temporary and backup files
 *.log

@@ -298,6 +298,9 @@ function renderActivity(events){
 
 function renderTable(events){
   var body = document.querySelector('#tlt tbody');
+  // tbody is rebuilt in default order (newest first), so drop the stored
+  // sort direction — otherwise the next header click toggles the wrong way.
+  document.getElementById('tlt').removeAttribute('data-sc');
   if (!events.length) {
     body.innerHTML = "<tr><td colspan='7' class='empty'>No events in the selected range.</td></tr>";
     return;
@@ -330,11 +333,24 @@ function domainBadge(domain){
 function renderDeviceOptions(){
   if (!window.jQuery) return;
   var $search = jQuery('#deviceSearch');
-  if ($search.data('tl-init')) return;
+  var initialized = !!$search.data('tl-init');
   var devices = Array.from(new Set(allEvents.map(function(e){ return e.device; }))).sort();
+  if (!devices.length && !initialized) return; // no events yet; retry on a later render
+  var current = initialized ? String($search.val() || '') : '';
+  // Keep the selected device listed even if its events aged out of the set.
+  if (current && devices.indexOf(current) === -1) { devices.push(current); devices.sort(); }
+  var key = devices.join('\n');
+  if ($search.data('tl-devices') === key) return;
   var options = '<option value=""></option>';
   devices.forEach(function(device){ options += '<option value="' + esc(device) + '">' + esc(device) + '</option>'; });
-  $search.html(options).data('tl-init', true);
+  $search.html(options).data('tl-devices', key);
+  if (initialized) {
+    // Rebuilding the options drops the selection; restore it without
+    // firing select2:select (deviceFilter is untouched).
+    $search.val(current).trigger('change.select2');
+    return;
+  }
+  $search.data('tl-init', true);
   $search.select2({placeholder:'Search Device...', allowClear:true, width:'200px', dropdownAutoWidth:true});
   $search.on('select2:select', function(e){
     var tmp = document.createElement('textarea');
@@ -412,6 +428,6 @@ document.addEventListener('visibilitychange', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 </body>
 </html>

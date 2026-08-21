@@ -3,9 +3,10 @@
 
 Static pins lock the gating shape (verbose-only notices, withheld pipeline
 identity, stale-marker suppression); functional runs drive the real script
-with stub stages through a stub config helper. Scenarios that would reach
-wait_until_not_running are avoided on purpose: its pgrep -f pattern can match
-unrelated developer processes (an editor with assets.sh open) and hang.
+with stub stages through a stub config helper. The pgrep-based
+wait_until_not_running loops were removed (the exclusive flock already
+serializes collectors and could hang on unrelated processes such as an
+editor with assets.sh open), so full-pipeline runs are exercised directly.
 """
 
 import os
@@ -83,6 +84,14 @@ class StageSkipStaticContractTests(unittest.TestCase):
         post_gate = self.source.rindex('if [[ "$SKIP_ALERTS" == "true" ]]; then')
         self.assertIn("run_command python3 ./check_alerts.py",
                       self.source[post_gate:])
+
+    def test_pgrep_wait_loops_removed(self):
+        # The exclusive flock taken before any stage is the serialization
+        # mechanism; a pgrep -f wait under the held lock could only ever
+        # match unrelated processes (an editor with assets.sh open) and
+        # hang the locked pipeline forever.
+        self.assertNotIn("wait_until_not_running", self.source)
+        self.assertNotIn("pgrep", self.source)
 
     def test_fabric_scan_self_gate_with_force_escape(self):
         scan = FABRIC_SCAN.read_text(encoding="utf-8")
@@ -184,6 +193,29 @@ class StageSkipFunctionalTests(unittest.TestCase):
         self.assertFalse((witness / "assets").exists())
         self.assertFalse((witness / "check-lldp").exists())
         self.assertFalse((witness / "alerts").exists())
+
+    def test_full_pipeline_run_executes_every_stage_under_one_identity(self):
+        # Previously avoided: assets/check-lldp/fabric-scan sat behind a
+        # pgrep-based wait that could hang on unrelated processes. With the
+        # wait removed the unskipped pipeline is safe to drive end to end.
+        root, lldpq_dir, witness = self._make_tree([])
+        result = self._run(root, lldpq_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stamps = {
+            name: (witness / name).read_text(encoding="utf-8")
+            for name in ("assets", "check-lldp", "monitor", "fabric-scan")
+        }
+        self.assertEqual(len(set(stamps.values())), 1,
+                         "all stages must share one pipeline identity")
+        self.assertNotEqual(stamps["monitor"], "pipeline_id=\n",
+                            "a full run must carry a pipeline identity")
+        self.assertEqual((witness / "alerts").read_text(encoding="utf-8"),
+                         "ran\n",
+                         "assets-only alert pre-check runs exactly once")
+        self.assertFalse(
+            (lldpq_dir / "monitor-results" / ".lldpq-stale").exists(),
+            "successful monitor must leave the report state current",
+        )
 
 
 if __name__ == "__main__":

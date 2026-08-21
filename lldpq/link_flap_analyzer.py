@@ -47,7 +47,8 @@ def _short_window_cell(value: int) -> str:
     them -- a literal 0 there means "not measurable at this cadence", not "no
     recent flapping". Render an em-dash for that unmeasurable zero so operators
     do not read it as a positive all-clear; a genuine non-zero (fast cadence)
-    still shows the real count."""
+    still shows the real count. The 1h cell reuses this treatment when an
+    hourly-or-slower poll cadence makes that window unmeasurable too."""
     return str(value) if value else "&mdash;"
 
 
@@ -212,8 +213,10 @@ class LinkFlapAnalyzer:
                 "last_update": time.time()
             }
             self._atomic_json_write(f"{self.data_dir}/flap_history.json", data)
+            return True
         except Exception as e:
             print(f"Error saving flap history: {e}")
+            return False
 
     @staticmethod
     def _atomic_json_write(path: str, value: Any) -> None:
@@ -234,7 +237,10 @@ class LinkFlapAnalyzer:
             # Web-served output: nginx must always retain read access.
             os.fchmod(descriptor, mode | 0o644)
             if metadata is not None:
-                os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+                try:
+                    os.fchown(descriptor, metadata.st_uid, metadata.st_gid)
+                except PermissionError:
+                    pass
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 descriptor = -1
                 # Single-string write: streaming json.dump is several times
@@ -383,9 +389,11 @@ class LinkFlapAnalyzer:
         """Return True when any port crosses the configured hourly warning rate."""
         warning = self.thresholds["warning_flaps_per_hour"]
         for port_name in self.carrier_transitions_stats:
-            count = self.calculate_flapping_rate(port_name)["flap_1_hr"]
+            counters = self.calculate_flapping_rate(port_name)
+            count = self._hourly_rate_for_grading(
+                counters, self._hourly_window_measurable(port_name))
             if warning > 0 and count >= warning:
-                print(f"Flap threshold exceeded on {port_name}: {count} flaps in last hour")
+                print(f"Flap threshold exceeded on {port_name}: {count:g} flaps in last hour")
                 return True
         return False
     
@@ -417,21 +425,71 @@ class LinkFlapAnalyzer:
                         fits = period.value >= FlapPeriod.FLAP_1_HR.value and sample_age <= period.value
                     if fits:
                         flap_counters[period.name.lower()] += int(flap_count)
-        
+
         return flap_counters
-    
+
+    def _hourly_window_measurable(self, port_name: str) -> bool:
+        """True when this port's history can populate the 1h bucket at all.
+
+        The interval-fit rule never attributes a poll interval of one hour or
+        longer to the 1h window, so at an hourly-or-slower cadence flap_1_hr
+        stays 0 forever while 12h/24h carry real flaps. Legacy entries are
+        attributed to the 1h bucket while fresh, and an empty history keeps
+        the measured grading (a genuine quiet hour)."""
+        saw_interval_aware = False
+        for event in self.flapping_hist.get(port_name, []):
+            if len(event) < 3:
+                continue
+            if len(event) < 5:
+                return True
+            saw_interval_aware = True
+            try:
+                interval_seconds = float(event[4])
+            except (TypeError, ValueError):
+                continue
+            if interval_seconds < FlapPeriod.FLAP_1_HR.value:
+                return True
+        return not saw_interval_aware
+
+    def _hourly_rate_for_grading(self, counters: Dict[str, int],
+                                 hourly_measurable: bool) -> float:
+        """Effective per-hour flap value used by every severity decision.
+
+        The displayed 1h bucket deliberately refuses to overclaim a poll
+        interval that does not fit it; severity must not inherit that display
+        contract. When the cadence cannot fit the 1h window, grade from the
+        smallest window it does fit (12h, then 24h) scaled to a per-hour
+        rate. A cadence that can fit the 1h window keeps the exact flap_1_hr
+        grading."""
+        if hourly_measurable:
+            return float(counters.get("flap_1_hr", 0))
+        for period in (FlapPeriod.FLAP_12_HRS, FlapPeriod.FLAP_24_HRS):
+            count = counters.get(period.name.lower(), 0)
+            if count:
+                return count * FlapPeriod.FLAP_1_HR.value / period.value
+        return 0.0
+
     def _build_port_cache(self):
         """Build cache of all port statuses and counters - call once before bulk operations"""
         self._port_cache = {}
         self._export_rows = None
         for port_name in self.carrier_transitions_stats.keys():
             counters = self.calculate_flapping_rate(port_name)
-            status = self._status_for_counters(counters)
-            self._port_cache[port_name] = {'status': status, 'counters': counters}
+            hourly_measured = self._hourly_window_measurable(port_name)
+            hourly_rate = self._hourly_rate_for_grading(counters, hourly_measured)
+            status = self._status_for_counters(counters, hourly_rate)
+            self._port_cache[port_name] = {
+                'status': status,
+                'counters': counters,
+                'hourly_rate': hourly_rate,
+                'hourly_measured': hourly_measured,
+            }
 
-    def _status_for_counters(self, counters: Dict[str, int]) -> FlapStatus:
+    def _status_for_counters(self, counters: Dict[str, int],
+                             hourly: Optional[float] = None) -> FlapStatus:
         """Grade a port from configured one-hour flap thresholds."""
-        hourly = counters.get("flap_1_hr", 0)
+        if hourly is None:
+            hourly = counters.get("flap_1_hr", 0)
         critical = self.thresholds["critical_flaps_per_hour"]
         warning = self.thresholds["warning_flaps_per_hour"]
         if critical > 0 and hourly >= critical:
@@ -439,12 +497,13 @@ class LinkFlapAnalyzer:
         if warning > 0 and hourly >= warning:
             return FlapStatus.WARNING
         return FlapStatus.OK
-    
+
     def get_port_flap_status(self, port_name: str) -> FlapStatus:
         """Get current flap status for a port"""
         counters = self.calculate_flapping_rate(port_name)
-        
-        return self._status_for_counters(counters)
+        hourly = self._hourly_rate_for_grading(
+            counters, self._hourly_window_measurable(port_name))
+        return self._status_for_counters(counters, hourly)
     
     def get_flap_summary(self) -> Dict[str, Any]:
         """Get summary of all flapping ports - uses cache for performance"""
@@ -496,31 +555,44 @@ class LinkFlapAnalyzer:
         for port_name, cached in self._port_cache.items():
             status = cached['status']
             counters = cached['counters']
-            
+            hourly_rate = cached.get('hourly_rate', counters.get('flap_1_hr', 0))
+            # The grading value, not the raw 1h bucket: at a slow cadence the
+            # bucket is 0 while the rate-equivalent crossed the threshold.
+            hourly_value = (
+                int(hourly_rate) if float(hourly_rate).is_integer()
+                else round(hourly_rate, 1)
+            )
+            if cached.get('hourly_measured', True):
+                rate_text = f"{hourly_value} flaps in last hour"
+            else:
+                rate_text = (
+                    f"~{hourly_value} flaps/hour averaged over the wider window"
+                )
+
             if status == FlapStatus.CRITICAL:
                 anomalies.append({
                     "device": port_name.split(':', 1)[0] if ':' in port_name else "unknown",
                     "interface": port_name.split(':', 1)[1] if ':' in port_name else port_name,
                     "type": "CRITICAL_FLAPPING",
                     "severity": "critical",
-                    "message": f"Port {port_name} crossed the critical threshold ({counters['flap_1_hr']} flaps in last hour)",
+                    "message": f"Port {port_name} crossed the critical threshold ({rate_text})",
                     "details": {
-                        "flap_count_1hr": counters['flap_1_hr'],
+                        "flap_count_1hr": hourly_value,
                         "critical_threshold": self.thresholds["critical_flaps_per_hour"],
                         "current_transitions": self.carrier_transitions_stats.get(port_name, 0)
                     },
                     "action": f"Check physical cabling and hardware health for {port_name}"
                 })
-            
+
             elif status == FlapStatus.WARNING:
                 anomalies.append({
                     "device": port_name.split(':', 1)[0] if ':' in port_name else "unknown",
                     "interface": port_name.split(':', 1)[1] if ':' in port_name else port_name,
                     "type": "WARNING_FLAPPING",
                     "severity": "warning",
-                    "message": f"Port {port_name} crossed the warning threshold ({counters['flap_1_hr']} flaps in last hour)",
+                    "message": f"Port {port_name} crossed the warning threshold ({rate_text})",
                     "details": {
-                        "flap_count_1hr": counters['flap_1_hr'],
+                        "flap_count_1hr": hourly_value,
                         "warning_threshold": self.thresholds["warning_flaps_per_hour"],
                         "current_transitions": self.carrier_transitions_stats.get(port_name, 0)
                     },
@@ -985,7 +1057,7 @@ class LinkFlapAnalyzer:
                     <th class="sortable" data-column="3" data-type="number">30s <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="4" data-type="number">1m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="5" data-type="number">5m <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
-                    <th class="sortable" data-column="6" data-type="number">1h <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="6" data-type="number">1h <span class="info-tooltip" data-tooltip="Only counts when a full poll interval fits this window; — means not measurable at the current cadence">ⓘ</span> <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="7" data-type="number">12h <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="8" data-type="number">24h <span class="sort-arrow"></span></th>
                     <th class="sortable" data-column="9" data-type="number">Total <span class="info-tooltip" data-tooltip="Cumulative count since last device reboot">ⓘ</span> <span class="sort-arrow"></span></th>
@@ -1026,6 +1098,16 @@ class LinkFlapAnalyzer:
             device_key = html.escape(str(port['device']), quote=True)
             port_key = html.escape(f"{port['device']}:{port['interface']}", quote=True)
             device_names.setdefault(str(port['device']), canonical(port['device']))
+            # At an hourly-or-slower cadence the 1h bucket is unmeasurable
+            # (see _hourly_window_measurable); give its zero the same em-dash
+            # treatment as the shorter windows instead of a false all-clear.
+            hourly_measured = self._port_cache.get(
+                f"{port['device']}:{port['interface']}", {}
+            ).get('hourly_measured', True)
+            hourly_cell = (
+                str(port['flaps_1h']) if hourly_measured
+                else _short_window_cell(port['flaps_1h'])
+            )
             (table_rows if dashboard_status != "ok" else deferred_rows).append(f"""
         <tr class="flap-row" data-device-key="{device_key}" data-status="{dashboard_status}" data-flap-status="{status_val}" data-port-key="{port_key}" onclick="toggleFlapDetails(this)">
             <td>{canonical(port['device'])}</td>
@@ -1034,7 +1116,7 @@ class LinkFlapAnalyzer:
             <td data-value="{port['flaps_30s']}">{_short_window_cell(port['flaps_30s'])}</td>
             <td data-value="{port['flaps_1m']}">{_short_window_cell(port['flaps_1m'])}</td>
             <td data-value="{port['flaps_5m']}">{_short_window_cell(port['flaps_5m'])}</td>
-            <td data-value="{port['flaps_1h']}">{port['flaps_1h']}</td>
+            <td data-value="{port['flaps_1h']}">{hourly_cell}</td>
             <td data-value="{port['flaps_12h']}">{port['flaps_12h']}</td>
             <td data-value="{port['flaps_24h']}">{port['flaps_24h']}</td>
             <td data-value="{port['total_transitions']}"><span class="{transition_class}">{port['total_transitions']}</span></td>
@@ -1783,7 +1865,7 @@ class LinkFlapAnalyzer:
                         cells[3].dataset.value != null ? cells[3].dataset.value : cells[3].textContent.trim(), // 30 sec
                         cells[4].dataset.value != null ? cells[4].dataset.value : cells[4].textContent.trim(), // 1 min
                         cells[5].dataset.value != null ? cells[5].dataset.value : cells[5].textContent.trim(), // 5 min
-                        cells[6].textContent.trim(), // 1 hour
+                        cells[6].dataset.value != null ? cells[6].dataset.value : cells[6].textContent.trim(), // 1 hour
                         cells[7].textContent.trim(), // 12 hours
                         cells[8].textContent.trim(), // 24 hours
                         cells[9].textContent.trim()  // Total
@@ -1876,7 +1958,7 @@ class LinkFlapAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

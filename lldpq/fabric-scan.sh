@@ -854,7 +854,7 @@ run_scan_job() {
 
 for ip in "${!devices[@]}"; do
     IFS=' ' read -r username hostname <<< "${devices[$ip]}"
-    run_scan_job "$ip" "$hostname" "$username" 8>&- &
+    run_scan_job "$ip" "$hostname" "$username" 8>&- 9>&- &
     ((active_jobs++))
     if (( active_jobs >= MAX_PARALLEL )); then
         if [[ "$scan_supports_wait_n" == "true" ]]; then

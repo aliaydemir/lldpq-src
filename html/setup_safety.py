@@ -22,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import math
 import io
 from pathlib import Path
@@ -51,6 +52,15 @@ ALIAS_LIMITS = {
     "interfaces": (2000, 64, 32),
     "devices": (2000, 128, 64),
 }
+# Detached Provision workers hold rolling shared inventory locks across
+# per-device SSH deploys; an unbounded wait here would hang the CGI request
+# into the nginx timeout instead of returning a JSON busy refusal.
+try:
+    INVENTORY_LOCK_WAIT_SECONDS = float(
+        os.environ.get("LLDPQ_INVENTORY_LOCK_WAIT_SECONDS", "30")
+    )
+except ValueError:
+    INVENTORY_LOCK_WAIT_SECONDS = 30.0
 
 
 class SetupSafetyError(ValueError):
@@ -151,7 +161,9 @@ def acquire_global_configuration_lock(path="/etc/lldpq.conf.lock") -> int:
     return descriptor
 
 
-def acquire_inventory_lock(path: str) -> int:
+def acquire_inventory_lock(
+    path: str, shared: bool = False, timeout: Optional[float] = None
+) -> int:
     """Join Provision/backup inventory transactions after the global lock."""
     if not os.path.isabs(path):
         raise SetupSafetyError("Inventory lock path must be absolute")
@@ -172,7 +184,21 @@ def acquire_inventory_lock(path: str) -> int:
             raise SetupSafetyError(
                 "Inventory lock has unsafe type, permissions, or identity"
             )
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        if timeout is None:
+            fcntl.flock(descriptor, operation)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(descriptor, operation | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise SetupSafetyError(
+                            "Inventory lock is busy, please retry"
+                        )
+                    time.sleep(0.2)
         locked = os.lstat(path)
         if (opened.st_dev, opened.st_ino) != (locked.st_dev, locked.st_ino):
             raise SetupSafetyError("Inventory lock changed while waiting to acquire it")
@@ -1628,7 +1654,16 @@ def _main() -> int:
                 raise SetupSafetyError(
                     "Shared inventory lock is required for devices.yaml access"
                 )
-            inventory_lock_fd = acquire_inventory_lock(args.inventory_lock)
+            # read-devices only computes content + sha256 revision, so a
+            # shared lock suffices; both CGI-reachable commands take a bounded
+            # wait so rolling worker shared locks cannot starve them into the
+            # nginx timeout.  Boot-time recover-all may wait indefinitely.
+            inventory_lock_fd = acquire_inventory_lock(
+                args.inventory_lock,
+                shared=args.command == "read-devices",
+                timeout=(None if args.command == "recover-all"
+                         else INVENTORY_LOCK_WAIT_SECONDS),
+            )
         if args.command == "recover-all":
             if not args.lldpq_dir or not args.web_root:
                 raise SetupSafetyError("Managed LLDPq and web roots are required")

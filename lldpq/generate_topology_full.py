@@ -106,7 +106,7 @@ def categorize_device(device_name, config):
                             # name (e.g. the rack field) — not just the trailing "-" segment.
                             m = re.search(number_regex, device_name, re.IGNORECASE)
                             if not m:
-                                break  # no match -> fall through to regular patterns
+                                continue  # no match -> try later rules, then regular patterns
                             device_number = int(m.group(1))
                         else:
                             device_number = int(device_name.split("-")[-1])
@@ -115,8 +115,8 @@ def categorize_device(device_name, config):
                         else:
                             return rule["odd_layer"], rule["icon"]
                     except (ValueError, IndexError, re.error):
-                        # If parsing fails, continue to regular patterns
-                        break
+                        # If parsing fails, try later rules, then regular patterns
+                        continue
         except re.error:
             # Invalid regex, fall back to substring match
             if rule["pattern"] in device_name:
@@ -162,48 +162,6 @@ def stagger_row_for(device_name, config):
         except (ValueError, IndexError, re.error):
             continue
     return None
-
-def append_creation_time_to_html(html_file_path):
-    timestamp = datetime.now().strftime("Created on %Y-%m-%d %H-%M")
-    try:
-        with open(html_file_path, "r") as f:
-            content = f.read()
-        content_before = content
-        content = re.sub(
-            r'\s*<button[^>]*>Created on \d{4}-\d{2}-\d{2} \d{2}-\d{2}</button>',
-            '',
-            content
-        )
-        insert_point = content.lower().rfind('</body>')
-        if insert_point != -1:
-            new_div = f'        <button onclick="time()">{timestamp}</button>\n'
-            new_content = content[:insert_point] + new_div + content[insert_point:]
-            # Stage and rename. nginx serves this page while it is rewritten, so
-            # a truncated in-place write would hand the browser a broken
-            # document; the mode carries over so it stays world-readable.
-            try:
-                html_mode = stat.S_IMODE(os.stat(html_file_path).st_mode)
-            except FileNotFoundError:
-                html_mode = 0o664
-            staged_path = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=os.path.dirname(html_file_path) or ".",
-                    prefix=".lldp_html.",
-                    delete=False,
-                ) as staged:
-                    staged_path = staged.name
-                    os.fchmod(staged.fileno(), html_mode | 0o644)
-                    staged.write(new_content)
-                os.replace(staged_path, html_file_path)
-                staged_path = None
-            finally:
-                if staged_path and os.path.exists(staged_path):
-                    os.unlink(staged_path)
-    except Exception as e:
-        print(f"[ERROR] Failed to modify HTML: {e}")
 
 def parse_assets_file(assets_file_path):
     device_info = {}
@@ -284,9 +242,11 @@ def apply_host_patterns(patterns, all_hostnames):
 
 def scan_lldp_neighbors(directory):
     """
-    Scan LLDP result files to discover all neighbor hostnames.
-    This is used to apply patterns before the full LLDP parse.
-    Parses the main lldp_results.ini file.
+    Discover neighbor hostnames from the aggregate lldp_results.ini only
+    (Exp-Nbr/Act-Nbr columns). This is used to apply patterns before the
+    full LLDP parse. Note: the aggregate omits unmanaged neighbors seen on
+    ports not modeled in topology.dot, so endpoint_hosts patterns cannot
+    match such hosts (exact endpoint_hosts entries are matched elsewhere).
     
     Format: Port  Status  Exp-Nbr  Exp-Nbr-Port  Act-Nbr  Act-Nbr-Port  Port-Status
     We need Act-Nbr (index 4) which is the actual neighbor hostname.
@@ -672,6 +632,10 @@ def generate_topology_file(output_filename, directory, assets_file_path, devices
 
     for defined_link in defined_links:
         src_device, src_ifname, tgt_device, tgt_ifname = defined_link
+        # Management (eth0) edges are excluded from wiring validation and the
+        # LLDP parse skips them, so they would always render as missing here.
+        if is_eth0(src_ifname) or is_eth0(tgt_ifname):
+            continue
         forward_link_tuple = (src_device, src_ifname, tgt_device, tgt_ifname)
         reverse_link_tuple = (tgt_device, tgt_ifname, src_device, src_ifname)
 
@@ -815,8 +779,6 @@ def main(argv=None):
 
     try:
         generate_topology_file(output_file, lldp_results_directory, assets_file_path, devices_yaml_path, dot_file_path)
-        if not explicit_output:
-            append_creation_time_to_html(f"{WEB_ROOT}/topology/main.html")
         return 0
     except Exception as exc:
         print(f"Error generating topology: {exc}")

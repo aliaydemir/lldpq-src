@@ -343,7 +343,6 @@ active_jobs_file=$(mktemp) || {
     rm -f "$unreachable_hosts_file"
     exit 1
 }
-completed_file=""
 scope_expected_hosts_file=""
 collection_status_file=""
 collection_status_manifest=""
@@ -949,7 +948,6 @@ cleanup_monitor_temp() {
     fi
     [[ -n "$unreachable_hosts_file" ]] && rm -f "$unreachable_hosts_file"
     [[ -n "$active_jobs_file" ]] && rm -f "$active_jobs_file"
-    [[ -n "$completed_file" ]] && rm -f "$completed_file"
     [[ -n "$scope_expected_hosts_file" ]] && rm -f "$scope_expected_hosts_file"
     [[ -n "$collection_status_file" ]] && rm -f "$collection_status_file"
     [[ -n "$analysis_log_dir" ]] && rm -rf "$analysis_log_dir"
@@ -1115,11 +1113,13 @@ preflight_publish_disk_space() {
 prune_orphaned_publish_stages() {
     # SIGKILL/OOM/power loss between publish staging and activation leaves
     # $WEB_ROOT/.monitor-results.new.* trees (and their .previous rollback
-    # copies) behind until they trip the disk_full preflight. The global
-    # monitor lock is held, so no concurrent publisher owns any stage tree;
-    # only trees older than 2 hours are removed, and never while the
-    # published tree itself is missing (a retained .previous may then be the
-    # only copy of the last-known-good web reports).
+    # copies) behind until they trip the disk_full preflight. The same class
+    # of event leaks fabric-scan's stage dirs inside the source tree, which
+    # then inflate the publish estimate and get copied into every publish.
+    # The global monitor lock is held, so no concurrent publisher owns any
+    # stage tree; only trees older than 2 hours are removed, and never while
+    # the published tree itself is missing (a retained .previous may then be
+    # the only copy of the last-known-good web reports).
     local stale_stage
     [[ -d "$WEB_ROOT/monitor-results" ]] || return 0
     while IFS= read -r -d '' stale_stage; do
@@ -1128,8 +1128,10 @@ prune_orphaned_publish_stages() {
         else
             echo "Warning: could not remove orphaned publish stage: $stale_stage" >&2
         fi
-    done < <("${LLDPQ_PRIV[@]}" find "$WEB_ROOT" -mindepth 1 -maxdepth 1 \
-        -name '.monitor-results.new.*' -mmin +120 -print0 2>/dev/null)
+    done < <("${LLDPQ_PRIV[@]}" find "$WEB_ROOT" "$SCRIPT_DIR/monitor-results" \
+        -mindepth 1 -maxdepth 1 \
+        \( -name '.monitor-results.new.*' -o -name '.fabric-tables.publish.*' \
+           -o -name '.fabric-rollback.*' \) -mmin +120 -print0 2>/dev/null)
     return 0
 }
 
@@ -3003,8 +3005,12 @@ EOF
 
     # BOUNDED_CMD_COUNT must track the number of _lldpq_run_bounded calls in
     # the remote collector below; each one can hold a wedged device for up to
-    # MONITOR_COMMAND_TIMEOUT_SECONDS before its own timeout fires.
-    local BOUNDED_CMD_COUNT=52
+    # MONITOR_COMMAND_TIMEOUT_SECONDS before its own timeout fires. Call
+    # sites inside loops count at their worst-case iteration count: the
+    # hw-management thermal reads add 8 (ASIC) + 4 (CPU) bounds, and the
+    # deadline-shared thermal fallback sweeps add 3 more (a 2-bound deadline
+    # plus one in-flight read).
+    local BOUNDED_CMD_COUNT=67
     # Umbrella must cover every per-section budget it forwards plus the sum
     # of the per-command bounds and fixed slack, so a wedged-but-reachable
     # device finishes as a bounded slow collection instead of being killed
@@ -3174,7 +3180,9 @@ EOF
         : > "$_lldpq_snapshot_dir/ifalias"
         : > "$_lldpq_snapshot_dir/swp-ifalias"
         : > "$_lldpq_snapshot_dir/swp-ifalias-html"
-        if _lldpq_scope_selected all; then
+        # The DUP IFALIAS section consumes the ifalias snapshot and stamps
+        # coverage OK, so a scoped duplicate run must populate it too.
+        if _lldpq_scope_selected all || _lldpq_scope_selected duplicate; then
         for _lldpq_alias_path in "$_lldpq_net_class_root"/*/ifalias; do
             [ -r "$_lldpq_alias_path" ] || continue
             IFS= read -r _lldpq_alias < "$_lldpq_alias_path" 2>/dev/null || _lldpq_alias=""
@@ -4013,7 +4021,7 @@ EOF
         asic_raw=""
         for asic_file in /var/run/hw-management/thermal/asic /run/hw-management/thermal/asic /var/run/hw-management/thermal/asic1 /run/hw-management/thermal/asic1; do
             if [ -e "$asic_file" ]; then
-                asic_raw=$(sudo -n cat "$asic_file" 2>/dev/null || cat "$asic_file" 2>/dev/null || echo "")
+                asic_raw=$(_lldpq_run_bounded sudo -n cat "$asic_file" 2>/dev/null || _lldpq_run_bounded cat "$asic_file" 2>/dev/null || echo "")
                 if [ -n "$asic_raw" ]; then
                     break
                 fi
@@ -4031,15 +4039,21 @@ EOF
         else
             # Fallback: Try alternative ASIC temperature sources
             echo "ASIC_FALLBACK_DEBUG:"
+            # mlxsw registers one thermal zone per module, so on a wedged
+            # sensor bus an unbounded sweep of bounded reads could still
+            # outlast the SSH umbrella; both sweeps share a two-bound
+            # deadline instead (generous for the healthy path).
+            _thermal_sweep_deadline=$(( $(date +%s) + 2 * MONITOR_COMMAND_TIMEOUT_SECONDS ))
             # Check thermal zones
             for zone in /sys/class/thermal/thermal_zone*/type; do
+                [ "$(date +%s)" -lt "$_thermal_sweep_deadline" ] || break
                 if [ -r "$zone" ]; then
-                    zone_type=$(cat "$zone" 2>/dev/null)
+                    zone_type=$(_lldpq_run_bounded cat "$zone" 2>/dev/null)
                     if echo "$zone_type" | grep -qi "asic\|switch\|mlxsw"; then
                         zone_dir=$(dirname "$zone")
                         temp_file="$zone_dir/temp"
                         if [ -r "$temp_file" ]; then
-                            temp_raw=$(cat "$temp_file" 2>/dev/null)
+                            temp_raw=$(_lldpq_run_bounded cat "$temp_file" 2>/dev/null)
                             if [ -n "$temp_raw" ] && [ "$temp_raw" -gt 0 ]; then
                                 awk "BEGIN{printf \"THERMAL_ZONE_ASIC: %.1f\n\", $temp_raw/1000}"
                                 break
@@ -4050,12 +4064,13 @@ EOF
             done
             # Check hwmon for ASIC
             for hwmon in /sys/class/hwmon/hwmon*/temp*_label; do
+                [ "$(date +%s)" -lt "$_thermal_sweep_deadline" ] || break
                 if [ -r "$hwmon" ]; then
-                    label=$(cat "$hwmon" 2>/dev/null)
+                    label=$(_lldpq_run_bounded cat "$hwmon" 2>/dev/null)
                     if echo "$label" | grep -qi "asic\|switch"; then
                         temp_file=$(echo "$hwmon" | sed "s/_label$/_input/")
                         if [ -r "$temp_file" ]; then
-                            temp_raw=$(cat "$temp_file" 2>/dev/null)
+                            temp_raw=$(_lldpq_run_bounded cat "$temp_file" 2>/dev/null)
                             if [ -n "$temp_raw" ] && [ "$temp_raw" -gt 0 ]; then
                                 awk "BEGIN{printf \"HWMON_ASIC: %.1f\n\", $temp_raw/1000}"
                                 break
@@ -4068,7 +4083,7 @@ EOF
         cpu_raw=""
         for cpu_file in /var/run/hw-management/thermal/cpu_pack /run/hw-management/thermal/cpu_pack; do
             if [ -e "$cpu_file" ]; then
-                cpu_raw=$(sudo -n cat "$cpu_file" 2>/dev/null || cat "$cpu_file" 2>/dev/null || echo "")
+                cpu_raw=$(_lldpq_run_bounded sudo -n cat "$cpu_file" 2>/dev/null || _lldpq_run_bounded cat "$cpu_file" 2>/dev/null || echo "")
                 if [ -n "$cpu_raw" ]; then
                     break
                 fi
@@ -4744,8 +4759,6 @@ PY
 fi
 
 total_devices=${#devices[@]}
-completed_file="/tmp/monitor_completed_$$"
-echo "0" > "$completed_file"
 collection_phase_start=$(date +%s)
 startup_recovery_duration=$((collection_phase_start - START_TIME))
 

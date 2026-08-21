@@ -359,7 +359,7 @@ class NVUEValidator:
                         # Validate VRF
                         if 'vrf' in server_config:
                             vrf = server_config['vrf']
-                            if vrf not in ['mgmt', 'default'] and vrf.lower() in RESERVED_NAMES:
+                            if not isinstance(vrf, str) or (vrf not in ['mgmt', 'default'] and vrf.lower() in RESERVED_NAMES):
                                 self.add_warning(f"{server_path}.vrf",
                                                f"VRF should be verified: '{vrf}'")
     
@@ -404,7 +404,7 @@ class NVUEValidator:
         
         if 'enable' in data:
             val = data['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -423,7 +423,7 @@ class NVUEValidator:
                                      f"Invalid state: '{state}'")
                 if 'enable' in auto_save:
                     val = auto_save['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.auto-save.enable",
                                      f"Invalid value: '{val}'")
     
@@ -453,7 +453,7 @@ class NVUEValidator:
         
         if 'enable' in data:
             val = data['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -673,7 +673,7 @@ class NVUEValidator:
                 # Could have nested enable/value structure
                 if 'enable' in storm_value:
                     val = storm_value['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{storm_path}.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
     
@@ -685,7 +685,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -816,7 +816,7 @@ class NVUEValidator:
         # Auto-negotiate validation
         if 'auto-negotiate' in config:
             val = config['auto-negotiate']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.auto-negotiate", 
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -964,7 +964,7 @@ class NVUEValidator:
             if key not in valid_stp_options:
                 self.add_warning(f"{path}.{key}", f"Unknown STP option: '{key}'")
             
-            if value not in VALID_ON_OFF and value not in [True, False]:
+            if (not isinstance(value, str) or value not in VALID_ON_OFF) and value not in [True, False]:
                 self.add_error(f"{path}.{key}", 
                              f"Invalid value: '{value}' (must be on/off)")
     
@@ -1014,7 +1014,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -1119,7 +1119,7 @@ class NVUEValidator:
         # lacp-bypass validation
         if 'lacp-bypass' in config:
             val = config['lacp-bypass']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.lacp-bypass",
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -1136,7 +1136,7 @@ class NVUEValidator:
                 # Validate uplink
                 if 'uplink' in mh:
                     val = mh['uplink']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{mh_path}.uplink",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -1149,7 +1149,7 @@ class NVUEValidator:
                         # Validate enable
                         if 'enable' in segment:
                             val = segment['enable']
-                            if val not in VALID_ON_OFF and val not in [True, False]:
+                            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                                 self.add_error(f"{seg_path}.enable",
                                              f"Invalid value: '{val}' (must be on/off)")
                         
@@ -1186,6 +1186,9 @@ class NVUEValidator:
     
     def _is_valid_mac(self, mac: str) -> bool:
         """Check if MAC address is valid."""
+        # Unquoted MACs like 44:38:39:00:00:01 parse as YAML-1.1 sexagesimal ints
+        if not isinstance(mac, str):
+            return False
         pattern = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
         return bool(pattern.match(mac))
     
@@ -1199,7 +1202,7 @@ class NVUEValidator:
             ar = config['adaptive-routing']
             if isinstance(ar, dict) and 'enable' in ar:
                 val = ar['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{path}.adaptive-routing.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
         
@@ -1208,7 +1211,7 @@ class NVUEValidator:
             pim = config['pim']
             if isinstance(pim, dict) and 'enable' in pim:
                 val = pim['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{path}.pim.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
         
@@ -1224,7 +1227,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -1277,7 +1280,7 @@ class NVUEValidator:
         # Validate passive
         if 'passive' in config:
             val = config['passive']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.passive",
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -1359,7 +1362,7 @@ class NVUEValidator:
             if isinstance(snooping, dict):
                 if 'enable' in snooping:
                     val = snooping['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.snooping.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
         
@@ -1369,7 +1372,7 @@ class NVUEValidator:
             if isinstance(querier, dict):
                 if 'enable' in querier:
                     val = querier['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.querier.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -1415,7 +1418,7 @@ class NVUEValidator:
             vrr = data['vrr']
             if isinstance(vrr, dict) and 'enable' in vrr:
                 val = vrr['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{path}.vrr.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
         
@@ -1423,7 +1426,7 @@ class NVUEValidator:
             ar = data['adaptive-routing']
             if isinstance(ar, dict) and 'enable' in ar:
                 val = ar['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{path}.adaptive-routing.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
         
@@ -1537,7 +1540,7 @@ class NVUEValidator:
         
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -1617,7 +1620,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -1697,7 +1700,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -1857,7 +1860,7 @@ class NVUEValidator:
             # Validate enable
             if 'enable' in af_config:
                 val = af_config['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{af_path}.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
             
@@ -1897,7 +1900,7 @@ class NVUEValidator:
             if isinstance(to_evpn, dict):
                 if 'enable' in to_evpn:
                     val = to_evpn['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.to-evpn.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -1966,7 +1969,7 @@ class NVUEValidator:
             if isinstance(bfd, dict):
                 if 'enable' in bfd:
                     val = bfd['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.bfd.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -2019,7 +2022,7 @@ class NVUEValidator:
             
             if 'enable' in af_config:
                 val = af_config['enable']
-                if val not in VALID_ON_OFF and val not in [True, False]:
+                if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                     self.add_error(f"{af_path}.enable",
                                  f"Invalid value: '{val}' (must be on/off)")
     
@@ -2221,7 +2224,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in config:
             val = config['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -2258,7 +2261,7 @@ class NVUEValidator:
         
         if 'enable' in data:
             val = data['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
     
@@ -2273,7 +2276,7 @@ class NVUEValidator:
                 # Validate enable
                 if 'enable' in vxlan:
                     val = vxlan['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.vxlan.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -2311,7 +2314,7 @@ class NVUEValidator:
                 # Validate arp-nd-suppress
                 if 'arp-nd-suppress' in vxlan:
                     val = vxlan['arp-nd-suppress']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.vxlan.arp-nd-suppress",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -2344,7 +2347,7 @@ class NVUEValidator:
             if isinstance(roce, dict):
                 if 'enable' in roce:
                     val = roce['enable']
-                    if val not in VALID_ON_OFF and val not in [True, False]:
+                    if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                         self.add_error(f"{path}.roce.enable",
                                      f"Invalid value: '{val}' (must be on/off)")
                 
@@ -2538,7 +2541,7 @@ class NVUEValidator:
         # Validate enable (global)
         if 'enable' in data:
             val = data['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -2561,7 +2564,7 @@ class NVUEValidator:
         # Validate dot1-tlv (IEEE 802.1 TLVs)
         if 'dot1-tlv' in data:
             val = data['dot1-tlv']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.dot1-tlv",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -2584,7 +2587,7 @@ class NVUEValidator:
         # Validate enable
         if 'enable' in data:
             val = data['enable']
-            if val not in VALID_ON_OFF and val not in [True, False]:
+            if (not isinstance(val, str) or val not in VALID_ON_OFF) and val not in [True, False]:
                 self.add_error(f"{path}.enable",
                              f"Invalid value: '{val}' (must be on/off)")
         
@@ -2626,7 +2629,7 @@ class NVUEValidator:
                     
                     if isinstance(backup_config, dict) and 'vrf' in backup_config:
                         vrf = backup_config['vrf']
-                        if vrf.lower() in RESERVED_NAMES and vrf not in ['mgmt', 'default']:
+                        if not isinstance(vrf, str) or (vrf.lower() in RESERVED_NAMES and vrf not in ['mgmt', 'default']):
                             self.add_warning(f"{path}.backup.{backup_ip}.vrf",
                                            f"VRF should be verified: '{vrf}'")
         
@@ -3250,7 +3253,18 @@ def validate_file(input_file: Path) -> ValidationResult:
         return result
     
     validator = NVUEValidator()
-    return validator.validate(yaml_content, str(input_file))
+    try:
+        return validator.validate(yaml_content, str(input_file))
+    except Exception as e:
+        # Malformed-but-parseable YAML must not abort the whole run:
+        # report it as a per-file error and let other files validate.
+        result = ValidationResult(str(input_file))
+        result.issues.append(ValidationIssue(
+            Severity.ERROR,
+            "validator",
+            f"validator internal error: {e}"
+        ))
+        return result
 
 
 def validate_directory(input_dir: Path) -> List[ValidationResult]:

@@ -1129,6 +1129,85 @@ class AskAiInsightsTest(unittest.TestCase):
         bgp = next(row for row in timeline["coverage"] if row["source"] == "bgp")
         self.assertEqual(bgp["status"], "invalid")
 
+    def test_pretty_printed_producer_history_is_accepted(self):
+        # bgp_analyzer.save_bgp_history writes json.dumps(data, indent=2); the
+        # streaming parser must accept inter-token whitespace between tokens.
+        data = {
+            "bgp_history": {
+                "leaf01": [
+                    {
+                        "timestamp": NOW - 200,
+                        "established_count": 8,
+                        "down_count": 0,
+                        "warning_neighbors": 0,
+                        "critical_neighbors": 0,
+                    },
+                    {
+                        "timestamp": NOW - 100,
+                        "established_count": 7,
+                        "down_count": 1,
+                        "warning_neighbors": 0,
+                        "critical_neighbors": 1,
+                    },
+                ]
+            },
+            "current_bgp_stats": {},
+            "collection_coverage": {
+                "expected_devices": 1,
+                "current_bgp_devices": 1,
+                "unavailable_bgp_devices": [],
+            },
+            "flap_baselines": {},
+            "flap_events": {},
+            "update_storms": {},
+            "last_update": NOW - 100,
+        }
+        path = self.monitor / "bgp_history.json"
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        events, coverage = ai_insights._extract_bgp(path, NOW - 3600, NOW, 1800)
+        self.assertNotEqual(coverage["status"], "invalid")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["severity"], "critical")
+        self.assertIn("down 0→1", events[0]["summary"])
+
+        flap_path = self.monitor / "flap_history.json"
+        flap_path.write_text(json.dumps({
+            "flapping_hist": {"leaf01:swp1": [[NOW - 70, 20, 2, NOW - 370, 300]]}
+        }, indent=2), encoding="utf-8")
+        events, coverage = ai_insights._extract_flaps(flap_path, NOW - 3600, NOW, 1800)
+        self.assertNotEqual(coverage["status"], "invalid")
+        self.assertEqual(
+            [(event["category"], event["device"], event["subject"]) for event in events],
+            [("link", "leaf01", "swp1")],
+        )
+
+    def test_whitespace_exemption_keeps_other_control_bytes_invalid(self):
+        path = self.monitor / "bgp_history.json"
+        # \t/\r\n between tokens are legal JSON whitespace and must parse.
+        path.write_bytes(
+            b'{\t"bgp_history":\r\n{"leaf01":\t[\r\n'
+            b'{"timestamp":%d,"down_count":0},\r\n'
+            b'\t{"timestamp":%d,"down_count":1}\r\n]\t}\r\n}'
+            % (int(NOW - 200), int(NOW - 100))
+        )
+        events, coverage = ai_insights._extract_bgp(path, NOW - 3600, NOW, 1800)
+        self.assertNotEqual(coverage["status"], "invalid")
+        self.assertEqual(len(events), 1)
+
+        # Every other bare control byte, and unescaped control bytes inside
+        # strings, must still be rejected.
+        for payload in (
+            b'{"bgp_history":{"leaf01":[\x01{"timestamp":1}]}}',
+            b'{"bgp_history":{"leaf01":[{"note":"a\nb","timestamp":1}]}}',
+        ):
+            with self.subTest(payload=payload):
+                path.write_bytes(payload)
+                events, coverage = ai_insights._extract_bgp(
+                    path, NOW - 3600, NOW, 1800
+                )
+                self.assertEqual(coverage["status"], "invalid")
+                self.assertEqual(events, [])
+
     def test_stream_parser_handles_chunk_boundaries_and_detects_mutation(self):
         self.write_monitor("pfc_ecn_history.json", {
             "history": {

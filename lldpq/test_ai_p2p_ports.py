@@ -91,6 +91,21 @@ class ResolvePortMapTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0]["peer_device"], "OOB-02")
 
+    def test_two_group_breakout_precise_row_wins_for_first_lane(self):
+        # 1/2/1's tolerant aliases include swp1s0, so only the group-fitted
+        # index may answer swp1s0 — independently of design row order (the
+        # tolerant lookup's first hit flips with the order).
+        rows = [
+            _conn("peer-b", "49", "SP-01", "1/2/1"),
+            _conn("peer-a", "49", "SP-01", "1/1/1"),
+        ]
+        for conns in (rows, list(reversed(rows))):
+            index = ai_p2p.build_port_index(conns)
+            hit = ai_p2p.lookup_by_device_port(index, "SP-01", "swp1s0")
+            self.assertIsNotNone(hit)
+            self.assertEqual(hit["port"], "1/1/1")
+            self.assertEqual(hit["peer_device"], "peer-a")
+
     def test_precise_index_wins_over_ambiguous_three_part_alias(self):
         conns = [
             # 3/3/1 tolerantly includes swp3s4, but with maxZ=4 its precise

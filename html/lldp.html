@@ -555,6 +555,7 @@
     <!-- jQuery and Select2 for device search -->
     <script src="/css/jquery-3.5.1.min.js"></script>
     <script src="/css/select2.min.js"></script>
+    <script src="/css/job-poll.js?v=20260821-1"></script>
 
     <script>
         let totalConnections = 0;
@@ -1120,12 +1121,19 @@
 
         function setP2pDesignStatus(status) {
             p2pDesignStatus = status;
+            updateCsvExportAvailability();
+        }
+
+        // The scoped-CSV click hook (lifecycle-scope.js) snapshots hidden rows
+        // before downloadCSV flushes pending chunks, so rows flushed by the
+        // export itself would bypass the Analysis Scope. Keep the button
+        // disabled until the chunked render has fully landed.
+        function updateCsvExportAvailability() {
             const button = document.getElementById('download-csv');
-            if (button) {
-                const loading = status === 'loading';
-                button.disabled = loading;
-                button.setAttribute('aria-busy', loading ? 'true' : 'false');
-            }
+            if (!button) return;
+            const loading = p2pDesignStatus === 'loading' || pendingConnectionsRender !== null;
+            button.disabled = loading;
+            button.setAttribute('aria-busy', loading ? 'true' : 'false');
         }
 
         function escHtml(v) {
@@ -1572,6 +1580,7 @@
                 requestAnimationFrame(appendConnectionsChunk);
             } else {
                 pendingConnectionsRender = null;
+                updateCsvExportAvailability();
             }
         }
 
@@ -1602,6 +1611,7 @@
             tbody.innerHTML = '';
             pendingConnectionsRender = { generation, ordered, next: 0 };
             appendConnectionsChunk();
+            updateCsvExportAvailability();
         }
 
         function parseLLDPReportData(data) {
@@ -2025,31 +2035,12 @@
 
         // Run LLDP Check Function.  Completion is tied to the opaque token
         // returned by the server; elapsed time is never treated as success.
-        const LLDP_JOB_STORAGE_KEY = 'lldpq.activeLldpJobToken';
-        let activeLLDPJobToken = null;
-        let lldpPollGeneration = 0;
-        let lldpPollTimer = null;
+        // The polling state machine and timers live in the shared
+        // css/job-poll.js module; this page supplies the UI callbacks.
         let lldpStatusNotification = null;
         // Set when the LLDP job finished but the new report failed to load;
         // the Retry button then reloads the report instead of starting a job.
         let lldpReportReloadRetryPending = false;
-
-        function setStoredLLDPToken(token) {
-            try {
-                if (token) sessionStorage.setItem(LLDP_JOB_STORAGE_KEY, token);
-                else sessionStorage.removeItem(LLDP_JOB_STORAGE_KEY);
-            } catch (_) {
-                // Private-storage restrictions must not break the live poll.
-            }
-        }
-
-        function getStoredLLDPToken() {
-            try {
-                return sessionStorage.getItem(LLDP_JOB_STORAGE_KEY) || '';
-            } catch (_) {
-                return '';
-            }
-        }
 
         function setLLDPButton(state, enabled) {
             const button = document.getElementById('run-lldp');
@@ -2145,112 +2136,64 @@
             }
         }
 
-        function scheduleLLDPStatusPoll(token, generation, delayMs) {
-            if (token !== activeLLDPJobToken || generation !== lldpPollGeneration) return;
-            if (lldpPollTimer) clearTimeout(lldpPollTimer);
-            lldpPollTimer = setTimeout(() => pollLLDPJob(token, generation), delayMs);
+        function dismissLLDPTracking() {
+            lldpJob.dismiss();
         }
 
-        async function pollLLDPJob(token, generation) {
-            if (token !== activeLLDPJobToken || generation !== lldpPollGeneration) return;
-            try {
-                const response = await fetch(`/trigger-lldp?token=${encodeURIComponent(token)}`, {
-                    method: 'GET',
-                    cache: 'no-store',
-                    headers: {
-                        'Accept': 'application/json',
-                        'Cache-Control': 'no-cache'
-                    }
-                });
-                const data = await response.json();
-                if ((response.status === 401 || response.status === 403) && data && data.success === false) {
-                    // auth-guard rejected the session. Polling with a dead
-                    // session can never succeed; stop instead of retrying.
-                    activeLLDPJobToken = null;
-                    lldpPollGeneration += 1;
-                    setLLDPButton('failure', true);
-                    updateLLDPNotification('failure', 'Session Expired',
-                        'Your session expired — log in again.',
-                        data.error || 'Status polling stopped; the job itself was not cancelled.');
-                    autoHideLLDPNotification();
-                    return;
-                }
-                if (data.status === 'error' && data.message === 'LLDP job was not found') {
-                    // A persisted session token may outlive the server-side TTL
-                    // or a restored installation.  This one response is
-                    // terminal for that token; network/auth/transient status
-                    // errors below remain retriable.
-                    setStoredLLDPToken('');
-                    activeLLDPJobToken = null;
-                    lldpPollGeneration += 1;
-                    setLLDPButton('failure', true);
-                    updateLLDPNotification('failure', 'LLDP Job Is No Longer Available',
-                        data.message, 'Start a new LLDP check to create a fresh tracked request.');
-                    autoHideLLDPNotification();
-                    return;
-                }
-                if (!response.ok || data.status === 'error') {
-                    throw new Error(data.error || data.message || `Status request failed (${response.status})`);
-                }
-                if (data.token !== token || token !== activeLLDPJobToken || generation !== lldpPollGeneration) {
-                    return; // Never let an older/different request reload this report.
-                }
+        function showLLDPDismissAction() {
+            if (!lldpStatusNotification) return;
+            const action = document.createElement('button');
+            action.type = 'button';
+            action.textContent = 'Dismiss tracking';
+            action.style.cssText = `
+                margin-top: 10px;
+                background: #404040;
+                color: #d4d4d4;
+                border: none;
+                padding: 6px 12px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 12px;
+            `;
+            action.addEventListener('click', dismissLLDPTracking);
+            lldpStatusNotification.append(document.createElement('br'), action);
+        }
 
-                const reason = data.reason || 'Waiting for LLDP status';
-                if (data.status === 'success') {
-                    // Clear the stored token before reloading the report, so a
-                    // failed refresh can never re-trigger a completed job loop
-                    // (same safety the full-page reload relied on).
-                    setStoredLLDPToken('');
-                    activeLLDPJobToken = null;
-                    lldpPollGeneration += 1;
-                    updateLLDPNotification('success', '✅ LLDP Check Complete',
-                        'The matching LLDP report completed successfully.', 'Loading the new report...');
-                    setLLDPButton('running', false);
-                    reloadLLDPReportInPlace();
-                    return;
-                }
-                const nowSeconds = Math.floor(Date.now() / 1000);
-                const statusAge = data.updated_at ? nowSeconds - data.updated_at : 0;
-                const retryOverdue = data.status === 'failure' && data.retry_scheduled &&
-                    data.next_retry_at && nowSeconds - data.next_retry_at > 300;
-                const queueDelayed = data.status === 'queued' && statusAge > 120;
-                const workerStalled = (data.status === 'running' && statusAge > 3600) || retryOverdue;
-                if (queueDelayed) {
-                    // Assets and LLDP share one serialized trigger daemon.  A
-                    // legitimate Assets collection can keep this request queued
-                    // for more than two minutes; queue age alone is not failure.
+        const lldpJob = window.LLDPqJobPoll.create({
+            triggerUrl: '/trigger-lldp',
+            storageKey: 'lldpq.activeLldpJobToken',
+            jobLabel: 'LLDP',
+            jobNotFoundMessage: 'LLDP job was not found',
+            waitingReason: 'Waiting for LLDP status',
+            callbacks: {
+                onTracked() {
                     setLLDPButton('queued', false);
-                    updateLLDPNotification('queued', 'LLDP Check Still Queued', reason,
-                        'The worker may be completing an earlier refresh. This request remains tracked.');
-                    scheduleLLDPStatusPoll(token, generation, 15000);
-                    return;
-                }
-                if (workerStalled) {
-                    setLLDPButton('failure', true);
-                    updateLLDPNotification('failure', 'LLDP Worker Appears Stalled', reason,
-                        'No timely lifecycle update was received. The job was not cancelled and this report is not considered complete.');
-                    scheduleLLDPStatusPoll(token, generation, 15000);
-                    return;
-                }
-                if (data.status === 'running') {
-                    setLLDPButton('running', false);
-                    updateLLDPNotification('running', 'LLDP Check Running', reason,
-                        `Attempt ${data.attempt || 1}; this page refreshes only after confirmed success.`);
-                    scheduleLLDPStatusPoll(token, generation, 2000);
-                    return;
-                }
-                if (data.status === 'queued') {
+                    updateLLDPNotification('queued', 'LLDP Check Queued',
+                        'The request was accepted and is waiting for the LLDP worker.',
+                        'This page refreshes only after confirmed success.');
+                },
+                onQueued(reason) {
                     setLLDPButton('queued', false);
                     updateLLDPNotification('queued', 'LLDP Check Queued', reason,
                         'Waiting for the matching request to start.');
-                    const queuedDelay = data.next_retry_at
-                        ? Math.max(2000, Math.min(10000, data.next_retry_at * 1000 - Date.now() + 500))
-                        : 2000;
-                    scheduleLLDPStatusPoll(token, generation, queuedDelay);
-                    return;
-                }
-                if (data.status === 'failure') {
+                },
+                onQueueDelayed(reason) {
+                    setLLDPButton('queued', false);
+                    updateLLDPNotification('queued', 'LLDP Check Still Queued', reason,
+                        'The worker may be completing an earlier refresh. This request remains tracked.');
+                },
+                onStalled(reason) {
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'LLDP Worker Appears Stalled', reason,
+                        'No timely lifecycle update was received. The job was not cancelled and this report is not considered complete.');
+                    showLLDPDismissAction();
+                },
+                onRunning(reason, data) {
+                    setLLDPButton('running', false);
+                    updateLLDPNotification('running', 'LLDP Check Running', reason,
+                        `Attempt ${data.attempt || 1}; this page refreshes only after confirmed success.`);
+                },
+                onFailure(reason, data) {
                     // A real failed attempt is visible immediately.  Existing
                     // daemon semantics still retry without a finite cap; leave
                     // the button usable and watch this token at low frequency.
@@ -2259,44 +2202,61 @@
                         ? `Automatic retry is scheduled (attempt ${data.attempt || 1}). You may start a newer request.`
                         : `Request ended after attempt ${data.attempt || 0}.`;
                     updateLLDPNotification('failure', 'LLDP Check Failed', reason, retryDetail);
-                    if (data.retry_scheduled) {
-                        const retryDelay = data.next_retry_at
-                            ? Math.max(5000, Math.min(30000, data.next_retry_at * 1000 - Date.now() + 1000))
-                            : 10000;
-                        scheduleLLDPStatusPoll(token, generation, retryDelay);
-                    } else {
-                        setStoredLLDPToken('');
-                        activeLLDPJobToken = null;
-                        autoHideLLDPNotification();
-                    }
-                    return;
+                    if (!data.retry_scheduled) autoHideLLDPNotification();
+                },
+                onSuccess() {
+                    // Stop tracking before reloading the report, so a failed
+                    // refresh can never re-trigger a completed job loop
+                    // (same safety the full-page reload relied on).
+                    lldpJob.stopTracking();
+                    updateLLDPNotification('success', '✅ LLDP Check Complete',
+                        'The matching LLDP report completed successfully.', 'Loading the new report...');
+                    setLLDPButton('running', false);
+                    reloadLLDPReportInPlace();
+                },
+                onJobMissing(data) {
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'LLDP Job Is No Longer Available',
+                        data.message, 'Start a new LLDP check to create a fresh tracked request.');
+                    autoHideLLDPNotification();
+                },
+                onAuthRejected(data) {
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'Session Expired',
+                        'Your session expired — log in again.',
+                        data.error || 'Status polling stopped; the job itself was not cancelled.');
+                    autoHideLLDPNotification();
+                },
+                onPollError(error) {
+                    console.error('❌ Error reading LLDP job status:', error);
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'LLDP Status Unavailable', error.message,
+                        'The report has not been treated as complete; status will be checked again.');
+                },
+                onSubmitStart() {
+                    setLLDPButton('queued', false);
+                },
+                onSubmitted(token) {
+                    console.log('✅ LLDP job queued:', token);
+                },
+                onSubmitError(error) {
+                    console.error('❌ Error starting LLDP check:', error);
+                    setLLDPButton('failure', true);
+                    updateLLDPNotification('failure', 'Could Not Start LLDP Check', error.message,
+                        'No report was treated as newly completed.');
+                    autoHideLLDPNotification();
+                },
+                onDismissed() {
+                    setLLDPButton('idle', true);
+                    updateLLDPNotification('queued', 'LLDP Tracking Dismissed',
+                        'Stopped tracking the previous LLDP check request.',
+                        'You can start a new check whenever you are ready.');
+                    autoHideLLDPNotification();
                 }
-                throw new Error(`Unknown LLDP job state: ${data.status}`);
-            } catch (error) {
-                if (token !== activeLLDPJobToken || generation !== lldpPollGeneration) return;
-                console.error('❌ Error reading LLDP job status:', error);
-                setLLDPButton('failure', true);
-                updateLLDPNotification('failure', 'LLDP Status Unavailable', error.message,
-                    'The report has not been treated as complete; status will be checked again.');
-                scheduleLLDPStatusPoll(token, generation, 5000);
             }
-        }
+        });
 
-        function trackLLDPJob(token) {
-            if (!/^[a-f0-9]{32}$/.test(token)) return false;
-            activeLLDPJobToken = token;
-            lldpPollGeneration += 1;
-            const generation = lldpPollGeneration;
-            setStoredLLDPToken(token);
-            setLLDPButton('queued', false);
-            updateLLDPNotification('queued', 'LLDP Check Queued',
-                'The request was accepted and is waiting for the LLDP worker.',
-                'This page refreshes only after confirmed success.');
-            scheduleLLDPStatusPoll(token, generation, 250);
-            return true;
-        }
-
-        async function runLLDPCheck() {
+        function runLLDPCheck() {
             if (lldpReportReloadRetryPending) {
                 // The last check already completed; re-fetch the published
                 // report instead of queueing a whole new collection.
@@ -2308,41 +2268,10 @@
                 reloadLLDPReportInPlace();
                 return;
             }
-            // Cancel/ignore all callbacks associated with an older token.
-            lldpPollGeneration += 1;
-            activeLLDPJobToken = null;
-            if (lldpPollTimer) clearTimeout(lldpPollTimer);
-            setLLDPButton('queued', false);
-            try {
-                const response = await fetch('/trigger-lldp', {
-                    method: 'POST',
-                    cache: 'no-store',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Cache-Control': 'no-cache'
-                    }
-                });
-                const data = await response.json();
-                if (!response.ok || data.status !== 'started' ||
-                    !/^[a-f0-9]{32}$/.test(data.token || '')) {
-                    throw new Error(data.error || data.message || 'Trigger failed');
-                }
-                console.log('✅ LLDP job queued:', data.token);
-                trackLLDPJob(data.token);
-            } catch (error) {
-                console.error('❌ Error starting LLDP check:', error);
-                setStoredLLDPToken('');
-                setLLDPButton('failure', true);
-                updateLLDPNotification('failure', 'Could Not Start LLDP Check', error.message,
-                    'No report was treated as newly completed.');
-                autoHideLLDPNotification();
-            }
+            lldpJob.submit();
         }
 
-        window.addEventListener('DOMContentLoaded', () => {
-            const pendingToken = getStoredLLDPToken();
-            if (/^[a-f0-9]{32}$/.test(pendingToken)) trackLLDPJob(pendingToken);
-        });
+        window.addEventListener('DOMContentLoaded', () => lldpJob.retrackStored());
 
         // CSV Download Function
         const CSV_HEADERS = Object.freeze([
@@ -2887,6 +2816,6 @@
             }
         })();
     </script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 </body>
 </html>

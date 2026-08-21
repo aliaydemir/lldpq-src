@@ -21,9 +21,12 @@ eval "$LLDPQ_CONFIG_ASSIGNMENTS" || \
     trigger_fatal "runtime configuration could not be applied"
 unset LLDPQ_CONFIG_ASSIGNMENTS
 LLDPQ_DIR="${LLDPQ_DIR:-$HOME/lldpq}"
-MONITOR_TRIGGER_FILE="${LLDPQ_MONITOR_TRIGGER_FILE:-/tmp/.monitor_web_trigger}"
-CONFIGS_TRIGGER_FILE="/tmp/.configs_web_trigger"
-TRANSCEIVER_TRIGGER_FILE="/tmp/.transceiver_web_trigger"
+# Web trigger tokens live outside sticky /tmp so an unprivileged local user
+# cannot pre-create the fixed filenames and pin the CGI's rename to EPERM.
+TRIGGER_TOKEN_DIR="/var/lib/lldpq/triggers"
+MONITOR_TRIGGER_FILE="${LLDPQ_MONITOR_TRIGGER_FILE:-$TRIGGER_TOKEN_DIR/.monitor_web_trigger}"
+CONFIGS_TRIGGER_FILE="$TRIGGER_TOKEN_DIR/.configs_web_trigger"
+TRANSCEIVER_TRIGGER_FILE="$TRIGGER_TOKEN_DIR/.transceiver_web_trigger"
 DAEMON_PID_FILE="${LLDPQ_TRIGGER_DAEMON_PID_FILE:-/tmp/lldp_trigger_daemon.pid}"
 DAEMON_LOCK_FILE="${LLDPQ_TRIGGER_DAEMON_LOCK_FILE:-/tmp/lldpq-trigger-daemon.lock}"
 CONFIGS_LOCK_FILE="/tmp/configs_running.lock"
@@ -70,6 +73,10 @@ CONFIGS_RETRY_BASE_SECONDS="${LLDPQ_CONFIG_RETRY_BASE_SECONDS:-30}"
 CONFIGS_RETRY_MAX_SECONDS="${LLDPQ_CONFIG_RETRY_MAX_SECONDS:-300}"
 TRIGGER_RETRY_BASE_SECONDS="${LLDPQ_TRIGGER_RETRY_BASE_SECONDS:-30}"
 TRIGGER_RETRY_MAX_SECONDS="${LLDPQ_TRIGGER_RETRY_MAX_SECONDS:-300}"
+# Web-triggered collections first wait for a collector this daemon did not
+# start (cron pipeline or an operator shell) to finish.  Bound that wait so a
+# wedged collector cannot stall job servicing indefinitely.
+TRIGGER_WAIT_MAX_SECONDS="${LLDPQ_TRIGGER_WAIT_MAX_SECONDS:-600}"
 LLDP_JOB_STATUS_TTL_SECONDS="${LLDPQ_LLDP_JOB_STATUS_TTL_SECONDS:-86400}"
 ASSETS_JOB_STATUS_TTL_SECONDS="${LLDPQ_ASSETS_JOB_STATUS_TTL_SECONDS:-$LLDP_JOB_STATUS_TTL_SECONDS}"
 case "$CONFIGS_RETRY_BASE_SECONDS" in
@@ -90,6 +97,9 @@ esac
 if (( TRIGGER_RETRY_MAX_SECONDS < TRIGGER_RETRY_BASE_SECONDS )); then
     TRIGGER_RETRY_MAX_SECONDS="$TRIGGER_RETRY_BASE_SECONDS"
 fi
+case "$TRIGGER_WAIT_MAX_SECONDS" in
+    ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_TRIGGER_WAIT_MAX_SECONDS" ;;
+esac
 case "$LLDP_JOB_STATUS_TTL_SECONDS" in
     ''|*[!0-9]*|0) trigger_fatal "invalid LLDPQ_LLDP_JOB_STATUS_TTL_SECONDS" ;;
 esac
@@ -299,6 +309,14 @@ ensure_assets_job_dir() {
     mkdir -p -m 2770 "$ASSETS_JOB_DIR" 2>/dev/null || return 1
     chmod 2770 "$ASSETS_JOB_DIR" 2>/dev/null || true
     [[ -d "$ASSETS_JOB_DIR" && -r "$ASSETS_JOB_DIR" && -w "$ASSETS_JOB_DIR" ]]
+}
+
+# Mutual lldpq/www-data group membership makes 2770 sufficient for the CGIs
+# to write tokens here without a chown this unprivileged account cannot do.
+ensure_trigger_token_dir() {
+    mkdir -p -m 2770 "$TRIGGER_TOKEN_DIR" 2>/dev/null || return 1
+    chmod 2770 "$TRIGGER_TOKEN_DIR" 2>/dev/null || true
+    [[ -d "$TRIGGER_TOKEN_DIR" && -r "$TRIGGER_TOKEN_DIR" && -w "$TRIGGER_TOKEN_DIR" ]]
 }
 
 # Atomically publish one complete token-specific lifecycle snapshot.  Readers
@@ -558,6 +576,12 @@ ensure_lldp_job_dir || \
     trigger_fatal "LLDP job directory is missing or not writable: $LLDP_JOB_DIR"
 ensure_assets_job_dir || \
     trigger_fatal "Assets job directory is missing or not writable: $ASSETS_JOB_DIR"
+# Defensive bootstrap for hosts upgraded before install.sh created the
+# directory. Non-fatal: a missing token directory only idles the on-demand
+# refresh buttons, never the job queues above.
+ensure_trigger_token_dir || \
+    printf 'lldpq-trigger: WARNING: trigger token directory unavailable: %s\n' \
+        "$TRIGGER_TOKEN_DIR" >&2
 
 # Hold one kernel lock for the daemon's entire lifetime.  A PID
 # check-then-write is not atomic and PID reuse can reject the real successor;
@@ -590,12 +614,32 @@ cleanup() {
 # Set trap for cleanup on exit
 trap cleanup SIGTERM SIGINT EXIT
 
-# Wait function to prevent conflicts
+# Wait for a collector this daemon did not start (cron pipeline or an operator
+# shell) to finish before launching our own copy.  Match only executed-command
+# forms -- "bash ./assets.sh", "/bin/bash /path/check-lldp.sh", "sh -x
+# check-lldp.sh" -- never a plain filename argument such as "vim
+# check-lldp.sh", which the old space-delimited pattern also caught.  The wait
+# is bounded: on timeout an optional excerpt is left for the caller's
+# published failure reason and the function returns nonzero, so the caller
+# skips the job through its normal failure path instead of hanging.
 wait_until_not_running() {
-    local script_name="${1#./}"
-    local pattern="(^|/|[[:space:]])${script_name}([[:space:]]|$)"
+    local script_name="${1#./}" excerpt_file="${2:-}"
+    local name_re="${script_name//./[.]}"
+    local pattern="^([^ ]*/)?((ba)?sh( -[^ ]*)* )?([^ ]*/)?${name_re}( |$)"
+    local waited=0
     while pgrep -f "$pattern" >/dev/null; do
+        if (( waited >= TRIGGER_WAIT_MAX_SECONDS )); then
+            printf 'lldpq-trigger: gave up after %ss waiting for another running %s\n' \
+                "$TRIGGER_WAIT_MAX_SECONDS" "$script_name" >&2
+            if [[ -n "$excerpt_file" ]]; then
+                printf 'timed out after %ss waiting for another running %s\n' \
+                    "$TRIGGER_WAIT_MAX_SECONDS" "$script_name" \
+                    > "$excerpt_file" 2>/dev/null || true
+            fi
+            return 1
+        fi
         sleep 2
+        waited=$((waited + 2))
     done
 }
 
@@ -614,9 +658,11 @@ run_under_monitor_lock() {
 
 refresh_lldp() {
     cd "$LLDPQ_DIR" || return 1
-    wait_until_not_running "./assets.sh"
+    # A wait timeout fails this attempt; the caller publishes the excerpt as
+    # the failure reason and retries on the normal bounded-backoff schedule.
+    wait_until_not_running "./assets.sh" "$LLDP_EXCERPT_FILE" || return 1
     run_logged_collector assets.sh "$LLDP_EXCERPT_FILE" ./assets.sh || return 1
-    wait_until_not_running "./check-lldp.sh"
+    wait_until_not_running "./check-lldp.sh" "$LLDP_EXCERPT_FILE" || return 1
     run_logged_collector check-lldp.sh "$LLDP_EXCERPT_FILE" ./check-lldp.sh
 }
 
@@ -765,7 +811,7 @@ process_lldp_jobs() {
 
 refresh_assets() {
     cd "$LLDPQ_DIR" || return 1
-    wait_until_not_running "./assets.sh"
+    wait_until_not_running "./assets.sh" "$ASSETS_EXCERPT_FILE" || return 1
     run_logged_collector assets.sh "$ASSETS_EXCERPT_FILE" ./assets.sh
 }
 
@@ -967,7 +1013,12 @@ refresh_monitor() (
         report_state=stale
         return 1
     fi
-    wait_until_not_running "./assets.sh"
+    if ! wait_until_not_running "./assets.sh"; then
+        mark_trigger_reports_stale \
+            "timed out waiting for another running assets.sh before web analysis" || true
+        report_state=stale
+        return 1
+    fi
     if ! run_logged_collector assets.sh "$MONITOR_EXCERPT_FILE" ./assets.sh; then
         detail=$(take_collector_excerpt "$MONITOR_EXCERPT_FILE")
         mark_trigger_reports_stale \
@@ -975,7 +1026,12 @@ refresh_monitor() (
         report_state=stale
         return 1
     fi
-    wait_until_not_running "./check-lldp.sh"
+    if ! wait_until_not_running "./check-lldp.sh"; then
+        mark_trigger_reports_stale \
+            "timed out waiting for another running check-lldp.sh before web analysis" || true
+        report_state=stale
+        return 1
+    fi
     if ! run_logged_collector check-lldp.sh "$MONITOR_EXCERPT_FILE" ./check-lldp.sh; then
         detail=$(take_collector_excerpt "$MONITOR_EXCERPT_FILE")
         mark_trigger_reports_stale \

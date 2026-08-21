@@ -1036,7 +1036,9 @@
             document.getElementById('edit-device').value = peer.device;
             document.getElementById('edit-vrf').value = peer.vrf;
             document.getElementById('edit-profile').value = peer.bgp_profile;
-            document.getElementById('edit-local-ip').value = peer.local_ip || '';
+            // Prefill with the full CIDR so the real prefix length round-trips
+            // (a bare IP would be re-normalized to /31 on save)
+            document.getElementById('edit-local-ip').value = peer.local_ip_cidr || peer.local_ip || '';
             document.getElementById('edit-remote-peer').value = peer.remote_peer;
             
             // Weight toggle

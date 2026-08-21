@@ -255,7 +255,12 @@ class RoutesAnalyzer:
                     if prev_total is not None else None
                 note = ""
                 severity = "ok"
-                if (prev_total is not None and prev_total >= DROP_MIN_ROUTES
+                # Anomaly detection only compares fresh snapshots: a stale
+                # scan freezes both sides, and re-comparing the frozen
+                # snapshot against the frozen pre-drop sample would re-record
+                # the same event on every run.
+                if (not self.scan_stale and prev_total is not None
+                        and prev_total >= DROP_MIN_ROUTES
                         and metrics["total"] < prev_total * (1 - DROP_FRACTION)):
                     severity = "critical"
                     note = "route count dropped %d → %d" % (
@@ -270,7 +275,8 @@ class RoutesAnalyzer:
 
             # A VRF that had routes in the previous sample but is absent now
             # (device still reporting) is a hard failure mode, not a zero row.
-            if isinstance(previous_vrfs, dict):
+            # Gated on scan freshness like the drop check above.
+            if not self.scan_stale and isinstance(previous_vrfs, dict):
                 for vrf in sorted(set(previous_vrfs) - set(current_vrfs),
                                   key=str.casefold):
                     prev_metrics = previous_vrfs.get(vrf)
@@ -1110,7 +1116,7 @@ document.addEventListener('DOMContentLoaded', function(){
 });
 </script>
 <script src="/p2p-alias.js"></script>
-<script src="/css/table-filter.js?v=20260803-tf-5"></script>
+<script src="/css/table-filter.js?v=20260821-tf-6"></script>
 <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

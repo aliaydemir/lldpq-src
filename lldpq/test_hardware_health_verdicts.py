@@ -9,11 +9,15 @@ claimed the hottest component in the box was healthy when it was never read.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -122,6 +126,113 @@ class CollectorContractTests(unittest.TestCase):
     def test_cpu_temperature_requires_a_positive_reading(self):
         self.assertIn(
             'if [ -n "$cpu_raw" ] && [ "$cpu_raw" -gt 0 ]; then', self.source
+        )
+
+
+class CollectionUnavailableExportTests(unittest.TestCase):
+    """An all-unreachable run must publish 'unavailable', never 'partial'.
+
+    process_hardware_data used to patch only the HTML and the summary JSON
+    after the fact, so export/hardware.{json,csv} kept the generator's
+    'partial'/'current' coverage while every sibling domain said 'unavailable'.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "monitor-results" / "hardware-data").mkdir(parents=True)
+        previous = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        # The generator must see the fixture, not a live install's manifest.
+        env_guard = mock.patch.dict(os.environ)
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
+        os.environ.pop("LLDPQ_COLLECTION_STATUS_FILE", None)
+        os.environ.pop("LLDPQ_ASSETS_FILE", None)
+
+    def read_export(self):
+        export = self.root / "monitor-results" / "export" / "hardware.json"
+        return json.loads(export.read_text(encoding="utf-8"))
+
+    def assert_sidecar_matches(self, artifact):
+        sidecar = artifact.with_name(artifact.name + ".sha256")
+        digest, name = sidecar.read_text(encoding="utf-8").split()
+        self.assertEqual(name, artifact.name)
+        self.assertEqual(
+            digest, hashlib.sha256(artifact.read_bytes()).hexdigest()
+        )
+
+    def test_the_export_publishes_unavailable_for_an_all_unreachable_run(self):
+        hardware.generate_hardware_html(collection_unavailable=True)
+        self.assertEqual(
+            self.read_export()["collection_status"], "unavailable"
+        )
+
+    def test_the_export_digest_sidecars_match_the_published_content(self):
+        hardware.generate_hardware_html(collection_unavailable=True)
+        export_dir = self.root / "monitor-results" / "export"
+        self.assert_sidecar_matches(export_dir / "hardware.json")
+        self.assert_sidecar_matches(export_dir / "hardware.csv")
+
+    def test_the_summary_says_unavailable_without_post_hoc_patching(self):
+        hardware.generate_hardware_html(collection_unavailable=True)
+        summary = json.loads(
+            (self.root / "monitor-results" / "summary"
+             / "hardware-summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(summary["collection_status"], "unavailable")
+
+    def test_a_reachable_run_keeps_its_computed_coverage_status(self):
+        hardware.generate_hardware_html()
+        self.assertEqual(self.read_export()["collection_status"], "current")
+
+    def test_the_command_line_flag_reaches_the_export(self):
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_DIR / "generate_hardware_html.py"),
+             "--collection-unavailable"],
+            capture_output=True, text=True, cwd=self.root, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.read_export()["collection_status"], "unavailable"
+        )
+
+    def test_process_hardware_data_forwards_the_verdict(self):
+        source = (SCRIPT_DIR / "process_hardware_data.py").read_text()
+        self.assertIn(
+            'generator_cmd.append("--collection-unavailable")', source
+        )
+        self.assertIn("if all_devices_unavailable:", source)
+
+
+class CsvExportContractTests(unittest.TestCase):
+    """The CSV export must exclude rows the table-filter funnels hid.
+
+    table-filter.js hides rows via the tf-hidden class, never via
+    style.display, so both the row filter and the '# Rows exported' count
+    in downloadCSV must check that class or the export silently includes
+    devices the operator filtered out.
+    """
+
+    def setUp(self):
+        self.source = (SCRIPT_DIR / "generate_hardware_html.py").read_text(
+            encoding="utf-8"
+        )
+
+    def test_the_row_filter_excludes_tf_hidden_rows(self):
+        self.assertIn(
+            "if (row.style.display !== 'none' && "
+            "!row.classList.contains('tf-hidden')) {",
+            self.source,
+        )
+
+    def test_the_exported_count_excludes_tf_hidden_rows(self):
+        self.assertIn(
+            "r => r.style.display !== 'none' && "
+            "!r.classList.contains('tf-hidden')).length;",
+            self.source,
         )
 
 

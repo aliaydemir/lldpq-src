@@ -16,7 +16,10 @@
 LLDPQ_GUARD_SESSIONS_DIR="/var/lib/lldpq/sessions"
 
 _guard_get_cookie() {
-    echo "$HTTP_COOKIE" | tr ';' '\n' | grep "lldpq_session=" | cut -d'=' -f2 | tr -d ' '
+    # Anchor to the exact cookie name and take the first match only, so a
+    # stale scoped cookie (e.g. old_lldpq_session or a Path-scoped duplicate)
+    # cannot pollute the extracted token.
+    echo "$HTTP_COOKIE" | tr ';' '\n' | grep -E '^[[:space:]]*lldpq_session=' | head -n1 | cut -d'=' -f2- | tr -d ' '
 }
 
 _guard_deny() {

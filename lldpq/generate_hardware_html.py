@@ -16,6 +16,7 @@ import os
 import re
 import html
 import statistics
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -1263,7 +1264,7 @@ def calculate_device_health_grade(device_name, device_data):
         return worst_known
     return "UNKNOWN"
 
-def generate_hardware_html():
+def generate_hardware_html(collection_unavailable=False):
     """Generate hardware analysis HTML using existing data"""
     
     # Parse assets.ini to get device model information
@@ -1369,6 +1370,13 @@ def generate_hardware_html():
         current_device_count < expected_devices or unknown_device_count > 0
     )
     coverage_status = "partial" if coverage_partial else "current"
+    # A run where every inventory device was unreachable publishes
+    # 'unavailable' in the machine-readable artifacts, matching the sibling
+    # domains. The HTML keeps coverage_status: process_hardware_data still
+    # inserts its post-hoc unavailable banner, which keys on that attribute.
+    published_status = (
+        "unavailable" if collection_unavailable else coverage_status
+    )
 
     # Identify the specific hosts that were expected but did not report a
     # current sample, so a partial run is never silently read as all-healthy.
@@ -2454,7 +2462,10 @@ def generate_hardware_html():
                 const table = document.getElementById('hardware-table');
                 const tbody = table.querySelector('tbody');
                 const rows = tbody.querySelectorAll('tr.hw-row');
-                const visibleCount = Array.from(rows).filter(r => r.style.display !== 'none').length;
+                // table-filter.js funnels hide rows via the tf-hidden class, never via
+                // style.display; the export must honor both so it matches the visible table.
+                const visibleCount = Array.from(rows).filter(
+                    r => r.style.display !== 'none' && !r.classList.contains('tf-hidden')).length;
                 const filtered = visibleCount !== rows.length;
 
                 // Comment header first so parsers that honor a leading '#' never
@@ -2474,9 +2485,9 @@ def generate_hardware_html():
                 // Column header follows the comment block.
                 csvContent += headers.join(',') + '\\n';
 
-                // Process each visible row
+                // Process each visible row (same predicate as visibleCount above)
                 rows.forEach(row => {
-                    if (row.style.display !== 'none') {
+                    if (row.style.display !== 'none' && !row.classList.contains('tf-hidden')) {
                         const cells = row.querySelectorAll('td');
                         if (cells.length >= 10) {
                             const rowData = [
@@ -2568,7 +2579,7 @@ def generate_hardware_html():
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""
@@ -2596,7 +2607,7 @@ def generate_hardware_html():
         json.dumps({
             "domain": "hardware",
             "generated_at": generated_at,
-            "collection_status": coverage_status,
+            "collection_status": published_status,
             **summary_counts,
         }) + "\n",
     )
@@ -2631,7 +2642,7 @@ def generate_hardware_html():
             for name, details in device_details.items()
         ],
         summary_counts,
-        coverage_status,
+        published_status,
         generated_at=generated_at,
     )
 
@@ -2659,4 +2670,9 @@ def generate_hardware_html():
     print(f"   - Unknown: {len(summary['unknown_devices'])}")
 
 if __name__ == "__main__":
-    generate_hardware_html()
+    # process_hardware_data computes the fabric-wide outcome before spawning
+    # this generator and passes it down, because the export/summary are
+    # written here — before its post-hoc unavailable marking could run.
+    generate_hardware_html(
+        collection_unavailable="--collection-unavailable" in sys.argv[1:]
+    )

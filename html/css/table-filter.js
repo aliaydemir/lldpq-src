@@ -221,7 +221,13 @@
         function applyFromList() {
             var boxes = listEl.querySelectorAll('input[type=checkbox]');
             var term = searchEl.value.trim();
-            var next = active === null ? new Set(values) : new Set(active);
+            // Intersect the persisted set with the values currently in the
+            // table: stale members surviving a tbody re-render must not
+            // inflate next.size into the everything-selected guard below.
+            // An explicitly-empty persisted set stays empty (hide-all).
+            var next = active === null
+                ? new Set(values)
+                : new Set(values.filter(function (v) { return active.has(v); }));
             boxes.forEach(function (cb) {
                 if (cb.checked) next.add(cb.value); else next.delete(cb.value);
             });

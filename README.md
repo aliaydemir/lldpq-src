@@ -1652,7 +1652,7 @@ Summary times are configured directly in `notifications.yaml`.
 ```
 cd ~/lldpq
 nano notifications.yaml                               # add webhook URLs + enable alerts
-python3 test_alerts.py                               # test configuration
+python3 verify_alerts.py                             # test configuration
 ```
 
 ### setup webhooks:

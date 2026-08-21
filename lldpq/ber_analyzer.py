@@ -76,6 +76,12 @@ class BERAnalyzer:
     TREND_ANALYSIS_POINTS = 10
     HISTORY_CONTEXT_POINTS = 2
     HISTORY_SYMBOL_CONTEXT_POINTS = 1
+    # A "worsening" trend verdict additionally requires the recent-window
+    # average density to reach this fraction of the GOOD/WARNING boundary
+    # (frame_density_warning_threshold), i.e. one decade below the warning
+    # zone.  Healthy ports hold a zero baseline, so a purely relative ratio
+    # would otherwise flag a single errored frame on a GOOD port.
+    TREND_DENSITY_FLOOR_RATIO = 0.1
     MAX_HISTORY_ENTRIES_PER_PORT = (
         TREND_ANALYSIS_POINTS
         + HISTORY_CONTEXT_POINTS
@@ -772,9 +778,18 @@ class BERAnalyzer:
         
         for port_name in list(self.ber_history.keys()):
             if port_name in self.ber_history:
+                entries = self.ber_history[port_name]
+                # Shards are external input: drop shape-corrupted entries so
+                # one malformed record cannot crash analyzer construction
+                # (per-entry containment, routes-history precedent).
+                if not isinstance(entries, list):
+                    del self.ber_history[port_name]
+                    continue
                 retained = [
-                    entry for entry in self.ber_history[port_name]
-                    if current_time - entry['timestamp'] <= retention_seconds
+                    entry for entry in entries
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get('timestamp'), (int, float))
+                    and current_time - entry['timestamp'] <= retention_seconds
                 ]
                 self.ber_history[port_name] = self._bound_port_history(retained)
                 
@@ -1111,12 +1126,19 @@ class BERAnalyzer:
         avg_first = sum(first_half) / len(first_half) if first_half else 0
         avg_second = sum(second_half) / len(second_half) if second_half else 0
         
-        change_ratio = (avg_second - avg_first) / (avg_first + 1e-15)  # Avoid division by zero
-        
+        # Floor the baseline so the reported ratio stays bounded: against the
+        # zero baseline that is the norm on healthy ports, a raw relative
+        # ratio would divide a single errored frame by ~1e-15.
+        density_floor = (self.config["frame_density_warning_threshold"]
+                         * self.TREND_DENSITY_FLOOR_RATIO)
+        change_ratio = (avg_second - avg_first) / max(avg_first, density_floor)
+
         if abs(change_ratio) < 0.1:
             trend = "stable"
         elif change_ratio > 0.1:
-            trend = "worsening" 
+            # Worsening only when the absolute level nears the warning zone;
+            # a rising but negligible density is still a stable port.
+            trend = "worsening" if avg_second >= density_floor else "stable"
         else:
             trend = "improving"
         
@@ -1829,7 +1851,11 @@ class BERAnalyzer:
                     meta_bits.append(f"errors Δ RX {delta_rx:,} / TX {delta_tx:,}")
                 change_ratio = details.get('change_ratio')
                 if isinstance(change_ratio, (int, float)) and change_ratio > 0:
-                    meta_bits.append(f"error density ×{change_ratio:.1f} vs baseline")
+                    # change_ratio is a relative delta (0.5 == +50%), not a
+                    # multiplier; render it as a signed percentage.
+                    meta_bits.append(
+                        f"error density +{change_ratio * 100:.0f}% vs baseline"
+                    )
 
                 # Remote end of the link from LLDP, so both ends of the cable
                 # can be inspected without leaving the page.
@@ -2987,7 +3013,7 @@ class BERAnalyzer:
         })();
     </script>
     <script src="/p2p-alias.js"></script>
-    <script src="/css/table-filter.js?v=20260803-tf-5"></script>
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script src="/css/analysis-guard.js?v=20260731-analysis-3"></script>
 </body>
 </html>"""

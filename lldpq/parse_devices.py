@@ -118,10 +118,19 @@ def get_all_devices(config):
             username = default_username
         elif isinstance(device_config, dict):
             # Extended format: IP: {hostname: x, username: y, role: z}
-            hostname = device_config.get('hostname', 'unknown')
+            hostname = device_config.get('hostname')
+            if hostname is None:
+                # A typo'd hostname key used to fall back to a literal
+                # 'unknown' device that was collected and SSH'd for real.
+                print(f"ERROR: Device {ip}: missing hostname key", file=sys.stderr)
+                sys.exit(1)
             username = device_config.get('username', default_username)
             role = device_config.get('role', None)
-            if role:
+            # YAML 'role: false' parses as bool False; treat it like null
+            # (no role) instead of the never-matchable string 'False'.
+            if role is None or role is False:
+                role = None
+            else:
                 role = str(role).lower()
         else:
             print(f"ERROR: Invalid device config for {ip}", file=sys.stderr)

@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -687,7 +688,7 @@ class SetupSafetyRecoverAllTests(unittest.TestCase):
             events.append("global")
             return os.open(os.devnull, os.O_RDONLY)
 
-        def inventory_lock(_path):
+        def inventory_lock(_path, **_kwargs):
             events.append("inventory")
             return os.open(os.devnull, os.O_RDONLY)
 
@@ -777,6 +778,125 @@ os.close(fd)
                 if waiter.poll() is None:
                     waiter.kill()
                     waiter.communicate()
+
+    def _hold_lock_in_subprocess(self, lock_path):
+        script = f"""
+import fcntl, os, sys
+fd = os.open({str(lock_path)!r}, os.O_RDWR | os.O_CREAT, 0o660)
+fcntl.flock(fd, fcntl.LOCK_EX)
+print('held', flush=True)
+sys.stdin.read()
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(holder.communicate)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_exclusive_wait_is_bounded_and_raises_busy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / ".inventory.lock"
+            self._hold_lock_in_subprocess(lock_path)
+            started = time.monotonic()
+            with self.assertRaises(SAFETY.SetupSafetyError) as caught:
+                SAFETY.acquire_inventory_lock(str(lock_path), timeout=0.3)
+            self.assertIn("busy", str(caught.exception))
+            self.assertLess(time.monotonic() - started, 5)
+
+    def test_save_devices_writer_refuses_with_busy_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / ".inventory.lock"
+            target = root / "devices.yaml"
+            target.write_text("devices: {}\n")
+            self._hold_lock_in_subprocess(lock_path)
+            argv = [
+                str(HELPER_PATH),
+                "save-devices",
+                "--target", str(target),
+                "--parser", str(root / "parse_devices.py"),
+                "--managed-root", str(root),
+                "--inventory-lock", str(lock_path),
+            ]
+            stdin = mock.Mock(buffer=io.BytesIO(b"devices: {}\n"))
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(sys, "stdin", stdin):
+                    with mock.patch.object(
+                        SAFETY, "INVENTORY_LOCK_WAIT_SECONDS", 0.3
+                    ):
+                        with mock.patch.object(
+                            SAFETY,
+                            "acquire_global_configuration_lock",
+                            side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
+                        ):
+                            with mock.patch(
+                                "sys.stdout", new_callable=io.StringIO
+                            ) as stdout:
+                                self.assertEqual(SAFETY._main(), 2)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["success"])
+            self.assertIn("busy", payload["error"])
+
+    def test_read_devices_takes_shared_bounded_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / ".inventory.lock"
+            target = root / "devices.yaml"
+            target.write_text("devices: {}\n")
+            recorded = {}
+
+            def record(path, shared=False, timeout=None):
+                recorded["shared"] = shared
+                recorded["timeout"] = timeout
+                return os.open(os.devnull, os.O_RDONLY)
+
+            argv = [
+                str(HELPER_PATH),
+                "read-devices",
+                "--target", str(target),
+                "--managed-root", str(root),
+                "--inventory-lock", str(lock_path),
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(
+                    SAFETY, "acquire_inventory_lock", side_effect=record
+                ):
+                    with mock.patch.object(
+                        SAFETY,
+                        "acquire_global_configuration_lock",
+                        side_effect=lambda: os.open(os.devnull, os.O_RDONLY),
+                    ):
+                        with mock.patch("sys.stdout", new_callable=io.StringIO):
+                            self.assertEqual(SAFETY._main(), 0)
+            self.assertTrue(recorded["shared"])
+            self.assertEqual(
+                recorded["timeout"], SAFETY.INVENTORY_LOCK_WAIT_SECONDS
+            )
+
+    def test_concurrent_shared_readers_do_not_serialize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / ".inventory.lock"
+            first = SAFETY.acquire_inventory_lock(
+                str(lock_path), shared=True, timeout=0.5
+            )
+            second = None
+            try:
+                # A second reader must be granted while the first still holds
+                # the lock; a writer must still be refused.
+                second = SAFETY.acquire_inventory_lock(
+                    str(lock_path), shared=True, timeout=0.5
+                )
+                with self.assertRaises(SAFETY.SetupSafetyError):
+                    SAFETY.acquire_inventory_lock(str(lock_path), timeout=0.3)
+            finally:
+                if second is not None:
+                    os.close(second)
+                os.close(first)
 
 
 class SetupCronScheduleContractTests(unittest.TestCase):
