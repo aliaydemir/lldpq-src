@@ -2363,20 +2363,25 @@
             return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
         }
 
+        // The file has to say what the operator is reading on screen, so the six
+        // device/port columns carry whatever setAliasedCell put in those very
+        // cells (lldp_export.ALIASED_CSV_COLUMNS pins the same indices for the
+        // headless ?p2p=1 export). The design join below stays on the report's
+        // own names — a label must not move a P2P metadata row.
         function canonicalConnectionRow(connection) {
             const status = determineLLDPStatus(connection);
             const design = activeP2pDesignFor(connection);
             const row = [
-                connection.localDevice,
-                connection.localPort,
-                connection.portStatus,
-                connection.expectedDevice,
-                connection.expectedPort,
-                connection.actualDevice,
-                connection.actualPort,
-                status.status,
-                status.health
-            ].map(displayValue);
+                aliasedLabel(connection.localDevice, deviceAliasLc),
+                aliasedLabel(connection.localPort, portAliasLc),
+                displayValue(connection.portStatus),
+                aliasedLabel(connection.expectedDevice, deviceAliasLc),
+                aliasedLabel(connection.expectedPort, portAliasLc),
+                aliasedLabel(connection.actualDevice, deviceAliasLc),
+                aliasedLabel(connection.actualPort, portAliasLc),
+                displayValue(status.status),
+                displayValue(status.health)
+            ];
             return row.concat(design ? [
                 design.sheet_name == null ? '' : design.sheet_name,
                 design.row_number == null ? '' : design.row_number,

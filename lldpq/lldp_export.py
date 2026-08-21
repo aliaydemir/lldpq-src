@@ -14,11 +14,18 @@ table order.  ``build_payload`` cross-checks the classification against
 ``LLDPReport.counts`` — the two encode the same contract, and a mismatch
 means one of them drifted, which must surface as a loud error, never as a
 silently wrong export.
+
+The page's Download CSV follows its "P2P" toggle, so the byte-parity is
+two-sided: ``build_csv(report)`` reproduces the toggle-off download, and
+``build_csv(report, aliases=...)`` — the ``?p2p=1`` request — reproduces the
+toggle-on one, where the six device/port columns carry the operator-facing
+field labels from display-aliases.json.  Only the JSON payload is
+alias-free by design: it is the canonical machine view.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
 import ai_p2p
 import export_artifacts
@@ -32,6 +39,21 @@ CSV_HEADERS = (
     "Expected Port", "Active Neighbor", "Active Port", "Status",
     "Connection Health", "P2P Sheet", "P2P Line", "P2P SEQ",
 )
+
+# display-aliases.json sections, keyed by the column family they label.
+ALIAS_NAMESPACES = ("devices", "interfaces")
+
+# CSV column index -> alias namespace.  These are exactly the six columns the
+# page renders through setAliasedCell (html/lldp.html:1516-1533); Port Status,
+# Status, Connection Health and the P2P design columns are never aliased.
+ALIASED_CSV_COLUMNS = {
+    0: "devices",     # Local Device
+    1: "interfaces",  # Local Port
+    3: "devices",     # Expected Neighbor
+    4: "interfaces",  # Expected Port
+    5: "devices",     # Active Neighbor
+    6: "interfaces",  # Active Port
+}
 
 # Fresh-page default table order (html/lldp.html LLDP_STATUS_PRIORITY).
 _STATUS_PRIORITY = {"FAILED": 0, "NO INFO": 1, "WARNING": 2, "SUCCESS": 3}
@@ -179,10 +201,51 @@ def _optional_csv_field(value: Any) -> str:
     return export_artifacts.csv_field(text) if text else ""
 
 
-def build_csv(report: LLDPReport, p2p_design: Any = None) -> str:
-    """Byte-parity with the page's Download CSV of the freshly loaded table."""
+def alias_maps(aliases: Any) -> dict[str, dict[str, str]]:
+    """{namespace: {lower(real name): label}} from display-aliases.json.
+
+    Port of loadDisplayAliases + rebuildAliasLc (html/lldp.html:620-663):
+    absent or malformed alias data is simply no aliases, real names match
+    case-insensitively, and only the string labels the alias editor can write
+    (setup_safety.normalize_aliases) count as a label.
+    """
+    sections = aliases if isinstance(aliases, Mapping) else {}
+    maps: dict[str, dict[str, str]] = {}
+    for namespace in ALIAS_NAMESPACES:
+        section = sections.get(namespace)
+        entries = section.items() if isinstance(section, Mapping) else ()
+        maps[namespace] = {
+            name.lower(): label
+            for name, label in entries
+            if isinstance(name, str) and name and isinstance(label, str)
+        }
+    return maps
+
+
+def _aliased(value: Any, alias_lc: Mapping[str, str]) -> Any:
+    """aliasedLabel (html/lldp.html:637) for a request that opted in.
+
+    An empty map returns the cell untouched, so the unaliased export stays
+    byte-identical; an empty label falls back to the canonical value the same
+    way the page's ``p2pNamesOn && alias`` does.
+    """
+    if not alias_lc:
+        return value
+    return alias_lc.get(export_artifacts.display_value(value).lower()) or value
+
+
+def build_csv(
+    report: LLDPReport, p2p_design: Any = None, aliases: Any = None
+) -> str:
+    """Byte-parity with the page's Download CSV of the freshly loaded table.
+
+    ``aliases`` is the parsed display-aliases.json for a request that asked
+    for the operator-facing field labels (the page's "P2P: On" state).  The
+    default reproduces the toggle-off download byte for byte.
+    """
     items = classified_rows(report)
     p2p_index = _build_p2p_index(p2p_design)
+    maps = alias_maps(aliases)
     lines = [",".join(export_artifacts.csv_field(h) for h in CSV_HEADERS)]
     for row, status, health in items:
         cells = [
@@ -190,6 +253,10 @@ def build_csv(report: LLDPReport, p2p_design: Any = None) -> str:
             row.expected_device, row.expected_port,
             row.actual_device, row.actual_port, status, health,
         ]
+        for index, namespace in ALIASED_CSV_COLUMNS.items():
+            cells[index] = _aliased(cells[index], maps[namespace])
+        # The design join keys on the report's own names, never the labels:
+        # aliasing is display text and must not move a P2P metadata row.
         design = ai_p2p.lookup_by_device_port(
             p2p_index, row.local_device, row.local_port
         )
@@ -212,9 +279,12 @@ def build_csv(report: LLDPReport, p2p_design: Any = None) -> str:
 
 
 __all__ = (
+    "ALIASED_CSV_COLUMNS",
+    "ALIAS_NAMESPACES",
     "CSV_HEADERS",
     "DOMAIN",
     "LLDPExportDriftError",
+    "alias_maps",
     "build_csv",
     "build_payload",
     "classified_rows",

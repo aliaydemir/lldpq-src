@@ -8,6 +8,13 @@
 # session, and they exist precisely for headless automation (curl | jq).
 # If that posture ever changes, source auth-guard.sh + require_auth here and
 # pass HTTP_COOKIE through in the nginx location blocks.
+#
+# export_csv accepts one optional query parameter, p2p=1, which reproduces the
+# page's Download CSV with its "P2P" toggle ON: the six device/port columns
+# carry the display-aliases.json field labels instead of the report's own
+# names.  It selects a rendering mode only — same columns, same rows, same
+# public data, so the posture above is unchanged.  export_json has no such
+# mode: the JSON payload is the canonical machine view.
 
 json_error() {
     local status=$1 message=$2
@@ -32,6 +39,19 @@ case "$FORMAT" in
     json|csv) ;;
     *) json_error "500 Internal Server Error" "Unsupported export format" ;;
 esac
+
+# Strict opt-in: only a whole p2p=1 parameter counts.  The separator anchors
+# reject p2p=0/p2p=true/p2p=1x and any longer key or value that merely
+# contains it, so an unrecognized query never silently changes the bytes a
+# headless consumer already pins.
+p2p_aliases_requested() {
+    [[ "&${QUERY_STRING:-}&" =~ \&p2p=1\& ]]
+}
+
+P2P_ALIASES=0
+if p2p_aliases_requested; then
+    P2P_ALIASES=1
+fi
 
 # Load allowlisted config data through the fixed, root-owned parser.  A partial
 # upgrade must fail explicitly instead of guessing paths.
@@ -59,7 +79,8 @@ if [[ ! -r "$REPORT_FILE" ]]; then
 fi
 
 P2P_DESIGN_FILE="$WEB_ROOT/monitor-results/active-p2p.json"
-export REPORT_FILE P2P_DESIGN_FILE FORMAT
+ALIAS_FILE="$WEB_ROOT/display-aliases.json"
+export REPORT_FILE P2P_DESIGN_FILE ALIAS_FILE FORMAT P2P_ALIASES
 PYTHONPATH="$LLDPQ_DIR:$WEB_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 <<'PYTHON'
 import json
 import os
@@ -100,6 +121,22 @@ def load_active_p2p():
         return None
 
 
+def load_display_aliases():
+    """The alias file for a p2p=1 request, else None (canonical export).
+
+    Missing, unreadable or malformed alias data is no aliases at all — the
+    same tolerance the page's loadDisplayAliases applies — so the export
+    still renders, just with the report's own names.
+    """
+    if os.environ.get("P2P_ALIASES") != "1":
+        return None
+    try:
+        with open(os.environ["ALIAS_FILE"], encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, UnicodeError, ValueError):
+        return {}
+
+
 try:
     report = load_lldp_report(os.environ["REPORT_FILE"])
 except (LLDPReportError, OSError, UnicodeError) as exc:
@@ -111,13 +148,19 @@ common = [NO_STORE, f"X-LLDPQ-Report-Created: {created}"]
 
 try:
     if os.environ.get("FORMAT") == "csv":
+        aliases = load_display_aliases()
         body = lldp_export.build_csv(
-            report, p2p_design=load_active_p2p()
+            report, p2p_design=load_active_p2p(), aliases=aliases
         ).encode("utf-8")
         stamp = re.sub(r"[^0-9A-Za-z._-]", "_", created)
+        # A literal picked from the parsed flag, never request text: the two
+        # renderings land in two files instead of overwriting each other, and
+        # the filename stays as inert as the sanitized stamp.
+        mode = "_P2P" if aliases is not None else ""
         headers = [
             "Content-Type: text/csv; charset=utf-8",
-            f'Content-Disposition: attachment; filename="LLDP_Report_{stamp}.csv"',
+            "Content-Disposition: attachment; "
+            f'filename="LLDP_Report{mode}_{stamp}.csv"',
             *common,
         ]
     else:

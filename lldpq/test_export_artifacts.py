@@ -7,6 +7,13 @@ export's byte-parity with lldp.html's Download CSV (golden file over every
 classification branch), and monitor.sh's transaction contract for the new
 export artifacts (legacy_v5 snapshot recovery, per-scope validation and
 overlay coverage).
+
+The LLDP byte-parity is two-sided, because the page's Download CSV follows
+its "P2P" display-alias toggle: the toggle-off download is pinned against
+GOLDEN_CSV / no query parameter, and the toggle-on download against
+GOLDEN_ALIASED_CSV / ?p2p=1.  Both goldens run through the real CGI as well,
+so the shell that parses the parameter and loads display-aliases.json is
+covered end to end and not just the library underneath it.
 """
 
 import csv
@@ -14,6 +21,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +39,8 @@ import lldp_export
 from lldp_report import parse_lldp_report
 
 MONITOR = SCRIPT_DIR / "monitor.sh"
+CONFIG_HELPER = ROOT / "bin" / "lldpq-config"
+LLDP_EXPORT_CGI = ROOT / "html" / "lldp-export-api.sh"
 EXPORT_CGIS = tuple(
     ROOT / "html" / name
     for name in ("export-api.sh", "lldp-export-api.sh", "ai-export-api.sh")
@@ -295,12 +305,78 @@ GOLDEN_CSV = (
 )
 
 
+# The alias file behind GOLDEN_ALIASED_CSV.  Every entry earns its place: the
+# casing differences prove the lookup is case-insensitive, the cross-namespace
+# entries would surface immediately if the device and interface maps were ever
+# interchanged, and the punctuation exercises the formula guard and RFC-4180
+# escaping on operator-supplied text.
+GOLDEN_ALIASES = {
+    "devices": {
+        "LEAF-01": "RACK-A-LEAF",     # file casing differs from the report's
+        "spine-01": "CORE-A",
+        "swp1": "PORT-NAME-IN-THE-DEVICE-MAP",
+    },
+    "interfaces": {
+        "SWP1": "M1",                 # file casing differs from the report's
+        "swp4": "=M4",                # a label that looks like a formula
+        "swp9": "M,9",                # a label that needs RFC-4180 quoting
+        "swp10": "M10",
+        "leaf-01": "DEVICE-NAME-IN-THE-PORT-MAP",
+    },
+}
+
+# GOLDEN_CSV as lldp.html downloads it with "P2P: On": same rows in the same
+# order, the six device/port columns relabeled.  spine-02 and most ports have
+# no alias and keep the report's own name; the missing sentinels stay N/A.
+GOLDEN_ALIASED_CSV = (
+    "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
+    "Active Neighbor,Active Port,Status,Connection Health,"
+    "P2P Sheet,P2P Line,P2P SEQ\r\n"
+    "RACK-A-LEAF,'=M4,DOWN,CORE-A,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,\r\n"
+    "RACK-A-LEAF,N/A,UP,CORE-A,swp18,CORE-A,swp18,FAILED,"
+    "Local Port Not Defined,,,\r\n"
+    "RACK-A-LEAF,swp2,UP,CORE-A,swp11,N/A,N/A,NO INFO,"
+    "No LLDP Response Received,,,\r\n"
+    "RACK-A-LEAF,swp3,DOWN,CORE-A,swp12,N/A,N/A,NO INFO,"
+    "Local Port is DOWN,,,\r\n"
+    "RACK-A-LEAF,swp5,UP,CORE-A,swp14,CORE-A,swp15,WARNING,"
+    '"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
+    "RACK-A-LEAF,swp6,UP,CORE-A,swp16,spine-02,swp16,WARNING,"
+    '"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
+    "RACK-A-LEAF,swp7,UP,CORE-A,swp17,N/A,N/A,WARNING,"
+    "Unexpected Connection,,,\r\n"
+    'RACK-A-LEAF,"M,9",UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
+    '"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
+    "RACK-A-LEAF,M1,UP,CORE-A,M10,CORE-A,M10,SUCCESS,"
+    "LLDP Connection Verified,,,\r\n"
+)
+
+# JS alias map -> display-aliases.json section, asserted against lldp.html's
+# own wiring by AliasedColumnContractTests rather than trusted here.
+BROWSER_ALIAS_MAPS = {"deviceAliasLc": "devices", "portAliasLc": "interfaces"}
+
+
 def _csv_rows(text):
     return list(csv.reader(io.StringIO(text, newline="")))
 
 
 def _source_between(source, start, end):
     return source.split(start, 1)[1].split(end, 1)[0]
+
+
+def _extract_function(source: str, name: str) -> str:
+    start = source.index("\n%s() {" % name) + 1
+    end = source.index("\n}", start) + 2
+    return source[start:end]
+
+
+def _require(needle, haystack=LLDP_HTML, label="html/lldp.html"):
+    """Locate a marker, reporting one line instead of dumping the file.
+
+    lldp.html is a few hundred KB; a bare assertIn buries the real message.
+    """
+    if needle not in haystack:
+        raise AssertionError(f"{label} no longer contains: {needle!r}")
 
 
 class LLDPExportGoldenTests(unittest.TestCase):
@@ -419,6 +495,187 @@ swp3s4 Pass right swp49 right swp49 UP
         self.assertEqual(statuses, sorted(statuses, key=order.__getitem__))
 
 
+class LLDPAliasedExportGoldenTests(unittest.TestCase):
+    """The ?p2p=1 rendering: the page's Download CSV with the toggle ON."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.report = parse_lldp_report(GOLDEN_INI)
+
+    def _aliased(self, aliases=None):
+        return lldp_export.build_csv(
+            self.report,
+            aliases=GOLDEN_ALIASES if aliases is None else aliases,
+        )
+
+    def test_csv_matches_toggled_download_semantics(self):
+        self.assertEqual(self._aliased(), GOLDEN_ALIASED_CSV)
+
+    def test_header_and_column_count_are_identical_in_both_modes(self):
+        plain = _csv_rows(lldp_export.build_csv(self.report))
+        aliased = _csv_rows(self._aliased())
+        self.assertEqual(aliased[0], plain[0])
+        self.assertEqual(aliased[0], list(lldp_export.CSV_HEADERS))
+        self.assertEqual(len(aliased), len(plain))
+        for index, (left, right) in enumerate(zip(plain, aliased)):
+            self.assertEqual(len(left), len(right), f"row {index} width")
+            self.assertEqual(len(right), len(lldp_export.CSV_HEADERS))
+
+    def test_the_toggle_changes_only_the_declared_columns(self):
+        plain = _csv_rows(lldp_export.build_csv(self.report))
+        aliased = _csv_rows(self._aliased())
+        allowed = set(lldp_export.ALIASED_CSV_COLUMNS)
+        touched = set()
+        for row_index, (left, right) in enumerate(zip(plain, aliased)):
+            differing = {
+                column for column, (a, b) in enumerate(zip(left, right))
+                if a != b
+            }
+            self.assertLessEqual(
+                differing, allowed,
+                f"row {row_index} changed outside the aliased columns",
+            )
+            touched |= differing
+        # ...and the golden really exercises every one of them, so a column
+        # silently dropping out of the aliasing cannot pass unnoticed.
+        self.assertEqual(touched, allowed)
+
+    def test_device_and_port_namespaces_are_not_interchanged(self):
+        text = self._aliased()
+        self.assertNotIn("PORT-NAME-IN-THE-DEVICE-MAP", text)
+        self.assertNotIn("DEVICE-NAME-IN-THE-PORT-MAP", text)
+        for row in _csv_rows(text)[1:]:
+            self.assertEqual(row[0], "RACK-A-LEAF")
+
+    def test_case_insensitive_alias_matching(self):
+        # 'LEAF-01'/'SWP1' in the file, 'leaf-01'/'swp1' in the report.
+        row = next(r for r in _csv_rows(self._aliased())[1:] if r[7] == "SUCCESS")
+        self.assertEqual(row[0], "RACK-A-LEAF")
+        self.assertEqual(row[1], "M1")
+
+    def test_value_without_an_alias_keeps_its_canonical_rendering(self):
+        rows = _csv_rows(self._aliased())[1:]
+        row = next(r for r in rows if r[5] == "spine-02")
+        self.assertEqual(row[1], "swp6")     # no alias -> report's own name
+        self.assertEqual(row[4], "swp16")
+        missing = next(r for r in rows if r[1] == "swp2")
+        self.assertEqual(missing[5], "N/A")  # missing sentinel, not a label
+        self.assertEqual(missing[6], "N/A")
+
+    def test_a_label_that_looks_like_a_formula_stays_guarded_and_escaped(self):
+        text = self._aliased()
+        rows = _csv_rows(text)
+        formula = next(r for r in rows[1:] if r[4] == "swp13")
+        self.assertEqual(formula[1], "'=M4")
+        quoted = next(r for r in rows[1:] if r[4] == "'=swp19")
+        self.assertEqual(quoted[1], "M,9")
+        self.assertIn("'=M4", text)
+        self.assertIn('"M,9"', text)
+
+    def test_status_and_health_columns_never_carry_labels(self):
+        # The health message embeds the report's names on purpose: it is
+        # evidence about the wiring, not a field label.
+        row = next(
+            r for r in _csv_rows(self._aliased())[1:]
+            if r[8].startswith("Wrong Device")
+        )
+        self.assertEqual(
+            row[8], "Wrong Device: Expected spine-01, Got spine-02"
+        )
+        self.assertEqual(row[2], "UP")
+        self.assertEqual(row[7], "WARNING")
+
+    def test_p2p_design_columns_are_unchanged_by_the_toggle(self):
+        design = {"connections": [{
+            "source_name": "leaf-01", "source_port": "swp5",
+            "dest_name": "spine-01", "dest_port": "swp14",
+            "sheet_name": "GB300-9-16", "row_number": 184, "seq": "2778",
+            "connection_type": "general", "network_type": "eth",
+        }]}
+        # Relabel the very device:port the design is keyed on: the join must
+        # still hit, because it reads the report's names, not the labels.
+        aliases = {
+            "devices": {"leaf-01": "RACK-A"},
+            "interfaces": {"swp5": "M5"},
+        }
+        plain = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
+        aliased = _csv_rows(
+            lldp_export.build_csv(
+                self.report, p2p_design=design, aliases=aliases
+            )
+        )
+        matched = next(row for row in aliased[1:] if row[1] == "M5")
+        self.assertEqual(matched[0], "RACK-A")
+        self.assertEqual(matched[-3:], ["GB300-9-16", "184", "2778"])
+        self.assertEqual(
+            [row[-3:] for row in aliased], [row[-3:] for row in plain]
+        )
+
+    def test_absent_or_unusable_alias_data_degrades_to_the_canonical_export(self):
+        plain = lldp_export.build_csv(self.report)
+        for aliases in (
+            None,                                   # no opt-in at all
+            {},                                     # the installed default
+            {"interfaces": {}, "devices": {}},
+            {"devices": None, "interfaces": "nope"},  # malformed sections
+            ["devices", "interfaces"],              # malformed document
+            "",
+            {"devices": {"leaf-01": ""}},           # empty label -> fall back
+            {"devices": {"": "X"}},                 # empty real name
+            {"devices": {"leaf-01": None}},         # non-string label
+            {"nonsense": {"leaf-01": "X"}},         # unknown section only
+        ):
+            with self.subTest(aliases=aliases):
+                self.assertEqual(lldp_export.build_csv(
+                    self.report, aliases=aliases), plain)
+
+    def test_a_label_for_the_missing_sentinel_applies_as_it_does_on_screen(self):
+        # aliasedLabel looks up displayValue(v), so an 'N/A' key relabels the
+        # empty cells too.  Pinned because the browser cannot help doing this
+        # and the two sides have to agree even on the quirk.
+        rows = _csv_rows(
+            lldp_export.build_csv(
+                self.report,
+                aliases={"interfaces": {"n/a": "UNPATCHED"}},
+            )
+        )
+        no_local_port = next(
+            row for row in rows[1:] if row[8] == "Local Port Not Defined"
+        )
+        self.assertEqual(no_local_port[1], "UNPATCHED")
+        no_neighbor = next(row for row in rows[1:] if row[4] == "swp13")
+        self.assertEqual(no_neighbor[6], "UNPATCHED")
+        # The device columns read the other namespace and stay untouched.
+        self.assertEqual(no_neighbor[5], "N/A")
+
+    def test_only_the_declared_indices_are_aliased(self):
+        """Probe every column at once: what build_csv does is the contract."""
+        report = parse_lldp_report(
+            """Created on 2026-08-21 00-00-00
+========== c0 ==========
+Port Status Exp-Nbr Exp-Nbr-Port Act-Nbr Act-Nbr-Port Port-Status
+----------
+c1 Pass c3 c4 c5 c6 UP
+"""
+        )
+        canonical = _csv_rows(lldp_export.build_csv(report))[1]
+        # Every canonical cell has a label in BOTH namespaces, so any column
+        # reading the wrong map — or reading one it should not — shows up.
+        aliases = {
+            namespace: {cell: f"{namespace}:{cell}" for cell in canonical}
+            for namespace in lldp_export.ALIAS_NAMESPACES
+        }
+        expected = [
+            f"{lldp_export.ALIASED_CSV_COLUMNS[index]}:{cell}"
+            if index in lldp_export.ALIASED_CSV_COLUMNS else cell
+            for index, cell in enumerate(canonical)
+        ]
+        self.assertEqual(
+            _csv_rows(lldp_export.build_csv(report, aliases=aliases))[1],
+            expected,
+        )
+
+
 class LLDPBrowserP2PExportContractTests(unittest.TestCase):
     def test_browser_and_headless_csv_headers_are_equal(self):
         match = re.search(
@@ -446,7 +703,31 @@ class LLDPBrowserP2PExportContractTests(unittest.TestCase):
             "lookupByDevicePort(p2pIndex, conn.localDevice, conn.localPort)",
             join,
         )
-        self.assertNotIn("p2pNamesOn", canonical + join)
+        # The device/port columns follow the toggle, but the design join that
+        # fills P2P Sheet/Line/SEQ must keep keying on the report's own names.
+        self.assertNotIn("p2pNamesOn", join)
+        self.assertNotIn("aliasedLabel", join)
+        for cell in ("design.sheet_name", "design.row_number", "design.seq"):
+            self.assertIn(cell, canonical)
+        self.assertNotIn("aliasedLabel(design", canonical)
+
+    def test_download_waits_for_the_aliases_before_it_can_be_clicked(self):
+        # download-csv ships disabled and only setP2pDesignStatus re-enables it
+        # (pinned above), and the design fetch that settles that status is
+        # chained behind loadDisplayAliases.  So the labels are always in place
+        # before the first click is possible, and the CSV cannot disagree with
+        # the table it was generated from.
+        boot = _source_between(
+            LLDP_HTML,
+            "window.addEventListener('load', function() {",
+            "// ===== Topology Editor Functions =====",
+        )
+        chained = _source_between(
+            boot, "loadDisplayAliases().then(() => {", "});"
+        )
+        self.assertIn("loadP2pDesign();", chained)
+        self.assertIn("loadLLDPData();", chained)
+        self.assertNotIn("loadP2pDesign();", boot.split("loadDisplayAliases")[0])
 
     def test_failed_design_load_reenables_download(self):
         button = re.search(
@@ -490,18 +771,259 @@ class LLDPBrowserP2PExportContractTests(unittest.TestCase):
         self.assertIn("p2p_design=load_active_p2p()", LLDP_EXPORT_API)
 
 
+class AliasedColumnContractTests(unittest.TestCase):
+    """The page and the headless export must alias the very same columns.
+
+    Three descriptions of one contract — the rendered cells, the browser's CSV
+    row, and lldp_export.ALIASED_CSV_COLUMNS — so none of them can drift on
+    its own and quietly relabel a column in only one of the two downloads.
+    """
+
+    def _rendered_columns(self):
+        """{cell index: JS alias map} from the setAliasedCell calls."""
+        return {
+            int(index): name
+            for index, name in re.findall(
+                r"setAliasedCell\(row\.insertCell\((\d+)\),"
+                r"\s*connection\.\w+,\s*(\w+)\)",
+                LLDP_HTML,
+            )
+        }
+
+    def _csv_columns(self):
+        """{column index: JS alias map} from canonicalConnectionRow's array."""
+        array = _source_between(
+            _source_between(
+                LLDP_HTML,
+                "function canonicalConnectionRow(connection)",
+                "function buildLLDPCSV(connections)",
+            ),
+            "const row = [",
+            "];",
+        )
+        columns = {}
+        for index, element in enumerate(array.split(",\n")):
+            match = re.search(r"aliasedLabel\([^,]+,\s*(\w+)\)", element)
+            if match:
+                columns[index] = match.group(1)
+        return columns
+
+    def test_the_page_exports_exactly_the_columns_it_renders_aliased(self):
+        rendered = self._rendered_columns()
+        self.assertEqual(len(rendered), 6, "setAliasedCell calls not found")
+        self.assertEqual(self._csv_columns(), rendered)
+
+    def test_the_headless_export_declares_the_same_columns(self):
+        self.assertEqual(
+            {
+                index: BROWSER_ALIAS_MAPS[name]
+                for index, name in self._csv_columns().items()
+            },
+            dict(lldp_export.ALIASED_CSV_COLUMNS),
+        )
+
+    def test_each_js_map_still_carries_the_namespace_it_is_matched_to(self):
+        # BROWSER_ALIAS_MAPS is only meaningful while lldp.html keeps wiring
+        # each display-aliases.json section to that map, case-folded.
+        _require("portAliasMap = (d.interfaces && typeof d.interfaces === 'object')")
+        _require("deviceAliasMap = (d.devices && typeof d.devices === 'object')")
+        _require("portAliasLc[k.toLowerCase()] = portAliasMap[k]")
+        _require("deviceAliasLc[k.toLowerCase()] = deviceAliasMap[k]")
+        self.assertEqual(
+            set(BROWSER_ALIAS_MAPS.values()),
+            set(lldp_export.ALIAS_NAMESPACES),
+        )
+
+    def test_a_label_cannot_bypass_the_browser_formula_guard(self):
+        # An alias is operator-supplied text, so every exported cell has to
+        # keep going through csvField/spreadsheetSafeValue.
+        builder = _source_between(
+            LLDP_HTML,
+            "function buildLLDPCSV(connections)",
+            "function renderedConnectionsInTableOrder()",
+        )
+        self.assertIn(
+            ".map((value, index) => csvField(value, index >= p2pColumnStart))",
+            builder,
+        )
+        guard = _source_between(
+            LLDP_HTML,
+            "function spreadsheetSafeValue(value, blankMissing = false)",
+            "function canonicalConnectionRow(connection)",
+        )
+        self.assertIn(r"/^\s*[=+\-@]/.test(text) ? `'${text}` : text", guard)
+        self.assertIn(r'/[",\r\n]/.test(text)', guard)
+        self.assertIn(r'text.replace(/"/g,', guard)
+
+
+def _cgi_environment(**overrides):
+    """A CGI env that a developer's own shell variables cannot perturb."""
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key not in (
+            "QUERY_STRING", "REQUEST_METHOD",
+            "LLDPQ_EXPORT_FORMAT", "LLDPQ_CONFIG_HELPER",
+        )
+    }
+    environment.update(overrides)
+    return environment
+
+
+class LLDPExportQueryParameterTests(unittest.TestCase):
+    """p2p=1 is the only accepted spelling; anything else stays canonical."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.function = _extract_function(
+            LLDP_EXPORT_API, "p2p_aliases_requested"
+        )
+
+    def _requested(self, query):
+        script = self.function + (
+            "\nif p2p_aliases_requested; then echo ON; else echo OFF; fi\n"
+        )
+        environment = _cgi_environment()
+        if query is not None:
+            environment["QUERY_STRING"] = query
+        result = subprocess.run(
+            ["bash", "-c", script], env=environment,
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_the_opt_in_is_recognised_anywhere_in_the_query(self):
+        for query in ("p2p=1", "p2p=1&x=2", "x=2&p2p=1", "a=b&p2p=1&c=d",
+                      "p2p=1&"):
+            with self.subTest(query=query):
+                self.assertEqual(self._requested(query), "ON")
+
+    def test_an_absent_or_empty_query_stays_canonical(self):
+        self.assertEqual(self._requested(None), "OFF")
+        self.assertEqual(self._requested(""), "OFF")
+
+    def test_near_misses_and_hostile_values_stay_canonical(self):
+        # The separator anchors reject every partial key or value, and the
+        # value is only ever matched, never expanded or executed, so shell
+        # and SQL punctuation are just characters that fail to match.
+        for query in (
+            "p2p=0", "p2p=true", "p2p=yes", "p2p=on", "p2p=01", "p2p=10",
+            "p2p=1x", "p2p =1", "xp2p=1", "foo=p2p=1", "P2P=1", "p2p",
+            "p2p=", "p2p=1%0A", "p2p=$(echo 1)", "p2p=`echo 1`",
+            "p2p=1;echo pwned", "p2p=1' OR '1'='1", "p2p=1\np2p=1",
+            "../../etc/passwd&p2p=2", "p2p=" + "1" * 4096,
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self._requested(query), "OFF")
+
+
+class LLDPExportCgiTests(unittest.TestCase):
+    """The installed CGI end to end: parameter, alias file, both goldens."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.web = root / "web"
+        self.web.mkdir()
+        # PYTHONPATH carries WEB_ROOT exactly as the installed tree does, and
+        # ai_p2p.py lives beside the CGI there.
+        shutil.copy2(ROOT / "html" / "ai_p2p.py", self.web / "ai_p2p.py")
+        (self.web / "lldp_results.ini").write_text(GOLDEN_INI, encoding="utf-8")
+        config = root / "lldpq.conf"
+        config.write_text(
+            f"LLDPQ_DIR={SCRIPT_DIR}\nWEB_ROOT={self.web}\n", encoding="utf-8"
+        )
+        self.helper = root / "helper"
+        self.helper.write_text(
+            "#!/usr/bin/env bash\n"
+            f'exec "{CONFIG_HELPER}" "$@" --config "{config}"\n',
+            encoding="utf-8",
+        )
+        self.helper.chmod(0o755)
+
+    def _write_aliases(self, content):
+        (self.web / "display-aliases.json").write_text(
+            content, encoding="utf-8"
+        )
+
+    def _get(self, query=None, export_format="csv"):
+        environment = _cgi_environment(
+            LLDPQ_CONFIG_HELPER=str(self.helper),
+            LLDPQ_EXPORT_FORMAT=export_format,
+            REQUEST_METHOD="GET",
+        )
+        if query is not None:
+            environment["QUERY_STRING"] = query
+        result = subprocess.run(
+            ["bash", str(LLDP_EXPORT_CGI)], env=environment,
+            capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        # Bytes, not text: the CSV's CRLF line endings are part of the contract.
+        headers, body = result.stdout.split(b"\n\n", 1)
+        self.assertIn(b"Status: 200 OK", headers)
+        return headers.decode("utf-8"), body.decode("utf-8")
+
+    def test_a_default_request_serves_the_canonical_golden(self):
+        self._write_aliases(json.dumps(GOLDEN_ALIASES))
+        headers, body = self._get()
+        self.assertEqual(body, GOLDEN_CSV)
+        self.assertIn('filename="LLDP_Report_2026-07-16_10-40-03.csv"', headers)
+
+    def test_the_opt_in_serves_the_aliased_golden(self):
+        self._write_aliases(json.dumps(GOLDEN_ALIASES))
+        headers, body = self._get("p2p=1")
+        self.assertEqual(body, GOLDEN_ALIASED_CSV)
+        self.assertIn(
+            'filename="LLDP_Report_P2P_2026-07-16_10-40-03.csv"', headers
+        )
+
+    def test_a_hostile_query_serves_the_canonical_bytes_and_filename(self):
+        self._write_aliases(json.dumps(GOLDEN_ALIASES))
+        for query in ("p2p=2", "p2p=1x", "foo=p2p=1", "p2p=1;echo pwned",
+                      "p2p=../../etc/passwd"):
+            with self.subTest(query=query):
+                headers, body = self._get(query)
+                self.assertEqual(body, GOLDEN_CSV)
+                self.assertIn(
+                    'filename="LLDP_Report_2026-07-16_10-40-03.csv"', headers
+                )
+
+    def test_an_unusable_alias_file_degrades_to_the_canonical_bytes(self):
+        for content in ("", "{", "[]", "null", '{"devices": 3}', "\x00"):
+            with self.subTest(content=content):
+                self._write_aliases(content)
+                _headers, body = self._get("p2p=1")
+                self.assertEqual(body, GOLDEN_CSV)
+
+    def test_a_missing_alias_file_degrades_to_the_canonical_bytes(self):
+        # The installer and docker-entrypoint.sh both create the file; a
+        # hand-managed web root must still not turn the export into a 500.
+        self.assertFalse((self.web / "display-aliases.json").exists())
+        headers, body = self._get("p2p=1")
+        self.assertEqual(body, GOLDEN_CSV)
+        # The filename reports the rendering that was asked for; that nothing
+        # is configured to relabel is what makes the bytes canonical.
+        self.assertIn(
+            'filename="LLDP_Report_P2P_2026-07-16_10-40-03.csv"', headers
+        )
+
+    def test_the_json_export_has_no_alias_mode(self):
+        self._write_aliases(json.dumps(GOLDEN_ALIASES))
+        _headers, canonical = self._get(export_format="json")
+        _headers, opted_in = self._get("p2p=1", export_format="json")
+        self.assertEqual(canonical, opted_in)
+        self.assertNotIn("RACK-A-LEAF", canonical)
+        self.assertIn("leaf-01", canonical)
+
+
 def _extract_array(source: str, name: str) -> list[str]:
     match = re.search(rf"\n{name}=\((.*?)\n\)", source, re.DOTALL)
     if match is None:
         raise AssertionError(f"array {name} not found in monitor.sh")
     body = re.sub(r"#[^\n]*", "", match.group(1))
     return body.split()
-
-
-def _extract_function(source: str, name: str) -> str:
-    start = source.index("\n%s() {" % name) + 1
-    end = source.index("\n}", start) + 2
-    return source[start:end]
 
 
 class MonitorExportContractTests(unittest.TestCase):

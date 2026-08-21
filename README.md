@@ -561,7 +561,7 @@ publish; use the index when that state is expected.
 |---|---|---|---|
 | `/export_json` | JSON | Generated on request | Discovery/freshness index; no CSV form |
 | `/lldp_results/export_json` | JSON | Generated on request from published `lldp_results.ini` | Counts and classified wiring rows |
-| `/lldp_results/export_csv` | CSV | Generated on request | Byte-equivalent to the LLDP page's default problems-first Download CSV |
+| `/lldp_results/export_csv` | CSV | Generated on request | Byte-equivalent to the LLDP page's default problems-first Download CSV; optional `?p2p=1` renders the display-alias labels |
 | `/bgp/export_json`, `/bgp/export_csv` | JSON / CSV | Atomic monitor artifact | BGP rows; JSON `extra.evpn` contains the EVPN VNI/route summary |
 | `/evpn-mh/export_json`, `/evpn-mh/export_csv` | JSON / CSV | Atomic monitor artifact | Ethernet Segment/PE/LACP/DF findings |
 | `/duplicate/export_json`, `/duplicate/export_csv` | JSON / CSV | Atomic monitor artifact | IP, MAC and APIPA findings |
@@ -792,7 +792,8 @@ The complete version-1 registry is:
   stays machine-parseable.
 - Monitor CSV downloads use `lldpq_<domain>_export.csv`; transceiver uses
   `lldpq_transceiver_export.csv`; LLDP uses
-  `LLDP_Report_<report-created>.csv`.
+  `LLDP_Report_<report-created>.csv`, or
+  `LLDP_Report_P2P_<report-created>.csv` for `?p2p=1`.
 
 ```bash
 base=http://<host>
@@ -805,11 +806,36 @@ curl -fSJO "$base/lldp_results/export_csv"
 curl -fsS "$base/pfc-ecn/export_csv" -o pfc-ecn.csv
 ```
 
+### LLDP display-alias labels (`?p2p=1`)
+
+The LLDP page's `P2P` toggle swaps device and port names for the field labels
+configured in Setup, and its Download CSV follows the toggle. The headless CSV
+reproduces both renderings:
+
+| Request | Local/Expected/Active device and port columns |
+|---|---|
+| `/lldp_results/export_csv` | The names the report itself carries (page toggle OFF) |
+| `/lldp_results/export_csv?p2p=1` | The configured field labels (page toggle ON) |
+
+```bash
+# Cabling-team view: field labels where one is configured
+curl -fSJO "http://<host>/lldp_results/export_csv?p2p=1"
+```
+
+`p2p=1` is the only accepted spelling; any other value or key is ignored and
+serves the canonical rendering. Only the six device/port columns change —
+header row, column count, row order, `Port Status`, `Status`,
+`Connection Health` and the `P2P Sheet`/`P2P Line`/`P2P SEQ` design columns are
+identical in both modes, and a name with no configured label keeps the name the
+report carries. With no labels configured, the two renderings are byte-equal.
+`/lldp_results/export_json` has no alias mode: it is the canonical machine view.
+
 ### Querying and automation examples
 
-Exports are full current snapshots. There are no server-side query parameters
-for filtering, pagination, lifecycle scope, time range, or format selection;
-JSON vs CSV is selected by the path. Apply filters client-side:
+Exports are full current snapshots. Apart from the LLDP CSV's `p2p=1` rendering
+switch above, there are no server-side query parameters for filtering,
+pagination, lifecycle scope, time range, or format selection; JSON vs CSV is
+selected by the path. Apply filters client-side:
 
 ```bash
 base=http://<host>
