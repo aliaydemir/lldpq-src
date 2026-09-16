@@ -110,8 +110,20 @@ class GuardFixture:
         self.real = self.real_dir / "dhcpd"
         self.guard = self.root / "lldpq-dhcpd-guard"
         self.state = self.root / "docker-dhcp-runtime.env"
-        self.config = self.root / "dhcpd.conf"
-        self.hosts = self.root / "dhcpd.hosts"
+        self.dhcp_dir = self.root / "etc-dhcp"
+        self.dhcp_dir.mkdir()
+        self.persistent_dir = self.root / "persistent-system-config"
+        self.persistent_dir.mkdir()
+        self.source_config = self.persistent_dir / "dhcpd.conf"
+        self.source_hosts = self.persistent_dir / "dhcpd.hosts"
+        self.source_config.touch()
+        self.source_hosts.touch()
+        self.config = self.dhcp_dir / "dhcpd.conf"
+        self.hosts = self.dhcp_dir / "dhcpd.hosts"
+        self.config.symlink_to(self.source_config)
+        self.hosts.symlink_to(self.source_hosts)
+        self.runtime_config = self.dhcp_dir / ".lldpq-runtime.conf"
+        self.runtime_hosts = self.dhcp_dir / ".lldpq-runtime.hosts"
         self.calls = self.root / "dhcpd.calls"
         self.interface = "test0"
         self.server_ip = "192.0.2.10"
@@ -172,14 +184,22 @@ class GuardFixture:
         self.config.write_text(
             f"option www-server {target};\n"
             f'option default-url "http://{target}/";\n'
-            f'option cumulus-provision-url "http://{target}/ztp.sh";\n',
+            f'option cumulus-provision-url "http://{target}/ztp.sh";\n'
+            f'include "{self.hosts}";\n',
             encoding="utf-8",
         )
 
-    def _render_guard(self) -> None:
+    def _render_guard(
+        self,
+        *,
+        default_config: Path | None = None,
+        provisioning_hosts: Path | None = None,
+        max_input_bytes: int = 8 * 1024 * 1024,
+    ) -> None:
         command = (
             guard_function_source()
-            + '\n_render_dhcp_start_guard "$1" "$2" "$3" "$4" "$5"\n'
+            + '\n_render_dhcp_start_guard "$1" "$2" "$3" "$4" "$5" '
+            '"$6" "$7" "$8" "$9" "${10}"\n'
         )
         result = subprocess.run(
             [
@@ -190,8 +210,13 @@ class GuardFixture:
                 str(self.guard),
                 str(self.real),
                 str(self.state),
-                str(self.config),
-                str(self.hosts),
+                str(default_config or self.config),
+                str(provisioning_hosts or self.hosts),
+                str(self.runtime_config),
+                str(self.runtime_hosts),
+                str(os.geteuid()),
+                str(os.getegid()),
+                str(max_input_bytes),
             ],
             capture_output=True,
             text=True,
@@ -282,7 +307,7 @@ class DockerDhcpGuardFunctionalTests(unittest.TestCase):
         self.assertIn("invalid DHCP configuration", result.stderr)
         self.assertEqual(
             fixture.recorded_calls(),
-            [f"<-t><-cf><{fixture.config}>"],
+            [f"<-t><-cf><{fixture.runtime_config}>"],
         )
 
     def test_provisioning_option_mismatch_is_refused(self):
@@ -297,22 +322,209 @@ class DockerDhcpGuardFunctionalTests(unittest.TestCase):
         self.assertIn("invalid DHCP provisioning override", result.stderr)
         self.assertEqual(
             fixture.recorded_calls(),
-            [f"<-t><-cf><{fixture.config}>"],
+            [f"<-t><-cf><{fixture.runtime_config}>"],
         )
 
-    def test_valid_host_mode_executes_real_dhcpd_with_unchanged_start_args(self):
+    def test_symlinked_sources_are_copied_to_regular_runtime_snapshots(self):
         fixture = GuardFixture(self)
-        arguments = ("-d", "-cf", str(fixture.config), fixture.interface)
+        source_config = (
+            b"# bytes before the managed include stay exact\r\n"
+            + f'include\t"{fixture.hosts}" ; # managed\r\n'.encode()
+            + b"# bytes after it also stay exact\r\n"
+        )
+        source_hosts = b"# reservations\r\nhost leaf { fixed-address 192.0.2.20; }\r\n"
+        fixture.config.write_bytes(source_config)
+        fixture.hosts.write_bytes(source_hosts)
 
-        result = fixture.run(*arguments)
+        result = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(fixture.config.is_symlink())
+        self.assertTrue(fixture.hosts.is_symlink())
+        self.assertFalse(fixture.runtime_config.is_symlink())
+        self.assertFalse(fixture.runtime_hosts.is_symlink())
+        self.assertTrue(stat.S_ISREG(os.lstat(fixture.runtime_config).st_mode))
+        self.assertTrue(stat.S_ISREG(os.lstat(fixture.runtime_hosts).st_mode))
+        self.assertEqual(
+            stat.S_IMODE(fixture.runtime_config.stat().st_mode), 0o644
+        )
+        self.assertEqual(
+            stat.S_IMODE(fixture.runtime_hosts.stat().st_mode), 0o644
+        )
+        self.assertEqual(fixture.runtime_config.stat().st_uid, os.geteuid())
+        self.assertEqual(fixture.runtime_config.stat().st_gid, os.getegid())
+        self.assertEqual(fixture.runtime_hosts.stat().st_uid, os.geteuid())
+        self.assertEqual(fixture.runtime_hosts.stat().st_gid, os.getegid())
+        self.assertEqual(fixture.runtime_hosts.read_bytes(), source_hosts)
+        expected_config = source_config.replace(
+            os.fsencode(str(fixture.hosts)),
+            os.fsencode(str(fixture.runtime_hosts)),
+            1,
+        )
+        self.assertEqual(fixture.runtime_config.read_bytes(), expected_config)
+        self.assertEqual(fixture.config.read_bytes(), source_config)
+        self.assertEqual(fixture.hosts.read_bytes(), source_hosts)
+
+    def test_direct_source_paths_outside_runtime_directory_are_supported(self):
+        fixture = GuardFixture(self)
+        fixture.source_config.write_text(
+            f'include "{fixture.source_hosts}";\n', encoding="utf-8"
+        )
+        fixture.source_hosts.write_text("# direct source\n", encoding="utf-8")
+        fixture._render_guard(
+            default_config=fixture.source_config,
+            provisioning_hosts=fixture.source_hosts,
+        )
+
+        result = fixture.run("--lldpq-validate-only")
 
         self.assertEqual(result.returncode, 0, result.stderr[:300])
         self.assertEqual(
             fixture.recorded_calls(),
+            [f"<-t><-cf><{fixture.runtime_config}>"],
+        )
+        self.assertEqual(
+            fixture.runtime_hosts.read_text(encoding="utf-8"),
+            "# direct source\n",
+        )
+        self.assertIn(
+            f'include "{fixture.runtime_hosts}";',
+            fixture.runtime_config.read_text(encoding="utf-8"),
+        )
+
+    def test_valid_host_mode_replaces_only_config_value_in_start_args(self):
+        fixture = GuardFixture(self)
+        arguments = (
+            "-4",
+            "-d",
+            "-q",
+            "-cf",
+            str(fixture.config),
+            "--no-pid",
+            fixture.interface,
+        )
+
+        result = fixture.run(*arguments)
+
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        expected_start = list(arguments)
+        expected_start[expected_start.index("-cf") + 1] = str(
+            fixture.runtime_config
+        )
+        self.assertEqual(
+            fixture.recorded_calls(),
             [
-                f"<-t><-cf><{fixture.config}>",
-                "".join(f"<{argument}>" for argument in arguments),
+                f"<-t><-cf><{fixture.runtime_config}>",
+                "".join(f"<{argument}>" for argument in expected_start),
             ],
+        )
+        self.assertTrue(fixture.runtime_config.exists())
+        self.assertTrue(fixture.runtime_hosts.exists())
+
+    def test_validate_only_works_while_disabled_and_never_starts_daemon(self):
+        fixture = GuardFixture(self)
+        fixture.write_state(enabled="false", mode="disabled")
+
+        result = fixture.run(
+            "--lldpq-validate-only", "-cf", str(fixture.config)
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertEqual(
+            fixture.recorded_calls(),
+            [f"<-t><-cf><{fixture.runtime_config}>"],
+        )
+        self.assertNotIn("--lldpq-validate-only", fixture.recorded_calls()[0])
+
+    def test_invalid_missing_and_multiple_managed_includes_fail_closed(self):
+        cases = {
+            "missing": "# no include\n",
+            "invalid": f'include "{self.id()}.other";\n',
+            "multiple": None,
+        }
+        for label, content in cases.items():
+            with self.subTest(label=label):
+                fixture = GuardFixture(self)
+                if content is None:
+                    content = (
+                        f'include "{fixture.hosts}";\n'
+                        f'include "{fixture.hosts}";\n'
+                    )
+                fixture.config.write_text(content, encoding="utf-8")
+
+                result = fixture.run("--lldpq-validate-only")
+
+                self.assertEqual(result.returncode, 78, result.stderr[:300])
+                self.assertIn("managed hosts include", result.stderr)
+                self.assertEqual(fixture.recorded_calls(), [])
+                self.assertFalse(fixture.runtime_config.exists())
+                self.assertFalse(fixture.runtime_hosts.exists())
+
+    def test_missing_source_hosts_fails_before_runtime_activation(self):
+        fixture = GuardFixture(self)
+        fixture.source_hosts.unlink()
+
+        result = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(result.returncode, 78, result.stderr[:300])
+        self.assertIn("source hosts", result.stderr)
+        self.assertEqual(fixture.recorded_calls(), [])
+        self.assertFalse(fixture.runtime_config.exists())
+        self.assertFalse(fixture.runtime_hosts.exists())
+
+    def test_oversized_source_fails_before_runtime_activation(self):
+        fixture = GuardFixture(self)
+        fixture._render_guard(max_input_bytes=64)
+
+        result = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(result.returncode, 78, result.stderr[:300])
+        self.assertIn("source config is too large", result.stderr)
+        self.assertEqual(fixture.recorded_calls(), [])
+        self.assertFalse(fixture.runtime_config.exists())
+        self.assertFalse(fixture.runtime_hosts.exists())
+
+    def test_runtime_symlink_is_refused_without_modifying_its_target(self):
+        fixture = GuardFixture(self)
+        victim = fixture.root / "victim"
+        victim.write_bytes(b"must stay unchanged\n")
+        fixture.runtime_config.symlink_to(victim)
+
+        result = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(result.returncode, 78, result.stderr[:300])
+        self.assertIn("unsafe runtime target", result.stderr)
+        self.assertTrue(fixture.runtime_config.is_symlink())
+        self.assertEqual(victim.read_bytes(), b"must stay unchanged\n")
+        self.assertEqual(fixture.recorded_calls(), [])
+
+    def test_runtime_nonregular_target_fails_before_any_activation(self):
+        fixture = GuardFixture(self)
+        fixture.runtime_hosts.mkdir()
+
+        result = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(result.returncode, 78, result.stderr[:300])
+        self.assertIn("unsafe runtime target", result.stderr)
+        self.assertTrue(fixture.runtime_hosts.is_dir())
+        self.assertFalse(fixture.runtime_config.exists())
+        self.assertEqual(fixture.recorded_calls(), [])
+
+    def test_each_validation_atomically_replaces_and_retains_snapshots(self):
+        fixture = GuardFixture(self)
+        first = fixture.run("--lldpq-validate-only")
+        self.assertEqual(first.returncode, 0, first.stderr[:300])
+        first_config_inode = fixture.runtime_config.stat().st_ino
+        first_hosts_inode = fixture.runtime_hosts.stat().st_ino
+        fixture.hosts.write_bytes(b"# changed reservations\n")
+
+        second = fixture.run("--lldpq-validate-only")
+
+        self.assertEqual(second.returncode, 0, second.stderr[:300])
+        self.assertNotEqual(fixture.runtime_config.stat().st_ino, first_config_inode)
+        self.assertNotEqual(fixture.runtime_hosts.stat().st_ino, first_hosts_inode)
+        self.assertEqual(
+            fixture.runtime_hosts.read_bytes(), b"# changed reservations\n"
         )
 
 
@@ -499,13 +711,85 @@ class DockerDhcpGuardInstallerTests(unittest.TestCase):
             source.index('mv -f "$staged_guard" "$guard_path"'),
         )
 
+    def test_runtime_snapshots_default_to_fixed_root_owned_0644_files(self):
+        source = guard_function_source()
+        with tempfile.TemporaryDirectory() as temporary:
+            rendered = Path(temporary) / "guard"
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    source + '\n_render_dhcp_start_guard "$1"\n',
+                    "render-default-guard",
+                    str(rendered),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr[:300])
+            guard = rendered.read_text(encoding="utf-8")
+        require_text(
+            guard,
+            "RUNTIME_CONFIG=/etc/dhcp/.lldpq-runtime.conf",
+            "runtime config path",
+        )
+        require_text(
+            guard,
+            "RUNTIME_HOSTS=/etc/dhcp/.lldpq-runtime.hosts",
+            "runtime hosts path",
+        )
+        require_text(guard, "RUNTIME_OWNER_UID=0", "runtime owner uid")
+        require_text(guard, "RUNTIME_OWNER_GID=0", "runtime owner gid")
+        require_text(guard, "os.fchmod(handle.fileno(), 0o644)", "runtime mode")
+        require_text(
+            guard,
+            "os.fchown(handle.fileno(), owner_uid, owner_gid)",
+            "runtime owner",
+        )
+        require_text(guard, "os.fsync(handle.fileno())", "runtime file fsync")
+        require_text(guard, "os.replace(temporary, target)", "runtime rename")
+        require_text(guard, "os.fsync(directory_descriptor)", "runtime dir fsync")
+        require_text(
+            guard,
+            'python3 - "$RUNTIME_CONFIG" "$RUNTIME_HOSTS"',
+            "runtime provisioning checks",
+        )
+        reject_text(
+            guard,
+            'python3 - "$config" "$PROVISIONING_HOSTS" \\\n'
+            '    "$DHCP_RUNTIME_SERVER_IP"',
+            "persistent provisioning checks",
+        )
+
 
 class DockerDhcpLifecycleContractTests(unittest.TestCase):
-    def test_entrypoint_validations_call_original_binary_directly(self):
-        self.assertGreaterEqual(
-            ENTRYPOINT.count(f"{SYSTEM_DHCPD} -t -cf"),
-            5,
-            "entrypoint absolute dhcpd validation calls are missing",
+    def test_only_fully_staged_etc_dhcp_candidates_call_original_binary_directly(self):
+        require_text(
+            ENTRYPOINT,
+            f'{GUARD_PATH} --lldpq-validate-only \\\n'
+            '            -cf "$temp_file"',
+            "generated config with persistent hosts include",
+        )
+        require_text(
+            ENTRYPOINT,
+            f'{SYSTEM_DHCPD} -t -cf "$validation_candidate"',
+            "migration candidate validation",
+        )
+        reject_text(
+            ENTRYPOINT,
+            f'{SYSTEM_DHCPD} -t -cf "$temp_file"',
+            "candidate whose hosts include resolves through persistent storage",
+        )
+        reject_text(
+            ENTRYPOINT,
+            f"{SYSTEM_DHCPD} -t -cf /etc/dhcp/dhcpd.conf",
+            "persistent symlink validation",
+        )
+        reject_text(
+            ENTRYPOINT,
+            f'{SYSTEM_DHCPD} -t -cf "$config"',
+            "persistent migration validation",
         )
         bad = [
             line.strip()
@@ -515,6 +799,25 @@ class DockerDhcpLifecycleContractTests(unittest.TestCase):
             and "echo " not in line
         ]
         self.assertEqual(bad, [], f"PATH-selected dhcpd validation calls: {bad}")
+
+    def test_entrypoint_persistent_checks_use_guard_validate_only(self):
+        normalized = ENTRYPOINT.replace("\\\n", " ")
+        call_pattern = (
+            re.escape(GUARD_PATH)
+            + r"\s+--lldpq-validate-only\s+-cf\s+"
+        )
+        calls = re.findall(call_pattern + r'(?:"\$config"|/etc/dhcp/dhcpd\.conf)',
+                           normalized)
+        self.assertEqual(len(calls), 3, calls)
+        self.assertRegex(
+            normalized,
+            call_pattern + r'"\$config"',
+            "post-migration persistent validation",
+        )
+        self.assertEqual(
+            len(re.findall(call_pattern + r"/etc/dhcp/dhcpd\.conf", normalized)),
+            2,
+        )
 
     def test_entrypoint_validation_candidates_stay_in_apparmor_allowed_directory(self):
         require_text(
@@ -545,6 +848,13 @@ class DockerDhcpLifecycleContractTests(unittest.TestCase):
             f'{GUARD_PATH} -d -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE"',
             "entrypoint guarded autostart",
         )
+        self.assertRegex(
+            block.replace("\\\n", " "),
+            re.escape(GUARD_PATH)
+            + r"\s+--lldpq-validate-only\s+-cf\s+"
+            + r"/etc/dhcp/dhcpd\.conf",
+            "entrypoint guarded pre-autostart validation",
+        )
         reject_text(block, '\n    dhcpd -d ', "entrypoint raw autostart")
 
     def test_guard_executes_system_binary_without_relocation(self):
@@ -566,7 +876,11 @@ class DockerDhcpLifecycleContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr[:300])
             guard = rendered.read_text(encoding="utf-8")
         require_text(guard, f"REAL_DHCPD={SYSTEM_DHCPD}", "guard real binary")
-        require_text(guard, 'exec "$REAL_DHCPD" "$@"', "guard final exec")
+        require_text(
+            guard,
+            'exec "$REAL_DHCPD" "${final_arguments[@]}"',
+            "guard final exec",
+        )
         reject_text(guard, LEGACY_DHCPD, "guard relocated binary")
 
     def test_docker_validation_ignores_path_lookup(self):

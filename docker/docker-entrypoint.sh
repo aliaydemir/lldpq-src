@@ -1089,7 +1089,11 @@ _install_docker_dhcp_config() {
     # Ubuntu's dhcpd AppArmor profile can read /etc/dhcp but not /tmp.
     temp_file=$(mktemp /etc/dhcp/.lldpq-dhcp-render.XXXXXXXX)
     _render_docker_dhcp_config "$temp_file" "$server_ip"
-    if ! /usr/sbin/dhcpd -t -cf "$temp_file" >/dev/null 2>&1; then
+    # The rendered config is local, but its include may still resolve through
+    # the persistent system-config volume. Use the guard's direct runtime
+    # snapshot so path-confined dhcpd never follows that source symlink.
+    if ! /usr/local/libexec/lldpq-dhcpd-guard --lldpq-validate-only \
+            -cf "$temp_file" >/dev/null 2>&1; then
         echo "ERROR: generated Docker DHCP configuration failed dhcpd -t" >&2
         rm -f "$temp_file"
         return 1
@@ -1372,7 +1376,8 @@ PYTHON
     rm -f "$candidate" "$hosts_candidate"
 
     if [[ "$activation_failed" == "true" ]] || \
-        ! /usr/sbin/dhcpd -t -cf "$config" >/dev/null 2>&1; then
+        ! /usr/local/libexec/lldpq-dhcpd-guard \
+            --lldpq-validate-only -cf "$config" >/dev/null 2>&1; then
         if [[ "$config_changed" == "true" ]]; then
             if ! rollback_stage=$(mktemp "$directory/.dhcpd.conf.rollback.XXXXXXXX") || \
                ! cp -p "$backup" "$rollback_stage" || \
@@ -1527,6 +1532,13 @@ _render_dhcp_start_guard() {
     local runtime_state="${3:-/run/lldpq/docker-dhcp-runtime.env}"
     local default_config="${4:-/etc/dhcp/dhcpd.conf}"
     local provisioning_hosts="${5:-/etc/dhcp/dhcpd.hosts}"
+    local runtime_config="${6:-/etc/dhcp/.lldpq-runtime.conf}"
+    local runtime_hosts="${7:-/etc/dhcp/.lldpq-runtime.hosts}"
+    local runtime_owner_uid="${8:-0}"
+    local runtime_owner_gid="${9:-0}"
+    # Provision caps inventory at 10,000 bounded records; 8 MiB leaves ample
+    # room for their rendered reservations while bounding root-side reads.
+    local max_input_bytes="${10:-8388608}"
 
     {
         printf '%s\n' '#!/bin/bash'
@@ -1536,11 +1548,252 @@ _render_dhcp_start_guard() {
         printf 'RUNTIME_STATE=%q\n' "$runtime_state"
         printf 'DEFAULT_CONFIG=%q\n' "$default_config"
         printf 'PROVISIONING_HOSTS=%q\n' "$provisioning_hosts"
+        printf 'RUNTIME_CONFIG=%q\n' "$runtime_config"
+        printf 'RUNTIME_HOSTS=%q\n' "$runtime_hosts"
+        printf 'RUNTIME_OWNER_UID=%q\n' "$runtime_owner_uid"
+        printf 'RUNTIME_OWNER_GID=%q\n' "$runtime_owner_gid"
+        printf 'MAX_INPUT_BYTES=%q\n' "$max_input_bytes"
         cat <<'GUARD'
 
 if [ ! -f "$REAL_DHCPD" ] || [ ! -x "$REAL_DHCPD" ]; then
     echo "LLDPq: isc-dhcp-server binary is missing or not executable: $REAL_DHCPD" >&2
     exit 78
+fi
+
+validate_only=false
+config="$DEFAULT_CONFIG"
+config_count=0
+expect_config=false
+final_arguments=()
+for argument in "$@"; do
+    if [ "$expect_config" = "true" ]; then
+        config="$argument"
+        final_arguments+=("$RUNTIME_CONFIG")
+        expect_config=false
+        continue
+    fi
+    case "$argument" in
+        --lldpq-validate-only)
+            if [ "$validate_only" = "true" ]; then
+                echo "LLDPq: duplicate guard validation flag." >&2
+                exit 78
+            fi
+            validate_only=true
+            ;;
+        -cf)
+            config_count=$((config_count + 1))
+            final_arguments+=("$argument")
+            expect_config=true
+            ;;
+        *)
+            final_arguments+=("$argument")
+            ;;
+    esac
+done
+if [ "$expect_config" = "true" ]; then
+    echo "LLDPq: -cf requires a configuration path." >&2
+    exit 78
+fi
+if [ "$config_count" -gt 1 ]; then
+    echo "LLDPq: multiple -cf options are not allowed." >&2
+    exit 78
+fi
+if [ "$config_count" -eq 0 ]; then
+    if [ "${#final_arguments[@]}" -eq 0 ]; then
+        final_arguments=("-cf" "$RUNTIME_CONFIG")
+    else
+        final_arguments=("-cf" "$RUNTIME_CONFIG" "${final_arguments[@]}")
+    fi
+fi
+
+_stage_runtime_snapshot() {
+    # This shell/Python process is still outside dhcpd's path-based AppArmor
+    # profile, so it can follow the persistent source links. The confined child
+    # below receives only atomically published files in /etc/dhcp.
+    python3 - "$config" "$PROVISIONING_HOSTS" "$RUNTIME_CONFIG" \
+        "$RUNTIME_HOSTS" "$MAX_INPUT_BYTES" "$RUNTIME_OWNER_UID" \
+        "$RUNTIME_OWNER_GID" <<'PYTHON_RUNTIME_SNAPSHOT'
+import os
+import re
+import stat
+import sys
+import tempfile
+
+
+class SnapshotError(Exception):
+    pass
+
+
+source_config = sys.argv[1]
+source_hosts = sys.argv[2]
+runtime_config = sys.argv[3]
+runtime_hosts = sys.argv[4]
+try:
+    max_input_bytes = int(sys.argv[5])
+    owner_uid = int(sys.argv[6])
+    owner_gid = int(sys.argv[7])
+except ValueError as exc:
+    raise SystemExit("LLDPq: invalid DHCP runtime snapshot settings") from exc
+
+
+def read_bounded(path, label):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise SnapshotError(f"{label} is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SnapshotError(f"{label} is not a regular file")
+        if metadata.st_size > max_input_bytes:
+            raise SnapshotError(f"{label} is too large")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor, min(65536, max_input_bytes - total + 1)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_input_bytes:
+                raise SnapshotError(f"{label} is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def check_runtime_target(target):
+    try:
+        metadata = os.lstat(target)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SnapshotError("unsafe runtime target") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SnapshotError("unsafe runtime target")
+
+
+def stage_file(target, content, parent):
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", dir=parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fchown(handle.fileno(), owner_uid, owner_gid)
+            os.fchmod(handle.fileno(), 0o644)
+            os.fsync(handle.fileno())
+        return temporary
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+temporaries = {}
+try:
+    if max_input_bytes <= 0 or owner_uid < 0 or owner_gid < 0:
+        raise SnapshotError("invalid runtime snapshot settings")
+    for path in (source_config, source_hosts, runtime_config, runtime_hosts):
+        if not os.path.isabs(path):
+            raise SnapshotError("snapshot paths must be absolute")
+    if any(character in source_hosts for character in ('"', "\r", "\n")):
+        raise SnapshotError("managed hosts path is invalid")
+
+    runtime_parent = os.path.dirname(runtime_config)
+    if runtime_parent != os.path.dirname(runtime_hosts):
+        raise SnapshotError("runtime targets must share one directory")
+    try:
+        parent_metadata = os.lstat(runtime_parent)
+    except OSError as exc:
+        raise SnapshotError("runtime directory is unavailable") from exc
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise SnapshotError("unsafe runtime directory")
+
+    config_content = read_bounded(source_config, "source config")
+    hosts_content = read_bounded(source_hosts, "source hosts")
+    source_hosts_bytes = os.fsencode(source_hosts)
+    runtime_hosts_bytes = os.fsencode(runtime_hosts)
+    include_pattern = re.compile(
+        rb'(?m)(^[ \t]*include[ \t]+")'
+        + re.escape(source_hosts_bytes)
+        + rb'("[ \t]*;)'
+    )
+    runtime_content, include_count = include_pattern.subn(
+        lambda match: match.group(1) + runtime_hosts_bytes + match.group(2),
+        config_content,
+    )
+    if include_count != 1:
+        raise SnapshotError(
+            f"managed hosts include count is {include_count}, expected 1"
+        )
+
+    for target in (runtime_hosts, runtime_config):
+        check_runtime_target(target)
+    temporaries[runtime_hosts] = stage_file(
+        runtime_hosts, hosts_content, runtime_parent
+    )
+    temporaries[runtime_config] = stage_file(
+        runtime_config, runtime_content, runtime_parent
+    )
+
+    for target in (runtime_hosts, runtime_config):
+        check_runtime_target(target)
+    for target in (runtime_hosts, runtime_config):
+        temporary = temporaries[target]
+        os.replace(temporary, target)
+        temporaries[target] = None
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_descriptor = os.open(runtime_parent, directory_flags)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+    for target in (runtime_hosts, runtime_config):
+        metadata = os.lstat(target)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o644
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != owner_gid
+        ):
+            raise SnapshotError("runtime snapshot metadata mismatch")
+except SnapshotError as exc:
+    print(f"LLDPq: DHCP runtime snapshot failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+except OSError:
+    print("LLDPq: DHCP runtime snapshot failed: I/O error", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    for temporary in temporaries.values():
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+PYTHON_RUNTIME_SNAPSHOT
+}
+
+if [ "$validate_only" = "true" ]; then
+    if ! _stage_runtime_snapshot; then
+        exit 78
+    fi
+    if ! "$REAL_DHCPD" -t -cf "$RUNTIME_CONFIG" >/dev/null 2>&1; then
+        echo "LLDPq: invalid DHCP configuration." >&2
+        exit 78
+    fi
+    exit 0
 fi
 
 DHCP_RUNTIME_ENABLED=false
@@ -1562,10 +1815,10 @@ if [ -z "$DHCP_RUNTIME_INTERFACE" ] || [ -z "$DHCP_RUNTIME_SERVER_IP" ]; then
     echo "LLDPq: DHCP provisioning server state is incomplete." >&2
     exit 78
 fi
-if [ "$#" -eq 0 ]; then
+if [ "${#final_arguments[@]}" -eq 0 ]; then
     last_argument=
 else
-    last_argument="${!#}"
+    last_argument="${final_arguments[${#final_arguments[@]} - 1]}"
 fi
 if [ "$last_argument" != "$DHCP_RUNTIME_INTERFACE" ]; then
     echo "LLDPq: refusing DHCP start on '$last_argument'; expected '$DHCP_RUNTIME_INTERFACE'." >&2
@@ -1577,22 +1830,16 @@ if ! ip -o -4 addr show dev "$DHCP_RUNTIME_INTERFACE" 2>/dev/null | \
     exit 78
 fi
 
-config="$DEFAULT_CONFIG"
-previous=
-for argument in "$@"; do
-    if [ "$previous" = "-cf" ]; then
-        config="$argument"
-        break
-    fi
-    previous="$argument"
-done
-if ! "$REAL_DHCPD" -t -cf "$config" >/dev/null 2>&1; then
-    echo "LLDPq: refusing to start with an invalid DHCP configuration: $config" >&2
+if ! _stage_runtime_snapshot; then
+    exit 78
+fi
+if ! "$REAL_DHCPD" -t -cf "$RUNTIME_CONFIG" >/dev/null 2>&1; then
+    echo "LLDPq: refusing to start with an invalid DHCP configuration." >&2
     exit 78
 fi
 # Both files may contain global, subnet, group or per-host overrides. Validate
 # every active directive across free-form/multiline ISC syntax.
-if ! python3 - "$config" "$PROVISIONING_HOSTS" \
+if ! python3 - "$RUNTIME_CONFIG" "$RUNTIME_HOSTS" \
     "$DHCP_RUNTIME_SERVER_IP" <<'PYTHON'
 import ipaddress
 import pathlib
@@ -1686,7 +1933,7 @@ then
     exit 78
 fi
 
-exec "$REAL_DHCPD" "$@"
+exec "$REAL_DHCPD" "${final_arguments[@]}"
 GUARD
     } > "$output"
 }
@@ -1781,7 +2028,8 @@ if _docker_dhcp_is_managed; then
         DHCP_AUTOSTART=false
         echo "⚠ DHCP will stay stopped until its managed configuration is repaired" >&2
     fi
-    if ! /usr/sbin/dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+    if ! /usr/local/libexec/lldpq-dhcpd-guard --lldpq-validate-only \
+        -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
         echo "⚠ Existing LLDPq-managed DHCP config is invalid; DHCP will stay disabled until it is repaired" >&2
         DHCP_AUTOSTART=false
     elif [ "$DHCP_MANAGED_REFERENCES_OK" = "true" ]; then
@@ -1837,7 +2085,8 @@ fi
 # network-specific config passed validation. DHCP_AUTOSTART seeds that state on
 # the first container run; subsequent UI Start/Stop choices take precedence.
 if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
-    if ! /usr/sbin/dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+    if ! /usr/local/libexec/lldpq-dhcpd-guard --lldpq-validate-only \
+        -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
         echo "  DHCP: not started because dhcpd.conf failed validation" >&2
         DHCP_AUTOSTART=false
     fi
