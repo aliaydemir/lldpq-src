@@ -49,7 +49,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ansible ansible-lint \
     python3-jmespath python3-wheel \
     && rm -rf /var/lib/apt/lists/*
-RUN ansible-galaxy collection install nvidia.nvue community.general ansible.netcommon
+COPY docker/install-ansible-collections.sh /usr/local/sbin/install-ansible-collections
+RUN chmod 0755 /usr/local/sbin/install-ansible-collections \
+    && /usr/local/sbin/install-ansible-collections \
+    && rm -f /usr/local/sbin/install-ansible-collections
 
 # Create lldpq user (matches host user pattern)
 RUN useradd -m -s /bin/bash -G www-data lldpq \
