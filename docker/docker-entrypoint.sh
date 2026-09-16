@@ -1086,9 +1086,10 @@ DHCPEOF
 _install_docker_dhcp_config() {
     local server_ip="$1" backup_existing="${2:-false}"
     local temp_file target_file staged_file backup_file
-    temp_file=$(mktemp /tmp/lldpq-dhcp.XXXXXXXX)
+    # Ubuntu's dhcpd AppArmor profile can read /etc/dhcp but not /tmp.
+    temp_file=$(mktemp /etc/dhcp/.lldpq-dhcp-render.XXXXXXXX)
     _render_docker_dhcp_config "$temp_file" "$server_ip"
-    if ! dhcpd -t -cf "$temp_file" >/dev/null 2>&1; then
+    if ! /usr/sbin/dhcpd -t -cf "$temp_file" >/dev/null 2>&1; then
         echo "ERROR: generated Docker DHCP configuration failed dhcpd -t" >&2
         rm -f "$temp_file"
         return 1
@@ -1137,7 +1138,7 @@ _install_docker_dhcp_config() {
 _migrate_managed_dhcp_server_references() {
     local server_ip="$1" config=/etc/dhcp/dhcpd.conf hosts=/etc/dhcp/dhcpd.hosts
     local target hosts_target directory hosts_directory candidate hosts_candidate
-    local validation_candidate config_changed=false hosts_changed=false
+    local validation_candidate validation_hosts config_changed=false hosts_changed=false
     local backup="" hosts_backup="" rollback_stage="" hosts_rollback_stage=""
     local timestamp activation_failed=false rollback_failed=false
 
@@ -1287,15 +1288,23 @@ PYTHON
         return 1
     fi
 
-    # Validate the two candidates together by redirecting the managed include
-    # in a disposable config. This catches cross-file syntax errors before any
-    # live path is replaced.
-    validation_candidate=$(mktemp /tmp/lldpq-dhcp-validation.XXXXXXXX) || {
+    # Validate both candidates from /etc/dhcp, which the packaged AppArmor
+    # profile permits, before replacing either persistent target.
+    validation_candidate=$(mktemp /etc/dhcp/.lldpq-dhcp-validation.XXXXXXXX) || {
         rm -f "$candidate" "$hosts_candidate"
         return 1
     }
+    validation_hosts=$(mktemp /etc/dhcp/.lldpq-dhcp-hosts-validation.XXXXXXXX) || {
+        rm -f "$candidate" "$hosts_candidate" "$validation_candidate"
+        return 1
+    }
+    if ! cp "$hosts_candidate" "$validation_hosts"; then
+        rm -f "$candidate" "$hosts_candidate" "$validation_candidate" \
+            "$validation_hosts"
+        return 1
+    fi
     if ! python3 - "$candidate" "$validation_candidate" "$hosts_target" \
-        "$hosts_candidate" <<'PYTHON'
+        "$validation_hosts" <<'PYTHON'
 import os
 import pathlib
 import re
@@ -1321,16 +1330,18 @@ if count != 1:
 destination.write_text(rendered, encoding="utf-8")
 PYTHON
     then
-        rm -f "$candidate" "$hosts_candidate" "$validation_candidate"
+        rm -f "$candidate" "$hosts_candidate" "$validation_candidate" \
+            "$validation_hosts"
         echo "ERROR: managed DHCP validation candidate could not be rendered" >&2
         return 1
     fi
-    if ! dhcpd -t -cf "$validation_candidate" >/dev/null 2>&1; then
-        rm -f "$candidate" "$hosts_candidate" "$validation_candidate"
+    if ! /usr/sbin/dhcpd -t -cf "$validation_candidate" >/dev/null 2>&1; then
+        rm -f "$candidate" "$hosts_candidate" "$validation_candidate" \
+            "$validation_hosts"
         echo "ERROR: migrated DHCP config/hosts failed dhcpd -t; originals retained" >&2
         return 1
     fi
-    rm -f "$validation_candidate"
+    rm -f "$validation_candidate" "$validation_hosts"
 
     timestamp=$(date +%Y%m%d-%H%M%S)
     if [[ "$config_changed" == "true" ]]; then
@@ -1361,7 +1372,7 @@ PYTHON
     rm -f "$candidate" "$hosts_candidate"
 
     if [[ "$activation_failed" == "true" ]] || \
-        ! dhcpd -t -cf "$config" >/dev/null 2>&1; then
+        ! /usr/sbin/dhcpd -t -cf "$config" >/dev/null 2>&1; then
         if [[ "$config_changed" == "true" ]]; then
             if ! rollback_stage=$(mktemp "$directory/.dhcpd.conf.rollback.XXXXXXXX") || \
                ! cp -p "$backup" "$rollback_stage" || \
@@ -1395,6 +1406,7 @@ PYTHON
 # Keep the default monitoring compose safe and require the Linux host-network
 # provisioning compose to opt in with an explicit interface and server IP.
 LLDPQ_DHCP_MODE="${LLDPQ_DHCP_MODE:-disabled}"
+export LLDPQ_DHCP_MODE
 DHCP_RUNTIME_DIR=/run/lldpq
 DHCP_RUNTIME_STATE="$DHCP_RUNTIME_DIR/docker-dhcp-runtime.env"
 mkdir -p "$DHCP_RUNTIME_DIR"
@@ -1485,43 +1497,51 @@ _configure_dhcp_runtime() {
     esac
 }
 
-# Guard every real dhcpd start, including requests coming from Provision UI.
-# Syntax-only `dhcpd -t` remains available in monitoring mode. This prevents a
-# bridge container from reporting a locally-running but externally-useless DHCP
-# process as success. The expected interface/IP state is root-owned under /run.
-_install_dhcp_runtime_guard() {
-    local system_dhcpd=/usr/sbin/dhcpd
-    # The relocated binary must keep the basename 'dhcpd': the kernel derives
-    # the process comm from the exec'd path, and pgrep/pkill -x dhcpd (used by
-    # provision-api.sh and the autostart check below) match on comm.
-    local real_dhcpd=/usr/libexec/lldpq-dhcpd/dhcpd
+# Guard every LLDPq-controlled Docker start without replacing the distro
+# executable. Keeping dhcpd at its packaged path preserves path-based AppArmor
+# attachment and the native `dhcpd` process name used by pgrep/pkill.
+_is_legacy_lldpq_dhcp_guard() {
+    local candidate="$1"
+    [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+    grep -Fqx '#!/bin/bash' "$candidate" 2>/dev/null &&
+        grep -Fqx '# LLDPq Docker DHCP runtime guard. Generated by docker-entrypoint.sh.' \
+            "$candidate" 2>/dev/null &&
+        grep -Fqx 'REAL_DHCPD=/usr/libexec/lldpq-dhcpd/dhcpd' \
+            "$candidate" 2>/dev/null &&
+        grep -Fqx 'exec -a dhcpd "$REAL_DHCPD" "$@"' \
+            "$candidate" 2>/dev/null
+}
 
-    mkdir -p /usr/libexec/lldpq-dhcpd
-    if [ ! -x "$real_dhcpd" ]; then
-        if [ ! -x "$system_dhcpd" ]; then
-            echo "ERROR: isc-dhcp-server binary is missing" >&2
-            return 1
-        fi
-        cp -p "$system_dhcpd" "$real_dhcpd"
-        chown root:root "$real_dhcpd"
-        chmod 755 "$real_dhcpd"
-    fi
-    rm -f "$system_dhcpd"
-    cat > "$system_dhcpd" <<'GUARD'
-#!/bin/bash
-# LLDPq Docker DHCP runtime guard. Generated by docker-entrypoint.sh.
-set -u
+_is_regular_executable() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]
+}
 
-REAL_DHCPD=/usr/libexec/lldpq-dhcpd/dhcpd
-RUNTIME_STATE=/run/lldpq/docker-dhcp-runtime.env
+_is_elf_executable() {
+    _is_regular_executable "$1" &&
+        [ "$(od -An -t x1 -N 4 "$1" 2>/dev/null | tr -d '[:space:]')" = "7f454c46" ]
+}
 
-for argument in "$@"; do
-    case "$argument" in
-        -t|--version)
-            exec -a dhcpd "$REAL_DHCPD" "$@"
-            ;;
-    esac
-done
+_render_dhcp_start_guard() {
+    local output="$1"
+    local real_dhcpd="${2:-/usr/sbin/dhcpd}"
+    local runtime_state="${3:-/run/lldpq/docker-dhcp-runtime.env}"
+    local default_config="${4:-/etc/dhcp/dhcpd.conf}"
+    local provisioning_hosts="${5:-/etc/dhcp/dhcpd.hosts}"
+
+    {
+        printf '%s\n' '#!/bin/bash'
+        printf '%s\n' '# LLDPq Docker DHCP start guard. Generated by docker-entrypoint.sh.'
+        printf '%s\n' 'set -u'
+        printf 'REAL_DHCPD=%q\n' "$real_dhcpd"
+        printf 'RUNTIME_STATE=%q\n' "$runtime_state"
+        printf 'DEFAULT_CONFIG=%q\n' "$default_config"
+        printf 'PROVISIONING_HOSTS=%q\n' "$provisioning_hosts"
+        cat <<'GUARD'
+
+if [ ! -f "$REAL_DHCPD" ] || [ ! -x "$REAL_DHCPD" ]; then
+    echo "LLDPq: isc-dhcp-server binary is missing or not executable: $REAL_DHCPD" >&2
+    exit 78
+fi
 
 DHCP_RUNTIME_ENABLED=false
 DHCP_RUNTIME_MODE=disabled
@@ -1538,8 +1558,16 @@ if [ "$DHCP_RUNTIME_ENABLED" != "true" ] || [ "$DHCP_RUNTIME_MODE" != "host" ]; 
     exit 78
 fi
 
-last_argument="${!#:-}"
-if [ -z "$DHCP_RUNTIME_INTERFACE" ] || [ "$last_argument" != "$DHCP_RUNTIME_INTERFACE" ]; then
+if [ -z "$DHCP_RUNTIME_INTERFACE" ] || [ -z "$DHCP_RUNTIME_SERVER_IP" ]; then
+    echo "LLDPq: DHCP provisioning server state is incomplete." >&2
+    exit 78
+fi
+if [ "$#" -eq 0 ]; then
+    last_argument=
+else
+    last_argument="${!#}"
+fi
+if [ "$last_argument" != "$DHCP_RUNTIME_INTERFACE" ]; then
     echo "LLDPq: refusing DHCP start on '$last_argument'; expected '$DHCP_RUNTIME_INTERFACE'." >&2
     exit 78
 fi
@@ -1549,7 +1577,7 @@ if ! ip -o -4 addr show dev "$DHCP_RUNTIME_INTERFACE" 2>/dev/null | \
     exit 78
 fi
 
-config=/etc/dhcp/dhcpd.conf
+config="$DEFAULT_CONFIG"
 previous=
 for argument in "$@"; do
     if [ "$previous" = "-cf" ]; then
@@ -1564,7 +1592,7 @@ if ! "$REAL_DHCPD" -t -cf "$config" >/dev/null 2>&1; then
 fi
 # Both files may contain global, subnet, group or per-host overrides. Validate
 # every active directive across free-form/multiline ISC syntax.
-if ! python3 - "$config" /etc/dhcp/dhcpd.hosts \
+if ! python3 - "$config" "$PROVISIONING_HOSTS" \
     "$DHCP_RUNTIME_SERVER_IP" <<'PYTHON'
 import ipaddress
 import pathlib
@@ -1658,15 +1686,92 @@ then
     exit 78
 fi
 
-# exec -a keeps argv[0] as 'dhcpd'; comm comes from the exec'd path basename.
-exec -a dhcpd "$REAL_DHCPD" "$@"
+exec "$REAL_DHCPD" "$@"
 GUARD
-    chown root:root "$system_dhcpd"
-    chmod 755 "$system_dhcpd"
+    } > "$output"
+}
+
+_install_dhcp_start_guard() {
+    local system_dhcpd="${1:-/usr/sbin/dhcpd}"
+    local guard_path="${2:-/usr/local/libexec/lldpq-dhcpd-guard}"
+    local legacy_real_dhcpd="${3:-/usr/libexec/lldpq-dhcpd/dhcpd}"
+    local runtime_state="${4:-/run/lldpq/docker-dhcp-runtime.env}"
+    local default_config="${5:-/etc/dhcp/dhcpd.conf}"
+    local provisioning_hosts="${6:-/etc/dhcp/dhcpd.hosts}"
+    local system_directory helper_directory staged_restore staged_guard
+
+    system_directory=$(dirname "$system_dhcpd")
+    if _is_legacy_lldpq_dhcp_guard "$system_dhcpd"; then
+        if ! _is_elf_executable "$legacy_real_dhcpd"; then
+            echo "ERROR: legacy LLDPq dhcpd wrapper found, but its original ELF is not a regular executable: $legacy_real_dhcpd" >&2
+            return 1
+        fi
+        staged_restore=$(mktemp "$system_directory/.dhcpd.restore.XXXXXXXX") || {
+            echo "ERROR: could not stage legacy dhcpd restoration" >&2
+            return 1
+        }
+        if ! cp -p "$legacy_real_dhcpd" "$staged_restore" ||
+           ! chown root:root "$staged_restore" ||
+           ! chmod 0755 "$staged_restore" ||
+           ! _is_elf_executable "$staged_restore" ||
+           ! sync -f "$staged_restore"; then
+            rm -f "$staged_restore"
+            echo "ERROR: legacy LLDPq dhcpd restoration could not be prepared; wrapper retained" >&2
+            return 1
+        fi
+        if ! mv -f "$staged_restore" "$system_dhcpd"; then
+            rm -f "$staged_restore"
+            echo "ERROR: legacy LLDPq dhcpd wrapper could not be replaced atomically" >&2
+            return 1
+        fi
+        sync -f "$system_directory"
+        if ! _is_elf_executable "$system_dhcpd"; then
+            echo "ERROR: restored isc-dhcp-server binary is invalid" >&2
+            return 1
+        fi
+        echo "✓ Restored distro dhcpd path from legacy LLDPq Docker layout"
+    elif [ -f "$system_dhcpd" ] &&
+         [ "$(head -c 2 "$system_dhcpd" 2>/dev/null || true)" = "#!" ]; then
+        echo "ERROR: refusing to replace unknown wrapper at $system_dhcpd" >&2
+        return 1
+    elif ! _is_elf_executable "$system_dhcpd"; then
+        echo "ERROR: isc-dhcp-server binary is missing or not a regular ELF executable: $system_dhcpd" >&2
+        return 1
+    fi
+
+    helper_directory=$(dirname "$guard_path")
+    if [ -L "$helper_directory" ] ||
+       { [ -e "$helper_directory" ] && [ ! -d "$helper_directory" ]; }; then
+        echo "ERROR: unsafe DHCP start-guard directory: $helper_directory" >&2
+        return 1
+    fi
+    mkdir -p "$helper_directory"
+    chown root:root "$helper_directory"
+    chmod 0755 "$helper_directory"
+    staged_guard=$(mktemp "$helper_directory/.lldpq-dhcpd-guard.XXXXXXXX") || {
+        echo "ERROR: could not stage Docker DHCP start guard" >&2
+        return 1
+    }
+    if ! _render_dhcp_start_guard "$staged_guard" "$system_dhcpd" \
+            "$runtime_state" "$default_config" "$provisioning_hosts" ||
+       ! chown root:root "$staged_guard" ||
+       ! chmod 0755 "$staged_guard" ||
+       ! _is_regular_executable "$staged_guard" ||
+       ! sync -f "$staged_guard"; then
+        rm -f "$staged_guard"
+        echo "ERROR: Docker DHCP start guard could not be installed" >&2
+        return 1
+    fi
+    if ! mv -f "$staged_guard" "$guard_path"; then
+        rm -f "$staged_guard"
+        echo "ERROR: Docker DHCP start guard could not be activated" >&2
+        return 1
+    fi
+    sync -f "$helper_directory"
 }
 
 _configure_dhcp_runtime
-_install_dhcp_runtime_guard
+_install_dhcp_start_guard
 
 if _docker_dhcp_is_managed; then
     DHCP_MANAGED_REFERENCES_OK=true
@@ -1676,7 +1781,7 @@ if _docker_dhcp_is_managed; then
         DHCP_AUTOSTART=false
         echo "⚠ DHCP will stay stopped until its managed configuration is repaired" >&2
     fi
-    if ! dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+    if ! /usr/sbin/dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
         echo "⚠ Existing LLDPq-managed DHCP config is invalid; DHCP will stay disabled until it is repaired" >&2
         DHCP_AUTOSTART=false
     elif [ "$DHCP_MANAGED_REFERENCES_OK" = "true" ]; then
@@ -1732,7 +1837,7 @@ fi
 # network-specific config passed validation. DHCP_AUTOSTART seeds that state on
 # the first container run; subsequent UI Start/Stop choices take precedence.
 if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
-    if ! dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
+    if ! /usr/sbin/dhcpd -t -cf /etc/dhcp/dhcpd.conf >/dev/null 2>&1; then
         echo "  DHCP: not started because dhcpd.conf failed validation" >&2
         DHCP_AUTOSTART=false
     fi
@@ -1747,7 +1852,7 @@ if [ "${DHCP_AUTOSTART:-false}" = "true" ] && [ -f /etc/dhcp/dhcpd.conf ]; then
     mkdir -p /var/log/lldpq 2>/dev/null
     # -d keeps dhcpd in the foreground logging to stderr; redirect to a file so the logs
     # survive (no syslog/journald in the container) and the Provision UI can tail them.
-    dhcpd -d -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE" >> /var/log/lldpq/dhcpd.log 2>&1 &
+    /usr/local/libexec/lldpq-dhcpd-guard -d -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE" >> /var/log/lldpq/dhcpd.log 2>&1 &
     sleep 1
     if pgrep -x dhcpd >/dev/null 2>&1; then
         echo "✓ DHCP server started (interface: $DHCP_IFACE, log: /var/log/lldpq/dhcpd.log)"

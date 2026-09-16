@@ -467,6 +467,12 @@ dedicated Compose file supplies the complete guarded configuration. Docker
 Desktop on macOS cannot provide this physical-L2 DHCP/ONIE mode; use it for
 monitoring only.
 
+The container keeps the distribution's `dhcpd` executable at
+`/usr/sbin/dhcpd`, so syntax/version checks and the daemon retain the packaged
+path and process identity. LLDPq daemon starts use the separate root-owned
+`/usr/local/libexec/lldpq-dhcpd-guard`, which rechecks Docker mode, interface,
+address, syntax, and provisioning-server options immediately before start.
+
 The single `DHCP_INTERFACE` / `PROVISION_SERVER_IP` host-network model is
 unchanged by multi-pool DHCP: exactly one listen interface, one `dhcpd.conf`,
 one `dhcpd.hosts` and one include. **Provision → DHCP Server** manages up to 8

@@ -40,6 +40,18 @@ if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true
 fi
 
+# FastCGI request environments need not retain the container's startup
+# variables. Recover only the root-owned Docker DHCP fields used by this API.
+DOCKER_DHCP_GUARD=/usr/local/libexec/lldpq-dhcpd-guard
+DOCKER_DHCP_RUNTIME_STATE=/run/lldpq/docker-dhcp-runtime.env
+if [[ -x "$DOCKER_DHCP_GUARD" && -r "$DOCKER_DHCP_RUNTIME_STATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$DOCKER_DHCP_RUNTIME_STATE"
+    LLDPQ_DHCP_MODE="${DHCP_RUNTIME_MODE:-disabled}"
+    DHCP_INTERFACE="${DHCP_RUNTIME_INTERFACE:-}"
+    PROVISION_SERVER_IP="${DHCP_RUNTIME_SERVER_IP:-}"
+fi
+
 LLDPQ_DIR="${LLDPQ_DIR:-/home/lldpq/lldpq}"
 LLDPQ_USER="${LLDPQ_USER:-lldpq}"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
@@ -106,6 +118,7 @@ AUTO_SET_HOSTNAME="${AUTO_SET_HOSTNAME:-true}"
 # Export for Python
 export LLDPQ_DIR LLDPQ_USER WEB_ROOT
 export DHCP_HOSTS_FILE DHCP_CONF_FILE DHCP_LEASES_FILE DHCP_LOG_FILE ZTP_SCRIPT_FILE BASE_CONFIG_DIR
+export LLDPQ_DHCP_MODE DHCP_INTERFACE PROVISION_SERVER_IP
 export PROVISION_UPLOAD_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
 export POST_DATA POST_DATA_FILE ACTION LINES_PARAM UPGRADE_JOB_ID UPGRADE_WORKER_MODE
@@ -156,6 +169,7 @@ DHCP_HOSTS_FILE = os.environ.get('DHCP_HOSTS_FILE', '/etc/dhcp/dhcpd.hosts')
 DHCP_LEASES_FILE = os.environ.get('DHCP_LEASES_FILE', '/var/lib/dhcp/dhcpd.leases')
 DHCP_LOG_FILE = os.environ.get('DHCP_LOG_FILE', '/var/log/lldpq/dhcpd.log')
 ISC_DHCP_DEFAULT_FILE = os.environ.get('ISC_DHCP_DEFAULT_FILE', '/etc/default/isc-dhcp-server')
+DOCKER_DHCP_GUARD = '/usr/local/libexec/lldpq-dhcpd-guard'
 ZTP_SCRIPT_FILE = os.environ.get('ZTP_SCRIPT_FILE', f'{WEB_ROOT}/cumulus-ztp.sh')
 BASE_CONFIG_DIR = os.environ.get('BASE_CONFIG_DIR', f'{LLDPQ_DIR}/sw-base')
 PROVISION_UPLOAD_DIR = os.environ.get('PROVISION_UPLOAD_DIR', f'{WEB_ROOT}/provision-uploads')
@@ -2094,7 +2108,11 @@ def _discard_validation_file(path):
 def validate_dhcp_config_candidate(conf_content, hosts_content=None,
                                    live_hosts_path=None, require_binary=True):
     """Syntax-check a complete DHCP candidate without touching live files."""
-    dhcpd = shutil.which('dhcpd') or '/usr/sbin/dhcpd'
+    docker_mode = os.environ.get('LLDPQ_DHCP_MODE', '').strip().lower()
+    if docker_mode in ('disabled', 'host'):
+        dhcpd = '/usr/sbin/dhcpd'
+    else:
+        dhcpd = shutil.which('dhcpd') or '/usr/sbin/dhcpd'
     if not os.path.exists(dhcpd):
         if require_binary:
             raise RuntimeError('dhcpd executable is not installed')
@@ -2171,14 +2189,19 @@ def dhcp_is_running():
 
 
 def stop_dhcp_best_effort():
-    for svc in ('isc-dhcp-server', 'dhcpd'):
-        try:
-            subprocess.run(['sudo', 'systemctl', 'stop', svc], capture_output=True,
-                           text=True, timeout=10)
-        except Exception:
-            pass
+    docker_dhcp_mode = os.environ.get('LLDPQ_DHCP_MODE', '').strip().lower()
+    if docker_dhcp_mode not in ('disabled', 'host'):
+        for svc in ('isc-dhcp-server', 'dhcpd'):
+            try:
+                subprocess.run(['sudo', 'systemctl', 'stop', svc], capture_output=True,
+                               text=True, timeout=10)
+            except Exception:
+                pass
     try:
-        subprocess.run(['sudo', 'pkill', '-x', 'dhcpd'], capture_output=True, timeout=5)
+        kill_command = ['pkill', '-x', 'dhcpd']
+        if docker_dhcp_mode not in ('disabled', 'host') or os.geteuid() != 0:
+            kill_command.insert(0, 'sudo')
+        subprocess.run(kill_command, capture_output=True, timeout=5)
     except Exception:
         pass
 
@@ -2197,28 +2220,33 @@ def persist_docker_dhcp_desired_state(running):
 
 def restart_dhcp():
     """Restart ISC DHCP server. Returns (success, message)."""
-    if os.environ.get('LLDPQ_DHCP_MODE', '').strip().lower() == 'disabled':
+    docker_dhcp_mode = os.environ.get('LLDPQ_DHCP_MODE', '').strip().lower()
+    if docker_dhcp_mode == 'disabled':
         return False, ('DHCP is disabled in Docker bridge/monitoring mode; '
                        'use docker-compose.provisioning.yml on a Linux host')
-    for svc in ['isc-dhcp-server', 'dhcpd']:
-        try:
-            result = subprocess.run(
-                ['sudo', 'systemctl', 'restart', svc],
-                capture_output=True, text=True, timeout=15
-            )
-            if result.returncode == 0:
-                verify = subprocess.run(['systemctl', 'is-active', svc],
-                                        capture_output=True, text=True, timeout=5)
-                if verify.returncode == 0 and verify.stdout.strip() == 'active':
-                    return True, f"{svc} restarted"
-        except Exception:
-            continue
+    if docker_dhcp_mode not in ('disabled', 'host'):
+        for svc in ['isc-dhcp-server', 'dhcpd']:
+            try:
+                result = subprocess.run(
+                    ['sudo', 'systemctl', 'restart', svc],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    verify = subprocess.run(['systemctl', 'is-active', svc],
+                                            capture_output=True, text=True, timeout=5)
+                    if verify.returncode == 0 and verify.stdout.strip() == 'active':
+                        return True, f"{svc} restarted"
+            except Exception:
+                continue
     
     # Try direct dhcpd restart (Docker). Use -d so dhcpd logs to stderr, redirected to
     # DHCP_LOG_FILE (no syslog/journald in the container); detach so it survives the CGI.
     try:
         # Kill existing
-        subprocess.run(['sudo', 'pkill', '-x', 'dhcpd'], capture_output=True, timeout=5)
+        kill_command = ['pkill', '-x', 'dhcpd']
+        if docker_dhcp_mode not in ('disabled', 'host') or os.geteuid() != 0:
+            kill_command.insert(0, 'sudo')
+        subprocess.run(kill_command, capture_output=True, timeout=5)
         # Find interface
         iface = read_isc_dhcp_interface() or 'eth0'
         logpath = os.environ.get('DHCP_LOG_FILE', '/var/log/lldpq/dhcpd.log')
@@ -2232,10 +2260,20 @@ def restart_dhcp():
             logf = subprocess.DEVNULL
         conf = os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf')
         # Start detached, foreground (-d) so its packet log goes to the file.
-        proc = subprocess.Popen(
-            ['sudo', 'dhcpd', '-d', '-cf', conf, iface],
-            stdout=logf, stderr=logf, start_new_session=True
-        )
+        if docker_dhcp_mode in ('disabled', 'host'):
+            start_command = [DOCKER_DHCP_GUARD, '-d', '-cf', conf, iface]
+            if os.geteuid() != 0:
+                start_command.insert(0, 'sudo')
+        else:
+            start_command = ['sudo', 'dhcpd', '-d', '-cf', conf, iface]
+        try:
+            proc = subprocess.Popen(
+                start_command,
+                stdout=logf, stderr=logf, start_new_session=True
+            )
+        finally:
+            if logf is not subprocess.DEVNULL:
+                logf.close()
         time.sleep(0.8)
         if proc.poll() is not None and proc.returncode not in (0, None):
             return False, "dhcpd failed to start (see DHCP log)"
@@ -3733,33 +3771,38 @@ def _action_dhcp_service_control_locked():
     if action not in ('start', 'stop', 'restart'):
         error_json(f"Invalid action: {action}")
     
-    # Try systemctl first (native install).  Docker falls through to direct
-    # process management and persists the operator's desired lifecycle state.
-    for svc in ['isc-dhcp-server', 'dhcpd']:
-        try:
-            r = subprocess.run(
-                ['sudo', 'systemctl', action, svc],
-                capture_output=True, text=True, timeout=15
-            )
-            if r.returncode == 0:
-                # Stop also disables (prevent auto-start on boot)
-                if action == 'stop':
-                    subprocess.run(['sudo', 'systemctl', 'disable', svc],
-                                   capture_output=True, text=True, timeout=10)
-                    result_json({"success": True, "message": f"{svc} stopped & disabled"})
-                # Start also enables
-                elif action == 'start':
-                    subprocess.run(['sudo', 'systemctl', 'enable', svc],
-                                   capture_output=True, text=True, timeout=10)
-                    result_json({"success": True, "message": f"{svc} started & enabled"})
-                else:
-                    result_json({"success": True, "message": f"{svc} restarted"})
-        except Exception:
-            continue
+    # Keep native service management unchanged. Docker always uses the guarded
+    # direct path so a functioning systemctl cannot bypass its lifecycle checks.
+    docker_dhcp_mode = os.environ.get('LLDPQ_DHCP_MODE', '').strip().lower()
+    if docker_dhcp_mode not in ('disabled', 'host'):
+        for svc in ['isc-dhcp-server', 'dhcpd']:
+            try:
+                r = subprocess.run(
+                    ['sudo', 'systemctl', action, svc],
+                    capture_output=True, text=True, timeout=15
+                )
+                if r.returncode == 0:
+                    # Stop also disables (prevent auto-start on boot)
+                    if action == 'stop':
+                        subprocess.run(['sudo', 'systemctl', 'disable', svc],
+                                       capture_output=True, text=True, timeout=10)
+                        result_json({"success": True, "message": f"{svc} stopped & disabled"})
+                    # Start also enables
+                    elif action == 'start':
+                        subprocess.run(['sudo', 'systemctl', 'enable', svc],
+                                       capture_output=True, text=True, timeout=10)
+                        result_json({"success": True, "message": f"{svc} started & enabled"})
+                    else:
+                        result_json({"success": True, "message": f"{svc} restarted"})
+            except Exception:
+                continue
     
     # Fallback: direct process management (Docker/non-systemd).
     if action in ('stop', 'restart'):
-        subprocess.run(['sudo', 'pkill', '-x', 'dhcpd'], capture_output=True, timeout=5)
+        kill_command = ['pkill', '-x', 'dhcpd']
+        if docker_dhcp_mode not in ('disabled', 'host') or os.geteuid() != 0:
+            kill_command.insert(0, 'sudo')
+        subprocess.run(kill_command, capture_output=True, timeout=5)
         if action == 'stop':
             if dhcp_is_running():
                 error_json('dhcpd did not stop')

@@ -1290,8 +1290,11 @@ class ListenInterfaceKeyTests(ApiFixture):
         reader = shell_function(ENTRYPOINT, "_read_isc_dhcp_interface")
         self.assertIn("for key in INTERFACESv4 INTERFACES; do", reader)
         self.assertIn('DHCP_IFACE=$(_read_isc_dhcp_interface)', ENTRYPOINT)
-        self.assertIn('dhcpd -d -cf /etc/dhcp/dhcpd.conf "$DHCP_IFACE"',
-                      ENTRYPOINT)
+        self.assertTrue(
+            '/usr/local/libexec/lldpq-dhcpd-guard -d -cf '
+            '/etc/dhcp/dhcpd.conf "$DHCP_IFACE"' in ENTRYPOINT,
+            "Docker entrypoint must start DHCP through its guard",
+        )
         self.assertNotRegex(ENTRYPOINT, r"grep -q '\^INTERFACES='")
 
 
