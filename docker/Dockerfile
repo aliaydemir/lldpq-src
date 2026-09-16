@@ -18,7 +18,7 @@ ENV TZ=UTC
 # ruamel.yaml via pip: comment-preserving YAML editing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nginx fcgiwrap \
-    python3 python3-yaml python3-pip python3-netaddr \
+    python3 python3-yaml python3-pip python3-jmespath python3-wheel \
     openssh-client sshpass \
     sudo cron \
     iproute2 iputils-ping dnsutils tcpdump \
@@ -26,7 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dos2unix bash-completion colordiff net-tools bzip2 nano vim \
     tmux openssh-server \
     isc-dhcp-server \
-    && pip3 install --no-cache-dir ruamel.yaml requests \
+    && pip3 install --no-cache-dir \
+        ruamel.yaml requests \
+        ansible-core==2.17.14 netaddr==1.3.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Shell usability tools (eza as exa, syntax-highlighted nano, custom bashrc)
@@ -43,16 +45,6 @@ RUN mkdir -p /run/sshd && \
     sed -i 's/^#Port 22/Port 2033/' /etc/ssh/sshd_config && \
     sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
     sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-
-# Ansible + dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ansible ansible-lint \
-    python3-jmespath python3-wheel \
-    && rm -rf /var/lib/apt/lists/*
-COPY docker/install-ansible-collections.sh /usr/local/sbin/install-ansible-collections
-RUN chmod 0755 /usr/local/sbin/install-ansible-collections \
-    && /usr/local/sbin/install-ansible-collections \
-    && rm -f /usr/local/sbin/install-ansible-collections
 
 # Create lldpq user (matches host user pattern)
 RUN useradd -m -s /bin/bash -G www-data lldpq \

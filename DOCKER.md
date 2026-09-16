@@ -526,9 +526,20 @@ shape and the save-time validation.
 
 ## Ansible integration
 
-Ansible, ansible-lint, and the required collections are installed in the
-image, but integration is disabled by default with `ANSIBLE_DIR=NoNe`. A mount
-or file copy alone does not enable the VLAN/VRF reports or Fabric
+The image provides a pinned controller baseline (`ansible-core 2.17.14` and
+`netaddr 1.3.0`), but integration is disabled by default with
+`ANSIBLE_DIR=NoNe`. LLDPq core monitoring, DHCP/ONIE, and its own Fabric data
+processing do not require downloads from Ansible Galaxy.
+
+Collections belong to the mounted automation project. Declare them in a pinned
+`requirements.yml` (or `collections/requirements.yml`) and install them into
+the project's persistent `collections/` directory. This keeps core image builds
+available when Galaxy is down and prevents one hardcoded collection set from
+silently drifting beyond the controller version. For example, the cl-auto
+automation family declares `ansible.utils >=6,<7`; it does not use
+`nvidia.nvue`, `community.general`, or `ansible.netcommon`.
+
+A mount or file copy alone does not enable the VLAN/VRF reports or Fabric
 Config/Editor/Migration/Deploy tools.
 
 For a new persistent direct deployment, keep the `lldpq-ansible` named volume
@@ -547,6 +558,22 @@ sudo docker cp ~/my_ansible_project/. lldpq:/home/lldpq/ansible/
 sudo docker exec lldpq \
   chown -R lldpq:www-data /home/lldpq/ansible
 ```
+
+Install the project's declared collections after copying it:
+
+```bash
+# Project with requirements.yml at its root
+sudo docker exec -u lldpq -w /home/lldpq/ansible lldpq \
+  ansible-galaxy collection install -r requirements.yml -p collections
+
+# Use -r collections/requirements.yml instead when the project keeps it there.
+```
+
+Ansible searches `$ANSIBLE_DIR/collections` automatically in LLDPq-triggered
+playbook runs. For an offline deployment, populate that directory before
+copying/importing the project instead of contacting Galaxy from the switch or
+isolated server. Projects needing additional controller-side Python packages
+beyond the shipped baseline should build a reviewed derivative image.
 
 The copied project survives recreation only when the container has the
 `lldpq-ansible` named volume (or an equivalent host bind mount) from the
@@ -1205,4 +1232,8 @@ sudo docker ps -a --filter name=lldpq          # Container status
 ### Built-in tools
 
 Available inside the container shell:
-`exa`, `nano`, `tmux`, `colordiff`, `dos2unix`, `bash-completion`, `net-tools`, `bzip2`, `jq`, `git`, `curl`, `tcpdump`, `ansible`, `ansible-lint`, `ansible-galaxy`
+`exa`, `nano`, `tmux`, `colordiff`, `dos2unix`, `bash-completion`,
+`net-tools`, `bzip2`, `jq`, `git`, `curl`, `tcpdump`, `ansible`,
+`ansible-playbook`, and `ansible-galaxy`. The controller baseline also includes
+`netaddr`; project-specific lint/development tools are not part of the runtime
+image.

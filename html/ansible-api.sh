@@ -39,6 +39,14 @@ export ANSIBLE_HOME="/tmp/ansible-www"
 export HOME="$ANSIBLE_HOME"
 export ANSIBLE_LOCAL_TEMP="/tmp/ansible-tmp"
 export ANSIBLE_CACHE_PLUGIN_CONNECTION="/tmp/ansible-cache"
+# Project-owned collections survive Docker recreation with the mounted
+# ANSIBLE_DIR and let each automation repository declare its own versions
+# instead of coupling the LLDPq core image to a live Galaxy service.
+_ansible_collection_root="${ANSIBLE_DIR:-$EDITOR_ROOT}"
+if [[ -n "$_ansible_collection_root" && "$_ansible_collection_root" != "NoNe" ]]; then
+    export ANSIBLE_COLLECTIONS_PATH="$_ansible_collection_root/collections:${ANSIBLE_COLLECTIONS_PATH:-$ANSIBLE_HOME/collections:/usr/share/ansible/collections}"
+fi
+unset _ansible_collection_root
 mkdir -p "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 chmod 775 "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 
