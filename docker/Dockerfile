@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client sshpass \
     sudo cron \
     iproute2 iputils-ping dnsutils tcpdump \
-    curl jq git bsdmainutils bsdextrautils util-linux \
+    curl jq git bsdmainutils bsdextrautils util-linux procps \
     dos2unix bash-completion colordiff net-tools bzip2 nano vim \
     tmux openssh-server \
     isc-dhcp-server \

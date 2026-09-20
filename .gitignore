@@ -13,3 +13,4 @@ tests/
 output/
 .pytest_cache/
 .regress-check/
+reports/

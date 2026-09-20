@@ -1332,6 +1332,12 @@ packages `python3-yaml` (PyYAML), `python3-ruamel.yaml`, and
 `python3-requests`; the installer deliberately uses distro packages rather
 than `pip --user`.
 
+Native installation configures four CGI workers through
+`/etc/systemd/system/fcgiwrap.service.d/lldpq-workers.conf`, so a slow request
+does not occupy the sole web API worker. Uninstall removes this LLDPq-specific
+override. Fabric edits and Ansible jobs share a lock and return a busy response
+when another operation owns the inventory.
+
 On an air-gapped host, install those packages and the standard runtime
 dependencies from the local OS repository before running the offline update.
 The offline updater does not contact apt, pip, or GitHub.

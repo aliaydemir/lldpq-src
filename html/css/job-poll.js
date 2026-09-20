@@ -72,6 +72,9 @@
                     }
                 });
                 const data = await response.json();
+                // Every response, including auth and missing-job errors,
+                // belongs to the generation that issued the request.
+                if (token !== activeToken || gen !== generation) return;
                 if (callbacks.onAuthRejected &&
                     (response.status === 401 || response.status === 403) &&
                     data && data.success === false) {
@@ -151,8 +154,8 @@
                     return;
                 }
                 if (data.status === 'failure') {
-                    callbacks.onFailure(reason, data);
                     if (data.retry_scheduled) {
+                        callbacks.onFailure(reason, data);
                         const retryDelay = data.next_retry_at
                             ? Math.max(5000, Math.min(30000, data.next_retry_at * 1000 - Date.now() + 1000))
                             : 10000;
@@ -160,6 +163,8 @@
                     } else {
                         setStoredToken('');
                         activeToken = null;
+                        generation += 1;
+                        callbacks.onFailure(reason, data);
                     }
                     return;
                 }
@@ -185,6 +190,7 @@
         async function submit() {
             // Cancel/ignore all callbacks associated with an older token.
             generation += 1;
+            const gen = generation;
             activeToken = null;
             if (pollTimer) clearTimeout(pollTimer);
             callbacks.onSubmitStart();
@@ -198,13 +204,15 @@
                     }
                 });
                 const data = await response.json();
+                if (gen !== generation) return;
                 if (!response.ok || data.status !== 'started' ||
                     !TOKEN_RE.test(data.token || '')) {
                     throw new Error(data.error || data.message || 'Trigger failed');
                 }
                 callbacks.onSubmitted(data.token);
-                track(data.token);
+                if (gen === generation) track(data.token);
             } catch (error) {
+                if (gen !== generation) return;
                 setStoredToken('');
                 callbacks.onSubmitError(error);
             }

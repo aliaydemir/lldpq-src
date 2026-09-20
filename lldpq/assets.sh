@@ -333,6 +333,32 @@ process_one() {
 # One file per worker avoids concurrent appends.  The later exact-coverage
 # validation turns any worker/write failure into a failed run without replacing
 # the previous published snapshots.
+wait_for_asset_slot() {
+    local completed_pid="" status=0 pid
+    local -a pending=()
+    # Ubuntu 22.04+ ships Bash >=5.1. Wait for ANY worker, and retain its
+    # status and identity so early failures cannot disappear during dispatch.
+    if (( BASH_VERSINFO[0] > 5 ||
+          (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1) )); then
+        wait -n -p completed_pid "${pids[@]}" 2>/dev/null || status=$?
+        if [[ -n "${completed_pid:-}" ]]; then
+            (( status == 0 )) || worker_failed=true
+            for pid in "${pids[@]}"; do
+                [[ "$pid" == "$completed_pid" ]] || pending+=("$pid")
+            done
+            pids=("${pending[@]}")
+            return 0
+        fi
+        # All children can finish before wait -n is entered. Reap each saved
+        # status instead of treating wait's "no unwaited child" as success.
+    fi
+    # Older Bash keeps the bounded batch fallback and the same failure policy.
+    for pid in "${pids[@]}"; do
+        wait "$pid" || worker_failed=true
+    done
+    pids=()
+}
+
 pids=()
 worker_failed=false
 index=0
@@ -345,10 +371,7 @@ for ip in "${device_ips[@]}"; do
     index=$((index + 1))
 
     if (( ${#pids[@]} >= ASSETS_MAX_PARALLEL )); then
-        for pid in "${pids[@]}"; do
-            wait "$pid" || worker_failed=true
-        done
-        pids=()
+        wait_for_asset_slot
     fi
 done
 for pid in "${pids[@]}"; do

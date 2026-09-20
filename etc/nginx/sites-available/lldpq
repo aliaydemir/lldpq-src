@@ -8,8 +8,8 @@ server {
         server_name _;
 
         # Analysis reports and their JSON payloads reach tens of MB at fabric
-        # scale, and every response below is no-store; compression is the only
-        # transfer-size lever. text/html is always included when gzip is on.
+        # scale. Their responses remain no-store; compression reduces their
+        # transfer size. text/html is always included when gzip is on.
         # octet-stream stays OUT of this list: provisioning serves multi-GB
         # OS images (*.bin/*.img/*.iso, onie-installer aliases) statically and
         # on-the-fly gzip would throttle them and break byte-range resume.
@@ -30,6 +30,22 @@ server {
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
             add_header Pragma "no-cache";
             add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+        }
+
+        # Static assets can be retained and conditionally revalidated (304),
+        # including after an upgrade at the same URL. Reports and APIs retain
+        # no-store. Do not use a long immutable TTL for unversioned filenames.
+        location ~* ^/(?:css/|png/|monaco/|topology/).+\.(?:js|css|woff2?|ttf|eot|svg|png|ico)$ {
+            try_files $uri =404;
+            etag on;
+            if_modified_since exact;
+            add_header Cache-Control "public, no-cache";
+        }
+        location ~ ^/(?:p2p-alias|lifecycle-scope)\.js$ {
+            try_files $uri =404;
+            etag on;
+            if_modified_since exact;
+            add_header Cache-Control "public, no-cache";
         }
 
         # Every page omitted from the operator menu is also admin-gated when

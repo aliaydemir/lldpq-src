@@ -175,6 +175,27 @@ class PfcEcnHistoryShardTests(unittest.TestCase):
             all(stamp >= time.time() - analyzer.HISTORY_SECONDS - 1 for stamp in stamps)
         )
 
+    def test_baseline_pruning_is_host_local_and_keeps_failed_port_reads(self):
+        result_dir = self._result_tree(["leaf1", "leaf10"])
+        original = {
+            key: {"timestamp": 1000, "counters": {"rx_pause": 12}}
+            for key in (
+                "leaf1:swp1", "leaf1:swp2", "leaf10:swp1", "leaf10:swp2",
+                "missing:swp1", "inventory_error:swp1", "retired:swp1",
+            )
+        }
+        (result_dir / "pfc_ecn_baseline.json").write_text(json.dumps({"ports": original}))
+        (result_dir / "pfc-ecn-data" / "inventory_error_pfc_ecn.txt").write_text(
+            "__LLDPQ_PFC_ECN_INVENTORY_STATUS__:ERROR:0\n")
+        self.assertTrue(self._run(result_dir, {
+            "leaf1": "OK", "leaf10": "OK", "missing": "OK", "inventory_error": "OK",
+        }))
+        baselines = json.loads((result_dir / "pfc_ecn_baseline.json").read_text())["ports"]
+        self.assertEqual(baselines, {
+            key: original[key]
+            for key in ("leaf1:swp1", "leaf10:swp1", "missing:swp1", "inventory_error:swp1")
+        })
+
 
 if __name__ == "__main__":
     unittest.main()

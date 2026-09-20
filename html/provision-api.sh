@@ -1813,9 +1813,12 @@ def _action_save_bindings_locked():
         if not isinstance(remove_devices, list) or not all(isinstance(x, str) for x in remove_devices):
             error_json('remove_devices must be a list of hostnames')
         if os.path.exists(devices_file):
-            devices_content, devices_msg = sync_bindings_to_devices_yaml(
-                bindings, remove_devices, write=False
-            )
+            try:
+                devices_content, devices_msg = sync_bindings_to_devices_yaml(
+                    bindings, remove_devices, write=False
+                )
+            except ValueError as exc:
+                error_json(str(exc))
         else:
             error_json('devices.yaml not found; inventory was not changed')
 
@@ -1982,14 +1985,20 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
         ip_to_key[str(key)] = key
         hostname_to_key[h] = key
     
-    # Remove devices
+    # Resolve every source before changing keys. Reading from the dictionary
+    # while moving entries loses hosts (and their SSH overrides) on IP swaps
+    # or cycles. Deep copies also keep YAML aliases from sharing mutations.
+    import copy
+    original_devices = copy.deepcopy(devices)
+    removed_keys = set()
     for h in remove_hostnames:
         key = hostname_to_key.get(h)
-        if key and key in devices:
-            del devices[key]
+        if key is not None and key in devices and key not in removed_keys:
+            removed_keys.add(key)
             removed += 1
-    
+
     # Add/update complete bindings. Static devices do not require a MAC.
+    complete_bindings = []
     for b in bindings:
         hostname = b.get('hostname', '').strip()
         ip = b.get('ip', '').strip()
@@ -1999,48 +2008,61 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
         has_mac = bool(mac and mac != '-' and 'x' not in mac.lower())
         if not hostname or not ip or (b.get('dhcp', True) and not has_mac):
             continue
-        
-        existing_key = hostname_to_key.get(hostname) or ip_to_key.get(ip)
-        
-        if existing_key and existing_key in devices:
-            # Update existing entry
-            # If IP changed (key is old IP, binding has new IP), move to new key
-            if str(existing_key) != ip:
-                old_info = devices[existing_key]
-                del devices[existing_key]
-                # Re-create at new IP key. Dict-form entries keep all their
-                # fields (per-device username override etc.); only
-                # hostname/role change.
-                if isinstance(old_info, dict):
-                    old_info['hostname'] = hostname
-                    if role:
-                        old_info['role'] = role
-                    else:
-                        old_info.pop('role', None)
-                    devices[ip] = old_info
-                elif role:
-                    devices[ip] = f"{hostname} @{role}"
-                else:
-                    devices[ip] = hostname
-            else:
-                # Same IP — just update role
-                info = devices[existing_key]
-                if isinstance(info, str):
-                    devices[existing_key] = f"{hostname} @{role}" if role else hostname
-                elif isinstance(info, dict):
-                    if role:
-                        info['role'] = role
-                    else:
-                        info.pop('role', None)
+        complete_bindings.append((hostname, ip, role))
+
+    # A hostname match owns its old metadata even if another binding takes
+    # its old address. IP fallback supports a same-address hostname rename.
+    hostname_keys = {
+        hostname_to_key[hostname] for hostname, _, _ in complete_bindings
+        if hostname in hostname_to_key
+        and hostname_to_key[hostname] not in removed_keys
+    }
+    changes = []
+    source_keys = set()
+    target_ips = set()
+    for hostname, ip, role in complete_bindings:
+        existing_key = hostname_to_key.get(hostname)
+        if existing_key in removed_keys:
+            existing_key = None
+        if existing_key is None:
+            candidate = ip_to_key.get(ip)
+            if candidate not in removed_keys and candidate not in hostname_keys:
+                existing_key = candidate
+        if ip in target_ips or (existing_key is not None and existing_key in source_keys):
+            raise ValueError('Multiple bindings refer to the same devices.yaml entry')
+        target_ips.add(ip)
+        if existing_key is not None:
+            source_keys.add(existing_key)
             updated += 1
         else:
-            # Add new device
-            if role:
-                devices[ip] = f"{hostname} @{role}"
-            else:
-                devices[ip] = hostname
             added += 1
-    
+        changes.append((existing_key, hostname, ip, role))
+
+    # Do not overwrite an unrelated monitored host that was neither moved
+    # nor explicitly removed by this save.
+    for _, _, ip, _ in changes:
+        occupied_key = ip_to_key.get(ip)
+        if (occupied_key is not None and occupied_key not in source_keys
+                and occupied_key not in removed_keys):
+            raise ValueError(f'IP {ip} is already used in devices.yaml; move or remove that device first')
+
+    # Keep in-place entries in position, including their YAML comments.
+    moved_keys = {source for source, _, ip, _ in changes
+                  if source is not None and str(source) != ip}
+    for key in removed_keys | moved_keys:
+        devices.pop(key, None)
+    for existing_key, hostname, ip, role in changes:
+        info = copy.deepcopy(original_devices.get(existing_key))
+        if isinstance(info, dict):
+            info['hostname'] = hostname
+            if role:
+                info['role'] = role
+            else:
+                info.pop('role', None)
+            devices[ip] = info
+        else:
+            devices[ip] = f"{hostname} @{role}" if role else hostname
+
     parts = []
     if added: parts.append(f'{added} added')
     if updated: parts.append(f'{updated} updated')

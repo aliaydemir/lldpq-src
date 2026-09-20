@@ -12,6 +12,7 @@ import re
 import json
 import html
 import time
+import math
 import collections
 import stat
 import tempfile
@@ -97,6 +98,10 @@ class LinkFlapAnalyzer:
         self.carrier_transitions_stats = {}  # port -> current transition count
         self.prev_cumulative = {}  # port -> last cycle's cumulative carrier_changes (persisted baseline)
         self.prev_sample_time = {}  # port -> timestamp of persisted baseline
+        # A single carrier transition can be the first half of a flap. Keep
+        # its earliest possible time across polls/restarts until its mate
+        # arrives; otherwise +1, +1 (or an odd delta) silently loses a flap.
+        self.pending_transition_start = {}
         self.flapping_counters = {}  # port -> {period: count}
         self.cycle_events = []  # flaps detected THIS run (Timeline sidecar)
         self._port_cache = {}  # Cache for calculated port status/counters
@@ -178,6 +183,7 @@ class LinkFlapAnalyzer:
                     self.carrier_transitions_lookback[port] = collections.deque(lookback, maxlen=100)
                 self.prev_cumulative = dict(data.get("prev_cumulative", {}))
                 self.prev_sample_time = dict(data.get("prev_sample_time", {}))
+                self.pending_transition_start = dict(data.get("pending_transition_start", {}))
                 # Restore the per-port cumulative counter. Every report surface
                 # (total_ports, table, summary, anomalies) is keyed off it, so a
                 # port that fails collection this cycle -- exactly what a hard
@@ -208,6 +214,7 @@ class LinkFlapAnalyzer:
                 "carrier_transitions_lookback": {port: list(deq) for port, deq in self.carrier_transitions_lookback.items()},
                 "prev_cumulative": self.prev_cumulative,
                 "prev_sample_time": self.prev_sample_time,
+                "pending_transition_start": self.pending_transition_start,
                 "carrier_transitions_stats": self.carrier_transitions_stats,
                 "collection_coverage": self.collection_coverage,
                 "last_update": time.time()
@@ -333,45 +340,67 @@ class LinkFlapAnalyzer:
         # Cycle-over-cycle delta vs the persisted previous cumulative reading.
         prev = self.prev_cumulative.get(port_name)
         prev_time = self.prev_sample_time.get(port_name)
-        if prev is not None and current_transitions >= prev:
+        detected_flaps = 0
+        observation_start = None
+        if (prev is not None and current_transitions >= prev
+                and prev_time is not None and math.isfinite(float(prev_time))
+                and float(prev_time) <= curr_time):
             delta = current_transitions - prev
+            pending_start = self.pending_transition_start.get(port_name)
+            if pending_start is not None and delta:
+                pending_start = float(pending_start)
+                if math.isfinite(pending_start) and pending_start <= float(prev_time):
+                    self._record_flaps(
+                        port_name, current_transitions, curr_time, 1, pending_start
+                    )
+                    detected_flaps = 1
+                    observation_start = pending_start
+                    delta -= 1
+                self.pending_transition_start.pop(port_name, None)
+            # Keep pairs observed this poll separate from a carried pair:
+            # an old unmatched transition must not push fresh flaps outside
+            # their true observation window.
             if delta >= self.MIN_CARRIER_TRANSITION_DELTA:
-                # The exact event time is unknown.  Persist the complete poll
-                # interval so short-window counters can refuse to overclaim it.
-                if prev_time is None:
-                    # Baselines persisted by older versions have no sampling
-                    # timestamp, so the delta may span minutes or days. Rebase
-                    # once instead of assigning an unknowable interval.
-                    pass
-                else:
-                    interval_start = float(prev_time)
-                    interval_seconds = max(0.0, curr_time - interval_start)
-                    self.flapping_hist[port_name].append((
-                        curr_time,
-                        current_transitions,
-                        delta // 2,
-                        interval_start,
-                        interval_seconds,
-                    ))
-                    # Timeline sidecar record for this cycle's detected flaps.
-                    device, _, interface = port_name.partition(":")
-                    flaps = delta // 2
-                    self.cycle_events.append({
-                        "ts": int(curr_time),
-                        "severity": "critical" if flaps >= 5 else "warning",
-                        "device": device,
-                        "object": interface or port_name,
-                        "kind": "link-flap",
-                        "detail": "%d flap(s) within %ds poll interval" % (
-                            flaps, int(interval_seconds)),
-                    })
-        # current < prev => counter reset (e.g. reboot); skip this cycle and just re-baseline below.
+                self._record_flaps(
+                    port_name, current_transitions, curr_time,
+                    delta // 2, float(prev_time),
+                )
+                detected_flaps += delta // 2
+                if observation_start is None:
+                    observation_start = float(prev_time)
+            if delta % 2:
+                self.pending_transition_start[port_name] = float(prev_time)
+        else:
+            # Counter reset, clock rollback or a legacy baseline without a
+            # timestamp: rebase without joining transitions across that gap.
+            self.pending_transition_start.pop(port_name, None)
         self.prev_cumulative[port_name] = current_transitions
         self.prev_sample_time[port_name] = curr_time
+
+        if detected_flaps:
+            # Timeline events deduplicate by timestamp/device/interface, so
+            # publish one combined event even when history needs two windows.
+            device, _, interface = port_name.partition(":")
+            self.cycle_events.append({
+                "ts": int(curr_time),
+                "severity": "critical" if detected_flaps >= 5 else "warning",
+                "device": device,
+                "object": interface or port_name,
+                "kind": "link-flap",
+                "detail": "%d flap(s) within %ds observation interval" % (
+                    detected_flaps, int(curr_time - observation_start)),
+            })
 
         # Keep lookback/stats for the rest of the report (Total column = current cumulative counter).
         self.carrier_transitions_lookback[port_name].append((curr_time, current_transitions))
         self.carrier_transitions_stats[port_name] = current_transitions
+
+    def _record_flaps(self, port_name, transitions, timestamp, count, interval_start):
+        """Record complete observation intervals, never guessed event times."""
+        interval_seconds = timestamp - interval_start
+        self.flapping_hist[port_name].append((
+            timestamp, transitions, count, interval_start, interval_seconds,
+        ))
 
     def _cleanup_old_entries(self, curr_time: float):
         """Remove entries older than thresholds"""

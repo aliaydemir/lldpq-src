@@ -1939,6 +1939,12 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
             }
     finish_phase("load")
 
+    # Build once: scanning every baseline for every host costs O(hosts *
+    # total ports). Only this host's existing keys can be retired below.
+    baseline_keys_by_host: Dict[str, List[str]] = {}
+    for key in baselines:
+        baseline_keys_by_host.setdefault(key.split(":", 1)[0], []).append(key)
+
     records: List[Dict[str, Any]] = []
     lossless_priority = configured_priority()
     # Priorities seen on ports that returned nothing for the configured one.
@@ -1992,8 +1998,7 @@ def process_pfc_ecn_data_files(data_dir: str = "monitor-results/pfc-ecn-data") -
         # reconfiguration) must not persist forever.  Ports with failed
         # counter reads still appear in the snapshot, so their baselines are
         # untouched.
-        host_prefix = f"{hostname}:"
-        for key in [k for k in baselines if k.startswith(host_prefix)]:
+        for key in baseline_keys_by_host.get(hostname, []):
             if key.split(":", 1)[1] not in physical_ports:
                 del baselines[key]
         for interface, entry in sorted(physical_ports.items()):

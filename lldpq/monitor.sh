@@ -1800,8 +1800,13 @@ PYTHON
 
     select_scope_web_overlays || return 1
     stage_dir=$("${LLDPQ_PRIV[@]}" mktemp -d "$WEB_ROOT/.monitor-results.new.XXXXXXXXXX") || return 1
-    if ! "${LLDPQ_PRIV[@]}" cp -a "${CP_REFLINK_ARGS[@]}" -- \
-            "$destination_dir/." "$stage_dir/"; then
+    # The web baseline is immutable: collectors only write the separate local
+    # tree. Share unchanged report inodes across the two directory generations,
+    # omit overlays, and copy mutable markers independently. Overlay copies
+    # below never write into a linked baseline file.
+    if ! "${LLDPQ_PRIV[@]}" python3 "$SCRIPT_DIR/stage_scoped_reports.py" \
+            "$destination_dir" "$stage_dir" "${LLDPQ_USER:-$(whoami)}" \
+            www-data "${SCOPE_WEB_OVERLAYS[@]}"; then
         "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
     fi

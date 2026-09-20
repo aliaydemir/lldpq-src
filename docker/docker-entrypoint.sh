@@ -2127,47 +2127,104 @@ echo "  ✓ cron"
 # container writable layer, so the socket pathname can outlive the old process.
 # Remove only that stale runtime artifact and do not report readiness until the
 # replacement process is alive and has created a real Unix socket.
+# Bound CGI concurrency independently of device SSH parallelism. A live table
+# query must not occupy the only worker used by auth, status and admin pages.
+LLDPQ_FCGI_WORKERS="${LLDPQ_FCGI_WORKERS:-4}"
+case "$LLDPQ_FCGI_WORKERS" in
+    ''|*[!0-9]*|0|0*)
+        echo "ERROR: LLDPQ_FCGI_WORKERS must be an integer from 1 to 32" >&2
+        exit 1 ;;
+esac
+if [ "${#LLDPQ_FCGI_WORKERS}" -gt 2 ] || [ "$LLDPQ_FCGI_WORKERS" -gt 32 ]; then
+    echo "ERROR: LLDPQ_FCGI_WORKERS must be an integer from 1 to 32" >&2
+    exit 1
+fi
 FCGIWRAP_SOCKET=/var/run/fcgiwrap.socket
-rm -f -- "$FCGIWRAP_SOCKET"
-/usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &
-FCGIWRAP_PID=$!
-FCGIWRAP_READY=false
+FCGIWRAP_PID=""
 
-for _ in {1..50}; do
-    if ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
-        if wait "$FCGIWRAP_PID" 2>/dev/null; then
-            FCGIWRAP_STATUS=0
-        else
-            FCGIWRAP_STATUS=$?
+_fcgiwrap_pool_healthy() {
+    local snapshot
+    [ -n "$FCGIWRAP_PID" ] && [ -S "$FCGIWRAP_SOCKET" ] || return 1
+    snapshot=$(ps -eo pid=,ppid=,pgid=,stat=,comm=) || return 1
+    # -c 1 serves directly in the leader. Larger pools fork exactly N workers;
+    # fcgiwrap does not replace workers that die, and orphan workers can keep
+    # accepting requests after the master dies. Neither case is a healthy pool.
+    awk -v master="$FCGIWRAP_PID" -v expected="$LLDPQ_FCGI_WORKERS" '
+        $3 == master && $4 !~ /^[ZX]/ && $5 ~ /(^|\/)fcgiwrap$/ {
+            if ($1 == master) leader = 1
+            if ($2 == master) workers++
+        }
+        END { exit !(leader && (expected == 1 || workers == expected)) }
+    ' <<< "$snapshot"
+}
+
+_fcgiwrap_group_alive() {
+    local snapshot
+    [ -n "$FCGIWRAP_PID" ] || return 1
+    # Exclude zombies, including an initial master reparented to nginx PID 1.
+    # If process inspection fails, keep treating the group as alive rather
+    # than launch an overlapping replacement that cannot be owned safely.
+    snapshot=$(ps -eo pgid=,stat=) || return 0
+    awk -v group="$FCGIWRAP_PID" '
+        $1 == group && $2 !~ /^[ZX]/ { alive = 1 }
+        END { exit !alive }
+    ' <<< "$snapshot"
+}
+
+_stop_fcgiwrap() {
+    local attempt
+    [ -n "$FCGIWRAP_PID" ] || return 0
+    # Each launch owns a separate session/process group. Never pkill by name:
+    # doing so can kill unrelated pools and cannot distinguish orphan workers.
+    kill -TERM -- "-$FCGIWRAP_PID" 2>/dev/null || true
+    for attempt in {1..20}; do
+        _fcgiwrap_group_alive || break
+        sleep 0.1
+    done
+    if _fcgiwrap_group_alive; then
+        kill -KILL -- "-$FCGIWRAP_PID" 2>/dev/null || true
+        for attempt in {1..20}; do
+            _fcgiwrap_group_alive || break
+            sleep 0.1
+        done
+    fi
+    if _fcgiwrap_group_alive; then
+        echo "ERROR: fcgiwrap pool $FCGIWRAP_PID could not be stopped" >&2
+        return 1
+    fi
+    wait "$FCGIWRAP_PID" 2>/dev/null || true
+    FCGIWRAP_PID=""
+    return 0
+}
+
+_start_fcgiwrap() {
+    local attempt
+    # Refuse to overwrite ownership of a pool that has not been cleaned up.
+    [ -z "$FCGIWRAP_PID" ] || return 1
+    rm -f -- "$FCGIWRAP_SOCKET"
+    setsid /usr/sbin/fcgiwrap -f -c "$LLDPQ_FCGI_WORKERS" -s "unix:$FCGIWRAP_SOCKET" &
+    FCGIWRAP_PID=$!
+    for attempt in {1..50}; do
+        if _fcgiwrap_pool_healthy; then
+            if chown www-data:www-data "$FCGIWRAP_SOCKET" &&
+               chmod 660 "$FCGIWRAP_SOCKET" && _fcgiwrap_pool_healthy; then
+                return 0
+            fi
+            break
         fi
-        rm -f -- "$FCGIWRAP_SOCKET"
-        echo "ERROR: fcgiwrap exited during startup (status $FCGIWRAP_STATUS)" >&2
-        exit 1
-    fi
-    if [ -S "$FCGIWRAP_SOCKET" ]; then
-        FCGIWRAP_READY=true
-        break
-    fi
-    sleep 0.1
-done
-
-if [ "$FCGIWRAP_READY" != true ] || ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
-    kill "$FCGIWRAP_PID" 2>/dev/null || true
-    wait "$FCGIWRAP_PID" 2>/dev/null || true
+        kill -0 "$FCGIWRAP_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    _stop_fcgiwrap || return 1
     rm -f -- "$FCGIWRAP_SOCKET"
-    echo "ERROR: fcgiwrap did not create a live socket within 5 seconds" >&2
+    echo "ERROR: fcgiwrap did not create a complete live pool within 5 seconds" >&2
+    return 1
+}
+
+if ! _start_fcgiwrap; then
     exit 1
 fi
-
-chown www-data:www-data "$FCGIWRAP_SOCKET"
-chmod 660 "$FCGIWRAP_SOCKET"
-if ! kill -0 "$FCGIWRAP_PID" 2>/dev/null; then
-    wait "$FCGIWRAP_PID" 2>/dev/null || true
-    rm -f -- "$FCGIWRAP_SOCKET"
-    echo "ERROR: fcgiwrap exited before startup completed" >&2
-    exit 1
-fi
-echo "  ✓ fcgiwrap"
+echo "  ✓ fcgiwrap ($LLDPQ_FCGI_WORKERS workers)"
 
 # Start SSH server (port 2033)
 /usr/sbin/sshd 2>/dev/null && echo "  ✓ sshd (port 2033)" || echo "  ⚠ sshd failed to start"
@@ -2279,8 +2336,8 @@ echo "  ✓ console-pty (127.0.0.1:${CONSOLE_PTY_PORT})"
 # Watchdog for the fire-and-forget daemons. The console supervisor above only
 # owns console-pty; nginx as PID 1 keeps the container alive even when
 # fcgiwrap dies (every CGI API answers 502) or cron dies (all scheduled
-# collection silently stops). Poll liveness by exact daemon name and restart
-# with the same commands used at startup. A daemon that dies more than
+# collection silently stops). Inspect the owned CGI pool and cron's exact name
+# and restart with the same commands used at startup. A daemon that dies more than
 # WATCHDOG_STORM_LIMIT times inside WATCHDOG_STORM_WINDOW seconds is abandoned
 # with a CRITICAL log instead of restarting forever; the container stays up.
 WATCHDOG_POLL_DELAY=$CONSOLE_RESTART_DELAY
@@ -2288,15 +2345,8 @@ WATCHDOG_STORM_LIMIT=5
 WATCHDOG_STORM_WINDOW=60
 
 _restart_fcgiwrap() {
-    rm -f -- "$FCGIWRAP_SOCKET"
-    /usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &
-    local _fcgiwrap_attempt
-    for _fcgiwrap_attempt in {1..50}; do
-        [ -S "$FCGIWRAP_SOCKET" ] && break
-        sleep 0.1
-    done
-    chown www-data:www-data "$FCGIWRAP_SOCKET" 2>/dev/null || true
-    chmod 660 "$FCGIWRAP_SOCKET" 2>/dev/null || true
+    _stop_fcgiwrap || return 1
+    _start_fcgiwrap
 }
 
 _restart_cron() {
@@ -2307,12 +2357,13 @@ _supervise_services() {
     local now
     local fcgiwrap_deaths=0 fcgiwrap_window_start=0 fcgiwrap_abandoned=false
     local cron_deaths=0 cron_window_start=0 cron_abandoned=false
+    trap '_stop_fcgiwrap || true' EXIT
     trap 'exit 0' TERM INT
 
     while true; do
         sleep "$WATCHDOG_POLL_DELAY"
 
-        if [ "$fcgiwrap_abandoned" != true ] && ! pgrep -x fcgiwrap >/dev/null 2>&1; then
+        if [ "$fcgiwrap_abandoned" != true ] && ! _fcgiwrap_pool_healthy; then
             now=$(date +%s)
             if [ $((now - fcgiwrap_window_start)) -gt "$WATCHDOG_STORM_WINDOW" ]; then
                 fcgiwrap_window_start=$now
@@ -2321,10 +2372,10 @@ _supervise_services() {
             fcgiwrap_deaths=$((fcgiwrap_deaths + 1))
             if [ "$fcgiwrap_deaths" -gt "$WATCHDOG_STORM_LIMIT" ]; then
                 fcgiwrap_abandoned=true
-                echo "CRITICAL: fcgiwrap died more than ${WATCHDOG_STORM_LIMIT} times in ${WATCHDOG_STORM_WINDOW}s; not restarting it again (container stays up)" >&2
+                echo "CRITICAL: fcgiwrap pool failed more than ${WATCHDOG_STORM_LIMIT} times in ${WATCHDOG_STORM_WINDOW}s; not restarting it again (container stays up)" >&2
             else
-                echo "  ⚠ fcgiwrap died; restarting (${fcgiwrap_deaths}/${WATCHDOG_STORM_LIMIT} within ${WATCHDOG_STORM_WINDOW}s)" >&2
-                _restart_fcgiwrap
+                echo "  ⚠ fcgiwrap pool is incomplete; restarting (${fcgiwrap_deaths}/${WATCHDOG_STORM_LIMIT} within ${WATCHDOG_STORM_WINDOW}s)" >&2
+                _restart_fcgiwrap || echo "  ⚠ fcgiwrap pool restart failed; watchdog will retry" >&2
             fi
         fi
 
@@ -2340,7 +2391,7 @@ _supervise_services() {
                 echo "CRITICAL: cron died more than ${WATCHDOG_STORM_LIMIT} times in ${WATCHDOG_STORM_WINDOW}s; not restarting it again (container stays up)" >&2
             else
                 echo "  ⚠ cron died; restarting (${cron_deaths}/${WATCHDOG_STORM_LIMIT} within ${WATCHDOG_STORM_WINDOW}s)" >&2
-                _restart_cron
+                _restart_cron || echo "  ⚠ cron restart failed; watchdog will retry" >&2
             fi
         fi
     done

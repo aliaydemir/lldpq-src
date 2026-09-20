@@ -2754,6 +2754,14 @@ fi
 echo "  root-owned authentication users helper removed"
 
 # ─── 2. Telemetry stack ───────────────────────────────────────────────
+# Remove only LLDPq's worker override before the shared CGI service is
+# restored. Other applications' service drop-ins remain untouched.
+run_required "LLDPq CGI worker override could not be removed" \
+    "sudo rm -f '/etc/systemd/system/fcgiwrap.service.d/lldpq-workers.conf'"
+run "sudo rmdir '/etc/systemd/system/fcgiwrap.service.d' 2>/dev/null || true"
+run_required "Could not reload systemd after removing the CGI override" \
+    "sudo systemctl daemon-reload"
+
 step "Removing telemetry stack..."
 if [[ -f "$LLDPQ_INSTALL_DIR/telemetry/docker-compose.yaml" ]]; then
     TELEMETRY_REMOVED=false

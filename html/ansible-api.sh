@@ -50,9 +50,24 @@ unset _ansible_collection_root
 mkdir -p "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 chmod 775 "$ANSIBLE_HOME" "$ANSIBLE_LOCAL_TEMP" "$ANSIBLE_CACHE_PLUGIN_CONNECTION" 2>/dev/null || true
 
-# Background deploy job state and single-runner lock for nv config apply
+# Share Fabric API's inventory lock for edits, git and Ansible jobs. Using
+# separate locks lets the two editors overwrite each other or change inputs
+# partway through a deploy when CGI requests run concurrently.
+FABRIC_LOCK_DIR="${FABRIC_LOCK_DIR:-$(cd -- "$(dirname "$0")" && pwd)/.locks}"
+FABRIC_LOCK_GROUP="${FABRIC_LOCK_GROUP:-www-data}"
+if mkdir -p "$FABRIC_LOCK_DIR" 2>/dev/null; then
+    chgrp "$FABRIC_LOCK_GROUP" "$FABRIC_LOCK_DIR" 2>/dev/null || true
+    chmod 2770 "$FABRIC_LOCK_DIR" 2>/dev/null || true
+fi
+FABRIC_LOCK_FILE="${FABRIC_LOCK_FILE:-$FABRIC_LOCK_DIR/fabric-api.lock}"
+if (umask 0007; : >>"$FABRIC_LOCK_FILE") 2>/dev/null; then
+    chmod 660 "$FABRIC_LOCK_FILE" 2>/dev/null || true
+fi
+
+# Background deploy job state and single-runner lock for nv config apply.
+# The detached worker inherits fd 9, retaining the shared inventory lock.
 DEPLOY_STATE_DIR="$ANSIBLE_HOME/deploy-jobs"
-DEPLOY_LOCK="$ANSIBLE_HOME/ansible-apply.lock"
+DEPLOY_LOCK="$FABRIC_LOCK_FILE"
 mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
 chmod 775 "$DEPLOY_STATE_DIR" 2>/dev/null || true
 
@@ -95,9 +110,12 @@ json_response() {
 # overlap a running deploy or each other. Emits the "locked" JSON response and
 # returns 1 if the lock is busy. The lock is released when fd 9 closes on exit.
 acquire_deploy_lock() {
-    exec 9>"$DEPLOY_LOCK"
+    if ! exec 9>>"$DEPLOY_LOCK" 2>/dev/null; then
+        json_response '{"success": false, "error": "Could not open config lock file"}'
+        return 1
+    fi
     if ! flock -n 9; then
-        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+        json_response '{"success": false, "locked": true, "error": "Another config edit, deploy, diff, or generate is already running. Try again shortly."}'
         return 1
     fi
     return 0
@@ -436,9 +454,7 @@ run_diff() {
     # Single-runner lock: never run diff while a deploy/generate/diff is applying
     # config on the same switches. The lock is released when this fd closes (or,
     # for a detached job, when the job holding the inherited fd exits).
-    exec 9>"$DEPLOY_LOCK"
-    if ! flock -n 9; then
-        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+    if ! acquire_deploy_lock; then
         return
     fi
 
@@ -490,9 +506,7 @@ run_deploy() {
     # immediate "locked" response. The backgrounded job inherits this fd and
     # therefore keeps the lock held for its whole lifetime; the lock is released
     # only when the job exits and its inherited fd closes.
-    exec 9>"$DEPLOY_LOCK"
-    if ! flock -n 9; then
-        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+    if ! acquire_deploy_lock; then
         return
     fi
 
@@ -626,9 +640,7 @@ run_generate() {
     # Single-runner lock shared with deploy/diff so generation cannot race a
     # concurrent nv config apply. Released when this fd closes (or, for a
     # detached job, when the job holding the inherited fd exits).
-    exec 9>"$DEPLOY_LOCK"
-    if ! flock -n 9; then
-        json_response '{"success": false, "locked": true, "error": "Another deploy, diff, or generate is already running. Try again shortly."}'
+    if ! acquire_deploy_lock; then
         return
     fi
 

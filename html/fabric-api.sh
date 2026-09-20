@@ -260,13 +260,21 @@ case "$_FABRIC_ACTION" in
         require_admin ;;
 esac
 
-# Load config - read ANSIBLE_DIR from config file, but don't overwrite env var
-if [[ -f /etc/lldpq.conf ]]; then
-    _conf_ansible_dir=$(grep "^ANSIBLE_DIR=" /etc/lldpq.conf 2>/dev/null | cut -d= -f2)
-    if [[ -n "$_conf_ansible_dir" ]]; then
-        ANSIBLE_DIR="$_conf_ansible_dir"
-    fi
+# Use the same data parser as Setup/Ansible Editor. Setup saves quoted values;
+# treating those quotes as part of the directory breaks every inventory path.
+if [[ ! -x /usr/local/bin/lldpq-config ]]; then
+    echo "Content-Type: application/json"
+    echo ""
+    echo '{"success": false, "error": "Required runtime config helper is missing; run install.sh to repair this installation."}'
+    exit 0
 fi
+if ! LLDPQ_CONFIG_ASSIGNMENTS=$(/usr/local/bin/lldpq-config --require-config 2>/dev/null); then
+    echo "Content-Type: application/json"
+    echo ""
+    echo '{"success": false, "error": "Runtime configuration is missing or unreadable; run install.sh to repair this installation."}'
+    exit 0
+fi
+eval "$LLDPQ_CONFIG_ASSIGNMENTS"
 # NoNe = explicitly disabled, treat as empty
 if [[ "$ANSIBLE_DIR" == "NoNe" ]]; then
     ANSIBLE_DIR=""
@@ -279,13 +287,15 @@ export ANSIBLE_DIR
 # A single process-wide advisory lock (held on fd 9 until this CGI process
 # exits) protects bgp_profiles.yaml / vlan_profiles.yaml / sw_port_profiles.yaml
 # and host_vars/*.yaml from lost-update races between concurrent admins.
+# Ansible Editor also holds this lock for edits/git/deploy/diff/generate,
+# including the lifetime of detached jobs that inherit fd 9.
 # Lock files live in a private setgid directory instead of world-writable /tmp
 # (same idea as $WEB_ROOT/.inventory.lock). Both the LLDPq CLI/AI user and the
 # www-data CGI worker execute this API, so the directory must retain group
 # traversal/write access and every lock must inherit the shared web group.
 # Acquisition fails CLOSED: proceeding without the lock would silently
 # re-enable the races it exists to prevent.
-FABRIC_LOCK_DIR="${FABRIC_LOCK_DIR:-$(dirname "$0")/.locks}"
+FABRIC_LOCK_DIR="${FABRIC_LOCK_DIR:-$(cd -- "$(dirname "$0")" && pwd)/.locks}"
 FABRIC_LOCK_GROUP="${FABRIC_LOCK_GROUP:-www-data}"
 if mkdir -p "$FABRIC_LOCK_DIR" 2>/dev/null; then
     chgrp "$FABRIC_LOCK_GROUP" "$FABRIC_LOCK_DIR" 2>/dev/null || true
@@ -304,8 +314,10 @@ acquire_lock() {
         echo '{"success": false, "error": "Could not open config lock file"}'
         exit 0
     fi
-    if ! flock -w 30 9 2>/dev/null; then
-        echo '{"success": false, "error": "Config lock is busy, please retry"}'
+    # A detached Ansible job may own this lock for minutes. Return promptly
+    # instead of occupying a CGI worker while waiting for that job to finish.
+    if ! flock -n 9 2>/dev/null; then
+        echo '{"success": false, "locked": true, "error": "Another config edit or Ansible job is running; please retry when it finishes"}'
         exit 0
     fi
 }

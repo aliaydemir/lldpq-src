@@ -5081,6 +5081,8 @@ For a metric TREND over time (only when telemetry is enabled):
 To check reachability / trace the path between two endpoints (graph-based, read-only):
 [PATH: <source> <dest_ip>]
   - <source> = a device hostname OR a source IP; <dest_ip> = the destination IP.
+  - If the operator names a VRF, use [PATH: <source> <dest_ip> <vrf>].
+    Otherwise omit it: IP sources auto-detect their VRF; hostname sources use default.
   - Returns the hop-by-hop path (or where it breaks). Use for "how does A reach B",
     blackhole, or asymmetric-routing questions.
 
@@ -5484,7 +5486,7 @@ def run_promql(query, cookie, max_rows=60):
         return False, f'promql error: {e}'
 
 
-def run_tracepath(src, dst, cookie):
+def run_tracepath(src, dst, cookie, vrf=''):
     """Read-only graph-based path discovery via search-api.sh. src may be a device
     hostname or an IP; dst is a destination IP. Returns (ok, compact_json_text)."""
     import subprocess
@@ -5496,11 +5498,13 @@ def run_tracepath(src, dst, cookie):
         if is_ip(src) and is_ip(dst):
             qs = ('action=trace-path-ip'
                   f'&source_ip={urllib.parse.quote(src)}'
-                  f'&dest_ip={urllib.parse.quote(dst)}&vrf=default')
+                  f'&dest_ip={urllib.parse.quote(dst)}')
         else:
             qs = ('action=trace-path'
                   f'&source={urllib.parse.quote(src)}'
-                  f'&ip={urllib.parse.quote(dst)}&vrf=default')
+                  f'&ip={urllib.parse.quote(dst)}')
+        if vrf:
+            qs += '&vrf=' + urllib.parse.quote(vrf, safe='')
         env = dict(os.environ)
         env['REQUEST_METHOD'] = 'GET'
         env['QUERY_STRING'] = qs
@@ -5516,7 +5520,7 @@ def run_tracepath(src, dst, cookie):
                 raw = raw.split(sep, 1)[1]
                 break
         d = json.loads(raw.strip())
-        if isinstance(d, dict) and d.get('success') is False and d.get('error'):
+        if isinstance(d, dict) and d.get('error'):
             return False, str(d.get('error'))
         return True, json.dumps(d)[:4000]
     except subprocess.TimeoutExpired:
@@ -6813,7 +6817,7 @@ def action_chat():
             r'(?m)^\s*\[PROMQLRANGE:\s*(.+)\]\s*$', response or ''
         )
         paths = re.findall(
-            r'(?m)^\s*\[PATH:\s*(\S+)\s+(\S+)\]\s*$', response or ''
+            r'(?m)^\s*\[PATH:\s*([^\]\s]+)\s+([^\]\s]+)(?:\s+([^\]\s]+))?\]\s*$', response or ''
         )
         searches = re.findall(
             r'(?m)^\s*\[SEARCH:\s*(.+)\]\s*$', response or ''
@@ -6878,7 +6882,7 @@ def action_chat():
                 + [f"[AUDIT: {p} {t}]" for p, t in audits]
                 + [f"[PROMQL: {q}]" for q in promqls]
                 + [f"[PROMQLRANGE: {s}]" for s in promranges]
-                + [f"[PATH: {s} {d}]" for s, d in paths]
+                + [f"[PATH: {s} {d}{(' ' + v) if v else ''}]" for s, d, v in paths]
                 + [f"[SEARCH: {q}]" for q in searches]
                 + [f"[DRYRUN: {d} {c}]" for d, c in dryruns]
                 + [f"[P2P: {t}]" for t in p2ps]
@@ -7149,16 +7153,16 @@ def action_chat():
             tools_used.append({'promqlrange': q, 'range': rng, 'ok': ok})
             results.append(f"[PROMQLRANGE: {q} | {rng} | {step}]\n{out}")
         # Path discovery (graph-based tracepath)
-        for src, dst in paths[:2]:
+        for src, dst, path_vrf in paths[:2]:
             if (round_tools >= MAX_TOOLS_PER_ROUND or total_tools >= MAX_TOTAL_TOOLS
                     or time.monotonic() > deadline or _job_cancelled()):
                 break
             src, dst = src.strip(), dst.strip()
             total_tools += 1
             round_tools += 1
-            ok, out = run_tracepath(src, dst, cookie)
-            tools_used.append({'path': f'{src} -> {dst}', 'ok': ok})
-            results.append(f"[PATH {src} -> {dst}]\n{out}")
+            ok, out = run_tracepath(src, dst, cookie, vrf=path_vrf)
+            tools_used.append({'path': f'{src} -> {dst}', 'vrf': path_vrf, 'ok': ok})
+            results.append(f"[PATH {src} -> {dst}{(' VRF ' + path_vrf) if path_vrf else ''}]\n{out}")
         # Web research (known bugs / release notes / advisories)
         for q in searches[:1]:
             if (round_tools >= MAX_TOOLS_PER_ROUND or total_tools >= MAX_TOTAL_TOOLS
@@ -8400,7 +8404,7 @@ def _build_analysis_v2(mr_dir, devices, cookie, deadline):
     return result
 
 
-def _generation_still_current(devices):
+def _generation_still_current(devices, initial_generation):
     """Re-validate the transactional generation immediately before a persist:
     a new collection may have started while the LLM ladder ran, and the report
     must never overwrite state from a newer generation."""
@@ -8409,13 +8413,62 @@ def _generation_still_current(devices):
         if dev.get('hostname')
     }
     try:
-        return bool(_pipeline_generation_state(inventory_hosts).get('current'))
+        current = _pipeline_generation_state(inventory_hosts)
+        return bool(
+            current.get('current') and initial_generation.get('pipeline_id')
+            and initial_generation.get('completed_at')
+            and all(current.get(key) == initial_generation.get(key)
+                    for key in ('pipeline_id', 'completed_at'))
+        )
     except Exception:
         return False
 
 
+def _commit_analysis_state(devices, initial_generation, analysis, snapshot=None,
+                           findings=None, covered_devices=None):
+    """Commit against the input generation while excluding monitor publishers.
+
+    The existing monitor lock also serializes concurrent AI commits. It is
+    held only during validation and local state writes, never during an LLM
+    or live-device call. If collection is running, return the analysis without
+    persisting it. Open the collector-owned lock read-only so the web user
+    neither needs write permission nor creates a differently owned lock.
+    """
+    import fcntl
+    descriptor = None
+    try:
+        descriptor = os.open(os.environ.get(
+            'LLDPQ_MONITOR_LOCK_FILE', '/tmp/lldpq-monitor.lock'
+        ), os.O_RDONLY)
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return False
+    try:
+        if not _generation_still_current(devices, initial_generation):
+            return False
+        if findings is not None:
+            classified, summary = _classified_findings_or_fallback(
+                findings, covered_devices, persist=True
+            )
+            analysis.update(findings=classified, findings_summary=summary)
+        _save_json_state(ANALYSIS_FILE, analysis)
+        if snapshot is not None:
+            _save_json_state(
+                os.path.join(AI_STATE_DIR, 'analysis-snapshot.json'), snapshot
+            )
+        return True
+    finally:
+        # Closing releases the flock even if a state write fails.
+        os.close(descriptor)
+
+
 def action_analyze():
     """Run autonomous fabric health analysis (with change detection vs the previous run)."""
+    # Capture identity before reading any observations: a publish during the
+    # summary/timeline reads must also prevent this analysis from being saved.
+    initial_generation = _load_json_file(_mr_path('.lldpq-current.json')) or {}
     fabric_summary, devices, device_health, collection_metadata = build_fabric_summary()
     fabric_summary = neutralize_untrusted_tool_tags(fabric_summary)
     device_list = neutralize_untrusted_tool_tags(build_device_list(devices, device_health))
@@ -8450,6 +8503,8 @@ def action_analyze():
         cur_config_hashes, changed_configs = {}, []
     collection_complete = bool(collection_metadata.get('complete'))
     report_persistable = bool(collection_metadata.get('report_persistable'))
+    snapshot = ({"timestamp": time.time(), "statuses": cur_snap,
+                 "config_hashes": cur_config_hashes} if collection_complete else None)
     baseline_established = False
     if collection_complete:
         previous_file = snap_file if os.path.exists(snap_file) else legacy_snap_file
@@ -8541,19 +8596,13 @@ def action_analyze():
                     analysis[_carry_key] = reused_prior[_carry_key]
             # Re-validate the generation right before the refresh write; a
             # newer collection in flight downgrades to a non-persisted reply.
-            persisted = _generation_still_current(devices)
-            if persisted:
-                try:
-                    _save_json_state(ANALYSIS_FILE, analysis)
-                    _save_json_state(
-                        snap_file, {"timestamp": time.time(), "statuses": cur_snap,
-                                    "config_hashes": cur_config_hashes}
-                    )
-                except Exception as error:
-                    error_json(
-                        "AI analysis refresh could not be saved: "
-                        + redact_secrets(str(error))
-                    )
+            try:
+                persisted = _commit_analysis_state(
+                    devices, initial_generation, analysis, snapshot
+                )
+            except Exception as error:
+                error_json("AI analysis refresh could not be saved: "
+                           + redact_secrets(str(error)))
             result_json({"success": True, "analysis": analysis['analysis'],
                          "timestamp": analysis['timestamp'],
                          "changes": changes, "collection": collection_metadata,
@@ -8657,12 +8706,9 @@ Correlations show temporal coincidence only and do not prove causation.""")
             # shortcut exactly like the synthesis path; re-validated here
             # because the scan LLM call takes time. The findings ledger only
             # advances together with a persisted report.
-            persistable_now = (
-                report_persistable and _generation_still_current(devices)
-            )
             covered = _covered_devices_for_findings(devices, collection_complete)
             classified, findings_summary = _classified_findings_or_fallback(
-                [], covered, persist=persistable_now
+                [], covered, persist=False
             )
             response = (
                 "Fabric scan: clean. The findings-only scan reported no "
@@ -8697,14 +8743,14 @@ Correlations show temporal coincidence only and do not prove causation.""")
                 "stages": stages,
             }
             persisted = False
-            if persistable_now:
+            if report_persistable:
                 try:
-                    _save_json_state(ANALYSIS_FILE, analysis)
-                    _save_json_state(
-                        snap_file, {"timestamp": time.time(), "statuses": cur_snap,
-                                    "config_hashes": cur_config_hashes}
+                    persisted = _commit_analysis_state(
+                        devices, initial_generation, analysis, snapshot,
+                        findings=[], covered_devices=covered,
                     )
-                    persisted = True
+                    classified = analysis['findings']
+                    findings_summary = analysis['findings_summary']
                 except Exception as error:
                     error_json("AI analysis completed but could not be saved: "
                                + redact_secrets(str(error)))
@@ -8931,13 +8977,12 @@ Correlations show temporal coincidence only and do not prove causation.""")
     # Re-validate the pipeline generation after the LLM ladder: the findings
     # ledger and the persisted report may only advance together on a still-
     # current generation.
-    persistable_now = report_persistable and _generation_still_current(devices)
+    covered = _covered_devices_for_findings(devices, collection_complete)
     if parsed_findings is not None:
         try:
             parsed_findings = _apply_suppressions(parsed_findings, devices)
-            covered = _covered_devices_for_findings(devices, collection_complete)
             classified, findings_summary = _classified_findings_or_fallback(
-                parsed_findings, covered, persist=persistable_now
+                parsed_findings, covered, persist=False
             )
             findings_fields = {'findings': classified,
                                'findings_summary': findings_summary}
@@ -8977,19 +9022,16 @@ Correlations show temporal coincidence only and do not prove causation.""")
     # removals/resolutions and steady-state reuse.
     persisted = False
     snapshot_updated = False
-    if persistable_now:
+    if report_persistable:
         try:
-            _save_json_state(ANALYSIS_FILE, analysis)
-            persisted = True
-            if collection_complete:
-                _save_json_state(
-                    snap_file, {
-                        "timestamp": time.time(),
-                        "statuses": cur_snap,
-                        "config_hashes": cur_config_hashes,
-                    }
-                )
-                snapshot_updated = True
+            persisted = _commit_analysis_state(
+                devices, initial_generation, analysis, snapshot,
+                findings=parsed_findings, covered_devices=covered,
+            )
+            snapshot_updated = persisted and collection_complete
+            findings_fields.update({key: analysis[key]
+                                    for key in ('findings', 'findings_summary')
+                                    if key in analysis})
         except Exception as error:
             error_json(f"AI analysis completed but could not be saved: {redact_secrets(str(error))}")
 

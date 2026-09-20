@@ -129,6 +129,7 @@ class AnsibleApiJsonContractTests(CgiJsonContractCase):
             QUERY_STRING=query,
             ANSIBLE_DIR=str(ansible_dir),
             EDITOR_ROOT=str(ansible_dir),
+            FABRIC_LOCK_DIR=str(self.tmp / "locks"),
         )
 
     def test_unknown_action_is_a_json_error(self):

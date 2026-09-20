@@ -129,6 +129,85 @@ class LinkFlapOptimizationTests(unittest.TestCase):
                 self.assertFalse(analyzer.save_flap_history())
 
 
+class SplitPollTransitionTests(unittest.TestCase):
+    PORT = "leaf:swp1"
+    START = 2_000_000.0
+
+    def sample(self, analyzer, offset, counter):
+        with mock.patch("link_flap_analyzer.time.time", return_value=self.START + offset):
+            analyzer.update_carrier_transitions(self.PORT, counter)
+
+    def counters(self, analyzer, offset):
+        with mock.patch("link_flap_analyzer.time.time", return_value=self.START + offset):
+            return analyzer.calculate_flapping_rate(self.PORT)
+
+    def test_split_pair_survives_restart_and_keeps_the_full_interval(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            self.sample(analyzer, 0, 100)
+            self.sample(analyzer, 600, 101)
+            with mock.patch("link_flap_analyzer.time.time", return_value=self.START + 600):
+                self.assertTrue(analyzer.save_flap_history())
+            analyzer = LinkFlapAnalyzer(root)
+            self.sample(analyzer, 1200, 102)
+            event, = analyzer.flapping_hist[self.PORT]
+            self.assertEqual(event[2:], (1, self.START, 1200))
+            self.assertNotIn(self.PORT, analyzer.pending_transition_start)
+            counts = self.counters(analyzer, 1201)
+            self.assertEqual(counts["flap_1_hr"], 1)
+            self.assertEqual(counts["flap_5_min"], 0)
+
+    def test_odd_delta_retains_the_unpaired_transition(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            for offset, counter in ((0, 100), (600, 103), (1200, 104)):
+                self.sample(analyzer, offset, counter)
+            self.assertEqual(self.counters(analyzer, 1201)["flap_1_hr"], 2)
+            self.assertEqual([event[4] for event in analyzer.flapping_hist[self.PORT]], [600, 1200])
+
+    def test_quiet_polls_do_not_shorten_the_pending_interval(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            for offset, counter in ((0, 100), (600, 101), (3600, 101), (4200, 102)):
+                self.sample(analyzer, offset, counter)
+            counts = self.counters(analyzer, 4201)
+            self.assertEqual(counts["flap_1_hr"], 0)
+            self.assertEqual(counts["flap_12_hrs"], 1)
+            self.assertEqual(analyzer.flapping_hist[self.PORT][0][4], 4200)
+
+    def test_old_pending_pair_does_not_age_fresh_pairs_out_of_the_window(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            for offset, counter in ((0, 100), (600, 101), (90000, 101), (90600, 106)):
+                self.sample(analyzer, offset, counter)
+            counts = self.counters(analyzer, 90601)
+            self.assertEqual(counts["flap_1_hr"], 2)
+            self.assertEqual(counts["flap_24_hrs"], 2)
+            self.assertEqual(len(analyzer.cycle_events), 1)
+            self.assertIn("3 flap(s)", analyzer.cycle_events[0]["detail"])
+
+    def test_counter_reset_discards_pending_transition(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            for offset, counter in ((0, 100), (600, 101), (1200, 0), (1800, 1)):
+                self.sample(analyzer, offset, counter)
+            self.assertEqual(list(analyzer.flapping_hist[self.PORT]), [])
+            self.sample(analyzer, 2400, 2)
+            self.assertEqual(self.counters(analyzer, 2401)["flap_1_hr"], 1)
+
+    def test_legacy_baseline_and_clock_rollback_rebase_without_guessing(self):
+        with tempfile.TemporaryDirectory() as root:
+            analyzer = LinkFlapAnalyzer(root)
+            analyzer.prev_cumulative[self.PORT] = 100
+            self.sample(analyzer, 0, 101)
+            self.sample(analyzer, 600, 102)
+            self.sample(analyzer, 300, 103)  # wall clock stepped backwards
+            self.sample(analyzer, 900, 104)
+            self.assertEqual(list(analyzer.flapping_hist[self.PORT]), [])
+            self.sample(analyzer, 1500, 105)
+            self.assertEqual(self.counters(analyzer, 1501)["flap_1_hr"], 1)
+
+
 class SlowCadenceSeverityTests(unittest.TestCase):
     """Severity must not read only the 1h bucket that a slow poll cadence
     makes permanently unreachable (interval-fit rule)."""

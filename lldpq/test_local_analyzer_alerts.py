@@ -5,6 +5,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,7 +27,8 @@ def _checker(tmp):
 def _write_summary(tmp, name, payload):
     summary_dir = Path(tmp) / "summary"
     summary_dir.mkdir(exist_ok=True)
-    (summary_dir / name).write_text(json.dumps(payload), encoding="utf-8")
+    (summary_dir / name).write_text(
+        json.dumps({"collection_status": "current", **payload}), encoding="utf-8")
 
 
 class LocalAnalyzerAlertTests(unittest.TestCase):
@@ -132,6 +134,73 @@ class LocalAnalyzerAlertTests(unittest.TestCase):
             ok, _, _ = self._run(checker, checker.check_routes_alerts)
             self.assertFalse(ok)
             self.assertTrue(checker.had_error)
+
+    def test_incomplete_coverage_never_clears_an_existing_alarm(self):
+        for domain, method_name, reporting in (
+            ("routes", "check_routes_alerts", "devices_reporting"),
+            ("fabric-check", "check_fabric_check_alerts", "devices_covered"),
+        ):
+            for status in ("partial", "stale", "unavailable", None):
+                with self.subTest(domain=domain, status=status), tempfile.TemporaryDirectory() as tmp:
+                    _write_summary(tmp, f"{domain}-summary.json", {
+                        "collection_status": status,
+                        "devices_expected": 2, reporting: 1,
+                    })
+                    checker = _checker(tmp)
+                    ok, sent, recorded = self._run(
+                        checker, getattr(checker, method_name), state="CRITICAL")
+                    self.assertFalse(ok)
+                    self.assertEqual(sent, {})
+                    self.assertEqual(recorded, {})
+                    self.assertTrue(checker.had_error)
+
+    def test_coverage_counts_override_an_incorrect_current_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_summary(tmp, "routes-summary.json", {
+                "devices_expected": 2, "devices_reporting": 1,
+            })
+            checker = _checker(tmp)
+            ok, sent, recorded = self._run(
+                checker, checker.check_routes_alerts, state="CRITICAL")
+            self.assertFalse(ok)
+            self.assertEqual((sent, recorded), ({}, {}))
+
+    def test_stale_or_invalid_summary_timestamp_never_recovers(self):
+        for stamp in (time.time() - 86400, time.time() + 3600, "invalid", float("nan")):
+            with self.subTest(stamp=stamp), tempfile.TemporaryDirectory() as tmp:
+                _write_summary(tmp, "fabric-check-summary.json", {"generated_at": stamp})
+                checker = _checker(tmp)
+                ok, sent, recorded = self._run(
+                    checker, checker.check_fabric_check_alerts, state="CRITICAL")
+                self.assertFalse(ok)
+                self.assertEqual((sent, recorded), ({}, {}))
+
+    def test_partial_coverage_preserves_observed_findings(self):
+        for domain, method_name, finding in (
+            ("routes", "check_routes_alerts", "route_drops_24h"),
+            ("fabric-check", "check_fabric_check_alerts", "mtu_mismatches"),
+        ):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as tmp:
+                _write_summary(tmp, f"{domain}-summary.json", {
+                    "collection_status": "partial", finding: 1,
+                })
+                checker = _checker(tmp)
+                ok, sent, _ = self._run(checker, getattr(checker, method_name))
+                self.assertTrue(ok)
+                self.assertEqual(sent["severity"], "CRITICAL")
+
+    def test_complete_coverage_can_recover(self):
+        for domain, method_name in (
+            ("routes", "check_routes_alerts"),
+            ("fabric-check", "check_fabric_check_alerts"),
+        ):
+            with self.subTest(domain=domain), tempfile.TemporaryDirectory() as tmp:
+                _write_summary(tmp, f"{domain}-summary.json", {})
+                checker = _checker(tmp)
+                ok, sent, _ = self._run(
+                    checker, getattr(checker, method_name), state="CRITICAL")
+                self.assertTrue(ok)
+                self.assertEqual(sent["severity"], "RECOVERED")
 
 
 class ImmediateAlertGatingTests(unittest.TestCase):

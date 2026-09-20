@@ -136,12 +136,13 @@ class ServiceWatchdogContractTest(unittest.TestCase):
         cls.entrypoint = ENTRYPOINT.read_text(encoding="utf-8")
         cls.dockerfile = DOCKERFILE.read_text(encoding="utf-8")
 
-    def test_the_watchdog_checks_both_daemons_by_exact_name(self):
-        """pgrep -x cannot be fooled by substring matches (e.g. cron in a path)."""
+    def test_the_watchdog_checks_owned_pool_and_cron_by_exact_name(self):
+        """An unrelated pool cannot make the owned CGI service look healthy."""
         parts = self.entrypoint.split("_supervise_services()")
         self.assertEqual(len(parts), 2, "watchdog function is missing")
         watchdog = parts[1]
-        self.assertIn("pgrep -x fcgiwrap", watchdog)
+        self.assertIn("! _fcgiwrap_pool_healthy", watchdog)
+        self.assertNotIn("pgrep -x fcgiwrap", watchdog)
         self.assertIn("pgrep -x cron", watchdog)
 
     def test_the_watchdog_runs_in_the_background_before_nginx(self):
@@ -150,11 +151,13 @@ class ServiceWatchdogContractTest(unittest.TestCase):
         self.assertLess(start, self.entrypoint.find("exec nginx"))
 
     def test_restarts_reuse_the_exact_startup_commands(self):
-        """Once at startup, once in the watchdog restart helper."""
+        """Startup and restart share the same complete-pool readiness check."""
         self.assertEqual(
-            self.entrypoint.count('/usr/sbin/fcgiwrap -f -s "unix:$FCGIWRAP_SOCKET" &'),
-            2,
+            self.entrypoint.count('setsid /usr/sbin/fcgiwrap -f -c "$LLDPQ_FCGI_WORKERS" -s "unix:$FCGIWRAP_SOCKET" &'),
+            1,
         )
+        self.assertIn('if ! _start_fcgiwrap; then', self.entrypoint)
+        self.assertIn('_restart_fcgiwrap() {\n    _stop_fcgiwrap || return 1\n    _start_fcgiwrap', self.entrypoint)
         self.assertEqual(self.entrypoint.count("service cron start"), 2)
 
     def test_a_restart_storm_is_capped_instead_of_looping_forever(self):

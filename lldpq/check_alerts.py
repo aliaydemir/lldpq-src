@@ -1143,7 +1143,11 @@ class LLDPqAlerts:
                 current_state = "OK"
             
             send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
-            if current_state == "OK" and not send_recovery:
+            if current_state == "OK" and not self._flap_device_coverage_current(device):
+                # A fresh history file can contain only retained events from
+                # unreadable ports. Their expiry cannot prove recovery.
+                pass
+            elif current_state == "OK" and not send_recovery:
                 self.record_state_without_delivery(device, "link_flaps", current_state)
             elif self.should_send_alert(device, "link_flaps", current_state):
                 if current_state == "CRITICAL":
@@ -1275,9 +1279,37 @@ class LLDPqAlerts:
                     (port, interface, entries)
                 )
             self._flap_history_index = index
+            # Validate and index once as well: partial fabrics can have
+            # thousands of unavailable devices, consulted by every caller.
+            self._flap_unavailable_devices = None
+            try:
+                coverage = payload.get("collection_coverage")
+                unavailable = coverage["unavailable_devices"]
+                expected = int(coverage["expected_devices"])
+                current = int(coverage["current_devices"])
+                if (isinstance(unavailable, list) and expected > 0
+                        and 0 < current <= expected):
+                    unavailable = set(unavailable)
+                    if len(unavailable) == expected - current:
+                        self._flap_unavailable_devices = unavailable
+            except (TypeError, ValueError, KeyError, OverflowError):
+                pass
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             self._flap_history_error = exc
         return self._flap_history_index, self._flap_history_error
+
+    def _flap_device_coverage_current(self, device):
+        """Only complete current device coverage may clear its flap alarm.
+
+        Positive events remain usable on a partially collected device. Old
+        formats without coverage are readable but cannot prove an all-clear.
+        """
+        unavailable = getattr(self, "_flap_unavailable_devices", None)
+        if unavailable is not None and device not in unavailable:
+            return True
+        print(f"    ⚠️ Preserving link-flap state for {device}: incomplete collection coverage")
+        self.had_error = True
+        return False
 
     def get_device_flap_counts(self, device, window_seconds=3600):
         """Return per-interface flap deltas recorded inside the time window."""
@@ -2220,6 +2252,34 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             return None
         return payload if isinstance(payload, dict) else None
 
+    def _domain_collection_status(self, stats, reporting_key):
+        """Reconcile coverage and summary freshness before clearing alerts."""
+        status = stats.get("collection_status", "unavailable")
+        if not isinstance(status, str):
+            return "unavailable"
+        try:
+            generated_at = stats.get("generated_at")
+            if generated_at is not None:
+                age = time.time() - float(generated_at)
+                if (not math.isfinite(age) or age < -300
+                        or age > self.get_data_max_age_seconds()):
+                    return "stale"
+            if status == "current":
+                if int(stats.get("devices_stale") or 0) or int(stats.get("devices_missing") or 0):
+                    return "partial"
+                expected = stats.get("devices_expected")
+                reporting = stats.get(reporting_key)
+                if expected is not None or reporting is not None:
+                    if expected is None or reporting is None:
+                        return "unavailable"
+                    if int(expected) <= 0 or int(reporting) <= 0:
+                        return "unavailable"
+                    if int(reporting) != int(expected):
+                        return "partial"
+        except (TypeError, ValueError, OverflowError):
+            return "unavailable"
+        return status
+
     def check_routes_alerts(self):
         """Fabric-wide stateful alert for route drops / disappeared VRFs."""
         stats = self._load_domain_summary("routes-summary.json")
@@ -2229,12 +2289,15 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
         drops = int(stats.get("route_drops_24h") or 0)
         vrf_losses = int(stats.get("vrfs_disappeared_24h") or 0)
         stale = int(stats.get("devices_stale") or 0)
+        coverage = self._domain_collection_status(stats, "devices_reporting")
+        if (coverage not in {"current", "partial"}
+                or (coverage != "current" and not (drops or vrf_losses))):
+            print(f"    ⚠️ Preserving route alert state: collection is {coverage}")
+            self.had_error = True
+            return False
         if drops or vrf_losses:
             severity = "CRITICAL"
             title = "Route Table Anomalies"
-        elif stale:
-            severity = "WARNING"
-            title = "Route Collection Stale"
         else:
             severity = "OK"
             title = "Route Tables Stable"
@@ -2302,6 +2365,12 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
         fec = int(stats.get("fec_mismatches") or 0)
         autoneg = int(stats.get("autoneg_mismatches") or 0)
         config = int(stats.get("config_mtu_mismatches") or 0)
+        coverage = self._domain_collection_status(stats, "devices_covered")
+        if (coverage not in {"current", "partial"}
+                or (coverage != "current" and not (mtu or speed or fec or autoneg or config))):
+            print(f"    ⚠️ Preserving fabric-check alert state: collection is {coverage}")
+            self.had_error = True
+            return False
         if mtu or speed or fec:
             severity = "CRITICAL"
             title = "Fabric Link Mismatches"
@@ -2756,6 +2825,8 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             return "critical"
         if any(count >= warning for count in counts.values()):
             return "warnings"
+        if not self._flap_device_coverage_current(device):
+            return "unknown"
         return "stable"
     
     def get_device_optical_status(self, device):

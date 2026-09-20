@@ -69,6 +69,12 @@ sudo docker exec -it -u lldpq lldpq bash
 
 Open `http://<docker-host>:8080` from a workstation on the management network.
 
+The web API uses four CGI workers by default. Set `-e LLDPQ_FCGI_WORKERS=8`
+on `docker run`, or add `LLDPQ_FCGI_WORKERS: "8"` to the Compose service's
+`environment`, to change the pool size (1–32). The watchdog restores the pool
+if its master or workers exit. This setting is separate from device collection
+parallelism; increasing it allows more requests and can increase memory use.
+
 Management networks frequently permit SSH to the host but block HTTP, so the
 page never loads even though the container is healthy. Forward the port through
 the SSH session you already have and open the UI locally instead:

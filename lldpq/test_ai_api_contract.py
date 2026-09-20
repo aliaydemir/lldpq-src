@@ -122,12 +122,11 @@ class AskAiApiContractTest(unittest.TestCase):
         )
 
     def test_partial_coverage_persists_report_but_not_trusted_snapshot(self):
-        # The persist gate now also re-validates the generation right before
-        # the write (a new collection may have started during the LLM ladder).
-        self.assertIn("if persistable_now:", PYTHON_TEXT)
+        # Every branch shares the generation-bound commit helper; behavioral
+        # lock/race coverage lives in test_ai_generation_trace.py.
+        self.assertIn("if report_persistable:", PYTHON_TEXT)
         self.assertIn(
-            "persistable_now = report_persistable and "
-            "_generation_still_current(devices)",
+            "if not _generation_still_current(devices, initial_generation):",
             PYTHON_TEXT,
         )
         self.assertIn("if collection_complete:", PYTHON_TEXT)
@@ -137,14 +136,16 @@ class AskAiApiContractTest(unittest.TestCase):
         self.assertIn(
             "if scan_findings == [] and collection_complete:", PYTHON_TEXT
         )
-        final_persistence = PYTHON_TEXT.split(
-            "# Persist a report from every transactionally current generation", 1
-        )[1].split("result_json(", 1)[0]
-        self.assertLess(
-            final_persistence.index("_save_json_state(ANALYSIS_FILE, analysis)"),
-            final_persistence.index("if collection_complete:"),
+        commit = ast.get_source_segment(
+            PYTHON_TEXT, next(node for node in TREE.body
+                             if isinstance(node, ast.FunctionDef)
+                             and node.name == '_commit_analysis_state')
         )
-        self.assertIn("snapshot_updated = True", final_persistence)
+        self.assertLess(
+            commit.index("_save_json_state(ANALYSIS_FILE, analysis)"),
+            commit.index("if snapshot is not None:"),
+        )
+        self.assertIn("snapshot_updated = persisted and collection_complete", PYTHON_TEXT)
 
     def test_current_partial_report_is_returned_as_fresh_last_analysis(self):
         ns = load_symbols("action_get_analysis")

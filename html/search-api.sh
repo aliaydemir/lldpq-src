@@ -2143,6 +2143,12 @@ try:
                                 candidates.append((hostname, v, 0, fab_degree))
         if not candidates:
             return None, None
+        candidate_vrfs = {candidate[1] for candidate in candidates}
+        if not prefer_vrf and len(candidate_vrfs) > 1:
+            emit_trace_error(
+                f"IP {ip} is present in multiple VRFs ({', '.join(sorted(candidate_vrfs))}); "
+                "specify a VRF for this trace."
+            )
         # Sort: prefer matching VRF, then local (connected route), then lowest degree (leaf < spine)
         def sort_key(x):
             vrf_match = 0 if (prefer_vrf and x[1] == prefer_vrf) else 1
@@ -2264,7 +2270,9 @@ try:
         print(json.dumps(response))
         raise SystemExit(0)
 
-    source_leaf, detected_vrf = find_device_prefer_leaf(source_ip, vrf_hint)
+    source_leaf, detected_vrf = find_device_prefer_leaf(
+        source_ip, vrf_hint, require_vrf=bool(vrf_hint)
+    )
     if not source_leaf:
         emit_trace_error(f"Source IP {source_ip} not found in any device.")
 
@@ -2827,9 +2835,10 @@ def is_destination_local(dest_ip, device_data, vrf):
             if prefix and prefix_match(dest_ip, prefix) >= 0:
                 return True
     
-    # Also check ARP
+    # An ARP observation only proves reachability in its recorded VRF.
+    # Legacy rows without a VRF are not proof for any requested tenant.
     for arp in device_data.get('arp', []):
-        if arp.get('ip') == dest_ip:
+        if arp.get('ip') == dest_ip and arp.get('vrf') == vrf:
             return True
     
     return False
