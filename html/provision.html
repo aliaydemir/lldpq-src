@@ -4057,6 +4057,7 @@ let ztpLoaded = false;
 let scriptEditorVisible = false;
 let serialMappings = [];
 let generatedConfigs = [];
+let ztpImagesUnserved = new Set();
 
 // ---- Serial Mapping ----
 
@@ -4279,14 +4280,21 @@ function renderOSImages(images) {
         return;
     }
 
+    ztpImagesUnserved = new Set(
+        images.filter(img => img.served === false).map(img => img.name));
+
     container.innerHTML = images.map(img => {
         const version = img.version || imageVersionFromName(img.name);
         const active = version && version === activeTarget;
+        // Stored is not served: onie-install fetches the image over HTTP, so an
+        // image whose web-root URL is absent would only fail on the switch.
+        const unserved = img.served === false;
         return `
-            <div style="display:flex; align-items:center; gap:10px; padding:6px 10px; background:${active ? '#1a2e00' : '#252526'}; border:1px solid ${active ? '#76b900' : '#2d2d2d'}; border-radius:4px; margin-bottom:4px;">
+            <div style="display:flex; align-items:center; gap:10px; padding:6px 10px; background:${active ? '#1a2e00' : '#252526'}; border:1px solid ${unserved ? '#ff9800' : (active ? '#76b900' : '#2d2d2d')}; border-radius:4px; margin-bottom:4px;">
                 <svg viewBox="0 0 24 24" style="width:18px;height:18px;fill:#76b900;flex-shrink:0;"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>
                 <span style="flex:1;font-family:monospace;font-size:12px;">${escHtml(img.name)}</span>
                 ${active ? '<span class="badge badge-success">Active ZTP</span>' : ''}
+                ${unserved ? '<span class="badge badge-warning" title="The image is stored but not reachable at http://&lt;image server&gt;/' + escAttr(img.name) + '. LLDPq could not publish the web-root link; check that the web root is writable by the install user and www-data.">Not served</span>' : ''}
                 <span style="color:#888;font-size:11px;">${escHtml(normalizeImageSize(img))}</span>
                 ${version ? `<button class="btn btn-primary btn-sm" onclick="useImageForZTP('${escAttr(img.name)}')" style="padding:2px 8px;font-size:11px;">Use for ZTP</button>` : ''}
                 <button class="btn btn-danger btn-sm" onclick="deleteOSImage('${escAttr(img.name)}')" style="padding:2px 8px;font-size:11px;">Del</button>
@@ -4303,8 +4311,11 @@ async function useImageForZTP(name) {
     const migrationNotice = upgradeLegacyTemplate
         ? '<br><br><span style="color:#ff9800;">The saved script is legacy and will be replaced with the hardened v3 template after confirmation.</span>'
         : '';
+    const servedNotice = ztpImagesUnserved.has(name)
+        ? '<br><br><span style="color:#ff9800;">This image is stored but not reachable over HTTP. Saving will retry publishing its web-root link; if the warning stays, <code>onie-install</code> will fail with a 404 on the switch.</span>'
+        : '';
     showConfirmModal('Use Image for ZTP',
-        `Set ZTP target version to <strong>${escHtml(version)}</strong> and save <code>cumulus-ztp.sh</code>?<br><br>Image: <code>${escHtml(name)}</code>${migrationNotice}`,
+        `Set ZTP target version to <strong>${escHtml(version)}</strong> and save <code>cumulus-ztp.sh</code>?<br><br>Image: <code>${escHtml(name)}</code>${servedNotice}${migrationNotice}`,
         async () => {
             document.getElementById('ztpTargetOS').value = version;
             applyQuickSettings(async () => {

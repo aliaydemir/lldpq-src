@@ -3740,6 +3740,14 @@ def action_save_ztp_script():
             'error': f'ZTP script was not saved: {exc}',
         })
     content = bind_ztp_image_name(content)
+    # The script now carries an absolute image URL; publish it before saving so
+    # "Use for ZTP" cannot arm a switch against a 404.
+    bound_image = ztp_script_static_setting(content, 'CUMULUS_IMAGE_NAME')
+    if bound_image and valid_os_image_name(bound_image):
+        try:
+            ensure_provision_root_link(bound_image)
+        except Exception:
+            pass
 
     filepath = ZTP_SCRIPT_FILE
 
@@ -5460,7 +5468,66 @@ def publish_provision_root_link(name):
             ['sudo', '-u', LLDPQ_USER, 'bash', '-c', command],
             capture_output=True, timeout=10,
         )
-        return result.returncode == 0
+        # The upload transaction trusts this verdict, so confirm the link the
+        # helper was supposed to leave behind instead of only its exit status.
+        return result.returncode == 0 and os.path.islink(link) and \
+            os.readlink(link) == relative_target
+
+
+def provision_root_link_state(name):
+    """Report whether a stored image is reachable at its web-root URL.
+
+    'ok' when nginx already serves the name, either through the published
+    compatibility symlink or as the regular file a pre-persistence layout
+    kept there; 'missing' when nothing occupies the path; 'foreign' when
+    something else does.
+    """
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+', name or ''):
+        return 'foreign'
+    link = os.path.join(WEB_ROOT, name)
+    if os.path.islink(link):
+        expected = os.path.relpath(
+            os.path.join(PROVISION_UPLOAD_DIR, name), WEB_ROOT
+        )
+        return 'ok' if os.readlink(link) == expected else 'foreign'
+    if os.path.isfile(link):
+        return 'ok'
+    return 'missing' if not os.path.lexists(link) else 'foreign'
+
+
+def ensure_provision_root_link(name):
+    """Restore a stored image's web-root URL when it went missing.
+
+    An upload publishes the link inside its own atomic transaction and the
+    Docker entrypoint rebuilds every one of them at container start, but a
+    native install had nothing that reconciled them afterwards: an image
+    copied in by hand, or one whose link was lost, stays listed and bindable
+    while http://server/<image> answers 404 -- which only surfaces once
+    onie-install runs on the switch.  A regular file at that path is never
+    replaced; the legacy layout serves the image from there.
+    """
+    state = provision_root_link_state(name)
+    if state == 'ok':
+        return True
+    link = os.path.join(WEB_ROOT, name)
+    if state == 'foreign' and os.path.lexists(link) and not os.path.islink(link):
+        return False
+    return publish_provision_root_link(name)
+
+
+def reconcile_provision_root_links(images):
+    """Re-publish every listed image that is stored but no longer served."""
+    healed = False
+    upload_dir = os.path.abspath(PROVISION_UPLOAD_DIR)
+    for image in images:
+        if image.get('served') or \
+                os.path.dirname(os.path.abspath(image.get('path', ''))) != upload_dir:
+            continue
+        try:
+            healed = ensure_provision_root_link(image['name']) or healed
+        except Exception:
+            pass
+    return healed
 
 
 def publish_uploaded_image(stage, destination, filename, expected_size):
@@ -5605,6 +5672,9 @@ def list_os_image_objects():
                     'size_bytes': size_bytes,
                     'version': image_version_from_name(name),
                     'path': f,
+                    # Stored is not served: ZTP and ONIE fetch the image over
+                    # HTTP, so report the web-root URL separately.
+                    'served': provision_root_link_state(name) == 'ok',
                 })
     images.sort(key=lambda x: x['name'])
     return images
@@ -7760,8 +7830,11 @@ def action_import_ssh_key():
 # ======================== OS IMAGES ========================
 
 def action_list_os_images():
-    """List Cumulus Linux image files in web root."""
-    result_json({"success": True, "images": list_os_image_objects()})
+    """List Cumulus Linux image files, restoring any lost web-root URL."""
+    images = list_os_image_objects()
+    if reconcile_provision_root_links(images):
+        images = list_os_image_objects()
+    result_json({"success": True, "images": images})
 
 
 def multipart_boundary_bytes(content_type):
@@ -8891,7 +8964,10 @@ def action_load_ztp_tab():
 
     # OS images
     try:
-        result['os_images'] = {"success": True, "images": list_os_image_objects()}
+        images = list_os_image_objects()
+        if reconcile_provision_root_links(images):
+            images = list_os_image_objects()
+        result['os_images'] = {"success": True, "images": images}
     except Exception as e:
         result['os_images'] = {"success": False, "error": str(e)}
 

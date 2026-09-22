@@ -416,8 +416,8 @@ class LldpqConfDuplicateHealTests(unittest.TestCase):
 ZTP_IMAGE_NAMES = (
     'is_current_ztp_template', 'ztp_script_static_setting',
     'image_version_from_name', 'valid_os_image_name', 'resolve_os_image_path',
-    'list_os_image_objects', 'rewrite_ztp_image_name', 'bind_ztp_image_name',
-    'unbind_ztp_image_name',
+    'provision_root_link_state', 'list_os_image_objects',
+    'rewrite_ztp_image_name', 'bind_ztp_image_name', 'unbind_ztp_image_name',
 )
 
 ZTP_TEMPLATE = (ROOT / "html" / "cumulus-ztp.sh").read_text(encoding="utf-8")

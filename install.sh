@@ -3993,6 +3993,42 @@ restore_preserved_runtime_data() {
     return 0
 }
 
+# ZTP and ONIE fetch the OS image over HTTP from the web root, while uploads
+# are stored in provision-uploads/ and published there as a relative symlink.
+# The upload creates that link inside its own transaction and the Docker
+# entrypoint rebuilds every one of them at container start, but a native
+# install had nothing that reconciled them: an image copied in by hand, or one
+# whose link was lost, stayed listed in Provision while http://server/<image>
+# answered 404 -- discovered only when onie-install ran on the switch.
+republish_provision_image_links() {
+    local web_root="$1" upload_dir="$1/provision-uploads"
+    local stored name link failed=false
+    [[ -d "$upload_dir" ]] || return 0
+
+    for stored in "$upload_dir"/*.bin "$upload_dir"/*.img "$upload_dir"/*.iso; do
+        [[ -f "$stored" && ! -L "$stored" ]] || continue
+        name=$(basename -- "$stored")
+        link="$web_root/$name"
+        # The pre-persistence layout served the image from this exact path.
+        # Never replace that copy with a link to a different one.
+        if [[ -f "$link" && ! -L "$link" ]]; then
+            continue
+        fi
+        if [[ -L "$link" ]] && \
+           [[ "$(readlink -- "$link" 2>/dev/null || true)" == "provision-uploads/$name" ]]; then
+            continue
+        fi
+        if root_run ln -sfn -- "provision-uploads/$name" "$link"; then
+            root_run chown -h "$LLDPQ_USER:www-data" "$link" 2>/dev/null || true
+        else
+            echo "[!] Image URL could not be published for $name" >&2
+            failed=true
+        fi
+    done
+    $failed && return 1
+    return 0
+}
+
 lldpq_install_exit_handler() {
     local status="$1"
     local disposition="${2:-exit}"
@@ -5122,6 +5158,7 @@ sudo chown -R "$LLDPQ_USER:www-data" "$WEB_ROOT/hstr" "$WEB_ROOT/configs" \
     "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
 sudo chmod 775 "$WEB_ROOT/hstr" "$WEB_ROOT/configs" "$WEB_ROOT/monitor-results" \
     "$WEB_ROOT/topology" "$WEB_ROOT/generated_config_folder" "$WEB_ROOT/provision-uploads"
+republish_provision_image_links "$WEB_ROOT" || true
 # Migrate locks created by older releases as 0600/0640. The setgid directory
 # keeps future CLI/AI and www-data lock inodes in the same shared group.
 sudo find "$WEB_ROOT/.locks" -mindepth 1 -maxdepth 1 -type f -name '*.lock' \
