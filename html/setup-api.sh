@@ -171,6 +171,7 @@ SETUP_SAFETY = os.environ.get('SETUP_SAFETY', '')
 _CONFIG_LOCK_HANDLE = None
 _INVENTORY_LOCK_HANDLE = None
 _SSH_KEY_LOCK_HANDLE = None
+_BMC_LOCK_CONTEXT = None
 
 
 def _emit_uncaught_json(exc_type, exc, tb):
@@ -450,9 +451,17 @@ def ensure_inventory_lock():
     _INVENTORY_LOCK_HANDLE = os.fdopen(descriptor, 'r+')
 
 def ensure_backup_locks():
-    """Use the shared global -> inventory order for portable config bundles."""
+    """Use the shared global -> inventory -> BMC order for config bundles."""
+    global _BMC_LOCK_CONTEXT
     ensure_configuration_lock()
     ensure_inventory_lock()
+    if _BMC_LOCK_CONTEXT is None:
+        import atexit
+        helper = load_backup_import_helper('lldpq_backup_lock_tools')
+        context = helper.bmc_configuration_lock(lldpq_dir)
+        context.__enter__()
+        _BMC_LOCK_CONTEXT = context
+        atexit.register(context.__exit__, None, None, None)
 
 def ensure_ssh_key_lock():
     """Lock order is global configuration first, then the SSH-key transaction."""
@@ -2411,6 +2420,7 @@ if action == 'backup-export':
         print(json.dumps({'success': False, 'error': 'include_key must be true or false'}))
         sys.exit(0)
     wanted = [('devices.yaml', lldpq_dir), ('tracking.yaml', lldpq_dir),
+              ('bmc.yaml', lldpq_dir),
               ('topology.dot', lldpq_dir),
               ('topology_config.yaml', lldpq_dir), ('notifications.yaml', lldpq_dir),
               ('display-aliases.json', web_root)]

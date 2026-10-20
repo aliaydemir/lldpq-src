@@ -10,6 +10,7 @@ import fcntl
 import grp
 import hashlib
 import io
+import importlib.util
 import json
 import math
 import os
@@ -26,10 +27,62 @@ import tarfile
 import tempfile
 import urllib.parse
 from typing import Callable, Iterable
+from contextlib import contextmanager
 
 
 class BackupImportError(RuntimeError):
     """A bundle could not be validated, committed, or rolled back safely."""
+
+
+def _load_bmc_support(lldpq_dir):
+    """Load the installed canonical validator, including for the standalone helper."""
+    path = os.path.join(lldpq_dir, "bmc_config.py")
+    if not os.path.isfile(path):
+        raise BackupImportError("BMC configuration support is missing; complete the update")
+    spec = importlib.util.spec_from_file_location("lldpq_bmc_backup", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, lldpq_dir)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+@contextmanager
+def bmc_configuration_lock(lldpq_dir):
+    """Call after the global and inventory locks; share the mapping editor lock."""
+    logical = pathlib.Path(lldpq_dir) / "bmc.yaml"
+    # Recovery must work even if application modules were lost in a partial
+    # upgrade. Never import service-owned application code on this root path.
+    if not logical.exists() and not logical.is_symlink():
+        if not (logical.parent / "bmc_config.py").is_file():
+            yield
+            return
+    target = logical.resolve()
+    if logical.is_symlink() and (
+        target != (logical.parent / "config" / logical.name).resolve()
+        or not target.is_relative_to(logical.parent.resolve())
+    ):
+        raise BackupImportError("BMC configuration link is outside its managed config location")
+    if target.exists() and not target.is_file():
+        raise BackupImportError("BMC configuration must be a regular file")
+    descriptor = os.open(str(target) + ".lock", os.O_RDWR | os.O_CREAT
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0), 0o660)
+    with os.fdopen(descriptor, "r+") as handle:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_mode & stat.S_IWOTH:
+            raise BackupImportError("BMC configuration lock has unsafe type or permissions")
+        if metadata.st_uid == os.geteuid():
+            os.fchmod(handle.fileno(), stat.S_IMODE(metadata.st_mode) | 0o660)
+            group = (target if target.exists() else target.parent).stat().st_gid
+            if os.geteuid() == 0 and metadata.st_gid != group:
+                os.fchown(handle.fileno(), -1, group)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 DISPLAY_ALIAS_LIMITS = {
@@ -2087,6 +2140,12 @@ def _validate_config(name, content, validation_dir, lldpq_dir):
         _validate_notifications(_load_yaml_mapping(text, name, allow_empty=True))
     elif name == "tracking.yaml":
         validate_tracking_config(_load_yaml_mapping(text, name, allow_empty=True))
+    elif name == "bmc.yaml":
+        support = _load_bmc_support(lldpq_dir)
+        try:
+            support.validate_document(_load_yaml_mapping(text, name))
+        except support.BMCConfigError as exc:
+            raise BackupImportError(f"bmc.yaml is invalid: {exc}") from exc
     elif name == "display-aliases.json":
         value = _load_json_no_duplicate_keys(text, name)
         normalized = validate_display_aliases(value)
@@ -2100,7 +2159,7 @@ def validate_config_for_bundle(name, content, *, lldpq_dir):
     """Apply restore-time validation before advertising a backup as usable."""
     supported = {
         "devices.yaml", "topology.dot", "topology_config.yaml",
-        "notifications.yaml", "tracking.yaml", "display-aliases.json",
+        "notifications.yaml", "tracking.yaml", "bmc.yaml", "display-aliases.json",
     }
     if name not in supported:
         raise BackupImportError(f"Unsupported managed backup config: {name}")
@@ -2513,6 +2572,7 @@ def restore_bundle(
     allowed = {
         "devices.yaml": lldpq_dir,
         "tracking.yaml": lldpq_dir,
+        "bmc.yaml": lldpq_dir,
         "topology.dot": web_root,
         "topology_config.yaml": web_root,
         "notifications.yaml": lldpq_dir,
@@ -2796,6 +2856,7 @@ def recover_retained_import(*, lldpq_dir, user, web_root):
     allowed = {
         "devices.yaml": lldpq_dir,
         "tracking.yaml": lldpq_dir,
+        "bmc.yaml": lldpq_dir,
         "topology.dot": web_root,
         "topology_config.yaml": web_root,
         "notifications.yaml": lldpq_dir,
@@ -3063,10 +3124,11 @@ def _main(argv=None):
             inventory_lock_handle = _acquire_inventory_lock(
                 os.path.normpath(args.web_root)
             )
-            result = recover_retained_import(
-                lldpq_dir=os.path.normpath(args.lldpq_dir), user=args.user,
-                web_root=os.path.normpath(args.web_root),
-            )
+            with bmc_configuration_lock(os.path.normpath(args.lldpq_dir)):
+                result = recover_retained_import(
+                    lldpq_dir=os.path.normpath(args.lldpq_dir), user=args.user,
+                    web_root=os.path.normpath(args.web_root),
+                )
         else:
             result = purge_native_recovery_state(user=args.user)
     except Exception as exc:

@@ -149,9 +149,13 @@ try:
 except OSError:
     sys.exit(1)
 
-if any(line.startswith("__LLDPQ_COLLECTION_ERROR__:") for line in lines):
+if any(line.startswith("__LLDPQ_COLLECTION_ERROR__:") and
+       line != "__LLDPQ_COLLECTION_ERROR__:BMC_LINK" for line in lines):
     sys.exit(1)
 
+# BMC link state is additive and independently validated.  An unsupported
+# iproute2 JSON command must not invalidate the existing fabric tables.
+markers = [marker for marker in markers if marker != "BMC_LINK"]
 if markers != expected:
     sys.exit(1)
 PYEOF
@@ -219,6 +223,13 @@ collect_device_data() {
         for b in /sys/class/net/*/bonding/slaves; do
             [ -f "$b" ] && echo "$(basename $(dirname $(dirname $b))):$(cat $b)"
         done 2>/dev/null
+        echo "===BMC_LINK==="
+        _bmc_link_output=$(/usr/sbin/ip -j -d link show 2>/dev/null)
+        if [ "$?" -ne 0 ]; then
+            echo "__LLDPQ_COLLECTION_ERROR__:BMC_LINK"
+        else
+            printf "%s\n" "$_bmc_link_output"
+        fi
         echo "===LOOPBACKS==="
         _loopback_output=$(/usr/sbin/ip -4 addr show lo 2>/dev/null)
         _loopback_status=$?
@@ -258,9 +269,9 @@ collect_device_data() {
         echo "===END==="
     ' > "$raw_file" 2>/dev/null
     ssh_status=$?
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGING_DIR/raw/${hostname}.checked-at"
 
     if [[ $ssh_status -ne 0 ]]; then
-        rm -f "$raw_file"
         if [[ "$ping_reachable" == "false" ]]; then
             write_collection_status "$hostname" "unreachable" "ping_and_ssh_failed"
             return 10
@@ -269,7 +280,6 @@ collect_device_data() {
         return 11
     fi
     if [[ ! -s "$raw_file" ]] || ! validate_raw_snapshot "$raw_file"; then
-        rm -f "$raw_file"
         write_collection_status "$hostname" "invalid" "partial_or_invalid_output"
         return 12
     fi
@@ -552,12 +562,13 @@ with open(output_file, 'w', encoding='utf-8') as f:
 PYEOF
 
     then
-        rm -f "$raw_file" "$output_file"
+        rm -f "$output_file"
         write_collection_status "$hostname" "invalid" "parse_failed"
         return 13
     fi
 
-    rm -f "$raw_file"
+    # Keep raw sections until BMC's independent source merge below.  The
+    # enclosing private staging directory is removed by the EXIT trap.
     write_collection_status "$hostname" "current" ""
     return 0
 }
@@ -712,6 +723,9 @@ if not isinstance(data, dict):
 collection = data.get('_collection')
 if not isinstance(collection, dict):
     collection = {}
+if collection.get('status') == 'unavailable' and not any(
+        key in data for key in ('arp', 'mac', 'routes')):
+    raise ValueError('BMC-only cache has no last-known-good fabric snapshot')
 last_success = collection.get('last_success') or collection.get('checked_at')
 if not last_success:
     last_success = datetime.fromtimestamp(os.path.getmtime(source)).isoformat()
@@ -884,6 +898,13 @@ for ip in "${!devices[@]}"; do
         prepare_last_known_snapshot "$hostname" "${collection_reason:-collection_failed}"
     fi
 done
+
+if ! python3 "$SCRIPT_DIR/bmc_collection.py" "$STAGING_DIR/inventory.tsv" \
+    "$STAGING_DIR/raw" "$STAGING_DIR/data" "$OUTPUT_DIR" \
+    "$LLDPQ_DIR/bmc.yaml" "$LLDPQ_DIR/lldp-results/lldp_neighbors.json"; then
+    echo "Could not merge BMC observations; existing fabric cache was preserved." >&2
+    exit 1
+fi
 
 if ! build_summary; then
     echo "Could not build fabric scan summary; existing cache was preserved." >&2

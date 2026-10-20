@@ -3008,7 +3008,7 @@ quiesce_update_web() {
     local deadline pid args web_cgi_running ancestor ancestor_pids=" " writer
     local -a state_writers=(
         setup-api.sh edit-devices.sh edit-topology.sh edit-config.sh
-        fabric-api.sh provision-api.sh ai-api.sh assets-api.sh
+        fabric-api.sh provision-api.sh ai-api.sh assets-api.sh bmc-api.sh
     )
     [[ "$INSTALL_MODE" == "update" ]] || return 0
     case "$wait_seconds" in
@@ -4805,6 +4805,8 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
                 sources+=("$LLDPQ_INSTALL_DIR/devices.yaml")
             [[ ! -e "$LLDPQ_INSTALL_DIR/tracking.yaml" ]] || \
                 sources+=("$LLDPQ_INSTALL_DIR/tracking.yaml")
+            [[ ! -e "$LLDPQ_INSTALL_DIR/bmc.yaml" ]] || \
+                sources+=("$LLDPQ_INSTALL_DIR/bmc.yaml")
             ((${#sources[@]} > 0)) || return 0
             prepare_shared_lock_files /etc/lldpq.conf.lock "$inventory_lock" || \
                 return 1
@@ -4815,6 +4817,7 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
                 cp -a -- "${sources[@]}" "$BACKUP_DIR/" || return 1
             [[ ! -e "$LLDPQ_INSTALL_DIR/devices.yaml" ]] || echo "  • devices.yaml"
             [[ ! -e "$LLDPQ_INSTALL_DIR/tracking.yaml" ]] || echo "  • tracking.yaml"
+            [[ ! -e "$LLDPQ_INSTALL_DIR/bmc.yaml" ]] || echo "  • bmc.yaml"
         }
 
         # Configuration files
@@ -4963,6 +4966,12 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     if [[ -f "$LLDPQ_INSTALL_DIR/tracking.yaml" ]]; then
         sudo cp -a "$LLDPQ_INSTALL_DIR/tracking.yaml" "$_preserved_dir/" || {
             echo "[!] Could not preserve tracking.yaml; update was not started" >&2
+            exit 1
+        }
+    fi
+    if [[ -f "$LLDPQ_INSTALL_DIR/bmc.yaml" ]]; then
+        sudo cp -a "$LLDPQ_INSTALL_DIR/bmc.yaml" "$_preserved_dir/" || {
+            echo "[!] Could not preserve bmc.yaml; update was not started" >&2
             exit 1
         }
     fi
@@ -5433,6 +5442,13 @@ if [[ -n "$_preserved_dir" ]] && [[ -d "$_preserved_dir" ]]; then
         }
         echo "    • tracking.yaml"
     fi
+    if [[ -f "$_preserved_dir/bmc.yaml" ]]; then
+        sudo cp "$_preserved_dir/bmc.yaml" "$LLDPQ_INSTALL_DIR/" || {
+            echo "[!] Could not restore preserved bmc.yaml" >&2
+            exit 1
+        }
+        echo "    • bmc.yaml"
+    fi
     if [[ -f "$_preserved_dir/notifications.yaml" ]]; then
         sudo cp "$_preserved_dir/notifications.yaml" "$LLDPQ_INSTALL_DIR/" || {
             echo "[!] Could not restore preserved notifications.yaml" >&2
@@ -5478,6 +5494,7 @@ sudo chown -R "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR"
 sudo chmod 750 "$LLDPQ_INSTALL_DIR"
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/devices.yaml" 2>/dev/null || true
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/tracking.yaml" 2>/dev/null || true
+sudo chmod 664 "$LLDPQ_INSTALL_DIR/bmc.yaml" 2>/dev/null || true
 sudo chmod 664 "$LLDPQ_INSTALL_DIR/notifications.yaml" 2>/dev/null || true
 sudo find "$LLDPQ_INSTALL_DIR" -name '*.sh' -exec chmod 755 {} +
 sudo find "$LLDPQ_INSTALL_DIR" -name '*.py' -exec chmod 755 {} +
@@ -5587,6 +5604,7 @@ if command -v setfacl >/dev/null 2>&1; then
 fi
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
+chmod 664 "$(git rev-parse --show-toplevel)/bmc.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
     find "$(git rev-parse --show-toplevel)/monitor-results" -type d \
         -exec chmod 775 {} + 2>/dev/null || true
@@ -6361,6 +6379,7 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     echo "  Preserved:"
     echo "    • $LLDPQ_INSTALL_DIR/devices.yaml"
     echo "    • $LLDPQ_INSTALL_DIR/tracking.yaml"
+    echo "    • $LLDPQ_INSTALL_DIR/bmc.yaml"
     echo "    • $WEB_ROOT/topology.dot"
     echo "    • $WEB_ROOT/topology_config.yaml"
     [[ -f "$LLDPQ_INSTALL_DIR/notifications.yaml" ]] && echo "    • $LLDPQ_INSTALL_DIR/notifications.yaml"
@@ -6571,6 +6590,7 @@ if command -v setfacl >/dev/null 2>&1; then
 fi
 chmod 664 "$(git rev-parse --show-toplevel)/devices.yaml" 2>/dev/null || true
 chmod 664 "$(git rev-parse --show-toplevel)/tracking.yaml" 2>/dev/null || true
+chmod 664 "$(git rev-parse --show-toplevel)/bmc.yaml" 2>/dev/null || true
 if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
     find "$(git rev-parse --show-toplevel)/monitor-results" -type d \
         -exec chmod 775 {} + 2>/dev/null || true

@@ -62,6 +62,7 @@ package details are covered under
   - [02h · Console](#02h-interactive-console-admin-only)
   - [02i · Fleet Commands](#02i-fleet-commands-admin-only)
   - [02j · Machine-readable exports](#02j-machine-readable-exports-public-api)
+  - [02k · BMC connections](#02k-bmc-connections)
 - [03 · Configuration files](#03-configuration-files)
   - [03a · Inventory & Bootstrap](#03a-inventory-bootstrap-admin-only)
   - [03b · Guided Setup](#03b-guided-web-setup-setup-page)
@@ -927,6 +928,52 @@ analysis, `/ai/export_json` can therefore return an empty JSON object and the
 index can report the file as available; automation must require a non-empty
 string `.analysis`, as in the example above.
 
+## [02k] BMC connections
+
+**Wiring → BMC** compares expected BMC MAC addresses against the MAC
+tables and physical link states collected from Cumulus/NVIDIA switches already
+in `devices.yaml`. The table shows **Switch, Port, Expected-MAC, Active-MAC,
+Hostname and Status** and follows the selected Analysis Scope.
+
+Administrators can manage the same inventory from **Setup → BMC Mappings**,
+**BMC → Edit Mappings**, or a result row's **Edit** button. Add rows
+individually or use **CSV Template / Import CSV** for bulk entry. Import previews
+let you append or replace rows before **Save Mappings**. Concurrent changes
+produce a conflict message without overwriting the other user's changes.
+
+```csv
+switch,port,expected_mac,hostname,vlan,bmc_ip,enabled
+oob-01,swp1,02:aa:bb:cc:dd:01,server-01-bmc,100,192.0.2.10,true
+```
+
+`switch`, `port`, `expected_mac` and `hostname` are required. The switch must
+exist in inventory; physical ports such as `swp1` and `swp1s0` are supported.
+VLAN and BMC IP are optional. BMC IP is stored as a reference only; this release
+does not probe BMCs or generate BMC alerts. MAC addresses accept colon, dash,
+dotted or compact notation and are saved in normalized colon notation.
+
+| Status | Meaning |
+| --- | --- |
+| MATCH | Expected MAC observed on the expected physical port. Extra MACs are shown as a warning. |
+| MISMATCH | Another MAC is present on the expected port. |
+| WRONG PORT | Expected MAC observed on another configured BMC port with current link/FDB data. |
+| NOT SEEN | Port is up, but the expected MAC is absent. A silent BMC's MAC may have aged out; this does not establish that it is offline. |
+| PORT DOWN | Current link data reports the expected port down. |
+| UNKNOWN / STALE | Required observations are unavailable, failed or older than 15 minutes. |
+| DISABLED | Mapping is retained but excluded from comparison. |
+
+FDB entries on virtual interfaces, bonds and known uplinks are not treated as
+proof of a direct BMC connection. **Refresh** reads cached observations;
+**Run Scan** starts the existing asynchronous fabric scan. Collection reuses
+the switch's existing scan connection and retrieves link states in that same
+session. An unrelated ARP/route collection failure does not discard valid BMC
+observations. Each row shows its observation time and last-seen time.
+
+Mappings live in `bmc.yaml`, independently of observations. Native updates,
+the persistent Docker config directory, and Setup backup/restore preserve
+them. Exporting result CSV respects the current filters and Analysis Scope;
+exporting mapping CSV includes the editor's current rows.
+
 ## [03] configuration files
 
 edit these files:
@@ -934,6 +981,7 @@ edit these files:
 ```
 ~/lldpq/devices.yaml             # add your switches (required) - used by pping, zzh, send-cmd, get-conf
 ~/lldpq/tracking.yaml            # lifecycle state overrides and transition metadata
+~/lldpq/bmc.yaml                 # expected BMC switch/port/MAC/hostname mappings
 ~/lldpq/topology.dot             # expected cable connections
 ~/lldpq/topology_config.yaml      # optional: customize device layers/icons (supports regex patterns)
 ~/lldpq/notifications.yaml        # optional: slack alerts + thresholds
@@ -1078,7 +1126,7 @@ Export a portable Setup configuration bundle (`.tar.gz`) and re-import it on
 an installed LLDPq host. This is a configuration-migration bundle, not a
 complete runtime or bare-metal backup.
 
-- **Included:** `devices.yaml`, `tracking.yaml`, `topology.dot`, `topology_config.yaml`, `notifications.yaml`, `display-aliases.json`, and a whitelist of **portable** `/etc/lldpq.conf` preferences (schedules, parallelism, feature toggles, AI settings)
+- **Included:** `devices.yaml`, `tracking.yaml`, `bmc.yaml`, `topology.dot`, `topology_config.yaml`, `notifications.yaml`, `display-aliases.json`, and a whitelist of **portable** `/etc/lldpq.conf` preferences (schedules, parallelism, feature toggles, AI settings)
 - **Excluded from portable prefs:** host-specific paths and secrets (e.g. the
   AI API key), plus host-bound telemetry collector IP/port/VRF settings
 - **SSH key** (optional checkbox, on by default): includes the collector key pair so the restored install can reach devices immediately. Bundles can already contain notification webhooks; always store them securely, especially when the private key is included.
@@ -1149,7 +1197,7 @@ It first copies the retained items into
 `$LLDPQ_INSTALL_DIR/uninstall-kept-data/`, then removes their former live/web
 locations. The retained set is exactly:
 
-- Setup configuration: `devices.yaml`, `tracking.yaml`, `notifications.yaml`, `topology.dot`,
+- Setup configuration: `devices.yaml`, `tracking.yaml`, `bmc.yaml`, `notifications.yaml`, `topology.dot`,
   `topology_config.yaml`, and `display-aliases.json`;
 - runtime data: `monitor-results/`, `lldp-results/`, and `alert-states/`;
 - history: collected `configs/`, command-history `hstr/`, and the web
@@ -1296,7 +1344,7 @@ sensitive material such as `/etc/lldpq.conf`, password hashes, notification
 webhooks, and SSH private keys; store it with restricted access.
 
 ### what gets backed up & preserved:
-- **config files**: devices.yaml, tracking.yaml, notifications.yaml, topology.dot, topology_config.yaml
+- **config files**: devices.yaml, tracking.yaml, bmc.yaml, notifications.yaml, topology.dot, topology_config.yaml
 - **monitoring data**: assets.ini, monitor-results/, lldp-results/, alert-states/
 - **system configs**: /etc/lldpq.conf, /etc/lldpq-users.conf
 - **DHCP configs**: /etc/dhcp/dhcpd.conf, /etc/dhcp/dhcpd.hosts

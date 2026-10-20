@@ -6,6 +6,8 @@
     <title>..::LLDPQ:: Setup</title>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
     <script src="/css/auth.js"></script>
+    <link rel="stylesheet" href="/css/bmc.css?v=20261020-1">
+    <script src="/css/bmc.js?v=20261020-1"></script>
     <style>
         * { box-sizing: border-box; }
         html, body { height: 100%; margin: 0; }
@@ -539,7 +541,7 @@
                 <!-- Step 9: Backup & Restore -->
                 <div class="su-panel" data-step-key="backup">
                     <h2>9. Backup &amp; Restore <span class="p-file">config bundle</span></h2>
-                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>tracking.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus your tunable <strong>settings</strong> (schedules, parallelism, toggles) and (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. On restore, settings are merged back <em>by key</em> &mdash; host paths &amp; secrets (e.g. AI key) are never carried or overwritten.</p>
+                    <p class="p-desc">Export LLDPq config &mdash; <code>devices.yaml</code>, <code>tracking.yaml</code>, <code>bmc.yaml</code>, <code>topology.dot</code>, <code>topology_config.yaml</code>, <code>notifications.yaml</code>, <code>display-aliases.json</code> &mdash; plus your tunable <strong>settings</strong> (schedules, parallelism, toggles) and (optionally) the collector <strong>SSH key</strong>, as one <code>.tar.gz</code> to migrate LLDPq to another host or keep as a restore point. On restore, settings are merged back <em>by key</em> &mdash; host paths &amp; secrets (e.g. AI key) are never carried or overwritten.</p>
                     <div class="sched-card">
                         <label style="display:flex;align-items:center;gap:8px;color:#d4d4d4;font-size:13px;cursor:pointer;margin-bottom:10px;"><input type="checkbox" id="bk-include-key" checked style="width:16px;height:16px;accent-color:#76b900;"> Include the collector SSH key &mdash; complete set for migration <strong style="color:#ffb74d;">(adds the private key)</strong></label>
                         <div class="p-toolbar">
@@ -573,6 +575,20 @@
                         </div>
                         <div class="status info" id="mt-status"></div>
                     </div>
+                </div>
+
+                <!-- BMC inventory shares the editor with the BMC page. -->
+                <div class="su-panel" data-step-key="bmc">
+                    <h2>BMC Mappings</h2>
+                    <p class="p-desc">Define the expected switch port, MAC address and hostname for each BMC, iDRAC or iLO connection. LLDPq compares these mappings with the MAC tables and port states collected from your inventory switches.</p>
+                    <div class="key-card">
+                        <div class="p-toolbar">
+                            <button class="btn primary" type="button" onclick="LLDPqBMC.openEditor()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Edit Mappings</button>
+                            <a href="bmc.html" class="btn secondary" style="text-decoration:none">View BMC</a>
+                        </div>
+                        <p class="p-desc" style="margin-bottom:0">Add or edit individual rows, import a CSV, or download the current mappings. This is the same editor available from the BMC page. Switch, Port, Expected-MAC and Hostname are required; VLAN and BMC-IP are optional.</p>
+                    </div>
+                    <div class="note">A missing MAC does not always mean a disconnected BMC: an idle device can age out of the MAC table. Results distinguish a down port from a MAC that is not seen, and show when observations are unavailable or stale.</div>
                 </div>
 
                 <!-- Non-numbered Danger Zone: deliberately outside the 11-step wizard. -->
@@ -776,16 +792,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderSteps();
     // Allow deep-linking to a step, e.g. setup.html?step=update (used by the index "Update Available" popup).
     var startIdx = 0;
+    var startBMC = false;
     var startUninstall = restoreUninstallJobState();
     try {
         var sp = new URLSearchParams(location.search).get('step') || (location.hash || '').replace('#', '');
-        if (sp === 'uninstall') startUninstall = true;
+        if (sp === 'bmc') startBMC = true;
+        else if (sp === 'uninstall') startUninstall = true;
         else if (sp) { var si = STEPS.findIndex(function (s) { return s.key === sp; }); if (si >= 0) startIdx = si; }
     } catch (e) {}
     if (startUninstall) {
         showUninstall();
         if (uninstallCommitted && uninstallJobId) resumeUninstallJobStatus();
-    } else goStep(startIdx);
+    } else if (startBMC) showBMCMappings();
+    else goStep(startIdx);
     // A successful self-update reloads with a one-use cache-busting query so
     // the browser cannot keep executing the pre-update inline JavaScript.
     try {
@@ -828,6 +847,18 @@ function renderSteps() {
         const desc = document.createElement('div'); desc.className = 'desc'; desc.textContent = s.desc;
         copy.append(label, desc); step.append(num, copy); c.appendChild(step);
     });
+
+    const bmcSeparator = document.createElement('div');
+    bmcSeparator.className = 'su-sep'; bmcSeparator.textContent = 'OOB Connections';
+    const bmc = document.createElement('div'); bmc.className = 'su-step'; bmc.id = 'step-bmc';
+    bmc.setAttribute('role', 'button'); bmc.setAttribute('tabindex', '0');
+    bmc.addEventListener('click', showBMCMappings);
+    bmc.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); showBMCMappings(); } });
+    const bmcMark = document.createElement('div'); bmcMark.className = 'num'; bmcMark.textContent = 'B';
+    const bmcCopy = document.createElement('div');
+    const bmcLabel = document.createElement('div'); bmcLabel.className = 'lbl'; bmcLabel.textContent = 'BMC Mappings';
+    const bmcDesc = document.createElement('div'); bmcDesc.className = 'desc'; bmcDesc.textContent = 'Switch / port / MAC / hostname';
+    bmcCopy.append(bmcLabel, bmcDesc); bmc.append(bmcMark, bmcCopy); c.append(bmcSeparator, bmc);
 
     const separator = document.createElement('div');
     separator.className = 'su-sep';
@@ -893,6 +924,22 @@ function goStep(i) {
         u.hash = '';
         history.replaceState(null, '', u.pathname + u.search);
     } catch (e) { /* deep-link state is non-critical */ }
+}
+
+function showBMCMappings() {
+    if (uninstallCommitted || uninstallStarting) return;
+    if (current === STEPS.length) invalidateUninstallPreview('', true);
+    current = STEPS.length + 1;
+    document.querySelectorAll('.su-step').forEach(function (el) {
+        const active = el.id === 'step-bmc';
+        el.classList.toggle('active', active);
+        if (active) el.setAttribute('aria-current', 'page'); else el.removeAttribute('aria-current');
+    });
+    document.querySelectorAll('.su-panel').forEach(function (el) { el.classList.toggle('active', el.dataset.stepKey === 'bmc'); });
+    document.getElementById('nav-ind').textContent = 'BMC Mappings';
+    document.getElementById('nav-back').disabled = true;
+    document.getElementById('nav-next').style.visibility = 'hidden';
+    try { const u = new URL(location.href); u.searchParams.set('step', 'bmc'); u.hash = ''; history.replaceState(null, '', u.pathname + u.search); } catch (e) {}
 }
 
 function showUninstall() {
@@ -996,7 +1043,7 @@ function initDirtyGuards() {
 }
 
 function hasUnsavedSetupChanges() {
-    return aliasesDirty || notifDirty || ansibleDirty || runSettingsDirty || Object.keys(FILES).some(function (key) { return FILES[key].dirty; });
+    return aliasesDirty || notifDirty || ansibleDirty || runSettingsDirty || (typeof LLDPqBMC !== 'undefined' && LLDPqBMC.hasUnsavedChanges()) || Object.keys(FILES).some(function (key) { return FILES[key].dirty; });
 }
 
 function markDone(stepKey, isDone) {

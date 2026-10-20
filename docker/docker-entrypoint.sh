@@ -476,6 +476,7 @@ if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$CONFIG_DIR" 2>/dev/n
     }
     _setup_config_file devices.yaml         /home/lldpq/lldpq/devices.yaml      lldpq:www-data    664
     _setup_config_file tracking.yaml        /home/lldpq/lldpq/tracking.yaml     lldpq:www-data    664
+    _setup_config_file bmc.yaml             /home/lldpq/lldpq/bmc.yaml          lldpq:www-data    664
     _setup_config_file topology.dot         /var/www/html/topology.dot          lldpq:www-data    664
     _setup_config_file topology_config.yaml /var/www/html/topology_config.yaml  lldpq:www-data    664
     _setup_config_file lldpq-users.conf     /etc/lldpq-users.conf               www-data:www-data 600
@@ -538,6 +539,13 @@ if [ ! -f /home/lldpq/lldpq/tracking.yaml ]; then
 fi
 chown lldpq:www-data /home/lldpq/lldpq/tracking.yaml
 chmod 664 /home/lldpq/lldpq/tracking.yaml
+
+# Expected BMC cabling is operator configuration, never scan-generated data.
+if [ ! -f /home/lldpq/lldpq/bmc.yaml ]; then
+    printf 'version: 1\nmappings: []\n' > /home/lldpq/lldpq/bmc.yaml
+fi
+chown lldpq:www-data /home/lldpq/lldpq/bmc.yaml
+chmod 664 /home/lldpq/lldpq/bmc.yaml
 
 # ─── Topology files Setup ───
 # Real files in web root (editable from web UI), symlinks in lldpq dir (used by scripts)

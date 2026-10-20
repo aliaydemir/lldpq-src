@@ -1,0 +1,4 @@
+# Expected BMC cabling. Edit in Setup > BMC Mappings or BMC.
+# Observed switch MAC tables never modify these expectations.
+version: 1
+mappings: []
