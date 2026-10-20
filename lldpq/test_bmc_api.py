@@ -1,4 +1,8 @@
 """Exercise the real CGI boundary and portable BMC backup validation locally."""
+import ast
+import base64
+import builtins
+from contextlib import ExitStack, redirect_stdout
 import grp
 import fcntl
 import io
@@ -6,12 +10,15 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import backup_import
@@ -196,6 +203,123 @@ class BMCBackupTest(unittest.TestCase):
             with self.assertRaises(backup_import.BackupImportError):
                 with backup_import.bmc_configuration_lock(root):
                     self.fail("unmanaged target was locked")
+
+
+class BMCSetupBackupRoundTripTest(unittest.TestCase):
+    """Run Setup's actual export/import handlers against isolated config files.
+
+    Only OS account/privilege boundaries are adapted to the current test user;
+    archive validation, staging, activation, and recovery cleanup are real.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="lldpq-bmc-backup-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.application = self.root / "application"
+        self.web = self.root / "web"
+        self.home = self.root / "home"
+        for directory in (self.application, self.web, self.home):
+            directory.mkdir()
+        (self.application / "bmc_config.py").symlink_to(REPO / "lldpq/bmc_config.py")
+        self.account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid(),
+                                       pw_dir=str(self.home), pw_name="lldpq-backup-test")
+        self.group = SimpleNamespace(gr_gid=os.getgid())
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(backup_import.pwd, "getpwnam", return_value=self.account))
+        self.stack.enter_context(mock.patch.object(backup_import.grp, "getgrnam", return_value=self.group))
+        self.stack.enter_context(mock.patch.object(backup_import, "_docker_environment", return_value=False))
+        self.stack.enter_context(mock.patch.object(
+            backup_import, "_as_collector",
+            side_effect=lambda _user, arguments, **kwargs: backup_import._run(arguments, **kwargs),
+        ))
+        # Production runs on Linux. Homebrew provides equivalent GNU commands
+        # for running the same filesystem transaction in macOS development.
+        if sys.platform == "darwin":
+            commands = ("sync", "mv", "chmod", "chgrp", "stat", "cp", "rm")
+            binaries = {name: shutil.which("g" + name) for name in commands}
+            if not all(binaries.values()):
+                self.skipTest("GNU coreutils are needed for the Linux restore transaction")
+            toolbin = self.root / "bin"
+            toolbin.mkdir()
+            for name, executable in binaries.items():
+                (toolbin / name).symlink_to(executable)
+            self.stack.enter_context(mock.patch.dict(os.environ, {
+                "PATH": str(toolbin) + os.pathsep + os.environ.get("PATH", ""),
+            }))
+            self.stack.enter_context(mock.patch.object(
+                backup_import, "_secure_list_dir",
+                side_effect=lambda _user, path: os.listdir(path),
+            ))
+        original_open = builtins.open
+
+        def fixture_open(path, *args, **kwargs):
+            if path == "/etc/lldpq.conf":
+                raise FileNotFoundError(path)
+            return original_open(path, *args, **kwargs)
+
+        self.stack.enter_context(mock.patch("builtins.open", side_effect=fixture_open))
+        source = (REPO / "html/setup-api.sh").read_text().split("python3 << 'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        self.handlers = {}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+                if isinstance(node.test.left, ast.Name) and node.test.left.id == "action":
+                    action = ast.literal_eval(node.test.comparators[0])
+                    if action in ("backup-export", "backup-import"):
+                        self.handlers[action] = compile(ast.Module(body=[node], type_ignores=[]), "setup-backup-handler", "exec")
+
+    def call_setup(self, action, body):
+        with ExitStack() as locks:
+            def acquire_lock():
+                locks.enter_context(backup_import.bmc_configuration_lock(str(self.application)))
+
+            namespace = {
+                "action": action, "post_data": body, "json": json, "sys": sys,
+                "lldpq_dir": str(self.application), "web_root": str(self.web),
+                "lldpq_user": self.account.pw_name, "LLDPQ_PREF_KEYS": set(),
+                "load_backup_import_helper": lambda _name: backup_import,
+                "ensure_backup_locks": acquire_lock,
+                "ensure_restore_locks": acquire_lock,
+                "ensure_configuration_lock": lambda: None,
+                "valid_cron_schedule": lambda _schedule: True,
+            }
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit) as stopped:
+                exec(self.handlers[action], namespace)
+            self.assertEqual(stopped.exception.code, 0)
+            return json.loads(output.getvalue())
+
+    def test_setup_export_then_restore_preserves_bmc_mappings_and_managed_link(self):
+        for use_link in (False, True):
+            with self.subTest(managed_config_link=use_link):
+                logical = self.application / "bmc.yaml"
+                if logical.exists():
+                    logical.unlink()
+                target = logical
+                if use_link:
+                    target = self.application / "config/bmc.yaml"
+                    target.parent.mkdir(exist_ok=True)
+                    logical.symlink_to(target)
+                original = json.dumps({"version": 1, "mappings": [
+                    ROW, {**ROW, "switch": "oob-02", "port": "swp12",
+                          "expected_mac": "02:aa:bb:cc:dd:02", "hostname": "server-02-bmc",
+                          "vlan": None, "bmc_ip": "192.0.2.22", "enabled": False},
+                ]}).encode()
+                target.write_bytes(original)
+                exported = self.call_setup("backup-export", {"include_key": False})
+                self.assertTrue(exported["success"], exported)
+                self.assertIn("bmc.yaml", exported["files"])
+                with tarfile.open(fileobj=io.BytesIO(base64.b64decode(exported["data"])), mode="r:gz") as archive:
+                    self.assertTrue(archive.getmember("bmc.yaml").isfile())
+                    self.assertEqual(archive.extractfile("bmc.yaml").read(), original)
+                target.write_text("version: 1\nmappings: []\n")
+                restored = self.call_setup("backup-import", {"data": exported["data"]})
+                self.assertTrue(restored["success"], restored)
+                self.assertIn("bmc.yaml", restored["restored"])
+                self.assertEqual(target.read_bytes(), original)
+                self.assertEqual(logical.is_symlink(), use_link)
+                self.assertFalse((self.home / ".lldpq-state/.backup-import-recovery").exists())
 
 
 if __name__ == "__main__":

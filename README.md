@@ -934,23 +934,30 @@ string `.analysis`, as in the example above.
 tables and physical link states collected from Cumulus/NVIDIA switches already
 in `devices.yaml`. The table shows **Switch, Port, Expected-MAC, Active-MAC,
 Hostname and Status** and follows the selected Analysis Scope.
+The page uses the same header controls, searchable device selector, column
+filter menus, sorting controls and table styling as **Results**.
+**P2P: On/Off** and **Edit Aliases** use the same display aliases and browser
+preference as Results. Aliases apply to switch, port and hostname labels;
+search accepts both real names and aliases. Result sorting and CSV follow the
+displayed labels, while mapping edits and mapping CSV retain the real names.
 
 Administrators can manage the same inventory from **Setup → BMC Mappings**,
-**BMC → Edit Mappings**, or a result row's **Edit** button. Add rows
+**BMC → Edit Mappings**, or by double-clicking a result row. Add rows
 individually or use **CSV Template / Import CSV** for bulk entry. Import previews
 let you append or replace rows before **Save Mappings**. Concurrent changes
 produce a conflict message without overwriting the other user's changes.
 
 ```csv
-switch,port,expected_mac,hostname,vlan,bmc_ip,enabled
-oob-01,swp1,02:aa:bb:cc:dd:01,server-01-bmc,100,192.0.2.10,true
+switch,port,expected_mac,hostname
+oob-01,swp1,02:aa:bb:cc:dd:01,server-01-bmc
 ```
 
 `switch`, `port`, `expected_mac` and `hostname` are required. The switch must
 exist in inventory; physical ports such as `swp1` and `swp1s0` are supported.
-VLAN and BMC IP are optional. BMC IP is stored as a reference only; this release
-does not probe BMCs or generate BMC alerts. MAC addresses accept colon, dash,
-dotted or compact notation and are saved in normalized colon notation.
+These are the editor's four fields. New mappings are monitored automatically;
+no VLAN, IP address or enable switch is required. MAC addresses accept colon,
+dash, dotted or compact notation and are saved in normalized colon notation.
+This release does not probe BMCs or generate BMC alerts.
 
 | Status | Meaning |
 | --- | --- |
@@ -964,15 +971,20 @@ dotted or compact notation and are saved in normalized colon notation.
 
 FDB entries on virtual interfaces, bonds and known uplinks are not treated as
 proof of a direct BMC connection. **Refresh** reads cached observations;
-**Run Scan** starts the existing asynchronous fabric scan. Collection reuses
+**Run BMC Check** starts the existing asynchronous fabric scan. Collection reuses
 the switch's existing scan connection and retrieves link states in that same
 session. An unrelated ARP/route collection failure does not discard valid BMC
-observations. Each row shows its observation time and last-seen time.
+observations. Hover over a status badge to see its diagnostic details,
+observation time and last-seen time.
 
 Mappings live in `bmc.yaml`, independently of observations. Native updates,
 the persistent Docker config directory, and Setup backup/restore preserve
 them. Exporting result CSV respects the current filters and Analysis Scope;
 exporting mapping CSV includes the editor's current rows.
+Previously configured VLAN, BMC IP and enabled values remain supported and
+are preserved when editing existing mappings. Legacy CSV files are accepted;
+mapping exports include the additional columns only when needed to preserve
+nondefault values.
 
 ## [03] configuration files
 

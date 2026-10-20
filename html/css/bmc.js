@@ -6,8 +6,8 @@
     else root.LLDPqBMC = api;
 }(typeof window === 'undefined' ? globalThis : window, function (root) {
     'use strict';
-    const COLUMNS = ['switch', 'port', 'expected_mac', 'hostname', 'vlan', 'bmc_ip', 'enabled'];
-    const STATUSES = ['MATCH', 'MISMATCH', 'WRONG PORT', 'NOT SEEN', 'PORT DOWN', 'UNKNOWN', 'STALE', 'DISABLED'];
+    const COLUMNS = ['switch', 'port', 'expected_mac', 'hostname'];
+    const LEGACY_COLUMNS = [...COLUMNS, 'vlan', 'bmc_ip', 'enabled'];
     const str = value => value === null || value === undefined ? '' : String(value);
     const statusOf = row => str(row.status || 'UNKNOWN').replace(/_/g, ' ').toUpperCase();
     const isProblem = row => !['MATCH', 'DISABLED'].includes(statusOf(row));
@@ -44,7 +44,7 @@
         const headers = rows.shift().map(value => value.trim().toLowerCase().replace(/[ -]+/g, '_'));
         if (new Set(headers).size !== headers.length) throw new Error('CSV contains duplicate column names.');
         for (const required of COLUMNS.slice(0, 4)) if (!headers.includes(required)) throw new Error('Missing CSV column: ' + required);
-        const unknown = headers.filter(header => !COLUMNS.includes(header));
+        const unknown = headers.filter(header => !LEGACY_COLUMNS.includes(header));
         if (unknown.length) throw new Error('Unknown CSV column: ' + unknown.join(', '));
         return rows.map((values, index) => {
             if (values.length !== headers.length) throw new Error('CSV row ' + (index + 2) + ' has the wrong number of columns.');
@@ -57,7 +57,10 @@
             return mapping(item);
         });
     }
-    function toCSV(rows, columns = COLUMNS) {
+    function toCSV(rows, columns) {
+        // New inventories have four fields. Retain explicit legacy settings
+        // when exporting older inventories so export/import never resets them.
+        if (!columns) columns = rows.some(row => (row.vlan != null && row.vlan !== '') || str(row.bmc_ip).trim() || row.enabled === false) ? LEGACY_COLUMNS : COLUMNS;
         const quote = value => '"' + str(value).replace(/"/g, '""') + '"';
         return [columns, ...rows.map(row => columns.map(key => Array.isArray(row[key]) ? row[key].join('; ') : row[key]))].map(row => row.map(quote).join(',')).join('\r\n') + '\r\n';
     }
@@ -162,10 +165,10 @@
         const dialog = el('div', 'bmc-editor-dialog'); dialog.setAttribute('role', 'dialog'); dialog.setAttribute('aria-modal', 'true'); dialog.setAttribute('aria-labelledby', 'bmc-editor-title');
         const header = el('div', 'bmc-editor-header'); const title = el('h2', '', 'BMC Mappings'); title.id = 'bmc-editor-title';
         const body = el('div', 'bmc-editor-body');
-        const note = el('p', 'bmc-note', 'Define where each BMC should be connected. Switch, Port, Expected-MAC and Hostname are required. VLAN and BMC-IP are optional. Saving updates the comparison using the latest observations.');
+        const note = el('p', 'bmc-note', 'Enter the switch, port, MAC address and hostname for each BMC. Saved mappings are checked automatically.');
         const toolbar = el('div', 'bmc-toolbar');
         const tableWrap = el('div', 'bmc-table-wrap'); const table = el('table', 'bmc-table'); const thead = el('thead'); const headings = el('tr');
-        ['Switch', 'Port', 'Expected-MAC', 'Hostname', 'VLAN', 'BMC-IP', 'Enabled', ''].forEach(value => headings.append(el('th', '', value)));
+        ['Switch', 'Port', 'Expected-MAC', 'Hostname', ''].forEach(value => headings.append(el('th', '', value)));
         const tbody = el('tbody'); thead.append(headings); table.append(thead, tbody); tableWrap.append(table);
         const switchOptions = el('datalist'); switchOptions.id = 'bmc-switch-options';
         const pagination = el('div','bmc-pagination'); const pageLabel = el('div','bmc-count'); pageLabel.setAttribute('aria-live','polite');
@@ -184,9 +187,10 @@
         }
         const setStatus = (text, kind = '') => { status.textContent = text; status.className = 'bmc-editor-status ' + kind; };
         const setBusy = value => {
-            busy = value; overlay.setAttribute('aria-busy', String(value));
-            overlay.querySelectorAll('input,select,button').forEach(node => { node.disabled = value; });
-            save.disabled = value || revision === null;
+            busy = value; overlay.setAttribute('aria-busy', String(!!value));
+            overlay.querySelectorAll('input,select,button').forEach(node => { node.disabled = !!value; });
+            closeButton.disabled = cancelButton.disabled = value === 'save';
+            save.disabled = !!value || revision === null;
             updatePagination();
         };
         const changed = () => { dirty = true; preview.hidden = true; setStatus('Unsaved changes'); };
@@ -209,19 +213,15 @@
                         field = el('input'); field.type = 'text'; field.setAttribute('list',switchOptions.id);
                         field.value = row.switch; field.placeholder = 'Select switch'; field.autocomplete = 'off';
                     } else {
-                        field = el('input'); field.type = key === 'enabled' ? 'checkbox' : key === 'vlan' ? 'number' : 'text';
-                        if (key === 'enabled') field.checked = row.enabled !== false;
-                        else field.value = str(row[key]);
-                        if (key === 'vlan') { field.min = '1'; field.max = '4094'; field.className = 'bmc-vlan-input'; }
+                        field = el('input'); field.type = 'text'; field.value = str(row[key]);
                         if (key === 'port') { field.placeholder = 'swp1'; field.className = 'bmc-port-input'; }
                         if (key === 'expected_mac') { field.placeholder = 'aa:bb:cc:dd:ee:ff'; field.className = 'bmc-mac-input'; }
                         if (key === 'hostname') field.className = 'bmc-hostname-input';
-                        if (key === 'bmc_ip') field.placeholder = 'Optional';
-                        if (key !== 'enabled') field.autocomplete = 'off';
+                        field.autocomplete = 'off';
                     }
                     field.setAttribute('aria-label', key.replace(/_/g, ' ') + ', row ' + (index + 1));
-                    field.addEventListener(key === 'enabled' ? 'change' : 'input', () => {
-                        row[key] = key === 'enabled' ? field.checked : field.value; changed();
+                    field.addEventListener('input', () => {
+                        row[key] = field.value; changed();
                     });
                     if (key === 'expected_mac') field.addEventListener('blur', () => { field.value = normalizeMac(field.value); row[key] = field.value; });
                     td.append(field); tr.append(td);
@@ -233,7 +233,7 @@
             if (selected) setTimeout(() => tbody.querySelector('.bmc-selected')?.scrollIntoView({ block:'nearest' }), 0);
         }
         async function load(selected) {
-            const token = gate.next(); setBusy(true); setStatus('Loading mappings…');
+            const token = gate.next(); setBusy('load'); setStatus('Loading mappings…');
             try {
                 const data = await apiRequest('config'); if (!gate.current(token)) return;
                 if (!Array.isArray(data.mappings) || data.revision == null) throw new Error('The BMC configuration response is invalid.');
@@ -245,9 +245,9 @@
             finally { if (gate.current(token)) setBusy(false); }
         }
         async function close() {
-            if (busy) return;
+            if (busy === 'save') return;
             if (dirty && !await confirmAction('Discard your unsaved BMC mapping changes?')) return;
-            dirty = false; gate.invalidate(); overlay.hidden = true; preview.hidden = true; focusReturn?.focus();
+            dirty = false; gate.invalidate(); setBusy(false); overlay.hidden = true; preview.hidden = true; focusReturn?.focus();
         }
         const previousPage = button('Previous Rows','secondary small',() => { if (editorPage > 0) editorPage--; render(); });
         const nextPage = button('Next Rows','secondary small',() => { editorPage++; render(); });
@@ -264,7 +264,7 @@
                 preview.replaceChildren(el('p', '', imported.length + ' mapping(s) ready to import. Choose how to apply them to your current ' + rows.length + ' row(s). Nothing is saved until Save Mappings.'));
                 const previewWrap = el('div','bmc-table-wrap'); const previewTable = el('table','bmc-table');
                 const previewHead = el('thead'); const previewHeaders = el('tr');
-                ['Switch','Port','Expected-MAC','Hostname','VLAN','BMC-IP','Enabled'].forEach(label => previewHeaders.append(el('th','',label)));
+                ['Switch','Port','Expected-MAC','Hostname'].forEach(label => previewHeaders.append(el('th','',label)));
                 previewHead.append(previewHeaders); const previewBody = el('tbody');
                 imported.slice(0,5).forEach(item => { const tr = el('tr'); COLUMNS.forEach(key => tr.append(el('td','',str(item[key])))); previewBody.append(tr); });
                 previewTable.append(previewHead,previewBody); previewWrap.append(previewTable); preview.append(previewWrap);
@@ -284,7 +284,7 @@
         });
         const save = button('Save Mappings', 'primary', async () => {
             if (busy || revision === null) return;
-            const token = gate.next(); setBusy(true); setStatus('Saving mappings…');
+            const token = gate.next(); setBusy('save'); setStatus('Saving mappings…');
             try {
                 const data = await apiRequest('save', {revision, mappings:rows.map(mapping)}); if (!gate.current(token)) return;
                 revision = data.revision; rows = (data.mappings || rows).map(mapping); dirty = false; render();
@@ -298,7 +298,8 @@
             button('Export CSV', 'secondary', () => download('bmc-mappings.csv', toCSV(rows))),
             button('CSV Template', 'secondary', () => download('bmc-mappings-template.csv', toCSV([]))), reload);
         const closeButton = button('Close', 'secondary', close); header.append(title, closeButton);
-        footer.append(status, button('Cancel', 'secondary', close), save); body.append(note, toolbar, preview, empty, switchOptions, tableWrap, pagination);
+        const cancelButton = button('Cancel', 'secondary', close);
+        footer.append(status, cancelButton, save); body.append(note, toolbar, preview, empty, switchOptions, tableWrap, pagination);
         dialog.append(header, body, footer); overlay.append(dialog); root.document.body.append(overlay);
         overlay.addEventListener('keydown', event => {
             if (event.key === 'Escape') { event.preventDefault(); close(); }
@@ -311,7 +312,7 @@
             }
         });
         root.addEventListener('beforeunload', event => { if (dirty) { event.preventDefault(); event.returnValue = ''; } });
-        return { isDirty: () => dirty, open: async selected => { focusReturn = root.document.activeElement; overlay.hidden = false; await load(selected); closeButton.focus(); } };
+        return { isDirty: () => dirty, open: async selected => { focusReturn = root.document.activeElement; overlay.hidden = false; await load(selected); if (!overlay.hidden) closeButton.focus(); } };
     }
     async function openEditor(selected) {
         if (typeof LLDPqAuth === 'undefined' || !LLDPqAuth.isAdmin()) return;
@@ -320,116 +321,7 @@
     }
 
     async function initResults() {
-        const doc = root.document, get = id => doc.getElementById(id);
-        const errorNode = get('bmc-error');
-        const showError = message => { errorNode.textContent = message; errorNode.hidden = !message; };
-        if (typeof LLDPqAuth === 'undefined' || !await LLDPqAuth.checkWithRetry()) {
-            get('bmc-loading').hidden = true; showError(typeof LLDPqAuth !== 'undefined' ? LLDPqAuth.lastCheckMessage() : 'Authentication is unavailable.'); return;
-        }
-        const admin = LLDPqAuth.isAdmin(); get('bmc-edit').hidden = !admin; get('bmc-actions-heading').hidden = !admin;
-        const gate = requestGate(); let rows = [], visible = [], loaded = false, scanTimer = null, scanning = false, page = 0;
-        const pageSize = 100;
-        let scope = 'all'; try { scope = root.sessionStorage.getItem('lldpq_tracking_view') || 'all'; } catch (_) {}
-        if (!['all','commissioning','handed_over'].includes(scope)) scope = 'all';
-        let scopeHosts = null;
-        const filters = () => ({search:get('bmc-search').value, switch:get('bmc-switch').value, status:get('bmc-status').value, problems:get('bmc-problems').checked});
-        function render() {
-            visible = filterRows(rows, filters()); const tbody = get('bmc-rows'); tbody.replaceChildren();
-            page = Math.min(page, Math.max(0, Math.ceil(visible.length / pageSize) - 1));
-            const counts = summarize(rows); const summary = get('bmc-summary'); summary.replaceChildren();
-            [['Total Ports','total','total',''],['Matching Ports','match','excellent','MATCH'],['Connection Problems','problem','critical','__connection'],['Not Seen','notSeen','warning','NOT SEEN'],['Unknown / Stale / Disabled','unknown','info','__unknown']].forEach(([label, key, color, filter]) => {
-                const card = el('button', 'summary-card card-' + color); card.type = 'button';
-                const active = get('bmc-status').value === filter && !get('bmc-problems').checked;
-                card.classList.toggle('active',active); card.setAttribute('aria-pressed',String(active));
-                card.append(el('div','card-value',str(counts[key])), el('div','card-label',label));
-                card.addEventListener('click', () => {
-                    get('bmc-status').value = filter;
-                    get('bmc-problems').checked = false;
-                    page = 0;
-                    render();
-                }); summary.append(card);
-            });
-            visible.slice(page * pageSize, (page + 1) * pageSize).forEach(row => {
-                const tr = el('tr'); tr.dataset.device = row.switch;
-                [row.switch,row.port,row.expected_mac,(row.active_macs || []).join('\n') || '—',row.hostname].forEach((value,index) => {
-                    const td = el('td', index === 2 || index === 3 ? 'mono' : '', str(value));
-                    if (index === 3) td.style.whiteSpace = 'pre-line';
-                    if (index === 1 && row.vlan != null) td.append(el('div','bmc-subtext','VLAN ' + row.vlan));
-                    tr.append(td);
-                });
-                const status = statusOf(row); const cell = el('td','bmc-status-cell');
-                const color = status === 'MATCH' ? 'green' : ['MISMATCH','WRONG PORT','PORT DOWN'].includes(status) ? 'red' : status === 'NOT SEEN' ? 'orange' : 'gray';
-                cell.append(el('span','badge badge-' + color,status));
-                if (row.detail) cell.append(el('div','bmc-subtext',str(row.detail)));
-                if (row.warnings?.length) {
-                    const labels = {MULTIPLE_MACS:'Multiple MACs learned on this port',AMBIGUOUS:'Expected MAC appears on multiple mapped ports'};
-                    cell.append(el('div','bmc-subtext',row.warnings.map(value => labels[value] || value).join('; ')));
-                }
-                if (row.observed_locations?.length && status === 'WRONG PORT') cell.append(el('div','bmc-subtext','Seen at: ' + row.observed_locations.map(item => typeof item === 'string' ? item : str(item.switch) + ' / ' + str(item.port)).join(', ')));
-                cell.append(el('div','bmc-subtext','Link: ' + (row.link_state || 'unknown') + ' · Checked: ' + timestamp(row.observed_at)), el('div','bmc-subtext','Last seen: ' + timestamp(row.last_seen)));
-                tr.append(cell);
-                if (admin) { const td = el('td'); td.append(button('Edit', 'secondary small', () => openEditor(row))); tr.append(td); }
-                tbody.append(tr);
-            });
-            get('bmc-table-wrap').hidden = !visible.length; get('bmc-empty').hidden = !loaded || visible.length > 0;
-            get('bmc-empty').textContent = rows.length ? 'No connections match these filters.' : scope !== 'all' ? 'No BMC mappings in the selected switch scope.' : 'No BMC mappings configured. ' + (admin ? 'Use Edit Mappings to add rows or import CSV.' : 'Ask an administrator to configure BMC mappings.');
-            get('bmc-count').textContent = loaded ? visible.length + ' of ' + rows.length + ' mapping(s)' + (visible.length > pageSize ? ' · Rows ' + (page * pageSize + 1) + '–' + Math.min((page + 1) * pageSize,visible.length) : '') + (scope !== 'all' ? ' · Scope: ' + scope.replace(/_/g,' ') : '') : '';
-            get('bmc-pagination-controls').hidden = visible.length <= pageSize;
-            get('bmc-previous').disabled = page === 0;
-            get('bmc-next').disabled = (page + 1) * pageSize >= visible.length;
-            get('bmc-export').disabled = !loaded || !visible.length;
-        }
-        async function loadResults() {
-            const token = gate.next(); get('bmc-refresh').disabled = true; showError('');
-            try {
-                if (scope !== 'all' && scopeHosts === null) {
-                    const data = await apiRequest('status', undefined, '/tracking-api.sh');
-                    if (!Array.isArray(data.devices)) throw new Error('Switch scope is unavailable.');
-                    if (!gate.current(token)) return;
-                    scopeHosts = new Set(data.devices.filter(item => item.state === scope).map(item => str(item.hostname).toLowerCase()));
-                }
-                const data = await apiRequest('results'); if (!gate.current(token)) return;
-                if (!Array.isArray(data.rows)) throw new Error('The BMC result response is invalid.');
-                rows = data.rows.filter(row => !scopeHosts || scopeHosts.has(str(row.switch).toLowerCase())); loaded = true; page = 0;
-                const selected = get('bmc-switch').value; get('bmc-switch').replaceChildren(new Option('All switches',''));
-                [...new Set(rows.map(row => row.switch))].sort().forEach(name => get('bmc-switch').append(new Option(name,name)));
-                if ([...get('bmc-switch').options].some(option => option.value === selected)) get('bmc-switch').value = selected;
-                get('bmc-updated').textContent = 'Last comparison: ' + timestamp(data.generated_at) + (data.observed_at ? ' · Observations: ' + timestamp(data.observed_at) : '');
-                render();
-            } catch (error) { if (gate.current(token)) showError(error.message + (loaded ? ' The displayed results are from the previous refresh.' : '')); }
-            finally { if (gate.current(token)) { get('bmc-loading').hidden = true; get('bmc-refresh').disabled = false; } }
-        }
-        STATUSES.forEach(status => get('bmc-status').append(new Option(status,status)));
-        get('bmc-status').append(new Option('Connection Problems','__connection'),new Option('Unknown / Stale / Disabled','__unknown'));
-        ['bmc-search','bmc-switch','bmc-status','bmc-problems'].forEach(id => get(id).addEventListener(id === 'bmc-search' ? 'input' : 'change',() => { page = 0; render(); }));
-        get('bmc-clear').addEventListener('click', () => { get('bmc-search').value = ''; get('bmc-switch').value = ''; get('bmc-status').value = ''; get('bmc-problems').checked = false; page = 0; render(); });
-        get('bmc-previous').addEventListener('click',() => { if (page > 0) page--; render(); });
-        get('bmc-next').addEventListener('click',() => { if ((page + 1) * pageSize < visible.length) page++; render(); });
-        get('bmc-refresh').addEventListener('click',loadResults);
-        get('bmc-edit').addEventListener('click', () => openEditor());
-        get('bmc-export').addEventListener('click', () => download('bmc-results.csv', toCSV(visible,['switch','port','expected_mac','active_macs','hostname','status','vlan','link_state','observed_at','last_seen','detail'])));
-        doc.addEventListener('bmc-mappings-saved',loadResults);
-        const scan = button('Run Scan', 'secondary', async () => {
-            if (scanning) return; scanning = true; scan.disabled = true; scan.textContent = 'Scanning…'; showError('');
-            const stop = () => { clearTimeout(scanTimer); scanning = false; scan.disabled = false; scan.textContent = 'Run Scan'; };
-            try {
-                const baseline = await apiRequest('scan-status',undefined,'/search-api.sh');
-                await apiRequest('run-scan',undefined,'/search-api.sh');
-                const started = Date.now();
-                const poll = async () => {
-                    try {
-                        const latest = await apiRequest('scan-status',undefined,'/search-api.sh');
-                        if (latest.timestamp && latest.timestamp !== baseline.timestamp) { stop(); await loadResults(); return; }
-                        if (Date.now() - started >= 600000) { stop(); showError('No completed scan was observed within 10 minutes. The scan may still be running. Refresh to check the latest data.'); return; }
-                    } catch (error) { stop(); showError('Scan status unavailable: ' + error.message + ' Refresh to check the latest data.'); return; }
-                    scanTimer = setTimeout(poll,5000);
-                };
-                scanTimer = setTimeout(poll,5000);
-            } catch (error) { stop(); showError('Scan could not be started: ' + error.message); }
-        });
-        get('bmc-refresh').after(scan);
-        root.addEventListener('pagehide', () => { clearTimeout(scanTimer); gate.invalidate(); });
-        await loadResults();
+        return root.LLDPqBMCResults.initResults(root.LLDPqBMC);
     }
-    return { normalizeMac, parseCSV, toCSV, filterRows, summarize, mapping, statusOf, requestGate, paginate, openEditor, initResults, hasUnsavedChanges: () => !!editor?.isDirty() };
+    return { normalizeMac, parseCSV, toCSV, filterRows, summarize, mapping, statusOf, requestGate, paginate, openEditor, initResults, apiRequest, timestamp, download, hasUnsavedChanges: () => !!editor?.isDirty() || !!root.LLDPqBMCAliasEditor?.hasUnsavedChanges() };
 }));

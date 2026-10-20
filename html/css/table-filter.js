@@ -1,7 +1,8 @@
 /* table-filter.js - Excel-style per-column header filters for lldpq tables.
  * Auto-attaches to any table containing th.sortable, plus table[data-filterable].
  * Hides rows only via the .tf-hidden class so it composes with page-level
- * filters that use row.style.display. No dependencies.
+ * filters that use row.style.display. Optional data-filter-label displays an
+ * alias while data-filter remains the stable selection key. No dependencies.
  */
 (function () {
     'use strict';
@@ -153,17 +154,35 @@
         }
     }
 
-    function collectValues(table, col) {
+    function collectOptions(table, col) {
         var rows = dataRows(table);
-        var seen = new Set();
-        for (var i = 0; i < rows.length; i++) seen.add(cellValue(rows[i], col));
-        var values = Array.from(seen);
-        values.sort(function (a, b) {
-            if (a === '') return -1;
-            if (b === '') return 1;
-            return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
+        var seen = new Map();
+        for (var i = 0; i < rows.length; i++) {
+            var value = cellValue(rows[i], col);
+            var cell = rows[i].cells[col];
+            // Opt in to a display label without changing the selection key.
+            // This keeps a selected device/port stable when aliases are toggled.
+            var label = cell && cell.dataset && cell.dataset.filterLabel;
+            label = label ? label.replace(/\s+/g, ' ').trim() : value;
+            if (!seen.has(value)) seen.set(value, label || value);
+        }
+        var labelCounts = new Map();
+        seen.forEach(function (label) {
+            labelCounts.set(label, (labelCounts.get(label) || 0) + 1);
         });
-        return values;
+        var options = [];
+        seen.forEach(function (label, value) {
+            options.push({ value: value, label: label,
+                display: labelCounts.get(label) > 1
+                    ? label + ' (' + value + ')' : label });
+        });
+        options.sort(function (a, b) {
+            if (a.value === '') return -1;
+            if (b.value === '') return 1;
+            return a.label.localeCompare(b.label, undefined, { numeric: true, sensitivity: 'base' }) ||
+                a.value.localeCompare(b.value, undefined, { numeric: true, sensitivity: 'base' });
+        });
+        return options;
     }
 
     function openFilterPopup(th, table) {
@@ -173,7 +192,8 @@
 
         var st = getState(table);
         var active = st.filters.get(col) || null;   // null => no filter (all)
-        var values = collectValues(table, col);
+        var options = collectOptions(table, col);
+        var values = options.map(function (option) { return option.value; });
 
         var popup = document.createElement('div');
         popup.className = 'tf-popup';
@@ -192,8 +212,11 @@
         function renderList() {
             var term = searchEl.value.trim().toLowerCase();
             var shown = term
-                ? values.filter(function (v) { return v.toLowerCase().indexOf(term) !== -1; })
-                : values;
+                ? options.filter(function (option) {
+                    return option.value.toLowerCase().indexOf(term) !== -1 ||
+                        option.label.toLowerCase().indexOf(term) !== -1;
+                })
+                : options;
             var capped = false;
             if (shown.length > MAX_LIST) { shown = shown.slice(0, MAX_LIST); capped = true; }
             var html = '';
@@ -205,13 +228,14 @@
                         ' values — type to narrow down</div>';
                 }
                 for (var i = 0; i < shown.length; i++) {
-                    var v = shown[i];
+                    var v = shown[i].value;
+                    var label = shown[i].display;
                     var checked = active === null || active.has(v);
                     html += '<label class="tf-item"><input type="checkbox" value="' +
                         v.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;') +
                         '"' + (checked ? ' checked' : '') + '> <span>' +
                         (v === '' ? '(Blanks)'
-                            : v.replace(/&/g, '&amp;').replace(/</g, '&lt;')) +
+                            : label.replace(/&/g, '&amp;').replace(/</g, '&lt;')) +
                         '</span></label>';
                 }
             }

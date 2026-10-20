@@ -6,8 +6,8 @@
     <title>..::LLDPQ:: Setup</title>
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
     <script src="/css/auth.js"></script>
-    <link rel="stylesheet" href="/css/bmc.css?v=20261020-1">
-    <script src="/css/bmc.js?v=20261020-1"></script>
+    <link rel="stylesheet" href="/css/bmc.css?v=20261021-2">
+    <script src="/css/bmc.js?v=20261021-2"></script>
     <style>
         * { box-sizing: border-box; }
         html, body { height: 100%; margin: 0; }
@@ -586,7 +586,7 @@
                             <button class="btn primary" type="button" onclick="LLDPqBMC.openEditor()"><svg viewBox="0 0 24 24"><use href="#i-save"/></svg>Edit Mappings</button>
                             <a href="bmc.html" class="btn secondary" style="text-decoration:none">View BMC</a>
                         </div>
-                        <p class="p-desc" style="margin-bottom:0">Add or edit individual rows, import a CSV, or download the current mappings. This is the same editor available from the BMC page. Switch, Port, Expected-MAC and Hostname are required; VLAN and BMC-IP are optional.</p>
+                        <p class="p-desc" style="margin-bottom:0">Add or edit individual rows, import a CSV, or download the current mappings. This is the same editor available from the BMC page. Enter Switch, Port, Expected-MAC and Hostname. Saved mappings are checked automatically.</p>
                     </div>
                     <div class="note">A missing MAC does not always mean a disconnected BMC: an idle device can age out of the MAC table. Results distinguish a down port from a MAC that is not seen, and show when observations are unavailable or stale.</div>
                 </div>

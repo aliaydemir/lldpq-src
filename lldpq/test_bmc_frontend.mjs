@@ -24,6 +24,21 @@ test('minimal CSV defaults optional fields without converting missing VLAN to ze
     }]);
 });
 
+test('new mapping templates and exports contain only the four requested fields', () => {
+    const header = '"switch","port","expected_mac","hostname"\r\n';
+    assert.equal(bmc.toCSV([]),header);
+    const rows = [bmc.mapping({switch:'oob-01',port:'swp1',expected_mac:'02:00:00:00:00:01',hostname:'server-01'})];
+    assert.ok(bmc.toCSV(rows).startsWith(header));
+    assert.deepEqual(bmc.parseCSV(bmc.toCSV(rows)),rows);
+    assert.equal(rows[0].enabled,true);
+});
+
+test('legacy mapping exports retain options so a round trip cannot silently change monitoring', () => {
+    const rows = [bmc.mapping({...sample,vlan:20,enabled:false})];
+    assert.ok(bmc.toCSV(rows).split('\r\n')[0].includes('"enabled"'));
+    assert.deepEqual(bmc.parseCSV(bmc.toCSV(rows)),rows);
+});
+
 test('CSV accepts false/zero/no and true/one/yes enabled values', () => {
     for (const value of ['false','0','No']) assert.equal(bmc.parseCSV(csvHeader + `oob-01,swp1,aabbccddeeff,server-01,,,${value}`)[0].enabled,false);
     for (const value of ['true','1','YES','']) assert.equal(bmc.parseCSV(csvHeader + `oob-01,swp1,aabbccddeeff,server-01,,,${value}`)[0].enabled,true);

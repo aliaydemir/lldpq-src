@@ -1,0 +1,392 @@
+/* Page controls match html/lldp.html. Shared mapping-editor styles stay in bmc.css. */
+
+        :where(body.bmc-page, body.bmc-page *) {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body.bmc-page input:-webkit-autofill,
+        body.bmc-page input:-webkit-autofill:hover,
+        body.bmc-page input:-webkit-autofill:focus {
+            -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important;
+            -webkit-text-fill-color: #fff !important;
+            caret-color: #fff !important;
+        }
+        
+        body.bmc-page {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        /* Page Header */
+        body.bmc-page .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid #404040;
+        }
+        
+        body.bmc-page .page-title {
+            font-size: 24px;
+            font-weight: 600;
+            color: #76b900;
+        }
+        
+        body.bmc-page .last-updated {
+            font-size: 13px;
+            color: #888;
+        }
+        
+        /* Dashboard Section */
+        body.bmc-page .dashboard-section {
+            background: #2d2d2d;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden;
+        }
+        
+        body.bmc-page .section-header {
+            padding: 12px 16px;
+            background: #333;
+            font-weight: 600;
+            font-size: 14px;
+            color: #76b900;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 1px solid #404040;
+        }
+        
+        body.bmc-page .section-content {
+            padding: 16px;
+        }
+        
+        /* Summary Grid */
+        body.bmc-page .summary-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); 
+            gap: 12px; 
+        }
+        
+        body.bmc-page .summary-card { 
+            background: #252526; 
+            padding: 15px; 
+            border-radius: 6px; 
+            border-left: 3px solid #76b900;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        
+        body.bmc-page .summary-card:hover {
+            background: #2d2d2d;
+            transform: translateY(-1px);
+        }
+        
+        body.bmc-page .summary-card.active {
+            background: #333;
+            border-left-width: 5px;
+        }
+        
+        body.bmc-page .card-excellent { border-left-color: #76b900; }
+        body.bmc-page .card-good { border-left-color: #8bc34a; }
+        body.bmc-page .card-warning { border-left-color: #ff9800; }
+        body.bmc-page .card-critical { border-left-color: #f44336; }
+        body.bmc-page .card-total { border-left-color: #4fc3f7; }
+        body.bmc-page .card-info { border-left-color: #4fc3f7; }
+        
+        body.bmc-page .card-value { font-size: 22px; font-weight: bold; color: #d4d4d4; }
+        body.bmc-page .card-excellent .card-value { color: #76b900; }
+        body.bmc-page .card-good .card-value { color: #8bc34a; }
+        body.bmc-page .card-warning .card-value { color: #ff9800; }
+        body.bmc-page .card-critical .card-value { color: #f44336; }
+        body.bmc-page .card-total .card-value { color: #4fc3f7; }
+        body.bmc-page .card-info .card-value { color: #4fc3f7; }
+        body.bmc-page .card-label { font-size: 12px; color: #888; margin-top: 4px; }
+        
+        /* Filter Info */
+        .filter-info {
+            text-align: center;
+            padding: 10px 15px;
+            margin: 15px 0;
+            background: rgba(118, 185, 0, 0.1);
+            border: 1px solid rgba(118, 185, 0, 0.3);
+            border-radius: 6px;
+            color: #76b900;
+            display: none;
+            font-size: 13px;
+        }
+        
+        .filter-info button {
+            margin-left: 10px;
+            padding: 4px 10px;
+            background: #76b900;
+            color: #000;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        
+        /* Status Badges */
+        body.bmc-page .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        body.bmc-page .badge-green {
+            background: rgba(118, 185, 0, 0.2);
+            color: #76b900;
+        }
+        body.bmc-page .badge-red {
+            background: rgba(244, 67, 54, 0.2);
+            color: #ff6b6b;
+        }
+        body.bmc-page .badge-orange {
+            background: rgba(255, 152, 0, 0.2);
+            color: #ffb74d;
+        }
+        body.bmc-page .badge-gray {
+            background: rgba(158, 158, 158, 0.2);
+            color: #999;
+        }
+        
+        /* Table Styling */
+        .bmc-results-table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            font-size: 13px;
+        }
+        
+        .bmc-results-table th, .bmc-results-table td { 
+            border: 1px solid #404040; 
+            padding: 10px 12px; 
+            text-align: left; 
+        }
+        
+        .bmc-results-table th { 
+            background: #333; 
+            color: #76b900;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        
+        .bmc-results-table tbody tr {
+            background: #252526;
+        }
+        
+        .bmc-results-table tbody tr:hover {
+            background: #2d2d2d;
+        }
+        
+        /* Messages */
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #888;
+        }
+        
+        #bmc-error {
+            text-align: center;
+            padding: 30px;
+            color: #ff6b6b;
+            background: rgba(244, 67, 54, 0.1);
+            border: 1px solid rgba(244, 67, 54, 0.3);
+            border-radius: 6px;
+            margin: 15px 0;
+        }
+        
+        /* Sortable */
+        .sortable {
+            cursor: pointer;
+            user-select: none;
+            padding-right: 20px;
+        }
+        
+        .sortable:hover {
+            background: #3c3c3c;
+        }
+        
+        .sort-arrow {
+            font-size: 10px;
+            color: #666;
+            margin-left: 5px;
+            opacity: 0.5;
+        }
+        
+        .sort-arrow::before { content: '▲▼'; }
+        .sortable.asc .sort-arrow::before { content: '▲'; color: #76b900; opacity: 1; }
+        .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
+        .sortable.asc .sort-arrow, .sortable.desc .sort-arrow { opacity: 1; }
+
+        /* Buttons */
+        body.bmc-page .btn {
+            padding: 8px 14px;
+            border: none;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        body.bmc-page .btn-primary {
+            background: linear-gradient(0deg, #76b900 0%, #5a8c00 100%);
+            color: white;
+        }
+        
+        body.bmc-page .btn-primary:hover {
+            background: linear-gradient(0deg, #8bd400 0%, #6ba000 100%);
+        }
+        
+        body.bmc-page .btn-secondary {
+            background: linear-gradient(0deg, #4fc3f7 0%, #0288d1 100%);
+            color: white;
+        }
+        
+        body.bmc-page .btn-secondary:hover {
+            background: linear-gradient(0deg, #81d4fa 0%, #039be5 100%);
+        }
+        
+        body.bmc-page .btn-gray {
+            background: #607d8b;
+            color: white;
+        }
+        
+        body.bmc-page .btn-gray:hover {
+            background: #546e7a;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        /* Device Search - Dark Theme */
+        .device-search-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        /* Start ~Filter-Device width, grow with selected tags up to ~5 wide, then wrap */
+        .device-search-container .select2-container { width: fit-content !important; min-width: 220px; max-width: 720px; }
+        .device-search-container .select2-container--default .select2-selection--single {
+            height: 34px;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background: #3c3c3c;
+            display: flex;
+            align-items: center;
+        }
+        .device-search-container .select2-container--default .select2-selection--single .select2-selection__rendered {
+            line-height: 34px;
+            color: #d4d4d4;
+            padding-left: 10px;
+            font-size: 13px;
+        }
+        .device-search-container .select2-container--default .select2-selection--single .select2-selection__arrow {
+            height: 34px;
+        }
+        .device-search-container .select2-container--default .select2-selection--single .select2-selection__placeholder {
+            color: #888;
+        }
+        
+        /* Select2 Dropdown Dark Theme */
+        .select2-dropdown {
+            background: #2d2d2d;
+            border: 1px solid #555;
+        }
+        .select2-container--default .select2-search--dropdown .select2-search__field {
+            background: #3c3c3c;
+            border: 1px solid #555;
+            color: #d4d4d4;
+        }
+        .select2-container--default .select2-results__option {
+            color: #d4d4d4;
+            padding: 8px 12px;
+        }
+        .select2-container--default .select2-results__option--highlighted[aria-selected] {
+            background: #76b900;
+            color: #000;
+        }
+        .select2-container--default .select2-results__option[aria-selected=true] {
+            background: #3c3c3c;
+        }
+        /* multi-select tags (dark theme, green accent) */
+        .device-search-container .select2-container--default .select2-selection--multiple {
+            background: #3c3c3c; border: 1px solid #555; min-height: 34px;
+            max-height: 72px; overflow-y: auto; overflow-x: hidden;   /* ~5 tags/row; 6-10 wrap to 2nd row; no horizontal scrollbar */
+        }
+        .device-search-container .select2-container--default .select2-selection--multiple .select2-selection__choice {
+            background: #2c3a12; border: 1px solid #76b900; color: #d4d4d4; border-radius: 3px; padding: 1px 6px;
+        }
+        .device-search-container .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
+            color: #9ccc65; margin-right: 4px;
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__rendered { color: #d4d4d4; }
+        .select2-container--default .select2-search--inline .select2-search__field { color: #d4d4d4; padding: 0; border: 0; border-radius: 0; outline: none; background: transparent; }
+        
+        .clear-search-btn {
+            background: #f44336;
+            color: white;
+            border: none;
+            padding: 6px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            display: none;
+        }
+        
+        .clear-search-btn:hover {
+            background: #d32f2f;
+        }
+        
+        .highlight-row {
+            background-color: rgba(118, 185, 0, 0.15) !important;
+        }
+        
+
+/* Result cells stay as compact as LLDP Results; diagnostics are in tooltips. */
+body.bmc-page .page-header { gap:16px; flex-wrap:wrap; }
+body.bmc-page .last-updated { margin-top:0; }
+body.bmc-page .btn svg { width:14px; height:14px; flex-shrink:0; }
+body.bmc-page .btn:disabled { opacity:.5; cursor:not-allowed; }
+body.bmc-page .section-header svg { width:16px; height:16px; fill:currentColor; flex-shrink:0; }
+body.bmc-page .bmc-results-table td { vertical-align:middle; }
+body.bmc-page .bmc-results-table th { white-space:nowrap; }
+body.bmc-page .bmc-results-table .mac-cell { white-space:nowrap; }
+body.bmc-page .table-scroll { overflow-x:auto; }
+body.bmc-page .bmc-results-table { min-width:680px; }
+body.bmc-page .bmc-row-edit { cursor:pointer; }
+body.bmc-page .filter-info { display:block; margin:16px; }
+body.bmc-page #bmc-count { padding:12px 16px; color:#888; font-size:12px; }
+body.bmc-page .bmc-refresh-link { margin-left:8px; border:0; background:transparent; color:#888; font:inherit; cursor:pointer; }
+body.bmc-page .bmc-refresh-link:hover { color:#76b900; }
+body.bmc-page [hidden] { display:none !important; }
+body.bmc-page .bmc-empty td { padding:30px 20px; text-align:center; color:#999; }
+body.bmc-page .device-search-container { max-width:100%; }
+body.bmc-page .device-search-container .select2-container { max-width:min(720px, calc(100vw - 64px)); }
+body.bmc-page .action-buttons { max-width:100%; }
+body.bmc-page .clear-search-btn { display:block; }
+body.bmc-page #bmc-error { white-space:pre-wrap; }
+body.bmc-page input:focus { outline:none; }
+@media (max-width:760px) {
+    body.bmc-page { padding:12px; }
+    body.bmc-page .page-header { align-items:flex-start; }
+    body.bmc-page .action-buttons { gap:8px; }
+    body.bmc-page .summary-grid { grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); }
+}
