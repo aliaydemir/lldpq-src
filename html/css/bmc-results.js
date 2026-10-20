@@ -81,7 +81,7 @@
             showError(auth ? auth.lastCheckMessage() : 'Authentication is unavailable.');
             return;
         }
-        const admin = auth.isAdmin(); get('bmc-edit').hidden = !admin; get('port-alias-btn').hidden = !admin; get('bmc-run').disabled = false;
+        const admin = auth.isAdmin(); get('bmc-edit').hidden = !admin; get('bmc-run').disabled = false;
         let rows = [], ordered = [], selectedDevices = [], status = '', loaded = false, scanning = false, scanTimer = null;
         let currentSort = { column:-1, descending:false }, pendingRender = null, generation = 0;
         let aliases = aliasMaps(), p2pNamesOn = true, alive = true, aliasChannel = null;
@@ -227,7 +227,6 @@
             try { root.localStorage.setItem('lldpq_port_alias_on',String(p2pNamesOn)); } catch (_) {}
             updateP2pToggleUI(); if (loaded) render();
         });
-        get('port-alias-btn').addEventListener('click',() => root.LLDPqBMCAliasEditor.open());
         root.addEventListener('storage',aliasStorageChanged);
         root.addEventListener('lldpq-aliases-updated',refreshAliases);
         try {

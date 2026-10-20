@@ -936,8 +936,8 @@ in `devices.yaml`. The table shows **Switch, Port, Expected-MAC, Active-MAC,
 Hostname and Status** and follows the selected Analysis Scope.
 The page uses the same header controls, searchable device selector, column
 filter menus, sorting controls and table styling as **Results**.
-**P2P: On/Off** and **Edit Aliases** use the same display aliases and browser
-preference as Results. Aliases apply to switch, port and hostname labels;
+**P2P: On/Off** uses the same display aliases and browser preference as Results.
+Aliases apply to switch, port and hostname labels;
 search accepts both real names and aliases. Result sorting and CSV follow the
 displayed labels, while mapping edits and mapping CSV retain the real names.
 

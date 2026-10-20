@@ -323,5 +323,5 @@
     async function initResults() {
         return root.LLDPqBMCResults.initResults(root.LLDPqBMC);
     }
-    return { normalizeMac, parseCSV, toCSV, filterRows, summarize, mapping, statusOf, requestGate, paginate, openEditor, initResults, apiRequest, timestamp, download, hasUnsavedChanges: () => !!editor?.isDirty() || !!root.LLDPqBMCAliasEditor?.hasUnsavedChanges() };
+    return { normalizeMac, parseCSV, toCSV, filterRows, summarize, mapping, statusOf, requestGate, paginate, openEditor, initResults, apiRequest, timestamp, download, hasUnsavedChanges: () => !!editor?.isDirty() };
 }));

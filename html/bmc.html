@@ -26,7 +26,6 @@
             <button class="btn btn-secondary" id="bmc-run" type="button"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8,5.14V19.14L19,12.14L8,5.14Z"/></svg><span id="bmc-run-text">Run BMC Check</span></button>
             <button class="btn btn-gray" id="bmc-edit" type="button" hidden><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M20.71,7.04C21.1,6.65 21.1,6 20.71,5.63L18.37,3.29C18,2.9 17.35,2.9 16.96,3.29L15.12,5.12L18.87,8.87M3,17.25V21H6.75L17.81,9.93L14.06,6.18L3,17.25Z"/></svg>Edit Mappings</button>
             <button class="btn btn-gray" id="p2p-toggle" type="button" title="Toggle interface names between OS (enP22...) and P2P/field labels (M1, S1)" aria-pressed="true"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M21,9L17,5V8H10V10H17V13M7,11L3,15L7,19V16H14V14H7V11Z"/></svg><span id="p2p-toggle-text">P2P: On</span></button>
-            <button class="btn btn-gray" id="port-alias-btn" type="button" hidden title="Edit device + port display aliases (real name -> P2P/field label) (admin)"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M5.5,7A1.5,1.5 0 0,1 4,5.5A1.5,1.5 0 0,1 5.5,4A1.5,1.5 0 0,1 7,5.5A1.5,1.5 0 0,1 5.5,7M21.41,11.58L12.41,2.58C12.05,2.22 11.55,2 11,2H4C2.89,2 2,2.89 2,4V11C2,11.55 2.22,12.05 2.59,12.41L11.58,21.41C11.95,21.78 12.45,22 13,22C13.55,22 14.05,21.78 14.41,21.41L21.41,14.41C21.78,14.05 22,13.55 22,13C22,12.44 21.77,11.94 21.41,11.58Z"/></svg>Edit Aliases</button>
             <button class="btn btn-primary" id="bmc-export" type="button" disabled><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>Download CSV</button>
         </div>
     </div>
@@ -64,9 +63,8 @@
     </div>
     <script src="/css/jquery-3.5.1.min.js"></script>
     <script src="/css/select2.min.js"></script>
-    <script src="/css/bmc.js?v=20261021-2"></script>
-    <script src="/css/bmc-alias-editor.js?v=20261021-2"></script>
-    <script src="/css/bmc-results.js?v=20261021-2"></script>
+    <script src="/css/bmc.js?v=20261021-3"></script>
+    <script src="/css/bmc-results.js?v=20261021-3"></script>
     <script src="/css/table-filter.js?v=20261021-tf-4"></script>
     <script>document.addEventListener('DOMContentLoaded', function () { LLDPqBMCResults.initResults(LLDPqBMC); });</script>
 </body>
