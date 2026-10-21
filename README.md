@@ -66,6 +66,7 @@ package details are covered under
 - [03 · Configuration files](#03-configuration-files)
   - [03a · Inventory & Bootstrap](#03a-inventory-bootstrap-admin-only)
   - [03b · Guided Setup](#03b-guided-web-setup-setup-page)
+  - [03c · IPv6 support](#03c-ipv6-support)
 - [04 · Cron jobs](#04-cron-jobs-auto-setup)
 - [05 · Update](#05-update)
 - [06 · Dependency management](#06-dependency-management)
@@ -1021,25 +1022,9 @@ roles are optional tags for grouping. They are used for:
 
 Recommended roles: `leaf`, `spine`, `core`, `border`, `oob` (or any naming that fits your topology).
 
-IPv4 and IPv6 management addresses can coexist in the same inventory. Keep one
-selected management address per hostname; IPv4/IPv6 automatic failover is not
-implemented. Quote IPv6 YAML keys:
-
-```yaml
-devices:
-  192.0.2.10: OOB-01 @oob
-  "2001:db8:100::11": OOB-02 @oob
-  "fe80::12%eth0": OOB-03 @oob
-```
-
-Link-local IPv6 requires the interface on the **LLDPq collector** (or inside its
-container), such as `%eth0`. The collector must already have IPv6 connectivity
-to the switches. Equivalent IPv6 spellings are normalized and duplicate
-addresses are rejected. Existing IPv4 and SSH hostname entries remain supported.
-IPv6 support covers management connections, collection, Console, Inventory and
-Discover. IPv6 Inventory entries are monitoring-only: DHCPv6, ZTP, Base Config
-deployment and OS upgrades over IPv6 are not included. IPv6 route/path analysis
-and inbound IPv6 telemetry listeners are outside this first stage.
+IPv4 and IPv6 management addresses can coexist in the same inventory. See
+[IPv6 support](#03c-ipv6-support) for YAML/CSV examples, discovery inputs,
+link-local interface scopes and the current support boundaries.
 
 ### tracking.yaml format
 
@@ -1295,6 +1280,132 @@ dependencies, use:
 
 The host-wide flags remain independent and off by default because those
 services and their data may be shared by workloads unrelated to LLDPq.
+
+## [03c] IPv6 support
+
+LLDPq supports IPv6 for switch management connections, monitoring and discovery.
+IPv4 and IPv6 devices use the same inventory, pages and collection workflows.
+The collector must already have IPv6 connectivity to each target, working SSH
+credentials and the usual switch-side permissions. For Docker, connectivity
+and interface names must be valid **inside the LLDPq container**. LLDPq does not
+configure the collector's IPv6 addresses or routes automatically.
+
+### What is supported
+
+| Area | Supported behavior |
+|---|---|
+| **Inventory** | Mix IPv4, global/ULA IPv6 and scoped link-local IPv6 in `devices.yaml`; add/edit IPv6 bindings and import/export CSV under **Provision → Inventory**. |
+| **Connections and monitoring** | Connect to switches over IPv6 for SSH-based collection and use the existing monitoring reports. Assets retains the selected IPv6 management address. BMC MAC/port comparison can use an IPv6-managed switch. |
+| **Console and Commands** | Open inventory devices in Console and run supported diagnostic commands from Commands or Device Details over IPv6. |
+| **Discover** | Scan explicit addresses, bounded ranges or small CIDRs using ICMPv6, TCP/22, SSH and local NDP observations. |
+| **Address matching** | Normalize equivalent IPv6 spellings, reject duplicate management addresses and sort addresses numerically. Interface scopes remain part of link-local identity. |
+| **DHCP separation** | IPv6 bindings always have DHCP disabled. Adding or editing only IPv6 monitoring records leaves unchanged IPv4 reservations and the DHCP service untouched. |
+
+### Example: mixed IPv4/IPv6 devices.yaml
+
+Edit `devices.yaml` directly or through **Setup → Inventory**. Use one selected
+management address per hostname and quote IPv6 YAML keys:
+
+```yaml
+defaults:
+  username: cumulus
+
+devices:
+  192.0.2.10: OOB-V4 @oob
+  "2001:db8:100::11": OOB-V6 @oob
+  "fd12:3456:789a::12": OOB-ULA @oob
+  "fe80::13%eth0": OOB-LOCAL @oob
+  "2001:db8:100::14":
+    hostname: OOB-ADMIN
+    username: admin
+    role: oob
+```
+
+Replace these example addresses and hostnames with your network values. Enter
+the address itself, without URL brackets (`[ ]`) or a subnet prefix. For
+example, `2001:0db8:0100:0:0:0:0:11` and `2001:db8:100::11` identify the same
+address and cannot be assigned to separate inventory devices.
+
+For a link-local address, `%eth0` identifies the **collector's local interface**,
+not the switch's interface. Replace it with the interface that reaches that
+link, such as `%enp1s0`. Bare `fe80::13` is rejected because its link is ambiguous.
+`fe80::13%eth0` and `fe80::13%eth1` remain separate targets.
+
+### Example: add or import IPv6 Inventory bindings
+
+In **Provision → Inventory**, use **Add Binding** or **Bulk Import**, then
+**Save** to update the inventory and `devices.yaml`. Bulk Import accepts the
+existing CSV column order:
+
+```csv
+Hostname,MAC,IP,Serial,Role
+OOB-V6,02:00:00:00:00:11,2001:db8:100::11,SN0011,oob
+OOB-ULA,-,fd12:3456:789a::12,,oob
+OOB-LOCAL,-,fe80::13%eth0,,oob
+```
+
+Use `-` or an empty MAC field when the MAC is unknown. An IPv6 management
+record can be monitored without a MAC; supplying a MAC does not enable DHCP.
+An unscanned or unreachable IPv6 record remains monitorable, while an explicitly
+commented record stays planned. CSV export preserves IPv6 addresses and
+sorts IPv4/IPv6 records numerically.
+
+### Example: discover IPv6 switches
+
+Open **Provision → Discover**, enter the **Discovery Range**, save the settings
+and click **Scan**. Accepted inputs include:
+
+| Input | Targets |
+|---|---|
+| `2001:db8:100::11` | One IPv6 address. |
+| `2001:db8:100::10-2001:db8:100::20` | An inclusive range with complete start/end addresses. |
+| `2001:db8:200::/126` | Three host addresses: `2001:db8:200::1` through `2001:db8:200::3`. |
+| `fe80::13%eth0` | One link-local target on the collector's `eth0` interface. |
+| `192.0.2.10-192.0.2.20,2001:db8:100::11,fd12:3456:789a::12` | A mixed IPv4/IPv6 scan. |
+
+At most **1500 expanded targets** are accepted per scan, checked before address
+enumeration and overlap removal. Use specific addresses or narrow ranges;
+`2001:db8:100::/64` is rejected. Range endpoints must have the same address
+family and interface scope. Unspecified and multicast targets are rejected.
+
+NDP supplies neighbor observations on the local link; routed switches may have
+no local NDP entry. A stale or static NDP entry alone does not prove a device is
+online. ICMPv6, TCP/22 and SSH provide additional reachability evidence.
+
+For devices authenticated over SSH, **Export to devices.yaml** can add discovery
+results to Inventory. A valid hostname learned over SSH is used for a new IPv6
+device. When identity matches an existing device, export retains its saved
+management address; discovering IPv6 does not automatically replace its IPv4
+address. Conflicting identities sharing a hostname block export for correction.
+IPv6 discovery never runs the automatic Base Config, ZTP-disable or hostname
+assignment actions, even when those toggles are enabled for IPv4 devices.
+
+### Example: Console and IPv6 diagnostic commands
+
+Select the device by hostname in **Console**, **Commands** or **Device Details**;
+LLDPq uses its configured management address. The diagnostic command runner
+accepts read-only commands such as:
+
+```text
+ip -6 addr show
+ip -6 route show
+ip -6 route get 2001:db8:100::11
+ip -6 neigh show
+```
+
+These commands inspect IPv6 state on the selected switch. Dedicated IPv6
+Routes/Tracepath analysis is a separate capability, listed below.
+
+### IPv6 features not yet supported
+
+| Feature | Current boundary |
+|---|---|
+| **DHCPv6 and ZTP** | No IPv6 address allocation or automated new-device provisioning. |
+| **Base Config deployment over IPv6** | Provision's configuration-deployment actions are disabled for IPv6 targets. |
+| **OS upgrades over IPv6** | IPv6 targets cannot be selected for the automated upgrade workflow. |
+| **IPv6 route/path analysis** | Dedicated Routes/Tracepath analysis for IPv6 networks is not included in this stage. |
+| **Inbound IPv6 telemetry** | IPv6 listeners for receiving streaming telemetry are not included in this stage. |
+| **Automatic IPv4/IPv6 failover** | One management address is selected per device; LLDPq does not retry another address family automatically. |
 
 ## [04] cron jobs (auto setup)
 
@@ -1980,6 +2091,7 @@ Expansion is limited to 1500 targets before scanning; an IPv6 `/64` is rejected.
 IPv6 probes use ICMPv6, TCP/22, SSH and NDP where available. A stale NDP entry
 alone does not mark a device reachable. Importing an IPv6 discovery result into
 Inventory keeps DHCP disabled and does not run post-provision actions.
+See [IPv6 support](#03c-ipv6-support) for complete examples and unsupported features.
 
 The Discover tab also owns the discovery IP range and the independent
 post-provision toggles for Base Config, ZTP disable, and hostname assignment.
