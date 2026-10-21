@@ -279,7 +279,9 @@ collect_over_ssh() {
     if [[ -z "${r_host:-}" || -n "${extra:-}" ]]; then
         return 1
     fi
-    [[ -z "${r_ip:-}" || "$r_ip" == "NA" ]] && r_ip="$ip"
+    # remote_info reports eth0's IPv4 address. Keep the selected IPv6 management
+    # address for IPv6 inventory entries, including their local interface scope.
+    [[ "$ip" == *:* || -z "${r_ip:-}" || "$r_ip" == "NA" ]] && r_ip="$ip"
     [[ -z "${r_mac:-}" ]] && r_mac="NA"
     [[ -z "${r_serial:-}" ]] && r_serial="NA"
     [[ -z "${r_model:-}" ]] && r_model="NA"
@@ -294,9 +296,11 @@ process_one() {
     local ip=$1 user=$2 host=$3 row_file=$4
     local ping_reachable=true now cached_data
     local c_ip c_mac c_serial c_model c_release c_uptime c_last_seen
+    local -a family=()
+    [[ "$ip" == *:* ]] && family=(-6)
 
     now=$(date '+%Y-%m-%d_%H:%M:%S')
-    if ! "$ASSETS_PING_BIN" -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+    if ! "$ASSETS_PING_BIN" "${family[@]}" -c 1 -W 1 "$ip" >/dev/null 2>&1; then
         ping_reachable=false
     fi
 

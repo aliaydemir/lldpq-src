@@ -6,6 +6,7 @@ contract CGI provides (ACTION/KIND/QS_* + state dirs pointed at a tempdir),
 mirroring the extract-heredoc pattern of test_lldpq_config_write.py.
 """
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -205,6 +206,52 @@ class InventoryApiTests(unittest.TestCase):
 
         self.assertTrue(result.get("success"), result)
         self.assertEqual(result["report"]["issues"], [])
+
+    def test_validate_ipam_detects_equivalent_ipv6_spelling(self):
+        version = "1700000003-eeeeeeee.json"
+        data = {"fabric": [
+            {"hostname": "leaf01", "mgmt_ip": "2001:db8::10", "role": "leaf"},
+            {"hostname": "leaf02", "mgmt_ip": "2001:0DB8:0:0:0:0:0:10", "role": "leaf"},
+            {"hostname": "leaf03", "mgmt_ip": "fe80::1%eth0", "role": "leaf"},
+            {"hostname": "leaf04", "mgmt_ip": "fe80::1%eth1", "role": "leaf"},
+            {"hostname": "leaf05", "mgmt_ip": "192.0.2.10", "role": "leaf"},
+        ]}
+        self.seed_version("ipam", version, data)
+        self.set_active("ipam", version)
+        result = self.run_api("validate", KIND="ipam")
+        self.assertTrue(result.get("success"), result)
+        issues = result["report"]["issues"]
+        self.assertEqual(len(issues), 1, issues)
+        self.assertEqual(issues[0]["kind"], "duplicate-mgmt-ip")
+        self.assertIn("leaf01", issues[0]["message"])
+        self.assertIn("leaf02", issues[0]["message"])
+
+    def test_upload_warns_on_equivalent_ipv6_fabric_address(self):
+        ansible_dir = self.root / "ansible"
+        profiles = ansible_dir / "inventory" / "group_vars" / "all" / "vlan_profiles.yaml"
+        profiles.parent.mkdir(parents=True)
+        profiles.write_text(
+            "vlan_profiles:\n  tenant:\n    vlans:\n      100:\n"
+            "        vrr_vip: '2001:0DB8:0:0:0:0:0:1/64'\n"
+            "        even_ip: '192.0.2.1/24'\n", encoding="utf-8")
+        design = {"format": "ipam", "hosts": [
+            {"hostname": "host-v6", "assignments": [{"ip": "2001:db8::1"}]},
+            {"hostname": "host-v4", "assignments": [{"ip": "192.0.2.1"}]},
+            {"hostname": "host-clean", "assignments": [{"ip": "2001:db8::2"}]},
+        ]}
+        body = self.root / "upload.json"
+        body.write_text(json.dumps({
+            "kind": "ipam", "filename": "design.json",
+            "content_b64": base64.b64encode(json.dumps(design).encode()).decode(),
+        }), encoding="utf-8")
+        result = self.run_api("upload", POST_DATA_FILE=body, ANSIBLE_DIR=ansible_dir)
+        self.assertTrue(result.get("success"), result)
+        stored = self.state_dir / "inventory" / "ipam" / result["version"]
+        warnings = json.loads(stored.read_text())["data"]["warnings"]
+        self.assertIn("assigns 2 address(es)", warnings[0])
+        self.assertIn("host-v6", warnings[0])
+        self.assertIn("host-v4", warnings[0])
+        self.assertNotIn("host-clean", warnings[0])
 
     # ---- topology preview source_version -----------------------------------
 

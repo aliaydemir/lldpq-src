@@ -163,6 +163,8 @@ if not POST_DATA and POST_DATA_FILE:
     except OSError:
         POST_DATA = ''
 LLDPQ_DIR = os.environ.get('LLDPQ_DIR', '/home/lldpq/lldpq')
+# Shared address handling is installed with the collector modules.
+sys.path.insert(0, LLDPQ_DIR)
 LLDPQ_USER = os.environ.get('LLDPQ_USER', 'lldpq')
 WEB_ROOT = os.environ.get('WEB_ROOT', '/var/www/html')
 DHCP_HOSTS_FILE = os.environ.get('DHCP_HOSTS_FILE', '/etc/dhcp/dhcpd.hosts')
@@ -349,39 +351,79 @@ def read_lldpq_conf_key(key, default=''):
     return value
 
 def ip_range_to_list(range_str):
-    """Parse comma-separated IP ranges and single IPs to list of IPs.
-    Supports: '192.168.100.10-192.168.100.249'
-              '192.168.100.11-192.168.100.199,192.168.100.201-192.168.100.252'
-              '10.20.30.6' (single IP)
-              '192.168.100.11-192.168.100.199,10.20.30.6' (mixed)
+    """Expand bounded IPv4/IPv6 targets; never enumerate an unbounded subnet.
+
+    Single addresses, comma-separated ranges and small CIDRs may be mixed.
+    Link-local addresses require a collector interface (e.g. %eth0); range
+    endpoints must use the same address family and scope. The 1500-target
+    budget is checked before any segment is expanded.
     """
-    if not range_str:
+    from addressing import normalize_address
+    if not range_str or not isinstance(range_str, str):
         return []
-    result = []
-    for segment in range_str.split(','):
-        segment = segment.strip()
-        if not segment:
-            continue
-        try:
-            if '-' not in segment:
-                result.append(str(ipaddress.IPv4Address(segment)))
+    segments = []
+    total = 0
+    try:
+        for segment in range_str.split(','):
+            segment = segment.strip()
+            if not segment:
                 continue
-            start_s, end_s = segment.split('-', 1)
-            start = int(ipaddress.IPv4Address(start_s.strip()))
-            end = int(ipaddress.IPv4Address(end_s.strip()))
+            if '/' in segment:
+                address_text, prefix = segment.rsplit('/', 1)
+                address = ipaddress.ip_address(normalize_address(address_text))
+                scope = getattr(address, 'scope_id', None)
+                network = ipaddress.ip_network(
+                    f'{str(address).split("%", 1)[0]}/{prefix}', strict=False)
+                start, end = int(network.network_address), int(network.broadcast_address)
+                # Match ipaddress.hosts(): /31,/32 and /127,/128 include both
+                # endpoints, IPv6 otherwise excludes the subnet-router anycast.
+                if network.version == 4 and network.prefixlen < 31:
+                    start, end = start + 1, end - 1
+                elif network.version == 6 and network.prefixlen < 127:
+                    start += 1
+                family = network.version
+            else:
+                try:
+                    address = ipaddress.ip_address(normalize_address(segment))
+                    start = end = int(address)
+                    family, scope = address.version, getattr(address, 'scope_id', None)
+                except ValueError:
+                    # A zone name itself may contain '-'; accept only a split
+                    # whose two sides are complete valid addresses.
+                    pair = None
+                    for match in re.finditer('-', segment):
+                        try:
+                            left = ipaddress.ip_address(normalize_address(segment[:match.start()].strip()))
+                            right = ipaddress.ip_address(normalize_address(segment[match.end():].strip()))
+                        except ValueError:
+                            continue
+                        if left.version != right.version or getattr(left, 'scope_id', None) != getattr(right, 'scope_id', None):
+                            continue
+                        pair = left, right
+                        break
+                    if pair is None:
+                        return []
+                    left, right = pair
+                    start, end = int(left), int(right)
+                    family, scope = left.version, getattr(left, 'scope_id', None)
             if end < start:
                 return []
-            # Fail early before constructing an accidentally huge list.
-            if end - start + 1 > 1500:
+            total += end - start + 1
+            if total > 1500:
                 return []
-            result.extend(str(ipaddress.IPv4Address(value))
-                          for value in range(start, end + 1))
-        except ipaddress.AddressValueError:
-            return []
-        if len(result) > 1500:
-            return []
-    # Preserve first-seen order while removing overlap between segments.
-    return list(dict.fromkeys(result))
+            segments.append((family, scope, start, end))
+        result = []
+        for family, scope, start, end in segments:
+            address_type = ipaddress.IPv4Address if family == 4 else ipaddress.IPv6Address
+            for value in range(start, end + 1):
+                target = address_type(value)
+                if target.is_unspecified or target.is_multicast:
+                    return []
+                text = str(target) + (f'%{scope}' if scope else '')
+                result.append(normalize_address(text))
+        return list(dict.fromkeys(result))
+    except (ValueError, TypeError):
+        return []
 
 # Also check alternate path for dhcpd.hosts (some setups use dhcpd.host)
 DHCP_HOSTS_ALT = DHCP_HOSTS_FILE.replace('dhcpd.hosts', 'dhcpd.host')
@@ -1031,6 +1073,7 @@ def is_valid_provision_hostname(value):
 
 def normalize_inventory_bindings(bindings):
     """Validate and normalize the canonical inventory before any file write."""
+    from addressing import normalize_address, address_family
     if not isinstance(bindings, list):
         raise ValueError('bindings must be a list')
     if len(bindings) > 10000:
@@ -1041,7 +1084,7 @@ def normalize_inventory_bindings(bindings):
     def unique(kind, value, hostname):
         if not value:
             return
-        key = value.lower()
+        key = value if kind == 'ip' else value.lower()
         previous = seen[kind].get(key)
         if previous:
             raise ValueError(f'Duplicate {kind} "{value}" ({previous}, {hostname})')
@@ -1063,9 +1106,12 @@ def normalize_inventory_bindings(bindings):
             raise ValueError(f'Inventory row {index} has an invalid hostname')
         if ip:
             try:
-                ip = str(ipaddress.IPv4Address(ip))
-            except ipaddress.AddressValueError:
-                raise ValueError(f'Inventory row {index} has an invalid IPv4 address: {ip}')
+                ip = normalize_address(ip)
+            except ValueError:
+                raise ValueError(f'Inventory row {index} has an invalid IP address: {ip}')
+            # IPv6 management is monitor-only; never produce DHCPv6/ZTP state.
+            if address_family(ip) == 6:
+                dhcp = False
         placeholder_mac = not mac or mac == '-' or 'x' in mac
         if placeholder_mac:
             mac = '-'
@@ -1082,15 +1128,23 @@ def normalize_inventory_bindings(bindings):
         if not placeholder_mac:
             unique('mac', mac, hostname)
         unique('serial', serial, hostname)
+        inv_status = str(raw.get('inv_status', '')).strip()
+        ipv6 = bool(ip and address_family(ip) == 6)
+        if ipv6 and raw.get('commented') is True:
+            inv_status = 'planned'
+        elif ipv6 and inv_status == 'planned':
+            inv_status = 'active'
         normalized.append({
             'hostname': hostname,
             'mac': mac,
             'ip': ip,
             'serial': serial,
             'role': role,
-            'inv_status': str(raw.get('inv_status', '')).strip(),
+            'inv_status': inv_status,
             'dhcp': dhcp,
         })
+        if ipv6 and raw.get('commented') is True:
+            normalized[-1]['commented'] = True
     return normalized
 
 
@@ -1287,6 +1341,7 @@ def supplement_with_monitored_devices(canonical):
 
     DHCP/inventory records stay authoritative and nothing here is written back.
     """
+    from addressing import normalize_address
     targets = _devices_yaml_targets()
     if not targets:
         return canonical
@@ -1313,8 +1368,8 @@ def supplement_with_monitored_devices(canonical):
         if not is_valid_provision_hostname(hostname):
             continue
         try:
-            ip = str(ipaddress.IPv4Address(raw_ip))
-        except ipaddress.AddressValueError:
+            ip = normalize_address(raw_ip)
+        except ValueError:
             continue
         if ip in known_ips:
             continue
@@ -1469,7 +1524,7 @@ def generate_dhcp_hosts(bindings):
             skipped += 1
             continue
         # Skip entries where DHCP is disabled (static IP devices)
-        if not b.get('dhcp', True):
+        if not b.get('dhcp', True) or ':' in ip:
             skipped += 1
             continue
 
@@ -1569,6 +1624,8 @@ def action_list_bindings():
     inventory.json is the source of truth — it preserves ALL entries including planned (no MAC).
     dhcpd.hosts only contains active DHCP entries with valid MACs.
     """
+    from addressing import normalize_address, address_family
+
     # Keep all three canonical inventory files stable until the response has
     # been assembled.  The handle intentionally remains live until result_json
     # terminates this short-lived CGI process.
@@ -1628,12 +1685,21 @@ def action_list_bindings():
                 cdata = json.load(f)
             for entry in cdata.get('entries', []):
                 if entry.get('ip'):
-                    disc_cache[entry['ip']] = entry
+                    try:
+                        disc_cache[normalize_address(entry['ip'])] = entry
+                    except ValueError:
+                        continue
     except Exception:
         pass
     
     # Enrich each binding
     for b in bindings:
+        try:
+            b['ip'] = normalize_address(str(b.get('ip', '')))
+            if address_family(b['ip']) == 6:
+                b['dhcp'] = False
+        except ValueError:
+            pass
         is_placeholder = 'x' in b.get('mac', '').lower() or b.get('mac', '') in ('', '-')
         # Show '-' instead of xx:xx:xx in UI
         if 'x' in b.get('mac', '').lower():
@@ -1645,7 +1711,15 @@ def action_list_bindings():
         # - planned: incomplete record (DHCP device without MAC, or unreachable static)
         # - discovered: reachable but not provisioned (no SSH key)
         needs_dhcp = b.get('dhcp', True)
-        if is_placeholder and needs_dhcp:
+        if address_family(b.get('ip', '')) == 6:
+            # A static management address is monitorable without a learned MAC.
+            # Reachability is shown separately; an unscanned row must not turn
+            # into a commented devices.yaml entry on the next export.
+            if b.get('commented'):
+                b['inv_status'] = 'planned'
+            else:
+                b['inv_status'] = 'discovered' if disc.get('device_type') == 'not_provisioned' else 'active'
+        elif is_placeholder and needs_dhcp:
             # DHCP device without MAC = always planned (waiting for MAC)
             b['inv_status'] = 'planned'
         elif is_placeholder and not needs_dhcp:
@@ -1682,6 +1756,7 @@ def action_list_bindings():
 
 def render_inventory_devices_yaml(bindings):
     """Render the existing grouped Inventory Export format without writing."""
+    from addressing import address_sort_key
     devices_file = os.path.join(LLDPQ_DIR, 'devices.yaml')
     defaults_username = 'cumulus'
     endpoint_hosts = []
@@ -1717,7 +1792,7 @@ def render_inventory_devices_yaml(bindings):
             'ip': ip,
             'role': role,
             'planned': planned,
-            'ip_num': int(ipaddress.IPv4Address(ip)),
+            'ip_num': address_sort_key(ip),
         })
 
     lines = [
@@ -1733,10 +1808,12 @@ def render_inventory_devices_yaml(bindings):
         for entry in sorted(groups[role], key=lambda item: item['ip_num']):
             suffix = f" @{entry['role']}" if entry['role'] != 'ungrouped' else ''
             if entry['planned']:
-                lines.append(f"#  {entry['ip']}: {entry['hostname']}{suffix}")
+                key = json.dumps(entry['ip']) if ':' in entry['ip'] else entry['ip']
+                lines.append(f"#  {key}: {entry['hostname']}{suffix}")
                 planned_count += 1
             else:
-                lines.append(f"  {entry['ip']}: {entry['hostname']}{suffix}")
+                key = json.dumps(entry['ip']) if ':' in entry['ip'] else entry['ip']
+                lines.append(f"  {key}: {entry['hostname']}{suffix}")
                 active_count += 1
     if active_count == 0:
         # Comment-only output would safe_load as devices: null and crash
@@ -1787,6 +1864,19 @@ def _action_save_bindings_locked():
     initial_revision = inventory_revision()
     filepath = get_dhcp_hosts_path()
     content, skipped = generate_dhcp_hosts(bindings)
+    previous_bindings = dhcp_hosts_bindings_unlocked()
+    has_ipv6 = any(':' in str(row.get('ip', '')) for row in bindings + previous_bindings)
+    previous_content, _ = generate_dhcp_hosts(previous_bindings)
+    # Compare reservations independent of row order; preserve the live DHCP
+    # file (including hand-maintained comments/options) for management edits.
+    monitor_only_change = has_ipv6 and sorted(content.splitlines()) == sorted(previous_content.splitlines())
+    change_dhcp = not monitor_only_change
+    try:
+        with open(filepath, 'r') as current_hosts:
+            dhcp_changed = change_dhcp and current_hosts.read() != content
+    except FileNotFoundError:
+        dhcp_changed = change_dhcp
+    do_restart = do_restart and change_dhcp
     written = len(bindings) - skipped
     inv_data = {'bindings': bindings, 'timestamp': time.time()}
     inv_content = json.dumps(inv_data, indent=2) + '\n'
@@ -1825,7 +1915,7 @@ def _action_save_bindings_locked():
     restart_ok = None
     restart_msg = ''
     rollback_performed = False
-    paths = [INVENTORY_FILE, filepath]
+    paths = [INVENTORY_FILE] + ([filepath] if change_dhcp else [])
     if devices_content is not None:
         paths.append(devices_file)
 
@@ -1847,30 +1937,32 @@ def _action_save_bindings_locked():
         # it and then silently never serves it.  Judge the final state against
         # the pools that are live right now, exactly as DHCP Config Save judges
         # a new pool set against the inventory that is live right now.
-        live_pools, live_pools_error = read_live_dhcp_pools()
-        if live_pools_error:
-            result_json({'success': False, 'error': live_pools_error,
-                         'rollback_performed': False})
-        pool_errors = validate_bindings_against_pools(bindings, live_pools)
-        if pool_errors:
-            result_json({'success': False, 'error': ' '.join(pool_errors),
-                         'rollback_performed': False})
+        if change_dhcp:
+            live_pools, live_pools_error = read_live_dhcp_pools()
+            if live_pools_error:
+                result_json({'success': False, 'error': live_pools_error,
+                             'rollback_performed': False})
+            pool_errors = validate_bindings_against_pools(bindings, live_pools)
+            if pool_errors:
+                result_json({'success': False, 'error': ' '.join(pool_errors),
+                             'rollback_performed': False})
 
-        # Validate the generated reservation file against the live DHCP config
-        # before changing any inventory file.
-        try:
-            validate_dhcp_hosts_candidate(content, filepath)
-        except Exception as exc:
-            result_json({'success': False, 'error': str(exc),
-                         'rollback_performed': False})
+            # Validate the generated reservation file against the live DHCP config
+            # before changing any inventory file.
+            try:
+                validate_dhcp_hosts_candidate(content, filepath)
+            except Exception as exc:
+                result_json({'success': False, 'error': str(exc),
+                             'rollback_performed': False})
         was_running = dhcp_is_running() if do_restart else None
         service_before = (
             'running' if was_running else 'stopped'
         ) if do_restart else None
         candidates = [
             (INVENTORY_FILE, inv_content, 0o664),
-            (filepath, content, 0o664),
         ]
+        if change_dhcp:
+            candidates.append((filepath, content, 0o664))
         if devices_content is not None:
             candidates.append((devices_file, devices_content, 0o664))
         journal = None
@@ -1881,7 +1973,8 @@ def _action_save_bindings_locked():
             )
             mark_provision_transaction(journal, 'activating')
             atomic_write_text(INVENTORY_FILE, inv_content, 0o664)
-            atomic_write_text(filepath, content, 0o664)
+            if change_dhcp:
+                atomic_write_text(filepath, content, 0o664)
             if devices_content is not None:
                 atomic_write_text(devices_file, devices_content, 0o664)
             sync_provision_transaction_targets(journal)
@@ -1914,8 +2007,10 @@ def _action_save_bindings_locked():
 
     result_json({
         "success": True,
-        "message": f"{written} active bindings saved ({skipped} planned). {devices_msg}",
+        "message": (f"{len(bindings)} inventory entries saved. {written} DHCP reservations. {devices_msg}"
+                    if has_ipv6 else f"{written} active bindings saved ({skipped} planned). {devices_msg}"),
         "dhcp_restart": restart_ok,
+        "dhcp_changed": dhcp_changed,
         "dhcp_message": restart_msg,
         "written": written,
         "skipped": skipped,
@@ -1942,6 +2037,7 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
     - Remove devices listed in remove_hostnames
     - Preserves existing comments and structure using ruamel.yaml
     """
+    from addressing import normalize_address
     devices_file = os.path.join(LLDPQ_DIR, 'devices.yaml')
     if not os.path.exists(devices_file):
         return 'devices.yaml not found'
@@ -1982,7 +2078,13 @@ def sync_bindings_to_devices_yaml(bindings, remove_hostnames, write=True):
             h = info.get('hostname', str(key))
         else:
             h = str(key)
-        ip_to_key[str(key)] = key
+        try:
+            normalized_key = normalize_address(str(key), allow_hostname=True)
+        except ValueError:
+            normalized_key = str(key)
+        if normalized_key in ip_to_key:
+            raise ValueError(f'Duplicate address in devices.yaml: {normalized_key}')
+        ip_to_key[normalized_key] = key
         hostname_to_key[h] = key
     
     # Resolve every source before changing keys. Reading from the dictionary
@@ -2562,6 +2664,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     heartbeat, when given, is called between scan phases so the discovery
     worker's liveness record stays fresh during long scans."""
     
+    from addressing import normalize_address, address_family
+
     # Get discovery range
     disc_range = read_lldpq_conf_key('DISCOVERY_RANGE', DISCOVERY_RANGE)
     if not disc_range:
@@ -2582,7 +2686,7 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     
     all_ips = ip_range_to_list(disc_range)
     if not all_ips:
-        raise ValueError(f"Invalid discovery range: {disc_range}")
+        raise ValueError('Invalid discovery range. Use IPv4/IPv6 addresses, bounded ranges or small CIDRs (max 1500 targets); link-local IPv6 requires %interface.')
     # Safety limit: prevent memory/timeout bombs from huge ranges
     if len(all_ips) > 1500:
         raise ValueError(f"Discovery range too large: {len(all_ips)} IPs (max 1500). Narrow the range.")
@@ -2609,8 +2713,10 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
                         continue
                     if isinstance(info, dict):
                         hostname = info.get('hostname', str(host_ip))
-                        if info.get('ip'):
-                            devices_yaml[info['ip']] = hostname
+                        try:
+                            devices_yaml[normalize_address(str(info.get('ip') or host_ip))] = hostname
+                        except ValueError:
+                            pass
                         role = info.get('role', '')
                         if role:
                             devices_roles[hostname] = role.lower()
@@ -2622,13 +2728,18 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
                             devices_roles[hostname] = m.group(2).lower()
                         else:
                             hostname = raw
-                        devices_yaml[str(host_ip)] = hostname
+                        try:
+                            devices_yaml[normalize_address(str(host_ip))] = hostname
+                        except ValueError:
+                            pass
     except Exception:
         pass
     
     # Check if range contains non-private IPs (possible typo like 92.x instead of 192.x)
     non_private = []
     for ip in all_ips[:5]:  # sample first 5
+        if address_family(ip) != 4:
+            continue
         parts = ip.split('.')
         first = int(parts[0]) if parts else 0
         if not (first == 10 or (first == 172 and 16 <= int(parts[1]) <= 31) or (first == 192 and int(parts[1]) == 168)):
@@ -2645,7 +2756,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     
     def ping_one(ip):
         try:
-            r = subprocess.run(['ping', '-c', '2', '-W', ping_wait, '-i', '0.2', ip],
+            family_flag = ['-6'] if address_family(ip) == 6 else []
+            r = subprocess.run(['ping'] + family_flag + ['-c', '2', '-W', ping_wait, '-i', '0.2', ip],
                              capture_output=True, text=True, timeout=4)
             return ip, r.returncode == 0
         except Exception:
@@ -2660,21 +2772,54 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     if heartbeat:
         heartbeat()
 
-    # Step 2: Read local ARP table
+    # Step 2: Read family-specific neighbours. A link-local NDP address is
+    # meaningful only on the interface reported by the kernel. Stale NDP can
+    # supply a MAC/candidate, but cannot by itself prove the device is online.
     local_arp = {}
-    try:
-        r = subprocess.run(['ip', 'neigh', 'show'], capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            for line in r.stdout.strip().split('\n'):
+    neighbor_alive = set()
+    neighbor_states = {}
+    families = {address_family(ip) for ip in all_ips}
+    for family in sorted(families):
+        command = ['ip', 'neigh', 'show'] if family == 4 else ['ip', '-6', 'neigh', 'show']
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                continue
+            for line in result.stdout.splitlines():
                 parts = line.split()
-                if 'lladdr' in parts:
-                    ip = parts[0]
-                    mac_idx = parts.index('lladdr') + 1
-                    if mac_idx < len(parts):
-                        local_arp[ip] = parts[mac_idx].lower()
-    except Exception:
-        pass
-    
+                if not parts or 'lladdr' not in parts or {'FAILED', 'INCOMPLETE'} & set(parts):
+                    continue
+                mac_idx = parts.index('lladdr') + 1
+                if mac_idx >= len(parts):
+                    continue
+                raw_ip = parts[0]
+                scopes = ['']
+                if family == 6 and ipaddress.ip_address(raw_ip).is_link_local:
+                    if 'dev' not in parts or parts.index('dev') + 1 >= len(parts):
+                        continue
+                    iface = parts[parts.index('dev') + 1]
+                    scopes = [iface]
+                    try:
+                        scopes.append(str(socket.if_nametoindex(iface)))
+                    except OSError:
+                        pass
+                state = next((item for item in reversed(parts) if item in {
+                    'REACHABLE', 'STALE', 'DELAY', 'PROBE', 'PERMANENT', 'NOARP'
+                }), '')
+                for scope in scopes:
+                    try:
+                        ip = normalize_address(raw_ip + (f'%{scope}' if scope else ''))
+                    except ValueError:
+                        continue
+                    if address_family(ip) != family:
+                        continue
+                    local_arp[ip] = parts[mac_idx].lower()
+                    neighbor_states[ip] = state
+                    if family == 4 or state == 'REACHABLE':
+                        neighbor_alive.add(ip)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+
     # TCP/22 is probed independently so ICMP-filtered devices are still
     # classified. Keep the timeout short and concurrency bounded.
     def tcp22_one(ip):
@@ -2698,7 +2843,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     # positive network signal to avoid a full-range slow SSH sweep.
     probe_ips = [
         ip for ip in all_ips
-        if ping_results.get(ip) or tcp_results.get(ip) or ip in local_arp or ip in binding_by_ip
+        if ping_results.get(ip) or tcp_results.get(ip) or ip in local_arp
+        or ip in binding_by_ip or ip in devices_yaml
     ]
 
     # Step 3: SSH probe candidates for classification + per-action state.
@@ -2762,7 +2908,7 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
 
     reachable_ips = [
         ip for ip in all_ips
-        if ping_results.get(ip) or tcp_results.get(ip) or ip in local_arp
+        if ping_results.get(ip) or tcp_results.get(ip) or ip in neighbor_alive
         or ssh_results.get(ip, {}).get('ssh_seen')
     ]
 
@@ -2773,7 +2919,13 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
         tcp_open = tcp_results.get(ip, False)
         disc_mac = local_arp.get(ip, '')
         probe = ssh_results.get(ip, {})
-        alive = bool(icmp_alive or tcp_open or disc_mac or probe.get('ssh_seen'))
+        neighbor_seen = ip in neighbor_alive
+        ipv6 = address_family(ip) == 6
+        if ipv6 and probe.get('management_mac'):
+            # Routed IPv6 targets have no local NDP entry. The authenticated
+            # SSH observation still supplies identity for inventory deduplication.
+            disc_mac = probe['management_mac']
+        alive = bool(icmp_alive or tcp_open or neighbor_seen or probe.get('ssh_seen'))
         binding = binding_by_ip.get(ip)
         
         hostname = ''
@@ -2801,6 +2953,10 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
             )
         else:
             hostname = devices_yaml.get(ip, '')
+            if ipv6 and not hostname and is_valid_provision_hostname(probe.get('actual_hostname', '')):
+                # IPv6 has no DHCP reservation from which to obtain a name.
+                # Use the authenticated SSH observation for explicit import.
+                hostname = probe['actual_hostname']
             mac_status = 'no_binding'
         
         if not alive:
@@ -2813,6 +2969,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
         
         entry = {
             'ip': ip,
+            'ip_version': 6 if ipv6 else 4,
+            'monitor_only': ipv6,
             'hostname': hostname,
             'binding_mac': binding_mac,
             'binding_serial': binding_serial,
@@ -2822,7 +2980,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
             'serial': probe.get('serial', ''),
             'role': entry_role,
             'source': '+'.join(name for name, present in (
-                ('ICMP', icmp_alive), ('ARP', bool(disc_mac)),
+                ('ICMPv6' if ipv6 else 'ICMP', icmp_alive),
+                ('NDP' if ipv6 else 'ARP', neighbor_seen),
                 ('TCP22', tcp_open), ('SSH', bool(probe.get('ssh_seen')))
             ) if present),
             'has_binding': binding is not None,
@@ -2834,9 +2993,11 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
             'ztp_disabled': bool(probe.get('ztp_disabled')),
             'actual_hostname': probe.get('actual_hostname', ''),
             'reachability': 'ssh' if probe.get('ssh_seen') else (
-                'tcp22' if tcp_open else ('arp' if disc_mac else ('icmp' if icmp_alive else 'none'))
+                'tcp22' if tcp_open else (('ndp' if ipv6 else 'arp') if neighbor_seen else ('icmp' if icmp_alive else 'none'))
             ),
-            'signals': {'icmp': icmp_alive, 'arp': bool(disc_mac),
+            'neighbor_state': neighbor_states.get(ip, ''),
+            'signals': {'icmp': icmp_alive, 'arp': neighbor_seen and not ipv6,
+                        'ndp': neighbor_seen and ipv6,
                         'tcp22': tcp_open, 'ssh': bool(probe.get('ssh_seen'))},
         }
         entries.append(entry)
@@ -2899,13 +3060,13 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
 
         provisioned_entries = [
             e for e in entries
-            if e['device_type'] == 'provisioned' and e['has_binding']
+            if not e['monitor_only'] and e['device_type'] == 'provisioned' and e['has_binding']
             and e.get('identity_verified')
             and has_pending_post_provision_action(e)
         ]
         blocked_entries = [
             e for e in entries
-            if e['device_type'] == 'provisioned' and e['has_binding']
+            if not e['monitor_only'] and e['device_type'] == 'provisioned' and e['has_binding']
             and not e.get('identity_verified')
             and has_pending_post_provision_action(e)
         ]
@@ -8462,11 +8623,12 @@ def action_update_role():
     if role and not re.fullmatch(r'[a-z0-9][a-z0-9_.-]{0,63}', role):
         error_json("Invalid role")
     if ip:
+        from addressing import normalize_address
         try:
-            ip = str(ipaddress.IPv4Address(ip))
-        except ipaddress.AddressValueError:
+            ip = normalize_address(ip)
+        except ValueError:
             error_json("Invalid IP address")
-    
+
     devices_file = os.path.join(LLDPQ_DIR, 'devices.yaml')
     if not os.path.exists(devices_file):
         error_json("devices.yaml not found")
@@ -8532,6 +8694,15 @@ def action_update_role():
         
         # If not found and we have IP, add it
         if not found and ip:
+            for existing_ip in devices:
+                if existing_ip in ('defaults', 'endpoint_hosts'):
+                    continue
+                try:
+                    occupied = normalize_address(str(existing_ip), allow_hostname=True)
+                except ValueError:
+                    continue
+                if occupied == ip:
+                    error_json(f'IP {ip} is already used in devices.yaml; update its existing device instead')
             if role:
                 devices[ip] = f"{hostname} @{role}"
             else:
@@ -8583,6 +8754,15 @@ def action_update_role():
                 break
         
         if not found and ip:
+            for existing_ip in devices:
+                if existing_ip in ('defaults', 'endpoint_hosts'):
+                    continue
+                try:
+                    occupied = normalize_address(str(existing_ip), allow_hostname=True)
+                except ValueError:
+                    continue
+                if occupied == ip:
+                    error_json(f'IP {ip} is already used in devices.yaml; update its existing device instead')
             devices[ip] = f"{hostname} @{role}" if role else hostname
             found = True
         
@@ -8651,6 +8831,7 @@ def action_rebuild_devices_yaml():
     
     # Group bindings by role, sort by IP within each group
     from collections import defaultdict
+    from addressing import address_sort_key
     groups = defaultdict(list)
     for b in bindings:
         hostname = b.get('hostname', '').strip()
@@ -8666,7 +8847,7 @@ def action_rebuild_devices_yaml():
             'ip': ip,
             'role': role,
             'planned': is_planned,
-            'ip_num': sum(int(p) * (256 ** (3 - i)) for i, p in enumerate(ip.split('.'))) if ip.count('.') == 3 else 0,
+            'ip_num': address_sort_key(ip),
         })
     
     # Sort groups alphabetically, sort entries by IP within each group
@@ -8692,11 +8873,12 @@ def action_rebuild_devices_yaml():
         lines.append(f'  # {role}')
         for e in entries:
             role_suffix = f" @{e['role']}" if e['role'] != 'ungrouped' else ''
+            key = json.dumps(e['ip']) if ':' in e['ip'] else e['ip']
             if e['planned']:
-                lines.append(f"#  {e['ip']}: {e['hostname']}{role_suffix}")
+                lines.append(f"#  {key}: {e['hostname']}{role_suffix}")
                 planned_count += 1
             else:
-                lines.append(f"  {e['ip']}: {e['hostname']}{role_suffix}")
+                lines.append(f"  {key}: {e['hostname']}{role_suffix}")
                 active_count += 1
 
     if active_count == 0:

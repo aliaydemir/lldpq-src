@@ -17,6 +17,7 @@ Two regressions are pinned here:
 """
 
 from pathlib import Path
+import json
 import subprocess
 import sys
 import tempfile
@@ -163,6 +164,85 @@ class RoleNormalizationTests(unittest.TestCase):
             nul_records(result.stdout),
             [("10.10.100.10", "cumulus", "Spine1", "spine")],
         )
+
+
+class IPv6InventoryTests(unittest.TestCase):
+    def test_mixed_inventory_preserves_legacy_names_and_normalizes_ipv6(self):
+        result = run_parser(
+            "defaults:\n  username: admin\n"
+            "devices:\n"
+            "  192.0.2.10: IPv4-Switch @oob\n"
+            "  '2001:0DB8:0:0:0:0:0:10': IPv6-Switch @oob\n"
+            "  switch.example.test: DNS-Switch\n"
+            "  ssh_alias: Alias-Switch\n"
+            "  'fd00:100::11':\n    hostname: ULA-Switch\n    username: cumulus\n",
+            "--format", "nul",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(nul_records(result.stdout), [
+            ("192.0.2.10", "admin", "IPv4-Switch", "oob"),
+            ("2001:db8::10", "admin", "IPv6-Switch", "oob"),
+            ("switch.example.test", "admin", "DNS-Switch", ""),
+            ("ssh_alias", "admin", "Alias-Switch", ""),
+            ("fd00:100::11", "cumulus", "ULA-Switch", ""),
+        ])
+
+    def test_equivalent_ipv6_addresses_fail_before_any_output(self):
+        config = (
+            "devices:\n"
+            "  192.0.2.10: Good-Switch\n"
+            "  '2001:db8::10': First-Switch\n"
+            "  '2001:0DB8:0000:0000:0000:0000:0000:0010': Second-Switch\n"
+        )
+        for output_format in ("nul", "json", "bash"):
+            with self.subTest(output_format=output_format):
+                result = run_parser(config, "--format", output_format)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Duplicate device address", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_dual_stack_does_not_create_two_records_with_same_hostname(self):
+        result = run_parser(
+            "devices:\n  192.0.2.10: OOB-01\n  '2001:db8::10': oob-01\n",
+            "--format", "nul",
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Duplicate hostname", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_link_local_addresses_keep_the_local_interface(self):
+        result = run_parser(
+            "devices:\n  'FE80:0:0:0:0:0:0:1%eth0': Link1\n  'fe80::1%eth1': Link2\n",
+            "--format", "json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([device["address"] for device in json.loads(result.stdout)], [
+            "fe80::1%eth0", "fe80::1%eth1",
+        ])
+
+    def test_invalid_or_ambiguous_literal_fails_entire_inventory(self):
+        for address in ("2001:::1", "2001:db8::gg", "192.0.2.999", "fe80::1", "fe80::1%eth0%eth1"):
+            with self.subTest(address=address):
+                result = run_parser(
+                    f"devices:\n  192.0.2.10: Good-Switch\n  '{address}': Invalid-Switch\n",
+                    "--format", "nul",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Invalid device address", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_absolute_path_import_works_outside_project_directory(self):
+        code = (
+            "import importlib.util, json\n"
+            f"spec = importlib.util.spec_from_file_location('isolated_devices_parser', {str(PARSER)!r})\n"
+            "parser = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(parser)\n"
+            "print(json.dumps(parser.get_all_devices({'devices': {'2001:0DB8::10': 'OOB-01'}})))\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, "-c", code], cwd=directory, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), [["2001:db8::10", "cumulus", "OOB-01", None]])
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ class BMCAPITest(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        for name in ("bmc_config.py", "bmc_results.py", "parse_devices.py"):
+        for name in ("bmc_config.py", "bmc_results.py", "parse_devices.py", "addressing.py"):
             (self.root / name).symlink_to(REPO / "lldpq" / name)
         (self.root / "devices.yaml").write_text("defaults:\n  username: cumulus\ndevices:\n  192.0.2.1: oob-01 @oob\n")
         helper = self.root / "config-helper"

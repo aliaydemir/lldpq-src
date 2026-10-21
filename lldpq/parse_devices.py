@@ -40,6 +40,18 @@ import re
 import argparse
 import json
 import shlex
+import importlib.util
+
+if __package__:
+    from .addressing import normalize_address
+else:
+    # setup_safety and other CGI helpers load this parser by absolute path.
+    # Load its sibling without depending on the caller's cwd or sys.path.
+    _addressing_spec = importlib.util.spec_from_file_location(
+        "_lldpq_addressing", os.path.join(os.path.dirname(__file__), "addressing.py"))
+    _addressing = importlib.util.module_from_spec(_addressing_spec)
+    _addressing_spec.loader.exec_module(_addressing)
+    normalize_address = _addressing.normalize_address
 
 class UniqueKeyLoader(yaml.SafeLoader):
     """SafeLoader that rejects duplicate mapping keys instead of last-wins"""
@@ -110,6 +122,7 @@ def get_all_devices(config):
         sys.exit(1)
     
     result = []
+    addresses_seen = {}
     hostnames_seen = {}
     for ip, device_config in devices.items():
         if isinstance(device_config, str):
@@ -155,12 +168,23 @@ def get_all_devices(config):
             )
             sys.exit(1)
 
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:%-]*', fields['address']):
+        try:
+            fields['address'] = normalize_address(fields['address'], allow_hostname=True)
+        except ValueError as exc:
             print(
-                f"ERROR: Invalid device address {fields['address']!r}",
+                f"ERROR: Invalid device address {fields['address']!r}: {exc}",
                 file=sys.stderr,
             )
             sys.exit(1)
+        address_key = fields['address']
+        if address_key in addresses_seen:
+            print(
+                f"ERROR: Duplicate device address {address_key!r}; "
+                f"{str(ip)!r} and {addresses_seen[address_key]!r} refer to the same address",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        addresses_seen[address_key] = str(ip)
         # Keep common legacy SSH principals such as DOMAIN\user and user+tag.
         # Values are transported as NUL-delimited data and passed as quoted
         # argv, so these characters no longer require generated-shell output.

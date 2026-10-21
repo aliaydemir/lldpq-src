@@ -29,6 +29,7 @@ from __future__ import annotations
 import ast
 import ipaddress
 import json
+import sys
 import os
 from pathlib import Path
 import re
@@ -45,6 +46,7 @@ from urllib.parse import urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lldpq"))
 PROVISION_API = (ROOT / "html" / "provision-api.sh").read_text(encoding="utf-8")
 PROVISION_HTML = (ROOT / "html" / "provision.html").read_text(encoding="utf-8")
 INSTALL_SH = (ROOT / "install.sh").read_text(encoding="utf-8")
@@ -1496,8 +1498,11 @@ class DiscoveryIsUntouchedTests(unittest.TestCase):
 
     def test_extra_ranges_remain_an_operator_choice(self):
         """Comma-separated ranges already work, so no code had to change."""
-        self.assertIn("Supports: '192.168.100.10-192.168.100.249'",
-                      extract_source("ip_range_to_list"))
+        namespace = {"ipaddress": ipaddress, "re": re}
+        exec(extract_source("ip_range_to_list"), namespace)
+        self.assertEqual(namespace["ip_range_to_list"](
+            "192.168.100.10-192.168.100.11,10.0.0.1"),
+            ["192.168.100.10", "192.168.100.11", "10.0.0.1"])
 
 
 class ProvisionUiContractTests(unittest.TestCase):

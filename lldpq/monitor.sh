@@ -1866,7 +1866,7 @@ publish_monitor_results() {
 }
 
 # SSH options with multiplexing
-SSH_OPTS="-o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60 -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT"
+SSH_OPTS="-o StrictHostKeyChecking=no -o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60 -o BatchMode=yes -o ConnectTimeout=$SSH_TIMEOUT"
 
 # Ping command - on Cumulus switches with Docker --privileged, the entrypoint
 # adds 'ip rule' for mgmt VRF so plain ping works. No ip vrf exec needed.
@@ -1874,7 +1874,9 @@ PING="ping"
 
 ping_test() {
     local device=$1
-    $PING -c 1 -W 0.5 "$device" > /dev/null 2>&1
+    local -a family=()
+    [[ "$device" == *:* ]] && family=(-6)
+    "$PING" "${family[@]}" -c 1 -W 0.5 "$device" > /dev/null 2>&1
 }
 
 record_collection_status() {

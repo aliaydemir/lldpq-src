@@ -122,7 +122,9 @@ trap cleanup_fabric_scan EXIT
 # Check if host is reachable.
 is_reachable() {
     local ip="$1"
-    "$PING_BIN" -c 1 -W 1 "$ip" >/dev/null 2>&1
+    local -a family=()
+    [[ "$ip" == *:* ]] && family=(-6)
+    "$PING_BIN" "${family[@]}" -c 1 -W 1 "$ip" >/dev/null 2>&1
 }
 
 write_collection_status() {

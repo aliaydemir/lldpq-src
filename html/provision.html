@@ -6,6 +6,7 @@
     <title>Provision - ZTP & Base Config</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
     <script src="/css/auth.js"></script>
+    <script src="/css/ip-address.js?v=20261021-1"></script>
     <style>
         /* Prevent browser autofill from changing input background */
         input:-webkit-autofill,
@@ -843,8 +844,8 @@
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
             <div>
                 <div class="section-title" style="font-size: 13px; margin-bottom: 8px;">Discovery Range</div>
-                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">IP range to scan for device discovery. Only IPs in this range will be pinged and probed.</div>
-                <input type="text" class="form-input" id="discoveryRange" autocomplete="off" style="width: 100%; font-family: 'Cascadia Code','Consolas',monospace;" placeholder="192.168.100.10-192.168.100.249">
+                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">IPv4/IPv6 addresses, full ranges or small CIDRs, separated by commas (up to 1,500 addresses). Link-local IPv6 requires the collector interface, e.g. fe80::1%eth0.</div>
+                <input type="text" class="form-input" id="discoveryRange" autocomplete="off" style="width: 100%; font-family: 'Cascadia Code','Consolas',monospace;" placeholder="192.168.100.10-192.168.100.249,2001:db8::10-2001:db8::20">
                 <div style="display: flex; align-items: center; gap: 8px; margin-top: 8px;">
                     <label style="font-size: 11px; color: #888; white-space: nowrap;">Auto-scan every</label>
                     <select class="form-input" id="scanInterval" onchange="applyScanInterval()" style="width: 90px; padding: 3px 6px; font-size: 12px;">
@@ -859,7 +860,7 @@
             </div>
             <div>
                 <div class="section-title" style="font-size: 13px; margin-bottom: 8px;">Post-Provision Actions</div>
-                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">Automatically run on newly provisioned devices (SSH key auth OK + no marker).</div>
+                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">Automatically run on newly provisioned IPv4 devices (SSH key auth OK + no marker). IPv6 devices are monitored only.</div>
                 <div style="display: flex; flex-direction: column; gap: 6px;">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: #ccc;">
                         <input type="checkbox" id="autoBaseConfig" checked> Deploy Base Config (sw-base files)
@@ -880,7 +881,7 @@
 
     <!-- Discovered Devices -->
     <div class="section-title" style="margin-top: 10px;">Discovered Devices</div>
-    <div class="section-desc">Subnet-wide discovery with SSH classification. Provisioned devices get auto-configured.</div>
+    <div class="section-desc">IPv4/IPv6 discovery with SSH classification. IPv6 discovery does not run DHCP, ZTP or configuration deployment.</div>
     <div class="stats-row" id="discoveredStats">
         <div class="stat-card" style="border-left-color:#4caf50; cursor:pointer;" onclick="setDiscoveredFilter('reachable')"><div class="stat-value" id="statReachable">-</div><div class="stat-label">Reachable</div></div>
         <div class="stat-card" style="cursor:pointer;" onclick="setDiscoveredFilter('provisioned')"><div class="stat-value" id="statProvisioned">-</div><div class="stat-label">Provisioned</div></div>
@@ -1481,7 +1482,7 @@
         </div>
         <div class="modal-field">
             <label>IP Address</label>
-            <input type="text" id="modalIP" class="mono" placeholder="e.g. 192.168.100.11" autocomplete="off">
+            <input type="text" id="modalIP" class="mono" placeholder="e.g. 192.168.100.11 or 2001:db8::11" autocomplete="off">
         </div>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
             <div class="modal-field" style="margin-bottom:0;">
@@ -1798,6 +1799,8 @@ function compareTrackingDevices(a, b) {
     let comparison = 0;
     if (!leftMissing && typeof left === 'number' && typeof right === 'number') {
         comparison = left - right;
+    } else if (!leftMissing && trackingSortCol === 'ip') {
+        comparison = LLDPqIP.compare(left, right);
     } else if (!leftMissing) {
         comparison = String(left).localeCompare(String(right), undefined, {
             numeric: true,
@@ -2608,7 +2611,8 @@ async function saveDHCPConfig() {
 function checkPrivateRange(rangeStr) {
     // Warn if range contains non-RFC1918 IPs (possible typo like 92.x instead of 192.x)
     if (!rangeStr) return '';
-    const firstIp = rangeStr.split(/[-,]/)[0].trim();
+    const firstIp = rangeStr.split(/[-,/]/)[0].trim();
+    if (LLDPqIP.parse(firstIp)?.version !== 4) return '';
     const parts = firstIp.split('.');
     if (parts.length !== 4) return '';
     const first = parseInt(parts[0]), second = parseInt(parts[1]);
@@ -2618,6 +2622,8 @@ function checkPrivateRange(rangeStr) {
 
 async function saveDiscoverySettings() {
     const rangeVal = document.getElementById('discoveryRange').value.trim();
+    const error = LLDPqIP.discoveryError(rangeVal);
+    if (error) { showToast(error, 'error'); return; }
     const rangeWarning = checkPrivateRange(rangeVal);
     if (rangeWarning) {
         showConfirmModal('Non-Private IP Range', rangeWarning, () => _doSaveDiscoverySettings(rangeVal));
@@ -2701,13 +2707,9 @@ function downloadBindingsCSV() {
     }
     // Format: hostname  MAC  IP (same as Bulk Import expects)
     const lines = allBindings
-        .filter(b => b.hostname && b.mac && b.ip)
-        .sort((a, b) => {
-            const pa = a.ip.split('.').map(n => n.padStart(3, '0')).join('.');
-            const pb = b.ip.split('.').map(n => n.padStart(3, '0')).join('.');
-            return pa.localeCompare(pb);
-        })
-        .map(b => `${b.hostname},${b.mac},${b.ip},${b.serial || ''},${b.role || ''}`);
+        .filter(b => b.hostname && b.ip)
+        .sort((a, b) => LLDPqIP.compare(a.ip, b.ip))
+        .map(b => `${b.hostname},${b.mac || '-'},${b.ip},${b.serial || ''},${b.role || ''}`);
     const header = 'Hostname,MAC,IP,Serial,Role';
     const content = header + '\n' + lines.join('\n') + '\n';
     const blob = new Blob([content], { type: 'text/csv' });
@@ -2741,10 +2743,7 @@ function parseBulkText(text) {
 
     const clean = v => (!v || v === '-') ? '' : v.trim();
     const isMAC = v => /^([0-9a-fx]{2}:){5}[0-9a-fx]{2}$/.test(v);
-    const isIP = v => {
-        const parts = String(v || '').split('.');
-        return parts.length === 4 && parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-    };
+    const isIP = v => !!LLDPqIP.parse(v);
 
     lines.forEach((line, idx) => {
         // Skip CSV header row
@@ -2796,15 +2795,16 @@ function parseBulkText(text) {
         }
 
         if (ip && !isIP(ip)) {
-            errors.push(`Line ${idx + 1}: invalid IP "${ip}"`);
+            errors.push(`Line ${idx + 1}: invalid IP "${ip}". Link-local IPv6 requires %interface.`);
             return;
         }
+        if (ip) ip = LLDPqIP.parse(ip).canonical;
 
         // Normalize: empty mac shows as '-'
         if (!mac) mac = '-';
 
-        // Auto-detect DHCP: if MAC is provided, device needs DHCP; if no MAC (static IP), it doesn't
-        const dhcp = (mac && mac !== '-');
+        // IPv6 management entries never create DHCP reservations.
+        const dhcp = !LLDPqIP.isIPv6(ip) && !!(mac && mac !== '-');
 
         entries.push({ hostname, mac, ip, serial, role: role.toLowerCase(), commented: false, dhcp, _provided: provided });
     });
@@ -2839,30 +2839,43 @@ function applyBulkImport() {
 
     // Merge with existing bindings (preserve existing fields not in import)
     let added = 0, updated = 0;
+    const candidateBindings = allBindings.map(binding => ({ ...binding }));
     entries.forEach(entry => {
-        const existing = allBindings.findIndex(b => b.hostname === entry.hostname);
+        const existing = candidateBindings.findIndex(b => b.hostname === entry.hostname);
         if (existing >= 0) {
             // Merge: keep existing values for fields not provided in import
-            const old = allBindings[existing];
+            const old = candidateBindings[existing];
             const provided = entry._provided || {};
-            allBindings[existing] = {
+            candidateBindings[existing] = {
                 ...old,
                 hostname: entry.hostname,
                 mac: provided.mac ? entry.mac : old.mac,
                 ip: provided.ip ? entry.ip : old.ip,
                 serial: provided.serial ? entry.serial : (old.serial || ''),
                 role: provided.role ? entry.role : (old.role || ''),
-                dhcp: provided.mac ? entry.dhcp : old.dhcp,
+                dhcp: LLDPqIP.isIPv6(provided.ip ? entry.ip : old.ip) ? false : (provided.mac ? entry.dhcp : old.dhcp),
                 commented: false,
             };
             updated++;
         } else {
             const cleanEntry = { ...entry };
             delete cleanEntry._provided;
-            allBindings.push(cleanEntry);
+            candidateBindings.push(cleanEntry);
             added++;
         }
     });
+
+    const addresses = new Map();
+    for (const binding of candidateBindings) {
+        if (!binding.ip) continue;
+        const key = LLDPqIP.key(binding.ip);
+        if (addresses.has(key)) {
+            document.getElementById('bulkImportPreview').textContent = `Duplicate IP address for "${addresses.get(key)}" and "${binding.hostname}".`;
+            return;
+        }
+        addresses.set(key, binding.hostname);
+    }
+    allBindings = candidateBindings;
 
     bindingsModified = true;
     document.getElementById('btnSaveBindings').style.display = ''; document.getElementById('btnDiscardBindings').style.display = '';
@@ -2906,7 +2919,7 @@ function renderBindings() {
     const filtered = allBindings.filter(b =>
         b.hostname.toLowerCase().includes(filter) ||
         b.mac.toLowerCase().includes(filter) ||
-        b.ip.includes(filter) ||
+        b.ip.toLowerCase().includes(filter) || (filter && LLDPqIP.key(b.ip) === LLDPqIP.key(filter)) ||
         (b.serial || '').toLowerCase().includes(filter) ||
         (b.role || '').toLowerCase().includes(filter) ||
         (b.inv_status || '').toLowerCase().includes(filter)
@@ -2917,7 +2930,7 @@ function renderBindings() {
         let va = a[bindSortCol] || '';
         let vb = b[bindSortCol] || '';
         if (bindSortCol === 'ip') {
-            return bindSortAsc ? ipToNum(va) - ipToNum(vb) : ipToNum(vb) - ipToNum(va);
+            return LLDPqIP.compare(va, vb) * (bindSortAsc ? 1 : -1);
         }
         if (bindSortCol === 'inv_status') {
             const order = {planned: 0, discovered: 1, active: 2};
@@ -2930,11 +2943,11 @@ function renderBindings() {
 
     // Stats — use discovery cache to show reachability breakdown
     const discByIpStats = {};
-    (allDiscovered || []).forEach(d => { if (d.ip) discByIpStats[d.ip] = d; });
+    (allDiscovered || []).forEach(d => { if (d.ip) discByIpStats[LLDPqIP.key(d.ip)] = d; });
     
     let statActive = 0, statUnreachable = 0, statPlanned = 0, statDiscovered = 0;
     allBindings.forEach(b => {
-        const disc = discByIpStats[b.ip];
+        const disc = discByIpStats[LLDPqIP.key(b.ip)];
         if (disc && disc.device_type === 'provisioned') statActive++;
         else if (disc && disc.device_type === 'not_provisioned') statDiscovered++;
         else if (disc && disc.device_type === 'unreachable') statUnreachable++;
@@ -2942,9 +2955,9 @@ function renderBindings() {
     });
     
     // Count devices in scan but NOT in inventory
-    const invIps = new Set(allBindings.map(b => b.ip));
+    const invIps = new Set(allBindings.map(b => LLDPqIP.key(b.ip)));
     const noBinding = (allDiscovered || []).filter(
-        d => d.ip && !invIps.has(d.ip) && isDiscoveredNotInInventory(d)
+        d => d.ip && !invIps.has(LLDPqIP.key(d.ip)) && isDiscoveredNotInInventory(d)
     ).length;
     
     const parts = [`${filtered.length} of ${allBindings.length} entries`];
@@ -2969,10 +2982,10 @@ function renderBindings() {
 
     // Build discovery lookup from cache (allDiscovered from subnet scan)
     const discByIp = {};
-    (allDiscovered || []).forEach(d => { if (d.ip) discByIp[d.ip] = d; });
+    (allDiscovered || []).forEach(d => { if (d.ip) discByIp[LLDPqIP.key(d.ip)] = d; });
 
     document.getElementById('bindingsBody').innerHTML = filtered.map((b, i) => {
-        const disc = discByIp[b.ip] || {};
+        const disc = discByIp[LLDPqIP.key(b.ip)] || {};
         const isAlive = disc.device_type && disc.device_type !== 'unreachable';
         
         let liveIcon;
@@ -3025,7 +3038,9 @@ function renderBindings() {
         // DHCP checkbox — disabled for entries without valid MAC (DHCP not applicable)
         const hasValidMac = b.mac && b.mac !== '-' && !b.mac.includes('x');
         const dhcpChecked = b.dhcp !== false ? 'checked' : '';
-        const dhcpHtml = hasValidMac
+        const dhcpHtml = LLDPqIP.isIPv6(b.ip)
+            ? '<span style="color:#444;font-size:11px;" title="IPv6 management only — DHCPv6 is not configured">—</span>'
+            : hasValidMac
             ? `<input type="checkbox" ${dhcpChecked} onchange="toggleDhcp('${escAttr(b.hostname)}', this.checked)" style="cursor:pointer;" title="DHCP binding">`
             : `<span style="color:#444;font-size:11px;" title="No MAC — DHCP not applicable">—</span>`;
 
@@ -3083,7 +3098,7 @@ function fillFromDiscovery(hostname, field, value) {
     
     // If filling MAC, also fill serial from discovery if available
     if (field === 'mac') {
-        const disc = (allDiscovered || []).find(d => d.ip === b.ip);
+        const disc = (allDiscovered || []).find(d => LLDPqIP.key(d.ip) === LLDPqIP.key(b.ip));
         if (disc && disc.serial && !b.serial) {
             b.serial = disc.serial;
             showToast(`MAC + Serial filled from discovery`, 'success');
@@ -3092,7 +3107,7 @@ function fillFromDiscovery(hostname, field, value) {
         }
     } else if (field === 'serial') {
         // If filling serial, also fill MAC if available
-        const disc = (allDiscovered || []).find(d => d.ip === b.ip);
+        const disc = (allDiscovered || []).find(d => LLDPqIP.key(d.ip) === LLDPqIP.key(b.ip));
         if (disc && disc.discovered_mac && (!b.mac || b.mac === '-')) {
             b.mac = disc.discovered_mac;
             showToast(`Serial + MAC filled from discovery`, 'success');
@@ -3106,7 +3121,7 @@ function fillFromDiscovery(hostname, field, value) {
 function toggleDhcp(hostname, checked) {
     const b = allBindings.find(x => x.hostname === hostname);
     if (b) {
-        b.dhcp = checked;
+        b.dhcp = LLDPqIP.isIPv6(b.ip) ? false : checked;
         bindingsModified = true;
         document.getElementById('btnSaveBindings').style.display = '';
         document.getElementById('btnDiscardBindings').style.display = '';
@@ -3116,7 +3131,8 @@ function toggleDhcp(hostname, checked) {
 function toggleAllDhcp(checked) {
     allBindings.forEach(b => {
         const hasValidMac = b.mac && b.mac !== '-' && !b.mac.includes('x');
-        if (hasValidMac) b.dhcp = checked;
+        if (LLDPqIP.isIPv6(b.ip)) b.dhcp = false;
+        else if (hasValidMac) b.dhcp = checked;
     });
     bindingsModified = true;
     document.getElementById('btnSaveBindings').style.display = '';
@@ -3407,7 +3423,7 @@ function closeBindingModal() {
 function saveBinding() {
     const hostname = document.getElementById('modalHostname').value.trim();
     let mac = document.getElementById('modalMAC').value.trim().toLowerCase();
-    const ip = document.getElementById('modalIP').value.trim();
+    let ip = document.getElementById('modalIP').value.trim();
     const serial = document.getElementById('modalSerial').value.trim();
     const role = document.getElementById('modalRole').value.trim().toLowerCase();
     const origHostname = document.getElementById('modalOrigHostname').value;
@@ -3429,16 +3445,17 @@ function saveBinding() {
     }
 
     // IP format validation
-    const ipParts = ip.split('.');
-    if (ipParts.length !== 4 || !ipParts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255)) {
-        showToast('Invalid IP format', 'error');
+    const address = LLDPqIP.parse(ip);
+    if (!address) {
+        showToast('Invalid IPv4/IPv6 address. Link-local IPv6 requires %interface, e.g. fe80::1%eth0.', 'error');
         return;
     }
+    ip = address.canonical;
 
     const duplicate = allBindings.find(x =>
         x.hostname !== origHostname && (
             x.hostname.toLowerCase() === hostname.toLowerCase() ||
-            (ip && x.ip === ip) ||
+            (ip && LLDPqIP.key(x.ip) === LLDPqIP.key(ip)) ||
             (mac !== '-' && x.mac && x.mac !== '-' && x.mac.toLowerCase() === mac) ||
             (serial && x.serial && x.serial.toLowerCase() === serial.toLowerCase())
         )
@@ -3453,6 +3470,7 @@ function saveBinding() {
         const idx = allBindings.findIndex(x => x.hostname === origHostname);
         if (idx >= 0) {
             allBindings[idx] = { ...allBindings[idx], hostname, mac, ip, serial, role, commented: false };
+            if (address.version === 6) allBindings[idx].dhcp = false;
         }
     } else {
         // Check duplicate
@@ -3460,7 +3478,7 @@ function saveBinding() {
             showToast(`Hostname "${hostname}" already exists`, 'error');
             return;
         }
-        allBindings.push({ hostname, mac, ip, serial, role, commented: false });
+        allBindings.push({ hostname, mac, ip, serial, role, commented: false, ...(address.version === 6 ? { dhcp: false } : {}) });
     }
 
     // Role is saved to devices.yaml when user clicks Save (via sync_devices),
@@ -3512,7 +3530,7 @@ async function saveBindings() {
         showToast(data.message || 'Saved', 'success');
         loadKnownRoles();
         // Ask if user wants to restart DHCP
-        showConfirmModal('Restart DHCP?',
+        if (data.dhcp_changed !== false) showConfirmModal('Restart DHCP?',
             'Bindings saved successfully.<br><br>Restart DHCP server to apply changes?<br><span style="color:#888;font-size:12px;">Skip if DHCP is not running (e.g. Docker without DHCP).</span>',
             () => _dhcpServiceAction('restart'), 'Restart', 'No');
     } else {
@@ -3706,8 +3724,10 @@ async function exportDiscoveredToDevicesYaml() {
         showToast('No provisioned devices found. Run a scan first.', 'error');
         return;
     }
+    const conflict = discoveredIdentityConflict(allBindings, provisioned);
+    if (conflict) { showToast(conflict, 'error'); return; }
 
-    const inInv = provisioned.filter(d => allBindings.some(b => b.ip === d.ip)).length;
+    const inInv = provisioned.filter(d => allBindings.some(b => sameDiscoveredDevice(b, d))).length;
     const notInInv = provisioned.length - inInv;
 
     let msg = `Export ${provisioned.length} provisioned devices to devices.yaml?<br><br>`;
@@ -3716,20 +3736,22 @@ async function exportDiscoveredToDevicesYaml() {
     msg += `<br><span style="color:#888;font-size:12px;">Adds missing devices to inventory, saves, then rebuilds devices.yaml (grouped by role, sorted by IP).</span>`;
 
     showConfirmModal('Export to devices.yaml', msg, async () => {
+        const conflict = discoveredIdentityConflict(allBindings, provisioned);
+        if (conflict) { showToast(conflict, 'error'); return; }
         // Build a detached candidate. Failed validation/conflict must not
         // leave unsaved rows in the live UI state.
         const candidateBindings = allBindings.map(binding => ({ ...binding }));
         let added = 0;
         for (const d of provisioned) {
-            if (!candidateBindings.some(b => b.ip === d.ip)) {
+            if (!candidateBindings.some(b => sameDiscoveredDevice(b, d))) {
                 candidateBindings.push({
                     hostname: d.hostname,
                     mac: d.discovered_mac || '-',
-                    ip: d.ip,
+                    ip: LLDPqIP.key(d.ip),
                     serial: d.serial || '',
                     role: d.role || '',
                     inv_status: 'active',
-                    dhcp: !!(d.discovered_mac),
+                    dhcp: !LLDPqIP.isIPv6(d.ip) && !!(d.discovered_mac),
                 });
                 added++;
             }
@@ -3766,7 +3788,7 @@ async function runSubnetScan() {
     const btn = document.getElementById('btnScan');
     btn.disabled = true;
     btn.textContent = 'Scanning...';
-    document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="9" class="loading">Scanning subnet: ping + SSH probe + post-provision...</td></tr>';
+    document.getElementById('discoveredBody').innerHTML = '<tr><td colspan="9" class="loading">Scanning targets: ping + SSH probe...</td></tr>';
     
     const data = await apiCall('discovery-start', { apply_post_provision: true });
     if (data.success && data.job) {
@@ -3781,6 +3803,7 @@ async function runSubnetScan() {
 }
 
 function renderPostProvisionBadge(device) {
+    if (LLDPqIP.isIPv6(device.ip)) return '<span class="badge badge-info" style="font-size:10px;" title="IPv6 management only; no provisioning actions">Monitoring</span>';
     const actionLabels = {
         base_config: 'Base Config',
         ztp_disable: 'Disable ZTP',
@@ -3806,6 +3829,7 @@ function renderPostProvisionBadge(device) {
 }
 
 function generatedConfigDeployState(device, configHostnames) {
+    if (LLDPqIP.isIPv6(device.ip)) return { visible: false, enabled: false, reason: 'IPv6 management only; configuration deployment is not supported.' };
     if (!device.hostname || !configHostnames.has(device.hostname)) {
         return { visible: false, enabled: false, reason: '' };
     }
@@ -3877,7 +3901,7 @@ function renderDiscovered() {
             (d.discovered_mac || '').toLowerCase().includes(filter) ||
             (d.serial || '').toLowerCase().includes(filter) ||
             (d.role || '').toLowerCase().includes(filter) ||
-            (d.ip || '').includes(filter)
+            (d.ip || '').toLowerCase().includes(filter) || LLDPqIP.key(d.ip) === LLDPqIP.key(filter)
         );
     }
 
@@ -3886,7 +3910,7 @@ function renderDiscovered() {
         let va = a[discSortCol] || '';
         let vb = b[discSortCol] || '';
         if (discSortCol === 'ip') {
-            return discSortAsc ? ipToNum(va) - ipToNum(vb) : ipToNum(vb) - ipToNum(va);
+            return LLDPqIP.compare(va, vb) * (discSortAsc ? 1 : -1);
         }
         const cmp = String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' });
         return discSortAsc ? cmp : -cmp;
@@ -3938,7 +3962,7 @@ function renderDiscovered() {
         return `<tr>
             <td><strong>${escHtml(d.hostname || '-')}</strong></td>
             <td style="font-family:monospace;font-size:12px;">${dmacHtml}</td>
-            <td style="font-family:monospace;font-size:12px;">${escHtml(d.ip || '-')}</td>
+            <td style="font-family:monospace;font-size:12px;" title="${escHtml(d.source || '')}">${escHtml(d.ip || '-')}</td>
             <td style="font-family:monospace;font-size:11px;color:#aaa;">${escHtml(d.serial || '-')}</td>
             <td>${roleHtml}</td>
             <td>${dtBadge}</td>
@@ -3988,7 +4012,7 @@ function downloadDiscoveredCSV() {
             (d.discovered_mac || '').toLowerCase().includes(searchFilter) ||
             (d.serial || '').toLowerCase().includes(searchFilter) ||
             (d.role || '').toLowerCase().includes(searchFilter) ||
-            (d.ip || '').includes(searchFilter)
+            (d.ip || '').toLowerCase().includes(searchFilter) || LLDPqIP.key(d.ip) === LLDPqIP.key(searchFilter)
         );
     }
 
@@ -3999,7 +4023,7 @@ function downloadDiscoveredCSV() {
 
     // Same column order as Bulk Import: Hostname, MAC, IP, Serial, Role
     const lines = filtered
-        .sort((a, b) => ipToNum(a.ip) - ipToNum(b.ip))
+        .sort((a, b) => LLDPqIP.compare(a.ip, b.ip))
         .map(d => [
             d.hostname || '-',
             d.discovered_mac || '-',
@@ -4019,16 +4043,40 @@ function downloadDiscoveredCSV() {
     showToast(`Downloaded ${filtered.length} devices (filter: ${typeFilter})`, 'success');
 }
 
-function ipToNum(ip) {
-    if (!ip) return 0;
-    const parts = ip.split('.');
-    // Use multiplication instead of bit shift to avoid signed 32-bit overflow for octets >= 128
-    return (+parts[0]) * 16777216 + (+parts[1]) * 65536 + (+parts[2]) * 256 + (+parts[3]);
+function sameDiscoveredDevice(binding, device) {
+    // Keep one management address per device when a dual-stack switch is seen
+    // at both addresses. Never replace the operator's saved address on export.
+    if (binding.ip && device.ip && LLDPqIP.key(binding.ip) === LLDPqIP.key(device.ip)) return true;
+    const knownMac = value => /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(value || '') ? value.toLowerCase() : '';
+    const knownSerial = value => value && value !== '-' ? String(value).trim().toLowerCase() : '';
+    const savedMac = knownMac(binding.mac), liveMac = knownMac(device.discovered_mac);
+    const savedSerial = knownSerial(binding.serial), liveSerial = knownSerial(device.serial);
+    // Factory hostnames are not unique. Contradictory physical identities must
+    // surface as a conflict instead of silently dropping a discovered device.
+    if ((savedMac && liveMac && savedMac !== liveMac) || (savedSerial && liveSerial && savedSerial !== liveSerial)) return false;
+    return !!((savedMac && savedMac === liveMac) || (savedSerial && savedSerial === liveSerial) ||
+        (binding.hostname && device.hostname && binding.hostname.toLowerCase() === device.hostname.toLowerCase()));
+}
+
+function discoveredIdentityConflict(bindings, discovered) {
+    const candidates = bindings.map(binding => ({ ...binding }));
+    for (const device of discovered) {
+        const named = candidates.find(binding => binding.hostname && device.hostname &&
+            binding.hostname.toLowerCase() === device.hostname.toLowerCase());
+        if (named && !sameDiscoveredDevice(named, device)) {
+            return `Cannot export "${device.hostname}": ${named.ip} and ${device.ip} have conflicting MAC or serial identities. Assign distinct hostnames before exporting.`;
+        }
+        if (!candidates.some(binding => sameDiscoveredDevice(binding, device))) {
+            candidates.push({ hostname: device.hostname, ip: device.ip, mac: device.discovered_mac, serial: device.serial });
+        }
+    }
+    return '';
 }
 
 function filterDiscovered() { renderDiscovered(); }
 
 async function deployGeneratedConfig(hostname, ip) {
+    if (LLDPqIP.isIPv6(ip)) { showToast('IPv6 devices support management and discovery only.', 'error'); return; }
     showConfirmModal('Re-deploy NVUE Config',
         `Re-deploy the saved NVUE config to <strong>${escHtml(hostname)}</strong> (${escHtml(ip)})?<br><br>` +
         `This will run:<br>` +
@@ -5047,6 +5095,7 @@ let upgradeDevices = [];
 let upgradeSelected = new Set();
 function upgradeSetSel(ip, checked) {
     if (!ip) return;
+    if (LLDPqIP.isIPv6(ip)) { upgradeSelected.delete(ip); return; }
     if (checked) upgradeSelected.add(ip); else upgradeSelected.delete(ip);
 }
 let upgradeImages = [];
@@ -5190,7 +5239,7 @@ function selectedUpgradeDevices() {
     return Array.from(document.querySelectorAll('.upgrade-dev-cb:checked')).map(cb => {
         const idx = parseInt(cb.dataset.index, 10);
         return upgradeDevices[idx];
-    }).filter(Boolean);
+    }).filter(device => device && !LLDPqIP.isIPv6(device.ip));
 }
 
 function upgradeSelectAll(checked) {
@@ -5211,22 +5260,11 @@ function toggleUpgradeRow(index) {
 let upgradeSortCol = 'hostname';
 let upgradeSortDir = 1;
 
-function ipSortKey(ip) {
-    if (!ip) return [0, 0, 0, 0];
-    const parts = String(ip).split('.').map(p => parseInt(p, 10) || 0);
-    while (parts.length < 4) parts.push(0);
-    return parts;
-}
-
 function compareUpgradeRows(a, b) {
     const col = upgradeSortCol;
     let av, bv;
     if (col === 'ip') {
-        const ai = ipSortKey(a.ip), bi = ipSortKey(b.ip);
-        for (let k = 0; k < 4; k++) {
-            if (ai[k] !== bi[k]) return (ai[k] - bi[k]) * upgradeSortDir;
-        }
-        return 0;
+        return LLDPqIP.compare(a.ip, b.ip) * upgradeSortDir;
     }
     if (col === 'startup_config') {
         av = a.startup_config ? 1 : 0;
@@ -5269,13 +5307,15 @@ function renderUpgradeTable(job = null) {
         const merged = Object.assign({}, d, jd || {});
         const current = merged.current_version || '';
         const already = target && current === target;
-        const candidate = merged.reachable && !already;
-        const status = merged.status || (already ? 'already' : (merged.reachable ? 'candidate' : 'unreachable'));
+        const monitorOnly = LLDPqIP.isIPv6(merged.ip);
+        const candidate = !monitorOnly && merged.reachable && !already;
+        const status = monitorOnly ? 'monitoring only' : merged.status || (already ? 'already' : (merged.reachable ? 'candidate' : 'unreachable'));
         return Object.assign(merged, {
             target_version: target,
             status,
             candidate,
             already,
+            ...(monitorOnly ? { message: 'IPv6 devices support management and discovery only.' } : {}),
         });
     });
     rows.sort(compareUpgradeRows);
@@ -5320,6 +5360,7 @@ async function runUpgradePrecheck() {
 }
 
 function getUpgradePayload(devices) {
+    if (devices.some(device => LLDPqIP.isIPv6(device.ip))) { showToast('IPv6 devices support management and discovery only.', 'error'); return null; }
     const imageName = document.getElementById('upgradeImage').value;
     const targetVersion = document.getElementById('upgradeTargetVersion').value.trim();
     const serverIp = document.getElementById('upgradeServerIP').value.trim();
@@ -5433,6 +5474,7 @@ let bcDeviceGroups = {};
 let bcSelected = new Set();
 function bcSetSel(ip, checked) {
     if (!ip) return;
+    if (LLDPqIP.isIPv6(ip)) { bcSelected.delete(ip); return; }
     if (checked) bcSelected.add(ip); else bcSelected.delete(ip);
 }
 
@@ -5475,7 +5517,7 @@ function renderBCDeviceList() {
                 <div id="bcd-${groupId}" style="display:none;">
                     ${filtered.map(d => `
                         <label style="display:flex; align-items:center; gap:8px; padding:4px 10px 4px 28px; cursor:pointer; font-size:12px; transition:background 0.1s;" onmouseover="this.style.background='#2a2a2a'" onmouseout="this.style.background=''">
-                            <input type="checkbox" class="bc-dev-cb" data-ip="${escHtml(d.ip)}" data-hostname="${escHtml(d.hostname)}" data-username="${escHtml(d.username || 'cumulus')}" data-group="${groupId}" ${bcSelected.has(d.ip) ? 'checked' : ''} style="accent-color:#76b900; width:13px; height:13px;" onchange="bcSetSel(this.dataset.ip, this.checked); bcUpdateCounts()">
+                            <input type="checkbox" class="bc-dev-cb" data-ip="${escHtml(d.ip)}" data-hostname="${escHtml(d.hostname)}" data-username="${escHtml(d.username || 'cumulus')}" data-group="${groupId}" ${LLDPqIP.isIPv6(d.ip) ? 'disabled title="IPv6 management only"' : (bcSelected.has(d.ip) ? 'checked' : '')} style="accent-color:#76b900; width:13px; height:13px;" onchange="bcSetSel(this.dataset.ip, this.checked); bcUpdateCounts()">
                             <span style="flex:1; color:#d4d4d4;">${escHtml(d.hostname)}</span>
                             <span style="color:#666; font-family:monospace; font-size:11px;">${escHtml(d.ip)}</span>
                         </label>
@@ -5497,12 +5539,12 @@ function bcToggleGroup(groupId) {
 
 function bcToggleGroupDevices(groupId) {
     const groupCb = document.getElementById('bcg-' + groupId);
-    document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]`).forEach(cb => { cb.checked = groupCb.checked; bcSetSel(cb.dataset.ip, cb.checked); });
+    document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]`).forEach(cb => { if (!cb.disabled) { cb.checked = groupCb.checked; bcSetSel(cb.dataset.ip, cb.checked); } });
     bcUpdateCounts();
 }
 
 function bcSelectAll(checked) {
-    document.querySelectorAll('.bc-dev-cb').forEach(cb => { cb.checked = checked; bcSetSel(cb.dataset.ip, checked); });
+    document.querySelectorAll('.bc-dev-cb').forEach(cb => { if (!cb.disabled) { cb.checked = checked; bcSetSel(cb.dataset.ip, checked); } });
     document.querySelectorAll('[id^="bcg-"]').forEach(cb => cb.checked = checked);
     bcUpdateCounts();
 }
@@ -5515,10 +5557,11 @@ function bcUpdateCounts() {
     // Update group checkboxes
     for (const role of Object.keys(bcDeviceGroups)) {
         const groupId = role.replace(/[^a-zA-Z0-9]/g, '_');
-        const groupCbs = document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]`);
-        const groupChecked = document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]:checked`);
+        const groupCbs = document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]:not(:disabled)`);
+        const groupChecked = document.querySelectorAll(`.bc-dev-cb[data-group="${groupId}"]:checked:not(:disabled)`);
         const gcb = document.getElementById('bcg-' + groupId);
         if (gcb) {
+            gcb.disabled = groupCbs.length === 0;
             gcb.checked = groupCbs.length > 0 && groupChecked.length === groupCbs.length;
             gcb.indeterminate = groupChecked.length > 0 && groupChecked.length < groupCbs.length;
         }
@@ -5533,6 +5576,11 @@ async function deployBaseConfig() {
         hostname: cb.dataset.hostname,
         username: cb.dataset.username
     }));
+
+    if (selectedDevices.some(device => LLDPqIP.isIPv6(device.ip))) {
+        showToast('IPv6 devices support management and discovery only.', 'error');
+        return;
+    }
 
     if (selectedDevices.length === 0) {
         showToast('Select at least one device', 'error');

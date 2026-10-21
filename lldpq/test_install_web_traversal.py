@@ -197,6 +197,10 @@ class WebReadProofTests(unittest.TestCase):
     def test_the_parser_readability_is_verified_as_the_web_user(self) -> None:
         _require('sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/parse_devices.py"')
 
+    def test_the_shared_address_helper_is_readable_by_the_web_user(self) -> None:
+        self.assertTrue((ROOT / "lldpq" / "addressing.py").is_file())
+        _require('sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/addressing.py"')
+
     def test_a_failed_proof_stops_the_installer(self) -> None:
         start = _require(
             'sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/parse_devices.py"'

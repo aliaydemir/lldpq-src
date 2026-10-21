@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from pathlib import Path
 import tempfile
 import textwrap
@@ -19,6 +20,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lldpq"))
 PROVISION_API = (ROOT / "html" / "provision-api.sh").read_text(encoding="utf-8")
 _BODY = PROVISION_API[
     PROVISION_API.index("python3 << 'PYTHON_SCRIPT'\n"):

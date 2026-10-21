@@ -471,6 +471,42 @@ class DevicesYamlRoleTests(unittest.TestCase):
         self.assertNotIn("dgx", result["yaml"])
         self.assertEqual(sorted(result["skipped"]), ["gb300-1-1-dgx-01", "pdu-a1"])
 
+    def test_quoted_and_scoped_ipv6_do_not_disappear_from_existing_devices_diff(self):
+        existing = (
+            "defaults:\n"
+            "  # Keep the configured collection account.\n"
+            "  username: admin\n\n"
+            "devices:\n"
+            "  \"2001:0DB8:0:0:0:0:0:10\": spine-01 @spine\n"
+            "  'fe80::1%eth0':\n"
+            "    hostname: leaf-01\n"
+            "    role: leaf\n"
+            "  fe80::1%eth1: leaf-02 @leaf\n"
+            "  192.0.2.10: leaf-03 @leaf\n"
+        )
+        ipam = {"fabric": [
+            {"hostname": "spine-01", "role": "spine", "mgmt_ip": "2001:db8::10"},
+            {"hostname": "leaf-01", "role": "leaf", "mgmt_ip": "FE80:0:0:0:0:0:0:1%eth0"},
+            {"hostname": "leaf-02", "role": "leaf", "mgmt_ip": "fe80::1%eth1"},
+            {"hostname": "leaf-03", "role": "leaf", "mgmt_ip": "192.0.2.10"},
+        ]}
+        result = ai_generate.ipam_to_devices_yaml(ipam, existing_yaml=existing)
+        self.assertEqual(result["diff"], {"added": [], "removed": [], "changed": []})
+        self.assertIn("  # Keep the configured collection account.\n  username: admin\n", result["yaml"])
+        self.assertIn('  "2001:db8::10": spine-01 @spine', result["yaml"])
+        self.assertIn('  "fe80::1%eth0": leaf-01 @leaf', result["yaml"])
+        self.assertIn("  192.0.2.10: leaf-03 @leaf", result["yaml"])
+        # Generated IPv6 keys round-trip through the same existing-file reader.
+        again = ai_generate.ipam_to_devices_yaml(ipam, existing_yaml=result["yaml"])
+        self.assertEqual(again["diff"], {"added": [], "removed": [], "changed": []})
+
+    def test_removed_quoted_ipv6_is_visible_in_diff(self):
+        result = ai_generate.ipam_to_devices_yaml(
+            {"fabric": []}, existing_yaml='devices:\n  "2001:db8::1": spine-01 @spine\n')
+        self.assertEqual(result["diff"]["removed"], [
+            {"ip": "2001:db8::1", "hostname": "spine-01", "role": "spine"},
+        ])
+
 
 if __name__ == "__main__":
     unittest.main()

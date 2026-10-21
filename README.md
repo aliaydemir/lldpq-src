@@ -1021,6 +1021,26 @@ roles are optional tags for grouping. They are used for:
 
 Recommended roles: `leaf`, `spine`, `core`, `border`, `oob` (or any naming that fits your topology).
 
+IPv4 and IPv6 management addresses can coexist in the same inventory. Keep one
+selected management address per hostname; IPv4/IPv6 automatic failover is not
+implemented. Quote IPv6 YAML keys:
+
+```yaml
+devices:
+  192.0.2.10: OOB-01 @oob
+  "2001:db8:100::11": OOB-02 @oob
+  "fe80::12%eth0": OOB-03 @oob
+```
+
+Link-local IPv6 requires the interface on the **LLDPq collector** (or inside its
+container), such as `%eth0`. The collector must already have IPv6 connectivity
+to the switches. Equivalent IPv6 spellings are normalized and duplicate
+addresses are rejected. Existing IPv4 and SSH hostname entries remain supported.
+IPv6 support covers management connections, collection, Console, Inventory and
+Discover. IPv6 Inventory entries are monitoring-only: DHCPv6, ZTP, Base Config
+deployment and OS upgrades over IPv6 are not included. IPv6 route/path analysis
+and inbound IPv6 telemetry listeners are outside this first stage.
+
 ### tracking.yaml format
 
 ```yaml
@@ -1952,6 +1972,14 @@ Additional indicators identify MAC mismatches and reachable addresses with no
 inventory binding. Results load from a persistent cache; **Scan** starts an
 immediate full scan. Automatic scanning is configurable as Off, 3, 5, 10, or
 15 minutes, with 5 minutes (`SCAN_INTERVAL=300`) as the default.
+
+The discovery range accepts comma-separated IPv4/IPv6 addresses, bounded ranges
+and small CIDRs, for example
+`192.0.2.10-192.0.2.20,2001:db8:100::10-2001:db8:100::20,2001:db8:200::/126`.
+Expansion is limited to 1500 targets before scanning; an IPv6 `/64` is rejected.
+IPv6 probes use ICMPv6, TCP/22, SSH and NDP where available. A stale NDP entry
+alone does not mark a device reachable. Importing an IPv6 discovery result into
+Inventory keeps DHCP disabled and does not run post-provision actions.
 
 The Discover tab also owns the discovery IP range and the independent
 post-provision toggles for Base Config, ZTP disable, and hostname assignment.

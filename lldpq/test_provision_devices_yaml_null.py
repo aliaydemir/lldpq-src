@@ -49,6 +49,7 @@ import yaml as pyyaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lldpq"))
 PROVISION_API = (ROOT / "html" / "provision-api.sh").read_text(encoding="utf-8")
 
 _BODY = PROVISION_API[

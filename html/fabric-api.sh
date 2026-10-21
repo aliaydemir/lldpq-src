@@ -10014,14 +10014,7 @@ ALLOWED_PATTERNS = [
     # ethtool variants
     r'^(sudo )?(/sbin/)?ethtool( -(m|S|i))? [A-Za-z0-9_.:-]+$',
     # IP/network commands
-    r'^ip (?:-br |--brief )?link\b',
-    r'^ip (?:-br |--brief )?addr\b',
-    r'^ip (?:-br |--brief )?route\b',
-    r'^ip (?:-br |--brief )?neigh\b',
-    r'^sudo ip (?:-br |--brief )?link\b',
-    r'^sudo ip (?:-br |--brief )?addr\b',
-    r'^sudo ip (?:-br |--brief )?route\b',
-    r'^sudo ip (?:-br |--brief )?neigh\b',
+    r'^(?:sudo )?ip (?:(?:-4|-6|-br|--brief) )*(?:link|addr|route|neigh)\b',
     r'^/sbin/bridge fdb\b',
     r'^/sbin/bridge vlan\b',
     r'^bridge fdb\b',
@@ -10299,8 +10292,8 @@ def validate_ip_command(tokens):
     if len(tokens) < 2 or tokens[0] != 'ip':
         return False
     index = 1
-    # An optional brief flag may precede the subcommand (e.g. ip -br addr show).
-    if tokens[index] in {'-br', '--brief'}:
+    # Address-family and brief flags may precede the read-only subcommand.
+    while index < len(tokens) and tokens[index] in {'-4', '-6', '-br', '--brief'}:
         index += 1
     if len(tokens) <= index:
         return False

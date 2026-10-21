@@ -489,7 +489,8 @@ def _parse_existing_devices(text):
     defaults_lines = []
     devices = []
     section = None
-    ip_re = re.compile(r"^\s*([0-9a-fA-F:.]+)\s*:\s*(.*)$")
+    ip_re = re.compile(
+        r'''^\s*(?:"([^"]+)"|'([^']+)'|([0-9a-fA-F:.]+(?:%[A-Za-z0-9_.-]+)?))\s*:\s*(.*)$''')
     cur_block = None
 
     def flush_block():
@@ -523,10 +524,11 @@ def _parse_existing_devices(text):
             if not stripped:
                 continue
             match = ip_re.match(line)
-            if match and _is_ip(match.group(1)):
+            address = next((part for part in match.groups()[:3] if part is not None), '') if match else ''
+            if match and _is_ip(address):
                 flush_block()
-                cur_block = {"ip": match.group(1), "hostname": "", "role": ""}
-                rest = match.group(2).strip()
+                cur_block = {"ip": str(ipaddress.ip_address(address)), "hostname": "", "role": ""}
+                rest = match.group(4).strip()
                 if rest:
                     host, role = _split_host_role(rest)
                     cur_block["hostname"] = host
@@ -588,6 +590,7 @@ def ipam_to_devices_yaml(ipam, existing_yaml=None):
         if not mgmt_ip or not _is_ip(mgmt_ip):
             skipped.append(hostname)
             continue
+        mgmt_ip = str(ipaddress.ip_address(mgmt_ip))
         key = hostname.casefold()
         if key in seen_hosts:
             continue
@@ -613,7 +616,8 @@ def ipam_to_devices_yaml(ipam, existing_yaml=None):
     out.append("")
     for entry in entries:
         role_suffix = " @%s" % entry["role"] if entry["role"] else ""
-        out.append("  %s: %s%s" % (entry["ip"], entry["hostname"], role_suffix))
+        address = json.dumps(entry["ip"]) if ':' in entry["ip"] else entry["ip"]
+        out.append("  %s: %s%s" % (address, entry["hostname"], role_suffix))
     yaml_text = "\n".join(out) + "\n"
 
     diff = _devices_diff(existing_devices, entries)
@@ -622,9 +626,10 @@ def ipam_to_devices_yaml(ipam, existing_yaml=None):
 
 def _ip_sort_key(ip):
     try:
-        return (0, int(ipaddress.ip_address(ip)))
+        address = ipaddress.ip_address(ip)
+        return (0, address.version, int(address), getattr(address, 'scope_id', '') or '')
     except ValueError:
-        return (1, ip)
+        return (1, 0, 0, ip)
 
 
 def _devices_diff(existing, generated):

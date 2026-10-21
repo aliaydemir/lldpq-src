@@ -1819,9 +1819,14 @@ def load_authorized_targets():
         if raw_ip in ('defaults', 'endpoint_hosts'):
             continue
         try:
-            ip = str(ipaddress.IPv4Address(str(raw_ip)))
-        except ipaddress.AddressValueError as exc:
+            address = ipaddress.ip_address(str(raw_ip))
+        except ValueError as exc:
             raise ValueError(f'invalid devices.yaml IP: {raw_ip}') from exc
+        # IPv6 entries are monitoring targets, outside the IPv4-only legacy
+        # upgrade workflow. Their presence must not block an existing update.
+        if address.version != 4:
+            continue
+        ip = str(address)
         if isinstance(info, dict):
             hostname = str(info.get('hostname', ip)).strip()
             username = str(info.get('username', default_username)).strip()
@@ -1852,9 +1857,12 @@ def load_authorized_targets():
         if not raw_ip:
             continue
         try:
-            ip = str(ipaddress.IPv4Address(raw_ip))
-        except ipaddress.AddressValueError as exc:
+            address = ipaddress.ip_address(raw_ip)
+        except ValueError as exc:
             raise ValueError('inventory.json contains an invalid IP') from exc
+        if address.version != 4:
+            continue
+        ip = str(address)
         hostname = str(binding.get('hostname', '')).strip()
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
             raise ValueError(f'invalid inventory hostname for {ip}')
@@ -5577,6 +5585,11 @@ if ! sudo -u www-data test -x "$LLDPQ_INSTALL_DIR" || \
    ! sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/parse_devices.py"; then
     echo "[!] www-data cannot read $LLDPQ_INSTALL_DIR/parse_devices.py" >&2
     echo "    Setup would report: Canonical device parser is missing" >&2
+    exit 1
+fi
+if ! sudo -u www-data test -r "$LLDPQ_INSTALL_DIR/addressing.py"; then
+    echo "[!] www-data cannot read $LLDPQ_INSTALL_DIR/addressing.py" >&2
+    echo "    Setup and discovery require the shared address helper" >&2
     exit 1
 fi
 _web_write_probe="$LLDPQ_INSTALL_DIR/.lldpq-web-write-probe"

@@ -464,7 +464,7 @@ def fabric_owned_addresses():
                     continue
                 addr = str(raw).split('/')[0].strip()
                 try:
-                    ipaddress.ip_address(addr)
+                    addr = str(ipaddress.ip_address(addr))
                 except ValueError:
                     continue
                 owned.setdefault(addr, 'VLAN %s %s' % (vlan_id, key))
@@ -483,7 +483,11 @@ def warn_on_fabric_owned_addresses(design):
         hostname = (host or {}).get('hostname') or '(unnamed)'
         for assignment in (host or {}).get('assignments') or []:
             addr = (assignment or {}).get('ip')
-            role = owned.get(addr)
+            try:
+                address_key = str(ipaddress.ip_address(str(addr).strip()))
+            except ValueError:
+                continue
+            role = owned.get(address_key)
             if role:
                 collisions.append('%s %s (%s) is %s' % (
                     hostname,
@@ -768,17 +772,17 @@ def validate_ipam(data):
                            'message': '%s has no mgmt_ip (record is skipped by the devices.yaml generator)' % host})
             continue
         try:
-            ipaddress.ip_address(mgmt_ip)
+            address_key = str(ipaddress.ip_address(mgmt_ip))
         except ValueError:
             issues.append({'severity': 'error', 'kind': 'invalid-mgmt-ip',
                            'message': '%s has an invalid mgmt_ip: %s' % (host, mgmt_ip)})
             continue
-        owner = ip_owner.get(mgmt_ip)
+        owner = ip_owner.get(address_key)
         if owner and owner.casefold() != key:
             issues.append({'severity': 'error', 'kind': 'duplicate-mgmt-ip',
                            'message': 'mgmt_ip %s is assigned to both %s and %s' % (mgmt_ip, owner, host)})
         else:
-            ip_owner[mgmt_ip] = host
+            ip_owner[address_key] = host
     counts = {
         'subnets': len(data.get('subnets', [])),
         'hosts': len(data.get('hosts', [])),
