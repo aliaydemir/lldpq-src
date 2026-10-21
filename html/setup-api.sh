@@ -113,7 +113,8 @@ POST_DATA_FILE=$(mktemp /tmp/lldpq-setup-request.XXXXXX) || {
     exit 0
 }
 trap 'rm -f "$POST_DATA_FILE"' EXIT
-MAX_JSON_BYTES=33554432
+# A 32 MiB portable bundle expands to about 43 MiB in base64 JSON.
+MAX_JSON_BYTES=67108864
 if [ -n "$CONTENT_LENGTH" ]; then
     if ! [[ "$CONTENT_LENGTH" =~ ^[0-9]+$ ]] || [ "${#CONTENT_LENGTH}" -gt 10 ]; then
         echo '{"success": false, "error": "Invalid Content-Length"}'
@@ -121,7 +122,7 @@ if [ -n "$CONTENT_LENGTH" ]; then
     fi
     CONTENT_LENGTH_NUM=$((10#$CONTENT_LENGTH))
     if [ "$CONTENT_LENGTH_NUM" -gt "$MAX_JSON_BYTES" ]; then
-        echo '{"success": false, "error": "JSON request exceeds the 32 MiB limit"}'
+        echo '{"success": false, "error": "JSON request exceeds the 64 MiB limit"}'
         exit 0
     fi
     head -c "$CONTENT_LENGTH_NUM" > "$POST_DATA_FILE" 2>/dev/null
@@ -134,7 +135,7 @@ else
     head -c $((MAX_JSON_BYTES + 1)) > "$POST_DATA_FILE" 2>/dev/null
     READ_SIZE=$(wc -c < "$POST_DATA_FILE" 2>/dev/null | tr -d ' ')
     if [ "${READ_SIZE:-0}" -gt "$MAX_JSON_BYTES" ]; then
-        echo '{"success": false, "error": "JSON request exceeds the 32 MiB limit"}'
+        echo '{"success": false, "error": "JSON request exceeds the 64 MiB limit"}'
         exit 0
     fi
 fi
@@ -804,15 +805,15 @@ def read_private_request_json():
     try:
         os.unlink(path)
         with os.fdopen(descriptor, 'rb') as source:
-            raw = source.read(33554433)
+            raw = source.read(67108865)
     except Exception:
         try:
             os.close(descriptor)
         except OSError:
             pass
         raise
-    if len(raw) > 33554432:
-        raise ValueError('JSON request exceeds the 32 MiB limit')
+    if len(raw) > 67108864:
+        raise ValueError('JSON request exceeds the 64 MiB limit')
     def reject_duplicate_keys(pairs):
         result = {}
         seen = {}

@@ -46,14 +46,6 @@ if [ "$METHOD" = "GET" ]; then
     fi
     
 elif [ "$METHOD" = "POST" ]; then
-    # Read POST data from stdin
-    # Use dd for reliable reading with CONTENT_LENGTH, fallback to cat
-    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-        POST_DATA=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
-    else
-        POST_DATA=$(cat)
-    fi
-    
     if [ ! -f "$SETUP_SAFETY" ]; then
         echo '{"success": false, "error": "Setup safety helper is missing; repair the installation"}'
         exit 0
@@ -64,7 +56,9 @@ elif [ "$METHOD" = "POST" ]; then
     if [ -f "$LLDPQ_DIR/topology_edges.py" ]; then
         ARGS+=(--topology-parser "$LLDPQ_DIR/topology_edges.py")
     fi
-    RESULT=$(printf '%s' "$POST_DATA" | sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c 'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
+    # Pass the FastCGI request stream straight to the helper's bounded reader.
+    # Byte-at-a-time dd and a shell copy made large topologies needlessly slow.
+    RESULT=$(sudo -n -H -u "$LLDPQ_USER" /usr/bin/bash -c 'exec python3 "$@"' -- "${ARGS[@]}" 2>/dev/null)
     if [ -z "$RESULT" ]; then
         echo '{"success": false, "error": "Failed to validate or atomically save topology.dot"}'
     else

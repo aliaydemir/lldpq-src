@@ -2547,14 +2547,26 @@
             }
             return 'Error: ' + ((data && data.error) || 'Topology save failed');
         }
+
+        async function readEditorResponse(response) {
+            const parsed = await response.json().catch(() => null);
+            const data = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+            if (!response.ok || !data) {
+                const fallback = response.status === 413
+                    ? 'HTTP 413: The request exceeds the server upload limit. Your editor content has been kept.'
+                    : 'HTTP ' + response.status + ': The server could not complete the request.';
+                return { ...(data || {}), success: false, error: (data && data.error) || fallback };
+            }
+            return data;
+        }
         
         function openTopologyEditor() {
             topologyRevision = null;
             document.getElementById('topologyEditorModal').style.display = 'flex';
             document.getElementById('topologyEditorStatus').textContent = 'Loading...';
             
-            fetch('/edit-topology')
-                .then(response => response.json())
+            return fetch('/edit-topology')
+                .then(readEditorResponse)
                 .then(data => {
                     if (data.success) {
                         rememberTopologyRevision(data);
@@ -2576,7 +2588,7 @@
                         document.getElementById('topologyEditorStatus').textContent = 'Loaded successfully. Edit and save.';
                         resetReplacePanel();
                     } else {
-                        document.getElementById('topologyEditorStatus').textContent = 'Error: ' + data.error;
+                        document.getElementById('topologyEditorStatus').textContent = 'Error: ' + (data.error || 'Topology load failed');
                     }
                 })
                 .catch(err => {
@@ -2673,12 +2685,12 @@
             }
             document.getElementById('topologyEditorStatus').textContent = 'Saving...';
             
-            fetch('/edit-topology', {
+            return fetch('/edit-topology', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(topologySavePayload(content))
             })
-            .then(response => response.json())
+            .then(readEditorResponse)
             .then(data => {
                 if (data.success) {
                     rememberTopologyRevision(data);
@@ -2704,12 +2716,12 @@
             }
             document.getElementById('topologyEditorStatus').textContent = 'Saving...';
             
-            fetch('/edit-topology', {
+            return fetch('/edit-topology', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(topologySavePayload(content))
             })
-            .then(response => response.json())
+            .then(readEditorResponse)
             .then(data => {
                 if (data.success) {
                     rememberTopologyRevision(data);

@@ -34,6 +34,18 @@ class BackupImportError(RuntimeError):
     """A bundle could not be validated, committed, or rolled back safely."""
 
 
+# Keep these aligned with Setup's editor limits. This helper is also installed
+# standalone for privileged recovery, so it must not import the web application.
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
+MAX_TOPOLOGY_BYTES = 10 * 1024 * 1024
+MAX_BUNDLE_BYTES = 32 * 1024 * 1024
+MAX_EXPANDED_BUNDLE_BYTES = 32 * 1024 * 1024
+
+
+def _config_size_limit(name):
+    return MAX_TOPOLOGY_BYTES if name == "topology.dot" else MAX_CONFIG_BYTES
+
+
 def _load_bmc_support(lldpq_dir):
     """Load the installed canonical validator, including for the standalone helper."""
     path = os.path.join(lldpq_dir, "bmc_config.py")
@@ -232,11 +244,12 @@ def validate_display_aliases(value):
     return normalized
 
 
-def collect_managed_config_files(wanted, managed_roots, *, max_size=2 * 1024 * 1024):
+def collect_managed_config_files(wanted, managed_roots, *, max_size=None):
     """Read config links as stable regular-file bytes, confined to managed roots."""
     roots = tuple(os.path.realpath(root) for root in managed_roots)
     collected = []
     for archive_name, base_dir in wanted:
+        size_limit = _config_size_limit(archive_name) if max_size is None else max_size
         logical_path = os.path.join(base_dir, archive_name)
         if not os.path.lexists(logical_path):
             continue
@@ -263,16 +276,16 @@ def collect_managed_config_files(wanted, managed_roots, *, max_size=2 * 1024 * 1
                     raise BackupImportError(
                         f"Backup source is not a regular file: {logical_path}"
                     )
-                if before.st_size > max_size:
+                if before.st_size > size_limit:
                     raise BackupImportError(
                         f"Backup source is too large: {archive_name}"
                     )
-                content = handle.read(max_size + 1)
+                content = handle.read(size_limit + 1)
                 after = os.fstat(handle.fileno())
         except Exception:
             # os.fdopen owns and closes descriptor once construction succeeds.
             raise
-        if len(content) > max_size:
+        if len(content) > size_limit:
             raise BackupImportError(f"Backup source is too large: {archive_name}")
         if (
             len(content) != after.st_size
@@ -1790,7 +1803,9 @@ def _validate_project_topology_dot(text, staged_path):
     if dot:
         try:
             checked = subprocess.run(
-                [dot, "-Tdot", staged_path, "-o", os.devnull],
+                # Syntax validation needs no graph layout; layout of large
+                # topologies can exceed the timeout despite valid DOT input.
+                [dot, "-Tcanon", staged_path, "-o", os.devnull],
                 capture_output=True,
                 text=True,
                 timeout=15,
@@ -2165,7 +2180,7 @@ def validate_config_for_bundle(name, content, *, lldpq_dir):
         raise BackupImportError(f"Unsupported managed backup config: {name}")
     if not isinstance(content, bytes):
         raise BackupImportError(f"Backup config must be bytes: {name}")
-    if len(content) > 2 * 1024 * 1024:
+    if len(content) > _config_size_limit(name):
         raise BackupImportError(f"Backup config is too large: {name}")
     with tempfile.TemporaryDirectory(prefix="lldpq-export-validate-") as validation_dir:
         _validate_config(name, content, validation_dir, lldpq_dir)
@@ -2360,13 +2375,13 @@ def _parse_bundle(raw, allowed, key_names, pref_keys, validate_cron, lldpq_dir):
                 if name in recognized_names:
                     raise BackupImportError(f"Duplicate backup entry: {name}")
                 recognized_names.add(name)
-                if member.size < 0 or member.size > 2 * 1024 * 1024:
+                if member.size < 0 or member.size > _config_size_limit(name):
                     raise BackupImportError(f"Backup entry is too large: {name}")
                 total_size += member.size
-                # Six managed configs, portable preferences and four possible
-                # SSH key members can each legally reach the 2 MiB entry cap.
-                # Keep import at least as permissive as bundles export can make.
-                if total_size > 20 * 1024 * 1024:
+                # Seven managed configs include a 10 MiB topology. Allow their
+                # aggregate plus preferences and keys without raising the
+                # individual limits for unrelated configuration files.
+                if total_size > MAX_EXPANDED_BUNDLE_BYTES:
                     raise BackupImportError("Expanded backup bundle is too large")
                 extracted = archive.extractfile(member)
                 if extracted is None:
@@ -2593,7 +2608,7 @@ def restore_bundle(
         raw = base64.b64decode(encoded_data, validate=True)
     except (ValueError, binascii.Error) as exc:
         raise BackupImportError("Invalid file (not base64)") from exc
-    if len(raw) > 16 * 1024 * 1024:
+    if len(raw) > MAX_BUNDLE_BYTES:
         raise BackupImportError("Backup bundle is too large")
 
     try:

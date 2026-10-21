@@ -30,13 +30,19 @@ from typing import Optional
 
 
 MAX_CONFIG_BYTES = 2 * 1024 * 1024
+MAX_TOPOLOGY_BYTES = 10 * 1024 * 1024
+# JSON can expand a UTF-8 control byte into six ASCII bytes (e.g. \\u0009).
+# Leave room for that worst-case encoding plus the revision/envelope fields.
+MAX_TOPOLOGY_REQUEST_BYTES = 64 * 1024 * 1024
 # Managed files nginx serves to the browser as static assets. They must stay
 # world-readable across a Setup save; devices.yaml/notifications.yaml are NOT
 # here because they may legitimately be group-only (0640) to protect secrets.
 WEB_SERVED_BASENAMES = frozenset(
     {"topology.dot", "topology_config.yaml", "display-aliases.json"}
 )
-MAX_DIRECT_MOUNT_JOURNAL_BYTES = 4 * 1024 * 1024
+# A topology recovery snapshot stores the original bytes as base64, so its
+# durable journal must accommodate more than the 10 MiB source-file limit.
+MAX_DIRECT_MOUNT_JOURNAL_BYTES = 16 * 1024 * 1024
 DIRECT_MOUNT_JOURNAL_VERSION = 1
 DIRECT_MOUNT_JOURNAL_ROOT = os.environ.get(
     "LLDPQ_DIRECT_WRITE_STATE_DIR",
@@ -352,7 +358,9 @@ def validate_topology_dot(content: str, topology_parser_path: str = None) -> Non
         with os.fdopen(fd, "w", encoding="utf-8") as target:
             target.write(content)
         result = subprocess.run(
-            [dot, "-Tdot", candidate, "-o", os.devnull],
+            # Canonical DOT validates Graphviz syntax without computing a
+            # layout, whose cost grows sharply for large topology graphs.
+            [dot, "-Tcanon", candidate, "-o", os.devnull],
             capture_output=True,
             text=True,
             timeout=15,
@@ -718,6 +726,19 @@ def _require_managed_target(path: str, managed_roots) -> None:
         raise SetupSafetyError("Configuration link points outside managed LLDPq directories")
 
 
+def _configuration_size_limit(resolved_path: str) -> int:
+    """Choose the limit for the actual managed file, after resolving links."""
+    return (MAX_TOPOLOGY_BYTES if os.path.basename(resolved_path) == "topology.dot"
+            else MAX_CONFIG_BYTES)
+
+
+def _check_configuration_size(encoded: bytes, limit: int) -> None:
+    if not encoded or len(encoded) > limit:
+        raise SetupSafetyError(
+            f"Configuration must be between 1 byte and {limit // (1024 * 1024)} MiB"
+        )
+
+
 def _write_staged(
     path: str,
     content: bytes,
@@ -873,7 +894,9 @@ def _write_descriptor(descriptor: int, content: bytes) -> None:
             raise SetupSafetyError("Direct-mount write made no progress")
         remaining = remaining[written:]
     os.fsync(descriptor)
-    if _read_descriptor(descriptor) != content:
+    # The caller already applied the target-specific limit to these candidate
+    # or journal bytes. Read one extra byte to detect an incorrect final length.
+    if _read_descriptor(descriptor, max(MAX_CONFIG_BYTES, len(content))) != content:
         raise SetupSafetyError("Direct-mount write verification failed")
 
 
@@ -1101,7 +1124,8 @@ def _load_direct_mount_journal(path: str) -> Optional[dict]:
     ):
         if isinstance(payload[name], bool) or not isinstance(payload[name], int):
             raise SetupSafetyError("Direct-mount recovery journal metadata is invalid")
-    if not 0 < payload["candidate_size"] <= MAX_CONFIG_BYTES:
+    config_limit = _configuration_size_limit(path)
+    if not 0 < payload["candidate_size"] <= config_limit:
         raise SetupSafetyError("Direct-mount recovery candidate size is invalid")
     for name in ("original_sha256", "candidate_sha256"):
         if not isinstance(payload[name], str) or not re.fullmatch(r"[0-9a-f]{64}", payload[name]):
@@ -1112,7 +1136,7 @@ def _load_direct_mount_journal(path: str) -> Optional[dict]:
         raise SetupSafetyError("Direct-mount recovery snapshot is invalid") from exc
     if (
         len(original) != payload["original_size"]
-        or len(original) > MAX_CONFIG_BYTES
+        or len(original) > config_limit
         or revision_bytes(original) != payload["original_sha256"]
     ):
         raise SetupSafetyError("Direct-mount recovery snapshot does not match its digest")
@@ -1213,7 +1237,7 @@ def _recover_direct_mount_journal_locked(
             or metadata.st_gid != payload["gid"]
         ):
             raise SetupSafetyError("Direct-mount target metadata changed during recovery")
-        current = _read_descriptor(descriptor)
+        current = _read_descriptor(descriptor, _configuration_size_limit(path))
         current_revision = revision_bytes(current)
         if (
             len(current) == payload["candidate_size"]
@@ -1408,7 +1432,7 @@ def _install_direct_mount_candidate(
             or opened.st_gid != metadata.st_gid
         ):
             raise SetupSafetyError("Direct-mount target metadata changed before writing")
-        pinned_current = _read_descriptor(descriptor)
+        pinned_current = _read_descriptor(descriptor, _configuration_size_limit(path))
         if pinned_current != original:
             raise RevisionConflict(revision_bytes(pinned_current))
         _publish_direct_mount_journal(path, original, content, opened)
@@ -1457,10 +1481,10 @@ def atomic_write_text(
     allow_direct_mount_inplace: bool = False,
     result_info: Optional[dict] = None,
 ) -> str:
-    encoded = content.encode("utf-8")
-    if not encoded or len(encoded) > MAX_CONFIG_BYTES:
-        raise SetupSafetyError("Configuration must be between 1 byte and 2 MiB")
     path = _resolved_regular_target(logical_path, managed_roots)
+    config_limit = _configuration_size_limit(path)
+    encoded = content.encode("utf-8")
+    _check_configuration_size(encoded, config_limit)
     directory = os.path.dirname(path)
     world_readable = os.path.basename(path) in WEB_SERVED_BASENAMES
     lock_path = path + ".lock"
@@ -1472,7 +1496,7 @@ def atomic_write_text(
             # Cap before reading so the write path is not weaker than the read
             # path (_read_descriptor enforces the same limit); this also avoids
             # loading a runaway file plus a full .bak copy into memory.
-            if stat.S_ISREG(metadata.st_mode) and metadata.st_size > MAX_CONFIG_BYTES:
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_size > config_limit:
                 raise SetupSafetyError("Configuration exceeds the safe size limit")
             current = Path(path).read_bytes()
         except FileNotFoundError:
@@ -1594,7 +1618,7 @@ def read_managed_text(
         except FileNotFoundError:
             return "", revision_bytes(b""), False
         try:
-            raw = _read_descriptor(descriptor)
+            raw = _read_descriptor(descriptor, _configuration_size_limit(path))
         finally:
             os.close(descriptor)
         try:
@@ -1641,13 +1665,24 @@ def _main() -> int:
     try:
         if args.command != "recover-all" and not args.target:
             raise SetupSafetyError("Configuration target is required")
-        incoming = "" if args.command in ("recover-all", "read-text", "read-devices") else _read_stdin_text(
-            MAX_CONFIG_BYTES * 4 if args.request_json else MAX_CONFIG_BYTES
-        )
+        config_limit = MAX_CONFIG_BYTES
+        incoming = ""
+        if args.command not in ("recover-all", "read-text", "read-devices"):
+            target = _resolved_regular_target(args.target, args.managed_root)
+            config_limit = _configuration_size_limit(target)
+            request_limit = config_limit
+            if args.request_json:
+                request_limit = (MAX_TOPOLOGY_REQUEST_BYTES
+                                 if config_limit == MAX_TOPOLOGY_BYTES
+                                 else MAX_CONFIG_BYTES * 4)
+            incoming = _read_stdin_text(request_limit)
         content = incoming
         expected_revision = args.expected_revision
         if args.request_json:
             content, expected_revision = parse_editor_request(incoming)
+        if args.command == "save-topology":
+            # Reject an oversized decoded file before running either parser.
+            _check_configuration_size(content.encode("utf-8"), config_limit)
         global_lock_fd = acquire_global_configuration_lock()
         if args.command in ("recover-all", "read-devices", "save-devices"):
             if not args.inventory_lock:

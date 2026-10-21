@@ -161,6 +161,171 @@ class SetupSafetyWriteTests(unittest.TestCase):
             )
         self.assertEqual(big.stat().st_size, SAFETY.MAX_CONFIG_BYTES + 1)
 
+    def _use_topology(self, size=SAFETY.MAX_TOPOLOGY_BYTES):
+        self.target = self.root / "topology.dot"
+        self.original = b"#" + b"o" * (size - 1)
+        self.candidate = "#" + "c" * (size - 1)
+        self.target.write_bytes(self.original)
+        self.target.chmod(0o644)
+        self.journal = Path(SAFETY._direct_mount_journal_path(str(self.target)))
+
+    def test_large_topology_round_trip_through_managed_symlink(self):
+        config = self.root / "config"
+        config.mkdir()
+        target = config / "topology.dot"
+        target.write_text("graph {\n}\n")
+        logical = self.root / "topology.dot"
+        logical.symlink_to(target)
+        # Multibyte text verifies the limit and revision apply to UTF-8 bytes.
+        content = "graph {\n//" + "é" * (SAFETY.MAX_CONFIG_BYTES // 2) + "\n}\n"
+        revision = SAFETY.atomic_write_text(
+            str(logical), content, managed_roots=[str(self.root)]
+        )
+        loaded, loaded_revision, exists = SAFETY.read_managed_text(
+            str(logical), managed_roots=[str(self.root)]
+        )
+        self.assertTrue(exists)
+        self.assertTrue(logical.is_symlink())
+        self.assertEqual(target.read_text(), content)
+        self.assertEqual(loaded, content)
+        self.assertEqual(loaded_revision, revision)
+        self.assertEqual(Path(str(target) + ".bak").read_text(), "graph {\n}\n")
+
+    def test_topology_ten_mib_boundary_and_overflow_preserve_saved_file(self):
+        target = self.root / "topology.dot"
+        content = "x" * SAFETY.MAX_TOPOLOGY_BYTES
+        revision = SAFETY.atomic_write_text(
+            str(target), content, managed_roots=[str(self.root)]
+        )
+        self.assertEqual(target.stat().st_size, SAFETY.MAX_TOPOLOGY_BYTES)
+        with self.assertRaisesRegex(SAFETY.SetupSafetyError, "10 MiB"):
+            SAFETY.atomic_write_text(
+                str(target), content + "x", managed_roots=[str(self.root)]
+            )
+        loaded, loaded_revision, exists = SAFETY.read_managed_text(
+            str(target), managed_roots=[str(self.root)]
+        )
+        self.assertTrue(exists)
+        self.assertEqual(loaded, content)
+        self.assertEqual(loaded_revision, revision)
+        self.assertFalse(Path(str(target) + ".bak").exists())
+
+    def test_other_configuration_limits_stay_two_mib(self):
+        for name in ("devices.yaml", "topology_config.yaml", "display-aliases.json"):
+            with self.subTest(name=name):
+                target = self.root / name
+                target.write_bytes(b"original")
+                with self.assertRaisesRegex(SAFETY.SetupSafetyError, "2 MiB"):
+                    SAFETY.atomic_write_text(
+                        str(target), "x" * (SAFETY.MAX_CONFIG_BYTES + 1),
+                        managed_roots=[str(self.root)],
+                    )
+                self.assertEqual(target.read_bytes(), b"original")
+                target.write_bytes(b"x" * (SAFETY.MAX_CONFIG_BYTES + 1))
+                with self.assertRaises(SAFETY.SetupSafetyError):
+                    SAFETY.read_managed_text(str(target), managed_roots=[str(self.root)])
+
+    def test_topology_symlink_does_not_raise_other_target_limit(self):
+        logical = self.root / "topology.dot"
+        logical.symlink_to(self.target)
+        with self.assertRaisesRegex(SAFETY.SetupSafetyError, "2 MiB"):
+            SAFETY.atomic_write_text(
+                str(logical), "x" * (SAFETY.MAX_CONFIG_BYTES + 1),
+                managed_roots=[str(self.root)],
+            )
+        self.assertEqual(self.target.read_bytes(), self.original)
+
+    def test_large_topology_direct_mount_save_verifies_pinned_inode(self):
+        self._use_topology()
+        inode = self.target.stat().st_ino
+        revision, info = self._fallback_write()
+        self.assertEqual(self.target.stat().st_ino, inode)
+        self.assertEqual(self.target.read_text(), self.candidate)
+        self.assertEqual(revision, SAFETY.revision_text(self.candidate))
+        self.assertEqual(info["write_mode"], "direct-mount-journaled-in-place")
+        self.assertEqual(Path(str(self.target) + ".bak").read_bytes(), self.original)
+        self.assertFalse(self.journal.exists())
+
+    def test_large_topology_failed_rollback_recovers_from_full_size_journal(self):
+        self._use_topology()
+
+        def fail_all_writes(descriptor, _content):
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"partial")
+            os.fsync(descriptor)
+            raise OSError(errno.EIO, "injected write and rollback failure")
+
+        with mock.patch.object(SAFETY, "_is_direct_mount", return_value=True):
+            with self._ebusy_on_target_replace():
+                with mock.patch.object(SAFETY, "_write_descriptor", side_effect=fail_all_writes):
+                    with self.assertRaises(SAFETY.SetupSafetyError):
+                        SAFETY.atomic_write_text(
+                            str(self.target), self.candidate,
+                            managed_roots=[str(self.root)], allow_direct_mount_inplace=True,
+                        )
+            # Base64 of the original 10 MiB must survive durable publication.
+            self.assertGreater(self.journal.stat().st_size, SAFETY.MAX_TOPOLOGY_BYTES)
+            content, revision, exists = SAFETY.read_managed_text(
+                str(self.target), managed_roots=[str(self.root)]
+            )
+        self.assertTrue(exists)
+        self.assertEqual(content.encode(), self.original)
+        self.assertEqual(revision, SAFETY.revision_bytes(self.original))
+        self.assertFalse(self.journal.exists())
+
+    def test_large_topology_completed_candidate_recovers_after_crash(self):
+        self._use_topology()
+        SAFETY._publish_direct_mount_journal(
+            str(self.target), self.original, self.candidate.encode(), self.target.stat()
+        )
+        self.target.write_text(self.candidate)
+        with mock.patch.object(SAFETY, "_is_direct_mount", return_value=True):
+            content, revision, exists = SAFETY.read_managed_text(
+                str(self.target), managed_roots=[str(self.root)]
+            )
+        self.assertTrue(exists)
+        self.assertEqual(content, self.candidate)
+        self.assertEqual(revision, SAFETY.revision_text(self.candidate))
+        self.assertFalse(self.journal.exists())
+
+    def test_topology_json_escaping_can_exceed_old_request_limit(self):
+        target = self.root / "topology.dot"
+        # A legal comment can be escaped as six ASCII bytes per source tab.
+        content = "graph {\n//" + "\t" * SAFETY.MAX_CONFIG_BYTES + "\n}\n"
+        request = json.dumps({"content": content}).replace("\\t", "\\u0009").encode()
+        self.assertGreater(len(request), SAFETY.MAX_CONFIG_BYTES * 4)
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(HELPER_PATH), "save-topology",
+                                           "--target", str(target), "--request-json",
+                                           "--managed-root", str(self.root)]),
+            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(request))),
+            mock.patch.object(sys, "stdout", output),
+            mock.patch.object(SAFETY, "acquire_global_configuration_lock", return_value=None),
+            mock.patch.object(SAFETY.shutil, "which", return_value=None),
+        ):
+            self.assertEqual(SAFETY._main(), 0)
+        self.assertTrue(json.loads(output.getvalue())["success"])
+        self.assertEqual(target.read_text(), content)
+
+    def test_topology_oversized_decoded_request_is_rejected_before_validation(self):
+        target = self.root / "topology.dot"
+        target.write_text("graph {\n}\n")
+        request = json.dumps({"content": "x" * (SAFETY.MAX_TOPOLOGY_BYTES + 1)}).encode()
+        output = io.StringIO()
+        with (
+            mock.patch.object(sys, "argv", [str(HELPER_PATH), "save-topology",
+                                           "--target", str(target), "--request-json"]),
+            mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(request))),
+            mock.patch.object(sys, "stdout", output),
+            mock.patch.object(SAFETY, "validate_topology_dot") as validate,
+        ):
+            self.assertEqual(SAFETY._main(), 2)
+            validate.assert_not_called()
+        self.assertIn("10 MiB", json.loads(output.getvalue())["error"])
+        self.assertEqual(target.read_text(), "graph {\n}\n")
+
     def test_exact_direct_mount_ebusy_uses_journaled_pinned_inode_write(self):
         old_inode = self.target.stat().st_ino
 
@@ -479,6 +644,30 @@ class SetupSafetyWriteTests(unittest.TestCase):
                     SAFETY.read_managed_text(
                         str(self.target), managed_roots=[str(self.root)]
                     )
+
+
+class SetupSafetyTopologyValidationTests(unittest.TestCase):
+    def test_graphviz_validation_uses_canonical_parse_without_layout(self):
+        with (
+            mock.patch.object(SAFETY.shutil, "which", return_value="/usr/bin/dot"),
+            mock.patch.object(SAFETY.subprocess, "run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            SAFETY.validate_topology_dot('graph {\n"leaf":"swp1" -- "server":"eth0";\n}\n')
+        args = run.call_args.args[0]
+        self.assertEqual(args[:2], ["/usr/bin/dot", "-Tcanon"])
+        self.assertEqual(args[3:], ["-o", os.devnull])
+        self.assertFalse(Path(args[2]).exists())
+
+    def test_graphviz_still_rejects_invalid_syntax_and_cleans_candidate(self):
+        with (
+            mock.patch.object(SAFETY.shutil, "which", return_value="/usr/bin/dot"),
+            mock.patch.object(SAFETY.subprocess, "run") as run,
+        ):
+            run.return_value = subprocess.CompletedProcess([], 1, "", "syntax error near '='")
+            with self.assertRaisesRegex(SAFETY.SetupSafetyError, "Invalid topology.dot: syntax error"):
+                SAFETY.validate_topology_dot("graph {\nlabel = ;\n}\n")
+        self.assertFalse(Path(run.call_args.args[0][2]).exists())
 
 
 class SetupSafetyCrossProcessRecoveryTests(unittest.TestCase):

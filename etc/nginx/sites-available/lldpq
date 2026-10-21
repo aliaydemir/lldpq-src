@@ -235,6 +235,9 @@ server {
         
         # Edit topology.dot endpoint with fcgiwrap
         location = /edit-topology {
+            # Match setup_safety.py's topology request limit. The DOT content
+            # is capped at 10 MiB; JSON escaping can expand it up to sixfold.
+            client_max_body_size 64m;
             # Execute edit script via fcgiwrap
             fastcgi_pass unix:/var/run/fcgiwrap.socket;
             fastcgi_param SCRIPT_FILENAME /var/www/html/edit-topology.sh;

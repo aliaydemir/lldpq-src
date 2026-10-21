@@ -1109,6 +1109,12 @@ revision, concurrent external changes cause a review/reload prompt, and Save
 is disabled while a request is in flight. The step rail and Save buttons mark
 real unsaved changes instead of treating a visited step as complete.
 
+The Setup and Results topology editors support `topology.dot` files up to
+10 MiB of UTF-8 content. The packaged Nginx configuration allows for JSON
+escaping overhead. Oversized requests show an explicit error and keep the
+editor contents. Validation checks wiring and DOT syntax without computing a
+graph layout. Other managed configuration files retain their 2 MiB limit.
+
 ### Display Aliases (step 5)
 
 Edit `display-aliases.json` without leaving Setup. Device names and
@@ -1145,6 +1151,9 @@ complete runtime or bare-metal backup.
 - **Not included:** monitoring/config history, DHCP leases and full DHCP configuration, uploaded OS images, generated provisioning files, LLDPq users/sessions, private Ask-AI analysis/learnings, or active job state.
 - **Import** restores every file to the right location, merges the portable prefs into `/etc/lldpq.conf`, and applies any schedule changes to cron.
 - **Transactional restore:** every included file is validated and staged before activation. Restore is all-or-rollback; native systemd recovery and Docker startup recovery consume retained rollback authority after an interruption.
+- **Size limits:** `topology.dot` supports 10 MiB; other individual configuration
+  files support 2 MiB. The compressed bundle and its total expanded contents
+  each support up to 32 MiB.
 - After a successful restore, run step 8 (**Run LLDPq**) to refresh derived data with the restored configuration.
 
 ### Maintenance (step 10)

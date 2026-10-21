@@ -1098,6 +1098,18 @@ function setStatus(id, msg, cls) {
     refreshDirtyMarkers();
 }
 
+async function readEditorResponse(response) {
+    const parsed = await response.json().catch(() => null);
+    const data = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    if (!response.ok || !data) {
+        const fallback = response.status === 413
+            ? 'HTTP 413: The request exceeds the server upload limit. Your editor content has been kept.'
+            : 'HTTP ' + response.status + ': The server could not complete the request.';
+        return { ...(data || {}), success: false, error: (data && data.error) || fallback };
+    }
+    return data;
+}
+
 async function loadFile(key, force) {
     const cfg = FILES[key];
     if (!cfg) return;
@@ -1110,8 +1122,15 @@ async function loadFile(key, force) {
     setStatus(cfg.st, 'Loading…', 'info');
     try {
         const r = await fetch(cfg.url, { cache: 'no-store' });
-        const data = await r.json().catch(() => ({}));
+        const data = await readEditorResponse(r);
         if (seq !== cfg.loadSeq || op !== cfg.opSeq) return;
+        if (!data.success) {
+            // A failed reload must not erase the draft or its last loaded
+            // revision. The server still checks that revision on Save.
+            ta.placeholder = 'Load failed — click Reload to retry.';
+            setStatus(cfg.st, 'Load failed: ' + (data.error || ('could not read ' + cfg.file)) + ' — click Reload to retry.', 'err');
+            return;
+        }
         if (cfg.editVersion !== startedVersion) {
             if (data.success && typeof data.revision === 'string') {
                 cfg.loaded = true;
@@ -1130,17 +1149,6 @@ async function loadFile(key, force) {
             if (!ta.value.trim()) ta.placeholder = cfg.file + ' is empty — type its contents here, then Save.';
             setStatus(cfg.st, ta.value.trim() ? ('Loaded ' + cfg.file) : (cfg.file + ' is empty — fill it in below.'), 'info');
             markDone(key, !!ta.value.trim());
-        } else {
-            // success:false is a real read error (a missing file comes back
-            // success:true with a revision), so there is no revision to save
-            // against. Don't promise a create-and-Save that saveFile blocks.
-            ta.value = '';
-            cfg.loaded = false;
-            cfg.dirty = false;
-            cfg.revision = null;
-            ta.placeholder = 'Load failed — click Reload to retry.';
-            setStatus(cfg.st, 'Load failed: ' + (data.error || ('could not read ' + cfg.file)) + ' — click Reload to retry.', 'err');
-            markDone(key, false);
         }
     } catch (e) {
         if (op !== cfg.opSeq) return;
@@ -1171,7 +1179,7 @@ async function saveFile(key) {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const data = await r.json().catch(() => ({}));
+        const data = await readEditorResponse(r);
         if (op !== cfg.opSeq) return;
         if (data.success) {
             cfg.loaded = true;
