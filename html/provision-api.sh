@@ -6003,6 +6003,62 @@ def check_upgrade_image_download(device, image_url):
         return str(exc)[:300]
 
 
+def check_upgrade_management_recovery(device, operation_id='', image_url='', ztp_url=''):
+    """Read saved IPv6 recovery evidence, or save it during guarded launch.
+
+    Literal IPv4 retains its existing flow. DNS/SSH aliases are checked using
+    SSH_CONNECTION, so a hostname resolving to IPv6 cannot bypass validation.
+    No switch-side YAML dependency is required.
+    """
+    from addressing import address_family
+    from upgrade_management import probe_shell, validate_snapshot
+    if address_family(device.get('ip', '')) == 4:
+        return {'expected': None, 'evidence': 'IPv4 management transport'}
+    script = 'set -eu\n'
+    if operation_id:
+        script += remote_identity_guard_shell(
+            device.get('expected_mac', ''), device.get('expected_serial', '')
+        ) + '\n'
+        script += '\n'.join([
+            'OPERATION_ID=' + shlex.quote(operation_id),
+            'current_operation="$(sudo cat /tmp/lldpq-upgrade.operation 2>/dev/null || true)"',
+            'if [ "$current_operation" = "$OPERATION_ID" ]; then',
+            "  if pgrep -f '/usr/cumulus/bin/onie-install' >/dev/null 2>&1 || [ -s /tmp/lldpq-upgrade.exit ]; then",
+            '    echo LLDPQ_UPGRADE_ALREADY_STARTED; exit 0',
+            '  fi',
+            "elif pgrep -f '/usr/cumulus/bin/onie-install' >/dev/null 2>&1; then",
+            '  echo "another LLDPq upgrade operation is already running" >&2; exit 75',
+            'fi',
+            'for resource in ' + shlex.quote(image_url) + ' ' + shlex.quote(ztp_url) + '; do',
+            '  curl --globoff --fail --silent --show-error --connect-timeout 5 --max-time 10 --head -- "$resource" >/dev/null',
+            'done',
+            # Save only IPv6 here. A DNS target using IPv4 keeps the historical
+            # config-save step in the dispatch shell below.
+            'set -- ${SSH_CONNECTION:-}',
+            'case "${3:-}" in *:*) sudo nv config save ;; esac',
+        ]) + '\n'
+    script += probe_shell()
+    try:
+        result = subprocess.run(
+            ['sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
+             '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
+             '-o', 'LogLevel=ERROR', f"{device.get('username', 'cumulus')}@{device['ip']}", 'bash -s'],
+            input=script, capture_output=True, text=True, timeout=55 if operation_id else 30,
+        )
+        if result.returncode != 0:
+            raise ValueError((result.stderr or 'Could not read saved management configuration').strip()[-300:])
+        if operation_id and 'LLDPQ_UPGRADE_ALREADY_STARTED' in result.stdout.splitlines():
+            return {'already_started': True}
+        prefix = 'LLDPQ_MGMT_SNAPSHOT='
+        lines = [line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)]
+        if len(lines) != 1:
+            raise ValueError('Management recovery probe did not return a complete snapshot')
+        expected, evidence = validate_snapshot(json.loads(lines[0]), device['ip'])
+        return {'expected': expected, 'evidence': evidence}
+    except Exception as exc:
+        return {'error': 'Management recovery not verified: ' + str(exc)[:350]}
+
+
 def run_upgrade_precheck(device, target_version, image_name, server_ip):
     info = get_device_version(device)
     info['target_version'] = target_version
@@ -6026,10 +6082,18 @@ def run_upgrade_precheck(device, target_version, image_name, server_ip):
         if download_error:
             checks.append('Image download is not reachable from device: ' + download_error)
     if not checks:
+        recovery = check_upgrade_management_recovery(device)
+        if recovery.get('error'):
+            checks.append(recovery['error'])
+        else:
+            info['management_recovery'] = recovery['evidence']
+    if not checks:
         # Precheck is deliberately read-only. The guarded launch path repeats
-        # the HTTP checks before saving config and invoking onie-install.
+        # HTTP checks and validates the freshly saved IPv6 config again before
+        # invoking onie-install. This is evidence, not a real reboot test.
         info['precheck_ok'] = True
-        checks.append('OK')
+        evidence = info.get('management_recovery', '')
+        checks.append('OK: ' + evidence if evidence.startswith('Static IPv6 ') else 'OK')
     info['checks'] = checks
     return info
 
@@ -6437,6 +6501,24 @@ def verify_upgrade_job_ztp(job):
         raise RuntimeError('Pinned upgrade ZTP artifact content changed')
 
 
+def verify_upgrade_job_preserve_hook(job):
+    """Keep older queued jobs from dispatching their full provisioning script.
+
+    Do not rewrite pinned artifacts: a switch may already have staged one.
+    Already-dispatched jobs can still be monitored through completion.
+    """
+    verify_upgrade_job_ztp(job)
+    with open(upgrade_ztp_artifact_path(job), 'r') as handle:
+        content = handle.read()
+    try:
+        validate_upgrade_preserve_hook_content(content)
+    except ValueError as exc:
+        raise RuntimeError(
+            'This job uses an older provisioning hook. Create a new upgrade '
+            'job to preserve the saved configuration; automatic launch is blocked.'
+        ) from exc
+
+
 def cleanup_upgrade_ztp_artifact(job):
     try:
         path = upgrade_ztp_artifact_path(job)
@@ -6577,6 +6659,41 @@ def launch_upgrade_worker(job_id):
 def _start_upgrade_for_device(dev, image_url, ztp_url, operation_id):
     ip = dev.get('ip')
     username = dev.get('username', 'cumulus')
+    from upgrade_management import probe_shell
+    recovery = check_upgrade_management_recovery(dev, operation_id, image_url, ztp_url)
+    if recovery.get('error'):
+        return False, recovery['error'], False
+    if recovery.get('already_started'):
+        return True, 'LLDPQ_UPGRADE_ALREADY_STARTED', False
+    expected = recovery.get('expected')
+    startup_argument = '/etc/nvue.d/startup.yaml'
+    snapshot_env = snapshot_child_cleanup = snapshot_transfer = snapshot_failed_cleanup = ''
+    if expected and expected['family'] == 6:
+        # The preceding SSH call saved NVUE, then validated that exact file on
+        # the collector. Bind dispatch to its checksum and actual return path;
+        # no second save may change that validated configuration.
+        # Pin the exact validated bytes: a later manual NVUE save cannot alter
+        # the file consumed by the asynchronous installer.
+        save_and_guard = ('test -s /etc/nvue.d/startup.yaml\n'
+                          'LLDPQ_STARTUP_FILE="$(\n' + probe_shell(expected, pin=True) + ')"\n' + r'''
+cleanup_startup_snapshot() {
+  sudo -n rm -f -- "$LLDPQ_STARTUP_FILE"
+  sudo -n rmdir -- "${LLDPQ_STARTUP_FILE%/*}" 2>/dev/null || true
+}
+trap cleanup_startup_snapshot EXIT
+echo LLDPQ_MGMT_GUARD_OK
+''')
+        startup_argument = '"$LLDPQ_STARTUP_FILE"'
+        snapshot_env = ' LLDPQ_STARTUP_FILE="$LLDPQ_STARTUP_FILE"'
+        snapshot_child_cleanup = '  rm -f -- "$LLDPQ_STARTUP_FILE"\n  rmdir -- "${LLDPQ_STARTUP_FILE%/*}" 2>/dev/null || true\n'
+        snapshot_transfer = 'trap - EXIT\n'
+        snapshot_failed_cleanup = '  cleanup_startup_snapshot\n'
+    else:
+        save_and_guard = 'sudo nv config save\ntest -s /etc/nvue.d/startup.yaml\n'
+        if expected:
+            # A DNS name can select another family/address on a second SSH
+            # connection. Never allow that to bypass the IPv6 recovery check.
+            save_and_guard = probe_shell(expected) + save_and_guard
     remote = 'set -e\n' + remote_identity_guard_shell(
         dev.get('expected_mac', ''), dev.get('expected_serial', '')
     ) + '\n' + r'''
@@ -6610,14 +6727,14 @@ for resource in "$IMAGE_URL" "$ZTP_URL"; do
   curl --globoff --fail --silent --show-error --connect-timeout 5 \
     --max-time 10 --head -- "$resource" >/dev/null
 done
-sudo nv config save
-test -s /etc/nvue.d/startup.yaml
+__LLDPQ_SAVE_AND_MANAGEMENT_GUARD__
 sudo rm -f /tmp/lldpq-upgrade.exit /tmp/lldpq-upgrade.log
 printf '%s\n' "$OPERATION_ID" | sudo tee /tmp/lldpq-upgrade.operation >/dev/null
 echo LLDPQ_UPGRADE_DISPATCHING
-sudo -n env IMAGE_URL="$IMAGE_URL" ZTP_URL="$ZTP_URL" nohup bash -c '
-  /usr/cumulus/bin/onie-install -fa -i "$IMAGE_URL" -z "$ZTP_URL" -t /etc/nvue.d/startup.yaml
+sudo -n env IMAGE_URL="$IMAGE_URL" ZTP_URL="$ZTP_URL"__LLDPQ_SNAPSHOT_ENV__ nohup bash -c '
+  /usr/cumulus/bin/onie-install -fa -i "$IMAGE_URL" -z "$ZTP_URL" -t __LLDPQ_STARTUP_ARGUMENT__
   rc=$?
+__LLDPQ_SNAPSHOT_CHILD_CLEANUP__
   if [ "$rc" -eq 0 ]; then
     reboot
     rc=$?
@@ -6626,14 +6743,21 @@ sudo -n env IMAGE_URL="$IMAGE_URL" ZTP_URL="$ZTP_URL" nohup bash -c '
   exit "$rc"
 ' >/tmp/lldpq-upgrade.log 2>&1 </dev/null &
 pid=$!
+__LLDPQ_SNAPSHOT_TRANSFER__
 sleep 1
 if ! kill -0 "$pid" 2>/dev/null; then
   wait "$pid" || true
   tail -20 /tmp/lldpq-upgrade.log 2>/dev/null || true
+__LLDPQ_SNAPSHOT_FAILED_CLEANUP__
   exit 1
 fi
 echo LLDPQ_UPGRADE_STARTED
-'''
+'''.replace('__LLDPQ_SAVE_AND_MANAGEMENT_GUARD__', save_and_guard)
+    remote = remote.replace('__LLDPQ_SNAPSHOT_ENV__', snapshot_env)
+    remote = remote.replace('__LLDPQ_STARTUP_ARGUMENT__', startup_argument)
+    remote = remote.replace('__LLDPQ_SNAPSHOT_CHILD_CLEANUP__', snapshot_child_cleanup)
+    remote = remote.replace('__LLDPQ_SNAPSHOT_TRANSFER__', snapshot_transfer)
+    remote = remote.replace('__LLDPQ_SNAPSHOT_FAILED_CLEANUP__', snapshot_failed_cleanup)
     try:
         r = subprocess.run(
             ['sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
@@ -6766,6 +6890,15 @@ def start_claimed_upgrade(job, dev, image_url, ztp_url):
         if current_dev.get('status') != 'starting' or \
            current_dev.get('operation_id') != operation_id:
             return dict(current_dev)
+        if not launch_attempted:
+            try:
+                verify_upgrade_job_preserve_hook(current)
+            except RuntimeError as exc:
+                current_dev['status'] = 'failed'
+                current_dev['error'] = str(exc)
+                finalize_upgrade_job(current)
+                save_upgrade_job(current)
+                return dict(current_dev)
         if current.get('stop_on_failure', True) and any(
             item.get('status') == 'failed' for item in current.get('devices', [])
         ) and not launch_attempted:
@@ -6830,9 +6963,20 @@ def start_claimed_upgrade(job, dev, image_url, ztp_url):
                 'without the target version; automatic relaunch was blocked'
             )
         else:
-            ok, detail, ambiguous = start_upgrade_for_device(
-                dev, image_url, ztp_url, operation_id
-            )
+            try:
+                verify_upgrade_job_preserve_hook(job)
+            except RuntimeError:
+                # The old installer may already be running. Continue observing
+                # it, but never retry an unconfirmed legacy dispatch.
+                ok, ambiguous = False, True
+                detail = (
+                    'Monitoring an earlier upgrade launch; automatic relaunch '
+                    'with the older provisioning hook is blocked'
+                )
+            else:
+                ok, detail, ambiguous = start_upgrade_for_device(
+                    dev, image_url, ztp_url, operation_id
+                )
             launch_status = 'upgrading' if ok else (
                 'waiting_reboot' if ambiguous else 'failed'
             )
@@ -7272,44 +7416,164 @@ def ensure_onie_symlinks(image_name):
     return created
 
 
-def prepare_upgrade_post_install_script(content, server_ip):
-    """Pin the selected HTTP server without changing the site's saved script.
+def upgrade_literal_shell_word(value):
+    """Read one shell literal without expanding variables or running shell code."""
+    # Quick Settings uses single quotes for passwords and double quotes with
+    # escaped dollar/backtick characters for public keys. Also accept adjacent
+    # quoted fragments (for example the escaped apostrophe in a password).
+    atom = r"'[^'\r\n]*'|\"(?:[^\"\\$`\r\n]|\\[\"\\$`])*\"|\\[^\r\n]|[A-Za-z0-9_@%+=:,./-]"
+    if not isinstance(value, str) or not re.fullmatch(rf'(?:{atom})+', value):
+        raise ValueError('Upgrade access settings must be literal Quick Settings values')
+    parts = []
+    for match in re.finditer(atom, value):
+        token = match.group(0)
+        if token.startswith("'"):
+            parts.append(token[1:-1])
+        elif token.startswith('"'):
+            # shlex deliberately keeps backslashes before $ and ` inside
+            # double quotes; Bash does not. Decode only literal escapes here.
+            parts.append(re.sub(r'\\(["\\$`])', r'\1', token[1:-1]))
+        elif token.startswith('\\'):
+            parts.append(token[1:])
+        else:
+            parts.append(token)
+    result = ''.join(parts)
+    if any(c in result for c in '\r\n\x00'):
+        raise ValueError('Invalid upgrade access setting')
+    return result
 
-    Older supported v2/v3 templates split a host at its first colon for ping.
-    Adapt only their known assignment/call shape inside the private artifact;
-    unfamiliar custom ping logic needs a template update instead of guessing.
-    """
+
+def upgrade_literal_assignment(content, name):
+    matches = re.findall(rf'^\s*{re.escape(name)}=(.*)$', content, re.MULTILINE)
+    if len(matches) != 1:
+        raise ValueError(f'Upgrade script must contain one literal {name} setting')
+    return upgrade_literal_shell_word(matches[0].strip())
+
+
+def render_upgrade_preserve_hook(public_key, password, target_release, server_ip):
+    """Build the entire supported post-install program; site script code is never copied."""
     from addressing import normalize_server_ref
     server_ip = normalize_server_ref(server_ip)
-    if not ztp_script_static_setting(content, 'IMAGE_SERVER_HOSTNAME'):
-        raise ValueError('Script must contain one literal IMAGE_SERVER_HOSTNAME setting')
-    content = re.sub(
-        r'^(\s*)IMAGE_SERVER_HOSTNAME=.*$',
-        lambda match: f'{match.group(1)}IMAGE_SERVER_HOSTNAME="{server_ip}"',
-        content, count=1, flags=re.MULTILINE,
+    if not re.fullmatch(r'[0-9][A-Za-z0-9._-]{0,99}', target_release):
+        raise ValueError('Invalid upgrade target release')
+    if not password or len(password) > 128 or any(c in password for c in '\r\n\x00'):
+        raise ValueError('Invalid cumulus password in Quick Settings')
+    if any(c in public_key for c in '\r\n\x00') or not ztp_script_public_key(
+            'KEY=' + shlex.quote(public_key)):
+        raise ValueError('Invalid SSH key in Quick Settings')
+    settings = ''.join(f'{name}={shlex.quote(value)}\n' for name, value in (
+        ('IMAGE_SERVER_HOSTNAME', server_ip),
+        ('CUMULUS_TARGET_RELEASE', target_release),
+        ('KEY', public_key),
+        ('CUMULUS_PASSWORD', password),
+    ))
+    return '''#!/bin/bash
+# CUMULUS-AUTOPROVISIONING
+# LLDPQ_UPGRADE_HOOK_VERSION=1
+# Upgrade only: the installer restores the saved NVUE startup.yaml.
+# Only literal access settings are copied from the site's ZTP Quick Settings.
+''' + settings + r'''
+function install_authorized_key(){
+    local directory="$1"
+    local owner="$2"
+    local group="$3"
+    local authorized_keys="$directory/authorized_keys"
+
+    mkdir -p "$directory" || return 1
+    chmod 700 "$directory" || return 1
+    touch "$authorized_keys" || return 1
+    if ! grep -Fqx -- "$KEY" "$authorized_keys"; then
+        if [ -s "$authorized_keys" ] &&
+            [ "$(tail -c 1 "$authorized_keys" | wc -l)" -eq 0 ]; then
+            printf '\n' >> "$authorized_keys" || return 1
+        fi
+        printf '%s\n' "$KEY" >> "$authorized_keys" || return 1
+    fi
+    chmod 600 "$authorized_keys" || return 1
+    chown "$owner:$group" "$directory" "$authorized_keys" || return 1
+}
+
+function install_cumulus_sudoers(){
+    local target=/etc/sudoers.d/10_cumulus
+    local staged=""
+    staged=$(mktemp /etc/sudoers.d/.10_cumulus.XXXXXX) || return 1
+    if ! printf '%s\n' 'cumulus ALL=(ALL) NOPASSWD:ALL' > "$staged" ||
+        ! chmod 440 "$staged"; then
+        rm -f "$staged"
+        return 1
+    fi
+    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$staged" >/dev/null; then
+        rm -f "$staged"
+        return 1
+    fi
+    mv -f "$staged" "$target"
+}
+
+function main(){
+    umask 077
+    # Restore access locally even when the image server is no longer reachable.
+    # Never fetch a provisioning config or change the restored NVUE settings.
+    if ! install_authorized_key /root/.ssh root root ||
+        ! install_authorized_key /home/cumulus/.ssh cumulus cumulus; then
+        echo 'Failed to restore the collector SSH key' >&2
+        return 1
+    fi
+    if ! install_cumulus_sudoers; then
+        echo 'Failed to restore the cumulus sudoers policy' >&2
+        return 1
+    fi
+    if ! passwd -x 99999 cumulus ||
+        ! printf '%s\n' "cumulus:$CUMULUS_PASSWORD" | chpasswd; then
+        echo 'Failed to restore the cumulus password' >&2
+        return 1
+    fi
+    echo 'Upgrade access setup complete; saved NVUE configuration preserved.'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
+'''
+
+
+def validate_upgrade_preserve_hook_content(content):
+    """Reject old provisioning hooks and modified/custom programs before dispatch."""
+    if not isinstance(content, str) or '\n# LLDPQ_UPGRADE_HOOK_VERSION=1\n' not in content:
+        raise ValueError('Pinned upgrade hook predates config preservation; start a new upgrade job')
+    actual = {name: upgrade_literal_assignment(content, name) for name in (
+        'KEY', 'CUMULUS_PASSWORD', 'CUMULUS_TARGET_RELEASE', 'IMAGE_SERVER_HOSTNAME',
+    )}
+    expected = render_upgrade_preserve_hook(
+        actual['KEY'], actual['CUMULUS_PASSWORD'], actual['CUMULUS_TARGET_RELEASE'],
+        actual['IMAGE_SERVER_HOSTNAME'],
     )
-    if server_ip.startswith('['):
-        target = server_ip[1:].split(']', 1)[0]
-        assignments = list(re.finditer(
-            r'^(\s*)IMAGE_SERVER_PING_TARGET=.*$', content, re.MULTILINE,
-        ))
-        if len(assignments) != 1:
-            raise ValueError('Update the post-install script template before using an IPv6 image server')
-        content = re.sub(
-            r'^(\s*)IMAGE_SERVER_PING_TARGET=.*$',
-            lambda match: f'{match.group(1)}IMAGE_SERVER_PING_TARGET="{target}"',
-            content, count=1, flags=re.MULTILINE,
-        )
-        legacy_ping = 'if ping "$target" -c2 --no-vrf-switch >/dev/null; then'
-        current_ping = 'if ping "${family_args[@]}" "$target" -c2 --no-vrf-switch >/dev/null; then'
-        if content.count(legacy_ping) == 1:
-            content = content.replace(legacy_ping, legacy_ping.replace('if ping ', 'if ping -6 '), 1)
-        elif not (current_ping in content and 'family_args=(-6)' in content):
-            raise ValueError('Update the post-install script ping helper before using an IPv6 image server')
-    validate_ztp_script_content(content)
-    if '__IMAGE_SERVER_IP__' in content:
-        raise ValueError('Post-install script still contains an image server placeholder')
+    if content != expected:
+        raise ValueError('Pinned upgrade hook is not the managed config-preserving program')
     return content
+
+
+def prepare_upgrade_post_install_script(content, server_ip):
+    """Keep startup.yaml authoritative and restore access without running fresh ZTP.
+
+    v2/v3 (including customized ping helpers) are inputs for literal credentials
+    only. Their main function, downloads, config replacement and installer logic
+    never enter the upgrade artifact. Fresh-device ZTP stays unchanged.
+    """
+    validate_ztp_script_content(content)
+    key = upgrade_literal_assignment(content, 'KEY')
+    target = upgrade_literal_assignment(content, 'CUMULUS_TARGET_RELEASE')
+    password_lines = re.findall(
+        r'^\s*echo\s+(.+?)\s*\|\s*chpasswd\s*$', content, re.MULTILINE,
+    )
+    if len(password_lines) != 1:
+        raise ValueError('Apply and save Quick Settings: one literal cumulus password is required')
+    account_password = upgrade_literal_shell_word(password_lines[0])
+    if not account_password.startswith('cumulus:'):
+        raise ValueError('Quick Settings password must belong to cumulus')
+    hook = render_upgrade_preserve_hook(key, account_password[8:], target, server_ip)
+    validate_ztp_script_content(hook)
+    validate_upgrade_preserve_hook_content(hook)
+    return hook
 
 
 def action_upgrade_start():

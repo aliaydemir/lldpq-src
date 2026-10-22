@@ -1318,7 +1318,7 @@ configure the collector's IPv6 addresses or routes automatically.
 | **Console and Commands** | Open inventory devices in Console and run supported diagnostic commands from Commands or Device Details over IPv6. |
 | **Discover** | Scan explicit addresses, bounded ranges or small CIDRs using ICMPv6, TCP/22, SSH and local NDP observations. |
 | **Base Config** | Explicitly deploy the standard files to IPv6 inventory devices over SSH/SCP. Generated NVUE configurations can also be deployed explicitly over SSH. |
-| **Upgrade** | Precheck, upgrade and track existing IPv6-managed switches through the persistent queue, including optional Base Config deployment after version verification. The download server can use IPv4, DNS or global/ULA IPv6. |
+| **Upgrade** | Precheck, upgrade and track switches with static IPv6 management saved in NVUE, including optional Base Config deployment after version verification. The download server can use IPv4, DNS or global/ULA IPv6. |
 | **Address matching** | Normalize equivalent IPv6 spellings, reject duplicate management addresses and sort addresses numerically. Interface scopes remain part of link-local identity. |
 | **DHCP separation** | IPv6 bindings always have DHCP disabled. Adding or editing only IPv6 monitoring records leaves unchanged IPv4 reservations and the DHCP service untouched. |
 
@@ -1440,8 +1440,10 @@ does not run automatic post-provision deployment.
 
 Upload the Cumulus image and save a supported post-install script with the
 matching target version and SSH public key in the **ZTP** tab, as for an IPv4
-upgrade. This script is used as the existing-device upgrade's post-install hook;
-it does not enable DHCPv6 or automatic new-device provisioning.
+upgrade. LLDPq uses its saved access settings to generate a separate upgrade
+hook. This hook restores SSH access locally; it does not fetch serial mappings,
+apply generated NVUE configurations or reinstall the OS. The full new-device
+ZTP script stays unchanged.
 
 In **Provision → Upgrade**, select the image, IPv6 inventory devices and batch
 size. The **Image Server IP** field starts with the saved ZTP/detected server,
@@ -1455,29 +1457,43 @@ but can be edited for this upgrade. Enter an address or hostname, not a full URL
 
 Use your actual image name and a server that serves both the selected image and
 LLDPq's job-specific post-install script. An IPv6 port requires brackets.
-The override applies only to this job's pinned script; it does not change the
+The override applies only to this upgrade job; it does not change the
 saved site-wide ZTP script or DHCP settings. The packaged web server listens on
 IPv6 when available; Docker networking and any published ports must also expose
 that listener to the switches.
 
 Run **Precheck**, review the results, then start the upgrade. LLDPq checks image
 HTTP access from each switch and checks both image and post-install script
-access again before installation. It saves NVUE startup configuration, passes
-it to `onie-install`, and tracks reboot, installed version and optional Base
-Config deployment. Job state survives LLDPq service/container restarts.
+access again before installation. The IPv6 recovery check compares the actual
+SSH address with the saved interface, prefix and VRF, and checks for a saved
+connected or static return path to the collector. An unsupported or missing
+recovery path blocks installation with a reason in the device row.
 
-The switch's management IPv6 address and routes must be preserved in its NVUE
-startup configuration, and the download server must remain reachable during
-installation and after reboot. Collector-side reachability alone is insufficient.
-Automated tests cover command construction and job lifecycle with mocked device
-responses; management recovery through a real OS reinstall still needs validation
-on the target switch/OS combination.
+Precheck is read-only. At launch, LLDPq saves NVUE and repeats the recovery
+validation. It stages a checksum-verified copy of the approved IPv6 startup
+configuration for `onie-install`, then tracks reboot, installed version and
+optional Base Config deployment. Job state survives LLDPq service/container
+restarts.
+
+For this upgrade path, the management IPv6 address must be **static and saved
+in NVUE**, together with its prefix, interface/VRF and required return route.
+LLDPq passes the saved configuration to `onie-install -t` so the new OS can
+restore it. No DHCPv6 server or full new-device ZTP workflow is required for
+this static-address path. An address in `devices.yaml` alone does not configure
+the switch. Temporary Linux addresses and configurations maintained outside
+NVUE are not covered by this preservation path.
+
+The image and hook are staged before reboot. The upgrade hook needs no network
+downloads after boot and does not replace the restored NVUE configuration.
+Automated tests use simulated device responses; recovery through a real OS
+reinstall still needs validation on the target switch/OS combination.
 
 ### IPv6 features not yet supported
 
 | Feature | Current boundary |
 |---|---|
 | **DHCPv6 and ZTP** | No IPv6 address allocation or automated new-device provisioning. |
+| **Upgrade with dynamic or external IPv6 configuration** | The recovery check requires static management settings saved in NVUE. DHCPv6/SLAAC-only addressing, runtime-only addresses and separately maintained Linux network files are not supported by this upgrade path. |
 | **Link-local HTTP download servers** | Upgrade image/hook servers require a global/ULA IPv6 address, IPv4 address or DNS name. Interface scopes cannot be shared across collector, switch and boot environment. Scoped link-local SSH targets remain supported. |
 | **IPv6 route/path analysis** | Dedicated Routes/Tracepath analysis for IPv6 networks is not included in this stage. |
 | **Inbound IPv6 telemetry** | IPv6 listeners for receiving streaming telemetry are not included in this stage. |
@@ -2342,11 +2358,29 @@ this upgrade without changing ZTP/DHCP settings. IPv4 and IPv6 management target
 are supported; see [IPv6 support](#03c-ipv6-support) for server-address examples
 and network prerequisites.
 
-The workflow preserves each switch's `/etc/nvue.d/startup.yaml` during the OS
-upgrade, verifies the installed version, and can optionally deploy Base Config
-after verification. It can stop the queue on the first failure, cancel queued
-work, and resume safely after service/container restart from persisted job
-state.
+The workflow stages each switch's `/etc/nvue.d/startup.yaml` with the image for
+restoration by the new OS. A separate upgrade hook restores SSH access without
+applying generated NVUE configurations. LLDPq verifies the installed version
+and can optionally deploy Base Config after verification. It can stop the queue
+on the first failure, cancel queued work, and resume after service/container
+restart from persisted job state. IPv6 upgrades require the saved static
+management configuration described in [IPv6 support](#03c-ipv6-support).
+
+For devices selected by an IPv4 address, the existing SSH, `nv config save`,
+`onie-install -t /etc/nvue.d/startup.yaml` and reboot flow is retained; the new
+static-IPv6 recovery checks do not apply. The separate access-only upgrade hook
+applies to **both IPv4 and IPv6**: it restores the configured SSH key, cumulus
+password and sudo access without fetching or applying generated NVUE configs.
+Optional Base Config deployment still runs after version verification. This
+does not change the full ZTP workflow used to provision new devices. Automated
+regression tests cover the IPv4 path; a real switch reinstall has not yet been
+validated for these changes.
+
+Jobs saved by older LLDPq versions with a full provisioning script cannot start
+additional devices after this update; create a new job for the remaining
+devices. Already-dispatched devices continue to be monitored, and their pinned
+artifacts are retained. LLDPq does not automatically relaunch an uncertain old
+installation with the previous provisioning script.
 
 ### Base Config Tab
 

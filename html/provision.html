@@ -1342,7 +1342,7 @@
 
 <!-- ==================== TAB 5: UPGRADE ==================== -->
 <div class="tab-content" id="tab-upgrade">
-    <div class="section-desc">Upgrade already-running switches to a newer Cumulus image. ZTP is for new devices; this tab preserves each switch's local <code>/etc/nvue.d/startup.yaml</code> during OS upgrade.</div>
+    <div class="section-desc">Upgrade already-running switches to a newer Cumulus image using their saved <code>/etc/nvue.d/startup.yaml</code>. IPv6 management must be statically configured in NVUE. The upgrade restores SSH access without applying generated configurations.</div>
 
     <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-bottom: 15px; padding: 15px; background:#1e1e1e; border:1px solid #3c3c3c; border-radius:6px;">
         <div>
@@ -5439,7 +5439,8 @@ function startUpgradeJob() {
     showConfirmModal('Start OS Upgrade',
         `Start upgrade for <strong>${devices.length}</strong> device(s)?<br><br>` +
         `Image: <code>${escHtml(payload.image_name)}</code><br>` +
-        `Command uses <code>-t /etc/nvue.d/startup.yaml</code> on each switch and will reboot upgraded devices.`,
+        `The installer restores the saved NVUE startup configuration and will reboot upgraded devices. ` +
+        `IPv6 recovery checks must pass before installation.`,
         async () => {
             document.getElementById('btnStartUpgrade').disabled = true;
             const data = await apiCall('upgrade-start', payload);
