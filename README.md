@@ -15,7 +15,7 @@
 ╚══════════════════════════════════════════════════════════╝
 ```
 
-simple network monitoring tool for Cumulus Linux switches
+simple network monitoring tool for Cumulus Linux switches 
 
 > *LLDPq is an independent project. It does not contain, derive from, or incorporate any code from any NVIDIA product.*
 >
