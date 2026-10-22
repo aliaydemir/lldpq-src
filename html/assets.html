@@ -1562,7 +1562,7 @@
 
 <!-- SSH Setup Modal -->
 <div id="sshSetupModal" onclick="if(event.target===this)closeSSHSetupModal()" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center;">
-    <div onclick="event.stopPropagation()" style="background: #2d2d2d; border-radius: 8px; width: 85%; max-width: 700px; max-height: 90vh; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
+    <div onclick="event.stopPropagation()" style="background: #2d2d2d; border-radius: 8px; width: 85%; max-width: 700px; max-height: 90vh; overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.5);">
         <!-- Header -->
         <div style="padding: 15px 20px; background: #1a1a1a; border-bottom: 1px solid #444; display: flex; justify-content: space-between; align-items: center;">
             <h3 style="margin: 0; color: #ff9800; font-size: 16px;">
@@ -1579,7 +1579,20 @@
         </div>
         <!-- Form -->
         <div style="padding: 20px;">
-            <p style="color: #aaa; font-size: 12px; margin-bottom: 12px;">Enter the device password to distribute the SSH key and fix sudo permissions on all devices.</p>
+            <p style="color: #aaa; font-size: 12px; margin-bottom: 12px;">Select devices, then enter their password to distribute the SSH key and fix sudo permissions.</p>
+            <fieldset id="sshDevicePicker" style="border: 0; padding: 0; margin: 0 0 15px; min-width: 0;">
+                <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;">
+                    <input id="sshDeviceSearch" type="search" placeholder="Search hostname or IP..." aria-label="Search SSH setup devices" oninput="renderSSHKeyDevices()" style="flex: 1; min-width: 160px; background: #1a1a1a; color: #fff; border: 1px solid #555; border-radius: 4px; padding: 7px 10px;">
+                    <button id="sshDeviceSelectAll" onclick="selectSSHKeyDevices(true)" style="background: #555; color: #fff; border: none; border-radius: 4px; padding: 7px 10px; cursor: pointer;">Select all</button>
+                    <button onclick="selectSSHKeyDevices(false)" style="background: #555; color: #fff; border: none; border-radius: 4px; padding: 7px 10px; cursor: pointer;">Clear</button>
+                    <button onclick="loadSSHKeyDevices()" style="background: #555; color: #fff; border: none; border-radius: 4px; padding: 7px 10px; cursor: pointer;">Refresh inventory</button>
+                </div>
+                <div id="sshDeviceList" style="max-height: 180px; overflow-y: auto; border: 1px solid #444; border-radius: 4px; background: #232323;"></div>
+                <div style="display: flex; flex-wrap: wrap; gap: 8px; justify-content: space-between; margin-top: 6px; font-size: 12px; color: #aaa;">
+                    <span id="sshDeviceCount">0 of 0 selected</span>
+                    <span id="sshDeviceStatus" role="status"></span>
+                </div>
+            </fieldset>
             <div style="margin-bottom: 15px;">
                 <label style="color: #ccc; font-size: 13px; display: block; margin-bottom: 5px;">Device Password</label>
                 <div style="position: relative;">
@@ -1624,6 +1637,120 @@ let sshSetupFailedDevices = [];
 let sshSetupGeneration = 0;
 let sshSetupInFlight = false;
 let sshSetupAbortController = null;
+let sshKeyDevices = [];
+let sshKeySelection = new Set();
+let sshKeyDevicesLoading = false;
+let sshKeyDevicesRequest = 0;
+let sshKeyDevicesAbortController = null;
+
+function filteredSSHKeyDevices() {
+    const query = document.getElementById('sshDeviceSearch').value.trim().toLowerCase();
+    return sshKeyDevices.filter(device => `${device.hostname} ${device.ip}`.toLowerCase().includes(query));
+}
+
+function selectedSSHKeyDevices() {
+    return sshKeyDevices.filter(device => sshKeySelection.has(device.ip)).map(device => device.ip);
+}
+
+function toggleSSHKeyDevice(ip, checked) {
+    if (sshSetupInFlight || sshKeyDevicesLoading || !sshKeyDevices.some(device => device.ip === ip)) return;
+    if (checked) sshKeySelection.add(ip);
+    else sshKeySelection.delete(ip);
+    updateSSHKeyControls();
+}
+
+function selectSSHKeyDevices(selected) {
+    if (sshSetupInFlight || sshKeyDevicesLoading) return;
+    if (selected) filteredSSHKeyDevices().forEach(device => sshKeySelection.add(device.ip));
+    else sshKeySelection.clear();
+    renderSSHKeyDevices();
+}
+
+function updateSSHKeyControls() {
+    document.getElementById('sshDevicePicker').disabled = sshSetupInFlight || sshKeyDevicesLoading;
+    document.getElementById('sshDeviceCount').textContent = `${selectedSSHKeyDevices().length} of ${sshKeyDevices.length} selected`;
+    checkPasswordInput();
+}
+
+function renderSSHKeyDevices() {
+    const list = document.getElementById('sshDeviceList');
+    const visible = filteredSSHKeyDevices();
+    document.getElementById('sshDeviceSelectAll').textContent = document.getElementById('sshDeviceSearch').value.trim() ? 'Select filtered' : 'Select all';
+    list.replaceChildren();
+    if (!visible.length) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding: 12px; color: #888; font-size: 12px;';
+        empty.textContent = sshKeyDevicesLoading ? 'Loading inventory...' : (sshKeyDevices.length ? 'No devices match your search.' : 'No devices available.');
+        list.appendChild(empty);
+    }
+    visible.forEach(device => {
+        const row = document.createElement('label');
+        row.style.cssText = 'display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid #333; cursor: pointer; font-size: 12px;';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = sshKeySelection.has(device.ip);
+        checkbox.disabled = sshSetupInFlight || sshKeyDevicesLoading;
+        checkbox.style.accentColor = '#ff9800';
+        checkbox.addEventListener('change', () => toggleSSHKeyDevice(device.ip, checkbox.checked));
+        const name = document.createElement('span');
+        name.style.cssText = 'color: #ddd; flex: 1; min-width: 0; overflow-wrap: anywhere;';
+        name.textContent = device.hostname;
+        const address = document.createElement('span');
+        address.style.cssText = 'color: #999; font-family: monospace; overflow-wrap: anywhere;';
+        address.textContent = device.ip;
+        row.append(checkbox, name, address);
+        list.appendChild(row);
+    });
+    updateSSHKeyControls();
+}
+
+async function loadSSHKeyDevices() {
+    if (sshSetupInFlight || document.getElementById('sshSetupModal').style.display !== 'flex') return false;
+    const generation = sshSetupGeneration;
+    const request = ++sshKeyDevicesRequest;
+    if (sshKeyDevicesAbortController) sshKeyDevicesAbortController.abort();
+    sshKeyDevicesAbortController = new AbortController();
+    sshKeyDevicesLoading = true;
+    sshKeyDevices = [];
+    sshKeySelection.clear();
+    sshSetupFailedDevices = [];
+    document.getElementById('sshDeviceSearch').value = '';
+    document.getElementById('sshDeviceStatus').textContent = '';
+    document.getElementById('sshRetryBtn').style.display = 'none';
+    document.getElementById('sshResultsArea').style.display = 'none';
+    document.getElementById('sshResultsBody').replaceChildren();
+    document.getElementById('sshSummary').style.display = 'none';
+    document.getElementById('sshSummary').replaceChildren();
+    document.getElementById('sshProgress').textContent = '';
+    resetSSHPasswordState();
+    renderSSHKeyDevices();
+    try {
+        const response = await fetch('/setup-api.sh', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action: 'list-key-devices'}), signal: sshKeyDevicesAbortController.signal
+        });
+        const data = await response.json();
+        if (generation !== sshSetupGeneration || request !== sshKeyDevicesRequest) return false;
+        if (!response.ok || !data.success) throw new Error(assetText(data.error, 'Could not load inventory'));
+        if (!Array.isArray(data.devices) || data.devices.some(device => !device ||
+            ['ip', 'hostname', 'username'].some(field => typeof device[field] !== 'string' || !device[field].trim())) ||
+            new Set(data.devices.map(device => device.ip)).size !== data.devices.length) {
+            throw new Error('Invalid device list; refresh the inventory.');
+        }
+        sshKeyDevices = data.devices;
+        return true;
+    } catch (error) {
+        if (generation !== sshSetupGeneration || request !== sshKeyDevicesRequest || error.name === 'AbortError') return false;
+        document.getElementById('sshDeviceStatus').textContent = error.message;
+        return false;
+    } finally {
+        if (generation === sshSetupGeneration && request === sshKeyDevicesRequest) {
+            sshKeyDevicesLoading = false;
+            sshKeyDevicesAbortController = null;
+            renderSSHKeyDevices();
+        }
+    }
+}
 
 function resetSSHPasswordState() {
     const input = document.getElementById('sshPassword');
@@ -1644,7 +1771,7 @@ function checkPasswordInput() {
     const pw = document.getElementById('sshPassword').value;
     const btn = document.getElementById('sshRunBtn');
     const hasKey = document.getElementById('sshKeyStatus').dataset.hasKey === 'true';
-    if (pw && hasKey && !sshSetupInFlight) {
+    if (pw && hasKey && !sshSetupInFlight && !sshKeyDevicesLoading && selectedSSHKeyDevices().length > 0) {
         btn.disabled = false;
         btn.style.opacity = '1';
     } else {
@@ -1679,6 +1806,7 @@ async function openSSHSetupModal() {
     const status = document.getElementById('sshKeyStatus');
     status.textContent = 'Checking SSH key...';
     status.dataset.hasKey = 'false';
+    const inventoryReady = loadSSHKeyDevices();
     
     try {
         const resp = await fetch('/provision-api.sh?action=get-ssh-key', {
@@ -1715,6 +1843,7 @@ async function openSSHSetupModal() {
         status.dataset.hasKey = 'true'; // Allow anyway
     }
     if (generation === sshSetupGeneration) checkPasswordInput();
+    await inventoryReady;
 }
 
 function closeSSHSetupModal() {
@@ -1726,6 +1855,12 @@ function closeSSHSetupModal() {
     sshSetupInFlight = false;
     if (sshSetupAbortController) sshSetupAbortController.abort();
     sshSetupAbortController = null;
+    if (sshKeyDevicesAbortController) sshKeyDevicesAbortController.abort();
+    sshKeyDevicesAbortController = null;
+    sshKeyDevicesRequest += 1;
+    sshKeyDevicesLoading = false;
+    sshKeyDevices = [];
+    sshKeySelection.clear();
     document.getElementById('sshSetupModal').style.display = 'none';
     resetSSHPasswordState();
     document.getElementById('sshRunBtn').disabled = true;
@@ -1879,15 +2014,23 @@ function finishSSHSetupControls() {
     document.getElementById('sshProgress').textContent = '';
     const btn = document.getElementById('sshRunBtn');
     btn.textContent = 'Run Setup';
-    btn.disabled = false;
-    btn.style.opacity = '1';
+    checkPasswordInput();
 }
 
 async function runSSHSetup(retryDevices = null) {
-    if (sshSetupInFlight) return false;
+    if (sshSetupInFlight || sshKeyDevicesLoading || document.getElementById('sshSetupModal').style.display !== 'flex') return false;
     const password = document.getElementById('sshPassword').value;
-    if (!password) return false;
+    if (!password || document.getElementById('sshKeyStatus').dataset.hasKey !== 'true') return false;
+    const retrying = retryDevices !== null;
+    const targets = retrying
+        ? (Array.isArray(retryDevices) ? [...new Set(retryDevices)].filter(ip => sshSetupFailedDevices.includes(ip)) : [])
+        : selectedSSHKeyDevices();
+    if (!targets.length) {
+        document.getElementById('sshProgress').textContent = retrying ? 'No failed devices to retry.' : 'Select at least one device.';
+        return false;
+    }
     sshSetupInFlight = true;
+    renderSSHKeyDevices();
     sshSetupGeneration += 1;
     const generation = sshSetupGeneration;
     if (sshSetupAbortController) sshSetupAbortController.abort();
@@ -1904,6 +2047,7 @@ async function runSSHSetup(retryDevices = null) {
     progress.textContent = 'Sending keys & fixing sudo...';
     
     if (!retryDevices) {
+        sshSetupFailedDevices = [];
         document.getElementById('sshResultsArea').style.display = 'none';
         document.getElementById('sshResultsBody').replaceChildren();
         document.getElementById('sshSummary').style.display = 'none';
@@ -1912,9 +2056,8 @@ async function runSSHSetup(retryDevices = null) {
     
     try {
         const body = { password: password };
-        if (retryDevices && retryDevices.length > 0) {
-            body.retry_devices = retryDevices;
-        }
+        if (retrying) body.retry_devices = targets;
+        else body.selected_devices = targets;
         
         const response = await fetch('/setup-api.sh', {
             method: 'POST',
@@ -1928,7 +2071,7 @@ async function runSSHSetup(retryDevices = null) {
         if (!response.ok || !data.success) {
             throw new Error(assetText(data.error, `Setup request failed (${response.status})`));
         }
-        renderSSHSetupResults(data, retryDevices);
+        renderSSHSetupResults(data, retrying ? targets : null);
         finishSSHSetupControls();
         return true;
     } catch (err) {
@@ -1941,7 +2084,10 @@ async function runSSHSetup(retryDevices = null) {
             sshSetupInFlight = false;
             sshSetupAbortController = null;
             resetSSHPasswordState();
-            checkPasswordInput();
+            if (sshSetupFailedDevices.length > 0) {
+                document.getElementById('sshRetryBtn').style.display = 'inline-block';
+            }
+            renderSSHKeyDevices();
         }
     }
 }

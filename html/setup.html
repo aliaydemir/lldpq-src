@@ -107,6 +107,10 @@
         .key-row .k { color:#9a9a9a; }
         .key-lbl { display:block; color:#9a9a9a; font-size:12px; margin:10px 0 6px; }
         .key-pub { min-height:64px !important; color:#9cdcfe; }
+        .key-device-picker { padding:0; margin:0; border:0; min-width:0; }
+        .key-device-list { max-height:260px; overflow:auto; }
+        .key-device-list table.res { display:table; margin-top:0; }
+        .key-device-list input[type=checkbox] { accent-color:#76b900; }
         .mono { font-family:'Cascadia Code',Consolas,monospace; font-size:12px; color:#cfcfcf; }
 
         table.res { width:100%; border-collapse:collapse; margin-top:14px; font-size:12.5px; display:none; }
@@ -180,7 +184,7 @@
                 <!-- Step 2: SSH keys -->
                 <div class="su-panel" data-step-key="keys">
                     <h2>2. SSH Keys</h2>
-                    <p class="p-desc">Authorize the collector's SSH key on every device in <code>devices.yaml</code> and enable passwordless <code>sudo</code> for the login user. This is the <strong>same single key pair</strong> used by Provision/ZTP.</p>
+                    <p class="p-desc">Authorize the collector's SSH key on selected devices in <code>devices.yaml</code> and enable passwordless <code>sudo</code> for the login user. This is the <strong>same single key pair</strong> used by Provision/ZTP.</p>
 
                     <div class="key-card">
                         <div class="key-row"><span class="k">Collector key</span><span id="key-state" class="badge gray">checking&hellip;</span></div>
@@ -202,11 +206,27 @@
                         </div>
                     </div>
 
-                    <div class="note">If you have already distributed the key, just click <strong>Verify</strong> &mdash; no password needed. To push the key to devices that don't trust it yet, enter the switch admin password once: it is used transiently (<code>ssh-copy-id</code>) and is <strong>never stored</strong>. Already-trusting devices are skipped. Make sure Step&nbsp;1 is saved first.</div>
+                    <div class="key-card">
+                        <label class="key-lbl" for="key-device-search">Devices from saved inventory &mdash; select one or more devices</label>
+                        <fieldset class="key-device-picker" id="key-device-picker">
+                            <div class="p-toolbar">
+                                <input class="sched-sel" id="key-device-search" type="search" placeholder="Search hostname or IP..." oninput="renderKeyDevices()">
+                                <button class="btn secondary" id="key-select-all" onclick="selectKeyDevices(true)" type="button">Select all</button>
+                                <button class="btn secondary" onclick="selectKeyDevices(false)" type="button">Clear selection</button>
+                                <button class="btn secondary" onclick="loadKeyDevices()" type="button"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Refresh inventory</button>
+                                <span class="status info" id="key-device-count" role="status">0 selected</span>
+                            </div>
+                            <div class="key-device-list">
+                                <table class="res"><thead><tr><th scope="col">Select</th><th scope="col">Device</th><th scope="col">IP / Host</th><th scope="col">User</th></tr></thead><tbody id="key-device-body"></tbody></table>
+                            </div>
+                        </fieldset>
+                        <div class="status info" id="key-device-status" role="status"></div>
+                    </div>
+                    <div class="note">Select the devices above, then click <strong>Verify selected</strong> &mdash; no password needed. To push the key to devices that don't trust it yet, enter the switch admin password once: it is used transiently (<code>ssh-copy-id</code>) and is <strong>never stored</strong>. Already-trusting devices are skipped. Make sure Step&nbsp;1 is saved first.</div>
                     <div class="key-input">
                         <input type="password" id="key-pw" placeholder="switch admin password (only needed to push the key)" autocomplete="new-password">
-                        <button class="btn secondary" id="verify-btn" onclick="verifyKeys()"><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Verify (no password)</button>
-                        <button class="btn primary" id="key-btn" onclick="distributeKeys()"><svg viewBox="0 0 24 24"><path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/></svg>Distribute to all</button>
+                        <button class="btn secondary" id="verify-btn" onclick="verifyKeys()" disabled><svg viewBox="0 0 24 24"><path d="M9,20.42L2.79,14.21L5.62,11.38L9,14.77L18.88,4.88L21.71,7.71L9,20.42Z"/></svg>Verify selected</button>
+                        <button class="btn primary" id="key-btn" onclick="distributeKeys()" disabled><svg viewBox="0 0 24 24"><path d="M7,14A2,2 0 0,1 5,12A2,2 0 0,1 7,10A2,2 0 0,1 9,12A2,2 0 0,1 7,14M12.65,10C11.83,7.67 9.61,6 7,6A6,6 0 0,0 1,12A6,6 0 0,0 7,18C9.61,18 11.83,16.33 12.65,14H17V18H21V14H23V10H12.65Z"/></svg>Distribute selected</button>
                         <button class="btn secondary" id="key-retry-btn" style="display:none" onclick="retryFailedKeys()" title="Push the key / fix sudo again only on the devices that failed in the last distribution"><svg viewBox="0 0 24 24"><use href="#i-reload"/></svg>Retry failed devices</button>
                     </div>
                     <div class="status info" id="key-progress"></div>
@@ -718,6 +738,11 @@ let keyInfoLoaded = false;   // SSH key panel loaded once
 let keyExists = false;       // a collector key currently exists
 let genArmed = false;        // two-click guard before replacing an existing key
 let keyRetryIps = [];        // IPs that failed the last distribution (drives "Retry failed devices")
+let keyDevices = [];
+let keySelectedIps = new Set();
+let keyDevicesLoading = false;
+let keyRequestBusy = false;
+let keyDevicesRefreshPending = false;
 let runActive = false;       // an lldpq run is in progress (drives polling)
 let runLogShown = false;     // run log fetched once on entering the step
 let runPollTimer = null;
@@ -899,6 +924,7 @@ function goStep(i) {
     if (FILES[key] && !FILES[key].loaded) loadFile(key, false);
     if (key === 'aliases' && !aliasesLoaded) loadAliases(false);
     if (key === 'keys' && !keyInfoLoaded) { keyInfoLoaded = true; loadSSHKeyInfo(); }
+    if (key === 'keys') loadKeyDevices();
     if (key === 'ansible' && !ansibleLoaded) { ansibleLoaded = true; loadAnsible(); }
     // Re-attach to the current/most-recent run whenever the step is re-entered
     // and nothing is actively polling (mirrors the Update step), so a replaced
@@ -1192,6 +1218,7 @@ async function saveFile(key) {
                 setStatus(cfg.st, 'Saved the submitted version, but newer editor changes remain unsaved.', 'info');
             }
             markDone(key, !!content.trim());
+            if (key === 'devices') loadKeyDevices();
         } else {
             const msg = data.conflict
                 ? ((data.error || (cfg.file + ' changed on disk.')) + ' Your editor was kept; reload to review before saving again.')
@@ -1522,6 +1549,113 @@ function publishAliasUpdate(revision) {
 }
 
 /* ---- Step 2: SSH key info / generate / import / verify ---- */
+function selectedKeyDevices() {
+    return keyDevices.filter(device => keySelectedIps.has(device.ip)).map(device => device.ip);
+}
+
+function filteredKeyDevices() {
+    const query = document.getElementById('key-device-search').value.trim().toLowerCase();
+    return keyDevices.filter(device => !query || [device.hostname, device.ip].some(value => String(value || '').toLowerCase().includes(query)));
+}
+
+function updateKeyControls() {
+    const busy = keyRequestBusy || keyDevicesLoading;
+    document.getElementById('key-device-picker').disabled = busy;
+    document.getElementById('verify-btn').disabled = busy || !keySelectedIps.size;
+    document.getElementById('key-btn').disabled = busy || !keySelectedIps.size;
+    document.getElementById('key-retry-btn').disabled = busy || !keyRetryIps.length;
+    document.getElementById('key-pw').disabled = busy;
+    document.getElementById('key-device-count').textContent = keySelectedIps.size + ' of ' + keyDevices.length + ' selected';
+}
+
+function toggleKeyDevice(ip, checked) {
+    if (keyRequestBusy || keyDevicesLoading || !keyDevices.some(device => device.ip === ip)) return;
+    if (checked) keySelectedIps.add(ip); else keySelectedIps.delete(ip);
+    updateKeyControls();
+}
+
+function selectKeyDevices(select) {
+    if (keyRequestBusy || keyDevicesLoading) return;
+    if (select) filteredKeyDevices().forEach(device => keySelectedIps.add(device.ip));
+    else keySelectedIps.clear();
+    renderKeyDevices();
+}
+
+function renderKeyDevices() {
+    const body = document.getElementById('key-device-body');
+    body.replaceChildren();
+    const visible = filteredKeyDevices();
+    document.getElementById('key-select-all').textContent = document.getElementById('key-device-search').value.trim() ? 'Select filtered' : 'Select all';
+    visible.forEach(device => {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        const input = document.createElement('input'); input.type = 'checkbox';
+        input.checked = keySelectedIps.has(device.ip);
+        input.setAttribute('aria-label', 'Select ' + (device.hostname || device.ip) + ' (' + device.ip + ')');
+        input.addEventListener('change', () => toggleKeyDevice(device.ip, input.checked));
+        td.appendChild(input); tr.appendChild(td);
+        appendResultTextCell(tr, device.hostname || device.ip, '#ddd');
+        appendResultTextCell(tr, device.ip, '#999', true);
+        appendResultTextCell(tr, device.username || '', '#999');
+        body.appendChild(tr);
+    });
+    if (!visible.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td'); td.colSpan = 4;
+        td.textContent = keyDevicesLoading ? 'Loading saved inventory…' : (keyDevices.length ? 'No devices match your search.' : 'No devices loaded. Save devices.yaml, then refresh inventory.');
+        tr.appendChild(td); body.appendChild(tr);
+    }
+    updateKeyControls();
+}
+
+function clearKeyResults() {
+    keyRetryIps = [];
+    document.getElementById('key-retry-btn').style.display = 'none';
+    document.getElementById('key-results').style.display = 'none';
+    document.getElementById('key-summary').style.display = 'none';
+    document.getElementById('key-results-body').replaceChildren();
+}
+
+async function loadKeyDevices() {
+    if (keyRequestBusy || keyDevicesLoading) { keyDevicesRefreshPending = true; return; }
+    keyDevicesRefreshPending = false;
+    keyDevicesLoading = true;
+    keyDevices = []; keySelectedIps.clear(); clearKeyResults();
+    document.getElementById('key-device-search').value = '';
+    document.getElementById('key-pw').value = '';
+    setStatus('key-progress', '', 'info');
+    setStatus('key-device-status', 'Loading saved inventory…', 'info');
+    markDone('keys', false);
+    renderKeyDevices();
+    try {
+        const response = await fetch('/setup-api.sh', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'list-key-devices' })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.success || !Array.isArray(data.devices)) throw new Error(data.error || 'Could not load devices.yaml.');
+        if (data.devices.some(device => !device || typeof device.ip !== 'string' || !device.ip)) throw new Error('The inventory response contains an invalid device.');
+        keyDevices = Array.from(new Map(data.devices.map(device => [device.ip, device])).values());
+        keyDevices.sort((a, b) => String(a.hostname || a.ip).localeCompare(String(b.hostname || b.ip)));
+        setStatus('key-device-status', keyDevices.length ? 'Select devices to verify or distribute the collector key.' : 'No active devices found in saved devices.yaml.', 'info');
+    } catch (error) {
+        setStatus('key-device-status', 'Inventory load failed: ' + error.message, 'err');
+    } finally {
+        keyDevicesLoading = false; renderKeyDevices();
+        if (keyDevicesRefreshPending) loadKeyDevices();
+    }
+}
+
+function finishKeyRequest() {
+    keyRequestBusy = false; updateKeyControls();
+    if (keyDevicesRefreshPending) loadKeyDevices();
+}
+
+function markKeySelectionDone(allOk, ips, results) {
+    const completed = new Set(results.map(result => result.ip));
+    markDone('keys', allOk && ips.length === keyDevices.length && keyDevices.length > 0 && keyDevices.every(device => completed.has(device.ip)));
+}
+
 async function loadSSHKeyInfo() {
     const st = document.getElementById('key-state');
     try {
@@ -1635,15 +1769,15 @@ async function downloadKey() {
 }
 
 async function verifyKeys() {
-    const btn = document.getElementById('verify-btn');
-    btn.disabled = true;
-    setStatus('key-progress', 'Checking which devices already trust the key (no password)\u2026', 'info');
-    document.getElementById('key-results').style.display = 'none';
-    document.getElementById('key-summary').style.display = 'none';
+    if (keyRequestBusy || keyDevicesLoading) return;
+    const ips = selectedKeyDevices();
+    if (!ips.length) { setStatus('key-progress', 'Select at least one device first.', 'err'); return; }
+    keyRequestBusy = true; clearKeyResults(); markDone('keys', false); updateKeyControls();
+    setStatus('key-progress', 'Checking ' + ips.length + ' selected device(s) (no password)\u2026', 'info');
     try {
-        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'verify' }) });
+        const r = await fetch('/setup-api.sh', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'verify', selected_devices: ips }) });
         const data = await r.json().catch(() => ({}));
-        if (!data.success) { setStatus('key-progress', data.error || 'Verify failed', 'err'); btn.disabled = false; return; }
+        if (!r.ok || !data.success) { setStatus('key-progress', data.error || 'Verify failed', 'err'); return; }
         if (data.public_key && !document.getElementById('key-pub').value) {
             document.getElementById('key-pub').value = data.public_key;
             const st = document.getElementById('key-state'); st.textContent = 'present'; st.className = 'badge green'; keyExists = true;
@@ -1665,16 +1799,16 @@ async function verifyKeys() {
         const total = data.total || 0;
         const sudoOk = Number.isFinite(Number(data.sudo_ok)) ? Number(data.sudo_ok) : results.filter(x => x.sudo_ok).length;
         setKeySummary(sum, [
-            { count:data.trusted || 0, total:total, text:' devices trust the collector key, ' },
+            { count:data.trusted || 0, total:total, text:' selected devices trust the collector key, ' },
             { count:sudoOk, total:total, text:' have passwordless sudo.' }
         ]);
-        const allOk = (data.trusted || 0) === total && sudoOk === total && total > 0;
-        setStatus('key-progress', allOk ? 'All devices trust the collector key and have passwordless sudo \u2713' : 'Some devices still need the key or passwordless sudo \u2014 use Distribute and check failed rows.', allOk ? 'ok' : 'info');
-        markDone('keys', allOk);
+        const allOk = total === ips.length && results.length === ips.length && new Set(results.map(x => x.ip)).size === ips.length && results.every(x => ips.includes(x.ip) && x.trusted && x.sudo_ok);
+        setStatus('key-progress', allOk ? 'Selected devices trust the collector key and have passwordless sudo \u2713' : 'Some selected devices still need the key or passwordless sudo \u2014 use Distribute selected and check failed rows.', allOk ? 'ok' : 'info');
+        markKeySelectionDone(allOk, ips, results);
     } catch (e) {
         setStatus('key-progress', 'Verify failed: ' + e.message, 'err');
     } finally {
-        btn.disabled = false;
+        finishKeyRequest();
     }
 }
 
@@ -1735,28 +1869,29 @@ function retryFailedKeys() {
 }
 
 async function distributeKeys(retryIps) {
+    if (keyRequestBusy || keyDevicesLoading) return;
     const pw = document.getElementById('key-pw').value;
-    const btn = document.getElementById('key-btn');
     const retryBtn = document.getElementById('key-retry-btn');
-    const retrying = Array.isArray(retryIps) && retryIps.length > 0;
+    const retrying = Array.isArray(retryIps);
+    const ips = retrying ? retryIps.filter(ip => keyRetryIps.includes(ip) && keyDevices.some(device => device.ip === ip)) : selectedKeyDevices();
+    if (!ips.length) { setStatus('key-progress', 'Select at least one device first.', 'err'); return; }
     if (!pw) { setStatus('key-progress', 'Enter the switch admin password first.', 'err'); return; }
-    btn.disabled = true;
-    if (retryBtn) retryBtn.disabled = true;
+    keyRequestBusy = true; clearKeyResults(); markDone('keys', false); updateKeyControls();
+    let receivedResults = false;
     setStatus('key-progress', retrying
-        ? 'Retrying ' + retryIps.length + ' failed device(s)…'
-        : 'Distributing key & enabling sudo (this can take a while for large fabrics)…', 'info');
-    document.getElementById('key-results').style.display = 'none';
-    document.getElementById('key-summary').style.display = 'none';
+        ? 'Retrying ' + ips.length + ' failed device(s)…'
+        : 'Distributing key & enabling sudo on ' + ips.length + ' selected device(s)…', 'info');
     try {
         const payload = { password: pw };
-        if (retrying) payload.retry_devices = retryIps;
+        if (retrying) payload.retry_devices = ips;
+        else payload.selected_devices = ips;
         const r = await fetch('/setup-api.sh', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
         const data = await r.json().catch(() => ({}));
-        if (!data.success) {
+        if (!r.ok || !data.success) {
             setStatus('key-progress', data.error || 'Distribution failed', 'err');
             return;
         }
@@ -1778,24 +1913,31 @@ async function distributeKeys(retryIps) {
         sum.style.display = 'block';
         const total = data.total || 0;
         setKeySummary(sum, [
-            { count:data.send_key_ok || 0, total:total, text:' devices have the key, ' },
+            { count:data.send_key_ok || 0, total:total, text:' selected devices have the key, ' },
             { count:data.sudo_fix_ok || 0, total:total, text:' have passwordless sudo.' }
         ]);
-        const allOk = (data.send_key_ok || 0) === total && (data.sudo_fix_ok || 0) === total && total > 0;
+        const results = data.results || [];
+        const allOk = total === ips.length && results.length === ips.length && new Set(results.map(x => x.ip)).size === ips.length && results.every(x => ips.includes(x.ip) && (x.send_key === 'ok' || x.send_key === 'already') && x.sudo_fix === 'ok');
         keyRetryIps = (data.results || [])
-            .filter(x => !((x.send_key === 'ok' || x.send_key === 'already') && x.sudo_fix === 'ok'))
+            .filter(x => ips.includes(x.ip) && !((x.send_key === 'ok' || x.send_key === 'already') && x.sudo_fix === 'ok'))
             .map(x => x.ip).filter(Boolean);
+        receivedResults = true;
         if (retryBtn) retryBtn.style.display = keyRetryIps.length ? 'inline-flex' : 'none';
         // Keep the transient password in the field while failures remain so
         // "Retry failed devices" can resend it; clear it on full success.
         if (!keyRetryIps.length) document.getElementById('key-pw').value = '';
-        setStatus('key-progress', allOk ? 'All devices reachable with the collector key and passwordless sudo \u2713' : 'Done — check failed key or sudo rows below, then use \u201cRetry failed devices\u201d.', allOk ? 'ok' : 'info');
-        markDone('keys', allOk);
+        setStatus('key-progress', allOk ? 'Selected devices reachable with the collector key and passwordless sudo \u2713' : 'Done — check failed key or sudo rows below, then use \u201cRetry failed devices\u201d.', allOk ? 'ok' : 'info');
+        markKeySelectionDone(allOk, ips, results);
     } catch (e) {
         setStatus('key-progress', 'Distribution failed: ' + e.message, 'err');
     } finally {
-        btn.disabled = false;
-        if (retryBtn) retryBtn.disabled = false;
+        // A retry without a usable response must not discard the last known
+        // failures or substitute the currently checked devices.
+        if (retrying && !receivedResults) {
+            keyRetryIps = ips;
+            retryBtn.style.display = 'inline-flex';
+        }
+        finishKeyRequest();
     }
 }
 

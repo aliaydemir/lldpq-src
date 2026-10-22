@@ -1086,7 +1086,7 @@ Admin-only **Setup** page (`http://<server>/setup.html`) — a guided, 11-step w
 | # | Step | What it does |
 |---|------|--------------|
 | 1 | Inventory | Edit `devices.yaml` — switches & credentials |
-| 2 | SSH Keys | Generate the collector key, authorize it on devices + passwordless sudo |
+| 2 | SSH Keys | Generate the collector key, select devices, verify or authorize the key + passwordless sudo |
 | 3 | Topology | Edit `topology.dot` — expected cabling |
 | 4 | Topology Config | Edit `topology_config.yaml` — layout / layer / icon rules |
 | 5 | Display Aliases | Optional — edit device/interface P2P and field display names |
@@ -1119,6 +1119,24 @@ The Setup and Results topology editors support `topology.dot` files up to
 escaping overhead. Oversized requests show an explicit error and keep the
 editor contents. Validation checks wiring and DOT syntax without computing a
 graph layout. Other managed configuration files retain their 2 MiB limit.
+
+### SSH key distribution (step 2)
+
+Select devices from the saved `devices.yaml` inventory before **Verify selected**
+or **Distribute selected**. Search by hostname or address to select one switch
+after an upgrade, or select multiple switches for a batch. IPv4 and IPv6 targets
+share the same list; no devices are selected initially. The selection count
+shows the scope of the next operation. Use the bulk-selection controls when
+you want to target the whole inventory.
+
+**Verify selected** checks key authentication and passwordless sudo without a
+password. **Distribute selected** uses the supplied switch admin password to
+authorize the existing collector key and prepare sudo only on those targets;
+it does not regenerate the key. Already-trusting devices skip key copying.
+**Retry failed devices** targets only failures from the last distribution.
+Save inventory edits first and refresh the device list when the inventory changes.
+The **Assets → SSH Setup** window also offers device selection before sending
+keys and fixing sudo, using the same saved inventory and selected-target API.
 
 ### Display Aliases (step 5)
 

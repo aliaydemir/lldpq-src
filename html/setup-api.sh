@@ -552,6 +552,39 @@ def load_devices(devices_yaml):
         return None, 'Invalid canonical device data: ' + str(e)
     return devices, None
 
+def select_key_devices(devices, request, devices_yaml):
+    """Resolve an explicit selection completely before any key/SSH operation.
+
+    Omitting both fields retains the legacy all-device operation. An empty or
+    stale explicit selection must never broaden that operation to all devices.
+    """
+    fields = [name for name in ('selected_devices', 'retry_devices') if name in request]
+    if len(fields) > 1:
+        raise ValueError('Use selected_devices or retry_devices, not both')
+    if not fields:
+        return devices
+    field = fields[0]
+    values = request[field]
+    if not isinstance(values, list) or not values or any(not isinstance(value, str) for value in values):
+        raise ValueError(field + ' must be a non-empty list of device addresses')
+
+    addressing_path = os.path.join(os.path.dirname(devices_yaml), 'addressing.py')
+    try:
+        spec = importlib.util.spec_from_file_location('lldpq_setup_addressing', addressing_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise ValueError('Canonical address helper is unavailable; repair this installation') from exc
+    try:
+        selected = {module.normalize_address(value, allow_hostname=True) for value in values}
+    except ValueError as exc:
+        raise ValueError('Invalid ' + field + ': ' + str(exc)) from exc
+    known = {device['ip'] for device in devices}
+    unknown = sorted(selected - known)
+    if unknown:
+        raise ValueError('Devices are no longer in the inventory; reload the device list: ' + ', '.join(unknown))
+    return [device for device in devices if device['ip'] in selected]
+
 def _as_service(argv, *, input_text=None, timeout=10):
     return subprocess.run(
         ['sudo', '-n', '-u', os.environ.get('LLDPQ_USER', 'lldpq')] + argv,
@@ -1326,6 +1359,15 @@ if action == 'get-private-key':
         print(json.dumps({'success': False, 'error': f'No private key found for {lldpq_user}'}))
     sys.exit(0)
 
+# ─── Action: List devices eligible for SSH-key operations (no device contact) ───
+if action == 'list-key-devices':
+    all_devices, load_error = load_devices(devices_yaml)
+    if load_error:
+        print(json.dumps({'success': False, 'error': load_error}))
+    else:
+        print(json.dumps({'success': True, 'devices': all_devices}))
+    sys.exit(0)
+
 # ─── Action: Verify which devices already trust the collector key (no password) ───
 if action == 'verify':
     try:
@@ -1337,7 +1379,11 @@ if action == 'verify':
     if load_error:
         print(json.dumps({'success': False, 'error': load_error}))
         sys.exit(0)
-
+    try:
+        all_devices = select_key_devices(all_devices, post_data, devices_yaml)
+    except ValueError as exc:
+        print(json.dumps({'success': False, 'error': str(exc)}))
+        sys.exit(0)
     ssh_key_path, key_generated, key_error = ensure_ssh_key(lldpq_user)
     if key_error:
         print(json.dumps({'success': False, 'error': 'SSH key error: ' + key_error}))
@@ -2643,19 +2689,27 @@ if action == 'purge-data':
 
 # ─── Action: Generate new key + distribute with password ───
 password = post_data.get('password', '')
-retry_devices = post_data.get('retry_devices', [])  # List of IPs for retry
 
 if (not isinstance(password, str) or not password or len(password) > 1024
         or any(char in password for char in ('\x00', '\r', '\n'))):
     print(json.dumps({'success': False, 'error': 'Password is required'}))
     sys.exit(0)
-if not isinstance(retry_devices, list) or any(not isinstance(value, str) for value in retry_devices):
-    print(json.dumps({'success': False, 'error': 'retry_devices must be a list of device addresses'}))
-    sys.exit(0)
 
+# Validate the full selection before creating a key or contacting any device.
+# Read after acquiring the lock: a preceding fan-out may have kept us waiting
+# while the user changed the inventory.
 try:
     ensure_ssh_key_lock()
 except Exception as exc:
+    print(json.dumps({'success': False, 'error': str(exc)}))
+    sys.exit(0)
+all_devices, load_error = load_devices(devices_yaml)
+if load_error:
+    print(json.dumps({'success': False, 'error': load_error}))
+    sys.exit(0)
+try:
+    all_devices = select_key_devices(all_devices, post_data, devices_yaml)
+except ValueError as exc:
     print(json.dumps({'success': False, 'error': str(exc)}))
     sys.exit(0)
 
@@ -2664,19 +2718,6 @@ ssh_key_path, key_generated, key_error = ensure_ssh_key(lldpq_user)
 if key_error:
     print(json.dumps({'success': False, 'error': f'SSH key error: {key_error}'}))
     sys.exit(0)
-
-# Load devices
-all_devices, load_error = load_devices(devices_yaml)
-if load_error:
-    print(json.dumps({'success': False, 'error': load_error}))
-    sys.exit(0)
-
-# Filter for retry if specified
-if retry_devices:
-    all_devices = [d for d in all_devices if d['ip'] in retry_devices]
-    if not all_devices:
-        print(json.dumps({'success': False, 'error': 'No matching devices for retry'}))
-        sys.exit(0)
 
 # Run setup for all devices in parallel. Key material is resolved; the
 # ssh-key lock alone covers the fan-out.
