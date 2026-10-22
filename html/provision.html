@@ -860,7 +860,7 @@
             </div>
             <div>
                 <div class="section-title" style="font-size: 13px; margin-bottom: 8px;">Post-Provision Actions</div>
-                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">Automatically run on newly provisioned IPv4 devices (SSH key auth OK + no marker). IPv6 devices are monitored only.</div>
+                <div class="section-desc" style="margin-bottom: 8px; font-size: 11px;">Automatically run on newly provisioned IPv4 devices (SSH key auth OK + no marker). For IPv6, use Base Config or Upgrade explicitly.</div>
                 <div style="display: flex; flex-direction: column; gap: 6px;">
                     <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 12px; color: #ccc;">
                         <input type="checkbox" id="autoBaseConfig" checked> Deploy Base Config (sw-base files)
@@ -1355,8 +1355,8 @@
         </div>
         <div>
             <label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">IMAGE SERVER IP</label>
-            <input type="text" class="form-input input-ip" id="upgradeServerIP" readonly autocomplete="off" style="width:100%; background:#252526;" placeholder="Uses ZTP Image Server IP">
-            <div id="upgradeServerInfo" style="font-size:11px;color:#666;margin-top:4px;">Uses ZTP Quick Settings IMAGE SERVER IP</div>
+            <input type="text" class="form-input input-ip" id="upgradeServerIP" oninput="onUpgradeServerInput()" autocomplete="off" style="width:100%;" placeholder="IPv4, IPv6 or hostname[:port]">
+            <div id="upgradeServerInfo" style="font-size:11px;color:#666;margin-top:4px;">Defaults to the saved image server. Changes here apply only to Upgrade.</div>
         </div>
         <div>
             <label style="font-size:11px;color:#888;display:block;margin-bottom:4px;">BATCH SIZE</label>
@@ -3039,7 +3039,7 @@ function renderBindings() {
         const hasValidMac = b.mac && b.mac !== '-' && !b.mac.includes('x');
         const dhcpChecked = b.dhcp !== false ? 'checked' : '';
         const dhcpHtml = LLDPqIP.isIPv6(b.ip)
-            ? '<span style="color:#444;font-size:11px;" title="IPv6 management only — DHCPv6 is not configured">—</span>'
+            ? '<span style="color:#444;font-size:11px;" title="DHCPv6 is not configured for IPv6 devices">—</span>'
             : hasValidMac
             ? `<input type="checkbox" ${dhcpChecked} onchange="toggleDhcp('${escAttr(b.hostname)}', this.checked)" style="cursor:pointer;" title="DHCP binding">`
             : `<span style="color:#444;font-size:11px;" title="No MAC — DHCP not applicable">—</span>`;
@@ -3803,7 +3803,7 @@ async function runSubnetScan() {
 }
 
 function renderPostProvisionBadge(device) {
-    if (LLDPqIP.isIPv6(device.ip)) return '<span class="badge badge-info" style="font-size:10px;" title="IPv6 management only; no provisioning actions">Monitoring</span>';
+    if (LLDPqIP.isIPv6(device.ip)) return '<span class="badge badge-info" style="font-size:10px;" title="Discovery does not deploy configuration to IPv6 devices automatically; use Base Config explicitly.">Manual</span>';
     const actionLabels = {
         base_config: 'Base Config',
         ztp_disable: 'Disable ZTP',
@@ -3829,7 +3829,6 @@ function renderPostProvisionBadge(device) {
 }
 
 function generatedConfigDeployState(device, configHostnames) {
-    if (LLDPqIP.isIPv6(device.ip)) return { visible: false, enabled: false, reason: 'IPv6 management only; configuration deployment is not supported.' };
     if (!device.hostname || !configHostnames.has(device.hostname)) {
         return { visible: false, enabled: false, reason: '' };
     }
@@ -4076,7 +4075,6 @@ function discoveredIdentityConflict(bindings, discovered) {
 function filterDiscovered() { renderDiscovered(); }
 
 async function deployGeneratedConfig(hostname, ip) {
-    if (LLDPqIP.isIPv6(ip)) { showToast('IPv6 devices support management and discovery only.', 'error'); return; }
     showConfirmModal('Re-deploy NVUE Config',
         `Re-deploy the saved NVUE config to <strong>${escHtml(hostname)}</strong> (${escHtml(ip)})?<br><br>` +
         `This will run:<br>` +
@@ -5095,7 +5093,6 @@ let upgradeDevices = [];
 let upgradeSelected = new Set();
 function upgradeSetSel(ip, checked) {
     if (!ip) return;
-    if (LLDPqIP.isIPv6(ip)) { upgradeSelected.delete(ip); return; }
     if (checked) upgradeSelected.add(ip); else upgradeSelected.delete(ip);
 }
 let upgradeImages = [];
@@ -5105,13 +5102,72 @@ let upgradePollGeneration = 0;
 let upgradePollErrors = 0;
 const UPGRADE_POLL_MAX_ERRORS = 4;
 let upgradeDetectedServerIP = '';
+let upgradeServerEdited = false;
 
 function rowIdFromIp(ip) {
-    return String(ip || '').replace(/[^a-zA-Z0-9_-]/g, '-');
+    const address = LLDPqIP.parse(String(ip || ''), false);
+    if (address && address.version === 4) return address.canonical.replace(/\./g, '-');
+    // Keep scope punctuation distinct: eth0.100 and eth0-100 are different
+    // collector interfaces, and each deployment needs its own progress row.
+    return 'address-' + encodeURIComponent(address ? address.canonical : String(ip || ''));
 }
 
 function isUsableImageServer(value) {
     return !!value && !value.includes('__') && !value.includes('_') && /^[A-Za-z0-9.-]+(:[0-9]{1,5})?$/.test(value);
+}
+
+// Upgrade accepts an independent HTTP authority; ZTP validation stays unchanged.
+function upgradeImageServerRef(value) {
+    const text = String(value || '').trim();
+    if (!text || /\s/.test(text)) return '';
+    let host = text, port = '';
+    if (text.startsWith('[')) {
+        const match = text.match(/^\[([^\]]+)\](?::([0-9]{1,5}))?$/);
+        if (!match || !LLDPqIP.isIPv6(match[1])) return '';
+        host = match[1];
+        port = match[2] || '';
+    } else if (!LLDPqIP.isIPv6(text)) {
+        const match = text.match(/^([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?$/);
+        if (!match) return '';
+        host = match[1];
+        port = match[2] || '';
+    }
+    if (port && (Number(port) < 1 || Number(port) > 65535)) return '';
+    const address = LLDPqIP.parse(host, false);
+    if (address) {
+        if (address.scope || address.words.every(word => word === 0)) return '';
+        if (address.version === 6) {
+            if ((address.words[0] & 0xffc0) === 0xfe80 || (address.words[0] & 0xff00) === 0xff00) return '';
+            const mapped = address.words.slice(0, 5).every(word => word === 0) && address.words[5] === 0xffff;
+            if (mapped && ((address.words[6] === 0 && address.words[7] === 0) ||
+                (address.words[6] >> 8) >= 224 && (address.words[6] >> 8) <= 239)) return '';
+            host = '[' + address.canonical + ']';
+        } else {
+            if (address.words[0] >= 224 && address.words[0] <= 239) return '';
+            host = address.canonical;
+        }
+    } else {
+        // A malformed numeric address must not become a hostname.
+        if (/^[0-9]+(?:\.[0-9]+){3}$/.test(host) || host.length > 253 ||
+            !host.replace(/\.+$/, '').split('.').every(label => /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label))) return '';
+        host = host.toLowerCase();
+    }
+    return host + (port ? ':' + Number(port) : '');
+}
+
+function renderUpgradeServerInfo() {
+    const target = document.getElementById('upgradeServerIP');
+    const info = document.getElementById('upgradeServerInfo');
+    if (!target || !info) return;
+    const selectedServer = upgradeImageServerRef(target.value);
+    info.innerHTML = selectedServer
+        ? `Upgrade image server: <span style="color:#76b900;font-family:monospace;">${escHtml(selectedServer)}</span>${upgradeServerEdited ? ' (Upgrade only)' : ''}`
+        : '<span style="color:#ff9800;">Enter a reachable IPv4, IPv6 or hostname; use [IPv6]:port for a custom port.</span>';
+}
+
+function onUpgradeServerInput() {
+    upgradeServerEdited = true;
+    renderUpgradeServerInfo();
 }
 
 function renderUpgradeImages() {
@@ -5140,16 +5196,11 @@ function onUpgradeImageChange() {
 function syncUpgradeServerIPFromZTP() {
     const source = document.getElementById('ztpImageServer');
     const target = document.getElementById('upgradeServerIP');
-    const info = document.getElementById('upgradeServerInfo');
-    if (!source || !target) return;
-    const ztpServer = document.getElementById('ztpImageServer') ? document.getElementById('ztpImageServer').value.trim() : '';
-    const selectedServer = isUsableImageServer(ztpServer) ? ztpServer : (isUsableImageServer(upgradeDetectedServerIP) ? upgradeDetectedServerIP : '');
-    target.value = selectedServer;
-    if (info) {
-        info.innerHTML = selectedServer
-            ? `Using image server: <span style="color:#76b900;font-family:monospace;">${escHtml(selectedServer)}</span>${selectedServer !== ztpServer ? ' <span style="color:#888;">(auto-detected)</span>' : ''}`
-            : '<span style="color:#ff9800;">Set IMAGE SERVER IP in the ZTP tab first.</span>';
+    if (!target) return;
+    if (!upgradeServerEdited) {
+        target.value = upgradeImageServerRef(source ? source.value : '') || upgradeImageServerRef(upgradeDetectedServerIP);
     }
+    renderUpgradeServerInfo();
 }
 
 async function loadUpgradeCandidates() {
@@ -5216,7 +5267,11 @@ function attachUpgradeJob(job, announce = false) {
     const server = document.getElementById('upgradeServerIP');
     const image = document.getElementById('upgradeImage');
     if (target) target.value = job.target_version || target.value;
-    if (server) server.value = job.server_ip || server.value;
+    if (server && job.server_ip) {
+        server.value = job.server_ip;
+        upgradeServerEdited = true;
+        renderUpgradeServerInfo();
+    }
     if (image && job.image_name) {
         let option = Array.from(image.options).find(item => item.value === job.image_name);
         if (!option) {
@@ -5239,7 +5294,7 @@ function selectedUpgradeDevices() {
     return Array.from(document.querySelectorAll('.upgrade-dev-cb:checked')).map(cb => {
         const idx = parseInt(cb.dataset.index, 10);
         return upgradeDevices[idx];
-    }).filter(device => device && !LLDPqIP.isIPv6(device.ip));
+    }).filter(Boolean);
 }
 
 function upgradeSelectAll(checked) {
@@ -5307,15 +5362,13 @@ function renderUpgradeTable(job = null) {
         const merged = Object.assign({}, d, jd || {});
         const current = merged.current_version || '';
         const already = target && current === target;
-        const monitorOnly = LLDPqIP.isIPv6(merged.ip);
-        const candidate = !monitorOnly && merged.reachable && !already;
-        const status = monitorOnly ? 'monitoring only' : merged.status || (already ? 'already' : (merged.reachable ? 'candidate' : 'unreachable'));
+        const candidate = merged.reachable && !already;
+        const status = merged.status || (already ? 'already' : (merged.reachable ? 'candidate' : 'unreachable'));
         return Object.assign(merged, {
             target_version: target,
             status,
             candidate,
             already,
-            ...(monitorOnly ? { message: 'IPv6 devices support management and discovery only.' } : {}),
         });
     });
     rows.sort(compareUpgradeRows);
@@ -5360,14 +5413,14 @@ async function runUpgradePrecheck() {
 }
 
 function getUpgradePayload(devices) {
-    if (devices.some(device => LLDPqIP.isIPv6(device.ip))) { showToast('IPv6 devices support management and discovery only.', 'error'); return null; }
     const imageName = document.getElementById('upgradeImage').value;
     const targetVersion = document.getElementById('upgradeTargetVersion').value.trim();
-    const serverIp = document.getElementById('upgradeServerIP').value.trim();
+    const serverValue = document.getElementById('upgradeServerIP').value.trim();
+    const serverIp = upgradeImageServerRef(serverValue);
     if (!devices.length) { showToast('Select at least one upgrade candidate', 'error'); return null; }
     if (!imageName || !targetVersion) { showToast('Target image and version are required', 'error'); return null; }
-    if (!serverIp) { showToast('Set IMAGE SERVER IP in the ZTP tab first', 'error'); return null; }
-    if (!isUsableImageServer(serverIp)) { showToast('Invalid image server. Replace __IMAGE_SERVER_IP__ with a real IP/hostname in the ZTP tab.', 'error'); return null; }
+    if (!serverValue) { showToast('Set IMAGE SERVER IP for this upgrade', 'error'); return null; }
+    if (!serverIp) { showToast('Invalid image server. Use IPv4, global/ULA IPv6, or hostname; use [IPv6]:port for a custom port. Link-local image servers are not supported.', 'error'); return null; }
     return {
         devices,
         image_name: imageName,
@@ -5474,7 +5527,6 @@ let bcDeviceGroups = {};
 let bcSelected = new Set();
 function bcSetSel(ip, checked) {
     if (!ip) return;
-    if (LLDPqIP.isIPv6(ip)) { bcSelected.delete(ip); return; }
     if (checked) bcSelected.add(ip); else bcSelected.delete(ip);
 }
 
@@ -5517,7 +5569,7 @@ function renderBCDeviceList() {
                 <div id="bcd-${groupId}" style="display:none;">
                     ${filtered.map(d => `
                         <label style="display:flex; align-items:center; gap:8px; padding:4px 10px 4px 28px; cursor:pointer; font-size:12px; transition:background 0.1s;" onmouseover="this.style.background='#2a2a2a'" onmouseout="this.style.background=''">
-                            <input type="checkbox" class="bc-dev-cb" data-ip="${escHtml(d.ip)}" data-hostname="${escHtml(d.hostname)}" data-username="${escHtml(d.username || 'cumulus')}" data-group="${groupId}" ${LLDPqIP.isIPv6(d.ip) ? 'disabled title="IPv6 management only"' : (bcSelected.has(d.ip) ? 'checked' : '')} style="accent-color:#76b900; width:13px; height:13px;" onchange="bcSetSel(this.dataset.ip, this.checked); bcUpdateCounts()">
+                            <input type="checkbox" class="bc-dev-cb" data-ip="${escHtml(d.ip)}" data-hostname="${escHtml(d.hostname)}" data-username="${escHtml(d.username || 'cumulus')}" data-group="${groupId}" ${bcSelected.has(d.ip) ? 'checked' : ''} style="accent-color:#76b900; width:13px; height:13px;" onchange="bcSetSel(this.dataset.ip, this.checked); bcUpdateCounts()">
                             <span style="flex:1; color:#d4d4d4;">${escHtml(d.hostname)}</span>
                             <span style="color:#666; font-family:monospace; font-size:11px;">${escHtml(d.ip)}</span>
                         </label>
@@ -5577,11 +5629,6 @@ async function deployBaseConfig() {
         username: cb.dataset.username
     }));
 
-    if (selectedDevices.some(device => LLDPqIP.isIPv6(device.ip))) {
-        showToast('IPv6 devices support management and discovery only.', 'error');
-        return;
-    }
-
     if (selectedDevices.length === 0) {
         showToast('Select at least one device', 'error');
         return;
@@ -5599,7 +5646,7 @@ async function deployBaseConfig() {
                 <thead><tr><th>Hostname</th><th>IP</th><th>Status</th><th>Details</th></tr></thead>
                 <tbody id="deployBody">
                     ${selectedDevices.map(d => `
-                        <tr id="deploy-${d.ip.replace(/\./g, '-')}">
+                        <tr id="deploy-${rowIdFromIp(d.ip)}">
                             <td><strong>${escHtml(d.hostname)}</strong></td>
                             <td style="font-family:monospace;font-size:12px;">${escHtml(d.ip)}</td>
                             <td><div class="spinner"></div></td>
@@ -5621,7 +5668,7 @@ async function deployBaseConfig() {
     if (data.success && data.results) {
         let okCount = 0, failCount = 0;
         data.results.forEach(r => {
-            const row = document.getElementById(`deploy-${r.ip.replace(/\./g, '-')}`);
+            const row = document.getElementById(`deploy-${rowIdFromIp(r.ip)}`);
             if (row) {
                 if (r.success) {
                     okCount++;

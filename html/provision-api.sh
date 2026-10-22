@@ -1419,13 +1419,14 @@ def load_canonical_inventory_bindings(include_monitored=False):
 
 def canonicalize_inventory_target(device, bindings=None):
     """Resolve hostname+IP to current inventory identity and reject stale input."""
+    from addressing import normalize_address
     hostname = str(device.get('hostname', '')).strip()
     raw_ip = str(device.get('ip', '')).strip()
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
         raise ValueError('Invalid device hostname')
     try:
-        ip = str(ipaddress.IPv4Address(raw_ip))
-    except ipaddress.AddressValueError as exc:
+        ip = normalize_address(raw_ip)
+    except ValueError as exc:
         raise ValueError(f'Invalid device IP: {raw_ip}') from exc
     if bindings is None:
         bindings = load_canonical_inventory_bindings(include_monitored=True)
@@ -1452,7 +1453,7 @@ def canonicalize_inventory_target(device, bindings=None):
         raise ValueError('Inventory serial changed after target selection')
     canonical = dict(device)
     canonical.update({
-        'hostname': binding['hostname'], 'ip': binding['ip'],
+        'hostname': binding['hostname'], 'ip': ip,
         'expected_mac': current_mac, 'expected_serial': current_serial,
     })
     return canonical
@@ -1615,9 +1616,12 @@ def get_server_ip():
     return _server_ip_cache
 
 def is_valid_server_ref(value):
-    if not value or '__' in value or '_' in value:
+    from addressing import normalize_server_ref
+    try:
+        normalize_server_ref(value)
+        return True
+    except ValueError:
         return False
-    return re.fullmatch(r'[A-Za-z0-9.-]+(?::[0-9]{1,5})?', value) is not None
 
 def action_list_bindings():
     """Load inventory from inventory.json (primary) or dhcpd.hosts (fallback).
@@ -5184,6 +5188,7 @@ def action_dhcp_log():
 
 def action_list_devices():
     """List devices from devices.yaml for base config deploy target selection."""
+    from addressing import normalize_address
     devices_file = os.path.join(LLDPQ_DIR, 'devices.yaml')
     
     if not os.path.exists(devices_file):
@@ -5230,7 +5235,11 @@ def action_list_devices():
             hostname = str(info) if info else str(ip)
             username = default_username
         
-        dev = {'ip': str(ip), 'hostname': hostname, 'username': username, 'role': role}
+        try:
+            ip = normalize_address(str(ip), allow_hostname=True)
+        except ValueError as exc:
+            error_json(f'Invalid devices.yaml management address: {exc}')
+        dev = {'ip': ip, 'hostname': hostname, 'username': username, 'role': role}
         groups.setdefault(role, []).append(dev)
     
     # Sort devices within each group by hostname
@@ -5382,7 +5391,10 @@ def _deploy_to_device(device, files, disable_ztp):
     # Step 2: SCP the exact manifest to the private staging directory.
     scp_files = [os.path.join(BASE_CONFIG_DIR, fname) for fname in files]
     try:
-        scp_cmd = ['sudo', '-u', LLDPQ_USER, 'scp'] + ssh_opts + scp_files + [f'{username}@{ip}:{remote_dir}/']
+        # SCP separates the host and path with ':', so IPv6 (including a
+        # collector-local scope) must be bracketed. SSH targets stay bare.
+        scp_host = f'[{ip}]' if ':' in ip else ip
+        scp_cmd = ['sudo', '-u', LLDPQ_USER, 'scp'] + ssh_opts + scp_files + [f'{username}@{scp_host}:{remote_dir}/']
         scp_result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=60)
         if scp_result.returncode != 0:
             cleanup_remote_stage()
@@ -5476,7 +5488,8 @@ def _deploy_to_device(device, files, disable_ztp):
 @contextmanager
 def device_mutation_lock(ip):
     """Serialize all LLDPq configuration mutations for one target IP."""
-    ip = str(ip or '')
+    from addressing import normalize_address
+    ip = normalize_address(str(ip or ''))
     os.makedirs(DISCOVERY_JOBS_DIR, exist_ok=True)
     device_key = hashlib.sha256(ip.encode('utf-8')).hexdigest()[:24]
     lock_path = os.path.join(
@@ -5510,6 +5523,7 @@ def deploy_to_device(device, files, disable_ztp):
         }
 
 def action_deploy_base_config():
+    from addressing import normalize_address
     try:
         data = json.loads(POST_DATA)
     except Exception:
@@ -5537,8 +5551,8 @@ def action_deploy_base_config():
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
             error_json('Invalid device hostname')
         try:
-            ip = str(ipaddress.IPv4Address(raw_ip))
-        except ipaddress.AddressValueError:
+            ip = normalize_address(raw_ip)
+        except ValueError:
             error_json(f'Invalid device IP: {raw_ip}')
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,31}', username):
             error_json('Invalid SSH username')
@@ -5907,6 +5921,7 @@ def get_device_version(device):
         return result
 
 def action_upgrade_candidates():
+    from addressing import normalize_address
     devices = []
     data_holder = {}
     # Reuse devices.yaml parsing logic from list-devices without emitting JSON.
@@ -5919,7 +5934,8 @@ def action_upgrade_candidates():
             raw = yaml.safe_load(f) or {}
         defaults = raw.get('defaults', {})
         default_username = defaults.get('username', 'cumulus')
-        for ip, info in raw.get('devices', raw).items():
+        section = raw.get('devices', raw) or {}
+        for ip, info in section.items():
             if ip in ('defaults', 'endpoint_hosts'):
                 continue
             role = 'ungrouped'
@@ -5935,7 +5951,8 @@ def action_upgrade_candidates():
             else:
                 hostname = str(info) if info else str(ip)
                 username = default_username
-            devices.append({'ip': str(ip), 'hostname': hostname, 'username': username, 'role': role})
+            ip = normalize_address(str(ip), allow_hostname=True)
+            devices.append({'ip': ip, 'hostname': hostname, 'username': username, 'role': role})
     except Exception as e:
         error_json(str(e))
 
@@ -5962,6 +5979,30 @@ def action_upgrade_candidates():
     candidates.sort(key=lambda x: x.get('hostname', ''))
     result_json({'success': True, 'devices': candidates, 'images': list_os_image_objects(), 'server_ip': get_server_ip(), 'done': True})
 
+def check_upgrade_image_download(device, image_url):
+    """Read-only, bounded HTTP check from the switch that will fetch the image."""
+    script = '\n'.join([
+        'set -eu',
+        f'IMAGE_URL={shlex.quote(image_url)}',
+        'curl --globoff --fail --silent --show-error --connect-timeout 5 '
+        '--max-time 15 --head -- "$IMAGE_URL" >/dev/null',
+        'echo LLDPQ_HTTP_OK',
+    ]) + '\n'
+    try:
+        result = subprocess.run(
+            ['sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes',
+             '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=no',
+             '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR',
+             f"{device.get('username', 'cumulus')}@{device['ip']}", 'bash -s'],
+            input=script, capture_output=True, text=True, timeout=25,
+        )
+        if result.returncode == 0 and 'LLDPQ_HTTP_OK' in result.stdout:
+            return ''
+        return (result.stderr or result.stdout or 'HTTP check failed').strip()[-300:]
+    except Exception as exc:
+        return str(exc)[:300]
+
+
 def run_upgrade_precheck(device, target_version, image_name, server_ip):
     info = get_device_version(device)
     info['target_version'] = target_version
@@ -5980,14 +6021,20 @@ def run_upgrade_precheck(device, target_version, image_name, server_ip):
     if not is_valid_server_ref(server_ip):
         checks.append('Invalid image server')
     if not checks:
-        # Precheck is deliberately read-only. The guarded launch path performs
-        # nv config save immediately before onie-install on the verified device.
+        from addressing import http_url
+        download_error = check_upgrade_image_download(device, http_url(server_ip, image_name))
+        if download_error:
+            checks.append('Image download is not reachable from device: ' + download_error)
+    if not checks:
+        # Precheck is deliberately read-only. The guarded launch path repeats
+        # the HTTP checks before saving config and invoking onie-install.
         info['precheck_ok'] = True
         checks.append('OK')
     info['checks'] = checks
     return info
 
 def action_upgrade_precheck():
+    from addressing import normalize_server_ref
     try:
         data = json.loads(POST_DATA)
     except Exception:
@@ -6002,8 +6049,10 @@ def action_upgrade_precheck():
         error_json('devices, target_version, image_name and server_ip are required')
     if not valid_os_image_name(image_name):
         error_json('Invalid image filename')
-    if not is_valid_server_ref(server_ip):
-        error_json('Invalid image server. Set a real ZTP IMAGE SERVER IP first.')
+    try:
+        server_ip = normalize_server_ref(server_ip)
+    except ValueError as exc:
+        error_json(f'Invalid image server: {exc}')
     if not isinstance(devices, list):
         error_json('Upgrade devices must be a list')
     try:
@@ -6165,8 +6214,9 @@ def validate_upgrade_job_state(job, expected_id):
         if not isinstance(item, dict) or item.get('status') not in statuses:
             raise ValueError('invalid upgrade device state')
         try:
-            ip = str(ipaddress.IPv4Address(str(item.get('ip', ''))))
-        except ipaddress.AddressValueError as exc:
+            from addressing import normalize_address
+            ip = normalize_address(str(item.get('ip', '')))
+        except ValueError as exc:
             raise ValueError('invalid upgrade device IP') from exc
         if ip in seen_ips:
             raise ValueError('duplicate upgrade device IP')
@@ -6533,8 +6583,6 @@ def _start_upgrade_for_device(dev, image_url, ztp_url, operation_id):
 IMAGE_URL="$1"
 ZTP_URL="$2"
 OPERATION_ID="$3"
-sudo nv config save
-test -s /etc/nvue.d/startup.yaml
 
 # A worker can die after the remote process starts but before local state is
 # committed.  Reusing the persisted operation ID makes that retry idempotent.
@@ -6555,6 +6603,15 @@ if [ "$current_operation" = "$OPERATION_ID" ]; then
     exit 0
   fi
 fi
+# Verify both HTTP resources from this switch before configuration changes or
+# dispatch. IPv6 transport does not imply the image server is reachable over
+# the same family; only a successful HTTP request establishes that path.
+for resource in "$IMAGE_URL" "$ZTP_URL"; do
+  curl --globoff --fail --silent --show-error --connect-timeout 5 \
+    --max-time 10 --head -- "$resource" >/dev/null
+done
+sudo nv config save
+test -s /etc/nvue.d/startup.yaml
 sudo rm -f /tmp/lldpq-upgrade.exit /tmp/lldpq-upgrade.log
 printf '%s\n' "$OPERATION_ID" | sudo tee /tmp/lldpq-upgrade.operation >/dev/null
 echo LLDPQ_UPGRADE_DISPATCHING
@@ -6581,9 +6638,9 @@ echo LLDPQ_UPGRADE_STARTED
         r = subprocess.run(
             ['sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8',
              '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
-             '-o', 'LogLevel=ERROR', f'{username}@{ip}', 'bash -s --', image_url,
-             ztp_url, operation_id],
-            input=remote, capture_output=True, text=True, timeout=35
+             '-o', 'LogLevel=ERROR', f'{username}@{ip}', 'bash -s --',
+             shlex.quote(image_url), shlex.quote(ztp_url), operation_id],
+            input=remote, capture_output=True, text=True, timeout=50
         )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or ''
@@ -6835,9 +6892,10 @@ def update_upgrade_job(job):
     # artifacts have been published successfully by action_upgrade_start.
     if job.get('ready', True) is False:
         return job
-    image_url = f"http://{job['server_ip']}/{job['image_name']}"
+    from addressing import http_url
+    image_url = http_url(job['server_ip'], job['image_name'])
     ztp_path = str(job.get('ztp_artifact', '')).lstrip('/')
-    ztp_url = f"http://{job['server_ip']}/{ztp_path}"
+    ztp_url = http_url(job['server_ip'], ztp_path)
 
     # A queued device is first committed as `starting` with an operation ID.
     # Only a later worker pass performs the irreversible remote launch.  This
@@ -7214,7 +7272,48 @@ def ensure_onie_symlinks(image_name):
     return created
 
 
+def prepare_upgrade_post_install_script(content, server_ip):
+    """Pin the selected HTTP server without changing the site's saved script.
+
+    Older supported v2/v3 templates split a host at its first colon for ping.
+    Adapt only their known assignment/call shape inside the private artifact;
+    unfamiliar custom ping logic needs a template update instead of guessing.
+    """
+    from addressing import normalize_server_ref
+    server_ip = normalize_server_ref(server_ip)
+    if not ztp_script_static_setting(content, 'IMAGE_SERVER_HOSTNAME'):
+        raise ValueError('Script must contain one literal IMAGE_SERVER_HOSTNAME setting')
+    content = re.sub(
+        r'^(\s*)IMAGE_SERVER_HOSTNAME=.*$',
+        lambda match: f'{match.group(1)}IMAGE_SERVER_HOSTNAME="{server_ip}"',
+        content, count=1, flags=re.MULTILINE,
+    )
+    if server_ip.startswith('['):
+        target = server_ip[1:].split(']', 1)[0]
+        assignments = list(re.finditer(
+            r'^(\s*)IMAGE_SERVER_PING_TARGET=.*$', content, re.MULTILINE,
+        ))
+        if len(assignments) != 1:
+            raise ValueError('Update the post-install script template before using an IPv6 image server')
+        content = re.sub(
+            r'^(\s*)IMAGE_SERVER_PING_TARGET=.*$',
+            lambda match: f'{match.group(1)}IMAGE_SERVER_PING_TARGET="{target}"',
+            content, count=1, flags=re.MULTILINE,
+        )
+        legacy_ping = 'if ping "$target" -c2 --no-vrf-switch >/dev/null; then'
+        current_ping = 'if ping "${family_args[@]}" "$target" -c2 --no-vrf-switch >/dev/null; then'
+        if content.count(legacy_ping) == 1:
+            content = content.replace(legacy_ping, legacy_ping.replace('if ping ', 'if ping -6 '), 1)
+        elif not (current_ping in content and 'family_args=(-6)' in content):
+            raise ValueError('Update the post-install script ping helper before using an IPv6 image server')
+    validate_ztp_script_content(content)
+    if '__IMAGE_SERVER_IP__' in content:
+        raise ValueError('Post-install script still contains an image server placeholder')
+    return content
+
+
 def action_upgrade_start():
+    from addressing import normalize_server_ref
     try:
         data = json.loads(POST_DATA)
     except Exception:
@@ -7234,8 +7333,10 @@ def action_upgrade_start():
             error_json(f'{flag} must be true or false')
     if not valid_os_image_name(image_name):
         error_json('Invalid image filename')
-    if not is_valid_server_ref(server_ip):
-        error_json('Invalid image server. Set a real ZTP IMAGE SERVER IP first.')
+    try:
+        server_ip = normalize_server_ref(server_ip)
+    except ValueError as exc:
+        error_json(f'Invalid image server: {exc}')
     image_path = resolve_os_image_path(image_name)
     if not image_path:
         error_json('Selected image not found on server')
@@ -7261,7 +7362,7 @@ def action_upgrade_start():
             'Apply Quick Settings, confirm the hardened-template upgrade, '
             'and save before starting device upgrade.'
         )
-    if '__IMAGE_SERVER_IP__' in ztp_content or '__TARGET_OS_VERSION__' in ztp_content:
+    if '__TARGET_OS_VERSION__' in ztp_content:
         error_json('cumulus-ztp.sh still contains placeholders. Apply Quick Settings and save ZTP script before upgrade.')
     if not ztp_script_public_key(ztp_content):
         error_json('cumulus-ztp.sh has no SSH key. Generate/import SSH key, Apply to Script, then Save before upgrade.')
@@ -7274,15 +7375,12 @@ def action_upgrade_start():
             f'the selected upgrade target {target_version}. Use the image '
             'from the ZTP tab and save the script before upgrade.'
         )
-    script_server = ztp_script_static_setting(
-        ztp_content, 'IMAGE_SERVER_HOSTNAME'
-    )
-    if script_server.lower() != server_ip.lower():
-        error_json(
-            f'ZTP image server {script_server or "is invalid"} does not match '
-            f'the upgrade server {server_ip}. Apply Quick Settings and save '
-            'the script before upgrade.'
-        )
+    # The override belongs only to this job's immutable post-install artifact;
+    # DHCP and the saved site-wide script retain their original server.
+    try:
+        ztp_content = prepare_upgrade_post_install_script(ztp_content, server_ip)
+    except ValueError as exc:
+        error_json(f'Upgrade post-install script is invalid: {exc}')
 
     try:
         batch_size = max(1, min(int(data.get('batch_size', 1) or 1), 100))
@@ -8452,6 +8550,7 @@ def action_upload_generated_config():
 
 def deploy_config_to_device(device, server_ip):
     """Verify one canonical target, then replace its NVUE config over SSH."""
+    from addressing import address_family, http_url
     try:
         with canonical_device_mutation(device) as canonical:
             ip = canonical['ip']
@@ -8462,7 +8561,21 @@ def deploy_config_to_device(device, server_ip):
                 raise ValueError('Generated config no longer matches target hostname')
             if not os.path.isfile(os.path.join(GENERATED_CONFIGS_DIR, filename)):
                 raise ValueError(f'Generated config is no longer available: {filename}')
-            config_url = f"http://{server_ip}/generated_config_folder/{filename}"
+            if address_family(ip) == 6:
+                # IPv6-only management can work without an IPv6 HTTP endpoint
+                # on LLDPq. Send the exact local YAML in the SSH stdin script;
+                # base64 avoids interpolation of configuration text by Bash.
+                with open(os.path.join(GENERATED_CONFIGS_DIR, filename), 'rb') as handle:
+                    encoded_config = base64.b64encode(handle.read()).decode('ascii')
+                download_commands = [
+                    f"printf '%s' {shlex.quote(encoded_config)} | base64 -d > \"$TMP\"",
+                ]
+            else:
+                config_url = http_url(server_ip, f'generated_config_folder/{filename}')
+                download_commands = [
+                    f'CONFIG_URL={shlex.quote(config_url)}',
+                    'curl -sf -- "$CONFIG_URL" -o "$TMP"',
+                ]
             ssh_opts = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                         '-o', 'StrictHostKeyChecking=no', '-o',
                         'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR']
@@ -8472,11 +8585,10 @@ def deploy_config_to_device(device, server_ip):
                     canonical.get('expected_mac', ''),
                     canonical.get('expected_serial', ''),
                 ),
-                f'CONFIG_URL={shlex.quote(config_url)}',
                 'TMP="$(mktemp /tmp/lldpq-startup.XXXXXX.yaml)"',
                 'cleanup() { rm -f -- "$TMP"; }',
                 'trap cleanup EXIT',
-                'curl -sf -- "$CONFIG_URL" -o "$TMP"',
+                *download_commands,
                 'test -s "$TMP"',
                 'sudo nv config replace "$TMP"',
                 'sudo nv config apply -y',
@@ -8509,6 +8621,7 @@ def deploy_config_to_device(device, server_ip):
 
 def action_deploy_generated_config():
     """Deploy generated NVUE config to one or more switches via SSH."""
+    from addressing import address_family, normalize_address, normalize_server_ref
     try:
         data = json.loads(POST_DATA)
     except Exception:
@@ -8522,9 +8635,15 @@ def action_deploy_generated_config():
     if not devices:
         error_json("No devices specified")
 
-    server_ip = get_server_ip()
-    if not is_valid_server_ref(server_ip) or server_ip == '127.0.0.1':
-        error_json("Cannot determine server IP for config download")
+    server_ip = ''
+    if any(not isinstance(device, dict) or address_family(device.get('ip')) != 6
+           for device in devices):
+        try:
+            server_ip = normalize_server_ref(data.get('server_ip') or get_server_ip())
+        except ValueError as exc:
+            error_json(f'Invalid config download server: {exc}')
+        if server_ip in ('127.0.0.1', '[::1]'):
+            error_json("Cannot determine server IP for config download")
 
     try:
         inventory = load_canonical_inventory_bindings(include_monitored=True)
@@ -8545,8 +8664,8 @@ def action_deploy_generated_config():
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
             error_json('Invalid device hostname')
         try:
-            ip = str(ipaddress.IPv4Address(raw_ip))
-        except ipaddress.AddressValueError:
+            ip = normalize_address(raw_ip)
+        except ValueError:
             error_json(f'Invalid device IP: {raw_ip}')
         binding = by_target.get((hostname.lower(), ip))
         if not binding:

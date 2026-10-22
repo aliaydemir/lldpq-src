@@ -2243,6 +2243,13 @@ CONSOLE_LOG_FILE=/var/log/lldpq/console.log
 CONSOLE_RESTART_DELAY=1
 CONSOLE_READY_DELAY=0.2
 
+# Serve upgrade images over IPv6 when the container has IPv6 networking.
+# Match the native installer fallback so IPv4-only kernels still start nginx.
+if [ ! -r /proc/net/if_inet6 ]; then
+    echo "  IPv6 not available — removing [::] listen directives from nginx config"
+    sed -i '/listen \[::]/d' /etc/nginx/sites-available/lldpq
+fi
+
 # Switch platforms already serve their own REST API on 8765, so a container
 # sharing the host network cannot take that port. console-pty reads this
 # variable itself; the readiness probes and the nginx route have to follow it.

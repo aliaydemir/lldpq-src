@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from urllib.parse import quote
 
 
 _HOST_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -80,3 +81,66 @@ def address_sort_key(value):
     except ValueError:
         return (0, 0, text.casefold())
     return (address.version, int(address), zone)
+
+
+def normalize_server_ref(value):
+    """Canonical HTTP authority for a switch-download server (not a full URL).
+
+    Bare IPv6 addresses are accepted for convenience; a port on IPv6 requires
+    brackets. Interface scopes cannot be shared between the collector, switch
+    and boot environment, so link-local/scoped servers are not supported.
+    """
+    if not isinstance(value, str):
+        raise ValueError("Image server must be an address or hostname")
+    text = value.strip()
+    if not text or any(c.isspace() for c in text) or any(c in text for c in '/\\@?#%'):
+        raise ValueError("Use an image server address or hostname, with an optional port")
+    port = None
+    bracketed = text.startswith('[')
+    if bracketed:
+        match = re.fullmatch(r'\[([^\]]+)\](?::([0-9]+))?', text)
+        if not match:
+            raise ValueError("Invalid bracketed IPv6 image server")
+        host, port = match.groups()
+    elif text.count(':') == 1:
+        host, port = text.split(':')
+        if not port or not re.fullmatch(r'[0-9]+', port):
+            raise ValueError("Image server port must be from 1 to 65535")
+    else:
+        host = text
+    if port is not None:
+        if len(port) > 5 or not 1 <= int(port) <= 65535:
+            raise ValueError("Image server port must be from 1 to 65535")
+        port = str(int(port))
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        if bracketed or ':' in host or _DOTTED_NUMBER_PATTERN.fullmatch(host):
+            raise ValueError("Invalid image server IP address") from None
+        labels = host.rstrip('.').split('.')
+        if len(host) > 253 or not all(
+                re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                for label in labels):
+            raise ValueError("Invalid image server hostname") from None
+        authority = host.lower()
+    else:
+        mapped = getattr(address, 'ipv4_mapped', None)
+        if address.is_unspecified or address.is_multicast or (
+                mapped is not None and (mapped.is_unspecified or mapped.is_multicast)):
+            raise ValueError("Image server must be a unicast address")
+        if address.version == 6:
+            if address.is_link_local:
+                raise ValueError("Use a global or ULA IPv6 image server, not link-local")
+            authority = '[' + normalize_address(host) + ']'
+        else:
+            if bracketed:
+                raise ValueError("Only IPv6 image servers use brackets")
+            authority = str(address)
+    return authority + (':' + port if port is not None else '')
+
+
+def http_url(server_ref, path):
+    """Build a switch-download URL with IPv6 brackets and an encoded path."""
+    if not isinstance(path, str) or any(part in ('.', '..') for part in path.split('/')):
+        raise ValueError("Invalid download path")
+    return 'http://' + normalize_server_ref(server_ref) + '/' + quote(path.lstrip('/'), safe='/')

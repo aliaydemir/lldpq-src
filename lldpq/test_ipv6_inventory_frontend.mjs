@@ -256,32 +256,166 @@ test('Inventory discovery lookup matches equivalent IPv6 text and renders no DHC
     h.context.renderBindings();
     assert.match(h.element('bindingCount').innerHTML, /Active: 1/);
     assert.doesNotMatch(h.element('bindingsBody').innerHTML, /onchange="toggleDhcp/);
-    assert.match(h.element('bindingsBody').innerHTML, /IPv6 management only/);
+    assert.match(h.element('bindingsBody').innerHTML, /DHCPv6 is not configured/);
 });
 
-test('IPv6 discovery shows monitoring status and cannot trigger any generated config action', async () => {
+test('IPv6 discovery leaves deployment manual and explicit generated config still requires identity', async () => {
     const h = harness();
     const device = { hostname: 'leaf', ip: '2001:db8::1', device_type: 'provisioned', identity_verified: true };
-    assert.match(h.context.renderPostProvisionBadge(device), /Monitoring/);
-    assert.equal(h.context.generatedConfigDeployState(device, new Set(['leaf'])).enabled, false);
-    assert.equal(h.context.renderGeneratedConfigAction(device, new Set(['leaf'])), '');
+    assert.match(h.context.renderPostProvisionBadge(device), /Manual/);
+    assert.equal(h.context.generatedConfigDeployState(device, new Set(['leaf'])).enabled, true);
+    assert.match(h.context.renderGeneratedConfigAction(device, new Set(['leaf'])), /Re-deploy/);
+    assert.equal(h.context.generatedConfigDeployState({ ...device, identity_verified: false }, new Set(['leaf'])).enabled, false);
+    assert.equal(h.context.generatedConfigDeployState({ ...device, mac_status: 'mismatch' }, new Set(['leaf'])).enabled, false);
     await h.context.deployGeneratedConfig('leaf', device.ip);
     assert.equal(h.requests.length, 0);
-    assert.equal(h.confirmations.length, 0);
-    assert.equal(h.context.getUpgradePayload([device]), null);
+    assert.equal(h.confirmations.length, 1);
+    await h.confirmations[0].callback();
+    assert.equal(h.requests[0].action, 'deploy-generated-config');
+    assert.equal(h.requests[0].payload.ip, device.ip);
 });
 
-test('IPv6 provisioning selection remains disabled even with reachable discovery data', () => {
+test('reachable IPv6 devices can be selected for explicit Upgrade and Base Config', () => {
     const h = harness();
     h.run(`upgradeDevices = [{hostname:'v6',ip:'2001:db8::1',reachable:true}]; bcDeviceGroups = {leaf: upgradeDevices};`);
     h.context.renderUpgradeTable();
-    assert.match(h.element('upgradeBody').innerHTML, /data-ip="2001:db8::1" disabled/);
-    assert.match(h.element('upgradeBody').innerHTML, /monitoring only/);
+    assert.doesNotMatch(h.element('upgradeBody').innerHTML, /data-ip="2001:db8::1" disabled/);
+    assert.match(h.element('upgradeBody').innerHTML, /candidate/);
     h.context.renderBCDeviceList();
-    assert.match(h.element('bcDeviceList').innerHTML, /disabled title="IPv6 management only"/);
+    assert.doesNotMatch(h.element('bcDeviceList').innerHTML, /disabled title="IPv6 management only"/);
     h.context.upgradeSetSel('2001:db8::1', true);
     h.context.bcSetSel('2001:db8::1', true);
-    assert.equal(h.run('upgradeSelected.size + bcSelected.size'), 0);
+    assert.equal(h.run('upgradeSelected.size + bcSelected.size'), 2);
+    h.context.document.querySelectorAll = selector => selector === '.upgrade-dev-cb:checked'
+        ? [{ dataset: { index: '0' } }] : [];
+    assert.equal(h.context.selectedUpgradeDevices()[0].ip, '2001:db8::1');
+});
+
+test('unreachable IPv6 and already-current devices retain existing upgrade selection gates', () => {
+    const h = harness();
+    h.element('upgradeTargetVersion').value = '5.16.1';
+    h.run(`upgradeDevices = [
+        {hostname:'offline',ip:'2001:db8::1',reachable:false},
+        {hostname:'current',ip:'2001:db8::2',reachable:true,current_version:'5.16.1'}
+    ];`);
+    h.context.renderUpgradeTable();
+    assert.match(h.element('upgradeBody').innerHTML, /data-ip="2001:db8::1" disabled/);
+    assert.match(h.element('upgradeBody').innerHTML, /data-ip="2001:db8::2" disabled/);
+});
+
+test('explicit Base Config sends mixed addresses and updates scoped IPv6 progress', async () => {
+    const h = harness();
+    const devices = [
+        { ip: '192.0.2.1', hostname: 'v4', username: 'cumulus' },
+        { ip: 'fe80::1%en-1', hostname: 'v6', username: 'admin' },
+    ];
+    h.context.document.querySelectorAll = selector => selector === '.bc-dev-cb:checked'
+        ? devices.map(dataset => ({ dataset })) : [];
+    h.context.apiCall = async (action, payload) => {
+        h.requests.push({ action, payload });
+        return { success: true, results: devices.map(device => ({ ...device, success: true, message: 'Applied' })) };
+    };
+    await h.context.deployBaseConfig();
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].action, 'deploy-base-config');
+    assert.equal(h.requests[0].payload.devices[1].ip, 'fe80::1%en-1');
+    assert.equal(h.requests[0].payload.disable_ztp, false);
+    assert.match(h.element('deployProgress').innerHTML, /id="deploy-address-fe80%3A%3A1%25en-1"/);
+    assert.match(h.element('deploy-address-fe80%3A%3A1%25en-1').innerHTML, /Applied/);
+    assert.equal(h.element('deployStatusText').textContent, 'Done: 2 OK, 0 failed');
+    assert.equal(h.element('btnDeploy').disabled, false);
+});
+
+test('scoped IPv6 interfaces with punctuation retain independent deployment progress rows', async () => {
+    const h = harness();
+    const devices = [
+        { ip: 'fe80::1%eth0.100', hostname: 'vlan', username: 'cumulus' },
+        { ip: 'fe80::1%eth0-100', hostname: 'dash', username: 'cumulus' },
+    ];
+    const rowIds = devices.map(device => 'deploy-' + h.context.rowIdFromIp(device.ip));
+    assert.notEqual(rowIds[0], rowIds[1]);
+    assert.equal(h.context.rowIdFromIp('192.0.2.1'), '192-0-2-1');
+    assert.equal(h.context.rowIdFromIp('fe80:0:0:0:0:0:0:1%eth0.100'), h.context.rowIdFromIp(devices[0].ip));
+    h.context.document.querySelectorAll = selector => selector === '.bc-dev-cb:checked'
+        ? devices.map(dataset => ({ dataset })) : [];
+    h.context.apiCall = async () => ({
+        success: true,
+        results: [
+            { ...devices[0], success: true, message: 'VLAN applied' },
+            { ...devices[1], success: false, error: 'Dash failed' },
+        ],
+    });
+    await h.context.deployBaseConfig();
+    for (const rowId of rowIds) assert.ok(h.element('deployProgress').innerHTML.includes(`id="${rowId}"`));
+    assert.match(h.element(rowIds[0]).innerHTML, /VLAN applied/);
+    assert.doesNotMatch(h.element(rowIds[0]).innerHTML, /Dash failed/);
+    assert.match(h.element(rowIds[1]).innerHTML, /Dash failed/);
+    assert.equal(h.element('deployStatusText').textContent, 'Done: 1 OK, 1 failed');
+});
+
+test('Upgrade image server accepts IPv6 authorities while ZTP retains its existing validator', () => {
+    const h = harness();
+    for (const [input, expected] of [
+        ['192.0.2.10', '192.0.2.10'],
+        ['images.example:8080', 'images.example:8080'],
+        ['IMAGES.EXAMPLE:8080', 'images.example:8080'],
+        ['2001:0DB8:0:0:0:0:0:10', '[2001:db8::10]'],
+        ['[2001:db8::10]:8080', '[2001:db8::10]:8080'],
+        ['[fd00::10]:65535', '[fd00::10]:65535'],
+    ]) assert.equal(h.context.upgradeImageServerRef(input), expected, input);
+    for (const value of [
+        '', '__IMAGE_SERVER_IP__', '2001:::1', '[2001:db8::1', '2001:db8::g',
+        'http://[2001:db8::1]', '[2001:db8::1]/images', 'host/path', 'host;echo',
+        'fe80::1', 'fe80::1%eth0', '[fe80::1%eth0]:8080', '[2001:db8::1%eth0]',
+        '::', 'ff02::1', '0.0.0.0', '224.0.0.1', '192.0.2.999',
+        '::ffff:0.0.0.0', '::ffff:224.0.0.1', '-invalid.example', 'invalid-.example', 'bad..example',
+        '[2001:db8::1]:0', '[2001:db8::1]:65536', 'host:99999',
+    ]) assert.equal(h.context.upgradeImageServerRef(value), '', value);
+    assert.equal(h.context.isUsableImageServer('192.0.2.10'), true);
+    assert.equal(h.context.isUsableImageServer('[2001:db8::10]'), false);
+});
+
+test('Upgrade server override survives refresh without modifying the saved ZTP input', () => {
+    const h = harness();
+    h.element('ztpImageServer').value = '192.0.2.10';
+    h.context.syncUpgradeServerIPFromZTP();
+    assert.equal(h.element('upgradeServerIP').value, '192.0.2.10');
+    h.element('upgradeServerIP').value = '2001:db8::10';
+    h.context.onUpgradeServerInput();
+    h.run(`upgradeDetectedServerIP = '192.0.2.20'`);
+    h.context.syncUpgradeServerIPFromZTP();
+    assert.equal(h.element('upgradeServerIP').value, '2001:db8::10');
+    assert.equal(h.element('ztpImageServer').value, '192.0.2.10');
+    assert.match(h.element('upgradeServerInfo').innerHTML, /Upgrade only/);
+    assert.equal(h.requests.length, 0);
+});
+
+test('recovered upgrade job keeps its IPv6 server through later default refreshes', () => {
+    const h = harness();
+    h.element('ztpImageServer').value = '192.0.2.10';
+    h.context.attachUpgradeJob({ id: 'existing-job', server_ip: '[2001:db8::10]:8080', complete: true, devices: [] });
+    h.context.syncUpgradeServerIPFromZTP();
+    assert.equal(h.element('upgradeServerIP').value, '[2001:db8::10]:8080');
+    assert.equal(h.element('ztpImageServer').value, '192.0.2.10');
+});
+
+test('Upgrade payload accepts IPv6 devices and canonically brackets the separate image server', () => {
+    const h = harness();
+    h.element('upgradeImage').value = 'cumulus-5.16.1.bin';
+    h.element('upgradeTargetVersion').value = '5.16.1';
+    h.element('upgradeServerIP').value = '2001:db8::10';
+    h.element('upgradeBaseAfter').checked = true;
+    h.element('upgradeStopOnFailure').checked = true;
+    const devices = [{ hostname: 'v6', ip: 'fe80::1%eth0' }, { hostname: 'v4', ip: '192.0.2.1' }];
+    const payload = h.context.getUpgradePayload(devices);
+    assert.equal(payload.server_ip, '[2001:db8::10]');
+    assert.equal(payload.devices[0].ip, 'fe80::1%eth0');
+    assert.equal(payload.devices.length, 2);
+    assert.equal(payload.base_config_after, true);
+    assert.equal(payload.stop_on_failure, true);
+    h.element('upgradeServerIP').value = '[fe80::10%eth0]';
+    assert.equal(h.context.getUpgradePayload(devices), null);
+    assert.match(h.events.at(-1).message, /Link-local image servers are not supported/);
 });
 
 test('an oversized IPv6 discovery range is rejected without sending a request', async () => {

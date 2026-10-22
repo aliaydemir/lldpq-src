@@ -1283,7 +1283,8 @@ services and their data may be shared by workloads unrelated to LLDPq.
 
 ## [03c] IPv6 support
 
-LLDPq supports IPv6 for switch management connections, monitoring and discovery.
+LLDPq supports IPv6 for switch management connections, monitoring, discovery,
+manual Base Config deployment and OS upgrades of existing switches.
 IPv4 and IPv6 devices use the same inventory, pages and collection workflows.
 The collector must already have IPv6 connectivity to each target, working SSH
 credentials and the usual switch-side permissions. For Docker, connectivity
@@ -1298,6 +1299,8 @@ configure the collector's IPv6 addresses or routes automatically.
 | **Connections and monitoring** | Connect to switches over IPv6 for SSH-based collection and use the existing monitoring reports. Assets retains the selected IPv6 management address. BMC MAC/port comparison can use an IPv6-managed switch. |
 | **Console and Commands** | Open inventory devices in Console and run supported diagnostic commands from Commands or Device Details over IPv6. |
 | **Discover** | Scan explicit addresses, bounded ranges or small CIDRs using ICMPv6, TCP/22, SSH and local NDP observations. |
+| **Base Config** | Explicitly deploy the standard files to IPv6 inventory devices over SSH/SCP. Generated NVUE configurations can also be deployed explicitly over SSH. |
+| **Upgrade** | Precheck, upgrade and track existing IPv6-managed switches through the persistent queue, including optional Base Config deployment after version verification. The download server can use IPv4, DNS or global/ULA IPv6. |
 | **Address matching** | Normalize equivalent IPv6 spellings, reject duplicate management addresses and sort addresses numerically. Interface scopes remain part of link-local identity. |
 | **DHCP separation** | IPv6 bindings always have DHCP disabled. Adding or editing only IPv6 monitoring records leaves unchanged IPv4 reservations and the DHCP service untouched. |
 
@@ -1396,13 +1399,68 @@ ip -6 neigh show
 These commands inspect IPv6 state on the selected switch. Dedicated IPv6
 Routes/Tracepath analysis is a separate capability, listed below.
 
+### Example: deploy Base Config over IPv6
+
+Save the device in Inventory with its IPv6 management address and a known
+**MAC or serial number**, such as the `OOB-V6` CSV row above. Deployment checks
+the current inventory and verifies the remote device's identity before changing
+files; an address alone is not sufficient authorization.
+
+Open **Provision → Base Config**, select the IPv6 switches and click **Deploy**.
+IPv4 and IPv6 targets can be selected together. Global/ULA addresses and scoped
+link-local targets such as `fe80::13%eth0` use the same file manifest and
+per-device progress table. SSH/SCP handles the IPv6 address formatting.
+
+For generated NVUE configurations, upload `<hostname>.yaml` or `<hostname>.yml`
+under **ZTP → Generated Configs**, refresh discovery to verify the device identity
+and explicitly deploy the matching configuration. For IPv6 targets, LLDPq sends
+the file through SSH, then runs NVUE replace/apply/save. No HTTP download server
+is required for this transfer. These are manual actions; IPv6 discovery still
+does not run automatic post-provision deployment.
+
+### Example: upgrade an existing switch over IPv6
+
+Upload the Cumulus image and save a supported post-install script with the
+matching target version and SSH public key in the **ZTP** tab, as for an IPv4
+upgrade. This script is used as the existing-device upgrade's post-install hook;
+it does not enable DHCPv6 or automatic new-device provisioning.
+
+In **Provision → Upgrade**, select the image, IPv6 inventory devices and batch
+size. The **Image Server IP** field starts with the saved ZTP/detected server,
+but can be edited for this upgrade. Enter an address or hostname, not a full URL:
+
+| Server input | Example image URL built by LLDPq |
+|---|---|
+| `2001:db8:100::250` | `http://[2001:db8:100::250]/cumulus-linux-5.14.0-mlx-amd64.bin` |
+| `[2001:db8:100::250]:8080` | `http://[2001:db8:100::250]:8080/cumulus-linux-5.14.0-mlx-amd64.bin` |
+| `images.example.net:8080` | `http://images.example.net:8080/cumulus-linux-5.14.0-mlx-amd64.bin` |
+
+Use your actual image name and a server that serves both the selected image and
+LLDPq's job-specific post-install script. An IPv6 port requires brackets.
+The override applies only to this job's pinned script; it does not change the
+saved site-wide ZTP script or DHCP settings. The packaged web server listens on
+IPv6 when available; Docker networking and any published ports must also expose
+that listener to the switches.
+
+Run **Precheck**, review the results, then start the upgrade. LLDPq checks image
+HTTP access from each switch and checks both image and post-install script
+access again before installation. It saves NVUE startup configuration, passes
+it to `onie-install`, and tracks reboot, installed version and optional Base
+Config deployment. Job state survives LLDPq service/container restarts.
+
+The switch's management IPv6 address and routes must be preserved in its NVUE
+startup configuration, and the download server must remain reachable during
+installation and after reboot. Collector-side reachability alone is insufficient.
+Automated tests cover command construction and job lifecycle with mocked device
+responses; management recovery through a real OS reinstall still needs validation
+on the target switch/OS combination.
+
 ### IPv6 features not yet supported
 
 | Feature | Current boundary |
 |---|---|
 | **DHCPv6 and ZTP** | No IPv6 address allocation or automated new-device provisioning. |
-| **Base Config deployment over IPv6** | Provision's configuration-deployment actions are disabled for IPv6 targets. |
-| **OS upgrades over IPv6** | IPv6 targets cannot be selected for the automated upgrade workflow. |
+| **Link-local HTTP download servers** | Upgrade image/hook servers require a global/ULA IPv6 address, IPv4 address or DNS name. Interface scopes cannot be shared across collector, switch and boot environment. Scoped link-local SSH targets remain supported. |
 | **IPv6 route/path analysis** | Dedicated Routes/Tracepath analysis for IPv6 networks is not included in this stage. |
 | **Inbound IPv6 telemetry** | IPv6 listeners for receiving streaming telemetry are not included in this stage. |
 | **Automatic IPv4/IPv6 failover** | One management address is selected per device; LLDPq does not retry another address family automatically. |
@@ -2260,8 +2318,11 @@ The ZTP script handles: OS version check + upgrade, password change, sudo fix, S
 Upgrade is intended for already-running Cumulus switches; ZTP remains the
 workflow for new devices. Administrators select an uploaded target image,
 target version, batch size, and candidate switches before running prechecks
-and starting the persistent, resumable queue. The read-only image-server
-address is inherited from **ZTP → Quick Settings**.
+and starting the persistent, resumable queue. The image-server address defaults
+to **ZTP → Quick Settings** or the detected server, and can be overridden for
+this upgrade without changing ZTP/DHCP settings. IPv4 and IPv6 management targets
+are supported; see [IPv6 support](#03c-ipv6-support) for server-address examples
+and network prerequisites.
 
 The workflow preserves each switch's `/etc/nvue.d/startup.yaml` during the OS
 upgrade, verifies the installed version, and can optionally deploy Base Config

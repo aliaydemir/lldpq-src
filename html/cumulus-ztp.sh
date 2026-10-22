@@ -6,19 +6,33 @@
 # LLDPQ_ZTP_TEMPLATE_VERSION=3
 #
 
+function image_server_ping_target(){
+    local server="${1-}"
+    local target=""
+    case "$server" in
+        \[*\]*) target="${server#\[}"; target="${target%%\]*}" ;;
+        *:*:*) target="$server" ;;
+        *) target="${server%%:*}" ;;
+    esac
+    [ -n "$target" ] || return 1
+    printf '%s\n' "$target"
+}
+
 function ping_until_reachable(){
     local target="${1-}"
     local max_tries=30
     local tries=0
+    local family_args=()
 
     if [ -z "$target" ]; then
         echo "$(date) ERROR: Image server target is empty." >&2
         return 1
     fi
+    [[ "$target" == *:* ]] && family_args=(-6)
     while [ "$tries" -lt "$max_tries" ]; do
         tries=$((tries+1))
         echo "$(date) INFO: ( Attempt $tries of $max_tries ) Pinging $target Target Until Reachable."
-        if ping "$target" -c2 --no-vrf-switch >/dev/null; then
+        if ping "${family_args[@]}" "$target" -c2 --no-vrf-switch >/dev/null; then
             return 0
         fi
         sleep 1
@@ -289,7 +303,7 @@ function main(){
         IMAGE_SERVER=http://$IMAGE_SERVER_HOSTNAME/cumulus-linux-$CUMULUS_TARGET_RELEASE-mlx-amd64.bin
     fi
     ZTP_URL=http://$IMAGE_SERVER_HOSTNAME/cumulus-ztp.sh
-    IMAGE_SERVER_PING_TARGET=${IMAGE_SERVER_HOSTNAME%%:*}
+    IMAGE_SERVER_PING_TARGET=$(image_server_ping_target "$IMAGE_SERVER_HOSTNAME") || return 1
     WORK_DIR=$(mktemp -d /tmp/lldpq-ztp.XXXXXX) || return 1
     trap 'rm -rf -- "${WORK_DIR-}"' EXIT
 

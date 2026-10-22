@@ -1,4 +1,4 @@
-"""IPv6 management stays read-only to provisioning while IPv4 stays compatible.
+"""IPv6 discovery stays read-only while explicit deployment verifies device identity.
 
 Exercises actual extracted CGI functions with temporary files and mocked network
 I/O; no SSH, ping, daemon or live device is used by these tests.
@@ -188,9 +188,14 @@ class ManagementInventoryTests(ApiFixture):
                     self.assertIn('already used', result['error'])
                     self.assertEqual(self.devices.read_bytes(), before)
 
-    def test_ipv6_is_still_rejected_by_remote_mutation_guard(self):
-        with self.assertRaisesRegex(ValueError, 'Invalid device IP'):
+    def test_ipv6_remote_mutation_requires_inventory_identity(self):
+        with self.assertRaisesRegex(ValueError, 'no inventory MAC or serial'):
             self.api['canonicalize_inventory_target'](binding(), [binding()])
+        known = binding(mac='aa:bb:cc:dd:ee:10')
+        canonical = self.api['canonicalize_inventory_target'](
+            binding('2001:0db8:0:0:0:0:0:10'), [known])
+        self.assertEqual(canonical['ip'], '2001:db8::10')
+        self.assertEqual(canonical['expected_mac'], known['mac'])
 
 
 class DurableIpv6SaveTests(unittest.TestCase):

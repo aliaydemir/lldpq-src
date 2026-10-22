@@ -1474,6 +1474,81 @@ def positive_integer(value, label, maximum=None):
         raise ValueError(f'invalid {label}')
 
 
+
+# The installer validates persisted jobs before replacing installed Python
+# modules, and Docker sources this root-owned library at startup. Keep these
+# small address checks self-contained; parity tests cover addressing.py.
+def normalize_upgrade_address(value):
+    value = str(value).strip()
+    literal, separator, zone = value.partition('%')
+    if separator and (':' not in literal or
+                      not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', zone)):
+        raise ValueError('invalid IPv6 scope')
+    address = ipaddress.ip_address(literal)
+    if address.version == 6:
+        if address.is_link_local and not separator:
+            raise ValueError('link-local IPv6 requires an interface scope')
+        canonical = (f'::ffff:{address.ipv4_mapped}'
+                     if address.ipv4_mapped is not None else address.compressed)
+        return canonical + ('%' + zone if separator else '')
+    if separator:
+        raise ValueError('IPv4 cannot have an interface scope')
+    return str(address)
+
+
+def valid_upgrade_server_ref(value):
+    try:
+        if not isinstance(value, str):
+            raise ValueError("Image server must be an address or hostname")
+        text = value.strip()
+        if not text or any(c.isspace() for c in text) or any(c in text for c in '/\\@?#%'):
+            raise ValueError("Use an image server address or hostname, with an optional port")
+        port = None
+        bracketed = text.startswith('[')
+        if bracketed:
+            match = re.fullmatch(r'\[([^\]]+)\](?::([0-9]+))?', text)
+            if not match:
+                raise ValueError("Invalid bracketed IPv6 image server")
+            host, port = match.groups()
+        elif text.count(':') == 1:
+            host, port = text.split(':')
+            if not port or not re.fullmatch(r'[0-9]+', port):
+                raise ValueError("Image server port must be from 1 to 65535")
+        else:
+            host = text
+        if port is not None:
+            if len(port) > 5 or not 1 <= int(port) <= 65535:
+                raise ValueError("Image server port must be from 1 to 65535")
+            port = str(int(port))
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            if bracketed or ':' in host or re.fullmatch(r'[0-9]+(?:\.[0-9]+){3}', host):
+                raise ValueError("Invalid image server IP address") from None
+            labels = host.rstrip('.').split('.')
+            if len(host) > 253 or not all(
+                    re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                    for label in labels):
+                raise ValueError("Invalid image server hostname") from None
+            authority = host.lower()
+        else:
+            mapped = getattr(address, 'ipv4_mapped', None)
+            if address.is_unspecified or address.is_multicast or (
+                    mapped is not None and (mapped.is_unspecified or mapped.is_multicast)):
+                raise ValueError("Image server must be a unicast address")
+            if address.version == 6:
+                if address.is_link_local:
+                    raise ValueError("Use a global or ULA IPv6 image server, not link-local")
+                authority = '[' + normalize_upgrade_address(host) + ']'
+            else:
+                if bracketed:
+                    raise ValueError("Only IPv6 image servers use brackets")
+                authority = str(address)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_resumable_current(filename, job, metadata):
     """Recognize only the exact resumable contract from the previous release."""
     missing = sorted(current_required.difference(job))
@@ -1503,7 +1578,7 @@ def validate_resumable_current(filename, job, metadata):
             not re.fullmatch(r'[A-Za-z0-9_.-]+\.(?:bin|img|iso)', str(job['image_name'])) or \
             not re.fullmatch(r'[0-9a-f]{64}', str(job['image_sha256'])) or \
             not re.fullmatch(r'[0-9a-f]{64}', str(job['ztp_sha256'])) or \
-            not re.fullmatch(r'[A-Za-z0-9.-]+(?::[0-9]{1,5})?', str(job['server_ip'])):
+            not valid_upgrade_server_ref(str(job['server_ip'])):
         raise ValueError('invalid current image/server metadata')
     expected_ztp = (
         f"provision-uploads/ztp-artifacts/{job['id']}.ztp"
@@ -1530,8 +1605,8 @@ def validate_resumable_current(filename, job, metadata):
         if not isinstance(device, dict) or device.get('status') not in current_statuses:
             raise ValueError('invalid current device state')
         try:
-            ip = str(ipaddress.IPv4Address(str(device.get('ip', ''))))
-        except ipaddress.AddressValueError as exc:
+            ip = normalize_upgrade_address(device.get('ip', ''))
+        except ValueError as exc:
             raise ValueError('invalid current device IP') from exc
         if ip in seen_ips:
             raise ValueError('duplicate current device IP')
@@ -2747,6 +2822,81 @@ def positive_integer(value, label, maximum=None):
             (maximum is not None and value > maximum):
         raise ValueError(f'invalid {label}')
 
+
+# The installer validates persisted jobs before replacing installed Python
+# modules, and Docker sources this root-owned library at startup. Keep these
+# small address checks self-contained; parity tests cover addressing.py.
+def normalize_upgrade_address(value):
+    value = str(value).strip()
+    literal, separator, zone = value.partition('%')
+    if separator and (':' not in literal or
+                      not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', zone)):
+        raise ValueError('invalid IPv6 scope')
+    address = ipaddress.ip_address(literal)
+    if address.version == 6:
+        if address.is_link_local and not separator:
+            raise ValueError('link-local IPv6 requires an interface scope')
+        canonical = (f'::ffff:{address.ipv4_mapped}'
+                     if address.ipv4_mapped is not None else address.compressed)
+        return canonical + ('%' + zone if separator else '')
+    if separator:
+        raise ValueError('IPv4 cannot have an interface scope')
+    return str(address)
+
+
+def valid_upgrade_server_ref(value):
+    try:
+        if not isinstance(value, str):
+            raise ValueError("Image server must be an address or hostname")
+        text = value.strip()
+        if not text or any(c.isspace() for c in text) or any(c in text for c in '/\\@?#%'):
+            raise ValueError("Use an image server address or hostname, with an optional port")
+        port = None
+        bracketed = text.startswith('[')
+        if bracketed:
+            match = re.fullmatch(r'\[([^\]]+)\](?::([0-9]+))?', text)
+            if not match:
+                raise ValueError("Invalid bracketed IPv6 image server")
+            host, port = match.groups()
+        elif text.count(':') == 1:
+            host, port = text.split(':')
+            if not port or not re.fullmatch(r'[0-9]+', port):
+                raise ValueError("Image server port must be from 1 to 65535")
+        else:
+            host = text
+        if port is not None:
+            if len(port) > 5 or not 1 <= int(port) <= 65535:
+                raise ValueError("Image server port must be from 1 to 65535")
+            port = str(int(port))
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            if bracketed or ':' in host or re.fullmatch(r'[0-9]+(?:\.[0-9]+){3}', host):
+                raise ValueError("Invalid image server IP address") from None
+            labels = host.rstrip('.').split('.')
+            if len(host) > 253 or not all(
+                    re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                    for label in labels):
+                raise ValueError("Invalid image server hostname") from None
+            authority = host.lower()
+        else:
+            mapped = getattr(address, 'ipv4_mapped', None)
+            if address.is_unspecified or address.is_multicast or (
+                    mapped is not None and (mapped.is_unspecified or mapped.is_multicast)):
+                raise ValueError("Image server must be a unicast address")
+            if address.version == 6:
+                if address.is_link_local:
+                    raise ValueError("Use a global or ULA IPv6 image server, not link-local")
+                authority = '[' + normalize_upgrade_address(host) + ']'
+            else:
+                if bracketed:
+                    raise ValueError("Only IPv6 image servers use brackets")
+                authority = str(address)
+        return True
+    except ValueError:
+        return False
+
+
 def validate_schema_v2(job, name):
     reconciliation = job.get('legacy_reconciliation')
     if reconciliation is not None:
@@ -2794,7 +2944,7 @@ def validate_schema_v2(job, name):
             not re.fullmatch(r'[A-Za-z0-9_.-]+\.(?:bin|img|iso)', str(job['image_name'])) or \
             not re.fullmatch(r'[0-9a-f]{64}', str(job['image_sha256'])) or \
             not re.fullmatch(r'[0-9a-f]{64}', str(job['ztp_sha256'])) or \
-            not re.fullmatch(r'[A-Za-z0-9.-]+(?::[0-9]{1,5})?', str(job['server_ip'])):
+            not valid_upgrade_server_ref(str(job['server_ip'])):
         raise ValueError('invalid upgrade image/server metadata')
     expected_ztp = f'provision-uploads/ztp-artifacts/{name[:-5]}.ztp'
     if job['ztp_artifact'] != expected_ztp:
@@ -2819,8 +2969,8 @@ def validate_schema_v2(job, name):
         if not isinstance(item, dict) or item.get('status') not in current_statuses:
             raise ValueError('invalid upgrade device state')
         try:
-            ip = str(ipaddress.IPv4Address(str(item.get('ip', ''))))
-        except ipaddress.AddressValueError as exc:
+            ip = normalize_upgrade_address(item.get('ip', ''))
+        except ValueError as exc:
             raise ValueError('invalid upgrade device IP') from exc
         if ip in seen_ips:
             raise ValueError('duplicate upgrade device IP')
