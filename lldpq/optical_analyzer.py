@@ -146,7 +146,6 @@ class OpticalAnalyzer:
         "temperature_min_c": 0.0,       # Minimum operating temperature
         "voltage_min_v": 3.0,           # Minimum supply voltage
         "voltage_max_v": 3.6,           # Maximum supply voltage
-        "bias_current_max_ma": 100.0,   # Maximum laser bias current
         "link_margin_min_db": 3.0       # Minimum acceptable link margin
     }
     # Several drivers report a dark optical lane as -40 dBm (or -inf).  Keep
@@ -191,8 +190,8 @@ class OpticalAnalyzer:
     def _load_network_thresholds(self) -> None:
         """Load the configurable margin while retaining safe defaults.
 
-        Module-specific alarm tables are not collected yet, so all other
-        optical limits remain the documented conservative defaults above.
+        Laser bias uses the module's own thresholds and flags from ethtool.
+        Other optical limits retain the documented defaults above.
         """
         if yaml is None:
             return
@@ -563,6 +562,19 @@ class OpticalAnalyzer:
             rf'\s*:\s*(?P<value>{number})\s*mA',
             re.IGNORECASE,
         )
+        bias_threshold_pattern = re.compile(
+            r'^Laser\s+(?:tx\s+)?bias\s+current\s+'
+            r'(?P<direction>high|low)\s+(?P<kind>alarm|warning)\s+threshold'
+            r'\s*:\s*(?P<value>\S+)\s*mA\s*$', re.IGNORECASE,
+        )
+        bias_flag_pattern = re.compile(
+            r'^Laser\s+(?:tx\s+)?bias\s+current\s+'
+            r'(?P<direction>high|low)\s+(?P<kind>alarm|warning)'
+            r'(?:\s*\(\s*Chan(?:nel)?\s+(?P<lane>\d+)\s*\))?'
+            r'\s*:\s*(?P<state>on|off)\s*$', re.IGNORECASE,
+        )
+        bias_thresholds = {}
+        bias_flags = {}
 
         def lane_number(match, readings):
             value = match.groupdict().get('nvue_lane') or match.groupdict().get('ethtool_lane')
@@ -589,6 +601,24 @@ class OpticalAnalyzer:
         lines = optical_data.strip().split('\n')
         for line in lines:
             line = line.strip()
+            threshold_match = bias_threshold_pattern.match(line)
+            if threshold_match:
+                try:
+                    value = float(threshold_match.group('value'))
+                    if math.isfinite(value) and value >= 0:
+                        key = (threshold_match.group('direction').lower() + '_'
+                               + threshold_match.group('kind').lower())
+                        bias_thresholds[key] = value
+                except ValueError:
+                    pass
+            flag_match = bias_flag_pattern.match(line)
+            if flag_match:
+                lane = str(int(flag_match.group('lane') or 1))
+                key = (flag_match.group('direction').lower() + '_'
+                       + flag_match.group('kind').lower())
+                bias_flags.setdefault(lane, {})[key] = (
+                    flag_match.group('state').lower() == 'on'
+                )
 
             # Parse temperature (NVUE format: "temperature : 48.71 degrees C" or ethtool: "Module temperature : 48.85 degrees C")
             temp_match = re.search(r'(?:Module\s+)?temperature\s*:\s*([\d.-]+)\s*degrees?\s*C', line)
@@ -630,12 +660,84 @@ class OpticalAnalyzer:
                 except ValueError:
                     pass
 
+        # Reject unsupported all-zero or internally inconsistent tables, not
+        # the measured current.  Partial valid limits can still prove a fault.
+        ordered = [bias_thresholds[key] for key in
+                   ('low_alarm', 'low_warning', 'high_warning', 'high_alarm')
+                   if key in bias_thresholds]
+        low_limits = [v for key, v in bias_thresholds.items() if key.startswith('low_')]
+        high_limits = [v for key, v in bias_thresholds.items() if key.startswith('high_')]
+        if (ordered and (not any(ordered) or ordered != sorted(ordered) or
+                         (low_limits and high_limits and
+                          max(low_limits) >= min(high_limits)))):
+            bias_thresholds = {}
+        optical_params['bias_thresholds_ma'] = bias_thresholds
+        optical_params['bias_flags'] = bias_flags
         self._set_lane_readings(optical_params, 'rx_power', rx_readings)
         self._set_lane_readings(optical_params, 'tx_power', tx_readings)
         self._set_lane_readings(optical_params, 'bias_current', bias_readings)
         self._select_declared_optical_lanes(optical_data, optical_params)
 
         return optical_params
+
+    @staticmethod
+    def _bias_lane_events(lane, value, thresholds, flags):
+        """Keep the strongest module evidence for each direction on a lane."""
+        events = []
+        for direction in ('low', 'high'):
+            for kind, severity in (('alarm', 'critical'), ('warning', 'warning')):
+                key = f'{direction}_{kind}'
+                limit = thresholds.get(key)
+                exceeded = (value is not None and limit is not None and
+                            (value <= limit if direction == 'low' else value >= limit))
+                flagged = flags.get(key) is True
+                if exceeded or flagged:
+                    events.append({
+                        'lane': lane, 'value_ma': value, 'threshold_ma': limit,
+                        'direction': direction, 'kind': kind, 'severity': severity,
+                        'source': 'module flag' if flagged else 'module threshold',
+                    })
+                    break
+        return events
+
+    def _assess_bias(self, optical_params):
+        """Assess selected lanes only; absent limits are not a universal limit."""
+        thresholds = optical_params.get('bias_thresholds_ma') or {}
+        flags = optical_params.get('bias_flags') or {}
+        values = optical_params.get('_bias_current_lanes_ma') or []
+        ids = optical_params.get('_bias_current_lane_ids') or []
+        readings = dict(zip(ids, values))
+        if not readings and optical_params.get('bias_current_ma') is not None:
+            readings[optical_params.get('bias_current_lane') or 1] = optical_params['bias_current_ma']
+        selected = set(readings)
+        for metric in ('rx_power', 'tx_power'):
+            selected.update(optical_params.get(f'_{metric}_lane_ids') or [])
+        if not selected:
+            selected = {int(lane) for lane in flags}
+        selected.difference_update(optical_params.get('_inactive_lane_ids') or [])
+        keys = {'low_alarm', 'low_warning', 'high_warning', 'high_alarm'}
+        events = []
+        complete = bool(selected)
+        for lane in sorted(selected):
+            value = readings.get(lane)
+            lane_flags = flags.get(str(lane), {})
+            events.extend(self._bias_lane_events(lane, value, thresholds, lane_flags))
+            complete = complete and (
+                (value is not None and keys.issubset(thresholds)) or
+                keys.issubset(lane_flags)
+            )
+        if events:
+            status = ('critical' if any(e['severity'] == 'critical' for e in events)
+                      else 'warning')
+            reason = 'Module-reported laser bias limit or alarm flag triggered.'
+        elif complete:
+            status = 'normal'
+            reason = 'No selected lane exceeds module bias limits or reports a bias alarm.'
+        else:
+            status = 'unknown'
+            reason = ('Bias assessment unavailable or partial: module limits or flags '
+                      'are missing/invalid. Other optical parameters are still assessed.')
+        return {'status': status, 'reason': reason, 'events': events}
 
     def _declared_optical_lane_count(self, optical_data: str) -> Optional[int]:
         """Return an unambiguous optical lane count from module media text.
@@ -720,7 +822,7 @@ class OpticalAnalyzer:
             if value < low + 1.0 or value > high - 1.0:
                 return (2, max(low + 1.0 - value, value - (high - 1.0)))
             return (1, -min(value - low, high - value))
-        # High bias is the only currently defined bias risk.
+        # Bias without module limits has no universal numeric risk boundary.
         return (1, value)
 
     def _set_lane_readings(self, optical_params: Dict[str, Any], metric: str,
@@ -737,7 +839,24 @@ class OpticalAnalyzer:
             optical_params[value_key] = None
             return
 
-        lane, value = max(readings, key=lambda item: self._lane_risk(metric, item[1]))
+        def risk(item):
+            lane, value = item
+            if metric != 'bias_current':
+                return self._lane_risk(metric, value)
+            events = self._bias_lane_events(
+                lane, value, optical_params.get('bias_thresholds_ma') or {},
+                (optical_params.get('bias_flags') or {}).get(str(lane), {}),
+            )
+            severity = max((3 if e['severity'] == 'critical' else 2
+                            for e in events), default=1)
+            distance = max((max(0, (e['threshold_ma'] - value
+                                   if e['direction'] == 'low'
+                                   else value - e['threshold_ma']))
+                            for e in events if e['threshold_ma'] is not None),
+                           default=0)
+            return (severity, distance, value)
+
+        lane, value = max(readings, key=risk)
         optical_params[value_key] = value
         optical_params[lane_key] = lane
 
@@ -754,6 +873,14 @@ class OpticalAnalyzer:
         if not match:
             return
         wanted_lane = int(match.group(1)) + 1
+        flags = optical_params.get('bias_flags') or {}
+        # Measurement IDs determine ownership whenever available, including
+        # a single already-scoped lane whose number differs from the suffix.
+        # Only flags-only samples need independent breakout selection.
+        has_lane_ids = any(optical_params.get(f'_{metric}_lane_ids')
+                           for metric in ('rx_power', 'tx_power', 'bias_current'))
+        if not has_lane_ids and len(flags) > 1 and str(wanted_lane) in flags:
+            optical_params['bias_flags'] = {str(wanted_lane): flags[str(wanted_lane)]}
 
         for metric in ('rx_power', 'tx_power', 'bias_current'):
             lanes_key = f'_{metric}_lanes_dbm' if metric != 'bias_current' else '_bias_current_lanes_ma'
@@ -859,14 +986,13 @@ class OpticalAnalyzer:
         tx_lanes = optical_params.get('_tx_power_lanes_dbm') or (
             [tx_power] if tx_power is not None else []
         )
-        bias_lanes = optical_params.get('_bias_current_lanes_ma') or (
-            [bias_current] if bias_current is not None else []
-        )
+        bias_assessment = self._assess_bias(optical_params)
 
         # No optical data available.  Voltage alone is useful inventory
         # evidence, but it is not enough to claim a healthy optical path.
-        if all(v is None for v in [rx_power, tx_power, temperature, voltage,
-                                   bias_current]):
+        if (all(v is None for v in [rx_power, tx_power, temperature, voltage,
+                                    bias_current]) and
+                not bias_assessment['events']):
             return OpticalHealth.UNKNOWN
 
         # Preserve an explicit link-down state when every relevant receive lane
@@ -891,8 +1017,11 @@ class OpticalAnalyzer:
             return OpticalHealth.CRITICAL
         if voltage is not None and (voltage < self.thresholds['voltage_min_v'] or voltage > self.thresholds['voltage_max_v']):
             return OpticalHealth.CRITICAL
-        if any(value > self.thresholds['bias_current_max_ma'] for value in bias_lanes):
+        if bias_assessment['status'] == 'critical':
             return OpticalHealth.CRITICAL
+
+        if bias_assessment['status'] == 'warning':
+            return OpticalHealth.WARNING
 
         if not rx_lanes and not tx_lanes:
             return OpticalHealth.UNKNOWN
@@ -962,11 +1091,6 @@ class OpticalAnalyzer:
                 voltage < self.thresholds['voltage_min_v'] + 0.1 or
                 voltage > self.thresholds['voltage_max_v'] - 0.1
             )
-        if bias_lanes:
-            good_band = good_band or any(
-                value > self.thresholds['bias_current_max_ma'] * 0.8
-                for value in bias_lanes
-            )
         if good_band:
             return OpticalHealth.GOOD
         return OpticalHealth.EXCELLENT
@@ -1007,6 +1131,8 @@ class OpticalAnalyzer:
             'temperature_c': optical_params['temperature_c'],
             'voltage_v': optical_params['voltage_v'],
             'bias_current_ma': optical_params['bias_current_ma'],
+            'bias_thresholds_ma': optical_params.get('bias_thresholds_ma', {}),
+            'bias_assessment': self._assess_bias(optical_params),
             'rx_power_lane': optical_params.get('rx_power_lane'),
             'tx_power_lane': optical_params.get('tx_power_lane'),
             'bias_current_lane': optical_params.get('bias_current_lane'),
@@ -1136,6 +1262,27 @@ class OpticalAnalyzer:
                 })
                 continue
 
+            bias_events = (stats.get('bias_assessment') or {}).get('events', [])
+            for event in bias_events:
+                value = event.get('value_ma')
+                limit = event.get('threshold_ma')
+                measurement = f'{value:.3f} mA' if value is not None else 'reading unavailable'
+                boundary = f'{limit:.3f} mA' if limit is not None else 'unavailable'
+                anomalies.append({
+                    'port': port_name,
+                    'type': 'LASER_BIAS_' + event['direction'].upper(),
+                    'severity': event['severity'],
+                    'message': (
+                        f"Laser bias lane {event['lane']}: {measurement}; module "
+                        f"{event['direction']} {event['kind']} threshold: {boundary}"
+                        + ('; module flag is On' if event['source'] == 'module flag' else '')
+                    ),
+                    'action': 'Review transceiver diagnostics and module operating limits',
+                    'bias_current_ma': value,
+                    'threshold_ma': limit,
+                    'lane': event['lane'],
+                })
+
             if health == OpticalHealth.CRITICAL:
                 # Critical optical issues
                 anomaly_count = len(anomalies)
@@ -1175,7 +1322,8 @@ class OpticalAnalyzer:
                         "temperature_c": temperature
                     })
 
-                if len(anomalies) == anomaly_count:
+                if (len(anomalies) == anomaly_count and
+                        not any(e['severity'] == 'critical' for e in bias_events)):
                     anomalies.append({
                         "port": port_name,
                         "type": "CRITICAL_OPTICAL_PARAMETER",
@@ -1197,7 +1345,7 @@ class OpticalAnalyzer:
                         "action": "Monitor closely, schedule proactive maintenance",
                         "link_margin_db": link_margin
                     })
-                else:
+                elif not bias_events:
                     anomalies.append({
                         "port": port_name,
                         "type": "OPTICAL_PARAMETER_WARNING",
@@ -1630,6 +1778,8 @@ class OpticalAnalyzer:
                 'rx_lane': port.get('rx_power_lane'),
                 'tx_lane': port.get('tx_power_lane'),
                 'bias_lane': port.get('bias_current_lane'),
+                'bias_thresholds_ma': stats.get('bias_thresholds_ma') or {},
+                'bias_assessment': stats.get('bias_assessment') or {},
                 'anomalies': [
                     {
                         'severity': item.get('severity', ''),
@@ -1792,7 +1942,7 @@ class OpticalAnalyzer:
                     <tr><td>Temperature</td><td>{self.thresholds['temperature_min_c']}°C</td><td>{self.thresholds['temperature_max_c']}°C</td><td>SFP/QSFP operating temperature</td></tr>
                     <tr><td>Voltage</td><td>{self.thresholds['voltage_min_v']}V</td><td>{self.thresholds['voltage_max_v']}V</td><td>Supply voltage range</td></tr>
                     <tr><td>Link Margin</td><td>{self.thresholds['link_margin_min_db']} dB</td><td>-</td><td>Minimum margin from notifications.yaml; based on the current generic RX sensitivity until module-specific limits are collected</td></tr>
-                    <tr><td>Bias Current</td><td>-</td><td>{self.thresholds['bias_current_max_ma']} mA</td><td>Maximum laser bias current</td></tr>
+                    <tr><td>Bias Current</td><td>Module low limits</td><td>Module high limits</td><td>Module-reported warning/alarm limits and flags, in mA. Expand a port to see its limits and assessment. Without sufficient module evidence, bias assessment is unavailable; other optical parameters are still graded.</td></tr>
                     <tr><td>Down</td><td>-</td><td>{self.DARK_POWER_DBM} dBm RX</td><td>No receive light on every selected active optical lane; reported separately from Critical threshold violations</td></tr>
                 </tbody>
             </table>
@@ -1909,7 +2059,24 @@ class OpticalAnalyzer:
                 esc(laneText(data.tx_lanes, ' dBm', data.tx_lane_ids)) + '</div></div>';
             inner += '<div class="detail-lane-card"><div class="detail-lane-title">Bias Current (worst L' +
                 esc(data.bias_lane ?? '-') + ')</div><div class="detail-lane-values">' +
-                esc(laneText(data.bias_lanes, ' mA', data.bias_lane_ids)) + '</div></div>';
+                esc(laneText(data.bias_lanes, ' mA', data.bias_lane_ids)) + '</div>';
+            const biasLimits = data.bias_thresholds_ma || {};
+            const biasAssessment = data.bias_assessment || {};
+            inner += '<div class="detail-empty">Module bias limits:</div><div class="detail-lane-values">';
+            [
+                ['low_alarm', 'Low alarm'], ['low_warning', 'Low warning'],
+                ['high_warning', 'High warning'], ['high_alarm', 'High alarm']
+            ].forEach(([key, label]) => {
+                const value = biasLimits[key];
+                inner += esc(label) + ': ' +
+                    (typeof value === 'number' && Number.isFinite(value)
+                        ? esc(value.toFixed(3)) + ' mA' : 'Unavailable') + '<br>';
+            });
+            inner += '</div><div class="detail-empty">Bias assessment: ' +
+                esc(String(biasAssessment.status || 'unknown').toUpperCase()) +
+                '<br>' + esc(biasAssessment.reason ||
+                    'Bias assessment unavailable: module limits and flags were not recorded.') +
+                '</div></div>';
             inner += '</div>';
 
             const inactive = data.inactive_lanes || [];

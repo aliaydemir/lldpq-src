@@ -1872,6 +1872,26 @@ The separate transceiver firmware scan uses
 Bulk CLI defaults can also be tuned with `SEND_CMD_MAX_PARALLEL=25`,
 `GET_CONFIGS_SSH_TIMEOUT=60`, and `TELEMETRY_MAX_PARALLEL=25`.
 
+### Optical bias current health
+
+Laser TX bias current is assessed using the module's own low/high warning and
+alarm thresholds and alarm flags from the existing `ethtool -m` collection.
+There is no universal 100 mA maximum and no additional switch command is needed.
+The Optical page's expanded port details show the module limits in mA and the
+bias assessment; a bias alert identifies the affected lane, measured value and
+available limit.
+
+For example, an MMS4X00-NM-T reporting a 100 mA low alarm, 120 mA low warning,
+480 mA high warning and 500 mA high alarm accepts a reading around 339 mA.
+A reading at or above 480 mA raises a warning, while at or above 500 mA raises a
+critical alarm. These are example module-reported values, not defaults for
+other optics.
+
+If sufficient valid module limits or flags are unavailable, the bias assessment
+is explicitly unavailable rather than inferred from a fixed current limit.
+Other optical metrics continue to determine port health using their existing
+rules. Breakout selection and unused-lane exclusions also apply to bias checks.
+
 ## [10] authentication
 
 web interface is protected with session-based authentication:
