@@ -827,7 +827,8 @@ curl -fSJO "http://<host>/lldp_results/export_csv?p2p=1"
 `p2p=1` is the only accepted spelling; any other value or key is ignored and
 serves the canonical rendering. Only the six device/port columns change —
 header row, column count, row order, `Port Status`, `Status`,
-`Connection Health` and the `P2P Sheet`/`P2P Line`/`P2P SEQ` design columns are
+`Connection Health`, the `P2P Sheet`/`P2P Line`/`P2P SEQ` design columns and the
+six Rack / U-Pos location columns are
 identical in both modes, and a name with no configured label keeps the name the
 report carries. With no labels configured, the two renderings are byte-equal.
 `/lldp_results/export_json` has no alias mode: it is the canonical machine view.
@@ -1066,6 +1067,8 @@ bootstrap workspace; it is different from the operational device table under
 
 - upload P2P cabling and IP allocation workbooks (`.xlsx` / `.xlsm`) or parsed
   P2P JSON
+- upload a simple Rack / Unit Mapping (`.csv` / `.xlsx` / `.xlsm`) when a
+  complete P2P cabling workbook is unavailable
 - retain recoverable versions and explicitly choose which version is the
   active design
 - run deterministic duplicate-port, breakout, blank/TBD endpoint, duplicate
@@ -1078,6 +1081,65 @@ Generated files are never applied silently: every candidate is previewed
 (including a diff where applicable) and requires confirmation. The active
 design is published as `active-p2p.json` / `active-ipam.json` for Ask-AI and
 Fabric Migration enrichment.
+
+### Rack / Unit Mapping
+
+**Inventory → Design Sources → Rack / Unit Mapping** accepts one device per
+row with its hostname, rack and rack-unit position. Download **CSV Template**
+for a ready-to-fill example, or upload an Excel workbook with the same columns:
+
+```csv
+Hostname,Rack,U-Pos
+sys2-lon14-p-swi-bes1,C1,6-7
+sys2-lon14-p-swi-bes2,C1,12-13
+sys2-lon14-p-swi-bes7,C2,6-7
+```
+
+`GOOGLE hostname` is also accepted as the hostname column. `U-Pos` accepts a
+single positive unit (`6`) or an ascending range (`6-7`). In Excel, format that
+column as **Text** before entering ranges so that Excel does not turn them into
+dates. Blank or invalid locations and contradictory duplicate hostnames are
+reported instead of guessing a value.
+
+Uploading stores a recoverable version and opens a **Preview**; it does not
+activate the mapping. Review the matched and unmatched hostnames and any
+conflicts, then click **Use Mapping**. Unmatched names may be kept for devices
+that will be discovered later. Conflicting locations must be corrected before
+activation. Previously uploaded versions remain available in the same card.
+
+LLDP **Results** and its **Download CSV** use the same hostname-to-location
+mapping and include these columns:
+
+| Device in the report | Location columns |
+|---|---|
+| Local device | `Local Rack`, `Local U-Pos` |
+| Expected neighbor | `Expected Rack`, `Expected U-Pos` |
+| Active neighbor | `Active Rack`, `Active U-Pos` |
+
+The active P2P **cabling workbook** supplies locations where its device entries
+have both rack and unit information. The simple mapping fills locations absent
+or incomplete in that workbook. Repeated identical P2P locations are combined;
+overlapping complete locations must agree. A simple mapping cannot be activated
+while its hostnames have conflicting locations. The existing P2P design activation workflow
+continues to work: if a new P2P version contains conflicting location metadata,
+Inventory shows a warning and the ambiguous locations appear as `N/A` in Results
+and empty fields in CSV downloads
+until corrected. They are never silently selected.
+
+Matching uses the full device hostname, ignoring letter case. It does not
+guess short names or use display aliases. The Rack / U-Pos values stay the same
+when switching the LLDP page's display-alias toggle or exporting with
+`?p2p=1`. Devices without a known location show `N/A` in Results and empty
+location fields in CSV downloads. The original CSV columns stay in their existing
+order; the six location columns are appended to the end.
+
+The selected mapping is stored with the Inventory versions in
+`/var/lib/lldpq/ai/inventory/locations/` and published as `active-locations.json`.
+Results and the CSV export use the stored selection, so report regeneration
+does not remove the mapping. It adds location
+information to results and exports; it does not generate `topology.dot`, infer
+port connections, change hostname labels or modify the existing P2P/IPAM
+generation workflow.
 
 ## [03b] guided web setup (Setup page)
 

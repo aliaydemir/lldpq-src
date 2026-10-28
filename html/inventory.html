@@ -26,7 +26,7 @@
         .p-file { color:#76b900; font-family:'Cascadia Code',Consolas,monospace; font-size:12px; }
 
         .grid-2 { display:flex; gap:16px; flex-wrap:wrap; }
-        .grid-2 > .kind-card { flex:1; min-width:340px; }
+        .grid-2 > .kind-card { flex:1; min-width:min(100%, 340px); }
         .kind-card { background:#202020; border:1px solid #333; border-radius:8px; padding:14px 16px; }
         .kind-card h3 { margin:0 0 8px; font-size:14px; color:#e0e0e0; }
 
@@ -59,7 +59,7 @@
         /* version list — same visual language as the provision OS-Image list */
         .ver-list { margin-top:4px; }
         .ver-empty { color:#888; font-size:12.5px; }
-        .ver-row { display:flex; align-items:center; gap:10px; padding:7px 10px; background:#252526; border:1px solid #2d2d2d; border-radius:5px; margin-bottom:5px; }
+        .ver-row { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding:7px 10px; background:#252526; border:1px solid #2d2d2d; border-radius:5px; margin-bottom:5px; }
         .ver-row.active { background:#1a2e00; border-color:#76b900; }
         .ver-row svg { width:18px; height:18px; fill:#76b900; flex-shrink:0; }
         .ver-name { font-family:'Cascadia Code',Consolas,monospace; font-size:12px; color:#cfcfcf; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:180px; }
@@ -91,6 +91,13 @@
 
         .preview-wrap { display:none; margin-top:12px; }
         .preview-wrap.show { display:block; }
+        .location-preview { border-top:1px solid #333; padding-top:14px; }
+        .location-preview h3 { margin:0 0 8px; font-size:14px; color:#e0e0e0; }
+        .location-table-wrap { max-height:420px; overflow:auto; border:1px solid #333; border-radius:5px; }
+        .location-table-wrap .rep-table { margin-top:0; }
+        .location-table-wrap th { position:sticky; top:0; background:#252526; }
+        .location-table-wrap td { overflow-wrap:anywhere; }
+        .location-conflicts { margin:8px 0; padding-left:20px; color:#ef7770; font-size:12.5px; }
 
         /* Bootstrap advisor (hidden unless the backend exposes the action) */
         .advisor { display:none; }
@@ -112,7 +119,7 @@
             <svg viewBox="0 0 24 24"><path d="M19,5V7H15V5H19M9,5V11H5V5H9M19,13V19H15V13H19M9,17V19H5V17H9M21,3H13V9H21V3M11,3H3V13H11V3M21,11H13V21H21V11M11,15H3V21H11V15Z"/></svg>
             Inventory &amp; Bootstrap
         </div>
-        <div class="su-sub">Upload the fabric design (P2P cabling + IP allocation), validate it, then generate the LLDPq install files. Every generated file is previewed and confirmed before it is written &mdash; nothing is applied silently.</div>
+        <div class="su-sub">Upload P2P cabling, IP allocation and device rack/unit information. Validate the design, enrich LLDP results and preview generated LLDPq install files before applying them.</div>
     </div>
 
     <div class="inv-wrap">
@@ -121,7 +128,7 @@
         <!-- 1. Design sources -->
         <div class="inv-panel">
             <h2>1. Design Sources</h2>
-            <p class="p-desc">Upload the P2P cabling workbook and the IPAM (IP allocation) workbook &mdash; <code>.xlsx</code>, <code>.xlsm</code> or a parsed <code>connections.json</code>. The newest uploads are kept as recoverable versions; pick one and click <strong>Use as Design</strong> to make it active. The active design is what the generators and Ask-AI use.</p>
+            <p class="p-desc">Upload the P2P cabling workbook and the IPAM (IP allocation) workbook &mdash; <code>.xlsx</code>, <code>.xlsm</code> or a parsed <code>connections.json</code>. Click <strong>Use as Design</strong> to activate a version for the generators and Ask-AI. If you only have device locations, upload a <strong>Rack / Unit Mapping</strong> to enrich LLDP results and CSV downloads.</p>
             <div class="note">A wrong upload stays recoverable: the previous versions are retained automatically (up to the keep limit) as a single silent backup &mdash; there is no version-diff UI by design.</div>
             <div class="grid-2">
                 <div class="kind-card">
@@ -141,6 +148,39 @@
                     </div>
                     <div class="ver-list" id="list-ipam"><span class="ver-empty">Loading&hellip;</span></div>
                     <div class="status info" id="st-ipam"></div>
+                </div>
+                <div class="kind-card">
+                    <h3>Rack / Unit Mapping <span class="p-file">locations</span></h3>
+                    <p class="p-desc">Hostname, Rack and U-Pos &mdash; upload CSV or Excel, review the matches, then use the mapping.</p>
+                    <div class="p-toolbar">
+                        <button class="btn secondary sm" id="btn-template-locations" onclick="downloadLocationTemplate()"><svg viewBox="0 0 24 24"><path d="M5,20H19V18H5M19,9H15V3H9V9H5L12,16L19,9Z"/></svg>CSV Template</button>
+                        <button class="btn secondary sm" id="btn-up-locations" onclick="document.getElementById('up-locations').click()"><svg viewBox="0 0 24 24"><path d="M9,16V10H5L12,3L19,10H15V16H9M5,20V18H19V20H5Z"/></svg>Upload CSV / Excel</button>
+                        <input type="file" id="up-locations" accept=".csv,.xlsx,.xlsm" style="display:none" onchange="uploadDesign('locations', this)">
+                    </div>
+                    <div class="ver-list" id="list-locations"><span class="ver-empty">Loading&hellip;</span></div>
+                    <div class="status info" id="st-locations" role="status" aria-live="polite"></div>
+                </div>
+            </div>
+            <div class="preview-wrap location-preview" id="pw-locations">
+                <div class="p-toolbar">
+                    <h3>Rack / Unit Mapping Preview <span class="p-file" id="location-preview-name"></span></h3>
+                    <div class="spacer"></div>
+                    <button class="btn secondary sm" id="btn-clear-locations" onclick="clearLocationPreview()">Close Preview</button>
+                </div>
+                <div class="rep-counts" id="location-preview-counts"></div>
+                <p class="p-desc">Locations are matched by hostname. Unmatched hostnames remain available for devices discovered later. Conflicting locations must be corrected before the mapping can be applied. This mapping does not generate cabling or change device names.</p>
+                <div id="location-preview-warnings"></div>
+                <div id="location-preview-conflicts"></div>
+                <div class="location-table-wrap">
+                    <table class="rep-table">
+                        <thead><tr><th>Hostname</th><th>Rack</th><th>U-Pos</th><th>Match</th></tr></thead>
+                        <tbody id="location-preview-rows"></tbody>
+                    </table>
+                </div>
+                <div class="p-toolbar" style="margin-top:10px">
+                    <span class="status info" id="st-location-preview" style="margin:0" role="status" aria-live="polite"></span>
+                    <div class="spacer"></div>
+                    <button class="btn primary" id="btn-apply-locations" onclick="applyLocationMapping()" disabled>Use Mapping</button>
                 </div>
             </div>
         </div>
@@ -245,6 +285,9 @@
 <script>
 const API = '/inventory-api.sh';
 const TOKENS = {};        // artifact -> confirm token from the last preview
+let locationPreview = null;
+let locationPreviewSequence = 0;
+let activeLocationVersion = '';
 const ART = {             // artifact key -> ui ids
     'topology':        { ta:'ta-topology',        pw:'pw-topology',        st:'st-topology',        stat:'stat-topology',        prev:'btn-prev-topology',        apply:'btn-apply-topology',        file:'topology.dot' },
     'devices':         { ta:'ta-devices',         pw:'pw-devices',         st:'st-devices',         stat:'stat-devices',         prev:'btn-prev-devices',         apply:'btn-apply-devices',         file:'devices.yaml' },
@@ -299,6 +342,7 @@ async function uploadDesign(kind, input) {
     const file = input.files && input.files[0];
     input.value = '';
     if (!file) return;
+    if (kind === 'locations') clearLocationPreview();
     setStatus('st-' + kind, 'Uploading ' + file.name + '…', 'info');
     const fd = new FormData();
     fd.append('kind', kind);
@@ -309,8 +353,10 @@ async function uploadDesign(kind, input) {
         const data = await r.json();
         if (data.success) {
             const w = (data.warnings && data.warnings.length) ? ' (' + data.warnings.length + ' warning(s))' : '';
-            setStatus('st-' + kind, 'Uploaded ' + (data.filename || file.name) + w + '. Click "Use as Design" to activate.', 'ok');
-            loadVersions();
+            const next = kind === 'locations' ? ' Preview the mapping before applying it.' : ' Click "Use as Design" to activate.';
+            setStatus('st-' + kind, 'Uploaded ' + (data.filename || file.name) + w + '.' + next, 'ok');
+            await loadVersions();
+            if (kind === 'locations' && data.version) await previewLocations(data.version);
         } else {
             setStatus('st-' + kind, data.error || 'Upload failed', 'err');
         }
@@ -328,6 +374,8 @@ function summaryChips(kind, sum) {
         chips.push('<span class="badge gray">' + (sum.total_connections || 0) + ' conns</span>');
         chips.push('<span class="badge green">' + (sum.resolved_links || 0) + ' links</span>');
         if (sum.unresolved) chips.push('<span class="badge amber">' + sum.unresolved + ' unresolved</span>');
+    } else if (kind === 'locations') {
+        chips.push('<span class="badge gray">' + escHtml(sum.total_locations || sum.total_records || 0) + ' locations</span>');
     } else {
         chips.push('<span class="badge gray">' + (sum.total_records || 0) + ' records</span>');
         chips.push('<span class="badge green">' + (sum.fabric || 0) + ' fabric</span>');
@@ -339,17 +387,21 @@ function summaryChips(kind, sum) {
 
 function renderVersions(kind, versions) {
     const box = document.getElementById('list-' + kind);
+    if (kind === 'locations') activeLocationVersion = ((versions || []).find(v => v.active) || {}).version || '';
     if (!versions || !versions.length) {
-        box.innerHTML = '<span class="ver-empty">No ' + kind.toUpperCase() + ' design uploaded yet.</span>';
+        box.innerHTML = '<span class="ver-empty">' + (kind === 'locations' ? 'No rack/unit mapping uploaded yet.' : 'No ' + kind.toUpperCase() + ' design uploaded yet.') + '</span>';
         return;
     }
     box.innerHTML = versions.map(v => {
         const active = !!v.active;
         const name = v.filename || v.version;
-        const action = active
+        const activateCall = 'activate(' + JSON.stringify(kind) + ',' + JSON.stringify(v.version) + ')';
+        const deleteCall = 'deleteVersion(' + JSON.stringify(kind) + ',' + JSON.stringify(v.version) + ',' + JSON.stringify(name) + ')';
+        let action = active
             ? '<span class="badge green">Active</span>'
-            : '<button class="btn secondary sm" onclick="activate(\'' + kind + '\',\'' + escHtml(v.version) + '\')">Use as Design</button>' +
-              '<button class="btn danger sm" title="Delete this stored version" onclick="deleteVersion(\'' + kind + '\',\'' + escHtml(v.version) + '\',\'' + escHtml(name) + '\')">Del</button>';
+            : (kind === 'locations' ? '' : '<button class="btn secondary sm" onclick="' + escHtml(activateCall) + '">Use as Design</button>') +
+              '<button class="btn danger sm" title="Delete this stored version" onclick="' + escHtml(deleteCall) + '">Del</button>';
+        if (kind === 'locations') action = '<button class="btn secondary sm" onclick="' + escHtml('previewLocations(' + JSON.stringify(v.version) + ')') + '">Preview</button>' + action;
         return '<div class="ver-row' + (active ? ' active' : '') + '">' +
             '<svg viewBox="0 0 24 24"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>' +
             '<span class="ver-name" title="' + escHtml(name) + '">' + escHtml(name) + '</span>' +
@@ -365,6 +417,7 @@ async function loadVersions() {
         if (data.success) {
             renderVersions('p2p', (data.versions || {}).p2p || []);
             renderVersions('ipam', (data.versions || {}).ipam || []);
+            renderVersions('locations', (data.versions || {}).locations || []);
         } else {
             setStatus('st-p2p', data.error || 'Failed to load versions', 'err');
         }
@@ -372,6 +425,8 @@ async function loadVersions() {
 }
 
 async function activate(kind, version) {
+    if (kind === 'locations') return previewLocations(version);
+    if (kind === 'p2p') clearLocationPreview();
     setStatus('st-' + kind, 'Activating…', 'info');
     setListBusy(kind, true);
     try {
@@ -379,10 +434,15 @@ async function activate(kind, version) {
         if (data.success) {
             let msg = 'Active design set.';
             if (data.publish_error) msg += ' (publish warning: ' + data.publish_error + ')';
-            setStatus('st-' + kind, msg, 'ok');
+            const warnings = (data.warnings || []).map(w => typeof w === 'string' ? w : w.message || '').filter(Boolean);
+            if (warnings.length) msg += ' ' + warnings.join(' ');
+            const conflicts = (data.conflicts || []).map(c => c.message || c.hostname || '').filter(Boolean);
+            if (conflicts.length) msg += ' ' + conflicts.join('; ');
+            setStatus('st-' + kind, msg, warnings.length || conflicts.length || data.publish_error ? 'info' : 'ok');
             loadVersions();
         } else {
-            setStatus('st-' + kind, data.error || 'Activate failed', 'err');
+            const conflicts = (data.conflicts || []).map(c => c.message || c.hostname || '').filter(Boolean);
+            setStatus('st-' + kind, (data.error || 'Activate failed') + (conflicts.length ? ': ' + conflicts.join('; ') : ''), 'err');
         }
     } catch (e) {
         setStatus('st-' + kind, 'Activate failed: ' + e.message, 'err');
@@ -399,6 +459,7 @@ async function deleteVersion(kind, version, filename) {
         const data = await apiPost('delete', { kind, version });
         if (data.success) {
             setStatus('st-' + kind, 'Version deleted.', 'ok');
+            if (kind === 'locations' && locationPreview && locationPreview.version === version) clearLocationPreview();
             loadVersions();
         } else {
             setStatus('st-' + kind, data.error || 'Delete failed', 'err');
@@ -407,6 +468,98 @@ async function deleteVersion(kind, version, filename) {
         setStatus('st-' + kind, 'Delete failed: ' + e.message, 'err');
     } finally {
         setListBusy(kind, false);
+    }
+}
+
+// ---- Rack / Unit Mapping -----------------------------------------------
+function clearLocationPreview() {
+    locationPreviewSequence++;
+    locationPreview = null;
+    document.getElementById('pw-locations').classList.remove('show');
+    setBusy(['btn-apply-locations'], true);
+    setStatus('st-location-preview', '', 'info');
+}
+
+async function downloadLocationTemplate() {
+    setBusy(['btn-template-locations'], true);
+    try {
+        const data = await apiGet('location-template');
+        if (!data.success || typeof data.content !== 'string') throw new Error(data.error || 'Template is unavailable');
+        const url = URL.createObjectURL(new Blob([data.content], { type: 'text/csv;charset=utf-8;' }));
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = data.filename || 'rack-unit-template.csv';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setStatus('st-locations', 'Template downloaded. Keep U-Pos values such as 6-7 as text when editing in Excel.', 'info');
+    } catch (e) {
+        setStatus('st-locations', 'Template download failed: ' + e.message, 'err');
+    } finally {
+        setBusy(['btn-template-locations'], false);
+    }
+}
+
+async function previewLocations(version) {
+    clearLocationPreview();
+    const sequence = locationPreviewSequence;
+    setStatus('st-locations', 'Checking rack/unit mapping…', 'info');
+    try {
+        const data = await apiGet('preview-locations', { version });
+        if (sequence !== locationPreviewSequence) return;
+        if (!data.success) throw new Error(data.error || 'Preview failed');
+        const rows = data.rows || [];
+        const counts = data.counts || {};
+        const conflicts = data.conflicts || [];
+        const warnings = data.warnings || [];
+        const hasConflicts = conflicts.length > 0 || Number(counts.conflicts) > 0 || rows.some(row => row.conflict);
+        const canApply = data.can_activate === true && !!data.token && !hasConflicts && version !== activeLocationVersion;
+        locationPreview = { version, token: canApply ? data.token : null };
+        document.getElementById('location-preview-name').textContent = data.filename || version;
+        document.getElementById('location-preview-counts').innerHTML =
+            '<span class="badge gray">' + escHtml(counts.total == null ? rows.length : counts.total) + ' locations</span>' +
+            '<span class="badge green">' + escHtml(counts.matched || 0) + ' matched</span>' +
+            '<span class="badge amber">' + escHtml(counts.unmatched || 0) + ' unmatched</span>' +
+            '<span class="badge ' + (hasConflicts ? 'red' : 'gray') + '">' + escHtml(counts.conflicts || conflicts.length) + ' conflicts</span>';
+        document.getElementById('location-preview-warnings').innerHTML = warnings.length
+            ? '<div class="note">' + warnings.map(w => escHtml(typeof w === 'string' ? w : w.message || JSON.stringify(w))).join('<br>') + '</div>' : '';
+        document.getElementById('location-preview-conflicts').innerHTML = conflicts.length
+            ? '<ul class="location-conflicts">' + conflicts.map(c => '<li>' + escHtml((c.hostname ? c.hostname + ': ' : '') + (c.message || 'Contradictory rack/unit locations')) + '</li>').join('') + '</ul>' : '';
+        document.getElementById('location-preview-rows').innerHTML = rows.length ? rows.map(row =>
+            '<tr><td>' + escHtml(row.hostname) + '</td><td>' + escHtml(row.rack) + '</td><td>' + escHtml(row.unit) + '</td><td>' +
+            (row.conflict ? '<span class="badge red">Conflicting locations</span>' : row.match === 'matched'
+                ? '<span class="badge green">Matched</span>' : '<span class="badge amber">Unmatched hostname</span>') + '</td></tr>'
+        ).join('') : '<tr><td colspan="4">No device locations in this mapping.</td></tr>';
+        document.getElementById('pw-locations').classList.add('show');
+        setBusy(['btn-apply-locations'], !canApply);
+        setStatus('st-location-preview', hasConflicts ? 'Correct the conflicting locations and upload a new version.'
+            : version === activeLocationVersion ? 'This mapping is already active.'
+            : canApply ? 'Review the rows above, then click Use Mapping.' : 'This mapping cannot be applied.', hasConflicts ? 'err' : 'info');
+        setStatus('st-locations', 'Preview ready. Uploading has not changed the active mapping.', 'info');
+    } catch (e) {
+        if (sequence === locationPreviewSequence) setStatus('st-locations', 'Preview failed: ' + e.message, 'err');
+    }
+}
+
+async function applyLocationMapping() {
+    if (!locationPreview || !locationPreview.token) return;
+    const candidate = locationPreview;
+    locationPreview = { version: candidate.version, token: null };
+    setBusy(['btn-apply-locations', 'btn-up-locations', 'btn-clear-locations'], true);
+    setListBusy('locations', true);
+    setStatus('st-location-preview', 'Applying mapping…', 'info');
+    try {
+        const data = await apiPost('activate', { kind: 'locations', version: candidate.version, confirm: candidate.token });
+        if (!data.success) throw new Error(data.error || 'Apply failed');
+        clearLocationPreview();
+        setStatus('st-locations', 'Rack/unit mapping is active. Reload LLDP Results to see the updated locations.' + (data.publish_error ? ' Publish warning: ' + data.publish_error : ''), data.publish_error ? 'err' : 'ok');
+        await loadVersions();
+    } catch (e) {
+        setStatus('st-location-preview', 'Apply failed: ' + e.message + ' Preview the mapping again before retrying.', 'err');
+    } finally {
+        setBusy(['btn-up-locations', 'btn-clear-locations'], false);
+        setListBusy('locations', false);
     }
 }
 

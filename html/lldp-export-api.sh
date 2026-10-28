@@ -79,8 +79,10 @@ if [[ ! -r "$REPORT_FILE" ]]; then
 fi
 
 P2P_DESIGN_FILE="$WEB_ROOT/monitor-results/active-p2p.json"
+LOCATION_DESIGN_FILE="$WEB_ROOT/monitor-results/active-locations.json"
 ALIAS_FILE="$WEB_ROOT/display-aliases.json"
-export REPORT_FILE P2P_DESIGN_FILE ALIAS_FILE FORMAT P2P_ALIASES
+AI_STATE_DIR="${AI_STATE_DIR:-/var/lib/lldpq/ai}"
+export REPORT_FILE P2P_DESIGN_FILE LOCATION_DESIGN_FILE ALIAS_FILE AI_STATE_DIR FORMAT P2P_ALIASES
 PYTHONPATH="$LLDPQ_DIR:$WEB_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 <<'PYTHON'
 import json
 import os
@@ -112,12 +114,47 @@ except Exception:
     raise SystemExit(0)
 
 
+def load_inventory_design(kind):
+    """Read the same durable selection as Inventory, before its public cache.
+
+    Full report publication replaces monitor-results. Its active design copies
+    can be absent or older; the Inventory versions live outside that tree.
+    """
+    try:
+        directory = os.path.join(os.environ["AI_STATE_DIR"], "inventory", kind)
+        with open(os.path.join(directory, "active.json"), encoding="utf-8") as stream:
+            pointer = json.load(stream)
+        version = pointer.get("active") if isinstance(pointer, dict) else None
+        if not isinstance(version, str) or not re.fullmatch(r"\d+-[0-9a-f]{8}\.json", version):
+            return None
+        with open(os.path.join(directory, version), encoding="utf-8") as stream:
+            wrapper = json.load(stream)
+        data = wrapper.get("data") if isinstance(wrapper, dict) else None
+        return data if isinstance(data, dict) else None
+    except (OSError, TypeError, UnicodeError, ValueError):
+        return None
+
+
 def load_active_p2p():
     try:
+        selected = load_inventory_design("p2p")
+        if selected is not None:
+            return ai_p2p.load_connections(selected)
         return ai_p2p.load_connections(os.environ["P2P_DESIGN_FILE"])
     except (OSError, TypeError, UnicodeError, ValueError):
         # The design join is optional enrichment. Missing, unreadable, or
         # malformed active P2P data degrades to the same blank columns.
+        return None
+
+
+def load_active_locations():
+    try:
+        selected = load_inventory_design("locations")
+        if selected is not None:
+            return selected
+        with open(os.environ["LOCATION_DESIGN_FILE"], encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, TypeError, UnicodeError, ValueError):
         return None
 
 
@@ -150,7 +187,8 @@ try:
     if os.environ.get("FORMAT") == "csv":
         aliases = load_display_aliases()
         body = lldp_export.build_csv(
-            report, p2p_design=load_active_p2p(), aliases=aliases
+            report, p2p_design=load_active_p2p(), aliases=aliases,
+            location_design=load_active_locations(),
         ).encode("utf-8")
         stamp = re.sub(r"[^0-9A-Za-z._-]", "_", created)
         # A literal picked from the parsed flag, never request text: the two

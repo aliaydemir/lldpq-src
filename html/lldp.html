@@ -503,7 +503,8 @@
             </svg>
             LLDP Connection Status
         </div>
-        <div class="section-content" style="padding: 0;">
+        <div class="section-content" style="padding: 0; overflow-x: auto;">
+            <div id="location-notice" role="status" style="display: none; padding: 12px 16px; color: #ff9800;"></div>
             <div id="filter-info" class="filter-info" role="status" aria-live="polite" aria-atomic="true" style="margin: 16px;">
                 <span id="filter-text"></span>
                 <button onclick="clearFilter()">Show All</button>
@@ -544,6 +545,12 @@
                     <th class="sortable" data-column="8" data-type="string">
                         Connection Health <span class="sort-arrow"></span>
                     </th>
+                    <th class="sortable" data-column="9" data-type="string">Local Rack <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="10" data-type="string">Local U-Pos <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="11" data-type="string">Expected Rack <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="12" data-type="string">Expected U-Pos <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="13" data-type="string">Active Rack <span class="sort-arrow"></span></th>
+                    <th class="sortable" data-column="14" data-type="string">Active U-Pos <span class="sort-arrow"></span></th>
                 </tr>
                 </thead>
                 <tbody id="lldp-data">
@@ -1116,6 +1123,9 @@
         // file (or the transceiver inventory) is absent.
         let p2pDesignStatus = 'loading';   // 'loading' | 'ready' | 'absent'
         let p2pIndex = new Map();          // deviceKey | portAlias -> design side entry
+        let deviceLocationsStatus = 'loading';
+        let deviceLocations = Object.create(null);
+        let deviceLocationsGeneration = 0;
         let xcvrInvStatus = 'loading';     // 'loading' | 'ready' | 'absent'
         let xcvrIndex = new Map();         // deviceKey | portAlias -> transceiver module
 
@@ -1131,7 +1141,7 @@
         function updateCsvExportAvailability() {
             const button = document.getElementById('download-csv');
             if (!button) return;
-            const loading = p2pDesignStatus === 'loading' || pendingConnectionsRender !== null;
+            const loading = p2pDesignStatus === 'loading' || deviceLocationsStatus === 'loading' || pendingConnectionsRender !== null;
             button.disabled = loading;
             button.setAttribute('aria-busy', loading ? 'true' : 'false');
         }
@@ -1368,6 +1378,49 @@
                 .then(() => refreshOpenLldpDetails());
         }
 
+        // Both workbook locations and the simple Rack / Unit import are
+        // resolved by the same backend helper used by the headless CSV export.
+        // Only canonical hostnames are keys; display labels never identify a rack.
+        function connectionLocationValues(connection) {
+            return [connection.localDevice, connection.expectedDevice, connection.actualDevice]
+                .flatMap(hostname => {
+                    const key = String(hostname == null ? '' : hostname).trim().toLowerCase();
+                    const location = Object.hasOwn(deviceLocations, key) ? deviceLocations[key] : null;
+                    return location ? [location.rack || '', location.unit || ''] : ['', ''];
+                });
+        }
+
+        async function loadDeviceLocations() {
+            const generation = ++deviceLocationsGeneration;
+            deviceLocationsStatus = 'loading';
+            updateCsvExportAvailability();
+            let notice = '';
+            try {
+                const response = await fetch('/inventory-api.sh?action=device-locations', { cache: 'no-store' });
+                if (!response.ok) throw new Error('status ' + response.status);
+                const result = await response.json();
+                if (!result.success || !result.locations || typeof result.locations !== 'object') {
+                    throw new Error('Invalid location response');
+                }
+                if (generation !== deviceLocationsGeneration) return;
+                deviceLocations = result.locations;
+                deviceLocationsStatus = 'ready';
+                if (result.conflicts && result.conflicts.length) {
+                    notice = 'Conflicting Rack / Unit information for: ' + result.conflicts.map(item => item.hostname).join(', ') + '. Location cells are left blank. Review the active files in Inventory.';
+                }
+            } catch (error) {
+                if (generation !== deviceLocationsGeneration) return;
+                deviceLocations = Object.create(null);
+                deviceLocationsStatus = 'unavailable';
+                notice = 'Rack / Unit information could not be loaded. Location cells are blank; reload the page to retry.';
+            }
+            const message = document.getElementById('location-notice');
+            message.textContent = notice;
+            message.style.display = notice ? 'block' : 'none';
+            if (allConnections.length) applyCurrentFilters();
+            updateCsvExportAvailability();
+        }
+
         function designStatusFor(conn) {
             if (p2pDesignStatus === 'loading') {
                 return { code: 'loading', label: 'Loading...', badge: 'badge-gray',
@@ -1480,7 +1533,7 @@
         }
         function lldpDetailHtml(conn) {
             const status = designStatusFor(conn);
-            return `<td colspan="9"><div class="detail-panel">` +
+            return `<td colspan="15"><div class="detail-panel">` +
                 `<div class="detail-title">${escHtml(joinDevPort(conn.localDevice, conn.localPort))} — Design vs Actual</div>` +
                 `<div class="compare-grid">${designCardHtml(status)}${actualCardHtml(conn)}</div>` +
                 `<div class="detail-status detail-status-${status.code}">` +
@@ -1555,6 +1608,9 @@
             statusCell.innerHTML = `<span class="${statusBadgeClass}">${status.status}</span>`;
 
             row.insertCell(8).textContent = status.health;
+            connectionLocationValues(connection).forEach(value => {
+                row.insertCell().textContent = value || 'N/A';
+            });
             return row;
         }
 
@@ -1721,7 +1777,7 @@
             if (connections.length > 50) {
                 const tbody = document.getElementById('lldp-data');
                 const loadingRow = tbody.insertRow();
-                loadingRow.innerHTML = '<td colspan="9" style="text-align: center; padding: 20px; color: #666; font-style: italic;">Loading remaining connections...</td>';
+                loadingRow.innerHTML = '<td colspan="15" style="text-align: center; padding: 20px; color: #666; font-style: italic;">Loading remaining connections...</td>';
                 
                 // Load all connections after 20ms
                 setTimeout(() => {
@@ -1914,6 +1970,7 @@
         // Data-level sort: mirrors the displayed cell text per column so the
         // order matches what the operator sees (aliases included).
         function connectionSortValue(connection, column) {
+            if (column >= 9 && column <= 14) return connectionLocationValues(connection)[column - 9] || 'N/A';
             switch (column) {
                 case 0: return aliasedLabel(connection.localDevice, deviceAliasLc);
                 case 1: return aliasedLabel(connection.localPort, portAliasLc);
@@ -1995,7 +2052,7 @@
             lldpReportReloadRetryPending = false;
             setP2pDesignStatus('loading');
             xcvrInvStatus = 'loading';
-            return Promise.all([loadLLDPData(), loadP2pDesign(), loadTransceiverInventory()])
+            return Promise.all([loadLLDPData(), loadP2pDesign(), loadTransceiverInventory(), loadDeviceLocations()])
                 .then(() => {
                     if (document.getElementById('error').style.display === 'block') {
                         // The job itself succeeded; only the report fetch
@@ -2277,7 +2334,8 @@
         const CSV_HEADERS = Object.freeze([
             'Local Device', 'Local Port', 'Port Status', 'Expected Neighbor', 'Expected Port',
             'Active Neighbor', 'Active Port', 'Status', 'Connection Health',
-            'P2P Sheet', 'P2P Line', 'P2P SEQ'
+            'P2P Sheet', 'P2P Line', 'P2P SEQ',
+            'Local Rack', 'Local U-Pos', 'Expected Rack', 'Expected U-Pos', 'Active Rack', 'Active U-Pos'
         ]);
 
         function spreadsheetSafeValue(value, blankMissing = false) {
@@ -2315,15 +2373,15 @@
                 design.sheet_name == null ? '' : design.sheet_name,
                 design.row_number == null ? '' : design.row_number,
                 design.seq == null ? '' : design.seq
-            ] : ['', '', '']);
+            ] : ['', '', ''], connectionLocationValues(connection));
         }
 
         function buildLLDPCSV(connections) {
             const lines = [CSV_HEADERS.map(value => csvField(value)).join(',')];
-            const p2pColumnStart = CSV_HEADERS.length - 3;
+            const optionalColumnStart = 9;
             connections.forEach(connection => {
                 lines.push(canonicalConnectionRow(connection)
-                    .map((value, index) => csvField(value, index >= p2pColumnStart))
+                    .map((value, index) => csvField(value, index >= optionalColumnStart))
                     .join(','));
             });
             return lines.join('\r\n') + '\r\n';
@@ -2347,6 +2405,7 @@
 
         function downloadCSV() {
             if (p2pDesignStatus === 'loading') return;
+            if (deviceLocationsStatus === 'loading') return;
             try {
                 // Get current date + active filter for filename
                 const now = new Date();
@@ -2516,6 +2575,7 @@
             loadDisplayAliases().then(() => {
                 loadLLDPData();
                 loadP2pDesign();
+                loadDeviceLocations();
                 loadTransceiverInventory();
             });
             initTableSorting();

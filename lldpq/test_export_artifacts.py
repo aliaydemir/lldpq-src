@@ -301,20 +301,20 @@ swp9 Fail exp,dev =swp19 act"dev @swp20 UP
 GOLDEN_CSV = (
     "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
     "Active Neighbor,Active Port,Status,Connection Health,"
-    "P2P Sheet,P2P Line,P2P SEQ\r\n"
-    "leaf-01,swp4,DOWN,spine-01,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,\r\n"
-    "leaf-01,N/A,UP,spine-01,swp18,spine-01,swp18,FAILED,Local Port Not Defined,,,\r\n"
-    "leaf-01,swp2,UP,spine-01,swp11,N/A,N/A,NO INFO,No LLDP Response Received,,,\r\n"
-    "leaf-01,swp3,DOWN,spine-01,swp12,N/A,N/A,NO INFO,Local Port is DOWN,,,\r\n"
+    "P2P Sheet,P2P Line,P2P SEQ,Local Rack,Local U-Pos,Expected Rack,Expected U-Pos,Active Rack,Active U-Pos\r\n"
+    "leaf-01,swp4,DOWN,spine-01,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,,,,,,,\r\n"
+    "leaf-01,N/A,UP,spine-01,swp18,spine-01,swp18,FAILED,Local Port Not Defined,,,,,,,,,\r\n"
+    "leaf-01,swp2,UP,spine-01,swp11,N/A,N/A,NO INFO,No LLDP Response Received,,,,,,,,,\r\n"
+    "leaf-01,swp3,DOWN,spine-01,swp12,N/A,N/A,NO INFO,Local Port is DOWN,,,,,,,,,\r\n"
     "leaf-01,swp5,UP,spine-01,swp14,spine-01,swp15,WARNING,"
-    '"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
+    '"Port Mismatch: Expected swp14, Got swp15",,,,,,,,,\r\n'
     "leaf-01,swp6,UP,spine-01,swp16,spine-02,swp16,WARNING,"
-    '"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
-    "leaf-01,swp7,UP,spine-01,swp17,N/A,N/A,WARNING,Unexpected Connection,,,\r\n"
+    '"Wrong Device: Expected spine-01, Got spine-02",,,,,,,,,\r\n'
+    "leaf-01,swp7,UP,spine-01,swp17,N/A,N/A,WARNING,Unexpected Connection,,,,,,,,,\r\n"
     'leaf-01,swp9,UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
-    '"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
+    '"Wrong Device: Expected exp,dev, Got act""dev",,,,,,,,,\r\n'
     "leaf-01,swp1,UP,spine-01,swp10,spine-01,swp10,SUCCESS,"
-    "LLDP Connection Verified,,,\r\n"
+    "LLDP Connection Verified,,,,,,,,,\r\n"
 )
 
 
@@ -344,24 +344,24 @@ GOLDEN_ALIASES = {
 GOLDEN_ALIASED_CSV = (
     "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
     "Active Neighbor,Active Port,Status,Connection Health,"
-    "P2P Sheet,P2P Line,P2P SEQ\r\n"
-    "RACK-A-LEAF,'=M4,DOWN,CORE-A,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,\r\n"
+    "P2P Sheet,P2P Line,P2P SEQ,Local Rack,Local U-Pos,Expected Rack,Expected U-Pos,Active Rack,Active U-Pos\r\n"
+    "RACK-A-LEAF,'=M4,DOWN,CORE-A,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,,,,,,,\r\n"
     "RACK-A-LEAF,N/A,UP,CORE-A,swp18,CORE-A,swp18,FAILED,"
-    "Local Port Not Defined,,,\r\n"
+    "Local Port Not Defined,,,,,,,,,\r\n"
     "RACK-A-LEAF,swp2,UP,CORE-A,swp11,N/A,N/A,NO INFO,"
-    "No LLDP Response Received,,,\r\n"
+    "No LLDP Response Received,,,,,,,,,\r\n"
     "RACK-A-LEAF,swp3,DOWN,CORE-A,swp12,N/A,N/A,NO INFO,"
-    "Local Port is DOWN,,,\r\n"
+    "Local Port is DOWN,,,,,,,,,\r\n"
     "RACK-A-LEAF,swp5,UP,CORE-A,swp14,CORE-A,swp15,WARNING,"
-    '"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
+    '"Port Mismatch: Expected swp14, Got swp15",,,,,,,,,\r\n'
     "RACK-A-LEAF,swp6,UP,CORE-A,swp16,spine-02,swp16,WARNING,"
-    '"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
+    '"Wrong Device: Expected spine-01, Got spine-02",,,,,,,,,\r\n'
     "RACK-A-LEAF,swp7,UP,CORE-A,swp17,N/A,N/A,WARNING,"
-    "Unexpected Connection,,,\r\n"
+    "Unexpected Connection,,,,,,,,,\r\n"
     'RACK-A-LEAF,"M,9",UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
-    '"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
+    '"Wrong Device: Expected exp,dev, Got act""dev",,,,,,,,,\r\n'
     "RACK-A-LEAF,M1,UP,CORE-A,M10,CORE-A,M10,SUCCESS,"
-    "LLDP Connection Verified,,,\r\n"
+    "LLDP Connection Verified,,,,,,,,,\r\n"
 )
 
 # JS alias map -> display-aliases.json section, asserted against lldp.html's
@@ -403,9 +403,9 @@ class LLDPExportGoldenTests(unittest.TestCase):
     def test_absent_design_keeps_blank_p2p_columns(self):
         rows = _csv_rows(lldp_export.build_csv(self.report))
         self.assertEqual(
-            rows[0][-3:], ["P2P Sheet", "P2P Line", "P2P SEQ"]
+            rows[0][9:12], ["P2P Sheet", "P2P Line", "P2P SEQ"]
         )
-        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
 
     def test_matched_design_adds_sheet_line_and_seq(self):
         design = {"connections": [{
@@ -416,7 +416,7 @@ class LLDPExportGoldenTests(unittest.TestCase):
         }]}
         rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
         matched = next(row for row in rows[1:] if row[1] == "swp5")
-        self.assertEqual(matched[-3:], ["GB300-9-16", "184", "2778"])
+        self.assertEqual(matched[9:12], ["GB300-9-16", "184", "2778"])
 
     def test_unmatched_design_keeps_p2p_columns_blank(self):
         design = {"connections": [{
@@ -426,7 +426,7 @@ class LLDPExportGoldenTests(unittest.TestCase):
             "connection_type": "general", "network_type": "eth",
         }]}
         rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
-        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
 
     def test_formula_like_quoted_sheet_is_guarded_and_rfc4180_escaped(self):
         design = {"connections": [{
@@ -437,14 +437,14 @@ class LLDPExportGoldenTests(unittest.TestCase):
         }]}
         text = lldp_export.build_csv(self.report, p2p_design=design)
         matched = next(row for row in _csv_rows(text)[1:] if row[1] == "swp9")
-        self.assertEqual(matched[-3:], ['\'=Rack,"Plan"', "184", "2778"])
+        self.assertEqual(matched[9:12], ['\'=Rack,"Plan"', "184", "2778"])
         self.assertIn('"\'=Rack,""Plan"""', text)
 
     def test_malformed_design_gracefully_degrades_to_blank_columns(self):
         rows = _csv_rows(
             lldp_export.build_csv(self.report, p2p_design={"not": "a design"})
         )
-        self.assertTrue(all(row[-3:] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
 
     def test_headless_export_uses_precise_three_part_port_match(self):
         report = parse_lldp_report(
@@ -470,7 +470,7 @@ swp3s4 Pass right swp49 right swp49 UP
             design_row("proof", "1/1/4", "Proof", 33, "333"),
         ]}
         rows = _csv_rows(lldp_export.build_csv(report, p2p_design=design))
-        self.assertEqual(rows[1][-3:], ["Right", "22", "222"])
+        self.assertEqual(rows[1][9:12], ["Right", "22", "222"])
 
     def test_payload_counts_match_report_counts(self):
         payload = lldp_export.build_payload(self.report)
@@ -619,9 +619,9 @@ class LLDPAliasedExportGoldenTests(unittest.TestCase):
         )
         matched = next(row for row in aliased[1:] if row[1] == "M5")
         self.assertEqual(matched[0], "RACK-A")
-        self.assertEqual(matched[-3:], ["GB300-9-16", "184", "2778"])
+        self.assertEqual(matched[9:12], ["GB300-9-16", "184", "2778"])
         self.assertEqual(
-            [row[-3:] for row in aliased], [row[-3:] for row in plain]
+            [row[9:12] for row in aliased], [row[9:12] for row in plain]
         )
 
     def test_absent_or_unusable_alias_data_degrades_to_the_canonical_export(self):
@@ -856,7 +856,7 @@ class AliasedColumnContractTests(unittest.TestCase):
             "function renderedConnectionsInTableOrder()",
         )
         self.assertIn(
-            ".map((value, index) => csvField(value, index >= p2pColumnStart))",
+            ".map((value, index) => csvField(value, index >= optionalColumnStart))",
             builder,
         )
         guard = _source_between(
@@ -942,6 +942,7 @@ class LLDPExportCgiTests(unittest.TestCase):
         # PYTHONPATH carries WEB_ROOT exactly as the installed tree does, and
         # ai_p2p.py lives beside the CGI there.
         shutil.copy2(ROOT / "html" / "ai_p2p.py", self.web / "ai_p2p.py")
+        shutil.copy2(ROOT / "html" / "device_locations.py", self.web / "device_locations.py")
         (self.web / "lldp_results.ini").write_text(GOLDEN_INI, encoding="utf-8")
         config = root / "lldpq.conf"
         config.write_text(
@@ -963,6 +964,7 @@ class LLDPExportCgiTests(unittest.TestCase):
     def _get(self, query=None, export_format="csv"):
         environment = _cgi_environment(
             LLDPQ_CONFIG_HELPER=str(self.helper),
+            AI_STATE_DIR=str(self.web.parent / "ai"),
             LLDPQ_EXPORT_FORMAT=export_format,
             REQUEST_METHOD="GET",
         )

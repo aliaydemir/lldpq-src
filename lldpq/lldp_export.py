@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 import ai_p2p
+import device_locations
 import export_artifacts
 from lldp_report import LLDPReport, LLDPRow
 
@@ -38,6 +39,8 @@ CSV_HEADERS = (
     "Local Device", "Local Port", "Port Status", "Expected Neighbor",
     "Expected Port", "Active Neighbor", "Active Port", "Status",
     "Connection Health", "P2P Sheet", "P2P Line", "P2P SEQ",
+    "Local Rack", "Local U-Pos", "Expected Rack", "Expected U-Pos",
+    "Active Rack", "Active U-Pos",
 )
 
 # display-aliases.json sections, keyed by the column family they label.
@@ -235,7 +238,8 @@ def _aliased(value: Any, alias_lc: Mapping[str, str]) -> Any:
 
 
 def build_csv(
-    report: LLDPReport, p2p_design: Any = None, aliases: Any = None
+    report: LLDPReport, p2p_design: Any = None, aliases: Any = None,
+    location_design: Any = None,
 ) -> str:
     """Byte-parity with the page's Download CSV of the freshly loaded table.
 
@@ -245,6 +249,7 @@ def build_csv(
     """
     items = classified_rows(report)
     p2p_index = _build_p2p_index(p2p_design)
+    locations = device_locations.resolve_locations(p2p_design, location_design)["locations"]
     maps = alias_maps(aliases)
     lines = [",".join(export_artifacts.csv_field(h) for h in CSV_HEADERS)]
     for row, status, health in items:
@@ -269,10 +274,15 @@ def build_csv(
             if design is not None
             else ("", "", "")
         )
+        location_cells = []
+        for hostname in (row.local_device, row.expected_device, row.actual_device):
+            location = locations.get(_normalized(hostname).lower(), {})
+            location_cells.extend((location.get("rack", ""), location.get("unit", "")))
         lines.append(",".join(
             [
                 *(export_artifacts.csv_field(cell) for cell in cells),
                 *(_optional_csv_field(cell) for cell in p2p_cells),
+                *(_optional_csv_field(cell) for cell in location_cells),
             ]
         ))
     return "\r\n".join(lines) + "\r\n"

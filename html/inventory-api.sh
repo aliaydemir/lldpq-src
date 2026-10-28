@@ -1,6 +1,6 @@
 #!/bin/bash
 # inventory-api.sh - Inventory / Bootstrap design API
-# Backend for the Inventory page (P2P + IPAM design upload, versioning, and
+# Backend for the Inventory page (P2P + IPAM + rack/unit upload, versioning, and
 # deterministic artifact generation).
 #
 # Mirrors the fabric-api.sh / ai-api.sh conventions:
@@ -8,7 +8,7 @@
 #   - Content-Type: application/json on every path, including errors
 #   - all logic in a stdlib-only python3 heredoc
 #
-# Versioned design state lives under AI_STATE_DIR/inventory/{p2p,ipam}/ using the
+# Versioned design state lives under AI_STATE_DIR/inventory/{p2p,ipam,locations}/ using the
 # same 2770 setgid + atomic-write conventions as the rest of the AI state. The
 # ACTIVE design is additionally PUBLISHED into the web-served monitor-results
 # directory (active-p2p.json / active-ipam.json) so the browser and Ask-AI
@@ -49,7 +49,7 @@ INVENTORY_LOCK="$WEB_ROOT/.inventory.lock"
 # when the published static copy is missing); every other action stays admin.
 source "$(dirname "$0")/auth-guard.sh"
 ACTION=$(echo "$QUERY_STRING" | grep -oP 'action=\K[^&]*' | head -1)
-if [[ "$ACTION" == "active-design" ]]; then
+if [[ "$ACTION" == "active-design" || "$ACTION" == "device-locations" ]]; then
     require_auth
 else
     require_admin
@@ -98,6 +98,7 @@ export ANSIBLE_DIR
 python3 << 'PYTHON_END'
 import base64
 import hashlib
+import fcntl
 import ipaddress
 import json
 import os
@@ -148,6 +149,7 @@ if _HERE not in sys.path:
 
 import ai_generate  # noqa: E402
 import ai_p2p       # noqa: E402
+import device_locations  # noqa: E402
 
 
 def fail(msg, **extra):
@@ -230,7 +232,7 @@ def run_setup_safety(args, stdin_text=''):
     try:
         proc = subprocess.run(cmd, input=stdin_text, capture_output=True,
                               text=True, timeout=60)
-    except subprocess.SubprocessError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         return None, 'Configuration write helper failed: %s' % exc
     out = (proc.stdout or '').strip()
     if not out:
@@ -260,14 +262,15 @@ def read_devices_text():
 # --------------------------------------------------------------------------
 
 _KIND_DIRS = {'p2p': os.path.join(INVENTORY_DIR, 'p2p'),
-              'ipam': os.path.join(INVENTORY_DIR, 'ipam')}
+              'ipam': os.path.join(INVENTORY_DIR, 'ipam'),
+              'locations': os.path.join(INVENTORY_DIR, 'locations')}
 _VERSION_RE = re.compile(r'^\d+-[0-9a-f]{8}\.json$')
 
 
 def kind_dir(kind):
     path = _KIND_DIRS.get(kind)
     if not path:
-        fail("kind must be 'p2p' or 'ipam'")
+        fail("kind must be 'p2p', 'ipam' or 'locations'")
     return path
 
 
@@ -350,6 +353,8 @@ def load_version(kind, version=''):
 
 
 def summarize(kind, data):
+    if kind == 'locations':
+        return {'total_locations': len(data.get('locations', []))}
     if kind == 'p2p':
         try:
             resolved = len(ai_p2p.expected_links(data))
@@ -418,9 +423,11 @@ def parse_json_body(body):
 
 
 def infer_kind(filename, given):
-    if given in ('p2p', 'ipam'):
+    if given in ('p2p', 'ipam', 'locations'):
         return given
     low = filename.lower()
+    if re.search(r'location|rack[-_ ]?unit', low):
+        return 'locations'
     if re.search(r'ipam|ip[-_ ]?alloc|addressing|subnet', low):
         return 'ipam'
     if re.search(r'p2p|connection|cabl|point[-_ ]?to[-_ ]?point', low):
@@ -504,6 +511,8 @@ def warn_on_fabric_owned_addresses(design):
 
 
 def parse_design(kind, filename, filebytes):
+    if kind == 'locations':
+        return device_locations.parse_upload(filebytes, filename)
     suffix = os.path.splitext(filename)[1].lower()
     if suffix in ('.xlsx', '.xlsm', '.xltx', '.xltm'):
         tmp = None
@@ -589,6 +598,86 @@ def content_token(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
 
 
+def optional_active(kind):
+    wrapper, version = load_version(kind, '')
+    return (wrapper or {}).get('data') or {}, version
+
+
+def location_preview(wrapper, version):
+    design = device_locations.validate_design(wrapper.get('data') or {})
+    p2p, p2p_version = optional_active('p2p')
+    result = device_locations.resolve_locations(p2p, design)
+    warnings = list(design.get('warnings', []))
+    try:
+        inventory, _ = read_devices_text()
+    except (OSError, subprocess.SubprocessError):
+        inventory = ''
+    known = set()
+    inventory_available = False
+    if inventory:
+        try:
+            import yaml
+        except ImportError:
+            _, entries = ai_generate._parse_existing_devices(inventory)
+            known = {e['hostname'].strip().lower() for e in entries}
+            inventory_available = bool(entries)
+            warnings.append('YAML support is unavailable; inventory matching uses the limited devices.yaml reader')
+        else:
+            try:
+                config = yaml.safe_load(inventory) or {}
+                if not isinstance(config, dict) or not isinstance(config.get('devices', {}), dict):
+                    raise ValueError('devices.yaml must contain a devices mapping')
+                for entry in config.get('devices', {}).values():
+                    hostname = entry.get('hostname', '') if isinstance(entry, dict) else str(entry).split('@', 1)[0]
+                    if hostname:
+                        known.add(str(hostname).strip().lower())
+                inventory_available = True
+            except (yaml.YAMLError, ValueError, TypeError):
+                known.clear()
+                warnings.append('devices.yaml could not be parsed; inventory matches are unavailable until the inventory is corrected')
+    else:
+        warnings.append('devices.yaml could not be read; inventory matches are unavailable')
+    candidate_hosts = {row['hostname'].lower() for row in design['locations']}
+    candidate_conflicts = []
+    for conflict in result['conflicts']:
+        if conflict['hostname'].lower() in candidate_hosts:
+            candidate_conflicts.append(conflict)
+        else:
+            warnings.append('Existing P2P issue outside this mapping: %s' % conflict['message'])
+    conflicts = {c['hostname'].lower() for c in candidate_conflicts}
+    rows = [dict(row, match='matched' if row['hostname'].lower() in known else 'unmatched',
+                 conflict=row['hostname'].lower() in conflicts) for row in design['locations']]
+    matched = sum(row['match'] == 'matched' for row in rows)
+    unmatched = len(rows) - matched
+    if unmatched and inventory_available:
+        warnings.append('%d device(s) are not present in devices.yaml; exact hostname matching is used' % unmatched)
+    token = content_token(json.dumps({'version': version, 'data': wrapper.get('data'),
+                                     'p2p_version': p2p_version, 'p2p': p2p}, sort_keys=True))
+    return {'version': version, 'filename': wrapper.get('filename', ''), 'rows': rows,
+            'counts': {'total': len(rows), 'matched': matched, 'unmatched': unmatched,
+                       'conflicts': len(candidate_conflicts)},
+            'conflicts': candidate_conflicts, 'warnings': warnings, 'token': token,
+            'can_activate': not candidate_conflicts}
+
+
+def action_device_locations():
+    p2p, _ = optional_active('p2p')
+    locations, _ = optional_active('locations')
+    ok(**device_locations.resolve_locations(p2p, locations))
+
+
+def action_location_template():
+    ok(filename='rack-unit-template.csv',
+       content='Hostname,Rack,U-Pos\r\nsys2-lon14-p-swi-bes1,C1,6-7\r\nsys2-lon14-p-swi-bes2,C1,12-13\r\n')
+
+
+def action_preview_locations():
+    wrapper, version = load_version('locations', QS_VERSION)
+    if not wrapper:
+        fail('Rack / Unit Mapping version not found')
+    ok(**location_preview(wrapper, version))
+
+
 # --------------------------------------------------------------------------
 # Actions
 # --------------------------------------------------------------------------
@@ -620,16 +709,17 @@ def action_upload():
         elif isinstance(payload.get('data'), dict):
             # Pre-parsed canonical design passed straight through.
             k = infer_kind(filename, kind)
-            if k not in ('p2p', 'ipam'):
-                fail("kind must be 'p2p' or 'ipam'")
-            version, summary = store_version(k, filename or 'design.json',
-                                             payload['data'], body)
+            if k not in ('p2p', 'ipam', 'locations'):
+                fail("kind must be 'p2p', 'ipam' or 'locations'")
+            data = (device_locations.validate_design(payload['data'], filename)
+                    if k == 'locations' else payload['data'])
+            version, summary = store_version(k, filename or 'design.json', data, body)
             ok(kind=k, version=version, filename=filename or 'design.json', summary=summary)
     if not filebytes:
         fail('no file content in upload')
     kind = infer_kind(filename, kind)
-    if kind not in ('p2p', 'ipam'):
-        fail("kind must be 'p2p' or 'ipam' (could not infer from filename)")
+    if kind not in ('p2p', 'ipam', 'locations'):
+        fail("kind must be 'p2p', 'ipam' or 'locations' (could not infer from filename)")
     if len(filebytes) > 64 * 1024 * 1024:
         fail('upload too large')
     try:
@@ -647,7 +737,7 @@ def action_list():
     # monitor-results) leaves the active pointer without its web-served copy.
     # Every Inventory page load repairs that quietly.
     republished = {}
-    for kind in ('p2p', 'ipam'):
+    for kind in ('p2p', 'ipam', 'locations'):
         target = os.path.join(MR_DIR, 'active-%s.json' % kind)
         if os.path.exists(target):
             continue
@@ -657,14 +747,14 @@ def action_list():
         wrapper['version'] = version
         okp, perr = publish_active(kind, wrapper)
         republished[kind] = True if okp else (perr or 'publish failed')
-    ok(versions={'p2p': list_versions('p2p'), 'ipam': list_versions('ipam')},
+    ok(versions={kind: list_versions(kind) for kind in _KIND_DIRS},
        keep=INVENTORY_KEEP, republished=republished)
 
 
 def action_active_design():
     kind = KIND or 'p2p'
-    if kind not in ('p2p', 'ipam'):
-        fail("kind must be 'p2p' or 'ipam'")
+    if kind not in ('p2p', 'ipam', 'locations'):
+        fail("kind must be 'p2p', 'ipam' or 'locations'")
     wrapper, version = load_version(kind, '')
     if not wrapper:
         fail('no active %s design' % kind)
@@ -686,11 +776,34 @@ def action_activate():
         payload = {}
     kind = payload.get('kind') or KIND
     version = payload.get('version') or QS_VERSION
-    if kind not in ('p2p', 'ipam'):
-        fail("kind must be 'p2p' or 'ipam'")
+    if kind not in ('p2p', 'ipam', 'locations'):
+        fail("kind must be 'p2p', 'ipam' or 'locations'")
+    # Serialize P2P and location activation so neither can race past the
+    # other's conflict check between preview and publishing.
+    ensure_dir(INVENTORY_DIR)
+    with open(os.path.join(INVENTORY_DIR, '.activation.lock'), 'a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        activate_version(kind, version, payload)
+
+
+def activate_version(kind, version, payload):
     wrapper, version = load_version(kind, version)
     if not wrapper:
         fail('version not found')
+    activation_conflicts = []
+    if kind == 'locations':
+        preview = location_preview(wrapper, version)
+        if payload.get('confirm') != preview['token']:
+            fail('confirm token missing or stale; preview the Rack / Unit Mapping again before applying')
+        if not preview['can_activate']:
+            fail('Resolve Rack / Unit conflicts before applying the mapping', conflicts=preview['conflicts'])
+    elif kind == 'p2p':
+        locations, _ = optional_active('locations')
+        if locations:
+            result = device_locations.resolve_locations(wrapper.get('data') or {}, locations)
+            # Cabling activation keeps its existing behavior. Conflicted
+            # rack metadata is reported and omitted by the location join.
+            activation_conflicts = result['conflicts']
     wrapper['version'] = version
     pointer = active_pointer_path(kind)
     prior = load_json(pointer)
@@ -703,7 +816,8 @@ def action_activate():
     atomic_write(pointer, json.dumps({'active': version, 'ts': int(time.time())}))
     published, perr = publish_active(kind, wrapper)
     ok(kind=kind, version=version, published=published,
-       publish_error=perr, summary=wrapper.get('summary', {}))
+       publish_error=perr, summary=wrapper.get('summary', {}), conflicts=activation_conflicts,
+       warnings=([c['message'] for c in activation_conflicts]))
 
 
 def action_delete():
@@ -713,8 +827,8 @@ def action_delete():
         payload = {}
     kind = payload.get('kind') or KIND
     version = payload.get('version') or QS_VERSION
-    if kind not in ('p2p', 'ipam'):
-        fail("kind must be 'p2p' or 'ipam'")
+    if kind not in ('p2p', 'ipam', 'locations'):
+        fail("kind must be 'p2p', 'ipam' or 'locations'")
     if not version or not _VERSION_RE.match(str(version)):
         fail('invalid version id')
     directory = kind_dir(kind)
@@ -739,12 +853,18 @@ def action_bootstrap_status():
 
 def action_validate():
     kind = KIND or 'p2p'
-    if kind not in ('p2p', 'ipam'):
-        fail("kind must be 'p2p' or 'ipam'")
+    if kind not in ('p2p', 'ipam', 'locations'):
+        fail("kind must be 'p2p', 'ipam' or 'locations'")
     wrapper, version = load_version(kind, QS_VERSION)
     if not wrapper:
         fail('no %s design (upload and activate one first)' % kind)
     data = wrapper.get('data') or {}
+    if kind == 'locations':
+        preview = location_preview(wrapper, version)
+        ok(kind=kind, version=version, report={
+            'issues': [{'severity': 'error', 'kind': 'location-conflict', 'message': c['message']}
+                       for c in preview['conflicts']],
+            'counts': preview['counts'], 'warnings': preview['warnings']})
     if kind == 'p2p':
         report = ai_generate.validate_p2p(data)
     else:
@@ -943,6 +1063,9 @@ _ACTIONS = {
     'list': action_list,
     'activate': action_activate,
     'active-design': action_active_design,
+    'device-locations': action_device_locations,
+    'location-template': action_location_template,
+    'preview-locations': action_preview_locations,
     'delete': action_delete,
     'bootstrap-status': action_bootstrap_status,
     'validate': action_validate,
