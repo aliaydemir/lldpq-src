@@ -1851,46 +1851,36 @@
             }
         }
         
+        let statsRequestId = 0;
         async function updateStats(device, timeRange) {
-            // Active devices count
-            const devicesResult = await queryPrometheus('count(count by (net_host_name) (cumulus_nvswitch_interface_if_out_octets))');
-            if (devicesResult.success && devicesResult.data?.result?.[0]) {
-                document.querySelector('#statDevices .value').textContent = devicesResult.data.result[0].value?.[1] || '-';
-            }
-            
-            // Interfaces count
-            const ifResult = await queryPrometheus('count(cumulus_nvswitch_interface_if_out_octets)');
-            if (ifResult.success && ifResult.data?.result?.[0]) {
-                document.querySelector('#statInterfaces .value').textContent = ifResult.data.result[0].value?.[1] || '-';
-            }
-            
-            // Total throughput
-            const tpResult = await queryPrometheus('sum(rate(cumulus_nvswitch_interface_if_in_octets[5m]) + rate(cumulus_nvswitch_interface_if_out_octets[5m])) * 8 / 1000000000');
-            if (tpResult.success && tpResult.data?.result?.[0]) {
-                const value = parseFloat(tpResult.data.result[0].value?.[1] || 0).toFixed(2);
-                document.querySelector('#statThroughput .value').innerHTML = `${value}<span class="unit">Gbps</span>`;
-            }
-            
-            // Total errors/s
-            const errResult = await queryPrometheus('sum(rate(cumulus_nvswitch_interface_if_in_errors[5m]) + rate(cumulus_nvswitch_interface_if_out_errors[5m]))');
-            if (errResult.success && errResult.data?.result?.[0]) {
-                const value = parseFloat(errResult.data.result[0].value?.[1] || 0).toFixed(1);
-                document.querySelector('#statErrors .value').innerHTML = `${value}<span class="unit">/s</span>`;
-            } else {
-                document.querySelector('#statErrors .value').innerHTML = `0<span class="unit">/s</span>`;
-            }
-            
-            // Total drops/s
-            const dropResult = await queryPrometheus('sum(rate(cumulus_nvswitch_interface_if_in_discards[5m]) + rate(cumulus_nvswitch_interface_if_out_discards[5m]))');
-            if (dropResult.success && dropResult.data?.result?.[0]) {
-                const value = parseFloat(dropResult.data.result[0].value?.[1] || 0).toFixed(1);
-                document.querySelector('#statDrops .value').innerHTML = `${value}<span class="unit">/s</span>`;
-            } else {
-                document.querySelector('#statDrops .value').innerHTML = `0<span class="unit">/s</span>`;
-            }
-            
+            const requestId = ++statsRequestId;
+            const cards = [
+                ['statDevices', 'count(count by (net_host_name) (cumulus_nvswitch_interface_if_out_octets))', null, ''],
+                ['statInterfaces', 'count(cumulus_nvswitch_interface_if_out_octets)', null, ''],
+                ['statThroughput', 'sum(rate(cumulus_nvswitch_interface_if_in_octets[5m]) + rate(cumulus_nvswitch_interface_if_out_octets[5m])) * 8 / 1000000000', 2, 'Gbps'],
+                ['statErrors', 'sum(rate(cumulus_nvswitch_interface_if_in_errors[5m]) + rate(cumulus_nvswitch_interface_if_out_errors[5m]))', 1, '/s'],
+                ['statDrops', 'sum(rate(cumulus_nvswitch_interface_if_in_discards[5m]) + rate(cumulus_nvswitch_interface_if_out_discards[5m]))', 1, '/s']
+            ];
+            await Promise.all(cards.map(async ([id, query, digits, unit]) => {
+                let result;
+                try { result = await queryPrometheus(query); }
+                catch (error) { result = { success: false }; }
+                // A slower refresh must not replace a newer measurement.
+                if (requestId !== statsRequestId) return;
+                const element = document.querySelector(`#${id} .value`);
+                const raw = result?.success ? result.data?.result?.[0]?.value?.[1] : null;
+                const value = raw == null || String(raw).trim() === '' ? NaN : Number(raw);
+                if (!Number.isFinite(value)) {
+                    element.textContent = '—';
+                    element.title = 'Measurement unavailable';
+                    return;
+                }
+                element.title = '';
+                const formatted = digits == null ? String(value) : value.toFixed(digits);
+                element.innerHTML = `${formatted}${unit ? `<span class="unit">${unit}</span>` : ''}`;
+            }));
         }
-        
+
         async function updateTotalThroughputChart(device, timeRange) {
             const deviceFilter = device !== 'all' ? `{net_host_name="${device}"}` : '';
             // Total throughput in Gbps (single line)

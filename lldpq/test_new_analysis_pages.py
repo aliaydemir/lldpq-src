@@ -126,7 +126,8 @@ class ConfigDriftAnalyzerTests(unittest.TestCase):
 
 
 class RoutesAnalyzerTests(unittest.TestCase):
-    def _snapshot(self, tmp, host, count, vrfs=("default",), status="current"):
+    def _snapshot(self, tmp, host, count, vrfs=("default",), status="current",
+                  epoch=2_000_000_000):
         tables = Path(tmp) / "monitor-results" / "fabric-tables"
         tables.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -139,9 +140,12 @@ class RoutesAnalyzerTests(unittest.TestCase):
                     for i in range(count)
                 ] for vrf in vrfs
             },
-            "_collection": {"status": status, "error": None},
+            "_collection": {"status": status, "error": None,
+                            "last_success": datetime.fromtimestamp(
+                                epoch, tz=timezone.utc).isoformat()},
         }
         (tables / ("%s.json" % host)).write_text(json.dumps(payload))
+        self._summary(tmp, epoch)
 
     def _summary(self, tmp, epoch):
         tables = Path(tmp) / "monitor-results" / "fabric-tables"
@@ -167,7 +171,7 @@ class RoutesAnalyzerTests(unittest.TestCase):
             self.assertEqual(first.summary_counts()["route_drops_24h"], 0)
             self.assertEqual(first.summary_counts()["total_routes"], 200)
 
-            self._snapshot(tmp, "Leaf1", 40, vrfs=("default",))
+            self._snapshot(tmp, "Leaf1", 40, vrfs=("default",), epoch=2_000_000_600)
             second = self._run(tmp, now=2_000_000_600)
             counts = second.summary_counts()
             self.assertEqual(counts["route_drops_24h"], 1)
@@ -216,12 +220,58 @@ class RoutesAnalyzerTests(unittest.TestCase):
                 self.assertEqual(counts["events_recorded"], 0)
 
             # Scan recovers: the drop is detected exactly once.
-            self._summary(tmp, base + 7200)
+            self._snapshot(tmp, "Leaf1", 10, epoch=base + 7200)
             fresh = self._run(tmp, now=base + 7200)
             counts = fresh.summary_counts()
             self.assertEqual(counts["new_events"], 1)
             self.assertEqual(counts["route_drops_24h"], 1)
             self.assertEqual(counts["events_recorded"], 1)
+
+    def test_failed_host_and_repeated_sample_do_not_advance_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = 2_000_000_000
+            self._snapshot(tmp, "Leaf1", 100)
+            self._run(tmp, now=base)
+            path = Path(tmp) / "monitor-results/routes-history/Leaf1.json"
+            original = path.read_bytes()
+            # A new fabric-wide scan can still contain old data for one host.
+            self._snapshot(tmp, "Leaf1", 10, status="stale")
+            self._summary(tmp, base + 600)
+            stale = self._run(tmp, now=base + 600)
+            self.assertEqual(stale.new_events, 0)
+            self.assertIsNone(stale.rows[0]["delta"])
+            self.assertEqual(path.read_bytes(), original)
+            # A second analysis of the exact same successful collection is
+            # also not a new measurement.
+            self._snapshot(tmp, "Leaf1", 100)
+            self._run(tmp, now=base + 601)
+            self.assertEqual(path.read_bytes(), original)
+            self._snapshot(tmp, "Leaf1", 10, epoch=base + 1200)
+            recovered = self._run(tmp, now=base + 1200)
+            self.assertEqual(recovered.new_events, 1)
+            repeated = self._run(tmp, now=base + 1201)
+            self.assertEqual(repeated.new_events, 0)
+            self.assertEqual(len(json.loads(path.read_text())["history"]), 2)
+
+    def test_invalid_device_timestamp_is_not_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot(tmp, "Leaf1", 100)
+            table = Path(tmp) / "monitor-results/fabric-tables/Leaf1.json"
+            payload = json.loads(table.read_text())
+            for stamp in (None, "invalid", "2099-01-01T00:00:00Z"):
+                payload["_collection"]["last_success"] = stamp
+                table.write_text(json.dumps(payload))
+                result = self._run(tmp, now=2_000_000_000)
+                self.assertEqual(result.device_status["Leaf1"], "stale")
+                self.assertFalse((Path(tmp) / "monitor-results/routes-history/Leaf1.json").exists())
+
+    def test_subsecond_collector_timestamp_is_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._snapshot(tmp, "Leaf1", 100, epoch=2_000_000_000.75)
+            result = self._run(tmp, now=2_000_000_000.9)
+            self.assertEqual(result.device_status["Leaf1"], "current")
+            history = Path(tmp) / "monitor-results/routes-history/Leaf1.json"
+            self.assertEqual(json.loads(history.read_text())["history"][0]["timestamp"], 2_000_000_000.75)
 
     def test_missing_scan_still_produces_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:

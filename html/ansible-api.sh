@@ -118,6 +118,11 @@ acquire_deploy_lock() {
         json_response '{"success": false, "locked": true, "error": "Another config edit, deploy, diff, or generate is already running. Try again shortly."}'
         return 1
     fi
+    if [[ -f "$ANSIBLE_DIR/.lldpq-write-journal.json" ]] &&
+       ! python3 "$LLDPQ_DIR/fabric_transactions.py" "$ANSIBLE_DIR" >&2; then
+        json_response '{"success": false, "error": "Interrupted config write could not be recovered; inventory is locked for repair"}'
+        return 1
+    fi
     return 0
 }
 
@@ -394,11 +399,12 @@ delete_file() {
 # started/job_id JSON response; the caller polls action=deploy-status.
 start_ansible_job() {
     local kind="$1" playbook="$2" limit="$3"
+    local bounce_plan="${4:-}" bounce_file=""
 
     mkdir -p "$DEPLOY_STATE_DIR" 2>/dev/null || true
 
     # Sweep stale job logs (older than 1 day) so state does not grow unbounded.
-    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' -o -name '*.pid' \) -mtime +1 -delete 2>/dev/null || true
+    find "$DEPLOY_STATE_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.rc' -o -name '*.pid' -o -name '*.bounce.json' \) -mtime +1 -delete 2>/dev/null || true
 
     local job_id="$kind-$(date +%Y%m%d-%H%M%S)-$$"
     local log_file="$DEPLOY_STATE_DIR/$job_id.log"
@@ -409,6 +415,17 @@ start_ansible_job() {
         json_response '{"success": false, "error": "Cannot create job log"}'
         return
     }
+
+    if [[ -n "$bounce_plan" ]]; then
+        bounce_file="$DEPLOY_STATE_DIR/$job_id.bounce.json"
+        if ! python3 "$LLDPQ_DIR/migration_bounce.py" "$ANSIBLE_DIR" "$bounce_plan" "$limit" > "$bounce_file" 2> "$log_file"; then
+            local error_json
+            error_json=$(python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' < "$log_file")
+            rm -f "$bounce_file"
+            json_response "{\"success\": false, \"error\": $error_json}"
+            return
+        fi
+    fi
 
     # Detach: setsid + closed stdio so the job outlives this CGI request, the
     # nginx timeout and the browser tab. fd 9 (the lock) is intentionally left
@@ -426,10 +443,21 @@ start_ansible_job() {
             ANSIBLE_FORCE_COLOR=true ansible-playbook "$6" >> "$2" 2>&1
         fi
         rc=$?
+        if [ "$rc" -eq 0 ] && [ -n "$7" ]; then
+            echo "=== PORT BOUNCE: remote recovery enabled ===" >> "$2"
+            ANSIBLE_FORCE_COLOR=true ansible-playbook "$7" -l "$4" >> "$2" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+                # An unreachable poll may leave a remote async task running.
+                # Keep the operation lock until its bounded recovery expires.
+                echo "Port bounce failed or could not be confirmed; waiting 240s for remote recovery before releasing the lock." >> "$2"
+                sleep 240
+            fi
+        fi
         echo "$rc" > "$3.tmp"
         mv -f "$3.tmp" "$3"
         exit "$rc"
-    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$limit" "$pid_file" "$playbook" </dev/null >/dev/null 2>&1 &
+    ' _ "$ANSIBLE_DIR" "$log_file" "$rc_file" "$limit" "$pid_file" "$playbook" "$bounce_file" </dev/null >/dev/null 2>&1 &
 
     json_response "{\"success\": true, \"started\": true, \"job_id\": \"$job_id\"}"
 }
@@ -510,7 +538,7 @@ run_deploy() {
         return
     fi
 
-    start_ansible_job "deploy" "playbooks/deploy_switch_configs.yaml" "$host,localhost"
+    start_ansible_job "deploy" "playbooks/deploy_switch_configs.yaml" "$host,localhost" "${BOUNCE_PLAN:-}"
 }
 
 # Poll a background job (deploy/diff/generate): tail its log and, once
@@ -851,12 +879,13 @@ parse_query
 # Large host lists overflow the URL length limit: diff/deploy/generate also
 # accept the same comma-joined list via a POST body of JSON {"host": "..."}.
 # The action stays in the query string, and a host query param still wins.
-if [ "$REQUEST_METHOD" = "POST" ] && [ -z "$HOST" ]; then
+BOUNCE_PLAN=""
+if [ "$REQUEST_METHOD" = "POST" ]; then
     case "$ACTION" in
         diff|deploy|generate)
             if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
                 POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
-                HOST=$(printf '%s' "$POST_DATA" | python3 -c '
+                BODY_HOST=$(printf '%s' "$POST_DATA" | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -864,6 +893,19 @@ except Exception:
     data = {}
 host = data.get("host", "") if isinstance(data, dict) else ""
 print(host if isinstance(host, str) else "")')
+                [[ -n "$HOST" ]] || HOST="$BODY_HOST"
+                if [[ "$ACTION" == "deploy" ]]; then
+                    BOUNCE_PLAN=$(printf '%s' "$POST_DATA" | python3 -c '
+import sys, json, re
+data = json.load(sys.stdin)
+plan = data.get("bounce_plan", "")
+if not isinstance(plan, str) or (plan and not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", plan)):
+    sys.exit(1)
+print(plan)') || {
+                        json_response '{"success": false, "error": "Invalid migration bounce plan"}'
+                        exit 0
+                    }
+                fi
             fi
             ;;
     esac

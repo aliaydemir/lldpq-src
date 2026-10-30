@@ -146,7 +146,8 @@ import shutil
 import pwd
 import grp
 from urllib.parse import urlparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import time
@@ -5499,10 +5500,53 @@ def device_mutation_lock(ip):
         yield
 
 
+_fabric_operation_local = threading.local()
+
+
+@contextmanager
+def fabric_operation_lock(exclusive=False):
+    """Exclude global device jobs while allowing per-device provision workers."""
+    import grp
+    held = getattr(_fabric_operation_local, 'mode', None)
+    if held is not None:
+        if exclusive and held != 'exclusive':
+            raise RuntimeError('Cannot upgrade a shared device operation lock')
+        yield
+        return
+    directory = os.environ.get('FABRIC_LOCK_DIR', os.path.join(WEB_ROOT, '.locks'))
+    path = os.environ.get('FABRIC_LOCK_FILE', os.path.join(directory, 'fabric-api.lock'))
+    os.makedirs(directory, mode=0o2770, exist_ok=True)
+    try:
+        os.chown(directory, -1, grp.getgrnam(os.environ.get('FABRIC_LOCK_GROUP', 'www-data')).gr_gid)
+    except (KeyError, PermissionError):
+        pass
+    try:
+        os.chmod(directory, 0o2770)
+    except PermissionError:
+        pass
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o660)
+    with os.fdopen(fd, 'a+') as handle:
+        try:
+            os.fchmod(handle.fileno(), 0o660)
+        except PermissionError:
+            pass
+        try:
+            mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another config edit, deploy, diff or telemetry operation is running; retry when it finishes')
+        try:
+            _fabric_operation_local.mode = 'exclusive' if exclusive else 'shared'
+            yield
+        finally:
+            del _fabric_operation_local.mode
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 @contextmanager
 def canonical_device_mutation(device):
     """Pin current inventory assignment and serialize one device mutation."""
-    with inventory_shared_lock():
+    with fabric_operation_lock(), inventory_shared_lock():
         bindings = _load_canonical_inventory_bindings_unlocked(include_monitored=True)
         canonical = canonicalize_inventory_target(device, bindings)
         with device_mutation_lock(canonical['ip']):
@@ -7154,6 +7198,8 @@ def run_upgrade_worker(job_id):
     ensure_upgrade_jobs_dir()
     worker_lock_path = job_path(job_id) + '.worker.lock'
     worker_lock = open(worker_lock_path, 'a+')
+    operation_stack = ExitStack()
+    operation_locked = False
     try:
         try:
             os.chmod(worker_lock_path, 0o664)
@@ -7178,6 +7224,12 @@ def run_upgrade_worker(job_id):
                     job['worker_heartbeat'] = int(time.time())
                     job.pop('worker_error', None)
                     save_upgrade_job(job)
+                if not operation_locked:
+                    # Retain the global lock through reboot and verification,
+                    # including gaps between SSH calls. Nested device work on
+                    # this worker thread reuses it without taking a second fd.
+                    operation_stack.enter_context(fabric_operation_lock(exclusive=True))
+                    operation_locked = True
                 updated = update_upgrade_job(job)
                 with upgrade_job_lock(job_id):
                     current = load_upgrade_job(job_id)
@@ -7217,6 +7269,7 @@ def run_upgrade_worker(job_id):
                     pass
             time.sleep(15)
     finally:
+        operation_stack.close()
         try:
             fcntl.flock(worker_lock.fileno(), fcntl.LOCK_UN)
         except OSError:
@@ -8812,9 +8865,8 @@ def action_upload_generated_config():
 
 # ======================== DEPLOY GENERATED CONFIG ========================
 
-def deploy_config_to_device(device, server_ip):
+def deploy_config_to_device(device, server_ip="", config_bytes=None):
     """Verify one canonical target, then replace its NVUE config over SSH."""
-    from addressing import address_family, http_url
     try:
         with canonical_device_mutation(device) as canonical:
             ip = canonical['ip']
@@ -8823,23 +8875,18 @@ def deploy_config_to_device(device, server_ip):
             if filename not in (hostname + '.yaml', hostname + '.yml') or \
                     not valid_generated_config_name(filename):
                 raise ValueError('Generated config no longer matches target hostname')
-            if not os.path.isfile(os.path.join(GENERATED_CONFIGS_DIR, filename)):
-                raise ValueError(f'Generated config is no longer available: {filename}')
-            if address_family(ip) == 6:
-                # IPv6-only management can work without an IPv6 HTTP endpoint
-                # on LLDPq. Send the exact local YAML in the SSH stdin script;
-                # base64 avoids interpolation of configuration text by Bash.
-                with open(os.path.join(GENERATED_CONFIGS_DIR, filename), 'rb') as handle:
-                    encoded_config = base64.b64encode(handle.read()).decode('ascii')
-                download_commands = [
-                    f"printf '%s' {shlex.quote(encoded_config)} | base64 -d > \"$TMP\"",
-                ]
-            else:
-                config_url = http_url(server_ip, f'generated_config_folder/{filename}')
-                download_commands = [
-                    f'CONFIG_URL={shlex.quote(config_url)}',
-                    'curl -sf -- "$CONFIG_URL" -o "$TMP"',
-                ]
+            if config_bytes is None:
+                with upgrade_coordinator_lock():
+                    with open(os.path.join(GENERATED_CONFIGS_DIR, filename), 'rb') as handle:
+                        config_bytes = handle.read()
+            if not config_bytes:
+                raise ValueError('Generated config is empty')
+            encoded_config = base64.b64encode(config_bytes).decode('ascii')
+            config_sha256 = hashlib.sha256(config_bytes).hexdigest()
+            download_commands = [
+                f"printf '%s' {shlex.quote(encoded_config)} | base64 -d > \"$TMP\"",
+                f"printf '%s  %s\\n' {shlex.quote(config_sha256)} \"$TMP\" | sha256sum -c -",
+            ]
             ssh_opts = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                         '-o', 'StrictHostKeyChecking=no', '-o',
                         'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR']
@@ -8865,7 +8912,8 @@ def deploy_config_to_device(device, server_ip):
                 input=remote_script, capture_output=True, text=True, timeout=120
             )
         if r.returncode == 0 and 'LLDPQ_CONFIG_OK' in r.stdout:
-            return {'ip': ip, 'hostname': hostname, 'success': True, 'message': 'Config applied'}
+            return {'ip': ip, 'hostname': hostname, 'success': True, 'message': 'Config applied',
+                    'config_sha256': config_sha256}
         detail = (r.stderr or r.stdout or 'Command failed').strip()[-300:]
         if r.returncode == 42 or 'identity' in detail.lower():
             detail = 'Identity verification failed: ' + detail
@@ -8898,16 +8946,6 @@ def action_deploy_generated_config():
 
     if not devices:
         error_json("No devices specified")
-
-    server_ip = ''
-    if any(not isinstance(device, dict) or address_family(device.get('ip')) != 6
-           for device in devices):
-        try:
-            server_ip = normalize_server_ref(data.get('server_ip') or get_server_ip())
-        except ValueError as exc:
-            error_json(f'Invalid config download server: {exc}')
-        if server_ip in ('127.0.0.1', '[::1]'):
-            error_json("Cannot determine server IP for config download")
 
     try:
         inventory = load_canonical_inventory_bindings(include_monitored=True)
@@ -8968,11 +9006,26 @@ def action_deploy_generated_config():
             'config_filename': config_filename,
         })
 
-    # Deploy in parallel
+    # Freeze the whole request before starting any worker. Upload/sync use the
+    # same coordinator, so even queued workers receive the selected revision.
+    try:
+        with upgrade_coordinator_lock():
+            config_snapshots = {}
+            for dev in canonical_devices:
+                filename = dev['config_filename']
+                with open(os.path.join(GENERATED_CONFIGS_DIR, filename), 'rb') as handle:
+                    content = handle.read()
+                if not content:
+                    raise ValueError(f'Generated config is empty: {filename}')
+                config_snapshots[filename] = content
+    except Exception as exc:
+        error_json(f'Could not snapshot generated configs: {exc}')
+
     results = []
     with ThreadPoolExecutor(max_workers=20) as executor:
         futures = {
-            executor.submit(deploy_config_to_device, dev, server_ip): dev
+            executor.submit(deploy_config_to_device, dev, '',
+                            config_snapshots[dev['config_filename']]): dev
             for dev in canonical_devices
         }
         for future in as_completed(futures):

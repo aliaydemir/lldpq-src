@@ -16,32 +16,17 @@ LLDPQ_MODE_FLOOR_DEF='def _lldpq_mode_floor(_ffd, _fdst):
     import os as _fos
     _fmode = ((_fos.stat(_fdst).st_mode & 0o777) if _fos.path.exists(_fdst) else 0) | 0o644
     _fos.fchmod(_ffd, _fmode)'
-# Shared two-phase multi-file commit for the inventory-mutating heredocs below
-# (requires LLDPQ_MODE_FLOOR_DEF): dump EVERY payload to a temp file next to
-# its destination first, then rename all back-to-back only after every dump
-# succeeded. Renames are the only non-rollbackable step and are individually
-# atomic, so a failure can no longer leave one file updated while a dependent
-# file (e.g. host_vars referencing a bgp profile) was never written.
+# Recoverable multi-file commit. acquire_lock recovers interrupted writes
+# before any reader builds a new inventory mutation.
 LLDPQ_ATOMIC_WRITE_DEF='def _atomic_write_many(_yaml, _writes):
-    # _writes: list of (data, dst_path); stage all dumps, then rename all
     import os as _aos
-    import shutil as _ash
-    import tempfile as _atmp
-    _staged = []
+    import sys as _asys
+    _asys.path.insert(0, _aos.environ.get("LLDPQ_DIR", ""))
     try:
-        for _data, _dst in _writes:
-            _fd, _tmp = _atmp.mkstemp(dir=_aos.path.dirname(_dst), suffix=".tmp")
-            _staged.append(_tmp)
-            _lldpq_mode_floor(_fd, _dst)
-            with _aos.fdopen(_fd, "w") as _f:
-                _yaml.dump(_data, _f)
-        for (_data, _dst), _tmp in zip(_writes, _staged):
-            _ash.move(_tmp, _dst)
-    except:
-        for _tmp in _staged:
-            if _aos.path.exists(_tmp):
-                _aos.unlink(_tmp)
-        raise'
+        from fabric_transactions import atomic_write_many
+    except ModuleNotFoundError:
+        from lldpq.fabric_transactions import atomic_write_many
+    atomic_write_many(_yaml, _writes, _aos.environ["ANSIBLE_DIR"])'
 # Shared last-resort error trap for the mutation heredocs below: an uncaught
 # exception must still produce a JSON error body instead of an empty CGI
 # response (the traceback keeps going to stderr for the nginx error log).
@@ -281,7 +266,7 @@ if [[ "$ANSIBLE_DIR" == "NoNe" ]]; then
 fi
 
 # Export for Python scripts
-export ANSIBLE_DIR
+export ANSIBLE_DIR LLDPQ_DIR
 
 # Serialize concurrent YAML read-modify-write across admin edits.
 # A single process-wide advisory lock (held on fd 9 until this CGI process
@@ -303,6 +288,7 @@ if mkdir -p "$FABRIC_LOCK_DIR" 2>/dev/null; then
 fi
 export FABRIC_LOCK_DIR
 FABRIC_LOCK_FILE="${FABRIC_LOCK_FILE:-$FABRIC_LOCK_DIR/fabric-api.lock}"
+export FABRIC_LOCK_FILE
 # The shell redirection in acquire_lock otherwise applies the caller's umask
 # and can create a 0640/0644 inode that the other runtime identity cannot open.
 # Pre-create/fix it while its creator owns it; setgid supplies the shared group.
@@ -318,6 +304,11 @@ acquire_lock() {
     # instead of occupying a CGI worker while waiting for that job to finish.
     if ! flock -n 9 2>/dev/null; then
         echo '{"success": false, "locked": true, "error": "Another config edit or Ansible job is running; please retry when it finishes"}'
+        exit 0
+    fi
+    if [[ -f "$ANSIBLE_DIR/.lldpq-write-journal.json" ]] &&
+       ! python3 "$LLDPQ_DIR/fabric_transactions.py" "$ANSIBLE_DIR" >&2; then
+        echo '{"success": false, "error": "Interrupted config write could not be recovered; inventory is locked for repair"}'
         exit 0
     fi
 }
@@ -3559,6 +3550,7 @@ def _lldpq_mode_floor(_ffd, _fdst):
     import os as _fos
     _fmode = ((_fos.stat(_fdst).st_mode & 0o777) if _fos.path.exists(_fdst) else 0) | 0o644
     _fos.fchmod(_ffd, _fmode)
+import io
 import json
 import os
 import re
@@ -3644,6 +3636,7 @@ missing = sorted(t for t in targets if t not in profiles)
 if missing:
     fail('Target profiles not found in sw_port_profiles.yaml: ' + ', '.join(missing))
 
+writes = []
 results = {}
 plan_changes = {}
 total_applied = 0
@@ -3751,17 +3744,12 @@ for device, sections in changes.items():
             applied.append({'section': section, 'name': port, 'old': current, 'new': new})
 
     if applied and not dry_run:
-        _fd, _path = tempfile.mkstemp(dir=os.path.dirname(hv_file), suffix='.tmp')
-        _lldpq_mode_floor(_fd, hv_file)
         try:
-            with os.fdopen(_fd, 'w') as _f:
-                yaml.dump(cfg, _f)
-            shutil.move(_path, hv_file)
+            stream = io.StringIO()
+            yaml.dump(cfg, stream)
+            writes.append((stream.getvalue().encode('utf-8'), hv_file))
         except Exception as e:
-            if os.path.exists(_path):
-                os.unlink(_path)
-            results[device] = {'applied': 0, 'skipped': skipped, 'error': f'Write failed: {e}'}
-            continue
+            fail(f'Cannot serialize {device}: {e}')
 
     total_applied += len(applied)
     total_skipped += len(skipped)
@@ -3782,13 +3770,16 @@ if total_applied and not dry_run:
             'total_skipped': total_skipped,
             'changes': plan_changes,
         }
-        _fd, _path = tempfile.mkstemp(dir=plans_dir, suffix='.tmp')
-        os.fchmod(_fd, 0o644)  # mkstemp defaults to 0600; keep plans readable for git/backup sweeps
-        with os.fdopen(_fd, 'w') as _f:
-            json.dump(plan_record, _f, indent=2)
-        shutil.move(_path, os.path.join(plans_dir, plan_id + '.json'))
-    except Exception:
-        plan_id = None  # plan record is best-effort; the host_vars edits stand
+        writes.append((json.dumps(plan_record, indent=2).encode('utf-8'),
+                       os.path.join(plans_dir, plan_id + '.json')))
+        sys.path.insert(0, os.environ.get('LLDPQ_DIR', ''))
+        try:
+            from fabric_transactions import atomic_write_bytes
+        except ModuleNotFoundError:
+            from lldpq.fabric_transactions import atomic_write_bytes
+        atomic_write_bytes(writes, ansible_dir)
+    except Exception as exc:
+        fail(f'Migration was not committed: {exc}')
 
 print(json.dumps({
     'success': True,
@@ -7576,6 +7567,7 @@ if (
 
 # Read config from lldpq.conf (same method as run-device-command)
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -7585,7 +7577,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -7764,6 +7762,7 @@ import hashlib
 import stat
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -7773,7 +7772,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -7959,6 +7964,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -7968,7 +7974,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8133,6 +8145,7 @@ PYTHON_CHECK_TELEM
         exit 0
         ;;
     run-telemetry-commands)
+        acquire_lock
         # Run telemetry commands on ALL devices in parallel
         read_post_body
         export POST_DATA
@@ -8146,6 +8159,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8155,7 +8169,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8347,6 +8367,7 @@ import urllib.parse
 import os
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8356,7 +8377,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8403,6 +8430,7 @@ import os
 import time
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8412,7 +8440,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8483,6 +8517,7 @@ import fcntl
 import ipaddress
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8492,7 +8527,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8607,6 +8648,7 @@ import urllib.request
 import urllib.parse
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8616,7 +8658,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -8940,6 +8988,7 @@ import json
 import os
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -8949,7 +8998,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -9005,6 +9060,7 @@ import secrets
 import shlex
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -9014,7 +9070,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -9256,6 +9318,7 @@ import secrets
 import shlex
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     for conf_path in ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]:
         if os.path.exists(conf_path):
@@ -9264,7 +9327,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -9492,6 +9561,7 @@ import secrets
 import shlex
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -9501,7 +9571,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -9735,6 +9811,7 @@ import os
 import shlex
 
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -9744,7 +9821,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -10733,6 +10816,7 @@ if (
 
 # Read config from lldpq.conf
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -10742,7 +10826,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 
@@ -10822,6 +10912,17 @@ STDOUT_CAP = 512 * 1024
 
 # Execute command via SSH using management IP
 try:
+    # Manual port mutations participate in the same lock as deploy/provision.
+    # Keep diagnostics available while a detached deployment is running.
+    if re.match(r'^sudo /usr/sbin/if(?:down|up) ', command):
+        fabric_lock_path = os.environ.get('FABRIC_LOCK_FILE') or os.path.join(
+            os.environ.get('FABRIC_LOCK_DIR') or '/tmp', 'fabric-api.lock')
+        fabric_lock = open(fabric_lock_path, 'a+')
+        try:
+            fcntl.flock(fabric_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({'success': False, 'locked': True, 'error': 'Another config or device operation is running'}))
+            exit()
     # Private service-owned lock dir (exported by the shell wrapper) instead
     # of world-writable /tmp, so other local users cannot pre-create the
     # predictable path and wedge this device via the uid check below.
@@ -11014,6 +11115,7 @@ def open_owned_lock(path):
 
 # Read config from lldpq.conf (same method as run-device-command)
 def read_lldpq_conf():
+    import shlex
     conf = {}
     conf_paths = ['/etc/lldpq.conf', os.path.expanduser('~/lldpq.conf')]
     for conf_path in conf_paths:
@@ -11023,7 +11125,13 @@ def read_lldpq_conf():
                     line = line.strip()
                     if line and not line.startswith('#') and '=' in line:
                         key, val = line.split('=', 1)
-                        conf[key.strip()] = val.strip()
+                        # Decode the same quoted values lldpq-config emits.
+                        # shlex performs no shell or variable expansion.
+                        try:
+                            tokens = shlex.split(val.strip(), comments=False, posix=True)
+                        except ValueError:
+                            continue
+                        conf[key.strip()] = tokens[0] if len(tokens) == 1 else val.strip()
             break
     return conf
 

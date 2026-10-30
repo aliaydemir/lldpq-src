@@ -214,7 +214,13 @@ class RoutesAnalyzer:
                 continue
             collection = snapshot.get("_collection") \
                 if isinstance(snapshot.get("_collection"), dict) else {}
-            status = str(collection.get("status") or "current")
+            status = str(collection.get("status") or "unavailable")
+            sample_time = self._sample_epoch(collection.get("last_success"))
+            fresh = (not self.scan_stale and status == "current"
+                     and sample_time is not None
+                     and -1 < self.now - sample_time <= _scan_max_age_seconds())
+            if status == "current" and not fresh:
+                status = "stale"
             self.device_status[host] = status
 
             routes = snapshot.get("routes")
@@ -235,6 +241,8 @@ class RoutesAnalyzer:
                        and isinstance(record.get("timestamp"), (int, float))] \
                 if isinstance(history, list) else []
             previous = history[-1] if history else None
+            new_sample = fresh and (previous is None or
+                                    sample_time > previous["timestamp"])
             previous_vrfs = previous.get("vrfs") \
                 if previous and isinstance(previous.get("vrfs"), dict) else {}
 
@@ -252,14 +260,14 @@ class RoutesAnalyzer:
                     if prev_metrics and isinstance(
                         prev_metrics.get("total"), (int, float)) else None
                 delta = metrics["total"] - prev_total \
-                    if prev_total is not None else None
-                note = ""
-                severity = "ok"
+                    if new_sample and prev_total is not None else None
+                note = "" if fresh else "collection unavailable or stale; history unchanged"
+                severity = "ok" if fresh else "warning"
                 # Anomaly detection only compares fresh snapshots: a stale
                 # scan freezes both sides, and re-comparing the frozen
                 # snapshot against the frozen pre-drop sample would re-record
                 # the same event on every run.
-                if (not self.scan_stale and prev_total is not None
+                if (new_sample and prev_total is not None
                         and prev_total >= DROP_MIN_ROUTES
                         and metrics["total"] < prev_total * (1 - DROP_FRACTION)):
                     severity = "critical"
@@ -276,7 +284,7 @@ class RoutesAnalyzer:
             # A VRF that had routes in the previous sample but is absent now
             # (device still reporting) is a hard failure mode, not a zero row.
             # Gated on scan freshness like the drop check above.
-            if not self.scan_stale and isinstance(previous_vrfs, dict):
+            if new_sample and isinstance(previous_vrfs, dict):
                 for vrf in sorted(set(previous_vrfs) - set(current_vrfs),
                                   key=str.casefold):
                     prev_metrics = previous_vrfs.get(vrf)
@@ -298,27 +306,28 @@ class RoutesAnalyzer:
             # A stale scan republishes the same frozen tables; appending
             # identical samples would blind drop detection and fill the
             # shard with no information.
-            if not self.scan_stale:
-                history.append({"timestamp": self.now, "vrfs": current_vrfs})
+            if new_sample:
+                history.append({"timestamp": sample_time, "vrfs": current_vrfs})
                 self._write_shard(shard_path, host, history)
 
         self._prune_events()
 
     def _scan_is_stale(self):
-        # A missing summary.json (first run) keeps the ungated behavior.
-        if not isinstance(self.scan_timestamp, str) or not self.scan_timestamp:
-            return False
+        scanned = self._sample_epoch(self.scan_timestamp)
+        # self.now is rounded to whole seconds; collector stamps include
+        # microseconds, so a sample from this second can appear <1s ahead.
+        return (scanned is None or
+                not -1 < self.now - scanned <= _scan_max_age_seconds())
+
+    @staticmethod
+    def _sample_epoch(stamp):
+        if not isinstance(stamp, str) or not stamp:
+            return None
         try:
-            scanned = datetime.fromisoformat(
-                self.scan_timestamp.replace("Z", "+00:00"))
-        except ValueError:
-            return False
-        if scanned.tzinfo is not None:
-            scanned_epoch = scanned.timestamp()
-        else:
-            # fabric-scan stamps naive local time.
-            scanned_epoch = time.mktime(scanned.timetuple())
-        return self.now - scanned_epoch > _scan_max_age_seconds()
+            # Naive fabric-scan timestamps use the collector local timezone.
+            return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
 
     def _placeholder_row(self, host, status, note):
         return {

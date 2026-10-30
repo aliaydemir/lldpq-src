@@ -1983,17 +1983,17 @@
         }
     }
 
-    async function ansibleApiCall(action, hosts) {
+    async function ansibleApiCall(action, hosts, options = {}) {
         const params = new URLSearchParams({ action });
         // Large host lists overflow the URL limit (nginx 414): the backend
         // accepts the same comma-joined list as POST body JSON for these
         // actions, with the action kept in the query string.
-        if (hosts && hosts.length > 2048 &&
-            (action === 'diff' || action === 'deploy' || action === 'generate')) {
+        if (action === 'deploy' || (hosts && hosts.length > 2048 &&
+            (action === 'diff' || action === 'generate'))) {
             const response = await fetch(`/ansible-api?${params}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host: hosts })
+                body: JSON.stringify({ host: hosts, ...options })
             });
             return await response.json();
         }
@@ -2033,7 +2033,7 @@
         } finally { showLoading(false); }
     }
 
-    async function pollDeployStatus(jobId, onSuccess) {
+    async function pollDeployStatus(jobId) {
         let lastLen = 0, pollErrors = 0;
         while (true) {
             let resp, data;
@@ -2070,7 +2070,6 @@
                 localStorage.removeItem(DEPLOY_JOB_KEY);
                 showLoading(false);
                 termAppend('deploy-term', `Deploy finished (exit code ${data.exit_code}).`, data.success ? 'ok' : 'err');
-                if (data.success && onSuccess) await onSuccess();
                 return;
             }
             await sleep(DEPLOY_POLL_INTERVAL);
@@ -2088,53 +2087,15 @@
         pollDeployStatus(saved.job_id);
     }
 
-    async function bouncePorts() {
-        const devs = planDevices();
-        if (!devs.length) return;
-        termAppend('deploy-term', '=== PORT BOUNCE: ifdown → 7s → ifup ===', 'hdr');
-        await Promise.all(devs.map(async dev => {
-            const ports = (appliedPlan.changes[dev].applied || []).map(e => e.name);
-            if (!ports.length) return;
-            termAppend('deploy-term', `[${dev}] ifdown ${ports.join(' ')}`, 'ok');
-            try {
-                const r = await fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    body: JSON.stringify({ device: dev, command: `sudo /usr/sbin/ifdown ${ports.join(' ')}` })
-                });
-                const d = await r.json();
-                if (!d.success) termAppend('deploy-term', `[${dev}] ifdown error: ${d.error || ''}`, 'err');
-            } catch (e) {
-                termAppend('deploy-term', `[${dev}] ifdown error: ${e.message}`, 'err');
-            }
-        }));
-        termAppend('deploy-term', 'Waiting 7 seconds...', 'hdr');
-        await sleep(7000);
-        await Promise.all(devs.map(async dev => {
-            const ports = (appliedPlan.changes[dev].applied || []).map(e => e.name);
-            if (!ports.length) return;
-            termAppend('deploy-term', `[${dev}] ifup ${ports.join(' ')}`, 'ok');
-            try {
-                const r = await fetch('/fabric-api.sh?action=run-device-command', {
-                    method: 'POST',
-                    body: JSON.stringify({ device: dev, command: `sudo /usr/sbin/ifup ${ports.join(' ')}` })
-                });
-                const d = await r.json();
-                if (!d.success) termAppend('deploy-term', `[${dev}] ifup error: ${d.error || ''}`, 'err');
-            } catch (e) {
-                termAppend('deploy-term', `[${dev}] ifup error: ${e.message}`, 'err');
-            }
-        }));
-        termAppend('deploy-term', 'Port bounce complete.', 'ok');
-    }
-
-    async function bounceIfChecked() {
-        const cb = $('bounce-ports-cb');
-        if (cb && cb.checked) await bouncePorts();
-    }
-
     async function runDeploy() {
         const devs = planDevices();
         if (!devs.length) return;
+        const submittedPlan = JSON.parse(JSON.stringify(appliedPlan));
+        const bounce = !!$('bounce-ports-cb')?.checked;
+        if (bounce && !submittedPlan?.id) {
+            termAppend('deploy-term', 'A saved migration plan is required for port bounce.', 'err');
+            return;
+        }
         const ok = await confirmAsync(
             `Deploy to ${devs.length} device(s)?\n\n${devs.join('\n')}\n\nThis will apply the new access VLANs on live switches!`,
             'Confirm Deploy');
@@ -2143,26 +2104,25 @@
         termAppend('deploy-term', `=== DEPLOY: ${devs.join(', ')} ===`, 'hdr');
         showLoading(true, `Deploying to ${devs.length} device(s)...`);
         try {
-            const result = await ansibleApiCall('deploy', devs.join(','));
+            const result = await ansibleApiCall('deploy', devs.join(','), { bounce_plan: bounce ? submittedPlan.id : '' });
             if (result.locked) {
                 termAppend('deploy-term', result.error || 'Another operation is in progress. Try again shortly.', 'err');
                 showLoading(false);
                 return;
             }
             if (result.started && result.job_id) {
-                localStorage.setItem(DEPLOY_JOB_KEY, JSON.stringify({ job_id: result.job_id, plan: appliedPlan }));
+                localStorage.setItem(DEPLOY_JOB_KEY, JSON.stringify({ job_id: result.job_id, plan: submittedPlan }));
                 // Job runs in the background: drop the blocking overlay so the
                 // user can read the streamed log while it polls.
                 showLoading(false);
                 termAppend('deploy-term', `Deploy started (job ${result.job_id}). Streaming log...`, 'hdr');
-                await pollDeployStatus(result.job_id, bounceIfChecked);
+                await pollDeployStatus(result.job_id);
                 return;
             }
             // synchronous fallback
             showLoading(false);
             termAppendAnsible('deploy-term', result.output || result.error || '');
             termAppend('deploy-term', result.success ? 'Deployment completed.' : 'Deployment failed.', result.success ? 'ok' : 'err');
-            if (result.success) await bounceIfChecked();
         } catch (e) {
             termAppend('deploy-term', 'Error: ' + e.message, 'err');
             showLoading(false);
