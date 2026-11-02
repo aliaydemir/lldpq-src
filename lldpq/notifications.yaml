@@ -57,8 +57,8 @@ thresholds:
     cpu_temp_warning: 75       # °C - Warning CPU temperature
     asic_temp_critical: 105    # °C - Critical ASIC temperature (Spectrum firmware warning level; shutdown at 120°C)
     asic_temp_warning: 95      # °C - Warning ASIC temperature (83-86°C is normal under load)
-    fan_rpm_critical: 3000     # RPM - Minimum fan speed (critical)
-    fan_rpm_warning: 4000      # RPM - Minimum fan speed (warning)
+    fan_rpm_critical: 3000     # Fallback minimum RPM when NVUE fan limits are unavailable (critical)
+    fan_rpm_warning: 4000      # Fallback minimum RPM when NVUE fan limits are unavailable (warning)
     memory_usage_critical: 90  # % - Critical memory usage
     memory_usage_warning: 80   # % - Warning memory usage
     load_per_core_warning: 1.0 # 5-min load / logical CPU cores (warning)

@@ -95,6 +95,9 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "device", "model", "health", "cpu_temp_c", "asic_temp_c",
         "memory_pct", "load_raw", "load_per_core", "cores",
         "psu_efficiency", "psu_in_w", "psu_out_w", "fans",
+        "psu_status", "psu_status_complete", "psu_status_detail", "psus",
+        "psu_redundancy", "power_leds",
+        "fan_status", "fan_status_complete", "fan_status_detail", "fan_states",
     ),
     "log": (
         "device", "severity", "age", "timestamp", "section",

@@ -22,12 +22,16 @@ import re
 from pathlib import Path
 
 try:
+    from .hardware_environment import parse_platform_environment
+    from .hardware_fans import evaluate_fan_health
     from .lldp_report import LLDPReportError, parse_lldp_report
     from .collection_freshness import (
         asset_timestamp_tolerance_seconds,
         parse_created_timestamp,
     )
 except ImportError:  # Direct script execution has no package context.
+    from hardware_environment import parse_platform_environment
+    from hardware_fans import evaluate_fan_health
     from lldp_report import LLDPReportError, parse_lldp_report
     from collection_freshness import (
         asset_timestamp_tolerance_seconds,
@@ -626,6 +630,8 @@ class LLDPqAlerts:
             return
         
         thresholds = self.config.get('thresholds', {}).get('hardware', {})
+
+        self.check_power_supply_alert(device, parse_platform_environment(hardware_data))
         
         # Check CPU temperature. Cumulus hardware-management fallbacks are
         # emitted without a degree suffix, while lm-sensors uses °C.
@@ -721,58 +727,61 @@ class LLDPqAlerts:
                         "RECOVERED", device, "asic_temp", current_state
                     )
 
-        # Check fan speeds
-        fan_matches = re.findall(r'(fan\d+):\s*(\d+)\s*RPM', hardware_data, re.IGNORECASE)
-        if fan_matches:
-            fan_critical = thresholds.get('fan_rpm_critical', 3000)
-            fan_warning = thresholds.get('fan_rpm_warning', 4000)
+        self.check_fan_alert(device, hardware_data, thresholds)
 
-            failed_fans = []
-            warning_fans = []
+    def check_power_supply_alert(self, device, power):
+        self.check_component_alert(device, power, 'power_supply',
+                                   (('psu', 'psus'), ('redundancy', 'redundancy'), ('led', 'leds')),
+                                   'Power Supply / Redundancy', 'Power Supplies Recovered')
 
-            # Report the real sensor label: positional Fan{i} renumbering named
-            # the wrong FRU with non-contiguous numbering or multiple hwmon
-            # chips. A label repeated across chips gets an ordinal suffix.
-            label_counts = {}
-            for label, rpm_str in fan_matches:
-                label_counts[label] = label_counts.get(label, 0) + 1
-                if label_counts[label] > 1:
-                    label = f"{label}#{label_counts[label]}"
-                rpm = int(rpm_str)
-                if rpm < fan_critical:
-                    failed_fans.append(f"{label}: {rpm} RPM")
-                elif rpm < fan_warning:
-                    warning_fans.append(f"{label}: {rpm} RPM")
-            
-            if failed_fans:
-                current_state = "CRITICAL"
-            elif warning_fans:
-                current_state = "WARNING"
-            else:
-                current_state = "OK"
-            
-            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
-            if current_state == "OK" and not send_recovery:
-                self.record_state_without_delivery(device, "fan_speed", current_state)
-            elif self.should_send_alert(device, "fan_speed", current_state):
-                if current_state == "CRITICAL":
-                    self.send_stateful_notification(
-                        f"🌀 Critical Fan Failure",
-                        f"Fan(s) below critical threshold: {', '.join(failed_fans)}",
-                        "CRITICAL", device, "fan_speed", current_state
-                    )
-                elif current_state == "WARNING":
-                    self.send_stateful_notification(
-                        f"⚠️ Fan Speed Warning",
-                        f"Fan(s) below warning threshold: {', '.join(warning_fans)}",
-                        "WARNING", device, "fan_speed", current_state
-                    )
-                elif current_state == "OK":
-                    self.send_stateful_notification(
-                        f"Fan Speeds Recovered",
-                        f"All fans operating normally",
-                        "RECOVERED", device, "fan_speed", current_state
-                    )
+    def check_fan_alert(self, device, hardware_data, thresholds):
+        fans = evaluate_fan_health(hardware_data, thresholds)
+        self.check_component_alert(device, fans, 'fan_speed', (('fan', 'fans'),),
+                                   'Fan State / Speed', 'Fans Recovered')
+
+    def check_component_alert(self, device, evidence, alert_type, row_keys, title_prefix, recovery_title):
+        """Notify state changes without clearing faults on missing components."""
+        grade = evidence['grade']
+        if grade == 'GOOD':
+            grade = 'EXCELLENT'  # Both are below the notification threshold.
+        if grade not in ('EXCELLENT', 'WARNING', 'CRITICAL'):
+            return  # Missing/unknown readings cannot clear an existing fault.
+        previous = self.get_alert_state(device, alert_type)
+        failed = set()
+        if previous and previous not in ('OK', 'UNKNOWN', 'WARNING', 'CRITICAL'):
+            try:
+                failed = {tuple(item) for item in json.loads(previous.split(':', 1)[1])}
+            except (IndexError, TypeError, ValueError):
+                return
+        observed = {(kind, row['name']) for kind, key in row_keys for row in evidence[key]}
+        rechecked = evidence['complete'] and failed.issubset(observed)
+        message = evidence['summary']
+        if grade == 'EXCELLENT':
+            # Every previously failed component must still be observed in a
+            # complete successful sample before reporting recovery.
+            if not rechecked:
+                return
+            if previous in (None, '', 'UNKNOWN') or not self.config.get('frequency', {}).get('send_recovery', True):
+                self.record_state_without_delivery(device, alert_type, 'OK')
+                return
+            state, severity, title = 'OK', 'RECOVERED', recovery_title
+        else:
+            # Retain component identity: a new component fault at the same severity
+            # is a meaningful change, while an identical repeat stays quiet.
+            components = {(item['kind'], item['name']) for item in evidence['issues']}
+            if failed and not rechecked:
+                # A partial warning must not forget an earlier critical component
+                # failure, even if it reports a different affected component.
+                components.update(failed)
+                if self._state_severity_rank(previous) > self._state_severity_rank(grade):
+                    grade = previous.split(':', 1)[0]
+                message += '; previous fault not fully rechecked: ' + ', '.join(
+                    name for _, name in sorted(failed))
+            state = grade + ':' + json.dumps(sorted(components), separators=(',', ':'))
+            severity, title = grade, title_prefix + ' ' + grade.title()
+        if self.should_send_alert(device, alert_type, state):
+            self.send_stateful_notification(
+                title, message, severity, device, alert_type, state)
 
     def check_system_alerts(self, device):
         """Check system metrics that are collected with hardware telemetry."""

@@ -3017,7 +3017,7 @@ EOF
     # hw-management thermal reads add 8 (ASIC) + 4 (CPU) bounds, and the
     # deadline-shared thermal fallback sweeps add 3 more (a 2-bound deadline
     # plus one in-flight read).
-    local BOUNDED_CMD_COUNT=67
+    local BOUNDED_CMD_COUNT=69
     # Umbrella must cover every per-section budget it forwards plus the sum
     # of the per-command bounds and fixed slack, so a wedged-but-reachable
     # device finishes as a bounded slow collection instead of being killed
@@ -4009,6 +4009,37 @@ EOF
         fi
         [ -n "$_platform_virt" ] || _platform_virt="unknown"
         echo "PLATFORM_VIRT: $_platform_virt"
+        # Keep PSU presence/state and redundancy separate from power efficiency.
+        # Bound NVUE like every other device command; failed/empty reads must
+        # never be published as a healthy power subsystem.
+        echo "__LLDPQ_PLATFORM_ENVIRONMENT_START__"
+        if command -v nv >/dev/null 2>&1; then
+            _environment_output=$(_lldpq_run_bounded nv show platform environment 2>/dev/null)
+            _environment_status=$?
+            if [ "$_environment_status" -eq 0 ] && [ -n "$_environment_output" ]; then
+                echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_ENVIRONMENT:OK"
+            else
+                echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_ENVIRONMENT:ERROR"
+            fi
+            printf "%s\n" "$_environment_output"
+        else
+            echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_ENVIRONMENT:UNAVAILABLE"
+        fi
+        echo "__LLDPQ_PLATFORM_ENVIRONMENT_END__"
+        echo "__LLDPQ_PLATFORM_FANS_START__"
+        if command -v nv >/dev/null 2>&1; then
+            _fan_output=$(_lldpq_run_bounded nv show platform environment fan 2>/dev/null)
+            _fan_status=$?
+            if [ "$_fan_status" -eq 0 ] && [ -n "$_fan_output" ]; then
+                echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_FANS:OK"
+            else
+                echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_FANS:ERROR"
+            fi
+            printf "%s\n" "$_fan_output"
+        else
+            echo "__LLDPQ_HARDWARE_SOURCE_STATUS__:PLATFORM_FANS:UNAVAILABLE"
+        fi
+        echo "__LLDPQ_PLATFORM_FANS_END__"
         echo "HARDWARE_HEALTH:"
         if command -v sensors >/dev/null 2>&1; then
             _hardware_output=$(_lldpq_run_bounded sensors 2>/dev/null)

@@ -15,13 +15,14 @@ import json
 import os
 import re
 import html
-import statistics
 import sys
 import tempfile
 import time
 from datetime import datetime, timezone
 import analysis_events
 import export_artifacts
+from hardware_environment import read_platform_environment
+from hardware_fans import FAN_COHORT_RATIO_THRESHOLDS, grade_fans_relative, read_fan_health
 from collection_freshness import (
     is_current_collection,
     read_asset_snapshot,
@@ -285,6 +286,16 @@ def threshold_reference_rows():
             f"<td>&ge; {a}{unit} and &lt; {b}{unit}</td>"
             f"<td>&lt; {a}{unit}</td></tr>"
         )
+    rows.append(
+        "<tr><td>PSU State / Redundancy</td>"
+        "<td>Reported supplies healthy; reported redundancy policy satisfied</td>"
+        "<td>&mdash;</td><td>Warning state or amber power/system LED</td>"
+        "<td>Failed PSU, failed redundancy policy, insufficient good PSUs, or red power/system LED</td></tr>"
+    )
+    rows.append(
+        "<tr><td>Fan Presence / State</td><td>Reported fans OK</td><td>&mdash;</td>"
+        "<td>Reported warning</td><td>Absent or failed fan, stopped fan, or RPM outside reported limits</td></tr>"
+    )
     return "\n".join(rows)
 
 def parse_assets_file(assets_file_path="assets.ini"):
@@ -591,7 +602,7 @@ def parse_fans_from_hardware_file(device_name):
         fans = {}
         # Generic matcher: any line that has "Fan" and ends with an RPM value
         # Match lines with 'fan' or 'Fan' keywords (case-insensitive)
-        for name, rpm in re.findall(r'^(.*?(?:fan)[^:]*?):\s*([0-9]+)\s*RPM', content, re.MULTILINE | re.IGNORECASE):
+        for name, rpm in re.findall(r'^([^\n:]*fan[^\n:]*):[ \t]*(\d+)[ \t]*RPM\b', content, re.MULTILINE | re.IGNORECASE):
             clean_name = name.strip()
             try:
                 fans[clean_name] = int(rpm)
@@ -741,92 +752,6 @@ def grade_load_per_core(cpu_load, cpu_cores):
         return None
     return grade_high_is_bad(load_per_core, "load_per_core")
 
-
-# Absolute fan RPM thresholds cannot be trusted across platforms: chassis fans
-# idle far below PSU fans and both swing with inlet temperature, so a single
-# fleet-wide band both false-flags a cool chassis fan as CRITICAL and always
-# grades a fast PSU fan EXCELLENT even as it slows. Grade each fan against the
-# median of its own cohort (same fan type, same device); a fan that lags its
-# peers - or has stopped while peers spin - is the reliable fault signal. Values
-# are CRITICAL/WARNING/GOOD ratio boundaries relative to that cohort baseline.
-FAN_COHORT_RATIO_THRESHOLDS = (0.5, 0.7, 0.85)
-
-
-def _classify_fan(name):
-    """Return a coarse cohort key ('psu' or 'system') for a fan by its label."""
-    return "psu" if "psu" in str(name).lower() else "system"
-
-
-def grade_fans_relative(fans):
-    """Grade fans by deviation from their own cohort baseline.
-
-    Returns ``(overall_grade, per_fan_details)`` where ``per_fan_details`` is a
-    list of dicts (name/rpm/type/grade/baseline/ratio) that feeds the expandable
-    detail panel. ``overall_grade`` is the worst per-fan grade, or ``None`` when
-    no fan can be graded (the caller treats that as missing telemetry).
-    """
-    numeric_fans = []
-    for name, rpm in (fans or {}).items():
-        if isinstance(rpm, bool) or not isinstance(rpm, (int, float)):
-            continue
-        if rpm != rpm or abs(rpm) == float("inf"):
-            continue
-        numeric_fans.append((str(name), float(rpm)))
-
-    cohorts = {}
-    for name, rpm in numeric_fans:
-        if rpm > 0:
-            cohorts.setdefault(_classify_fan(name), []).append(rpm)
-    baselines = {
-        cohort: statistics.median(values)
-        for cohort, values in cohorts.items() if values
-    }
-    any_spinning = bool(baselines)
-
-    critical_ratio, warning_ratio, good_ratio = FAN_COHORT_RATIO_THRESHOLDS
-    details = []
-    grades = []
-    for name, rpm in numeric_fans:
-        cohort = _classify_fan(name)
-        baseline = baselines.get(cohort)
-        ratio = None
-        if rpm <= 0:
-            # An empty slot is not reported as a fan at all, so a fan that is
-            # reported and reads zero has stopped. Treating an all-zero set as
-            # missing telemetry filed a switch whose entire fan tray had
-            # failed under "Unknown", alongside boxes that merely lack
-            # lm-sensors, and kept it out of the Critical count.
-            grade = "CRITICAL"
-        elif baseline and baseline > 0:
-            ratio = rpm / baseline
-            if ratio < critical_ratio:
-                grade = "CRITICAL"
-            elif ratio < warning_ratio:
-                grade = "WARNING"
-            elif ratio < good_ratio:
-                grade = "GOOD"
-            else:
-                grade = "EXCELLENT"
-        else:
-            grade = None
-        details.append({
-            "name": name,
-            "rpm": int(rpm) if float(rpm).is_integer() else round(rpm, 1),
-            "type": cohort,
-            "grade": grade,
-            "baseline": (
-                int(baseline) if baseline and float(baseline).is_integer()
-                else (round(baseline, 1) if baseline else None)
-            ),
-            "ratio": round(ratio, 2) if ratio is not None else None,
-        })
-        if grade:
-            grades.append(grade)
-
-    overall = (
-        max(grades, key=lambda g: GRADE_PRIORITY.get(g, 0)) if grades else None
-    )
-    return overall, details
 
 
 def _atomic_write(path, content):
@@ -1173,7 +1098,7 @@ def sys_watchdog_annotations(host_state, now=None):
     return reboot_text, restarts_text
 
 
-def calculate_device_health_grade(device_name, device_data):
+def calculate_device_health_grade(device_name, device_data, power_status=None, fan_health=None):
     """Calculate overall health grade for a device based on our thresholds"""
     health_grades = []
     # Source markers describe the primary collector command, not necessarily the
@@ -1182,12 +1107,20 @@ def calculate_device_health_grade(device_name, device_data):
     # Keep every other explicit collector failure fail-closed; fresh history can
     # otherwise mask a current MEMORY/CPU_LOAD error with an older value.
     missing_markers = hardware_missing_telemetry_markers(device_name)
-    required_telemetry_missing = bool(missing_markers - {"sensors"})
+    required_telemetry_missing = bool(missing_markers - {"sensors", "platform_environment", "platform_fans"})
 
     # On a virtualised switch the thermal, ASIC and PSU readings below do not
     # exist to be collected. Grade whatever the platform does report instead of
     # declaring the sample incomplete; physical switches are unaffected.
     platform_is_virtual = hardware_platform_is_virtual(device_name)
+
+    if power_status is None:
+        power_status = read_platform_environment(
+            f"monitor-results/hardware-data/{device_name}_hardware.txt")
+    if power_status["grade"]:
+        health_grades.append(power_status["grade"])
+    if not power_status["complete"] and not platform_is_virtual:
+        required_telemetry_missing = True
 
     # CPU Temperature grade
     cpu_temp, asic_temp = parse_temperature_from_hardware_file(device_name)
@@ -1244,11 +1177,10 @@ def calculate_device_health_grade(device_name, device_data):
     elif not platform_is_virtual:
         required_telemetry_missing = True
     
-    # Fan status grade (relative to each fan's own cohort baseline)
-    fans = device_data.get("fans", {})
-    if not fans:
-        fans = parse_fans_from_hardware_file(device_name)
-    fan_status, _fan_details = grade_fans_relative(fans)
+    # Presence/state and RPM must come from this collection, never history.
+    if fan_health is None:
+        fan_health = read_fan_health(f"monitor-results/hardware-data/{device_name}_hardware.txt")
+    fan_status = fan_health['grade']
     if fan_status:
         health_grades.append(fan_status)
     else:
@@ -1337,11 +1269,16 @@ def generate_hardware_html(collection_unavailable=False):
     
     for device_name, device_data in latest_devices.items():
         # Use our own health calculation instead of JSON's overall_grade
-        overall_grade = calculate_device_health_grade(device_name, device_data)
+        power_status = read_platform_environment(
+            os.path.join(hardware_data_dir, f"{device_name}_hardware.txt"))
+        fan_health = read_fan_health(os.path.join(hardware_data_dir, f"{device_name}_hardware.txt"))
+        overall_grade = calculate_device_health_grade(device_name, device_data, power_status, fan_health)
         device_info = {
             'device': device_name,
             'health_grade': overall_grade,
-            'data': device_data
+            'data': device_data,
+            'power_status': power_status,
+            'fan_health': fan_health,
         }
         
         if overall_grade == "EXCELLENT":
@@ -1656,7 +1593,7 @@ def generate_hardware_html(collection_unavailable=False):
                         <th class="sortable" data-column="5" data-type="number" title="Shows raw 5-minute load; health is evaluated as raw load divided by logical CPU cores">Load <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="6" data-type="hardware-status">Fan <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="7" data-type="number">PSU% <span class="sort-arrow"></span></th>
-                        <th class="sortable" data-column="8" data-type="power">PSU Power <span class="sort-arrow"></span></th>
+                        <th class="sortable" data-column="8" data-type="power">PSU Power / Status <span class="sort-arrow"></span></th>
                         <th class="sortable" data-column="9" data-type="string">Model <span class="sort-arrow"></span></th>
                     </tr>
                 </thead>
@@ -1676,6 +1613,7 @@ def generate_hardware_html(collection_unavailable=False):
         device_name = device_info['device']
         device_data = device_info['data']
         health_grade = device_info['health_grade']  # Already calculated in summary
+        power_status = device_info['power_status']
         
         # Extract key metrics for display. On a virtualised switch the readings
         # a hypervisor cannot provide are shown as a dash rather than "N/A", so
@@ -1710,14 +1648,9 @@ def generate_hardware_html(collection_unavailable=False):
         psu_efficiency_parsed = parse_psu_efficiency_from_hardware_file(device_name)
         psu_efficiency = psu_efficiency_parsed if psu_efficiency_parsed is not None else 0.0
         
-        # Calculate fan status for display (use JSON fans or parse from file if
-        # missing). Fans are graded relative to their own cohort baseline.
-        fans = device_data.get("fans", {})
-        if not fans:
-            fans = parse_fans_from_hardware_file(device_name)
-        fan_status, fan_details = grade_fans_relative(fans)
-        if fan_status is None:
-            fan_status = "N/A"
+        fan_health = device_info['fan_health']
+        fan_details = fan_health['fans']
+        fan_status = fan_health['grade'] or 'UNKNOWN'
 
         # Badge class for health
         if health_grade == "EXCELLENT":
@@ -1804,6 +1737,19 @@ def generate_hardware_html(collection_unavailable=False):
         psu_in_out_str = absent_metric
         if psu_in_w is not None and psu_out_w is not None:
             psu_in_out_str = f"{psu_in_w:.1f}W / {psu_out_w:.1f}W"
+        power_grade = power_status['grade'] or 'UNKNOWN'
+        power_applicable = not (platform_is_virtual and not power_status['psus'] and not power_status['issues'])
+        if not power_applicable:
+            power_label, power_color = 'N/A', 'gray'
+            power_title = 'No power supply telemetry on this virtualized platform'
+        else:
+            power_label = 'OK' if power_grade == 'EXCELLENT' else power_grade
+            power_color = {'EXCELLENT': 'green', 'WARNING': 'orange', 'CRITICAL': 'red'}.get(power_grade, 'gray')
+            power_title = power_status['summary']
+        power_status_badge = (
+            f'<span class="badge badge-{power_color}" title="{html.escape(power_title, quote=True)}">'
+            f'{power_label}</span>'
+        )
 
         # Watchdog annotations: reboot/service-restart markers follow the
         # status-dot style (no text content, so column sorting is unchanged).
@@ -1860,7 +1806,10 @@ def generate_hardware_html(collection_unavailable=False):
             ),
             "psu_in": round(psu_in_w, 1) if psu_in_w is not None else None,
             "psu_out": round(psu_out_w, 1) if psu_out_w is not None else None,
+            "power_status": power_status,
+            "power_applicable": power_applicable,
             "fans": fan_details,
+            "fan_health": fan_health,
             "rebooted": watchdog_reboot,
             "service_restarts": watchdog_restarts,
         }
@@ -1875,7 +1824,7 @@ def generate_hardware_html(collection_unavailable=False):
                     <td title="{load_title}">{cpu_load_str}{load_cell_suffix}</td>
                     <td><span class="{fan_badge_class}">{fan_status}</span>{fan_cell_suffix}</td>
                     <td>{psu_efficiency_str}{psu_cell_suffix}</td>
-                    <td>{psu_in_out_str}</td>
+                    <td>{psu_in_out_str}<br> {power_status_badge}</td>
                     <td>{device_model}</td>
                 </tr>
 """
@@ -2004,19 +1953,26 @@ def generate_hardware_html(collection_unavailable=False):
             }).join('');
 
             let fanCard = '<div class="detail-card"><h4>Fans</h4>';
+            if (d.fan_health) {
+                fanCard += '<div class="kv"><span>Status</span><span>'
+                    + hwEsc(d.fan_health.summary) + '</span></div>';
+                if (!d.fan_health.complete) {
+                    fanCard += '<div class="kv"><span>Coverage</span><span>Fan status could not be fully verified</span></div>';
+                }
+            }
             const fans = d.fans || [];
             if (fans.length) {
                 let body = '';
                 fans.forEach(function(f) {
-                    const grade = f.grade || 'UNKNOWN';
+                    const grade = f.grade || (f.optional ? 'N/A' : 'UNKNOWN');
                     const ratio = (f.ratio === null || f.ratio === undefined) ? '—' : f.ratio + '×';
                     const baseline = (f.baseline === null || f.baseline === undefined) ? '—' : f.baseline;
-                    body += '<tr><td>' + hwEsc(f.name) + '</td><td>' + hwEsc(f.rpm)
-                        + ' RPM</td><td>' + hwEsc(f.type) + '</td><td>' + hwEsc(baseline)
+                    body += '<tr><td>' + hwEsc(f.name) + '</td><td>' + hwEsc(f.state || 'not reported')
+                        + '</td><td>' + fmtNum(f.rpm, ' RPM') + '</td><td>' + hwEsc(f.type) + '</td><td>' + hwEsc(baseline)
                         + '</td><td>' + hwEsc(ratio) + '</td><td class="' + gradeClass(grade)
                         + '">' + hwEsc(grade) + '</td></tr>';
                 });
-                fanCard += '<table class="fan-list"><thead><tr><th>Fan</th><th>RPM</th>'
+                fanCard += '<table class="fan-list"><thead><tr><th>Fan</th><th>State</th><th>RPM</th>'
                     + '<th>Cohort</th><th>Baseline</th><th>vs&nbsp;peers</th><th>Grade</th></tr></thead>'
                     + '<tbody>' + body + '</tbody></table>';
             } else {
@@ -2024,11 +1980,25 @@ def generate_hardware_html(collection_unavailable=False):
             }
             fanCard += '</div>';
 
+            const power = d.power_status || {};
+            let powerCard = '<div class="detail-card"><h4>Power Supplies &amp; Redundancy</h4>';
+            powerCard += '<div class="kv"><span>Status</span><span>'
+                + hwEsc(d.power_applicable === false ? 'Not applicable on this virtualized platform'
+                    : power.summary || 'PSU status unavailable') + '</span></div>';
+            (power.psus || []).concat(power.redundancy || [], power.leds || []).forEach(function(p) {
+                powerCard += '<div class="kv"><span>' + hwEsc(p.name)
+                    + '</span><span>' + hwEsc(p.detail) + '</span></div>';
+            });
+            if (power.complete === false && d.power_applicable !== false) {
+                powerCard += '<div class="kv"><span>Coverage</span><span>Power status could not be fully verified</span></div>';
+            }
+            powerCard += '</div>';
+
             return '<td colspan="10"><div class="detail-panel">'
                 + '<div class="detail-title">' + hwEsc(d.device) + ' — ' + hwEsc(d.health) + '</div>'
                 + '<div class="detail-grid">'
                 + '<div class="detail-card"><h4>Sensors &amp; Resources</h4>' + sensorRows + '</div>'
-                + fanCard
+                + fanCard + powerCard
                 + '</div></div></td>';
         }
 
@@ -2454,7 +2424,7 @@ def generate_hardware_html(collection_unavailable=False):
                     'CPU Load',
                     'Fan Status',
                     'PSU Efficiency (%)',
-                    'PSU Power (IN/OUT)',
+                    'PSU Power (IN/OUT) / Status',
                     'Model'
                 ];
                 
@@ -2634,6 +2604,16 @@ def generate_hardware_html(collection_unavailable=False):
                 "psu_efficiency": details["psu_efficiency"],
                 "psu_in_w": details["psu_in"],
                 "psu_out_w": details["psu_out"],
+                "psu_status": (details["power_status"]["grade"] or "UNKNOWN") if details["power_applicable"] else "N/A",
+                "psu_status_complete": details["power_status"]["complete"],
+                "psu_status_detail": details["power_status"]["summary"] if details["power_applicable"] else "Not applicable on this virtualized platform",
+                "psus": "; ".join(f"{p['name']}={p['state']}" for p in details["power_status"]["psus"]) or None,
+                "psu_redundancy": "; ".join(f"{p['name']}: {p['detail']}" for p in details["power_status"]["redundancy"]) or None,
+                "power_leds": "; ".join(f"{p['name']}={p['state']}" for p in details["power_status"]["leds"]) or None,
+                "fan_status": details['fan_health']['grade'] or 'UNKNOWN',
+                "fan_status_complete": details['fan_health']['complete'],
+                "fan_status_detail": details['fan_health']['summary'],
+                "fan_states": "; ".join(f"{f['name']}={f['state']}" for f in details['fans']) or None,
                 "fans": " ".join(
                     f"{fan['name']}={fan['grade'] or 'N/A'}"
                     for fan in details["fans"]
