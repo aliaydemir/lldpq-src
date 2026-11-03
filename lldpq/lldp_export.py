@@ -34,14 +34,14 @@ from lldp_report import LLDPReport, LLDPRow
 
 DOMAIN = "lldp_results"
 
-# Display headers of the page's Download CSV (html/lldp.html:2290-2293).
+# CSV groups each device with its location, independently of the table layout.
 CSV_HEADERS = (
-    "Local Device", "Local Port", "Port Status", "Expected Neighbor",
-    "Expected Port", "Active Neighbor", "Active Port", "Status",
-    "Connection Health", "P2P Sheet", "P2P Line", "P2P SEQ",
-    "Local Rack", "Local U-Pos", "Expected Rack", "Expected U-Pos",
-    "Active Rack", "Active U-Pos",
+    "Local Device", "Local Rack", "Local U-Pos", "Local Port", "Port Status",
+    "Expected Neighbor", "Expected Rack", "Expected U-Pos", "Expected Port",
+    "Active Neighbor", "Active Rack", "Active U-Pos", "Active Port",
+    "Status", "Connection Health", "P2P Sheet", "P2P Line", "P2P SEQ",
 )
+OPTIONAL_CSV_COLUMNS = frozenset((1, 2, 6, 7, 10, 11, 15, 16, 17))
 
 # display-aliases.json sections, keyed by the column family they label.
 ALIAS_NAMESPACES = ("devices", "interfaces")
@@ -51,11 +51,11 @@ ALIAS_NAMESPACES = ("devices", "interfaces")
 # Status, Connection Health and the P2P design columns are never aliased.
 ALIASED_CSV_COLUMNS = {
     0: "devices",     # Local Device
-    1: "interfaces",  # Local Port
-    3: "devices",     # Expected Neighbor
-    4: "interfaces",  # Expected Port
-    5: "devices",     # Active Neighbor
-    6: "interfaces",  # Active Port
+    3: "interfaces",  # Local Port
+    5: "devices",     # Expected Neighbor
+    8: "interfaces",  # Expected Port
+    9: "devices",     # Active Neighbor
+    12: "interfaces",  # Active Port
 }
 
 # Fresh-page default table order (html/lldp.html LLDP_STATUS_PRIORITY).
@@ -199,7 +199,7 @@ def _build_p2p_index(p2p_design: Any) -> dict:
 
 
 def _optional_csv_field(value: Any) -> str:
-    """Formula-safe RFC-4180 field that keeps missing P2P metadata blank."""
+    """Formula-safe RFC-4180 field that keeps missing location/P2P data blank."""
     text = "" if value is None else str(value).strip()
     return export_artifacts.csv_field(text) if text else ""
 
@@ -253,13 +253,6 @@ def build_csv(
     maps = alias_maps(aliases)
     lines = [",".join(export_artifacts.csv_field(h) for h in CSV_HEADERS)]
     for row, status, health in items:
-        cells = [
-            row.local_device, row.local_port, row.port_status,
-            row.expected_device, row.expected_port,
-            row.actual_device, row.actual_port, status, health,
-        ]
-        for index, namespace in ALIASED_CSV_COLUMNS.items():
-            cells[index] = _aliased(cells[index], maps[namespace])
         # The design join keys on the report's own names, never the labels:
         # aliasing is display text and must not move a P2P metadata row.
         design = ai_p2p.lookup_by_device_port(
@@ -278,12 +271,18 @@ def build_csv(
         for hostname in (row.local_device, row.expected_device, row.actual_device):
             location = locations.get(_normalized(hostname).lower(), {})
             location_cells.extend((location.get("rack", ""), location.get("unit", "")))
+        cells = [
+            row.local_device, *location_cells[0:2], row.local_port, row.port_status,
+            row.expected_device, *location_cells[2:4], row.expected_port,
+            row.actual_device, *location_cells[4:6], row.actual_port,
+            status, health, *p2p_cells,
+        ]
+        for index, namespace in ALIASED_CSV_COLUMNS.items():
+            cells[index] = _aliased(cells[index], maps[namespace])
         lines.append(",".join(
-            [
-                *(export_artifacts.csv_field(cell) for cell in cells),
-                *(_optional_csv_field(cell) for cell in p2p_cells),
-                *(_optional_csv_field(cell) for cell in location_cells),
-            ]
+            _optional_csv_field(cell) if index in OPTIONAL_CSV_COLUMNS
+            else export_artifacts.csv_field(cell)
+            for index, cell in enumerate(cells)
         ))
     return "\r\n".join(lines) + "\r\n"
 

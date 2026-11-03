@@ -2332,10 +2332,10 @@
 
         // CSV Download Function
         const CSV_HEADERS = Object.freeze([
-            'Local Device', 'Local Port', 'Port Status', 'Expected Neighbor', 'Expected Port',
-            'Active Neighbor', 'Active Port', 'Status', 'Connection Health',
-            'P2P Sheet', 'P2P Line', 'P2P SEQ',
-            'Local Rack', 'Local U-Pos', 'Expected Rack', 'Expected U-Pos', 'Active Rack', 'Active U-Pos'
+            'Local Device', 'Local Rack', 'Local U-Pos', 'Local Port', 'Port Status',
+            'Expected Neighbor', 'Expected Rack', 'Expected U-Pos', 'Expected Port',
+            'Active Neighbor', 'Active Rack', 'Active U-Pos', 'Active Port',
+            'Status', 'Connection Health', 'P2P Sheet', 'P2P Line', 'P2P SEQ'
         ]);
 
         function spreadsheetSafeValue(value, blankMissing = false) {
@@ -2358,13 +2358,20 @@
         function canonicalConnectionRow(connection) {
             const status = determineLLDPStatus(connection);
             const design = activeP2pDesignFor(connection);
+            const locations = connectionLocationValues(connection);
             const row = [
                 aliasedLabel(connection.localDevice, deviceAliasLc),
+                locations[0],
+                locations[1],
                 aliasedLabel(connection.localPort, portAliasLc),
                 displayValue(connection.portStatus),
                 aliasedLabel(connection.expectedDevice, deviceAliasLc),
+                locations[2],
+                locations[3],
                 aliasedLabel(connection.expectedPort, portAliasLc),
                 aliasedLabel(connection.actualDevice, deviceAliasLc),
+                locations[4],
+                locations[5],
                 aliasedLabel(connection.actualPort, portAliasLc),
                 displayValue(status.status),
                 displayValue(status.health)
@@ -2373,15 +2380,15 @@
                 design.sheet_name == null ? '' : design.sheet_name,
                 design.row_number == null ? '' : design.row_number,
                 design.seq == null ? '' : design.seq
-            ] : ['', '', ''], connectionLocationValues(connection));
+            ] : ['', '', '']);
         }
 
         function buildLLDPCSV(connections) {
             const lines = [CSV_HEADERS.map(value => csvField(value)).join(',')];
-            const optionalColumnStart = 9;
+            const optionalColumns = new Set([1, 2, 6, 7, 10, 11, 15, 16, 17]);
             connections.forEach(connection => {
                 lines.push(canonicalConnectionRow(connection)
-                    .map((value, index) => csvField(value, index >= optionalColumnStart))
+                    .map((value, index) => csvField(value, optionalColumns.has(index)))
                     .join(','));
             });
             return lines.join('\r\n') + '\r\n';

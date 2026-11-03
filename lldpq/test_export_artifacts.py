@@ -299,22 +299,16 @@ swp9 Fail exp,dev =swp19 act"dev @swp20 UP
 # loaded (problems-first) table: FAILED, NO INFO, WARNING, SUCCESS — stable
 # within each bucket.
 GOLDEN_CSV = (
-    "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
-    "Active Neighbor,Active Port,Status,Connection Health,"
-    "P2P Sheet,P2P Line,P2P SEQ,Local Rack,Local U-Pos,Expected Rack,Expected U-Pos,Active Rack,Active U-Pos\r\n"
-    "leaf-01,swp4,DOWN,spine-01,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,,,,,,,\r\n"
-    "leaf-01,N/A,UP,spine-01,swp18,spine-01,swp18,FAILED,Local Port Not Defined,,,,,,,,,\r\n"
-    "leaf-01,swp2,UP,spine-01,swp11,N/A,N/A,NO INFO,No LLDP Response Received,,,,,,,,,\r\n"
-    "leaf-01,swp3,DOWN,spine-01,swp12,N/A,N/A,NO INFO,Local Port is DOWN,,,,,,,,,\r\n"
-    "leaf-01,swp5,UP,spine-01,swp14,spine-01,swp15,WARNING,"
-    '"Port Mismatch: Expected swp14, Got swp15",,,,,,,,,\r\n'
-    "leaf-01,swp6,UP,spine-01,swp16,spine-02,swp16,WARNING,"
-    '"Wrong Device: Expected spine-01, Got spine-02",,,,,,,,,\r\n'
-    "leaf-01,swp7,UP,spine-01,swp17,N/A,N/A,WARNING,Unexpected Connection,,,,,,,,,\r\n"
-    'leaf-01,swp9,UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
-    '"Wrong Device: Expected exp,dev, Got act""dev",,,,,,,,,\r\n'
-    "leaf-01,swp1,UP,spine-01,swp10,spine-01,swp10,SUCCESS,"
-    "LLDP Connection Verified,,,,,,,,,\r\n"
+    'Local Device,Local Rack,Local U-Pos,Local Port,Port Status,Expected Neighbor,Expected Rack,Expected U-Pos,Expected Port,Active Neighbor,Active Rack,Active U-Pos,Active Port,Status,Connection Health,P2P Sheet,P2P Line,P2P SEQ\r\n'
+    'leaf-01,,,swp4,DOWN,spine-01,,,swp13,N/A,,,N/A,FAILED,Local Port is DOWN,,,\r\n'
+    'leaf-01,,,N/A,UP,spine-01,,,swp18,spine-01,,,swp18,FAILED,Local Port Not Defined,,,\r\n'
+    'leaf-01,,,swp2,UP,spine-01,,,swp11,N/A,,,N/A,NO INFO,No LLDP Response Received,,,\r\n'
+    'leaf-01,,,swp3,DOWN,spine-01,,,swp12,N/A,,,N/A,NO INFO,Local Port is DOWN,,,\r\n'
+    'leaf-01,,,swp5,UP,spine-01,,,swp14,spine-01,,,swp15,WARNING,"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
+    'leaf-01,,,swp6,UP,spine-01,,,swp16,spine-02,,,swp16,WARNING,"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
+    'leaf-01,,,swp7,UP,spine-01,,,swp17,N/A,,,N/A,WARNING,Unexpected Connection,,,\r\n'
+    'leaf-01,,,swp9,UP,"exp,dev",,,\'=swp19,"act""dev",,,\'@swp20,WARNING,"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
+    'leaf-01,,,swp1,UP,spine-01,,,swp10,spine-01,,,swp10,SUCCESS,LLDP Connection Verified,,,\r\n'
 )
 
 
@@ -342,26 +336,16 @@ GOLDEN_ALIASES = {
 # order, the six device/port columns relabeled.  spine-02 and most ports have
 # no alias and keep the report's own name; the missing sentinels stay N/A.
 GOLDEN_ALIASED_CSV = (
-    "Local Device,Local Port,Port Status,Expected Neighbor,Expected Port,"
-    "Active Neighbor,Active Port,Status,Connection Health,"
-    "P2P Sheet,P2P Line,P2P SEQ,Local Rack,Local U-Pos,Expected Rack,Expected U-Pos,Active Rack,Active U-Pos\r\n"
-    "RACK-A-LEAF,'=M4,DOWN,CORE-A,swp13,N/A,N/A,FAILED,Local Port is DOWN,,,,,,,,,\r\n"
-    "RACK-A-LEAF,N/A,UP,CORE-A,swp18,CORE-A,swp18,FAILED,"
-    "Local Port Not Defined,,,,,,,,,\r\n"
-    "RACK-A-LEAF,swp2,UP,CORE-A,swp11,N/A,N/A,NO INFO,"
-    "No LLDP Response Received,,,,,,,,,\r\n"
-    "RACK-A-LEAF,swp3,DOWN,CORE-A,swp12,N/A,N/A,NO INFO,"
-    "Local Port is DOWN,,,,,,,,,\r\n"
-    "RACK-A-LEAF,swp5,UP,CORE-A,swp14,CORE-A,swp15,WARNING,"
-    '"Port Mismatch: Expected swp14, Got swp15",,,,,,,,,\r\n'
-    "RACK-A-LEAF,swp6,UP,CORE-A,swp16,spine-02,swp16,WARNING,"
-    '"Wrong Device: Expected spine-01, Got spine-02",,,,,,,,,\r\n'
-    "RACK-A-LEAF,swp7,UP,CORE-A,swp17,N/A,N/A,WARNING,"
-    "Unexpected Connection,,,,,,,,,\r\n"
-    'RACK-A-LEAF,"M,9",UP,"exp,dev",\'=swp19,"act""dev",\'@swp20,WARNING,'
-    '"Wrong Device: Expected exp,dev, Got act""dev",,,,,,,,,\r\n'
-    "RACK-A-LEAF,M1,UP,CORE-A,M10,CORE-A,M10,SUCCESS,"
-    "LLDP Connection Verified,,,,,,,,,\r\n"
+    'Local Device,Local Rack,Local U-Pos,Local Port,Port Status,Expected Neighbor,Expected Rack,Expected U-Pos,Expected Port,Active Neighbor,Active Rack,Active U-Pos,Active Port,Status,Connection Health,P2P Sheet,P2P Line,P2P SEQ\r\n'
+    "RACK-A-LEAF,,,'=M4,DOWN,CORE-A,,,swp13,N/A,,,N/A,FAILED,Local Port is DOWN,,,\r\n"
+    'RACK-A-LEAF,,,N/A,UP,CORE-A,,,swp18,CORE-A,,,swp18,FAILED,Local Port Not Defined,,,\r\n'
+    'RACK-A-LEAF,,,swp2,UP,CORE-A,,,swp11,N/A,,,N/A,NO INFO,No LLDP Response Received,,,\r\n'
+    'RACK-A-LEAF,,,swp3,DOWN,CORE-A,,,swp12,N/A,,,N/A,NO INFO,Local Port is DOWN,,,\r\n'
+    'RACK-A-LEAF,,,swp5,UP,CORE-A,,,swp14,CORE-A,,,swp15,WARNING,"Port Mismatch: Expected swp14, Got swp15",,,\r\n'
+    'RACK-A-LEAF,,,swp6,UP,CORE-A,,,swp16,spine-02,,,swp16,WARNING,"Wrong Device: Expected spine-01, Got spine-02",,,\r\n'
+    'RACK-A-LEAF,,,swp7,UP,CORE-A,,,swp17,N/A,,,N/A,WARNING,Unexpected Connection,,,\r\n'
+    'RACK-A-LEAF,,,"M,9",UP,"exp,dev",,,\'=swp19,"act""dev",,,\'@swp20,WARNING,"Wrong Device: Expected exp,dev, Got act""dev",,,\r\n'
+    'RACK-A-LEAF,,,M1,UP,CORE-A,,,M10,CORE-A,,,M10,SUCCESS,LLDP Connection Verified,,,\r\n'
 )
 
 # JS alias map -> display-aliases.json section, asserted against lldp.html's
@@ -403,9 +387,9 @@ class LLDPExportGoldenTests(unittest.TestCase):
     def test_absent_design_keeps_blank_p2p_columns(self):
         rows = _csv_rows(lldp_export.build_csv(self.report))
         self.assertEqual(
-            rows[0][9:12], ["P2P Sheet", "P2P Line", "P2P SEQ"]
+            rows[0][15:18], ["P2P Sheet", "P2P Line", "P2P SEQ"]
         )
-        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[15:18] == ["", "", ""] for row in rows[1:]))
 
     def test_matched_design_adds_sheet_line_and_seq(self):
         design = {"connections": [{
@@ -415,8 +399,8 @@ class LLDPExportGoldenTests(unittest.TestCase):
             "connection_type": "general", "network_type": "eth",
         }]}
         rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
-        matched = next(row for row in rows[1:] if row[1] == "swp5")
-        self.assertEqual(matched[9:12], ["GB300-9-16", "184", "2778"])
+        matched = next(row for row in rows[1:] if row[3] == "swp5")
+        self.assertEqual(matched[15:18], ["GB300-9-16", "184", "2778"])
 
     def test_unmatched_design_keeps_p2p_columns_blank(self):
         design = {"connections": [{
@@ -426,7 +410,7 @@ class LLDPExportGoldenTests(unittest.TestCase):
             "connection_type": "general", "network_type": "eth",
         }]}
         rows = _csv_rows(lldp_export.build_csv(self.report, p2p_design=design))
-        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[15:18] == ["", "", ""] for row in rows[1:]))
 
     def test_formula_like_quoted_sheet_is_guarded_and_rfc4180_escaped(self):
         design = {"connections": [{
@@ -436,15 +420,15 @@ class LLDPExportGoldenTests(unittest.TestCase):
             "connection_type": "general", "network_type": "eth",
         }]}
         text = lldp_export.build_csv(self.report, p2p_design=design)
-        matched = next(row for row in _csv_rows(text)[1:] if row[1] == "swp9")
-        self.assertEqual(matched[9:12], ['\'=Rack,"Plan"', "184", "2778"])
+        matched = next(row for row in _csv_rows(text)[1:] if row[3] == "swp9")
+        self.assertEqual(matched[15:18], ['\'=Rack,"Plan"', "184", "2778"])
         self.assertIn('"\'=Rack,""Plan"""', text)
 
     def test_malformed_design_gracefully_degrades_to_blank_columns(self):
         rows = _csv_rows(
             lldp_export.build_csv(self.report, p2p_design={"not": "a design"})
         )
-        self.assertTrue(all(row[9:12] == ["", "", ""] for row in rows[1:]))
+        self.assertTrue(all(row[15:18] == ["", "", ""] for row in rows[1:]))
 
     def test_headless_export_uses_precise_three_part_port_match(self):
         report = parse_lldp_report(
@@ -470,7 +454,7 @@ swp3s4 Pass right swp49 right swp49 UP
             design_row("proof", "1/1/4", "Proof", 33, "333"),
         ]}
         rows = _csv_rows(lldp_export.build_csv(report, p2p_design=design))
-        self.assertEqual(rows[1][9:12], ["Right", "22", "222"])
+        self.assertEqual(rows[1][15:18], ["Right", "22", "222"])
 
     def test_payload_counts_match_report_counts(self):
         payload = lldp_export.build_payload(self.report)
@@ -562,26 +546,26 @@ class LLDPAliasedExportGoldenTests(unittest.TestCase):
 
     def test_case_insensitive_alias_matching(self):
         # 'LEAF-01'/'SWP1' in the file, 'leaf-01'/'swp1' in the report.
-        row = next(r for r in _csv_rows(self._aliased())[1:] if r[7] == "SUCCESS")
+        row = next(r for r in _csv_rows(self._aliased())[1:] if r[13] == "SUCCESS")
         self.assertEqual(row[0], "RACK-A-LEAF")
-        self.assertEqual(row[1], "M1")
+        self.assertEqual(row[3], "M1")
 
     def test_value_without_an_alias_keeps_its_canonical_rendering(self):
         rows = _csv_rows(self._aliased())[1:]
-        row = next(r for r in rows if r[5] == "spine-02")
-        self.assertEqual(row[1], "swp6")     # no alias -> report's own name
-        self.assertEqual(row[4], "swp16")
-        missing = next(r for r in rows if r[1] == "swp2")
-        self.assertEqual(missing[5], "N/A")  # missing sentinel, not a label
-        self.assertEqual(missing[6], "N/A")
+        row = next(r for r in rows if r[9] == "spine-02")
+        self.assertEqual(row[3], "swp6")     # no alias -> report's own name
+        self.assertEqual(row[8], "swp16")
+        missing = next(r for r in rows if r[3] == "swp2")
+        self.assertEqual(missing[9], "N/A")  # missing sentinel, not a label
+        self.assertEqual(missing[12], "N/A")
 
     def test_a_label_that_looks_like_a_formula_stays_guarded_and_escaped(self):
         text = self._aliased()
         rows = _csv_rows(text)
-        formula = next(r for r in rows[1:] if r[4] == "swp13")
-        self.assertEqual(formula[1], "'=M4")
-        quoted = next(r for r in rows[1:] if r[4] == "'=swp19")
-        self.assertEqual(quoted[1], "M,9")
+        formula = next(r for r in rows[1:] if r[8] == "swp13")
+        self.assertEqual(formula[3], "'=M4")
+        quoted = next(r for r in rows[1:] if r[8] == "'=swp19")
+        self.assertEqual(quoted[3], "M,9")
         self.assertIn("'=M4", text)
         self.assertIn('"M,9"', text)
 
@@ -590,13 +574,13 @@ class LLDPAliasedExportGoldenTests(unittest.TestCase):
         # evidence about the wiring, not a field label.
         row = next(
             r for r in _csv_rows(self._aliased())[1:]
-            if r[8].startswith("Wrong Device")
+            if r[14].startswith("Wrong Device")
         )
         self.assertEqual(
-            row[8], "Wrong Device: Expected spine-01, Got spine-02"
+            row[14], "Wrong Device: Expected spine-01, Got spine-02"
         )
-        self.assertEqual(row[2], "UP")
-        self.assertEqual(row[7], "WARNING")
+        self.assertEqual(row[4], "UP")
+        self.assertEqual(row[13], "WARNING")
 
     def test_p2p_design_columns_are_unchanged_by_the_toggle(self):
         design = {"connections": [{
@@ -617,11 +601,11 @@ class LLDPAliasedExportGoldenTests(unittest.TestCase):
                 self.report, p2p_design=design, aliases=aliases
             )
         )
-        matched = next(row for row in aliased[1:] if row[1] == "M5")
+        matched = next(row for row in aliased[1:] if row[3] == "M5")
         self.assertEqual(matched[0], "RACK-A")
-        self.assertEqual(matched[9:12], ["GB300-9-16", "184", "2778"])
+        self.assertEqual(matched[15:18], ["GB300-9-16", "184", "2778"])
         self.assertEqual(
-            [row[9:12] for row in aliased], [row[9:12] for row in plain]
+            [row[15:18] for row in aliased], [row[15:18] for row in plain]
         )
 
     def test_absent_or_unusable_alias_data_degrades_to_the_canonical_export(self):
@@ -653,13 +637,13 @@ class LLDPAliasedExportGoldenTests(unittest.TestCase):
             )
         )
         no_local_port = next(
-            row for row in rows[1:] if row[8] == "Local Port Not Defined"
+            row for row in rows[1:] if row[14] == "Local Port Not Defined"
         )
-        self.assertEqual(no_local_port[1], "UNPATCHED")
-        no_neighbor = next(row for row in rows[1:] if row[4] == "swp13")
-        self.assertEqual(no_neighbor[6], "UNPATCHED")
+        self.assertEqual(no_local_port[3], "UNPATCHED")
+        no_neighbor = next(row for row in rows[1:] if row[8] == "swp13")
+        self.assertEqual(no_neighbor[12], "UNPATCHED")
         # The device columns read the other namespace and stay untouched.
-        self.assertEqual(no_neighbor[5], "N/A")
+        self.assertEqual(no_neighbor[9], "N/A")
 
     def test_only_the_declared_indices_are_aliased(self):
         """Probe every column at once: what build_csv does is the contract."""
@@ -793,17 +777,17 @@ class AliasedColumnContractTests(unittest.TestCase):
     """
 
     def _rendered_columns(self):
-        """{cell index: JS alias map} from the setAliasedCell calls."""
+        """{connection field: JS alias map} from the setAliasedCell calls."""
         return {
-            int(index): name
-            for index, name in re.findall(
-                r"setAliasedCell\(row\.insertCell\((\d+)\),"
-                r"\s*connection\.\w+,\s*(\w+)\)",
+            field: name
+            for field, name in re.findall(
+                r"setAliasedCell\(row\.insertCell\(\d+\),"
+                r"\s*connection\.(\w+),\s*(\w+)\)",
                 LLDP_HTML,
             )
         }
 
-    def _csv_columns(self):
+    def _csv_columns(self, by_field=False):
         """{column index: JS alias map} from canonicalConnectionRow's array."""
         array = _source_between(
             _source_between(
@@ -816,15 +800,15 @@ class AliasedColumnContractTests(unittest.TestCase):
         )
         columns = {}
         for index, element in enumerate(array.split(",\n")):
-            match = re.search(r"aliasedLabel\([^,]+,\s*(\w+)\)", element)
+            match = re.search(r"aliasedLabel\(connection\.(\w+),\s*(\w+)\)", element)
             if match:
-                columns[index] = match.group(1)
+                columns[match.group(1) if by_field else index] = match.group(2)
         return columns
 
     def test_the_page_exports_exactly_the_columns_it_renders_aliased(self):
         rendered = self._rendered_columns()
         self.assertEqual(len(rendered), 6, "setAliasedCell calls not found")
-        self.assertEqual(self._csv_columns(), rendered)
+        self.assertEqual(self._csv_columns(by_field=True), rendered)
 
     def test_the_headless_export_declares_the_same_columns(self):
         self.assertEqual(
@@ -856,7 +840,7 @@ class AliasedColumnContractTests(unittest.TestCase):
             "function renderedConnectionsInTableOrder()",
         )
         self.assertIn(
-            ".map((value, index) => csvField(value, index >= optionalColumnStart))",
+            ".map((value, index) => csvField(value, optionalColumns.has(index)))",
             builder,
         )
         guard = _source_between(

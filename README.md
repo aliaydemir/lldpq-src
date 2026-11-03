@@ -1130,8 +1130,16 @@ Matching uses the full device hostname, ignoring letter case. It does not
 guess short names or use display aliases. The Rack / U-Pos values stay the same
 when switching the LLDP page's display-alias toggle or exporting with
 `?p2p=1`. Devices without a known location show `N/A` in Results and empty
-location fields in CSV downloads. The original CSV columns stay in their existing
-order; the six location columns are appended to the end.
+location fields in CSV downloads. CSV downloads group each device with its rack
+and U-position, in this order:
+
+`Local Device`, `Local Rack`, `Local U-Pos`, `Local Port`, `Port Status`,
+`Expected Neighbor`, `Expected Rack`, `Expected U-Pos`, `Expected Port`,
+`Active Neighbor`, `Active Rack`, `Active U-Pos`, `Active Port`,
+`Status`, `Connection Health`, `P2P Sheet`, `P2P Line`, `P2P SEQ`.
+
+Both the page's Download CSV button and `/lldp_results/export_csv` use this
+layout. The P2P columns remain blank when only a rack mapping is supplied.
 
 The selected mapping is stored with the Inventory versions in
 `/var/lib/lldpq/ai/inventory/locations/` and published as `active-locations.json`.

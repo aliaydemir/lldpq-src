@@ -25,6 +25,10 @@ P2P = {"connections": [{
 }]}
 
 
+def location_values(row):
+    return [row[index] for index in (1, 2, 6, 7, 10, 11)]
+
+
 class LocationExportTests(unittest.TestCase):
     def setUp(self):
         self.report = parse_lldp_report(GOLDEN_INI)
@@ -34,29 +38,29 @@ class LocationExportTests(unittest.TestCase):
 
     def test_wrong_neighbor_has_its_own_location(self):
         rows = self.rows(location_design=LOCATIONS)
-        mismatch = next(row for row in rows[1:] if row[1] == 'swp6')
-        self.assertEqual(mismatch[12:], ['C1', '6-7', 'C2', '12-13', 'C3', '18'])
-        missing = next(row for row in rows[1:] if row[1] == 'swp4')
-        self.assertEqual(missing[12:], ['C1', '6-7', 'C2', '12-13', '', ''])
+        mismatch = next(row for row in rows[1:] if row[3] == 'swp6')
+        self.assertEqual(location_values(mismatch), ['C1', '6-7', 'C2', '12-13', 'C3', '18'])
+        missing = next(row for row in rows[1:] if row[3] == 'swp4')
+        self.assertEqual(location_values(missing), ['C1', '6-7', 'C2', '12-13', '', ''])
 
     def test_p2p_and_simple_mapping_produce_same_location_columns(self):
         simple = self.rows(location_design=LOCATIONS)
         combined = self.rows(p2p_design=P2P, location_design=LOCATIONS)
-        self.assertEqual([r[12:] for r in simple], [r[12:] for r in combined])
-        self.assertEqual(next(r for r in combined[1:] if r[1] == 'swp1')[9:12], ['Cabling', '8', '20'])
-        self.assertEqual(next(r for r in self.rows(p2p_design=P2P)[1:] if r[1] == 'swp1')[12:],
+        self.assertEqual([location_values(r) for r in simple], [location_values(r) for r in combined])
+        self.assertEqual(next(r for r in combined[1:] if r[3] == 'swp1')[15:18], ['Cabling', '8', '20'])
+        self.assertEqual(location_values(next(r for r in self.rows(p2p_design=P2P)[1:] if r[3] == 'swp1')),
                          ['C1', '6-7', 'C2', '12-13', 'C2', '12-13'])
 
     def test_display_aliases_never_change_location_join(self):
         raw = self.rows(location_design=LOCATIONS)
         aliased = self.rows(location_design=LOCATIONS, aliases=GOLDEN_ALIASES)
         self.assertNotEqual(raw[1][0], aliased[1][0])
-        self.assertEqual([r[12:] for r in raw], [r[12:] for r in aliased])
+        self.assertEqual([location_values(r) for r in raw], [location_values(r) for r in aliased])
 
     def test_conflicts_do_not_choose_an_arbitrary_location(self):
         conflicting = {"locations": [{"hostname": "leaf-01", "rack": "X1", "unit": "9"}]}
         rows = self.rows(p2p_design=P2P, location_design=conflicting)
-        self.assertTrue(all(r[12:14] == ['', ''] for r in rows[1:]))
+        self.assertTrue(all(r[1:3] == ['', ''] for r in rows[1:]))
         resolved = device_locations.resolve_locations(P2P, conflicting)
         self.assertEqual(resolved['conflicts'][0]['hostname'], 'leaf-01')
 
@@ -109,7 +113,8 @@ class LocationCgiTests(unittest.TestCase):
         (directory / 'active-locations.json').write_text(json.dumps(LOCATIONS))
         # Use the existing CGI harness to exercise real configuration/path handling.
         _headers, output = self._get()
-        self.assertIn('C1,6-7,C2,12-13', output)
+        self.assertIn(['C1', '6-7', 'C2', '12-13', 'C3', '18'],
+                      [location_values(row) for row in _csv_rows(output)[1:]])
 
     def seed_selection(self, kind, data):
         directory = self.web.parent / 'ai' / 'inventory' / kind
@@ -135,7 +140,8 @@ class LocationCgiTests(unittest.TestCase):
             'locations': [{'hostname': 'leaf-01', 'rack': 'OLD', 'unit': '1'}]}))
         _headers, output = self._get()
         self.assertNotIn('OLD', output)
-        self.assertIn('C1,6-7,C2,12-13', output)
+        self.assertIn(['C1', '6-7', 'C2', '12-13', 'C3', '18'],
+                      [location_values(row) for row in _csv_rows(output)[1:]])
 
 
 if __name__ == '__main__':
