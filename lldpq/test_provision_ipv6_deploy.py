@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -84,6 +85,15 @@ class DeploymentTests(unittest.TestCase):
         self.remote_identity_ok = True
         self.scp_ok = True
         self.http_ok = True
+        startup = (b'- set:\n    interface:\n      eth0:\n        ip:\n'
+                   b'          address:\n            2001:db8::10/64: {}\n'
+                   b'          vrf: mgmt\n')
+        self.management_snapshot = {
+            'family': 6, 'server': '2001:db8::10', 'client': '2001:db8::250',
+            'interface': 'eth0', 'prefix': 64, 'vrf': 'mgmt', 'gateway': '',
+            'startup_b64': base64.b64encode(startup).decode(),
+            'startup_sha256': hashlib.sha256(startup).hexdigest(),
+        }
         patch = mock.patch('subprocess.run', side_effect=self.run_command)
         patch.start()
         self.addCleanup(patch.stop)
@@ -109,6 +119,8 @@ class DeploymentTests(unittest.TestCase):
                 output = 'LLDPQ_UPGRADE_PREPARED\n'
             elif 'LLDPQ_UPGRADE_DISPATCHING' in script:
                 output = 'LLDPQ_UPGRADE_DISPATCHING\nLLDPQ_UPGRADE_STARTED\n'
+            elif 'LLDPQ_MGMT_SNAPSHOT=' in script:
+                output = 'LLDPQ_MGMT_SNAPSHOT=' + json.dumps(self.management_snapshot) + '\n'
             elif 'LLDPQ_CONFIG_OK' in script:
                 output = 'LLDPQ_CONFIG_OK\n'
             elif 'LLDPQ_BASE_OK' in script:
@@ -214,12 +226,74 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn('touch /tmp/not-executed', script)
         self.assertLess(script.index('EXPECTED_MAC='), script.index('sudo nv config replace'))
 
-    def test_generated_config_ipv4_keeps_http_transport(self):
+    def test_generated_config_ipv4_uses_verified_snapshot(self):
+        self.api['get_server_ip'] = mock.Mock(side_effect=AssertionError('Config must not require HTTP'))
         result = self.action('action_deploy_generated_config', {'devices': [self.devices[1]]})
         self.assertEqual(result['summary']['ok'], 1, result)
         script = next(kwargs['input'] for _, kwargs in self.calls if 'LLDPQ_CONFIG_OK' in (kwargs.get('input') or ''))
-        self.assertIn('http://192.0.2.250/generated_config_folder/leaf-v4.yaml', script)
-        self.assertIn('curl -sf', script)
+        self.assertNotIn('curl ', script)
+        self.assertIn(base64.b64encode(b'set: []\n').decode(), script)
+        digest = hashlib.sha256(b'set: []\n').hexdigest()
+        self.assertIn(digest, script)
+        self.assertEqual(result['results'][0]['config_sha256'], digest)
+        self.assertLess(script.index('sha256sum -c'), script.index('sudo nv config replace'))
+
+    def test_generated_config_batch_pins_all_content_before_workers_start(self):
+        original = self.api['deploy_config_to_device']
+        snapshots = []
+        def deploy(device, server, content):
+            snapshots.append(content)
+            # Upload after job submission, before this worker can send data.
+            for path in self.generated.glob('*.yaml'):
+                path.write_bytes(b'set: [changed]\n')
+            return original(device, server, content)
+        self.api['deploy_config_to_device'] = deploy
+        result = self.action('action_deploy_generated_config', {'devices': self.devices[:2]})
+        self.assertEqual(result['summary']['ok'], 2, result)
+        self.assertEqual(snapshots, [b'set: []\n', b'set: []\n'])
+        scripts = [kwargs['input'] for _, kwargs in self.calls
+                   if 'LLDPQ_CONFIG_OK' in (kwargs.get('input') or '')]
+        self.assertEqual(len(scripts), 2)
+        for script in scripts:
+            self.assertIn(base64.b64encode(b'set: []\n').decode(), script)
+            self.assertNotIn(base64.b64encode(b'set: [changed]\n').decode(), script)
+
+    def test_fabric_job_blocks_provision_before_ssh(self):
+        import fcntl
+        lock = self.web / '.locks/fabric-api.lock'
+        lock.parent.mkdir()
+        with lock.open('a+') as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.action('action_deploy_generated_config', {'devices': [self.devices[0]]})
+        self.assertEqual(result['summary']['fail'], 1, result)
+        self.assertIn('operation is running', result['results'][0]['error'])
+        self.assertFalse(any('ssh' in args for args, _ in self.calls))
+
+    def test_upgrade_worker_holds_global_lock_between_polls_and_releases_it(self):
+        import fcntl
+        job_id = '12345678-1234-1234-1234-123456789abc'
+        complete = False
+        self.api['load_upgrade_job'] = lambda _: {'complete': complete, 'devices': []}
+        self.api['save_upgrade_job'] = mock.Mock()
+        lock = self.web / '.locks/fabric-api.lock'
+        def assert_blocked():
+            with lock.open('a+') as handle:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        def update(job):
+            assert_blocked()
+            with self.api['canonical_device_mutation'](self.devices[0]):
+                assert_blocked()
+            return job
+        def sleep(_):
+            nonlocal complete
+            assert_blocked()
+            complete = True
+        self.api['update_upgrade_job'] = update
+        with mock.patch('time.sleep', side_effect=sleep):
+            self.api['run_upgrade_worker'](job_id)
+        with lock.open('a+') as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_generated_config_duplicate_equivalent_targets_are_rejected(self):
         result = self.action('action_deploy_generated_config', {'devices': [
@@ -244,6 +318,26 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('Image download is not reachable', result['results'][0]['checks'][0])
         self.api['launch_upgrade_worker'].assert_not_called()
 
+    def test_upgrade_precheck_rejects_ipv6_not_saved_in_nvue(self):
+        raw = b'- set:\n    interface:\n      eth0:\n        ip:\n          vrf: mgmt\n'
+        self.management_snapshot.update(startup_b64=base64.b64encode(raw).decode(),
+                                        startup_sha256=hashlib.sha256(raw).hexdigest())
+        result = self.action('action_upgrade_precheck', self.upgrade_payload())
+        self.assertFalse(result['results'][0]['precheck_ok'])
+        self.assertIn('Management IPv6 and prefix are not saved', result['results'][0]['checks'][0])
+        self.assertFalse(any('nv config save' in (kw.get('input') or '') for _, kw in self.calls))
+
+    def test_upgrade_worker_blocks_ipv6_launch_when_saved_return_route_is_missing(self):
+        job = self.start_job()
+        job = self.api['update_upgrade_job'](job)
+        self.api['save_upgrade_job'](job)
+        self.management_snapshot.update(client='2001:db8:1::250', gateway='fe80::1')
+        job = self.api['update_upgrade_job'](job)
+        self.assertEqual(job['devices'][0]['status'], 'failed')
+        self.assertIn('return gateway/route is not saved', job['devices'][0]['error'])
+        self.assertFalse(any('LLDPQ_UPGRADE_DISPATCHING' in (kw.get('input') or '')
+                             for _, kw in self.calls))
+
     def test_upgrade_launch_checks_both_resources_before_config_save_or_dispatch(self):
         job = self.start_job()
         job = self.api['update_upgrade_job'](job)
@@ -251,17 +345,23 @@ class DeploymentTests(unittest.TestCase):
         self.http_ok = False
         job = self.api['update_upgrade_job'](self.api['load_upgrade_job'](job['id']))
         self.assertEqual(job['devices'][0]['status'], 'failed')
-        script = next(kwargs['input'] for _, kwargs in self.calls if 'LLDPQ_UPGRADE_DISPATCHING' in (kwargs.get('input') or ''))
-        self.assertIn('for resource in "$IMAGE_URL" "$ZTP_URL"', script)
+        script = next(kwargs['input'] for argv, kwargs in self.calls
+                      if 'ssh' in argv and 'nv config save' in (kwargs.get('input') or ''))
+        self.assertIn('http://[2001:db8::250]/' + self.image_name, script)
+        self.assertIn('http://[2001:db8::250]/' + job['ztp_artifact'], script)
         self.assertLess(script.index('curl --globoff'), script.index('sudo nv config save'))
-        self.assertLess(script.index('curl --globoff'), script.index('echo LLDPQ_UPGRADE_DISPATCHING'))
+        self.assertFalse(any('LLDPQ_UPGRADE_DISPATCHING' in (kwargs.get('input') or '')
+                             for _, kwargs in self.calls))
 
     def test_upgrade_pins_ipv6_override_without_changing_saved_script(self):
         job = self.start_job(server_ip='[2001:0db8:0:0:0:0:0:250]:8080')
         self.assertEqual(job['server_ip'], '[2001:db8::250]:8080')
         self.assertEqual(self.script.read_text(), self.original_script)
         pinned = Path(self.api['upgrade_ztp_artifact_path'](job)).read_text()
-        self.assertIn('IMAGE_SERVER_HOSTNAME="[2001:db8::250]:8080"', pinned)
+        self.assertEqual(self.api['ztp_script_static_setting'](pinned, 'IMAGE_SERVER_HOSTNAME'),
+                         '[2001:db8::250]:8080')
+        self.api['validate_upgrade_preserve_hook_content'](pinned)
+        self.assertNotIn('apply_generated_config', pinned)
         self.api['verify_upgrade_job_ztp'](job)
         self.assertEqual(self.api['load_upgrade_job'](job['id'])['devices'][0]['ip'], '2001:db8::10')
         self.assertTrue(job['ready'])
@@ -269,7 +369,7 @@ class DeploymentTests(unittest.TestCase):
         self.api['launch_upgrade_worker'].assert_called_once_with(job['id'])
         self.assertFalse(any('ssh' in argv for argv, _ in self.calls))
 
-    def test_legacy_saved_template_is_adapted_only_in_pinned_artifact(self):
+    def test_legacy_saved_template_provides_settings_for_separate_upgrade_hook(self):
         legacy = self.original_script
         legacy = re.sub(r'^    IMAGE_SERVER_PING_TARGET=.*$',
                         '    IMAGE_SERVER_PING_TARGET=${IMAGE_SERVER_HOSTNAME%%:*}',
@@ -279,18 +379,72 @@ class DeploymentTests(unittest.TestCase):
         job = self.start_job(server_ip='[2001:db8::250]:8080')
         self.assertEqual(self.script.read_text(), legacy)
         pinned = Path(self.api['upgrade_ztp_artifact_path'](job)).read_text()
-        self.assertIn('IMAGE_SERVER_PING_TARGET="2001:db8::250"', pinned)
-        self.assertIn('if ping -6 "$target" -c2 --no-vrf-switch', pinned)
-        self.assertNotIn('IMAGE_SERVER_PING_TARGET=${IMAGE_SERVER_HOSTNAME%%:*}', pinned)
+        self.api['validate_upgrade_preserve_hook_content'](pinned)
+        self.assertNotIn('IMAGE_SERVER_PING_TARGET', pinned)
+        self.assertNotIn('resolve_hostname', pinned)
+        self.assertNotIn('nv config replace', pinned)
 
-    def test_unknown_custom_ping_template_requires_update_before_ipv6_upgrade(self):
+    def test_custom_provisioning_ping_is_not_used_by_upgrade_hook(self):
         custom = self.original_script.replace('ping "${family_args[@]}" "$target"', 'custom_ping "$target"')
         self.script.write_text(custom)
-        result = self.action('action_upgrade_start', self.upgrade_payload())
-        self.assertFalse(result['success'])
-        self.assertIn('Update the post-install script ping helper', result['error'])
+        job = self.start_job()
         self.assertEqual(self.script.read_text(), custom)
-        self.api['launch_upgrade_worker'].assert_not_called()
+        pinned = Path(self.api['upgrade_ztp_artifact_path'](job)).read_text()
+        self.api['validate_upgrade_preserve_hook_content'](pinned)
+        self.assertNotIn('custom_ping', pinned)
+
+    def legacy_hook(self, job):
+        """Model an already-persisted pre-fix job, including its real hash."""
+        path = Path(self.api['upgrade_ztp_artifact_path'](job))
+        path.write_text(self.original_script)
+        job['ztp_size'] = path.stat().st_size
+        job['ztp_sha256'] = self.api['sha256_file'](str(path))
+        self.api['save_upgrade_job'](job)
+        return path
+
+    def test_old_queued_hook_is_blocked_without_contacting_the_device(self):
+        job = self.start_job()
+        path = self.legacy_hook(job)
+        job = self.api['update_upgrade_job'](job)
+        self.api['save_upgrade_job'](job)
+        self.calls.clear()
+        job = self.api['update_upgrade_job'](job)
+        self.assertEqual(job['devices'][0]['status'], 'failed')
+        self.assertIn('older provisioning hook', job['devices'][0]['error'])
+        self.assertFalse(any('ssh' in argv for argv, _ in self.calls))
+        self.assertEqual(path.read_text(), self.original_script)
+
+    def test_old_attempted_hook_is_monitored_without_automatic_relaunch(self):
+        job = self.start_job()
+        job = self.api['update_upgrade_job'](job)
+        device = job['devices'][0]
+        device.update(remote_prepared_at=int(time.time()), launch_attempted_at=int(time.time()),
+                      started_at=int(time.time()))
+        self.remote_operation = device['operation_id']
+        path = self.legacy_hook(job)
+        self.calls.clear()
+        job = self.api['update_upgrade_job'](job)
+        self.assertFalse(job['complete'])
+        self.assertTrue(job['devices'][0]['launch_uncertain'])
+        self.assertFalse(any('LLDPQ_UPGRADE_DISPATCHING' in (kw.get('input') or '')
+                             for _, kw in self.calls))
+        self.assertEqual(path.read_text(), self.original_script)
+
+    def test_old_dispatched_hook_can_complete_after_target_version_returns(self):
+        job = self.start_job()
+        job = self.api['update_upgrade_job'](job)
+        device = job['devices'][0]
+        device.update(status='waiting_reboot', remote_prepared_at=int(time.time()),
+                      launch_attempted_at=int(time.time()), started_at=int(time.time()))
+        path = self.legacy_hook(job)
+        self.remote_version = job['target_version']
+        self.calls.clear()
+        job = self.api['update_upgrade_job'](job)
+        self.assertTrue(job['complete'])
+        self.assertEqual(job['devices'][0]['status'], 'done')
+        self.assertFalse(any('LLDPQ_UPGRADE_DISPATCHING' in (kw.get('input') or '')
+                             for _, kw in self.calls))
+        self.assertEqual(path.read_text(), self.original_script)
 
     def test_upgrade_ipv4_job_and_same_server_preserve_existing_behavior(self):
         job = self.start_job(devices=[self.devices[1]], server_ip='192.0.2.250')
@@ -341,7 +495,10 @@ class DeploymentTests(unittest.TestCase):
         self.assertIn('cumulus@2001:db8::10', argv)
         self.assertIn(shlex.quote('http://[2001:db8::250]/' + self.image_name), argv)
         self.assertIn(shlex.quote('http://[2001:db8::250]/' + job['ztp_artifact']), argv)
-        self.assertLess(kwargs['input'].index('EXPECTED_MAC='), kwargs['input'].index('sudo nv config save'))
+        self.assertLess(kwargs['input'].index('EXPECTED_MAC='), kwargs['input'].index('LLDPQ_MGMT_GUARD_OK'))
+        preparation = next(kw['input'] for argv, kw in self.calls
+                           if 'ssh' in argv and 'nv config save' in (kw.get('input') or ''))
+        self.assertLess(preparation.index('EXPECTED_MAC='), preparation.index('sudo nv config save'))
         self.remote_version = '5.16.0'
         job = self.api['update_upgrade_job'](self.api['load_upgrade_job'](job['id']))
         self.api['save_upgrade_job'](job)
