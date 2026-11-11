@@ -1,0 +1,52 @@
+#!/bin/bash
+# lldpq-vrf - run a command in the VRF the LLDPq services run in.
+#
+# On a Cumulus switch (--network host) the entrypoint re-runs itself inside the
+# management VRF, so every service reaches the devices through it. Processes
+# Docker starts afterwards - `docker exec` and the HEALTHCHECK - begin outside
+# that VRF: they can reach neither the devices nor the services' own 127.0.0.1
+# listeners.
+#
+#   lldpq-vrf <command> [args...]   run the command inside the services' VRF
+#   lldpq-vrf --pending             exit 0 when the services run in a VRF and
+#                                   the caller is still outside it
+#
+# Where the services are not in a VRF (bridge networking, or a host without a
+# management VRF) the command runs unchanged.
+#
+# Entering needs root. For any other user the command is started through sudo,
+# which resets the environment: variables set by the caller are not passed on.
+
+# The entrypoint records the VRF it moved into; fall back to PID 1's own.
+service_vrf=""
+service_vrf_file="${LLDPQ_SERVICE_VRF_FILE:-/run/lldpq-service-vrf}"
+if [ -f "$service_vrf_file" ] && [ -r "$service_vrf_file" ]; then
+    read -r service_vrf < "$service_vrf_file" || true
+fi
+case "$service_vrf" in *[!A-Za-z0-9_.-]*) service_vrf="" ;; esac
+[ -n "$service_vrf" ] || service_vrf=$(ip vrf identify 1 2>/dev/null) || service_vrf=""
+current_vrf=$(ip vrf identify 2>/dev/null) || current_vrf=""
+
+if [ "${1:-}" = "--pending" ]; then
+    [ -n "$service_vrf" ] && [ "$current_vrf" != "$service_vrf" ]
+    exit
+fi
+
+if [ $# -eq 0 ]; then
+    echo "usage: lldpq-vrf <command> [args...]" >&2
+    exit 2
+fi
+
+if [ -z "$service_vrf" ] || [ "$current_vrf" = "$service_vrf" ]; then
+    exec "$@"
+fi
+
+# LLDPQ_IN_VRF tells the started command (an interactive shell, for one) that
+# it was already moved, whatever else happens to its environment on the way.
+if [ "$(id -u)" -eq 0 ]; then
+    exec ip vrf exec "$service_vrf" env LLDPQ_IN_VRF="$service_vrf" "$@"
+fi
+
+# Enter the VRF as root, then drop back to the caller.
+exec sudo -n ip vrf exec "$service_vrf" \
+    sudo -n -u "$(id -un)" -- env LLDPQ_IN_VRF="$service_vrf" "$@"

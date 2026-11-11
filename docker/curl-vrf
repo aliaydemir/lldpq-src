@@ -1,0 +1,21 @@
+#!/bin/bash
+# curl for the LLDPq image, installed as /usr/local/bin/curl ahead of the real
+# one.
+#
+# On a Cumulus switch the services run inside the management VRF and a command
+# started with `docker exec` does not (see lldpq-vrf). The update and migration
+# steps in DOCKER.md test the web service with a curl started through
+# `docker exec`, and copies of earlier revisions do so without lldpq-vrf. From
+# outside the VRF that request cannot succeed: a healthy replacement is
+# reported as failed and rolled back to the previous image. Join the services
+# first, so those steps keep working.
+#
+# Everywhere else - inside the VRF, with bridge networking, on a host without
+# a management VRF - this runs the real curl unchanged. The entrypoint's
+# record of the VRF is checked first so that those cases start nothing extra.
+if [ -z "${LLDPQ_IN_VRF:-}" ] &&
+   [ -f "${LLDPQ_SERVICE_VRF_FILE:-/run/lldpq-service-vrf}" ] &&
+   lldpq-vrf --pending 2>/dev/null && lldpq-vrf true 2>/dev/null; then
+    exec lldpq-vrf /usr/bin/curl "$@"
+fi
+exec /usr/bin/curl "$@"

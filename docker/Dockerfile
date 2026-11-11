@@ -238,13 +238,24 @@ RUN for f in device-cache.json fabric-scan-cache.json discovery-cache.json inven
 COPY docker/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
+# On a Cumulus switch the entrypoint runs the services inside the management
+# VRF. lldpq-vrf runs a command in that same VRF; it is a plain pass-through
+# everywhere else.
+COPY --chown=root:root docker/lldpq-vrf /usr/local/bin/lldpq-vrf
+# The readiness probes of the documented update steps run curl through
+# `docker exec`, which starts outside that VRF; this curl joins it first.
+COPY --chown=root:root docker/curl-vrf /usr/local/bin/curl
+RUN chmod 0755 /usr/local/bin/lldpq-vrf /usr/local/bin/curl
+
 EXPOSE 80 2033
 
 # Full-chain health probe: nginx -> fcgiwrap -> CGI. auth-api action=check is
 # deliberately session-exempt and answers 200 {"authenticated": false} without
 # a cookie, so a JSON body proves fcgiwrap serves CGI behind nginx. Probing
-# 127.0.0.1:80 works in both bridge and host-network compose modes.
+# 127.0.0.1:80 works in both bridge and host-network compose modes. Docker
+# starts the probe outside the services' VRF, where their loopback listener is
+# not reachable, so it goes through lldpq-vrf.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -fsS 'http://127.0.0.1:80/auth-api?action=check' | grep -q '"authenticated"' || exit 1
+    CMD lldpq-vrf curl -fsS 'http://127.0.0.1:80/auth-api?action=check' | grep -q '"authenticated"' || exit 1
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

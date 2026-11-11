@@ -2232,7 +2232,11 @@ generation); it is not an analyzer failure. A stale marker reason beginning
 with `disk_full:` means publication staging was refused before collection due
 to insufficient web-filesystem space. In Docker, run the same checks with
 `sudo docker exec -u lldpq lldpq ...`; persistent-volume and fresh-start
-permission guidance is in [DOCKER.md](DOCKER.md).
+permission guidance is in [DOCKER.md](DOCKER.md). On a Cumulus switch the
+services run inside the management VRF. `lldpq`, `get-conf`, `send-cmd`,
+`pping`, `curl` and an interactive `bash` join it by themselves; prefix every
+other command that needs the network or a service on `localhost` with
+`lldpq-vrf` (see [Management VRF](DOCKER.md#management-vrf)).
 
 ## [14] Provision (ZTP & Device Management)
 

@@ -5,6 +5,15 @@
 # Executes commands from ~/lldpq/commands on all devices in devices.yaml
 # Edit ~/lldpq/commands to specify which commands to run (uncomment lines)
 
+# In the Docker image on a Cumulus switch the services run inside the
+# management VRF, but a command started with `docker exec` does not. Join them,
+# so a manual run reaches the devices the same way the scheduled one does.
+# Without the image's lldpq-vrf helper (a native install) this does nothing.
+if [ -z "${LLDPQ_IN_VRF:-}" ] && command -v lldpq-vrf >/dev/null 2>&1 &&
+   lldpq-vrf --pending 2>/dev/null && lldpq-vrf true 2>/dev/null; then
+    exec lldpq-vrf "$BASH" "$0" "$@"
+fi
+
 # Load config
 if [[ -x /usr/local/bin/lldpq-config ]]; then
     eval "$(/usr/local/bin/lldpq-config 2>/dev/null)" || true

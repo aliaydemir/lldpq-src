@@ -670,7 +670,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # Ping command - on Cumulus switches with Docker --privileged, the entrypoint
-# adds an mgmt-VRF rule so plain ping works.
+# runs every service inside the mgmt VRF, so plain ping works.
 PING="ping"
 
 ping_test() {

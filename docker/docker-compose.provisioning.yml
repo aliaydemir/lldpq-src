@@ -47,6 +47,9 @@ services:
       # in lldpq-provision-state and takes precedence on later recreations.
       DHCP_AUTOSTART: "${DHCP_AUTOSTART:-false}"
       # ANSIBLE_DIR: /home/lldpq/ansible
+      # Host with a "mgmt" VRF whose DHCP/ONIE clients are in-band: keep the
+      # services in the default VRF (see "Management VRF" in DOCKER.md).
+      # LLDPQ_ENTER_MGMT_VRF: "no"
 
 volumes:
   lldpq-data:

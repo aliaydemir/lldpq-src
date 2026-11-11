@@ -9,20 +9,168 @@ BACKUP_IMPORT_HELPER=/usr/local/libexec/lldpq-backup-import.py
 INSTALL_LIBRARY=/usr/local/libexec/lldpq-install-library.sh
 SETUP_SAFETY_HELPER=/usr/local/libexec/lldpq-setup-safety.py
 
-echo "╔══════════════════════════════════════╗"
-echo "║      LLDPq Network Monitoring        ║"
-echo "║      Docker Container v$(cat /var/www/html/VERSION 2>/dev/null || echo '?')         ║"
-echo "╚══════════════════════════════════════╝"
+# The entrypoint re-runs itself once inside the management VRF (see below);
+# print the banner only on the first pass.
+if [ -z "${LLDPQ_VRF_REEXEC:-}" ]; then
+    echo "╔══════════════════════════════════════╗"
+    echo "║      LLDPq Network Monitoring        ║"
+    echo "║      Docker Container v$(cat /var/www/html/VERSION 2>/dev/null || echo '?')         ║"
+    echo "╚══════════════════════════════════════╝"
+fi
 
 # ─── VRF Setup (Cumulus switch only) ───
-# If mgmt VRF exists (Cumulus Linux), route outbound traffic through it
-if ip vrf show mgmt >/dev/null 2>&1; then
-    MGMT_TABLE=$(ip vrf show mgmt 2>/dev/null | awk '/mgmt/{print $2}')
-    if [ -n "$MGMT_TABLE" ]; then
-        ip rule add pref 100 table "$MGMT_TABLE" 2>/dev/null || true
-        echo "✓ mgmt VRF detected (table $MGMT_TABLE) — outbound via mgmt"
+# With --network host on a Cumulus switch the container shares the switch's
+# network namespace but starts in the default VRF, while the devices LLDPq has
+# to reach are behind the management VRF. Re-run this entrypoint inside that
+# VRF so every service started below (cron, fcgiwrap, sshd, console-pty, nginx)
+# opens its sockets there.
+#
+# Nothing is added to the switch's routing policy; the only change made there
+# is removing the rule described next. Earlier images added an unscoped
+# "pref 100 lookup <mgmt table>" rule instead. It sat ahead of the l3mdev and
+# local rules, so the switch resolved its own in-band IPv4 addresses through
+# the mgmt table and stopped answering ARP and ping on them.
+#
+# LLDPQ_ENTER_MGMT_VRF=no keeps the services in the default VRF (for a host
+# whose devices or clients are reached in-band); the old rule is still removed.
+LLDPQ_MGMT_VRF=mgmt
+# The VRF the services run in, when they run in one. Read by lldpq-vrf.
+LLDPQ_SERVICE_VRF_FILE="${LLDPQ_SERVICE_VRF_FILE:-/run/lldpq-service-vrf}"
+# One-line outcome, repeated next to the ready message at the end of start-up.
+MGMT_VRF_STATUS=""
+# Set while the rule of an earlier image is still on the host; repeated there
+# too. The first pass hands it to the re-run through the environment.
+MGMT_RULE_WARNING="${LLDPQ_MGMT_RULE_WARNING:-}"
+unset LLDPQ_MGMT_RULE_WARNING
+
+# Run inside the VRF before committing to it: a listener on 127.0.0.1 must be
+# reachable from a second socket in the same VRF. The services depend on
+# exactly this (nginx to console-pty, the readiness probes below), and it does
+# not hold where VRF-local loopback traffic is filtered or the local rule is
+# consulted ahead of the l3mdev rule.
+MGMT_VRF_LOOPBACK_PROBE='
+import socket
+server = socket.socket()
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+client = socket.socket()
+client.settimeout(3)
+client.connect(server.getsockname())
+'
+
+_mgmt_vrf_table() {
+    # `ip vrf show NAME` prints "NAME TABLE" and fails when the VRF is absent.
+    ip vrf show "$1" 2>/dev/null |
+        awk -v vrf="$1" '$1 == vrf && $2 ~ /^[0-9]+$/ { print $2; exit }'
+}
+
+# Remove the rule an earlier image left on the host. It is recognised by its
+# exact shape: IPv4, pref 100, "from all", lookup <mgmt table>, nothing else.
+# A delete request ignores every selector it does not name, so the rule is only
+# removed when no other pref-100 rule points at the same table.
+_remove_legacy_mgmt_rule() {
+    local vrf="$1" table="$2" counts legacy other
+    counts=$(ip -4 rule show 2>/dev/null | awk -v vrf="$vrf" -v table="$table" '
+        $1 == "100:" {
+            target = ""
+            for (i = 2; i < NF; i++) if ($i == "lookup") target = $(i + 1)
+            if (target != vrf && target != table) next
+            if (NF == 5 && $2 == "from" && $3 == "all" && $4 == "lookup") legacy++
+            else other++
+        }
+        END { printf "%d %d\n", legacy, other }')
+    legacy=${counts%% *}
+    other=${counts##* }
+    case "$legacy$other" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$legacy" -gt 0 ] || return 0
+    # Each warning is one line, so a grep of the log shows all of it.
+    if [ "$other" -ne 0 ]; then
+        MGMT_RULE_WARNING="⚠ an earlier LLDPq image left an unscoped $vrf VRF rule (pref 100) on this host; it was not removed because other pref-100 rules use the same table. Review on the host: ip -4 rule show"
+        echo "$MGMT_RULE_WARNING" >&2
+        return 0
     fi
-fi
+    while [ "$legacy" -gt 0 ]; do
+        if ! ip -4 rule del pref 100 table "$table" 2>/dev/null; then
+            MGMT_RULE_WARNING="⚠ an earlier LLDPq image left an unscoped $vrf VRF rule (pref 100) on this host and it could not be removed. Run on the host: sudo ip rule del pref 100 table $table"
+            echo "$MGMT_RULE_WARNING" >&2
+            return 0
+        fi
+        legacy=$((legacy - 1))
+    done
+    echo "✓ removed the unscoped $vrf VRF rule (pref 100) left by an earlier LLDPq image"
+}
+
+# $1 VRF, $2 why it was not entered, $3 what the failed command printed
+_mgmt_vrf_not_entered() {
+    MGMT_VRF_STATUS="⚠ $1 VRF not entered: $2${3:+ [reported: $3]}; services run in the default VRF and may not reach the management network"
+    echo "$MGMT_VRF_STATUS" >&2
+}
+
+_enter_mgmt_vrf() {
+    local vrf="$LLDPQ_MGMT_VRF" table enter probe_error reason
+    # A restarted container keeps its writable layer: never trust an old marker.
+    # Only a file the entrypoint could have written is removed.
+    if [ -f "$LLDPQ_SERVICE_VRF_FILE" ] || [ -L "$LLDPQ_SERVICE_VRF_FILE" ]; then
+        rm -f -- "$LLDPQ_SERVICE_VRF_FILE" 2>/dev/null || true
+    fi
+    table=$(_mgmt_vrf_table "$vrf")
+    [ -n "$table" ] || return 0
+    if [ "$(ip vrf identify 2>/dev/null)" = "$vrf" ]; then
+        [ -e "$LLDPQ_SERVICE_VRF_FILE" ] ||
+            printf '%s\n' "$vrf" > "$LLDPQ_SERVICE_VRF_FILE" 2>/dev/null || true
+        MGMT_VRF_STATUS="✓ $vrf VRF detected (table $table) — services run inside it"
+        echo "$MGMT_VRF_STATUS"
+        return 0
+    fi
+    _remove_legacy_mgmt_rule "$vrf" "$table"
+    enter=$(printf '%s' "${LLDPQ_ENTER_MGMT_VRF:-yes}" | tr '[:upper:]' '[:lower:]')
+    case "$enter" in
+        no|false|off|0)
+            MGMT_VRF_STATUS="✓ $vrf VRF detected (table $table) — LLDPQ_ENTER_MGMT_VRF=$LLDPQ_ENTER_MGMT_VRF, services stay in the default VRF"
+            echo "$MGMT_VRF_STATUS"
+            return 0
+            ;;
+        yes|true|on|1) ;;
+        *)
+            echo "⚠ LLDPQ_ENTER_MGMT_VRF=$LLDPQ_ENTER_MGMT_VRF is not understood (use yes or no); entering the $vrf VRF" >&2
+            ;;
+    esac
+    if [ -n "${LLDPQ_VRF_REEXEC:-}" ]; then
+        _mgmt_vrf_not_entered "$vrf" "the entrypoint is still outside it after re-running"
+        return 0
+    fi
+    # Sockets bound to a VRF use the VRF device as their loopback, so the
+    # services' own 127.0.0.1 listeners need that address on it.
+    if ! ip -4 -o addr show dev "$vrf" 2>/dev/null | grep -q ' 127\.0\.0\.1/'; then
+        _mgmt_vrf_not_entered "$vrf" "it has no 127.0.0.1 address"
+        return 0
+    fi
+    # `ip vrf exec` creates a cgroup and attaches a BPF program to it.
+    if ! probe_error=$(ip vrf exec "$vrf" true 2>&1); then
+        _mgmt_vrf_not_entered "$vrf" \
+            "'ip vrf exec' is not usable here (the container needs --privileged)" \
+            "${probe_error##*$'\n'}"
+        return 0
+    fi
+    if ! probe_error=$(ip vrf exec "$vrf" python3 -c "$MGMT_VRF_LOOPBACK_PROBE" 2>&1); then
+        # Keep the last line: for a Python traceback that is the exception.
+        probe_error=${probe_error##*$'\n'}
+        case "$probe_error" in
+            *TimeoutError*|*"timed out"*)
+                reason="a 127.0.0.1 connection inside it timed out (does the host firewall drop loopback traffic on the $vrf device?)" ;;
+            *ConnectionRefused*)
+                reason="a 127.0.0.1 connection inside it was refused (is the local rule ahead of the l3mdev rule in 'ip rule show'?)" ;;
+            *)
+                reason="127.0.0.1 is not usable inside it" ;;
+        esac
+        _mgmt_vrf_not_entered "$vrf" "$reason" "$probe_error"
+        return 0
+    fi
+    [ -z "$MGMT_RULE_WARNING" ] || export LLDPQ_MGMT_RULE_WARNING="$MGMT_RULE_WARNING"
+    export LLDPQ_VRF_REEXEC=1
+    exec ip vrf exec "$vrf" /bin/bash "$0" "$@"
+}
+_enter_mgmt_vrf "$@"
 
 # ─── SSH Key Setup ───
 # Support mounting host SSH keys as read-only volume
@@ -2425,6 +2573,9 @@ case "${LLDPQ_PORT:-}" in
     *)   echo "LLDPq is ready! Access: http://localhost:${LLDPQ_PORT}" ;;
 esac
 echo "  SSH: container port 2033 (reachable only if published or with host networking)"
+# The VRF line is printed first thing; repeat it where the log is usually read.
+[ -z "$MGMT_VRF_STATUS" ] || echo "  $MGMT_VRF_STATUS"
+[ -z "$MGMT_RULE_WARNING" ] || echo "  $MGMT_RULE_WARNING"
 echo ""
 
 exec nginx -g 'daemon off;'

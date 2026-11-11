@@ -2,6 +2,15 @@
 # LLDPq Network Monitoring - Main execution script
 # Copyright (c) 2024 LLDPq Project - Licensed under MIT License
 
+# In the Docker image on a Cumulus switch the services run inside the
+# management VRF, but a command started with `docker exec` does not. Join them,
+# so a manual run reaches the devices the same way the scheduled one does.
+# Without the image's lldpq-vrf helper (a native install) this does nothing.
+if [ -z "${LLDPQ_IN_VRF:-}" ] && command -v lldpq-vrf >/dev/null 2>&1 &&
+   lldpq-vrf --pending 2>/dev/null && lldpq-vrf true 2>/dev/null; then
+    exec lldpq-vrf "$BASH" "$0" "$@"
+fi
+
 # Load the installed path fail-closed. Explicit LLDPQ_DIR remains supported for
 # isolated tests/source-tree runs, but a partial production upgrade must never
 # fall back to a different $HOME/lldpq tree.

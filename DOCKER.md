@@ -117,9 +117,91 @@ nginx is the last service to come up:
 
 ```bash
 sleep 30
-sudo docker logs --tail 20 lldpq
-curl -sS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1/
+sudo docker logs lldpq 2>&1 | grep -E 'VRF|ready|ERROR'
+sudo ip vrf exec mgmt curl -sS --max-time 5 -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1/
 ```
+
+The last command fits the normal case, where the log says the services run
+inside the management VRF. Where it says they stay in the default VRF, run the
+same `curl` without `sudo ip vrf exec mgmt`.
+
+#### Management VRF
+
+On Cumulus the management network is a separate VRF (`mgmt`), and a
+host-network container starts outside it. The entrypoint detects the VRF and
+re-runs itself inside it with `ip vrf exec`, so every LLDPq service reaches the
+devices through the management interface. The start-up log says so, once at
+the top and again next to the ready message:
+
+```text
+✓ mgmt VRF detected (table 1001) — services run inside it
+```
+
+What follows from that:
+
+- The web UI and the container's SSH service listen in the management VRF
+  only. They answer on the switch's management address, not on its in-band
+  addresses, which is why the check above runs `curl` through `ip vrf exec`.
+  For the SSH tunnel below, connect to the switch's management address.
+- All traffic of the services, IPv6 included, leaves through the management
+  VRF.
+- Commands started with `docker exec` begin outside the VRF. An interactive
+  `bash` and the `lldpq`, `get-conf`, `send-cmd`, `pping` and `curl` commands
+  move themselves in; prefix anything else that needs the network, or the
+  services' own `127.0.0.1` listeners, with `lldpq-vrf`, for example
+  `sudo docker exec -u lldpq lldpq lldpq-vrf ping -c 1 <device>`. For a user
+  other than root the move goes through `sudo`, which drops variables given
+  with `docker exec -e`; put them behind the helper instead:
+  `lldpq-vrf env https_proxy=<proxy> <command>`.
+- Restart LLDPq with `sudo docker restart lldpq`, not by restarting a service
+  through `docker exec`: a service started that way runs outside the VRF.
+  Restart it as well after the `mgmt` VRF itself was taken down and brought
+  back.
+- Entering the VRF needs `--privileged`, and the entrypoint first checks
+  that a `127.0.0.1` connection works inside the VRF, because the services
+  talk to each other that way. It needs `127.0.0.1` on the VRF device and
+  the `l3mdev` rule ahead of the `local` rule in `ip rule show` (Cumulus sets
+  up `mgmt` like that), and a host firewall that does not drop loopback
+  traffic on the `mgmt` device. When a check fails the log carries a one-line
+  `⚠ mgmt VRF not entered` warning with the reason, LLDPq stays in the
+  default VRF, and devices that are reachable only through the management
+  VRF stay out of reach. LLDPq never changes the switch's routing to
+  compensate.
+- The same applies to any other host that has a VRF named `mgmt`. Where
+  LLDPq has to work in the default VRF instead (devices reached in-band, or
+  DHCP/ONIE clients on an in-band interface), start it with
+  `-e LLDPQ_ENTER_MGMT_VRF=no`. With Compose, add
+  `LLDPQ_ENTER_MGMT_VRF: "no"` to the service's `environment:`; the stock
+  Compose files do not take this variable from the shell.
+
+> **Switches that ran an older image:** earlier images made the management
+> network reachable by adding a routing rule on the switch itself
+> (`100: from all lookup mgmt`); their start-up log says `outbound via mgmt`
+> instead of the line above. That rule also captures the switch's own IPv4
+> lookups: the switch stops answering ARP and ping on every in-band address
+> (SVIs, loopback) while BGP unnumbered sessions and all links stay up.
+> Stopping or removing the container does not remove the rule. A reboot does,
+> and an older container adds it again at every start.
+>
+> The current image removes the rule when it starts with host networking and
+> `--privileged`; in any other mode it cannot see or change the switch's
+> rules. To clear the rule by hand, stop the old container first so that it
+> cannot add the rule back (a stopped container keeps its data):
+>
+> ```bash
+> ip -4 rule show | grep '^100:'    # affected: one line, "100: from all lookup mgmt"
+> sudo docker stop lldpq
+> sudo ip -4 rule del pref 100 table "$(ip vrf show mgmt | awk '{print $2}')"
+> ip -4 rule show | grep '^100:'    # prints nothing once the rule is gone
+> ```
+>
+> Run the delete only when the first command printed exactly that one line
+> (on a host that has no name for the table it ends in the table number, for
+> example `lookup 1001`); if another pref-100 rule uses the same table, review
+> the rules first. A container that already runs the current image never adds
+> the rule: leave it running and skip the `docker stop` line. Otherwise
+> replace the container with the current image instead of starting the old
+> one again.
 
 Direct access then needs the control-plane ACL to permit the port; an SSH tunnel
 does not, because its traffic arrives on the SSH port. Pick an unused rule ID and
@@ -172,7 +254,10 @@ Linux host-network mode is selected.
 ### Removing the evaluation container
 
 Because this container keeps nothing outside itself, removing it and its image
-leaves the host as it was:
+leaves the host as it was. The one exception is a Cumulus switch that ran an
+older image with host networking: see the note under
+[Management VRF](#management-vrf) for the routing rule those images left
+behind.
 
 ```bash
 sudo docker rm -f lldpq
@@ -217,6 +302,10 @@ console route to match, so nothing else needs changing:
     environment:
       CONSOLE_PTY_PORT: "18765"
 ```
+
+On a switch the services also move into the management VRF at start-up; what
+that means for the web UI, `docker exec` and older images is described under
+[Management VRF](#management-vrf).
 
 Set the host config directory and create the two externally managed volumes
 before the first start:
@@ -570,7 +659,7 @@ Install the project's declared collections after copying it:
 ```bash
 # Project with requirements.yml at its root
 sudo docker exec -u lldpq -w /home/lldpq/ansible lldpq \
-  ansible-galaxy collection install -r requirements.yml -p collections
+  lldpq-vrf ansible-galaxy collection install -r requirements.yml -p collections
 
 # Use -r collections/requirements.yml instead when the project keeps it there.
 ```
@@ -602,6 +691,20 @@ project structure.
 > ship inside the image (html CGIs + nginx site + lldpq modules are COPY'd at
 > build time), so picking them up requires an image rebuild/update — there is
 > no html bind mount to hot-patch.
+
+> **Cumulus switch with host networking:** an image whose start-up log says
+> `outbound via mgmt` adds a routing rule to the switch at every start, and
+> the switch then stops answering ARP and ping on its in-band addresses. A
+> rollback to such an image, automatic or by hand, brings the rule back; so
+> does starting a retained pre-upgrade container. If that happened, stop the
+> container and clear the rule as described under
+> [Management VRF](#management-vrf).
+>
+> Take the update steps from this revision of the guide. Earlier revisions
+> test readiness with a plain `curl` started through `docker exec`, which
+> cannot reach the web service of an image that runs it inside the management
+> VRF without the image's own `curl` wrapper: such a script would report a
+> healthy replacement as failed and roll back to the old image.
 
 
 
@@ -641,8 +744,13 @@ fi
 
 wait_ready() {
   for _ in {1..30}; do
-    if sudo docker exec lldpq \
-         curl -fsS http://127.0.0.1/login.html >/dev/null 2>&1; then
+    # The web service may be listening inside the management VRF, where a
+    # plain `docker exec` cannot reach it; older images have no lldpq-vrf.
+    if sudo docker exec lldpq sh -c '
+         if command -v lldpq-vrf >/dev/null 2>&1; then
+           exec lldpq-vrf curl -fsS http://127.0.0.1/login.html
+         fi
+         exec curl -fsS http://127.0.0.1/login.html' >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -953,7 +1061,11 @@ sudo docker start "$container"
 ready=false
 for _ in {1..30}; do
   if [[ $(sudo docker inspect -f '{{.State.Running}}' "$container" 2>/dev/null) == true ]] && \
-     sudo docker exec "$container" curl -fsS http://127.0.0.1/login.html >/dev/null 2>&1; then
+     sudo docker exec "$container" sh -c '
+       if command -v lldpq-vrf >/dev/null 2>&1; then
+         exec lldpq-vrf curl -fsS http://127.0.0.1/login.html
+       fi
+       exec curl -fsS http://127.0.0.1/login.html' >/dev/null 2>&1; then
     ready=true
     break
   fi
@@ -999,7 +1111,11 @@ merely to enable telemetry.
 With bridge networking or Docker Desktop, `127.0.0.1` inside LLDPq is not the
 Docker host. Set `PROMETHEUS_URL` to an address reachable from the LLDPq
 container and manage the telemetry stack from the host. Linux host-network
-deployments can use `http://127.0.0.1:9090`.
+deployments can use `http://127.0.0.1:9090`. Where LLDPq runs inside the
+management VRF (see [Management VRF](#management-vrf)), `127.0.0.1` is that
+VRF's loopback: confirm that Prometheus answers there with
+`sudo docker exec lldpq lldpq-vrf curl -s http://127.0.0.1:9090/-/ready`, and
+put a management-network address in `PROMETHEUS_URL` if it does not.
 
 The telemetry assets are in the source repository; they are not embedded in
 the pre-built LLDPq image. Copy and start the stack without overwriting an
@@ -1105,7 +1221,10 @@ This deletes LLDPq's Docker-managed configuration, monitoring history, private
 AI state, uploaded images, SSH keys, and resumable job state. Inspect and
 retain any backup you need before continuing. Host bind-mount source paths,
 source checkouts, downloaded archives, and backup directories are outside
-Docker's ownership and must be reviewed separately.
+Docker's ownership and must be reviewed separately. On a Cumulus switch that
+ran an older image with host networking, removing the container does not
+remove the routing rule that image added; clear it as described under
+[Management VRF](#management-vrf).
 
 If the separate Docker telemetry stack was installed, remove it explicitly
 before LLDPq. The `-v` option permanently deletes Prometheus/Alertmanager

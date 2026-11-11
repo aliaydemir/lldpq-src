@@ -6,6 +6,22 @@
 # If not running interactively, don't do anything
 [ -z "$PS1" ] && return
 
+# On a Cumulus switch the LLDPq services run inside the management VRF, while
+# a `docker exec` shell starts outside it and cannot reach the devices. Move
+# interactive shells in as well. lldpq-vrf sets LLDPQ_IN_VRF for the shell it
+# starts, so this happens at most once.
+if [ -z "${LLDPQ_IN_VRF:-}" ] && command -v lldpq-vrf >/dev/null 2>&1 &&
+   lldpq-vrf --pending 2>/dev/null && lldpq-vrf true 2>/dev/null; then
+    # The new shell stays interactive (and a login shell) whatever stdin is.
+    _lldpq_shell_mode=-i
+    shopt -q login_shell && _lldpq_shell_mode=-il
+    if [ -n "${BASH_EXECUTION_STRING+x}" ]; then
+        # `bash -ic '<command>'`: take the command and its arguments along.
+        exec lldpq-vrf "$BASH" "$_lldpq_shell_mode" -c "$BASH_EXECUTION_STRING" "$0" "$@"
+    fi
+    exec lldpq-vrf "$BASH" "$_lldpq_shell_mode"
+fi
+
 # check the window size after each command and, if necessary,
 # update the values of LINES and COLUMNS.
 shopt -s checkwinsize
