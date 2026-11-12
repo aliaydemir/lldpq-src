@@ -178,15 +178,19 @@ What follows from that:
 > network reachable by adding a routing rule on the switch itself
 > (`100: from all lookup mgmt`); their start-up log says `outbound via mgmt`
 > instead of the line above. That rule also captures the switch's own IPv4
-> lookups: the switch stops answering ARP and ping on every in-band address
-> (SVIs, loopback) while BGP unnumbered sessions and all links stay up.
+> lookups: the switch stops answering ARP and ping on every in-band IPv4
+> address (SVIs, loopback) and its BGP sessions with numbered IPv4 neighbors
+> go down, while BGP unnumbered sessions and all links stay up.
 > Stopping or removing the container does not remove the rule. A reboot does,
 > and an older container adds it again at every start.
 >
 > The current image removes the rule when it starts with host networking and
-> `--privileged`; in any other mode it cannot see or change the switch's
-> rules. To clear the rule by hand, stop the old container first so that it
-> cannot add the rule back (a stopped container keeps its data):
+> `--privileged`. Where it shares the host network but may not change routing
+> rules, as without `--privileged`, it finds the rule and leaves it in place:
+> the log then carries a one-line `⚠` warning with the command to run on the
+> host. With bridge networking it does not see the switch's rules at all. To
+> clear the rule by hand, stop the old container first so that it cannot add
+> the rule back (a stopped container keeps its data):
 >
 > ```bash
 > ip -4 rule show | grep '^100:'    # affected: one line, "100: from all lookup mgmt"
@@ -204,8 +208,9 @@ What follows from that:
 > one again.
 
 Direct access then needs the control-plane ACL to permit the port; an SSH tunnel
-does not, because its traffic arrives on the SSH port. Pick an unused rule ID and
-review the pending NVUE diff before applying:
+does not, because its traffic arrives on the SSH port, but the switch's SSH
+server has to permit forwarding (see below). Pick an unused rule ID and review
+the pending NVUE diff before applying:
 
 ```bash
 rule=200
@@ -223,6 +228,22 @@ Where HTTP is blocked, tunnel to that port instead and browse
 ```bash
 ssh -L 8080:127.0.0.1:80 cumulus@cumulus-sw-mgmt
 ```
+
+The tunnel depends on the switch's SSH server permitting TCP forwarding, which
+an NVUE-managed switch may not: on Cumulus Linux 5.18.0 the `sshd_config` that
+NVUE generates sets `AllowTcpForwarding no`, and that release has no NVUE
+setting for it. The SSH login then still succeeds, but the page does not load
+and the SSH client prints `open failed: administratively prohibited`. Check on
+the switch:
+
+```bash
+sudo sshd -T | grep -i allowtcpforwarding
+```
+
+Where that prints `allowtcpforwarding no`, use the ACL rule above and narrow it
+to the workstation's prefix as shown under
+[First-time setup](#first-time-setup); a management network that blocks HTTP
+has to permit the port as well.
 
 The bridge/port-mapping command in the first block is portable across Linux and
 Docker Desktop; the host-network variant is Linux only. Docker Desktop 4.34+
@@ -522,9 +543,10 @@ Linux distributions, Cumulus Linux, and Docker Desktop on macOS.
 
 On a Cumulus Docker host, direct access needs the control-plane ACL rule shown
 in [Quick start](#quick-start). Where the management network blocks HTTP, the
-SSH tunnel from that section reaches the UI without any ACL or firewall change.
-To narrow direct access to one source prefix, add a source match to the same
-rule:
+SSH tunnel from that section reaches the UI without any ACL or firewall change,
+provided the switch's SSH server permits TCP forwarding (the check is in that
+section). To narrow direct access to one source prefix, add a source match to
+the same rule:
 
 ```bash
 nv set acl acl-default-whitelist rule 200 match ip source-ip 10.0.0.0/24
@@ -694,17 +716,20 @@ project structure.
 
 > **Cumulus switch with host networking:** an image whose start-up log says
 > `outbound via mgmt` adds a routing rule to the switch at every start, and
-> the switch then stops answering ARP and ping on its in-band addresses. A
-> rollback to such an image, automatic or by hand, brings the rule back; so
-> does starting a retained pre-upgrade container. If that happened, stop the
-> container and clear the rule as described under
-> [Management VRF](#management-vrf).
+> the switch then stops answering ARP and ping on its in-band IPv4 addresses
+> and loses its BGP sessions with numbered IPv4 neighbors. A rollback to such
+> an image, automatic or by hand, brings the rule back; so does starting a
+> retained pre-upgrade container. If that happened, stop the container and
+> clear the rule as described under [Management VRF](#management-vrf).
 >
-> Take the update steps from this revision of the guide. Earlier revisions
-> test readiness with a plain `curl` started through `docker exec`, which
-> cannot reach the web service of an image that runs it inside the management
-> VRF without the image's own `curl` wrapper: such a script would report a
-> healthy replacement as failed and roll back to the old image.
+> Take the update steps from this revision of the guide: they enter the
+> management VRF explicitly with `lldpq-vrf`. Earlier revisions test readiness
+> with a plain `curl` started through `docker exec`, which starts outside the
+> VRF. That probe still succeeds against the current image, because the
+> image's own `curl` moves itself in. A probe that bypasses it, such as
+> `/usr/bin/curl` or another HTTP client, cannot reach a web service that
+> runs inside the VRF: an update script that uses one would report a healthy
+> replacement as failed and roll back to the old image.
 
 
 
