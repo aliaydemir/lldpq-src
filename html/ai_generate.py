@@ -80,6 +80,12 @@ def _bad_token(text):
     return not text or bool(_WS_RE.search(text)) or '"' in text
 
 
+def _design_live_ports(live_ports, device_aliases=None):
+    """Live interface inventory that design labels can look up (see
+    ai_p2p.design_live_ports, shared with the other readers of the design)."""
+    return ai_p2p.design_live_ports(live_ports, device_aliases)
+
+
 # ---------------------------------------------------------------------------
 # 1. P2P design -> topology.dot
 # ---------------------------------------------------------------------------
@@ -183,7 +189,7 @@ def _link_in_scope(ctype, ntype, a_dev, a_port, b_dev, b_port, scope,
 
 def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
                         port_aliases=None, scope="full", include_mgmt=False,
-                        switch_names=None):
+                        switch_names=None, live_ports=None):
     """Render resolved physical P2P links as a topology.dot GraphViz graph.
 
     Only resolved links are emitted (ai_p2p already drops tbd/blank/customer
@@ -206,6 +212,12 @@ def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
     switch_names (from switch_names_from_ipam) is the authoritative switch set
     for sw-to-sw; without it a port-form + name heuristic decides, which can be
     fooled by storage appliances whose NICs are named swp-style.
+
+    live_ports ({live device: interface names}, e.g. the 'ports' section of
+    lldp_neighbors.json) lets three-part 'X/Y/Z' ports take their breakout
+    width from the switch itself, so a switch mixing 2x/4x/8x splits gets the
+    sub-port names that exist and an unsplit X/1/1 stays swpX. Without it the
+    device-wide width is used and validate_p2p flags the ports it cannot prove.
     """
     name = re.sub(r'["\\\x00-\x1f]', "", str(graph_name or "FABRIC")).strip() or "FABRIC"
     device_aliases = device_aliases or {}
@@ -224,7 +236,8 @@ def p2p_to_topology_dot(connections, graph_name="FABRIC", device_aliases=None,
     seen_edges = set()
     # Group-fitted breakout resolution for three-part 'X/Y/Z' ports (needs the
     # whole design for context); _os_port stays as the per-port fallback.
-    resolved = ai_p2p.resolve_port_map(connections)
+    resolved = ai_p2p.resolve_port_map(
+        connections, _design_live_ports(live_ports, device_aliases))
     for link in ai_p2p.expected_links(connections):
         meta = link.get("meta") or {}
         ctype = str(meta.get("connection_type") or "general").lower()
@@ -286,12 +299,117 @@ def _natural_key(text):
 # P2P validation (Inventory "validate" report; reuses ai_p2p warnings)
 # ---------------------------------------------------------------------------
 
-def validate_p2p(connections):
+def _fit_names(fit, width):
+    """OS names of a fit's rows that depend on the width (group > 1)."""
+    return ["swp%ds%d" % (fit["port"], (y - 1) * width + (z - 1))
+            for y, z, _port in fit["rows"] if y > 1]
+
+
+def _fit_width_text(fit):
+    """A fit's sub-ports per group as proven, else the least its rows need."""
+    if fit["source"] != "device":
+        return "port %d has %d" % (fit["port"], fit["width"])
+    return "port %d has at least %d" % (fit["port"], fit["subs"])
+
+
+def _breakout_width_issues(fits, row_of):
+    """Warnings for switches that mix breakout widths and for three-part ports
+    whose sub-port names rest on a width their own rows do not show, or on
+    live sub-ports that fit another group count as well (see
+    ai_p2p.resolve_port_map)."""
+    issues = []
+    by_device = {}
+    for fit in fits:
+        by_device.setdefault(fit["device_key"], []).append(fit)
+    for dev_fits in by_device.values():
+        # Only ports cabled beyond group 1 depend on the width at all.
+        wide = sorted((f for f in dev_fits if f["groups"] > 1),
+                      key=lambda f: f["port"])
+        if not wide:
+            continue
+        device = wide[0]["device"]
+        proven = [f for f in wide if f["source"] != "device"]
+        # A port without its own evidence still needs at least the subs its
+        # rows use, so one proven narrower port is enough to call it mixed.
+        floor = max(f["width"] if f["source"] != "device" else f["subs"]
+                    for f in wide)
+        if any(f["width"] < floor for f in proven):
+            issues.append({
+                "severity": "warning", "kind": "breakout-mixed-width",
+                "message": "%s mixes breakout widths (sub-ports per group: %s); "
+                "a three-part port whose width neither its rows nor the live "
+                "switch prove is mapped with the widest value on the switch"
+                % (device, ", ".join(_fit_width_text(f) for f in wide)),
+                "device": device,
+            })
+        widest = min(f["port"] for f in dev_fits
+                     if f["subs"] == f["device_width"])
+        for fit in wide:
+            if fit["source"] != "device" or fit["width"] == fit["subs"]:
+                continue
+            texts = [port for y, _z, port in fit["rows"] if y > 1]
+            issue = {
+                "severity": "warning", "kind": "breakout-width-ambiguous",
+                "message": "%s port %d: %s mapped to %s with %d sub-ports per "
+                "group, taken from port %d (the widest three-part port on this "
+                "switch), but the port's own rows only use %d, which would "
+                "give %s. Sparse cabling and a narrower breakout look the same "
+                "in the design - check the breakout of swp%d"
+                % (device, fit["port"], ", ".join(texts),
+                   ", ".join(_fit_names(fit, fit["width"])), fit["width"],
+                   widest, fit["subs"],
+                   ", ".join(_fit_names(fit, fit["subs"])), fit["port"]),
+                "device": device, "port": "swp%d" % fit["port"],
+            }
+            rows = [row_of[key] for key in
+                    ((fit["device_key"], port) for port in texts) if key in row_of]
+            if rows:
+                issue["row"] = rows[0]
+            issues.append(issue)
+        for fit in wide:
+            if not fit["other_widths"]:
+                continue
+            # The live sub-ports fit the groups the rows show, and a design
+            # written with more groups (one per leg) just as well.
+            texts = [port for y, _z, port in fit["rows"] if y > 1]
+            total = fit["width"] * ai_p2p._breakout_step(fit["groups"])
+            issue = {
+                "severity": "warning", "kind": "breakout-width-ambiguous",
+                "message": "%s port %d: %s mapped to %s as %d groups of %d (the "
+                "switch has %d sub-ports on swp%d), but the port's rows stop at "
+                "group %d, and read as %s they would be %s. The design does not "
+                "say which notation it uses - check the sub-port of swp%d each "
+                "row means"
+                % (device, fit["port"], ", ".join(texts),
+                   ", ".join(_fit_names(fit, fit["width"])),
+                   total // fit["width"], fit["width"], total, fit["port"],
+                   fit["groups"],
+                   " or ".join("%d groups of %d" % (total // width, width)
+                               for width in fit["other_widths"]),
+                   " or ".join(", ".join(_fit_names(fit, width))
+                               for width in fit["other_widths"]),
+                   fit["port"]),
+                "device": device, "port": "swp%d" % fit["port"],
+            }
+            rows = [row_of[key] for key in
+                    ((fit["device_key"], port) for port in texts) if key in row_of]
+            if rows:
+                issue["row"] = rows[0]
+            issues.append(issue)
+    return issues
+
+
+def validate_p2p(connections, live_ports=None, device_aliases=None):
     """Deterministic design-quality report for the Inventory validate action.
 
     Reuses the parser warnings carried on the canonical dict and adds structural
     checks the parser does not perform: reused/duplicate ports, port(OS)/breakout
-    mismatches, unresolved (tbd/blank) endpoints, and duplicate cable records.
+    mismatches, unresolved (tbd/blank) endpoints, duplicate cable records, and
+    three-part ports whose breakout width is mixed on a switch or not proven.
+
+    live_ports / device_aliases are the optional live interface inventory and
+    display aliases of p2p_to_topology_dot; with them the report judges the
+    same sub-port names topology.dot will carry.
 
     -> {"issues": [{severity, kind, message, ...}], "counts": {...},
         "warnings": [parser warnings]}
@@ -300,7 +418,12 @@ def validate_p2p(connections):
     warnings = list(connections.get("warnings", [])) if isinstance(connections, dict) else []
     issues = []
 
-    resolved = ai_p2p.resolve_port_map(connections)
+    live = _design_live_ports(live_ports, device_aliases)
+    resolved, fits = ai_p2p._fit_breakout_ports(connections, live)
+    # One key per switch, as the fit tells them apart: FQDN and short
+    # spellings of a switch are one device, two FQDNs that only share their
+    # first label are two.
+    device_key = ai_p2p.design_device_key(connections, live)
     port_owner = {}       # (device_key, os_port) -> (sheet_name, row_number)
     base_usage = {}       # (device_key, base_port) -> {"whole": [...], "split": [...]}
     edge_seen = {}        # frozenset endpoint keys -> first row_number
@@ -327,8 +450,8 @@ def validate_p2p(connections):
         (a_dev, a_raw, a_os), (b_dev, b_raw, b_os) = endpoints
         if a_dev and b_dev and a_raw and b_raw:
             edge_key = frozenset((
-                (min(ai_p2p._device_keys(a_dev)), a_os),
-                (min(ai_p2p._device_keys(b_dev)), b_os),
+                (device_key(a_dev), a_os),
+                (device_key(b_dev), b_os),
             ))
             if len(edge_key) == 1:
                 issues.append({
@@ -354,7 +477,7 @@ def validate_p2p(connections):
                 continue
             if ai_p2p._is_placeholder_name(raw_port):
                 continue  # 'tbd'/'x'/'-' pseudo-ports are not cabled endpoints
-            dev_key = min(ai_p2p._device_keys(dev))
+            dev_key = device_key(dev)
             key = (dev_key, os_port)
             if key in port_owner and port_owner[key] != (sheet, row):
                 first_sheet, first_row = port_owner[key]
@@ -390,6 +513,15 @@ def validate_p2p(connections):
             "row": usage["whole"][0][3],
         })
 
+    row_of = {}           # (device_key, design port text) -> first row_number
+    for record in records:
+        for side in ("source", "dest"):
+            dev = _clean(record.get(side + "_name"))
+            port = _clean(record.get(side + "_port")).lower().replace(" ", "")
+            if dev and port and record.get("row_number") is not None:
+                row_of.setdefault((device_key(dev), port), record["row_number"])
+    issues.extend(_breakout_width_issues(fits, row_of))
+
     if unresolved:
         issues.append({
             "severity": "info", "kind": "unresolved",
@@ -404,6 +536,9 @@ def validate_p2p(connections):
         "duplicate_ports": sum(1 for i in issues if i["kind"] == "duplicate-port"),
         "duplicate_records": sum(1 for i in issues if i["kind"] == "duplicate-record"),
         "breakout_conflicts": sum(1 for i in issues if i["kind"] == "breakout-conflict"),
+        "breakout_width_warnings": sum(
+            1 for i in issues
+            if i["kind"] in ("breakout-mixed-width", "breakout-width-ambiguous")),
         "unresolved": unresolved,
     }
     order = {"error": 0, "warning": 1, "info": 2}
@@ -559,7 +694,8 @@ def _split_host_role(text):
     match = re.match(r"^(\S+)\s*(?:@(\S+))?", text.strip())
     if not match:
         return text.strip(), ""
-    return match.group(1), (match.group(2) or "")
+    # Roles are case-insensitive: parse_devices.py lower-cases the tag.
+    return match.group(1), (match.group(2) or "").lower()
 
 
 _ROLE_SORT = {"border": 0, "core": 1, "spine": 2, "leaf": 3, "access": 4, "firewall": 5}

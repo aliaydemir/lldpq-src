@@ -611,8 +611,10 @@ def render_notifications(existing_text: Optional[str], payload: dict) -> str:
     )
     if network["link_flaps_critical"] < network["link_flaps_per_hour"]:
         raise SetupSafetyError("thresholds.flap_crit must be greater than or equal to flap_warn")
+    # A margin in dB, not a power level in dBm: the optical analyzer ignores
+    # a negative value, so it must not be stored as if it were in effect.
     network["optical_power_margin"] = _notification_number(
-        supplied.get("optical"), "thresholds.optical", -100, 100
+        supplied.get("optical"), "thresholds.optical", 0, 30
     )
     hardware["cpu_temp_critical"] = _notification_number(
         supplied.get("cpu"), "thresholds.cpu", 0, 250

@@ -482,12 +482,17 @@ class LLDPqAlerts:
         """Coarse severity rank of an alert state for escalation checks.
 
         Composite states (``CRITICAL:2:0:1``) lead with their severity token.
+        The token may name a second condition after ``+``
+        (``WARNINGS+DOWN``, ``WARNINGS+UNPLUGGED``): a warning on top of a
+        link-down, unreadable or unplugged state ranks above either one
+        alone and below CRITICAL.
         """
         token = str(state).split(":", 1)[0].upper()
-        if token in {"CRITICAL", "OUTAGE"}:
+        base, _, second = token.partition("+")
+        if base in {"CRITICAL", "OUTAGE"}:
             return 2
-        if token.startswith("WARNING") or token in {"DOWN", "UNPLUGGED"}:
-            return 1
+        if base.startswith("WARNING") or base in {"DOWN", "UNPLUGGED"}:
+            return 1.5 if second else 1
         return 0
 
     def should_send_alert(self, device, alert_type, current_state):
@@ -1180,32 +1185,82 @@ class LLDPqAlerts:
 
         self.check_processed_network_alerts(device)
 
-    def _notify_processed_health(self, device, alert_type, label, status):
-        """Deliver one stateful alert from an analyzer's per-device grade."""
+    @staticmethod
+    def _optical_base_condition(health_values):
+        """The persistent condition a degradation is reported next to.
+
+        Link down outranks unreadable diagnostics, which outrank an
+        unplugged module: the order of the device grade.
+        """
+        health_values = set(health_values)
+        return next(
+            (condition for condition in ("down", "unknown", "unplugged")
+             if condition in health_values), None
+        )
+
+    def _notify_processed_health(self, device, alert_type, label, status,
+                                 ports=None, idle_ports=0):
+        """Deliver one stateful alert from an analyzer's per-device grade.
+
+        ``ports`` maps each port of the device to its health behind an
+        optical grade, when the caller knows it. ``idle_ports`` is the
+        number of ungraded idle ports behind a BER grade.
+        """
         normalized = str(status or "unknown").lower()
         if normalized == "not_applicable":
             return True
+        ports = ports or {}
+        # The persistent conditions; the gap takes "also " or "still " when
+        # the condition is reported next to a degradation.
+        conditions = {
+            "down": "a monitored optical link is {}down",
+            "unplugged": "an expected optical module is {}unplugged",
+            "unknown": "current diagnostics are {}incomplete or unknown",
+        }
+        degradation, _, beside = normalized.partition("+")
         if normalized == "critical":
             state, severity = "CRITICAL", "CRITICAL"
+            beside = self._optical_base_condition(ports.values())
+            if beside:
+                # CRITICAL outranks the other condition, but it is
+                # remembered so that the end of the critical is not
+                # reported as a new link-down, unreadable or unplugged port.
+                state = f"CRITICAL+{beside.upper()}"
             title = f"{label} Critical"
             message = f"Processed {label} analysis reports a critical condition"
+        elif degradation == "warnings" and beside in conditions:
+            # A degrading port next to a link-down, unreadable or unplugged
+            # one has a state of its own, so the warning is neither hidden
+            # by that condition nor lost when it clears.
+            state, severity = f"WARNINGS+{beside.upper()}", "WARNING"
+            title = f"{label} Warning"
+            message = (
+                f"Processed {label} analysis reports a warning condition; "
+                + conditions[beside].format("also ")
+            )
         elif normalized in {"warning", "warnings", "down", "unplugged", "unknown"}:
             state = "WARNING_UNKNOWN" if normalized == "unknown" else normalized.upper()
             severity = "WARNING"
             title = f"{label} Warning"
-            descriptions = {
-                "down": "a monitored optical link is down",
-                "unplugged": "an expected optical module is unplugged",
-                "unknown": "current diagnostics are incomplete or unknown",
-            }
-            message = (
-                f"Processed {label} analysis reports "
-                f"{descriptions.get(normalized, 'a warning condition')}"
+            message = f"Processed {label} analysis reports " + (
+                conditions[normalized].format("")
+                if normalized in conditions else "a warning condition"
             )
         elif normalized in {"excellent", "good", "ok"}:
             state, severity = "OK", "RECOVERED"
             title = f"{label} Recovered"
             message = f"Processed {label} analysis is healthy"
+            if idle_ports:
+                # A port that stopped carrying traffic (link down, unused)
+                # is not graded: "healthy" would claim more than was
+                # measured, most of all when the faulty port itself went
+                # quiet.
+                message = (
+                    f"Processed {label} analysis reports no warning or "
+                    f"critical condition; {idle_ports} idle "
+                    f"{'port is' if idle_ports == 1 else 'ports are'} "
+                    "not graded"
+                )
         else:
             state, severity = "WARNING_UNSUPPORTED", "WARNING"
             title = f"{label} Status Unknown"
@@ -1214,7 +1269,63 @@ class LLDPqAlerts:
         previous_state = self.get_alert_state(device, alert_type)
         if state == "OK" and previous_state == "UNKNOWN":
             return self.record_state_without_delivery(device, alert_type, state)
-        if state == "OK" and not self.config.get('frequency', {}).get(
+        recovery = state == "OK"
+        name = state
+        previous_name, _, previous_ports = previous_state.partition(":")
+        previous_degradation, _, previous_beside = previous_name.partition("+")
+        # A degraded state records its ports as [degraded, otherwise
+        # impaired]. A count cannot tell a degradation that cleared from a
+        # degrading port that went down, unreadable or unplugged itself, or
+        # from one link returning while another one fails.
+        try:
+            was_degraded, was_impaired = map(set, json.loads(previous_ports))
+        except (TypeError, ValueError):
+            was_degraded = was_impaired = None
+        healthy = {
+            port for port, health in ports.items()
+            if health in ("excellent", "good")
+        }
+        degraded = {
+            port for port, health in ports.items()
+            if health in ("warning", "critical")
+        }
+        impaired = set(ports) - healthy - degraded
+        # A degraded port stays on record until it is seen healthy again.
+        unresolved = (was_degraded or set()) - healthy - degraded
+        if ports and name.partition("+")[0] in ("WARNINGS", "CRITICAL"):
+            state = name + ":" + json.dumps(
+                [sorted(degraded | unresolved), sorted(impaired)],
+                separators=(",", ":"),
+            )
+        if (name == previous_name
+                or name.partition("+")[0] == previous_degradation == "CRITICAL"):
+            # Only the ports behind the same state changed (or, under
+            # CRITICAL, the other condition appeared, changed or went
+            # away): keep the record current without a new alert.
+            if state != previous_state:
+                return self.record_state_without_delivery(
+                    device, alert_type, state
+                )
+        elif (normalized in conditions
+                and previous_beside == normalized.upper()
+                and was_degraded is not None and not unresolved
+                and impaired <= was_impaired):
+            # The degradation cleared while the other condition persists:
+            # announce the recovery instead of repeating that condition's
+            # warning. That is only true when every port that was degraded
+            # is healthy again and no further port went down, unreadable or
+            # unplugged; otherwise the plain warning below stands.
+            cleared = (
+                "critical" if previous_degradation == "CRITICAL" else "warning"
+            )
+            recovery = True
+            severity = "RECOVERED"
+            title = f"{label} {cleared.title()} Cleared"
+            message = (
+                f"Processed {label} analysis no longer reports a {cleared} "
+                "condition; " + conditions[normalized].format("still ")
+            )
+        if recovery and not self.config.get('frequency', {}).get(
                 'send_recovery', True):
             return self.record_state_without_delivery(device, alert_type, state)
         if not self.should_send_alert(device, alert_type, state):
@@ -1229,7 +1340,8 @@ class LLDPqAlerts:
             return True
         results = [
             self._notify_processed_health(
-                device, "ber_health", "BER", self.get_device_ber_status(device)
+                device, "ber_health", "BER", self.get_device_ber_status(device),
+                idle_ports=getattr(self, "_ber_idle_ports", {}).get(device, 0),
             )
         ]
         run_manifest = getattr(self, "run_manifest", None)
@@ -1238,9 +1350,10 @@ class LLDPqAlerts:
             if isinstance(run_manifest, dict) else set()
         )
         if "optical" not in skipped:
+            optical_status = self.get_device_optical_status(device)
             results.append(self._notify_processed_health(
-                device, "optical_health", "Optical",
-                self.get_device_optical_status(device),
+                device, "optical_health", "Optical", optical_status,
+                ports=getattr(self, "_optical_port_health", {}).get(device),
             ))
         return all(result is not False for result in results)
 
@@ -1881,8 +1994,10 @@ class LLDPqAlerts:
                 f"Optical: {optical_stats['down']} ports with no receive light/down state"
             )
         if optical_stats and optical_stats.get('unplugged', 0) > 0:
+            # Rows are ports: one pulled module in a breakout cage empties
+            # every sub-port, so the count must not be read as modules.
             warning_issues.append(
-                f"Optical: {optical_stats['unplugged']} expected modules unplugged"
+                f"Optical: {optical_stats['unplugged']} ports with an expected module unplugged"
             )
         if optical_stats and optical_stats.get('unknown', 0) > 0:
             warning_issues.append(
@@ -1895,11 +2010,16 @@ class LLDPqAlerts:
             warning_issues.append(
                 f"BER: {ber_stats['warnings']} ports with warnings"
             )
-        if ber_stats.get('unknown', 0) > 0:
-            warning_issues.append(
-                f"BER: {ber_stats['unknown']} ports awaiting a complete traffic sample"
-            )
-        
+        # Ungraded ports are idle (no traffic and no errors: unused or down)
+        # or still collecting a complete traffic sample. Neither is a fault,
+        # and neither count is part of the change signature below, so
+        # neither may open an issue: a WARNING raised for ports on their
+        # first sample (every switch that returns from a reboot) would stay
+        # the operator's last summary, because the run in which they are
+        # graded sends nothing. Both counts are shown in the BER block.
+        ber_idle = min(ber_stats.get('idle', 0), ber_stats.get('unknown', 0))
+        ber_awaiting = ber_stats.get('unknown', 0) - ber_idle
+
         if flap_stats.get('critical', 0) > 0:
             critical_issues.append(f"Link Flap: {flap_stats['critical']} problematic ports")
         if flap_stats.get('warnings', 0) > 0:
@@ -1962,10 +2082,12 @@ class LLDPqAlerts:
                 )
                 warning_issues.append(f"{label}: partial collection coverage{suffix}")
         
-        # Create summary signature for state tracking (include optical and LLDP)
+        # Create summary signature for state tracking (include optical and LLDP).
+        # Only actionable counts belong here: a port or device moving between
+        # the healthy bands (excellent <-> good), or a BER port moving between
+        # graded, idle and awaiting a sample, must not re-send the summary.
         optical_signature = (
             "skipped" if optical_skipped else
-            f"{optical_stats['excellent']}:{optical_stats['good']}:"
             f"{optical_stats['warnings']}:{optical_stats['critical']}:"
             f"{optical_stats.get('down', 0)}:"
             f"{optical_stats.get('unplugged', 0)}:"
@@ -1982,7 +2104,6 @@ class LLDPqAlerts:
         )
         summary_signature = "_".join(map(str, (
             total_devices,
-            hardware_stats['excellent'], hardware_stats['good'],
             hardware_stats['warnings'], hardware_stats['critical'],
             hardware_stats.get('unknown', 0),
             int(bool(hardware_stats.get('coverage_partial'))),
@@ -1994,8 +2115,7 @@ class LLDPqAlerts:
             int(bool(bgp_stats.get('coverage_partial'))),
             asset_stats['successful'], asset_stats['failed'],
             asset_stats['unknown'], asset_stats['stale'],
-            ber_stats['excellent'], ber_stats['good'], ber_stats['warnings'],
-            ber_stats['critical'], ber_stats.get('unknown', 0),
+            ber_stats['warnings'], ber_stats['critical'],
             int(bool(ber_stats.get('coverage_partial'))),
             flap_stats['stable'], flap_stats['warnings'],
             flap_stats['critical'],
@@ -2098,7 +2218,7 @@ Stable: {flap_stats['stable']}     Warnings: {flap_stats['warnings']}     Critic
 BER Analysis Results:
 
 
-Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: {ber_stats['warnings']}     Critical: {ber_stats['critical']}     Awaiting Sample: {ber_stats.get('unknown', 0)}
+Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: {ber_stats['warnings']}     Critical: {ber_stats['critical']}     Awaiting Sample: {ber_awaiting}     Idle: {ber_idle}
 
 
 ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──
@@ -2783,6 +2903,7 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             if not isinstance(current, dict):
                 raise ValueError("current BER stats must be an object")
             grades = []
+            idle_ports = 0
             max_age_seconds = self.get_data_max_age_seconds()
             now = time.time()
             for port_name, port_stats in current.items():
@@ -2799,6 +2920,12 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                         math.isfinite(float(record_time)) and
                         now - float(record_time) > max_age_seconds):
                     continue
+                # An idle port (no traffic and no errors: unused or down)
+                # is complete evidence of nothing to grade, not a missing
+                # sample, and must not turn the device unknown.
+                if port_stats.get("sample_status") == "idle":
+                    idle_ports += 1
+                    continue
                 grade = str(
                     port_stats.get("status")
                     or port_stats.get("effective_grade")
@@ -2806,8 +2933,13 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                     or "unknown"
                 ).lower()
                 grades.append(grade)
+            # Remembered for the alert step, which words a recovery
+            # differently while idle ports are left ungraded.
+            self.__dict__.setdefault("_ber_idle_ports", {})[device] = idle_ports
             if not grades:
-                return "not_applicable"
+                # Only idle ports: nothing is wrong and nothing is pending,
+                # so an earlier warning state can recover.
+                return "ok" if idle_ports else "not_applicable"
             priority = {
                 "critical": 4, "warning": 3, "warnings": 3,
                 "unknown": 2, "good": 1, "excellent": 0,
@@ -2863,17 +2995,24 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 return "unknown"
             if not isinstance(current_stats, dict):
                 raise ValueError("current_optical_stats must be an object")
-            health_values = []
+            port_health = {}
             for port_name, stats in current_stats.items():
                 if (not isinstance(port_name, str) or
                         port_name.split(":", 1)[0] != device or
                         not isinstance(stats, dict)):
                     continue
-                health_values.append(
+                port_health[port_name.partition(":")[2]] = (
                     str(stats.get("health_status", "unknown")).lower()
                 )
+            health_values = list(port_health.values())
             if not health_values:
                 return "not_applicable"
+            # Remembered for the alert step, which has to tell a degradation
+            # that cleared from a degrading port that went down, unreadable
+            # or unplugged itself.
+            self.__dict__.setdefault("_optical_port_health", {})[device] = (
+                port_health
+            )
             priority = {
                 "critical": 7, "down": 6, "warning": 5,
                 "unknown": 4, "unplugged": 3, "good": 2,
@@ -2882,8 +3021,12 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             result = max(
                 health_values, key=lambda value: priority.get(value, 3)
             )
-            if result == "warning":
-                return "warnings"
+            if result in ("down", "warning") and "warning" in health_values:
+                # A link-down, unreadable or unplugged port must neither
+                # hide a degrading one nor replace its recovery; only
+                # CRITICAL outranks the pair.
+                beside = self._optical_base_condition(health_values)
+                return f"warnings+{beside}" if beside else "warnings"
             return result
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             print(f"    ❌ Error reading optical status for {device}: {exc}")
@@ -3022,6 +3165,10 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 warnings = self.extract_element_value(content, 'warning-ports')
                 critical = self.extract_element_value(content, 'critical-ports')
                 unknown = self.extract_element_value(content, 'unknown-ports')
+                # Subset of the ungraded ports that are idle (unused or
+                # down). Reports generated before the split carry no
+                # attribute; all their ungraded ports count as awaiting.
+                idle = self.extract_attribute_int(content, 'data-ber-idle')
                 
                 stats = {
                     "excellent": excellent,
@@ -3029,6 +3176,7 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                     "warnings": warnings,
                     "critical": critical,
                     "unknown": unknown,
+                    "idle": idle or 0,
                 }
                 required_metrics = [
                     "excellent", "good", "warnings", "critical", "unknown"

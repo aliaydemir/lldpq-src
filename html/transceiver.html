@@ -289,7 +289,7 @@
     <div class="summary-grid">
         <div class="summary-card card-total">
             <div class="card-value" id="total-modules">-</div>
-            <div class="card-label">Total Modules</div>
+            <div class="card-label">Total Modules (<span id="total-ports">-</span> ports)</div>
         </div>
         <div class="summary-card card-info">
             <div class="card-value" id="unique-models">-</div>
@@ -384,6 +384,43 @@
         return [parseInt(m[1], 10), m[2] != null ? parseInt(m[2], 10) : -1, ''];
     }
 
+    // Rows are per port, and every breakout sibling of a cage reports the same
+    // physical module. A row names its module (device, cage swp<N>, and the
+    // serial when one is printed); a row of an inventory written before that
+    // key existed gets it by the same rule.
+    function moduleKey(m) {
+        if (m.module) return m.module;
+        const cage = /^swp\d+/.exec(m.port || '');
+        return [m.device, cage ? cage[0] : m.port, m.serial].filter(Boolean).join('/');
+    }
+
+    // Module totals of the rows, each physical module counted once (the rules
+    // of process_transceiver_data.py); of a module's rows the first one that
+    // carries a firmware version speaks for it.
+    function summarizeModules(rows) {
+        const modules = new Map();
+        for (const m of rows) {
+            const key = moduleKey(m), seen = modules.get(key);
+            if (!seen || (m.fw_version && !seen.fw_version)) modules.set(key, m);
+        }
+        // Keys are module-supplied strings: no inherited names to collide with.
+        const fwVersions = Object.create(null), statusCounts = Object.create(null);
+        for (const m of modules.values()) {
+            if (m.part_number && m.fw_version) {
+                const versions = fwVersions[m.part_number] || (fwVersions[m.part_number] = Object.create(null));
+                versions[m.fw_version] = (versions[m.fw_version] || 0) + 1;
+            }
+            const status = m.fw_status || 'ok';
+            statusCounts[status] = (statusCounts[status] || 0) + 1;
+        }
+        return {
+            total_modules: modules.size,
+            total_ports: rows.length,
+            fw_versions: fwVersions,
+            status_counts: statusCounts
+        };
+    }
+
     document.addEventListener('DOMContentLoaded', loadData);
 
     async function loadData() {
@@ -393,6 +430,9 @@
 
             allModules = data.modules || [];
             summary = data.summary || {};
+            // An inventory written before modules were counted once per cage
+            // has per-port totals and no port count: take both from its rows.
+            if (summary.total_ports == null) Object.assign(summary, summarizeModules(allModules));
             mixedFwModels = summary.mixed_fw_models || [];
             fwByModel = summary.fw_versions || {};
 
@@ -478,6 +518,7 @@
 
     function updateSummary() {
         document.getElementById('total-modules').textContent = summary.total_modules || 0;
+        document.getElementById('total-ports').textContent = summary.total_ports || 0;
         document.getElementById('unique-models').textContent = summary.unique_models || 0;
         document.getElementById('devices-count').textContent = summary.devices_with_modules || 0;
         document.getElementById('mixed-fw').textContent = mixedFwModels.length;
@@ -618,7 +659,7 @@
                 fwDisplay = renderStatusBadge(m.fw_status, m.fw_status_detail);
             }
 
-            return `<tr class="module-row" data-idx="${i}" onclick="toggleModuleDetails(this)">
+            return `<tr class="module-row" data-idx="${i}" data-module="${esc(moduleKey(m))}" onclick="toggleModuleDetails(this)">
                 <td>${esc(m.device)}</td>
                 <td><span class="badge badge-gray">${esc(m.port)}</span></td>
                 <td><span class="badge badge-blue">${esc(m.identifier || '-')}</span></td>
@@ -738,6 +779,7 @@
             '# Transceiver Inventory Report',
             '# Generated: ' + now.toLocaleString(),
             '# Total Modules: ' + (summary.total_modules != null ? summary.total_modules : allModules.length),
+            '# Total Ports: ' + (summary.total_ports != null ? summary.total_ports : allModules.length),
             '# Unique Models: ' + (summary.unique_models || 0),
             '# Devices: ' + (summary.devices_with_modules || 0),
             '# Mixed FW Models: ' + mixedFwModels.length,

@@ -299,6 +299,18 @@
         statuses.forEach(function (status) { metric('#' + status + '-' + unit, counts[status]); });
     }
 
+    function updateBER() {
+        updateGradeReport('#ber-table', 'ports', ['excellent', 'good', 'warning', 'critical', 'unknown']);
+        // The Not Graded card splits its ports under the count: still
+        // awaiting a traffic sample, or idle (rows stamped data-idle="1").
+        var ungraded = scopedRows('#ber-table tbody > tr').filter(function (row) {
+            return String(row.dataset.status || '').toLowerCase() === 'unknown';
+        });
+        var idle = ungraded.filter(function (row) { return row.dataset.idle === '1'; }).length;
+        metric('#awaiting-ports', ungraded.length - idle);
+        metric('#idle-ports', idle);
+    }
+
     function updateLogs() {
         var rows = scopedRows('#log-table > tbody > tr[data-device-key]');
         var totals = [0, 0, 0, 0];
@@ -389,8 +401,12 @@
 
     function updateTransceiver() {
         var rows = scopedRows('#module-table > tr');
-        var models = new Set(), devices = new Set(), firmware = new Map();
+        var models = new Set(), devices = new Set(), firmware = new Map(), modules = new Set();
         rows.forEach(function (row) {
+            // Rows are per port; the page stamps each with its physical module,
+            // which every breakout sibling of a cage shares. A row without the
+            // stamp counts by itself.
+            modules.add(row.dataset.module || row);
             devices.add(textAt(row, 0));
             var model = textAt(row, 4), fw = textAt(row, 7);
             if (model) models.add(model);
@@ -399,7 +415,8 @@
                 firmware.get(model).add(fw);
             }
         });
-        metric('#total-modules', rows.length);
+        metric('#total-modules', modules.size);
+        metric('#total-ports', rows.length);
         metric('#unique-models', models.size);
         metric('#devices-count', devices.size);
         var mixed = 0;
@@ -420,9 +437,7 @@
                 ['excellent', 'good', 'warning', 'critical', 'down', 'unplugged', 'unknown']
             );
         }
-        if (path.endsWith('/ber-analysis.html')) {
-            return updateGradeReport('#ber-table', 'ports', ['excellent', 'good', 'warning', 'critical', 'unknown']);
-        }
+        if (path.endsWith('/ber-analysis.html')) return updateBER();
         if (path.endsWith('/hardware-analysis.html')) {
             return updateGradeReport('#hardware-table', 'devices', ['excellent', 'good', 'warning', 'critical', 'unknown']);
         }

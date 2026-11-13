@@ -271,9 +271,18 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
                     module_status = fw_status
                     module_detail = fw_detail
 
+            # ethtool -m answers every breakout sibling of a cage with the
+            # same module, so the row names the module it belongs to: device
+            # and cage (swp<N>), plus the serial when one is printed.  Two
+            # serials in one cage are two modules.
+            cage = f'swp{port_num}' if port_num_match else iface
+            module_key = '/'.join(
+                part for part in (hostname, cage, info['serial']) if part)
+
             module = {
                 'device': hostname,
                 'port': iface,
+                'module': module_key,
                 'identifier': info['identifier'],
                 'vendor': info['vendor'],
                 'part_number': info['part_number'],
@@ -297,16 +306,26 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
     fw_by_model = {}
     status_counts = {}
 
+    # all_modules holds one row per port.  A physical module is counted once,
+    # however many breakout ports it serves; of its rows the first one that
+    # carries a firmware version speaks for it.
+    physical_modules = {}
     for m in all_modules:
         pn = m['part_number']
         if pn:
             unique_models.add(pn)
             devices_with_modules.add(m['device'])
-            if m['fw_version']:
-                fw = m['fw_version']
-                if pn not in fw_by_model:
-                    fw_by_model[pn] = {}
-                fw_by_model[pn][fw] = fw_by_model[pn].get(fw, 0) + 1
+        seen = physical_modules.get(m['module'])
+        if seen is None or (m['fw_version'] and not seen['fw_version']):
+            physical_modules[m['module']] = m
+
+    for m in physical_modules.values():
+        pn = m['part_number']
+        if pn and m['fw_version']:
+            fw = m['fw_version']
+            if pn not in fw_by_model:
+                fw_by_model[pn] = {}
+            fw_by_model[pn][fw] = fw_by_model[pn].get(fw, 0) + 1
         st = m.get('fw_status', 'ok')
         status_counts[st] = status_counts.get(st, 0) + 1
 
@@ -326,7 +345,8 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
         'modules': all_modules,
         'parse_failed': parse_failed,
         'summary': {
-            'total_modules': len(all_modules),
+            'total_modules': len(physical_modules),
+            'total_ports': len(all_modules),
             'unique_models': len(unique_models),
             'devices_with_modules': len(devices_with_modules),
             'fw_versions': fw_by_model,
@@ -371,7 +391,8 @@ def process_transceiver_data(optical_dir='monitor-results/optical-data',
         output_dir, 'transceiver', export_rows, result['summary'], None,
         subdir=None, basename='transceiver-export')
 
-    print(f"Transceiver inventory: {len(all_modules)} modules across "
+    print(f"Transceiver inventory: {len(physical_modules)} modules on "
+          f"{len(all_modules)} ports across "
           f"{len(devices_with_modules)} devices, {len(unique_models)} unique models"
           f"{f', {len(mixed_fw_models)} with mixed FW' if mixed_fw_models else ''}")
 

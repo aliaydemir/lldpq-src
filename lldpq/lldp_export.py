@@ -25,6 +25,7 @@ alias-free by design: it is the canonical machine view.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Mapping
 
 import ai_p2p
@@ -186,12 +187,30 @@ def build_payload(report: LLDPReport) -> dict[str, Any]:
     return payload
 
 
+# The LLDP stage publishes its neighbour sidecar next to this module
+# (check-lldp.sh: $LLDPQ_DIR/lldp-results/lldp_neighbors.json).
+NEIGHBORS_FILE = Path(__file__).resolve().parent / "lldp-results" / "lldp_neighbors.json"
+
+
+def _live_ports() -> Any:
+    """Interfaces the switches reported in the last LLDP run.
+
+    Three-part design ports take their breakout width from them, as the page
+    does from the report it shows.  None when the sidecar is missing,
+    unreadable or stale: the design alone then decides, as before.
+    """
+    try:
+        return ai_p2p.load_live_ports(NEIGHBORS_FILE)
+    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+        return None
+
+
 def _build_p2p_index(p2p_design: Any) -> dict:
     if p2p_design is None:
         return {}
     try:
         canonical = ai_p2p.load_connections(p2p_design)
-        return ai_p2p.build_port_index(canonical)
+        return ai_p2p.build_port_index(canonical, _live_ports())
     except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
         # P2P enrichment is optional. A stale/truncated active design must not
         # make the already-valid LLDP report unavailable to headless clients.

@@ -16,8 +16,9 @@ This module is the single owner of the export contract: the per-domain column
 registry (order == CSV column order == JSON "columns"), the value coercion
 rules, and the CSV rendering semantics (ported from lldp.html's csvField /
 spreadsheetSafeValue / displayValue so spreadsheet-formula injection is guarded
-identically everywhere).  Analyzers only hand it the row mappings they already
-assembled for their HTML tables.
+identically everywhere; the one exemption is a cell of pure numbers in a
+column listed in NUMERIC_LIST_COLUMNS).  Analyzers only hand it the row
+mappings they already assembled for their HTML tables.
 
 Contract rules:
 - Unknown row keys are rejected loudly (a silent schema widening in one
@@ -77,6 +78,8 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "device", "interface", "health", "rx_power_dbm", "tx_power_dbm",
         "temperature_c", "link_margin_db", "voltage_v", "bias_current_ma",
         "rx_lanes", "tx_lanes", "bias_lanes", "anomalies", "inactive_lanes",
+        "rx_lane_ids", "tx_lane_ids", "bias_lane_ids",
+        "rx_power_lane", "tx_power_lane", "bias_current_lane",
     ),
     "ber": (
         "device", "interface", "neighbor_device", "neighbor_port", "status",
@@ -120,6 +123,10 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
         "device", "port", "identifier", "vendor", "part_number", "serial",
         "vendor_rev", "connector", "fw_version", "cable_byte130", "fw_status",
         "fw_status_detail",
+        # The physical module a port row belongs to ("<device>/<cage>" plus
+        # "/<serial>" when one is printed): the sub-ports of a breakout cage
+        # carry the same value, so rows can be counted per module.
+        "module",
     ),
     # Rendered on request by the LLDP export CGI (lldp_export.py), not
     # published by monitor.sh; registered here so column governance is uniform.
@@ -130,18 +137,36 @@ EXPORT_SCHEMAS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# domain -> the columns whose cells are blank-separated lists of numbers the
+# analyzer wrote itself (lane readings such as "-1.2 -0.9 -1.5", lane
+# numbers).  Only these cells may skip the formula guard, and only while
+# they hold nothing but numbers; see spreadsheet_safe_value.
+NUMERIC_LIST_COLUMNS: dict[str, frozenset[str]] = {
+    "optical": frozenset({
+        "rx_lanes", "tx_lanes", "bias_lanes", "inactive_lanes",
+        "rx_lane_ids", "tx_lane_ids", "bias_lane_ids",
+    }),
+}
+
 
 class ExportContractError(ValueError):
     """Raised when an analyzer violates the export schema registry."""
 
 
 # ---------------------------------------------------------------------------
-# Value/CSV semantics — verbatim ports of lldp.html's displayValue (:582),
-# spreadsheetSafeValue (:2295) and csvField (:2300); shared by every export
-# and by the LLDP export CGI so there is exactly one injection guard.
+# Value/CSV semantics — ports of lldp.html's displayValue,
+# spreadsheetSafeValue and csvField; shared by every export and by the LLDP
+# export CGI so there is exactly one injection guard.  With the default
+# arguments they are verbatim ports: the headless LLDP CSV is promised to be
+# byte-identical to the page's Download CSV, so the default guard must not
+# drift from the page's.  The one exemption (``numeric_list``) is opt-in per
+# column and no LLDP column uses it.
 # ---------------------------------------------------------------------------
 
 _FORMULA_GUARD_RE = re.compile(r"^\s*[=+\-@]")
+# A cell made only of numbers, signs, dots and blanks (a list of lane
+# readings such as "-1.2 -0.9 -1.5") cannot name a function or a command.
+_NUMERIC_LIST_RE = re.compile(r"[0-9+\-. ]+")
 _CSV_QUOTE_RE = re.compile(r'[",\r\n]')
 
 
@@ -155,28 +180,47 @@ def display_value(value: Any) -> str:
     return "N/A" if text.lower() in ("", "none", "n/a") else text
 
 
-def spreadsheet_safe_value(value: Any) -> str:
+def spreadsheet_safe_value(value: Any, numeric_list: bool = False) -> str:
+    """``numeric_list`` marks a cell of a NUMERIC_LIST_COLUMNS column."""
     # Real numbers cannot be formula-injection vectors, and guarding them
     # would corrupt negative telemetry (optical dBm, counter deltas) into
     # apostrophe-prefixed strings.  Only untrusted text gets the guard.
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return display_value(value)
     text = display_value(value)
+    # The guard exists for text a spreadsheet would run; prefixing a list
+    # of negative readings only made its first value unparseable.  Limited
+    # to the columns that hold such lists: everywhere else text that merely
+    # looks numeric (an operator-supplied "-1") keeps the guard, as on the
+    # LLDP page.
+    if (numeric_list and _NUMERIC_LIST_RE.fullmatch(text)
+            and re.search(r"[0-9]", text)):
+        return text
     return f"'{text}" if _FORMULA_GUARD_RE.match(text) else text
 
 
-def csv_field(value: Any) -> str:
-    text = spreadsheet_safe_value(value)
+def csv_field(value: Any, numeric_list: bool = False) -> str:
+    text = spreadsheet_safe_value(value, numeric_list)
     if _CSV_QUOTE_RE.search(text):
         text = '"' + text.replace('"', '""') + '"'
     return text
 
 
-def render_csv(columns: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> str:
-    """RFC-4180 CSV with CRLF line endings and a trailing CRLF."""
+def render_csv(
+    columns: Sequence[str],
+    rows: Sequence[Mapping[str, Any]],
+    numeric_list_columns: Sequence[str] = (),
+) -> str:
+    """RFC-4180 CSV with CRLF line endings and a trailing CRLF.
+
+    ``numeric_list_columns`` names the columns of this domain that hold
+    lists of numbers (NUMERIC_LIST_COLUMNS).
+    """
     lines = [",".join(csv_field(column) for column in columns)]
     for row in rows:
-        lines.append(",".join(csv_field(row.get(column)) for column in columns))
+        lines.append(",".join(
+            csv_field(row.get(column), column in numeric_list_columns)
+            for column in columns))
     return "\r\n".join(lines) + "\r\n"
 
 
@@ -311,7 +355,8 @@ def write_export(
         json_path, hashlib.sha256(json_text.encode("utf-8")).hexdigest()
     )
 
-    csv_text = render_csv(payload["columns"], payload["rows"])
+    csv_text = render_csv(payload["columns"], payload["rows"],
+                          NUMERIC_LIST_COLUMNS.get(domain, ()))
     csv_path = target_dir / f"{stem}.csv"
     _atomic_write(csv_path, csv_text)
     analysis_sidecar.publish_digest(
@@ -323,6 +368,7 @@ __all__ = (
     "EXPORT_SCHEMAS",
     "EXPORT_SUBDIR",
     "ExportContractError",
+    "NUMERIC_LIST_COLUMNS",
     "SCHEMA_VERSION",
     "build_payload",
     "csv_field",

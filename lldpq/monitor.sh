@@ -3142,11 +3142,23 @@ EOF
         fi
 
         : > "$_lldpq_snapshot_dir/interfaces"
+        : > "$_lldpq_snapshot_dir/port-status-interfaces"
         if [ "$_lldpq_link_status" -eq 0 ]; then
-            awk '\''
+            # The inventory is physical ports only, exactly what the sysfs
+            # fallback and the PFC filter below accept: swp<N> and swp<N>s<M>.
+            # A VLAN sub-interface (swp6.100) has no cage and copies the
+            # carrier of its parent, so in the carrier and optical loops it
+            # billed one physical flap once more per sub-interface and cost a
+            # failing DOM read. The Port Status table does list
+            # sub-interfaces with their description; it keeps its own, wider
+            # list.
+            awk -v port_status="$_lldpq_snapshot_dir/port-status-interfaces" '\''
                 function emit() {
-                    if (name ~ /^swp[0-9]+[s0-9]*/) {
+                    if (name ~ /^swp[0-9]+(s[0-9]+)?$/) {
                         print name
+                    }
+                    if (name ~ /^swp[0-9]+[s0-9]*/) {
+                        print name > port_status
                     }
                 }
                 /^[0-9]+: / {
@@ -3175,6 +3187,10 @@ EOF
                 esac
                 printf "%s\n" "$_lldpq_interface_name" \
                     >> "$_lldpq_snapshot_dir/interfaces"
+                # The fallback recovers physical ports only; the Port Status
+                # table lists the same names here, as it always did.
+                printf "%s\n" "$_lldpq_interface_name" \
+                    >> "$_lldpq_snapshot_dir/port-status-interfaces"
             done
             if [ -s "$_lldpq_snapshot_dir/interfaces" ]; then
                 _lldpq_link_status=0
@@ -3199,6 +3215,8 @@ EOF
             printf "%s|%s\n" "$_lldpq_alias_name" "$_lldpq_alias" \
                 >> "$_lldpq_snapshot_dir/ifalias"
         done
+        sort -V "$_lldpq_snapshot_dir/port-status-interfaces" \
+            > "$_lldpq_snapshot_dir/port-status-interfaces-sorted"
         while IFS= read -r _lldpq_alias_name; do
             [ -n "$_lldpq_alias_name" ] || continue
             _lldpq_alias=""
@@ -3206,7 +3224,7 @@ EOF
                 < "$_lldpq_net_class_root/${_lldpq_alias_name}/ifalias" 2>/dev/null || _lldpq_alias=""
             printf "%s|%s\n" "$_lldpq_alias_name" "$_lldpq_alias" \
                 >> "$_lldpq_snapshot_dir/swp-ifalias"
-        done < "$_lldpq_snapshot_dir/interfaces-sorted"
+        done < "$_lldpq_snapshot_dir/port-status-interfaces-sorted"
         awk -F"|" '\''
             {
                 name=$1
@@ -3781,13 +3799,48 @@ EOF
                     fi
                     IFS= read -r state < "$_lldpq_net_class_root/$interface/operstate" 2>/dev/null || state="unknown"
                     echo "Interface state: ${state:-unknown}"
-                    # A bond, VLAN or loopback has no cage to read. Testing for
-                    # a backing device keeps the sweep generic instead of
-                    # matching interface-name conventions.
+                    # The cage is the unit of a DOM read: every swp<N>s<M> of
+                    # one cage answers from the same module EEPROM. The first
+                    # sibling to be read files the outcome under the cage and
+                    # the others replay it at their own turn, wherever they
+                    # sit in the sweep (link-up ports are read first). Read
+                    # per sibling, one hung module in a 4x or 8x cage was four
+                    # consecutive timeouts on its own and aborted the section
+                    # for the whole device.
+                    _optical_cage_file=""
+                    _optical_cage_result=""
+                    case "$interface" in
+                        swp[0-9]*s[0-9]*)
+                            _optical_cage_file="$_lldpq_snapshot_dir/optical-cage-${interface%s[0-9]*}"
+                            if [ -e "$_optical_cage_file.status" ]; then
+                                IFS= read -r _optical_cage_result < "$_optical_cage_file.status" 2>/dev/null || _optical_cage_result=""
+                            fi
+                            ;;
+                    esac
+                    # A link-down port is read only when it has a backing
+                    # device. A filed cage outcome needs no read, so it also
+                    # opens the gate: a link-down sibling without that device
+                    # link must not print "No transceiver data" for a module
+                    # its link-up sibling has just read or seen time out.
+                    _optical_gate=closed
                     if [ "$state" = "up" ] || [ -e "$_lldpq_net_class_root/$interface/device" ]; then
+                        _optical_gate=open
+                    elif [ -n "$_optical_cage_result" ]; then
+                        _optical_gate=open
+                    fi
+                    if [ "$_optical_gate" = "open" ]; then
                         if [ "$_optical_has_timeout" = "true" ]; then
                             _optical_remaining=$((_optical_deadline - $(date +%s)))
-                            if [ "$_optical_abort" = "true" ] || [ "$_optical_remaining" -le 0 ]; then
+                            if [ -n "$_optical_cage_result" ]; then
+                                # No module access: a replay needs no budget
+                                # and adds nothing to the timeout streak or
+                                # to the failed-read time, so a cage counts
+                                # once in both guards.
+                                if [ "$_optical_cage_result" = "timeout" ]; then
+                                    echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
+                                fi
+                                ethtool_output=$(cat "$_optical_cage_file.output" 2>/dev/null)
+                            elif [ "$_optical_abort" = "true" ] || [ "$_optical_remaining" -le 0 ]; then
                                 # A current report must never silently omit
                                 # the unvisited tail.  Keep every unvisited
                                 # port as explicit partial optical coverage,
@@ -3801,9 +3854,39 @@ EOF
                                     _optical_limit=$_optical_remaining
                                 fi
                                 _optical_read_started=$(date +%s)
-                                ethtool_output=$(timeout -k 1s "${_optical_limit}s" \
-                                    sudo ethtool -m "$interface" 2>/dev/null)
-                                _optical_status=$?
+                                for _optical_ask in first second; do
+                                    ethtool_output=$(timeout -k 1s "${_optical_limit}s" \
+                                        sudo ethtool -m "$interface" 2>/dev/null)
+                                    _optical_status=$?
+                                    if [ "$_optical_ask" = "second" ] ||
+                                       [ -z "$_optical_cage_file" ] ||
+                                       [ -n "$ethtool_output" ] ||
+                                       [ "$_optical_status" -eq 0 ] ||
+                                       [ "$_optical_status" -eq 124 ] ||
+                                       [ "$_optical_status" -eq 137 ]; then
+                                        break
+                                    fi
+                                    # The answer of this one read is filed for
+                                    # every sibling of the cage. An instant
+                                    # error without data is what an empty cage
+                                    # returns, but also what a transient EEPROM
+                                    # access error looks like; while each
+                                    # sibling read for itself, the next one
+                                    # simply got the dump. Ask once more before
+                                    # the whole cage is filed as holding no
+                                    # transceiver: a link-down sibling without
+                                    # data reads as an unplugged module. A read
+                                    # that crawled before it failed is not
+                                    # repeated, so a cage still counts once in
+                                    # the failed-read time.
+                                    _optical_now=$(date +%s)
+                                    [ $((_optical_now - _optical_read_started)) -le 1 ] || break
+                                    _optical_remaining=$((_optical_deadline - _optical_now))
+                                    if [ "$_optical_remaining" -lt "$_optical_limit" ]; then
+                                        _optical_limit=$_optical_remaining
+                                    fi
+                                    [ "$_optical_limit" -gt 0 ] || break
+                                done
                                 if [ "$_optical_status" -eq 124 ] || \
                                    [ "$_optical_status" -eq 137 ]; then
                                     # CMIS/EEPROM access can transiently collide
@@ -3831,6 +3914,7 @@ EOF
                                     fi
                                     if [ "$_optical_status" -ne 0 ]; then
                                         echo "__LLDPQ_COLLECTION_ERROR__:OPTICAL_TIMEOUT:${interface}"
+                                        _optical_cage_result=timeout
                                     fi
                                 fi
                                 if [ "$_optical_status" -eq 0 ] && [ -n "$ethtool_output" ]; then
@@ -3845,6 +3929,25 @@ EOF
                                        [ "$_optical_failed_spent" -ge "$_optical_failed_spent_limit" ]; then
                                         _optical_abort=true
                                     fi
+                                fi
+                                if [ -n "$_optical_cage_file" ] &&
+                                   [ "$_optical_cage_result" = "timeout" ] &&
+                                   [ "$_optical_limit" -lt "$OPTICAL_PORT_TIMEOUT_SECONDS" ]; then
+                                    # The remaining budget cut the read short:
+                                    # the module never had its full per-port
+                                    # time, so the timeout says nothing about
+                                    # it. Nothing is filed; the budget is
+                                    # spent, and the siblings are reported as
+                                    # unvisited by the branch above.
+                                    :
+                                elif [ -n "$_optical_cage_file" ]; then
+                                    # File what this sibling is about to
+                                    # print: the dump (empty stands for no
+                                    # transceiver data) and whether the read
+                                    # timed out. The status is written last so
+                                    # a failed write leaves the cage unread.
+                                    printf "%s\n" "$ethtool_output" > "$_optical_cage_file.output" &&
+                                        echo "${_optical_cage_result:-read}" > "$_optical_cage_file.status"
                                 fi
                             fi
                         else

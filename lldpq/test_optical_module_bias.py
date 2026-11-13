@@ -155,7 +155,8 @@ class OpticalModuleBiasTests(unittest.TestCase):
         stats = self.grade(sample(
             {1: 339}, flags={(1, "high_alarm"): True}
         ))
-        self.assertEqual(stats["health_status"], "critical")
+        # CMIS dump: a flag with the value inside the limit is a warning.
+        self.assertEqual(stats["health_status"], "warning")
 
     def test_sff_non_channel_flags_are_not_lost(self):
         output = sample({1: 30}, limits=None).replace(
@@ -228,8 +229,9 @@ class OpticalModuleBiasTests(unittest.TestCase):
         flags = {(lane, "high_alarm"): lane == 8 for lane in range(1, 9)}
         stats = self.grade(sample({8: 339}, flags=flags), "switch-a:swp61s0")
         self.assertEqual(stats["bias_current_lane_ids"], [8])
-        self.assertEqual(stats["health_status"], "critical")
-        self.assertEqual(stats["bias_assessment"]["status"], "critical")
+        # CMIS dump: a flag with the value inside the limit is a warning.
+        self.assertEqual(stats["health_status"], "warning")
+        self.assertEqual(stats["bias_assessment"]["status"], "warning")
         self.assertEqual(stats["bias_assessment"]["events"][0]["lane"], 8)
 
     def test_flags_only_breakout_does_not_inherit_another_lanes_alarm(self):

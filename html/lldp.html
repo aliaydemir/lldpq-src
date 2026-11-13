@@ -1123,6 +1123,7 @@
         // file (or the transceiver inventory) is absent.
         let p2pDesignStatus = 'loading';   // 'loading' | 'ready' | 'absent'
         let p2pIndex = new Map();          // deviceKey | portAlias -> design side entry
+        let p2pDesign = null;              // design behind p2pIndex, re-fitted to each new report
         let deviceLocationsStatus = 'loading';
         let deviceLocations = Object.create(null);
         let deviceLocationsGeneration = 0;
@@ -1257,56 +1258,210 @@
             return null;
         }
 
-        // Group-fitted OS spelling for three-part 'X/Y/Z' design ports (mirrors
-        // ai_p2p.resolve_port_map): lane = (Y-1)*maxZ + (Z-1), with maxZ (subs
-        // per group) inferred from all design rows sharing the same device+port.
-        // '1/1/1'..'1/2/4' therefore resolve to swp1s0..swp1s7 (8x split).
-        function resolvePortMapJs(records) {
+        // Group-fitted OS spelling for three-part 'X/Y/Z' design ports. This is
+        // the browser mirror of ai_p2p.resolve_port_map (keep both in step; the
+        // same table of cases runs through both): lane = (Y-1)*W + (Z-1), where
+        // W (subs per group) is decided per port, so a switch may mix widths:
+        // the port's own rows when only one breakout fits them ('1/1/1'..'1/2/4'
+        // can only be 8x: swp1s0..swp1s7), else the live sub-ports of swpX,
+        // else the widest sub of any three-part port on the device.
+        const BREAKOUT_STEPS = [1, 2, 4, 8];   // a cage is split 2x, 4x or 8x
+        function breakoutStepJs(count) {
+            for (const step of BREAKOUT_STEPS) if (step >= count) return step;
+            return 0;
+        }
+        // Device key of the breakout fit, built over the known device names
+        // (mirror of ai_p2p._breakout_device_key). A name is its lowercase
+        // spelling; a dotted name folds to its first label when that bare
+        // label is itself a known device or when no other known name shares
+        // it, so 'leaf-01.example.com' and 'LEAF-01' are one switch while
+        // 'leaf-01.site-a' and 'leaf-01.site-b' stay two.
+        function p2pDeviceKeyFnJs(names) {
+            const bare = new Set(), claims = new Map();
+            (names || []).forEach(name => {
+                const low = String(name == null ? '' : name).trim().toLowerCase();
+                if (low.indexOf('.') > -1) {
+                    const short = low.split('.')[0];
+                    if (!claims.has(short)) claims.set(short, new Set());
+                    claims.get(short).add(low);
+                } else if (low) {
+                    bare.add(low);
+                }
+            });
+            return name => {
+                const low = String(name == null ? '' : name).trim().toLowerCase();
+                if (low.indexOf('.') === -1) return low;
+                const short = low.split('.')[0];
+                const sharing = claims.has(short) ? claims.get(short).size : 0;
+                return (!short || bare.has(short) || sharing <= 1) ? short : low;
+            };
+        }
+        // livePorts: { device: [interface names] } (or a map keyed by them).
+        // -> Map(deviceKey -> Map(port number -> highest live sub-port index)),
+        // -1 = swpX itself is live (unsplit).
+        function livePortIndexJs(livePorts, deviceKey) {
+            const index = new Map();
+            if (!livePorts || typeof livePorts !== 'object' || Array.isArray(livePorts)) return index;
+            Object.keys(livePorts).forEach(name => {
+                const dev = deviceKey(name);
+                const ports = livePorts[name];
+                if (!dev || !ports || typeof ports !== 'object') return;
+                if (!index.has(dev)) index.set(dev, new Map());
+                const perPort = index.get(dev);
+                (Array.isArray(ports) ? ports : Object.keys(ports)).forEach(port => {
+                    const m = String(port).trim().toLowerCase().match(/^swp(\d+)(?:s(\d+))?$/);
+                    if (!m) return;
+                    const base = parseInt(m[1], 10);
+                    const sub = m[2] === undefined ? -1 : parseInt(m[2], 10);
+                    perPort.set(base, Math.max(perPort.has(base) ? perPort.get(base) : -1, sub));
+                });
+            });
+            return index;
+        }
+        // ownY / ownZ: highest group and sub the port's own rows use; liveTop:
+        // highest live sub-port index of swpX (null = none known, -1 = unsplit).
+        // -> { width: sub-ports per group, guess: nothing proves that width }.
+        function subsPerGroupJs(ownY, ownZ, liveTop, deviceZ) {
+            if (ownY === 1) return { width: ownZ, guess: false };   // lane = Z-1 for any width
+            const groups = breakoutStepJs(ownY);
+            const fitting = BREAKOUT_STEPS.filter(w => groups && w >= ownZ && groups * w <= 8);
+            if (fitting.length === 1) return { width: fitting[0], guess: false };
+            // A live swpXsN proves at least N+1 sub-ports. The report rows are a
+            // partial inventory, so use the highest index rounded up to a
+            // breakout size, never the number of names.
+            const total = liveTop !== null && liveTop >= 0 ? breakoutStepJs(liveTop + 1) : 0;
+            if (total && groups && total % groups === 0 && total / groups >= ownZ) {
+                // The live count settles the width only for the groups the
+                // rows show: rows reaching group 2 of a port with 4 or 8
+                // sub-ports are two groups of two/four (used here) or the
+                // first legs of a design written with one group per leg.
+                const others = BREAKOUT_STEPS.filter(more =>
+                    more > groups && total % more === 0 && total / more >= ownZ);
+                return { width: total / groups, guess: others.length > 0 };
+            }
+            // Borrowed from the widest three-part port of the device.
+            return { width: deviceZ, guess: deviceZ !== ownZ };
+        }
+        // -> Map('deviceKey|design port' -> OS name). Its .guessed Set holds the
+        // keys whose name rests on a width nothing proves (rows beyond group 1
+        // of such a port), as ai_p2p._guessed_ports does.
+        function resolvePortMapJs(records, livePorts) {
             const groups = new Map();
-            records.forEach(rec => {
-                if (!rec || typeof rec !== 'object') return;
+            const deviceMaxZ = new Map();
+            const rows = (records || []).filter(rec => rec && typeof rec === 'object');
+            const names = [];
+            rows.forEach(rec => names.push(rec.source_name, rec.dest_name));
+            if (livePorts && typeof livePorts === 'object' && !Array.isArray(livePorts)) {
+                Object.keys(livePorts).forEach(name => names.push(name));
+            }
+            const deviceKey = p2pDeviceKeyFnJs(names);
+            rows.forEach(rec => {
                 ['source', 'dest'].forEach(loc => {
-                    const dev = String(rec[loc + '_name'] == null ? '' : rec[loc + '_name']).trim().toLowerCase();
+                    const dev = deviceKey(rec[loc + '_name']);
                     const p = cleanPortValue(rec[loc + '_port']).toLowerCase().replace(/\s+/g, '');
                     const m = p.match(/^(\d+)\/(\d+)\/(\d+)$/);
                     if (!dev || !m) return;
-                    const key = dev + '|' + m[1];
-                    if (!groups.has(key)) groups.set(key, []);
-                    groups.get(key).push({ x: m[1], y: parseInt(m[2], 10), z: parseInt(m[3], 10), dev: dev, port: p });
+                    const x = parseInt(m[1], 10), y = parseInt(m[2], 10), z = parseInt(m[3], 10);
+                    const key = dev + '|' + x;
+                    if (!groups.has(key)) groups.set(key, { dev: dev, x: x, entries: [] });
+                    groups.get(key).entries.push({ y: y, z: z, port: p });
+                    deviceMaxZ.set(dev, Math.max(deviceMaxZ.get(dev) || 1, z));
                 });
             });
-            // Subs-per-group comes from the device, not the single port: a port
-            // may leave trailing lanes uncabled while the breakout type stays
-            // uniform per switch (mirrors ai_p2p.resolve_port_map).
-            const deviceMaxZ = new Map();
-            groups.forEach(list => list.forEach(e => {
-                deviceMaxZ.set(e.dev, Math.max(deviceMaxZ.get(e.dev) || 1, e.z));
-            }));
+            const live = livePortIndexJs(livePorts, deviceKey);
             const resolved = new Map();
-            groups.forEach(list => {
-                list.forEach(e => {
-                    const maxZ = deviceMaxZ.get(e.dev) || 1;
-                    resolved.set(e.dev + '|' + e.port,
-                        'swp' + e.x + 's' + ((e.y - 1) * maxZ + (e.z - 1)));
+            resolved.guessed = new Set();
+            groups.forEach(group => {
+                const ownY = Math.max.apply(null, group.entries.map(e => e.y));
+                const ownZ = Math.max.apply(null, group.entries.map(e => e.z));
+                const devLive = live.get(group.dev);
+                const liveTop = devLive && devLive.has(group.x) ? devLive.get(group.x) : null;
+                const fit = subsPerGroupJs(ownY, ownZ, liveTop, deviceMaxZ.get(group.dev));
+                // An unsplit port written X/1/1: the switch has swpX, not swpXs0.
+                const whole = liveTop === -1 && ownY === 1 && ownZ === 1;
+                group.entries.forEach(e => {
+                    const key = group.dev + '|' + e.port;
+                    resolved.set(key, whole ? 'swp' + group.x
+                        : 'swp' + group.x + 's' + ((e.y - 1) * fit.width + (e.z - 1)));
+                    if (fit.guess && e.y > 1) resolved.guessed.add(key);
                 });
             });
             return resolved;
         }
-        function resolvedOsPortJs(map, dev, port) {
-            const d = String(dev == null ? '' : dev).trim().toLowerCase();
+        // The map is keyed by the full name only for FQDNs that share their
+        // first label with another device, else by the short name: the exact
+        // spelling answers first, then the first label.
+        function resolvedKeyJs(map, dev, port) {
             const p = cleanPortValue(port).toLowerCase().replace(/\s+/g, '');
-            return (d && p && map.get(d + '|' + p)) || '';
+            if (!p) return '';
+            const low = String(dev == null ? '' : dev).trim().toLowerCase();
+            const names = low.indexOf('.') > -1 ? [low, low.split('.')[0]] : [low];
+            for (const name of names) {
+                if (name && map.has(name + '|' + p)) return name + '|' + p;
+            }
+            return '';
+        }
+        function resolvedOsPortJs(map, dev, port) {
+            const key = resolvedKeyJs(map, dev, port);
+            return key ? map.get(key) : '';
+        }
+        // Live interface inventory for the breakout fit, read from the report
+        // itself: a row's own port when the switch reports a link state or a
+        // neighbor on it (an expected-only row can name a port the switch does
+        // not have), plus the far-end port every discovered neighbor names.
+        // Keyed by the live name and by what display aliases call the device,
+        // never by the bare first label of a dotted name: the resolver would
+        // take that label as proof that two FQDN hosts sharing it are one
+        // switch (see p2pDeviceKeyFnJs).
+        function livePortInventoryJs(connections) {
+            const sets = new Map();
+            const keyCache = new Map();
+            const namesOf = device => {
+                const low = String(device).trim().toLowerCase();
+                const names = new Set([low]);
+                // An alias may be recorded under the short name of an FQDN host.
+                [low, low.split('.')[0]].forEach(key => {
+                    const fwd = deviceAliasLc[key];
+                    [fwd ? String(fwd).trim().toLowerCase() : '', deviceAliasRevLc[key] || '']
+                        .forEach(mapped => { if (mapped) names.add(mapped); });
+                });
+                return Array.from(names);
+            };
+            const add = (device, port) => {
+                if (isMissingValue(device) || isMissingValue(port)) return;
+                if (!keyCache.has(device)) keyCache.set(device, namesOf(device));
+                keyCache.get(device).forEach(key => {
+                    if (!sets.has(key)) sets.set(key, new Set());
+                    sets.get(key).add(String(port).trim());
+                });
+            };
+            (connections || []).forEach(conn => {
+                const seen = !isMissingValue(conn.actualDevice) && !isMissingValue(conn.actualPort);
+                // Port-Status is N/A for a port the switch did not list.
+                if (seen || ['UP', 'DOWN', 'UNKNOWN'].includes(conn.portStatus)) {
+                    add(conn.localDevice, conn.localPort);
+                }
+                if (seen) add(conn.actualDevice, conn.actualPort);
+            });
+            const inventory = Object.create(null);
+            sets.forEach((ports, key) => { inventory[key] = Array.from(ports); });
+            return inventory;
         }
         function makeP2pEntry(rec, loc, peer, resolvedMap) {
             const dev = rec[loc + '_name'], port = rec[loc + '_port'];
             if (isMissingValue(dev) || isMissingValue(port)) return null;
+            const localKey = resolvedKeyJs(resolvedMap, dev, port);
+            const peerKey = resolvedKeyJs(resolvedMap, rec[peer + '_name'], rec[peer + '_port']);
             return {
                 local_device: dev, local_port: port,
-                local_port_os: resolvedOsPortJs(resolvedMap, dev, port),
+                local_port_os: localKey ? resolvedMap.get(localKey) : '',
+                // true: the fitted name rests on a width nothing proves.
+                local_port_guess: !!localKey && resolvedMap.guessed.has(localKey),
                 local_rack: rec[loc + '_rack'] || '', local_ru: rec[loc + '_ru'] || '',
                 local_transceiver: rec[loc + '_transceiver'] || '',
                 peer_device: rec[peer + '_name'] || '', peer_port: rec[peer + '_port'] || '',
-                peer_port_os: resolvedOsPortJs(resolvedMap, rec[peer + '_name'], rec[peer + '_port']),
+                peer_port_os: peerKey ? resolvedMap.get(peerKey) : '',
+                peer_port_guess: !!peerKey && resolvedMap.guessed.has(peerKey),
                 peer_rack: rec[peer + '_rack'] || '', peer_ru: rec[peer + '_ru'] || '',
                 peer_transceiver: rec[peer + '_transceiver'] || '',
                 seq: rec.seq || '', bundle_id: rec.bundle_id || '',
@@ -1318,10 +1473,11 @@
             };
         }
         function buildP2pIndex(design) {
+            p2pDesign = design;
             p2pIndex = new Map();
             const records = design && Array.isArray(design.connections) ? design.connections
                 : (Array.isArray(design) ? design : []);
-            const resolvedMap = resolvePortMapJs(records);
+            const resolvedMap = resolvePortMapJs(records, livePortInventoryJs(allConnections));
             const entries = [];
             records.forEach(rec => {
                 if (rec && typeof rec === 'object') {
@@ -1331,12 +1487,40 @@
                     if (b) entries.push(b);
                 }
             });
-            // Precise keys first: the group-fitted OS spelling must win over the
-            // ambiguous per-port candidate aliases of other lanes on the same port.
+            // The first writer of a device|port key wins, in the order of
+            // ai_p2p.build_port_index (keep both in step):
+            // 1. fitted OS spellings of three-part ports that rest on evidence;
             entries.forEach(e => {
-                if (e.local_port_os) indexByDevicePort(p2pIndex, e.local_device, e.local_port_os, e);
+                if (e.local_port_os && !e.local_port_guess) {
+                    indexByDevicePort(p2pIndex, e.local_device, e.local_port_os, e);
+                }
             });
-            entries.forEach(e => indexByDevicePort(p2pIndex, e.local_device, e.local_port, e));
+            // 2. design ports that need no fitting, under their tolerant aliases;
+            entries.forEach(e => {
+                if (!e.local_port_os) indexByDevicePort(p2pIndex, e.local_device, e.local_port, e);
+            });
+            // 3. fitted spellings that are a guess: they must not take a port
+            //    from a row that names it outright;
+            entries.forEach(e => {
+                if (e.local_port_os && e.local_port_guess) {
+                    indexByDevicePort(p2pIndex, e.local_device, e.local_port_os, e);
+                }
+            });
+            // 4. the design text of three-part ports: only the exact text when
+            //    the spelling is firm (its other candidate lanes are other legs
+            //    of the port, so a cable on one of them is not this record),
+            //    every tolerant alias when it is a guess.
+            entries.forEach(e => {
+                if (!e.local_port_os) return;
+                if (e.local_port_guess) {
+                    indexByDevicePort(p2pIndex, e.local_device, e.local_port, e);
+                    return;
+                }
+                const exact = cleanPortValue(e.local_port).toLowerCase().replace(/\s+/g, '');
+                deviceKeysJs(e.local_device).forEach(dk => {
+                    if (!p2pIndex.has(dk + '|' + exact)) p2pIndex.set(dk + '|' + exact, e);
+                });
+            });
         }
         function buildXcvrIndex(modules) {
             xcvrIndex = new Map();
@@ -1446,11 +1630,16 @@
                 return { code: 'mismatch', label: 'Mismatch', badge: 'badge-red',
                     reason: `No live neighbor discovered; design expects ${expected}.`, design: d };
             }
-            // Prefer the group-fitted OS spelling (exact breakout lane), but keep
-            // the tolerant raw-notation match as a fallback so an unusual split
-            // scheme degrades to tolerance instead of a false mismatch.
-            const peerPortOk = (d.peer_port_os && portsMatch(d.peer_port_os, conn.actualPort))
-                || portsMatch(d.peer_port, conn.actualPort);
+            // The group-fitted OS spelling names one breakout lane, so when it
+            // is resolved it alone decides: the tolerant raw-notation match
+            // accepts every candidate lane of 'X/Y/Z' and would show a neighbor
+            // on the wrong leg as Match. Tolerance stays for unresolved ports
+            // and for a fitted name that is only a guess (peer_port_guess): a
+            // correctly cabled port must not turn red on an unproven width.
+            const peerPortOk = d.peer_port_os
+                ? portsMatch(d.peer_port_os, conn.actualPort)
+                    || (d.peer_port_guess && portsMatch(d.peer_port, conn.actualPort))
+                : portsMatch(d.peer_port, conn.actualPort);
             if (devicesMatch(d.peer_device, conn.actualDevice) && peerPortOk) {
                 return { code: 'match', label: 'Match', badge: 'badge-green',
                     reason: 'Live neighbor matches the active design.', design: d };
@@ -1747,6 +1936,9 @@
 
             // Store all connections for filtering
             allConnections = connections;
+            // The design join fits breakout sub-ports to the live ports of the
+            // report, so a new report re-fits the design that is already loaded.
+            if (p2pDesignStatus === 'ready') buildP2pIndex(p2pDesign);
 
             // Count by status
             totalConnections = 0;

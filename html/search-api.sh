@@ -880,6 +880,7 @@ get_lldp_neighbors() {
     # Keep SSH output on stdin so device-controlled text is never Python source.
     printf '%s' "$ssh_output" | python3 /dev/fd/3 "$search" 3<<'PYTHON'
 import json
+import re
 import sys
 
 output = sys.stdin.read()
@@ -947,8 +948,15 @@ try:
                                 search in str(mgmt_ip).lower()):
                             entries.append(entry)
     
-    # Sort by local port
-    entries.sort(key=lambda x: x['local_port'])
+    # Sort by local port in natural order (swp1, swp1s0, swp2, swp10). The
+    # split alternates text and digit runs, so every position compares
+    # text with text or number with number. Text compares without case, and
+    # a name that is not a string (null, a number) sorts as its text.
+    entries.sort(key=lambda x: [
+        int(part) if index % 2 else part.lower()
+        for index, part in enumerate(
+            re.split(r'([0-9]+)', str(x['local_port'] if x['local_port'] is not None else '')))
+    ])
     
 except (json.JSONDecodeError, TypeError, ValueError, AttributeError) as exc:
     print(json.dumps({"success": False, "error": f"Invalid LLDP response: {exc}"}))

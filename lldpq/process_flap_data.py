@@ -8,6 +8,7 @@ Licensed under MIT License - see LICENSE file for details
 """
 
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -27,6 +28,28 @@ try:
 except Exception:
     def canonical(_n):
         return _n
+
+# Every per-port state map of the analyzer. A port leaves all of them
+# together: a key left behind in one map keeps the port alive in the report
+# (carrier_transitions_stats) or revives its old baseline (prev_cumulative).
+_PORT_STATE_MAPS = (
+    "flapping_hist", "carrier_transitions_lookback", "prev_cumulative",
+    "prev_sample_time", "carrier_transitions_stats",
+    "pending_transition_start", "absent_since",
+)
+
+def _is_subinterface(interface):
+    """A VLAN sub-interface (swp6.100) copies its parent's carrier state.
+
+    Its carrier_changes counter moves with the parent's, so one physical flap
+    would be billed once more per sub-interface. Whatever the file holds it
+    is never a flap port: no row, no event and no baseline.
+
+    Only an interface name followed by VLAN ids qualifies (swp6.100,
+    swp1s0.300, bond1.100.200). Any other text with a dot in it is a damaged
+    row and must stay one, so that it still marks the collection incomplete.
+    """
+    return re.fullmatch(r'[A-Za-z][\w-]*(?:\.\d+)+', interface) is not None
 
 def _flap_rate_text(flap_analyzer, port_info):
     """Describe the value the severity was actually graded from.
@@ -81,11 +104,7 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                     return False
 
         active_hosts = set(statuses)
-        for attribute in (
-            "flapping_hist", "carrier_transitions_lookback", "prev_cumulative",
-            "prev_sample_time", "carrier_transitions_stats",
-            "pending_transition_start",
-        ):
+        for attribute in _PORT_STATE_MAPS:
             values = getattr(flap_analyzer, attribute, {})
             for port_name in list(values):
                 if port_name.split(":", 1)[0] not in active_hosts:
@@ -123,6 +142,19 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
         print("No current carrier transition collections found")
         print("Publishing flap report with unavailable device coverage")
     
+    # Persisted ports per host, indexed once before this cycle's samples so
+    # the removed-port prune below stays linear in the number of ports.
+    port_state_maps = [
+        getattr(flap_analyzer, attribute, {}) for attribute in _PORT_STATE_MAPS
+    ]
+    persisted_ports = {}
+    for port_name in set().union(*port_state_maps):
+        port_host, separator, port_interface = port_name.partition(":")
+        if separator:
+            persisted_ports.setdefault(port_host, []).append(
+                (port_name, port_interface)
+            )
+
     processed_devices = 0
     category_failed_hosts = set()
     processed_hosts = set()
@@ -144,24 +176,38 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
             continue
 
         processed_interfaces = 0
+        # Ports this file names, and whether it can be trusted as the host's
+        # whole inventory (no collection-error marker, no malformed row).
+        present_interfaces = set()
+        file_complete = True
         for line in content.splitlines():
             if not line or line.startswith("==="):
                 continue
             if line == "__LLDPQ_COLLECTION_ERROR__:LINK_INVENTORY":
                 print(f"Device collection error in {filename}: {line}")
                 category_failed_hosts.add(hostname)
+                file_complete = False
                 continue
             if "__LLDPQ_COLLECTION_ERROR__:" in line:
                 print(f"Unknown device collection error in {filename}: {line}")
                 category_failed_hosts.add(hostname)
+                file_complete = False
                 continue
             if ":" not in line:
                 print(f"Invalid carrier transition row in {filename}: {line}")
                 category_failed_hosts.add(hostname)
+                file_complete = False
                 continue
             interface, transitions_str = line.split(":", 1)
             interface = interface.strip()
             transitions_str = transitions_str.strip()
+            if _is_subinterface(interface):
+                # Files collected before the collector stopped listing them
+                # (or by an older collector) still carry these rows. Not a
+                # port and not a collection problem: the row is ignored and
+                # the name stays out of present_interfaces, so the rows it
+                # already has in the persisted history are pruned below.
+                continue
             if transitions_str == "unavailable":
                 # The switch could not read this port's counter. Skipping the
                 # sample keeps the persisted baseline intact; treating it as 0
@@ -172,21 +218,72 @@ def process_carrier_transition_files(data_dir="monitor-results/flap-data"):
                     "keeping the previous baseline"
                 )
                 category_failed_hosts.add(hostname)
+                # The port exists; only its counter could not be read.
+                if interface:
+                    present_interfaces.add(interface)
+                else:
+                    file_complete = False
                 continue
             try:
                 transitions = int(transitions_str)
             except ValueError:
                 print(f"Invalid transition count '{transitions_str}' for {interface}")
                 category_failed_hosts.add(hostname)
+                file_complete = False
                 continue
             if not interface or transitions < 0:
                 print(f"Invalid carrier transition row in {filename}: {line}")
                 category_failed_hosts.add(hostname)
+                file_complete = False
                 continue
             flap_analyzer.update_carrier_transitions(
                 f"{hostname}:{interface}", transitions
             )
+            present_interfaces.add(interface)
             processed_interfaces += 1
+        # A port this file names is not absent, whatever an earlier listing
+        # said about it.
+        for interface in present_interfaces:
+            flap_analyzer.absent_since.pop(f"{hostname}:{interface}", None)
+        # A complete file is the authority on which ports exist: the collector
+        # writes a row (a count or 'unavailable') for every inventory entry,
+        # so a persisted port the file no longer names was removed or renamed
+        # (breakout reconfiguration, deleted sub-interface), not missed by a
+        # failed read. An incomplete file, or one that names no port at all,
+        # must not prune anything.
+        #
+        # One listing is not proof yet: while switchd restarts or a breakout
+        # is applied the switch lists fewer ports for a moment, and dropping
+        # them then would erase a WARNING/CRITICAL flap state for good and
+        # report a recovery that never happened. A port is forgotten only
+        # when the next complete file does not name it either; a
+        # sub-interface is never a port and goes at once.
+        if file_complete and present_interfaces:
+            removed_ports = []
+            unconfirmed_ports = 0
+            for port_name, port_interface in persisted_ports.get(hostname, ()):
+                if port_interface in present_interfaces:
+                    continue
+                if (port_name in flap_analyzer.absent_since
+                        or _is_subinterface(port_interface)):
+                    removed_ports.append(port_name)
+                else:
+                    flap_analyzer.absent_since[port_name] = time.time()
+                    unconfirmed_ports += 1
+            for port_name in removed_ports:
+                for values in port_state_maps:
+                    values.pop(port_name, None)
+            if removed_ports:
+                print(
+                    f"Removed {len(removed_ports)} port(s) no longer present "
+                    f"on {hostname} from the flap history"
+                )
+            if unconfirmed_ports:
+                print(
+                    f"{unconfirmed_ports} port(s) of {hostname} are missing "
+                    "from this carrier listing; kept until the next complete "
+                    "collection confirms it"
+                )
         if processed_interfaces == 0:
             if hostname not in category_failed_hosts:
                 print(f"No carrier transition rows found for current host {hostname}")

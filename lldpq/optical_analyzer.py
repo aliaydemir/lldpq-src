@@ -14,6 +14,7 @@ import re
 import os
 import math
 import html
+import multiprocessing
 import tempfile
 
 import analysis_sidecar
@@ -45,15 +46,29 @@ DEFERRED_ROW_SENTINEL = "<!--=lldpq-row=-->"
 INLINE_ROW_CAP = 5000
 
 # Per-port evidence the expandable rows render (raw sample, lane identities,
-# the lanes grading set aside).  It is rebuilt from every collection and no
-# shard consumer reads it, so it stays out of the persisted current snapshot.
+# the lanes grading set aside, the module limits that graded the port, the
+# monitors the module does not implement, the collected link state, the
+# note of a row without readings and what a link-down row is read with: the
+# lanes whose laser is driven, whether the module shows transmit light on
+# any channel, the lane count its media declares).  It is rebuilt from every
+# collection and no shard consumer reads it, so it stays out of the
+# persisted current snapshot.
 SIDECAR_ONLY_STAT_KEYS = frozenset({
     "raw_data",
     "rx_power_lane_ids",
     "tx_power_lane_ids",
     "bias_current_lane_ids",
     "inactive_lanes",
+    "module_limits",
+    "not_monitored",
+    "link_state",
+    "note",
+    "lane_evidence",
 })
+
+# notifications.yaml files whose unusable optical margin was already
+# reported: one run builds several analyzers and the message is wanted once.
+_REPORTED_IGNORED_MARGINS = set()
 
 try:
     import yaml
@@ -148,6 +163,63 @@ class OpticalAnalyzer:
         "voltage_max_v": 3.6,           # Maximum supply voltage
         "link_margin_min_db": 3.0       # Minimum acceptable link margin
     }
+    # The limits a module prints for itself (``ethtool -m``), lowest first.
+    # RX power, TX power, temperature and voltage are each graded by the
+    # module's own table when all four are present and consistent; the
+    # generic values above then stay out of that metric.
+    MODULE_LIMIT_KEYS = ('low_alarm', 'low_warning', 'high_warning', 'high_alarm')
+    MODULE_LIMIT_METRICS = ('rx_power', 'tx_power', 'temperature', 'voltage')
+    # A table grades a metric only when its limits are physically plausible
+    # as well as consistent.  An unprogrammed table is ordered too (-128 /
+    # +128 C, 0 / 6.5535 V, 0.0001 / 6.5535 mW), and grading by it switched
+    # the generic alarm off: 110 C, 2.6 V or a lane at -30 dBm read healthy.
+    # The ranges hold the tables of real modules with room to spare:
+    # industrial-temperature parts alarm at -45 C and up to 110 C, supply
+    # limits sit between 2.7 and 3.9 V, the receive alarms of long-reach
+    # optics reach about -36 dBm and amplified transmitters about +8 dBm.
+    # Power is exclusive at its lower end: -40.00 dBm is 0.0001 mW, the
+    # smallest value the field can hold and the floor a dark lane is read
+    # as, so no reading can be below such a limit.
+    MODULE_LIMIT_PLAUSIBLE = {
+        'rx_power': (-40.0, 10.0),
+        'tx_power': (-40.0, 10.0),
+        'temperature': (-45.0, 125.0),
+        'voltage': (2.5, 4.0),
+    }
+    # How close to a module warning limit a healthy reading is GOOD rather
+    # than EXCELLENT (dB, dB, degrees C, V).  On the low side RX power uses
+    # the link margin instead.
+    MODULE_GOOD_BAND = {
+        'rx_power': 1.0,
+        'tx_power': 1.0,
+        'temperature': 5.0,
+        'voltage': 0.05,
+    }
+    # Name and number format of a module-graded metric in anomaly texts.
+    MODULE_LIMIT_TEXT = {
+        'rx_power': ('RX power', '{:.2f} dBm'),
+        'tx_power': ('TX power', '{:.2f} dBm'),
+        'temperature': ('Module temperature', '{:.2f}°C'),
+        'voltage': ('Module voltage', '{:.4f} V'),
+    }
+    MODULE_LIMIT_ACTIONS = {
+        ('rx_power', 'low'): 'Check fiber connection, clean connectors, or replace cable',
+        ('rx_power', 'high'): 'Verify the far-end optic type and attenuate the link if it is too short',
+        ('tx_power', 'low'): 'Inspect or replace the transceiver and verify module compatibility',
+        ('tx_power', 'high'): 'Inspect or replace the transceiver and verify module compatibility',
+        ('temperature', 'high'): 'Check cooling, reduce load, or replace SFP module',
+    }
+    # A link-down port whose transmit power reads no light while its lasers
+    # are driven, on a module that shows transmit light on no channel.
+    DARK_TRANSMITTER_ACTION = ('Check whether the peer receives light from '
+                               'this port; replace the transceiver if it '
+                               'does not')
+    # The same picture on a module whose transmit monitor is seen working
+    # on another channel.  A port disabled on the switch can read like this
+    # on a module whose lasers stay on, hence the condition.
+    DOWN_TRANSMITTER_ACTION = ('If the port is enabled on this switch, '
+                               'inspect or replace the transceiver: no '
+                               'light leaves although its lasers are driven')
     # Several drivers report a dark optical lane as -40 dBm (or -inf).  Keep
     # those readings as evidence; dropping them can turn a failed lane into a
     # healthy-looking average.
@@ -172,6 +244,52 @@ class OpticalAnalyzer:
     # lane.  Other families are only treated as single-lane when the media
     # string explicitly says so (LR1/ER1/ZR1, for example).
     UNNUMBERED_SINGLE_LANE_MEDIA = frozenset({'DR', 'FR'})
+    # What ethtool (sfpid.c, qsfp.c, cmis.c, sff-common.c) and NVUE print
+    # for a copper assembly: a 'Copper pigtail' or 'RJ45' connector, 'Passive
+    # Cable' / 'Copper cable' technology, the 'Passive Cu cmplnce.' /
+    # 'Active Cu cmplnce.' line, a Base-CR or BASE-T standard.  'No separable
+    # connector' is absent on purpose: an active optical cable prints it too
+    # and has full DOM.
+    COPPER_INDICATOR_RE = re.compile(
+        r'passive\s+copper|active\s+copper|copper\s+cable|copper\s+pigtail|'
+        r'\bRJ-?45\b|passive\s+cable|\bcu\s+cmplnce|base-cr|base-t|twinax|'
+        r'(?<![a-z])dac(?![a-z])',
+        re.IGNORECASE,
+    )
+    ACTIVE_OPTICAL_RE = re.compile(
+        r'(?<![a-z])aoc(?![a-z])|active\s+optical', re.IGNORECASE)
+    # A literal piece of every alternative above.  Plain substring tests on
+    # the lowercased block find the few lines worth the regular expressions;
+    # running those over every line of every block made the worker several
+    # times slower.
+    COPPER_TOKENS = ('copper', 'rj45', 'rj-45', 'passive', 'cmplnce',
+                     'base-cr', 'base-t', 'twinax', 'dac')
+    ACTIVE_OPTICAL_TOKENS = ('aoc', 'active')
+    # A power or bias value that is not zero: the unit, and before it on
+    # the same line a number with a digit other than 0 (or 'inf').  A limit
+    # line counts too; the test only has to be certain when it says "none".
+    READING_UNIT_RE = re.compile(r'm[AW]', re.IGNORECASE)
+    NONZERO_VALUE_RE = re.compile(
+        r'(?:[^\D0][\d.]*|inf)[^\S\n]*$', re.IGNORECASE)
+    # Vendor identity fields (SN/PN/date code) may coincidentally contain an
+    # indicator such as 'DAC'; the medium is told from descriptor lines only.
+    IDENTITY_LINE_RE = re.compile(r'\s*(?:vendor|serial|date)', re.IGNORECASE)
+    INTERFACE_STATE_RE = re.compile(
+        r'^[^\S\n]*Interface\s+state\s*:\s*(\S+)',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Identifier bytes ethtool decodes with cmis.c (QSFP-DD, OSFP, DSFP, the
+    # QSFP112-class "QSFP+ or later with CMIS", SFP-DD, SFP+ with CMIS).  The
+    # byte decides; the name covers collectors that print no byte.
+    CMIS_IDENTIFIER_RE = re.compile(
+        r'^[^\S\n]*Identifier\s*:\s*(?:0x(?:18|19|1b|1e|1f|20)\b|'
+        r'[^\n]*(?:QSFP-DD|OSFP|DSFP|QSFP112|SFP-DD|CMIS))',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # A condition of the module itself, not of one lane: in a breakout cage
+    # every sub-port reads it from the same module.
+    MODULE_SCOPE_METRICS = frozenset({'temperature', 'voltage'})
+    BREAKOUT_PORT_RE = re.compile(r'(?P<cage>swp\d+)s(?P<index>\d+)')
 
     def __init__(self, data_dir="monitor-results", load_history=True):
         self.data_dir = data_dir
@@ -191,7 +309,9 @@ class OpticalAnalyzer:
         """Load the configurable margin while retaining safe defaults.
 
         Laser bias uses the module's own thresholds and flags from ethtool.
-        Other optical limits retain the documented defaults above.
+        RX/TX power, temperature and voltage use the module's own thresholds
+        when it prints a valid table and the documented defaults above
+        otherwise.
         """
         if yaml is None:
             return
@@ -207,19 +327,41 @@ class OpticalAnalyzer:
             try:
                 with open(path, 'r') as stream:
                     config = yaml.safe_load(stream) or {}
-                value = config.get('thresholds', {}).get('network', {}).get(
-                    'optical_power_margin'
-                )
+                # A section whose keys are all commented out loads as None,
+                # and a hand-edited file can hold any type at either level.
+                thresholds = (config.get('thresholds')
+                              if isinstance(config, dict) else None)
+                network = (thresholds.get('network')
+                           if isinstance(thresholds, dict) else None)
+                value = (network.get('optical_power_margin')
+                         if isinstance(network, dict) else None)
                 if value is None:
                     return
-                margin = float(value)
+                try:
+                    margin = float(value)
+                except (TypeError, ValueError, OverflowError):
+                    margin = math.nan
                 if math.isfinite(margin) and margin >= 0:
                     self.thresholds['link_margin_min_db'] = margin
+                else:
+                    self._report_ignored_margin(path, value)
                 return
-            except (OSError, TypeError, ValueError, yaml.YAMLError):
+            except (OSError, TypeError, ValueError, AttributeError,
+                    yaml.YAMLError):
                 # Invalid or unreadable configuration deliberately keeps the
                 # documented 3 dB default.
                 return
+
+    def _report_ignored_margin(self, path: str, value: Any) -> None:
+        """Say once that a configured optical margin is not in effect."""
+        # A parse worker reads the same file as the process that started it.
+        if (multiprocessing.parent_process() is not None
+                or path in _REPORTED_IGNORED_MARGINS):
+            return
+        _REPORTED_IGNORED_MARGINS.add(path)
+        print(f"⚠️  Ignoring optical_power_margin {str(value)[:40]!r} in "
+              f"{path}: it must be a number of dB, 0 or greater. Using "
+              f"{self.thresholds['link_margin_min_db']} dB.")
 
     def load_optical_history(self):
         """Load historical optical data from per-device shards.
@@ -499,27 +641,14 @@ class OpticalAnalyzer:
         
         Returns None if this is a DAC/Copper cable (not optical)
         """
-        # Check for DAC/Copper cable - these don't have optical diagnostics
-        cable_type_indicators = [
-            'Passive copper',
-            'Active copper',
-            'Copper cable',
-            'Base-CR',  # Copper (e.g., 100G Base-CR4)
-            'DAC',
-            'Twinax',
-            'No separable connector'  # DAC cables
-        ]
-        
-        # Vendor identity fields (SN/PN/date code) may coincidentally contain
-        # indicator substrings such as 'DAC'; classify from descriptor lines only.
-        for line in optical_data.split('\n'):
-            if re.match(r'\s*(?:vendor|serial|date)', line, re.IGNORECASE):
-                continue
-            for indicator in cable_type_indicators:
-                if indicator in line:
-                    # This is a copper/DAC cable, not optical - skip optical analysis
-                    return None
-        
+        # The one rule that tells copper from optical is _is_copper: copper
+        # is named and no lane carries light or laser bias.  A copper block
+        # normally holds no reading at all, and then the answer is known
+        # before the per-line pass below; this is most blocks of a DAC rack.
+        names_copper = self._names_copper(optical_data)
+        if names_copper and not self._prints_nonzero_reading(optical_data):
+            return None
+
         optical_params = {
             'rx_power_dbm': None,
             'tx_power_dbm': None,
@@ -541,9 +670,13 @@ class OpticalAnalyzer:
         # spelled ambiguously, and an unlit lane is recognised from it.
         power_value = (rf'(?P<milliwatts>-?inf|{number})\s*mW\s*/\s*'
                        rf'(?P<value>-?inf|{number})\s*dBm')
+        # A module that measures receive power as OMA is labelled 'Receiver
+        # signal OMA' by ethtool (qsfp.c, cmis.c, sfpdiag.c), with or without
+        # a blank before '(Channel N)'; it is that lane's receive power.
         rx_pattern = re.compile(
             rf'(?:ch-(?P<nvue_lane>\d+)-rx-power|'
-            rf'(?:Rcvr|Receiver)\s+signal\s+(?:avg|average)\s+optical\s+power'
+            rf'(?:Rcvr|Receiver)\s+signal\s+'
+            rf'(?:(?:avg|average)\s+optical\s+power|OMA)'
             rf'(?:\s*\(\s*Channel\s+(?P<ethtool_lane>\d+)\s*\))?)'
             rf'\s*:\s*{power_value}',
             re.IGNORECASE,
@@ -573,8 +706,54 @@ class OpticalAnalyzer:
             r'(?:\s*\(\s*Chan(?:nel)?\s+(?P<lane>\d+)\s*\))?'
             r'\s*:\s*(?P<state>on|off)\s*$', re.IGNORECASE,
         )
+        # The other four tables ethtool's sff_show_thresholds prints next to
+        # the bias one, with the same labels for CMIS, SFF-8636 and SFF-8472
+        # modules.  'Laser output power' is TX; power is printed as mW / dBm,
+        # temperature as degrees C / degrees F and voltage in V.
+        module_threshold_pattern = re.compile(
+            r'^(?P<label>Laser\s+output\s+power|Laser\s+rx\s+power|'
+            r'Module\s+temperature|Module\s+voltage)\s+'
+            r'(?P<direction>high|low)\s+(?P<kind>alarm|warning)\s+threshold'
+            r'\s*:\s*(?P<reading>.*)$', re.IGNORECASE,
+        )
+        module_threshold_metrics = {
+            'laser output power': 'tx_power',
+            'laser rx power': 'rx_power',
+            'module temperature': 'temperature',
+            'module voltage': 'voltage',
+        }
+        power_threshold_pattern = re.compile(power_value, re.IGNORECASE)
+        temperature_threshold_pattern = re.compile(
+            r'(?P<value>\S+)\s*degrees?\s*C\b.*', re.IGNORECASE)
+        voltage_threshold_pattern = re.compile(
+            r'(?P<value>\S+)\s*V', re.IGNORECASE)
         bias_thresholds = {}
         bias_flags = {}
+        module_thresholds = {}
+
+        def module_threshold_value(metric, reading):
+            """One printed module limit, or None when it defines no limit."""
+            try:
+                if metric in ('rx_power', 'tx_power'):
+                    match = power_threshold_pattern.fullmatch(reading)
+                    # A limit the module leaves unset reads 0 mW / -inf dBm.
+                    if not match or not float(match.group('milliwatts')) > 0:
+                        return None
+                    value = float(match.group('value'))
+                elif metric == 'temperature':
+                    match = temperature_threshold_pattern.fullmatch(reading)
+                    if not match:
+                        return None
+                    value = float(match.group('value'))
+                else:
+                    match = voltage_threshold_pattern.fullmatch(reading)
+                    # 0.0000 V is an unset limit, as 0 mW is for power.
+                    if not match or not float(match.group('value')) > 0:
+                        return None
+                    value = float(match.group('value'))
+            except ValueError:
+                return None
+            return value if math.isfinite(value) else None
 
         def lane_number(match, readings):
             value = match.groupdict().get('nvue_lane') or match.groupdict().get('ethtool_lane')
@@ -611,6 +790,16 @@ class OpticalAnalyzer:
                         bias_thresholds[key] = value
                 except ValueError:
                     pass
+            limit_match = module_threshold_pattern.match(line)
+            if limit_match:
+                metric = module_threshold_metrics[
+                    ' '.join(limit_match.group('label').lower().split())]
+                value = module_threshold_value(
+                    metric, limit_match.group('reading'))
+                if value is not None:
+                    key = (limit_match.group('direction').lower() + '_'
+                           + limit_match.group('kind').lower())
+                    module_thresholds.setdefault(metric, {})[key] = value
             flag_match = bias_flag_pattern.match(line)
             if flag_match:
                 lane = str(int(flag_match.group('lane') or 1))
@@ -621,14 +810,24 @@ class OpticalAnalyzer:
                 )
 
             # Parse temperature (NVUE format: "temperature : 48.71 degrees C" or ethtool: "Module temperature : 48.85 degrees C")
+            # Exactly 0.00 C / 0.0000 V is what a module without that
+            # monitor prints (ethtool prints both for a cable): not read.
+            # A malformed number ('1.2.3') is no reading; it must not abort
+            # the device's whole file.
             temp_match = re.search(r'(?:Module\s+)?temperature\s*:\s*([\d.-]+)\s*degrees?\s*C', line)
             if temp_match:
-                optical_params['temperature_c'] = float(temp_match.group(1))
-            
+                try:
+                    optical_params['temperature_c'] = float(temp_match.group(1)) or None
+                except ValueError:
+                    pass
+
             # Parse voltage (NVUE format: "voltage : 3.2688 V" or ethtool: "Module voltage : 3.2096 V")
             voltage_match = re.search(r'(?:Module\s+)?voltage\s*:\s*([\d.-]+)\s*V', line)
             if voltage_match:
-                optical_params['voltage_v'] = float(voltage_match.group(1))
+                try:
+                    optical_params['voltage_v'] = float(voltage_match.group(1)) or None
+                except ValueError:
+                    pass
 
             rx_power_match = rx_pattern.search(line)
             if rx_power_match:
@@ -660,19 +859,43 @@ class OpticalAnalyzer:
                 except ValueError:
                     pass
 
+        # DAC/Copper cables don't have optical diagnostics.  Decided after the
+        # readings are known: light or laser bias proves an optical cable
+        # whatever its identity lines say.
+        if names_copper and not self._lit_or_driven(
+                rx_readings, tx_readings, bias_readings):
+            return None
+
+        # The collector prints the operstate into the block.  It tells a
+        # monitor the module does not implement from a dark module.
+        state_match = self.INTERFACE_STATE_RE.search(optical_data)
+        optical_params['_interface_state'] = (
+            state_match.group(1).strip().lower() if state_match else None)
+        # ethtool's CMIS channel flag lines need the measured value to back
+        # them (see _bias_lane_events).
+        optical_params['_cmis'] = bool(
+            self.CMIS_IDENTIFIER_RE.search(optical_data))
+
         # Reject unsupported all-zero or internally inconsistent tables, not
         # the measured current.  Partial valid limits can still prove a fault.
-        ordered = [bias_thresholds[key] for key in
-                   ('low_alarm', 'low_warning', 'high_warning', 'high_alarm')
-                   if key in bias_thresholds]
-        low_limits = [v for key, v in bias_thresholds.items() if key.startswith('low_')]
-        high_limits = [v for key, v in bias_thresholds.items() if key.startswith('high_')]
-        if (ordered and (not any(ordered) or ordered != sorted(ordered) or
-                         (low_limits and high_limits and
-                          max(low_limits) >= min(high_limits)))):
-            bias_thresholds = {}
+        bias_thresholds = self._consistent_limit_table(bias_thresholds)
         optical_params['bias_thresholds_ma'] = bias_thresholds
         optical_params['bias_flags'] = bias_flags
+        # The same rule for every other table the module prints.  Set before
+        # the lane readings below: the displayed lane is picked with them.
+        optical_params['module_thresholds'] = {}
+        # Tables set aside as implausible, as printed, for the detail row.
+        optical_params['_implausible_module_tables'] = {}
+        for metric in self.MODULE_LIMIT_METRICS:
+            table = self._consistent_limit_table(
+                module_thresholds.get(metric, {}))
+            if table and not self._plausible_limit_table(metric, table):
+                # Dropped whole, like an inconsistent table: the metric
+                # falls back to the generic rules.
+                optical_params['_implausible_module_tables'][metric] = table
+                continue
+            if table:
+                optical_params['module_thresholds'][metric] = table
         # Every lane as collected, before the declared-single-lane filter
         # below.  A breakout sub-port shares the module with its siblings, so
         # the channels it owns are told from the whole dump.  Internal: the
@@ -689,17 +912,240 @@ class OpticalAnalyzer:
 
         return optical_params
 
+    def _is_copper(self, optical_data, rx_readings, tx_readings,
+                   bias_readings) -> bool:
+        """True for a copper assembly: there is no optical path to grade.
+
+        'AOC' / 'Active Optical' in the transceiver type, or a lane that
+        carries light or laser bias, mean optical even next to a copper
+        indicator: ethtool prints 'Active Cable' and 'Active Cu cmplnce.'
+        for an SFP active optical cable as well.
+        """
+        return (self._names_copper(optical_data) and
+                not self._lit_or_driven(rx_readings, tx_readings,
+                                        bias_readings))
+
+    def _descriptor_lines(self, text: str, tokens):
+        """Lines of lowercased ``text`` holding a token, identity lines left out."""
+        seen = set()
+        for token in tokens:
+            position = text.find(token)
+            while position != -1:
+                start = text.rfind('\n', 0, position) + 1
+                end = text.find('\n', position)
+                if end == -1:
+                    end = len(text)
+                if start not in seen:
+                    seen.add(start)
+                    line = text[start:end]
+                    if not self.IDENTITY_LINE_RE.match(line):
+                        yield line
+                position = text.find(token, end)
+
+    def _names_copper(self, optical_data: str) -> bool:
+        """True when the descriptor lines name copper and no optical cable."""
+        text = optical_data.lower()
+        if not any(self.COPPER_INDICATOR_RE.search(line) for line in
+                   self._descriptor_lines(text, self.COPPER_TOKENS)):
+            return False
+        return not any(self.ACTIVE_OPTICAL_RE.search(line) for line in
+                       self._descriptor_lines(text, self.ACTIVE_OPTICAL_TOKENS))
+
+    def _prints_nonzero_reading(self, optical_data: str) -> bool:
+        """The block holds a mW or mA value that is not zero."""
+        for unit in self.READING_UNIT_RE.finditer(optical_data):
+            line_start = optical_data.rfind('\n', 0, unit.start()) + 1
+            if self.NONZERO_VALUE_RE.search(optical_data, line_start,
+                                            unit.start()):
+                return True
+        return False
+
+    def _lit_or_driven(self, rx_readings, tx_readings, bias_readings) -> bool:
+        """A lane carries light or laser bias: an optical path exists."""
+        return (any(value > self.DARK_POWER_DBM
+                    for _lane, value in rx_readings + tx_readings) or
+                any(value > self.LASER_OFF_BIAS_MA
+                    for _lane, value in bias_readings))
+
     @staticmethod
-    def _bias_lane_events(lane, value, thresholds, flags):
-        """Keep the strongest module evidence for each direction on a lane."""
+    def _consistent_limit_table(table):
+        """``table`` unless it is all-zero or internally inconsistent."""
+        ordered = [table[key] for key in
+                   ('low_alarm', 'low_warning', 'high_warning', 'high_alarm')
+                   if key in table]
+        low_limits = [v for key, v in table.items() if key.startswith('low_')]
+        high_limits = [v for key, v in table.items() if key.startswith('high_')]
+        if (ordered and (not any(ordered) or ordered != sorted(ordered) or
+                         (low_limits and high_limits and
+                          max(low_limits) >= min(high_limits)))):
+            return {}
+        return table
+
+    def _plausible_limit_table(self, metric, table) -> bool:
+        """Every printed limit lies where a real module's limit can lie."""
+        low, high = self.MODULE_LIMIT_PLAUSIBLE[metric]
+        if metric in ('rx_power', 'tx_power'):
+            return all(low < value <= high for value in table.values())
+        return all(low <= value <= high for value in table.values())
+
+    def _deciding_limits(self, optical_params, metric):
+        """The module's own table for ``metric`` when it is complete.
+
+        Only a complete table replaces the generic rules: with a side
+        missing nothing would watch that side at all.
+        """
+        table = (optical_params.get('module_thresholds') or {}).get(metric) or {}
+        if all(key in table for key in self.MODULE_LIMIT_KEYS):
+            return table
+        return None
+
+    @staticmethod
+    def _module_limit_event(metric, lane, value, limits):
+        """The strongest module limit ``value`` is beyond, or None."""
+        for direction in ('low', 'high'):
+            for kind, severity in (('alarm', 'critical'), ('warning', 'warning')):
+                limit = limits.get(f'{direction}_{kind}')
+                if limit is None:
+                    continue
+                if (value < limit) if direction == 'low' else (value > limit):
+                    return {
+                        'metric': metric, 'lane': lane, 'value': value,
+                        'threshold': limit, 'direction': direction,
+                        'kind': kind, 'severity': severity,
+                    }
+        return None
+
+    def _module_reading_tier(self, metric, value, limits):
+        """Sortable (tier, distance) of one reading on a complete module table.
+
+        Tier 4 is a dark receive lane, 3 beyond an alarm limit, 2 beyond a
+        warning limit or under the configured link margin, 1.5 healthy but
+        close to a warning limit and 1 comfortable.  Grading and the lane
+        picked for display both read it, so the row shows the lane that
+        explains the badge.
+        """
+        low_alarm, high_alarm = limits['low_alarm'], limits['high_alarm']
+        low_warning, high_warning = limits['low_warning'], limits['high_warning']
+        if metric == 'rx_power' and value <= self.DARK_POWER_DBM:
+            return (4, low_alarm - value)
+        if value < low_alarm or value > high_alarm:
+            return (3, max(low_alarm - value, value - high_alarm))
+        band = self.MODULE_GOOD_BAND[metric]
+        low_gap = low_warning - value
+        good_low_gap = (low_warning + band) - value
+        if metric == 'rx_power':
+            # The operator's margin counts up from the module's low alarm.
+            margin = self.calculate_link_margin(value, low_alarm)
+            margin_min = self.thresholds['link_margin_min_db']
+            low_gap = max(low_gap, margin_min - margin)
+            good_low_gap = (margin_min + 3.0) - margin
+        high_gap = value - high_warning
+        if low_gap > 0 or high_gap > 0:
+            return (2, max(low_gap, high_gap))
+        good_high_gap = value - (high_warning - band)
+        if good_low_gap > 0 or good_high_gap > 0:
+            return (1.5, max(good_low_gap, good_high_gap))
+        return (1, max(low_gap, high_gap))
+
+    @staticmethod
+    def _module_limit_readings(optical_params):
+        """metric -> [(lane or None, value)] of the readings that are graded."""
+        readings = {}
+        for metric in ('rx_power', 'tx_power'):
+            values = optical_params.get(f'_{metric}_lanes_dbm') or []
+            lanes = optical_params.get(f'_{metric}_lane_ids') or []
+            if not values and optical_params.get(f'{metric}_dbm') is not None:
+                values = [optical_params[f'{metric}_dbm']]
+                lanes = [optical_params.get(f'{metric}_lane')]
+            readings[metric] = [
+                (lanes[index] if index < len(lanes) else None, value)
+                for index, value in enumerate(values)
+            ]
+        for metric, key in (('temperature', 'temperature_c'),
+                            ('voltage', 'voltage_v')):
+            value = optical_params.get(key)
+            readings[metric] = [(None, value)] if value is not None else []
+        return readings
+
+    def _grade_module_limits(self, optical_params):
+        """What the module's own limits say about the graded readings.
+
+        Returns (deciding, tier, events): the complete tables by metric, the
+        worst tier one of their readings reached (see _module_reading_tier)
+        and every printed limit a reading is beyond.  A partial table decides
+        nothing, but as with bias a limit it does print can prove a fault.
+        """
+        tables = optical_params.get('module_thresholds') or {}
+        readings = self._module_limit_readings(optical_params)
+        deciding = {}
+        tier = 1
+        events = []
+        for metric in self.MODULE_LIMIT_METRICS:
+            table = tables.get(metric)
+            if not table:
+                continue
+            limits = self._deciding_limits(optical_params, metric)
+            if limits is not None:
+                deciding[metric] = limits
+            for lane, value in readings[metric]:
+                if limits is not None:
+                    tier = max(tier, self._module_reading_tier(
+                        metric, value, limits)[0])
+                event = self._module_limit_event(metric, lane, value, table)
+                if event:
+                    events.append(event)
+        return deciding, tier, events
+
+    def _assess_module_limits(self, optical_params):
+        """The limits that graded a port, for its expandable detail row."""
+        deciding, _tier, events = self._grade_module_limits(optical_params)
+        limits = {
+            'thresholds': optical_params.get('module_thresholds') or {},
+            'decided': list(deciding),
+            'events': events,
+        }
+        # Printed tables that grade nothing because they are implausible.
+        ignored = optical_params.get('_implausible_module_tables')
+        if ignored:
+            limits['ignored'] = ignored
+        return limits
+
+    def _module_limit_message(self, event):
+        """Name the reading, its lane and the module limit it is beyond."""
+        label, number = self.MODULE_LIMIT_TEXT[event['metric']]
+        lane = f" on lane {event['lane']}" if event.get('lane') is not None else ''
+        side = 'below' if event['direction'] == 'low' else 'above'
+        return (f"{label} {number.format(event['value'])}{lane} is {side} the "
+                f"module's {event['direction']} {event['kind']} "
+                f"{number.format(event['threshold'])}")
+
+    @staticmethod
+    def _bias_lane_events(lane, value, thresholds, flags,
+                          flag_needs_value=False):
+        """Keep the strongest module evidence for each direction on a lane.
+
+        ``flag_needs_value`` is set for CMIS dumps.  ethtool tests a CMIS
+        channel flag byte against the channel index instead of the
+        channel's bit, so a flag of lane 1 is printed On for channels 2, 4,
+        6 and 8.  The measured value and the module's limit are both in the
+        dump: a flag that is On while the value is inside that limit is kept
+        as 'module flag set, value in range' at warning level.  Without a
+        value or a valid limit the flag is all the evidence there is and
+        counts as before, as do all SFF-8636/SFF-8472 flags.
+        """
         events = []
         for direction in ('low', 'high'):
+            in_range_flag = None
             for kind, severity in (('alarm', 'critical'), ('warning', 'warning')):
                 key = f'{direction}_{kind}'
                 limit = thresholds.get(key)
                 exceeded = (value is not None and limit is not None and
                             (value <= limit if direction == 'low' else value >= limit))
                 flagged = flags.get(key) is True
+                if (flag_needs_value and flagged and not exceeded and
+                        value is not None and limit is not None):
+                    in_range_flag = in_range_flag or (kind, limit)
+                    continue
                 if exceeded or flagged:
                     events.append({
                         'lane': lane, 'value_ma': value, 'threshold_ma': limit,
@@ -707,6 +1153,15 @@ class OpticalAnalyzer:
                         'source': 'module flag' if flagged else 'module threshold',
                     })
                     break
+            else:
+                if in_range_flag:
+                    kind, limit = in_range_flag
+                    events.append({
+                        'lane': lane, 'value_ma': value, 'threshold_ma': limit,
+                        'direction': direction, 'kind': kind,
+                        'severity': 'warning', 'source': 'module flag',
+                        'value_in_range': True,
+                    })
         return events
 
     def _assess_bias(self, optical_params):
@@ -730,7 +1185,9 @@ class OpticalAnalyzer:
         for lane in sorted(selected):
             value = readings.get(lane)
             lane_flags = flags.get(str(lane), {})
-            events.extend(self._bias_lane_events(lane, value, thresholds, lane_flags))
+            events.extend(self._bias_lane_events(
+                lane, value, thresholds, lane_flags,
+                bool(optical_params.get('_cmis'))))
             complete = complete and (
                 (value is not None and keys.issubset(thresholds)) or
                 keys.issubset(lane_flags)
@@ -739,6 +1196,9 @@ class OpticalAnalyzer:
             status = ('critical' if any(e['severity'] == 'critical' for e in events)
                       else 'warning')
             reason = 'Module-reported laser bias limit or alarm flag triggered.'
+            if all(e.get('value_in_range') for e in events):
+                reason = ('Module bias flag set while the measured bias is '
+                          'inside the module limits.')
         elif complete:
             status = 'normal'
             reason = 'No selected lane exceeds module bias limits or reports a bias alarm.'
@@ -803,8 +1263,15 @@ class OpticalAnalyzer:
             if lane_one:
                 self._set_lane_readings(optical_params, metric, lane_one)
 
-    def _lane_risk(self, metric: str, value: float) -> tuple:
-        """Return a sortable risk tuple used to select the displayed lane."""
+    def _lane_risk(self, metric: str, value: float,
+                   limits: Optional[Dict[str, float]] = None) -> tuple:
+        """Return a sortable risk tuple used to select the displayed lane.
+
+        ``limits`` is the module's own table when it grades this metric; the
+        lane is then ranked by those limits, not by the generic ones.
+        """
+        if limits is not None:
+            return self._module_reading_tier(metric, value, limits)
         if metric == 'rx_power':
             low = self.thresholds['rx_power_min_dbm']
             high = self.thresholds['rx_power_critical_high_dbm']
@@ -848,13 +1315,29 @@ class OpticalAnalyzer:
             optical_params[value_key] = None
             return
 
+        limits = self._deciding_limits(optical_params, metric)
+        # A limit of an incomplete module table still raises the badge, so
+        # the lane beyond it must be the displayed one as well.
+        printed_limits = ((optical_params.get('module_thresholds') or {})
+                          .get(metric) if limits is None else None)
+
         def risk(item):
             lane, value = item
             if metric != 'bias_current':
-                return self._lane_risk(metric, value)
+                lane_risk = self._lane_risk(metric, value, limits)
+                event = (self._module_limit_event(metric, lane, value,
+                                                  printed_limits)
+                         if printed_limits else None)
+                if event:
+                    lane_risk = max(lane_risk, (
+                        3 if event['severity'] == 'critical' else 2,
+                        abs(value - event['threshold']),
+                    ))
+                return lane_risk
             events = self._bias_lane_events(
                 lane, value, optical_params.get('bias_thresholds_ma') or {},
                 (optical_params.get('bias_flags') or {}).get(str(lane), {}),
+                bool(optical_params.get('_cmis')),
             )
             severity = max((3 if e['severity'] == 'critical' else 2
                             for e in events), default=1)
@@ -1070,6 +1553,76 @@ class OpticalAnalyzer:
             if selected:
                 self._set_lane_readings(optical_params, metric, selected)
 
+    def _driven_lanes(self, optical_params: Dict[str, Any]) -> List[int]:
+        """The lanes of the row whose laser is driven.
+
+        A bias reading above the laser-off floor alone does not say so: a
+        laser at 0.4 mA with the module's low-bias alarm raised is off.  The
+        bias has to be free of low-side evidence from the module (its limits
+        and its flags, read as _bias_lane_events reads them).
+        """
+        thresholds = optical_params.get('bias_thresholds_ma') or {}
+        flags = optical_params.get('bias_flags') or {}
+        cmis = bool(optical_params.get('_cmis'))
+        driven = []
+        for lane, value in zip(
+                optical_params.get('_bias_current_lane_ids') or [],
+                optical_params.get('_bias_current_lanes_ma') or []):
+            if value <= self.LASER_OFF_BIAS_MA:
+                continue
+            events = self._bias_lane_events(
+                lane, value, thresholds, flags.get(str(lane), {}), cmis)
+            if not any(event['direction'] == 'low' and
+                       not event.get('value_in_range') for event in events):
+                driven.append(lane)
+        return driven
+
+    def _set_aside_unmonitored_sides(self, optical_params: Dict[str, Any]) -> None:
+        """Drop a power side the module does not monitor.
+
+        SFF-8636 leaves transmit power monitoring optional, but ethtool
+        prints the 'Transmit avg optical power' line of every channel
+        anyway: 0.0000 mW.  Graded as a measurement that was a dead
+        transmitter (-40 dBm, CRITICAL) on a port carrying traffic.
+
+        A side that reads no light on every channel of the module is not a
+        measurement when the rest of the evidence contradicts a dark module:
+        the link is up, or, for the transmit side of a block that carries no
+        link state at all, the lasers are driven while the port receives
+        light.  The side then has no value; the detail row says so.  One
+        dark lane among lit ones stays a fault, and so do the dark lanes of
+        a breakout sub-port while a sibling's channels show that the monitor
+        works.
+
+        With a collected link state that is not 'up' the reading stays:
+        bias, no transmit light and receive light is exactly what a failed
+        transmitter looks like (the peer signals remote fault and the link
+        drops).  The link-down row says what it found (_port_anomalies).
+        """
+        collected = self._lane_readings_as_collected(optical_params)
+        state = optical_params.get('_interface_state')
+        link_up = state == 'up'
+        dark = self.DARK_POWER_DBM
+        lasers_driven = (
+            state is None and
+            bool(self._driven_lanes(optical_params)) and
+            any(value > dark for value in
+                optical_params.get('_rx_power_lanes_dbm') or [])
+        )
+        unmonitored = []
+        for metric in ('tx_power', 'rx_power'):
+            row = optical_params.get(f'_{metric}_lanes_dbm') or []
+            module = [value for _lane, value in collected[metric]]
+            if not row or any(value > dark for value in row + module):
+                continue
+            # lasers_driven includes receive light, so it can only ever
+            # excuse the transmit side; the test says so explicitly.
+            if link_up or (metric == 'tx_power' and lasers_driven):
+                unmonitored.append(metric)
+        for metric in unmonitored:
+            self._set_lane_readings(optical_params, metric, [])
+        optical_params['_not_monitored'] = unmonitored
+
     def _select_in_service_lanes(self, optical_params: Dict[str, Any]) -> None:
         """Grade only the lanes whose laser is in service.
 
@@ -1139,10 +1692,17 @@ class OpticalAnalyzer:
                 self._set_lane_readings(optical_params, metric, kept)
         optical_params['_inactive_lane_ids'] = sorted(inactive)
 
-    def calculate_link_margin(self, rx_power_dbm: float) -> float:
-        """Calculate optical link margin"""
+    def calculate_link_margin(self, rx_power_dbm: float,
+                              rx_low_alarm_dbm: Optional[float] = None) -> float:
+        """Calculate optical link margin
+
+        ``rx_low_alarm_dbm`` is the module's own RX power low alarm when its
+        table grades the port; the margin then counts up from that limit.
+        """
         if rx_power_dbm is None:
             return 0.0
+        if rx_low_alarm_dbm is not None:
+            return rx_power_dbm - rx_low_alarm_dbm
 
         # Link margin = RX Power - Minimum sensitivity threshold
         # Using -14 dBm as a conservative minimum sensitivity for most optics
@@ -1163,6 +1723,8 @@ class OpticalAnalyzer:
             [tx_power] if tx_power is not None else []
         )
         bias_assessment = self._assess_bias(optical_params)
+        module_deciding, module_tier, module_events = (
+            self._grade_module_limits(optical_params))
 
         # No optical data available.  Voltage alone is useful inventory
         # evidence, but it is not enough to claim a healthy optical path.
@@ -1174,29 +1736,50 @@ class OpticalAnalyzer:
         # Preserve an explicit link-down state when every relevant receive lane
         # is dark.  A single dark lane on a non-breakout multi-lane link remains
         # CRITICAL below, while breakout interfaces are lane-filtered first.
-        if rx_lanes and all(value <= self.DARK_POWER_DBM for value in rx_lanes):
+        # A port whose link is up is never DOWN from receive power alone: its
+        # dark lanes are graded as the readings they are.
+        if (rx_lanes and all(value <= self.DARK_POWER_DBM for value in rx_lanes)
+                and optical_params.get('_interface_state') != 'up'):
             return OpticalHealth.DOWN
 
+        # A metric the module grades with its own complete limit table is
+        # kept away from the generic rules below: they flagged healthy optics
+        # (TX above 3 dBm, 60 C) and missed lanes under the module's alarm.
+        generic_rx = [] if 'rx_power' in module_deciding else rx_lanes
+        generic_tx = [] if 'tx_power' in module_deciding else tx_lanes
+        generic_temperature = (None if 'temperature' in module_deciding
+                               else temperature)
+        generic_voltage = None if 'voltage' in module_deciding else voltage
+
         # Critical conditions (any one triggers critical status)
-        if any(value < self.thresholds['rx_power_min_dbm'] for value in rx_lanes):
+        if any(value < self.thresholds['rx_power_min_dbm'] for value in generic_rx):
             return OpticalHealth.CRITICAL
         if any(value > self.thresholds.get('rx_power_critical_high_dbm', 7.0)
-               for value in rx_lanes):
+               for value in generic_rx):
             return OpticalHealth.CRITICAL
         if any(value < self.thresholds['tx_power_min_dbm'] or
                value > self.thresholds['tx_power_max_dbm']
-               for value in tx_lanes):
+               for value in generic_tx):
             return OpticalHealth.CRITICAL
-        if temperature is not None and temperature > self.thresholds['temperature_max_c']:
+        if generic_temperature is not None and generic_temperature > self.thresholds['temperature_max_c']:
             return OpticalHealth.CRITICAL
-        if temperature is not None and temperature < self.thresholds['temperature_min_c']:
+        if generic_temperature is not None and generic_temperature < self.thresholds['temperature_min_c']:
             return OpticalHealth.CRITICAL
-        if voltage is not None and (voltage < self.thresholds['voltage_min_v'] or voltage > self.thresholds['voltage_max_v']):
+        if generic_voltage is not None and (generic_voltage < self.thresholds['voltage_min_v'] or generic_voltage > self.thresholds['voltage_max_v']):
+            return OpticalHealth.CRITICAL
+        # Beyond a module alarm limit; a limit of an incomplete table counts
+        # too, exactly as a partial bias table can still prove a fault.
+        if module_tier >= 3 or any(event['severity'] == 'critical'
+                                   for event in module_events):
             return OpticalHealth.CRITICAL
         if bias_assessment['status'] == 'critical':
             return OpticalHealth.CRITICAL
 
         if bias_assessment['status'] == 'warning':
+            return OpticalHealth.WARNING
+        # Beyond a module warning limit, or under the configured link margin
+        # counted from the module's RX low alarm.
+        if module_tier >= 2 or module_events:
             return OpticalHealth.WARNING
 
         if not rx_lanes and not tx_lanes:
@@ -1206,27 +1789,27 @@ class OpticalAnalyzer:
         warning_count = 0
 
         # Low link margin warning
-        if rx_lanes and any(
+        if generic_rx and any(
             self.calculate_link_margin(value) < self.thresholds['link_margin_min_db']
-            for value in rx_lanes
+            for value in generic_rx
         ):
             warning_count += 1
 
         # High RX power warning (above warning high but below critical high)
         if any(value > self.thresholds.get('rx_power_warning_high_dbm', 5.0)
-               for value in rx_lanes):
+               for value in generic_rx):
             warning_count += 1
 
         # TX power near limits
-        if tx_lanes:
+        if generic_tx:
             if any(value < self.thresholds['tx_power_min_dbm'] + 1.0 or
                    value > self.thresholds['tx_power_max_dbm'] - 1.0
-                   for value in tx_lanes):
+                   for value in generic_tx):
                 warning_count += 1
 
         # Temperature approaching limits
-        if temperature is not None:
-            if temperature > self.thresholds['temperature_max_c'] - 10.0:
+        if generic_temperature is not None:
+            if generic_temperature > self.thresholds['temperature_max_c'] - 10.0:
                 warning_count += 1
 
         # Any independently meaningful threshold violation is a warning.  The
@@ -1240,40 +1823,131 @@ class OpticalAnalyzer:
         # readings from readings that are still valid but deserve trend
         # awareness.  The bands are derived from the configured hard limits so
         # custom optical margin settings continue to behave consistently.
-        good_band = False
-        if rx_lanes:
+        # A module-graded metric is in the band when a reading is close to
+        # one of the module's warning limits.
+        good_band = module_tier >= 1.5
+        if generic_rx:
             good_margin = self.thresholds['link_margin_min_db'] + 3.0
             good_band = good_band or any(
                 self.calculate_link_margin(value) < good_margin
-                for value in rx_lanes
+                for value in generic_rx
             )
             high_warning = self.thresholds.get('rx_power_warning_high_dbm', 5.0)
             good_band = good_band or any(
-                value > high_warning - 1.0 for value in rx_lanes
+                value > high_warning - 1.0 for value in generic_rx
             )
-        if tx_lanes:
+        if generic_tx:
             good_band = good_band or any(
                 value < self.thresholds['tx_power_min_dbm'] + 2.0 or
                 value > self.thresholds['tx_power_max_dbm'] - 2.0
-                for value in tx_lanes
+                for value in generic_tx
             )
-        if temperature is not None:
+        if generic_temperature is not None:
             good_band = good_band or (
-                temperature > self.thresholds['temperature_max_c'] - 20.0 or
-                temperature < self.thresholds['temperature_min_c'] + 10.0
+                generic_temperature > self.thresholds['temperature_max_c'] - 20.0 or
+                generic_temperature < self.thresholds['temperature_min_c'] + 10.0
             )
-        if voltage is not None:
+        if generic_voltage is not None:
             good_band = good_band or (
-                voltage < self.thresholds['voltage_min_v'] + 0.1 or
-                voltage > self.thresholds['voltage_max_v'] - 0.1
+                generic_voltage < self.thresholds['voltage_min_v'] + 0.1 or
+                generic_voltage > self.thresholds['voltage_max_v'] - 0.1
             )
         if good_band:
             return OpticalHealth.GOOD
         return OpticalHealth.EXCELLENT
 
+    def _health_causes(self, optical_params: Dict[str, Any],
+                       health: OpticalHealth) -> List[str]:
+        """The parameters that put a port at WARNING or CRITICAL.
+
+        Each parameter is held against the limits that graded it in
+        assess_optical_health (the module's table, else the generic rules).
+        Consumers use it to name the cause and to tell a condition of the
+        module (temperature, voltage) from one of a lane.
+        """
+        if health not in (OpticalHealth.WARNING, OpticalHealth.CRITICAL):
+            return []
+        floor = 3 if health == OpticalHealth.CRITICAL else 2
+        deciding, _tier, events = self._grade_module_limits(optical_params)
+        readings = self._module_limit_readings(optical_params)
+        generic = self.thresholds
+
+        def level(metric, value):
+            limits = deciding.get(metric)
+            if limits is not None or metric in ('rx_power', 'tx_power'):
+                return self._lane_risk(metric, value, limits)[0]
+            if metric == 'temperature':
+                if (value > generic['temperature_max_c'] or
+                        value < generic['temperature_min_c']):
+                    return 3
+                return 2 if value > generic['temperature_max_c'] - 10.0 else 1
+            return (3 if (value < generic['voltage_min_v'] or
+                          value > generic['voltage_max_v']) else 1)
+
+        causes = []
+        for metric in self.MODULE_LIMIT_METRICS:
+            beyond = any(level(metric, value) >= floor
+                         for _lane, value in readings[metric])
+            beyond = beyond or any(
+                event['metric'] == metric and
+                (floor == 2 or event['severity'] == 'critical')
+                for event in events)
+            if beyond:
+                causes.append(metric)
+        bias = self._assess_bias(optical_params)['status']
+        if bias == 'critical' or (floor == 2 and bias == 'warning'):
+            causes.append('bias_current')
+        return causes
+
+    def _restate_margin_history(self, port_name: str, reference: float) -> None:
+        """Keep a port's margin history on the level the new sample uses.
+
+        ``link_margin_db`` counts from the module's RX low alarm when the
+        module prints a valid RX table and from the generic sensitivity
+        otherwise; a sample written before that distinction existed carries
+        no reference and counted from the generic one.  A margin is the
+        lowest lane's power above its reference, so moving the reference
+        shifts it by a constant: earlier samples are restated instead of
+        leaving a step in the series, which trend readers (Ask-AI insights
+        compare consecutive samples) took for a margin that dropped on
+        every such port at the upgrade.
+        """
+        history = self.optical_history.get(port_name) or []
+        generic = self.thresholds['rx_power_min_dbm']
+
+        def margin_and_reference(entry):
+            if not isinstance(entry, dict):
+                return None
+            margin = entry.get('link_margin_db')
+            old = entry.get('link_margin_ref_dbm', generic)
+            if (isinstance(margin, bool) or isinstance(old, bool) or
+                    not isinstance(margin, (int, float)) or
+                    not isinstance(old, (int, float))):
+                return None
+            return margin, old
+
+        # Every restatement leaves the whole series on one level, so the
+        # newest sample that has a margin speaks for the rest.
+        for entry in reversed(history):
+            pair = margin_and_reference(entry)
+            if pair is None:
+                continue
+            if abs(pair[1] - reference) < 1e-9:
+                return
+            break
+        else:
+            return
+        for entry in history:
+            pair = margin_and_reference(entry)
+            if pair is None:
+                continue
+            entry['link_margin_db'] = round(pair[0] + pair[1] - reference, 6)
+            entry['link_margin_ref_dbm'] = reference
+
     def update_optical_stats(self, port_name: str, optical_data: str,
                              parsed: Optional[Dict[str, Any]] = None,
-                             lanes_per_subport: Optional[int] = None):
+                             lanes_per_subport: Optional[int] = None,
+                             link_down: bool = False):
         """Update optical statistics for a port
         
         Returns False if port is DAC/Copper (skipped), True if processed
@@ -1282,7 +1956,9 @@ class OpticalAnalyzer:
         already holds it (it is consumed: lane selection edits it in place).
         ``lanes_per_subport`` is the breakout cage's plan from
         plan_breakout_lanes; without it a breakout interface keeps channel
-        M+1.
+        M+1.  ``link_down`` is set for a port whose collected operstate is
+        down: the row is DOWN whatever the module reads, and its readings
+        say why (see _down_row_reading).
         """
         optical_params = (parsed if parsed is not None
                           else self.parse_optical_data(optical_data))
@@ -1293,21 +1969,37 @@ class OpticalAnalyzer:
 
         self._select_breakout_lane(port_name, optical_params,
                                    lanes_per_subport)
+        # A side the module does not monitor is no reading at all; told
+        # from the lanes the interface owns and from the whole module.
+        self._set_aside_unmonitored_sides(optical_params)
         # After the interface owns its lanes, and never before: a breakout
         # sub-interface whose own lane is dark is still that interface's
         # verdict, not a spare channel to set aside.
         self._select_in_service_lanes(optical_params)
 
         health = self.assess_optical_health(optical_params)
+        health_causes = self._health_causes(optical_params, health)
+        if link_down:
+            health = OpticalHealth.DOWN
 
         # Calculate additional metrics
         link_margin_db = None
         rx_lanes = optical_params.get('_rx_power_lanes_dbm') or []
+        # Counted from the module's own RX low alarm when its table grades
+        # the port, from the generic sensitivity otherwise.
+        rx_low_alarm = (self._deciding_limits(optical_params, 'rx_power')
+                        or {}).get('low_alarm')
         if rx_lanes:
-            link_margin_db = min(self.calculate_link_margin(value)
+            link_margin_db = min(self.calculate_link_margin(value, rx_low_alarm)
                                  for value in rx_lanes)
         elif optical_params['rx_power_dbm'] is not None:
-            link_margin_db = self.calculate_link_margin(optical_params['rx_power_dbm'])
+            link_margin_db = self.calculate_link_margin(
+                optical_params['rx_power_dbm'], rx_low_alarm)
+        # The level the margin counts from, kept with every history sample.
+        link_margin_ref_dbm = None
+        if link_margin_db is not None:
+            link_margin_ref_dbm = (rx_low_alarm if rx_low_alarm is not None
+                                   else self.thresholds['rx_power_min_dbm'])
 
         # Store current stats
         self.current_optical_stats[port_name] = {
@@ -1331,10 +2023,50 @@ class OpticalAnalyzer:
             'tx_power_lane_ids': optical_params.get('_tx_power_lane_ids', []),
             'bias_current_lane_ids': optical_params.get('_bias_current_lane_ids', []),
             'inactive_lanes': optical_params.get('_inactive_lane_ids', []),
+            # Which limits graded RX/TX power, temperature and voltage, and
+            # the module limits a reading is beyond (detail sidecar only).
+            'module_limits': self._assess_module_limits(optical_params),
+            # The power sides this module does not monitor (no value above).
+            'not_monitored': optical_params.get('_not_monitored', []),
+            'link_state': ('down' if link_down
+                           else optical_params.get('_interface_state')),
+            # What a link-down row is read with (see _down_row_keeps and
+            # _down_row_reading): the lanes whose laser is driven, whether
+            # any channel of the module shows transmit light (its TX monitor
+            # works) and the optical lane count the media text declares.
+            'lane_evidence': {
+                'driven_lanes': self._driven_lanes(optical_params),
+                'module_tx_light': any(
+                    value > self.DARK_POWER_DBM for _lane, value in
+                    self._lane_readings_as_collected(optical_params)['tx_power']),
+                'declared_lanes': optical_params.get(
+                    '_declared_optical_lane_count'),
+            },
+            # The parameters behind a WARNING, CRITICAL or DOWN state.
+            'health_causes': health_causes,
             'link_margin_db': link_margin_db,
             'last_updated': time.time(),
             'raw_data': optical_data[:500]  # Store first 500 chars for debugging
         }
+        if health == OpticalHealth.DOWN:
+            # A dark or undriven side is what a down port looks like; only
+            # the evidence that can explain the outage is kept and named.
+            stats = self.current_optical_stats[port_name]
+            stats['bias_assessment'] = self._down_row_bias_assessment(stats)
+            stats['health_causes'] = list(dict.fromkeys(
+                anomaly['metric']
+                for anomaly in self._port_anomalies(port_name, stats)
+                if anomaly.get('metric') and anomaly['severity'] == 'critical'
+            ))
+
+        # A row without a single reading is no sample.  Appended every run,
+        # such rows pushed the readings that prove the port optical out of
+        # its 100 entries: after 100 collections the port lost its row, and
+        # the module's later removal was no longer reported.
+        if health == OpticalHealth.UNKNOWN and all(
+                optical_params[key] is None for key in
+                ('rx_power_dbm', 'tx_power_dbm', 'temperature_c')):
+            return True
 
         # Store in history
         if port_name not in self.optical_history:
@@ -1348,11 +2080,19 @@ class OpticalAnalyzer:
             'tx_power_dbm': optical_params['tx_power_dbm'],
             'temperature_c': optical_params['temperature_c'],
             'link_margin_db': link_margin_db,
+            'link_margin_ref_dbm': link_margin_ref_dbm,
             'rx_power_lane': optical_params.get('rx_power_lane'),
             'tx_power_lane': optical_params.get('tx_power_lane'),
-            'bias_current_lane': optical_params.get('bias_current_lane')
+            'bias_current_lane': optical_params.get('bias_current_lane'),
+            # The receive lanes this sample graded.  Trend readers (Ask-AI
+            # insights) compare two samples only while they grade the same
+            # lanes: a breakout plan change is not a drop.
+            'rx_power_lane_ids': list(
+                optical_params.get('_rx_power_lane_ids') or []),
         }
 
+        if link_margin_ref_dbm is not None:
+            self._restate_margin_history(port_name, link_margin_ref_dbm)
         self.optical_history[port_name].append(history_entry)
         if len(self.optical_history[port_name]) > 100:
             self.optical_history[port_name] = self.optical_history[port_name][-100:]
@@ -1420,125 +2160,615 @@ class OpticalAnalyzer:
 
         return summary
 
+    def _down_row_lanes(self, stats: Dict[str, Any], metric: str) -> List[tuple]:
+        """[(lane or None, dBm)] of one power side of a row."""
+        values = stats.get(f'{metric}_lanes_dbm') or []
+        lanes = stats.get(f'{metric}_lane_ids') or []
+        if not values and stats.get(f'{metric}_dbm') is not None:
+            values = [stats[f'{metric}_dbm']]
+            lanes = [stats.get(f'{metric}_lane')]
+        return [(lanes[index] if index < len(lanes) else None, value)
+                for index, value in enumerate(values)]
+
+    def _down_row_keeps(self, stats: Dict[str, Any], metric: str,
+                        direction: str, lane: Optional[int] = None) -> bool:
+        """Whether a critical reading can explain a DOWN row.
+
+        A port that is shut has its lasers off and receives nothing: a dark
+        or undriven side is the state itself, not its cause, and every
+        parked port would list alarms.  A reading above a limit always
+        counts, and so does a condition of the module.  A low power reading
+        counts while that side still carries light on a lane of the port (a
+        weak lane, or a dead lane next to working ones).  A transmit lane
+        that reads no light counts as well when its own laser is driven and
+        the module shows transmit light on another channel: the monitor
+        works, so the lane's transmitter does not.
+        """
+        # 'high' is spelled out although light above a limit is light: no
+        # table that passes the plausibility check has a limit a dark lane
+        # could be above.
+        if metric in self.MODULE_SCOPE_METRICS or direction == 'high':
+            return True
+        if any(value > self.DARK_POWER_DBM
+               for _lane, value in self._down_row_lanes(stats, metric)):
+            return True
+        evidence = stats.get('lane_evidence') or {}
+        return (metric == 'tx_power' and
+                bool(evidence.get('module_tx_light')) and
+                lane in (evidence.get('driven_lanes') or []))
+
+    def _down_row_dark_transmitter(self, stats: Dict[str, Any]
+                                   ) -> Optional[Dict[str, Any]]:
+        """Transmit reads no light on every channel while lasers are driven.
+
+        On a link-down port that is a failed transmitter, or a module that
+        does not monitor transmit power: no channel of the module shows
+        transmit light, so the dump cannot tell them apart.  Returns the
+        driven lanes and their bias, or None.
+        """
+        evidence = stats.get('lane_evidence') or {}
+        lanes = self._down_row_lanes(stats, 'tx_power')
+        if (not lanes or evidence.get('module_tx_light') or
+                any(value > self.DARK_POWER_DBM for _lane, value in lanes)):
+            return None
+        bias = dict(zip(stats.get('bias_current_lane_ids') or [],
+                        stats.get('bias_current_lanes_ma') or []))
+        driven = [lane for lane in evidence.get('driven_lanes') or []
+                  if lane in bias]
+        if not driven:
+            return None
+        return {'lanes': driven, 'bias_ma': [bias[lane] for lane in driven]}
+
+    def _down_row_bias_assessment(self, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """The bias assessment of a DOWN row without laser-off evidence.
+
+        A low bias reading or low-bias flag is kept only while another lane
+        of the port is driven: that is a dead laser.  With no lane driven
+        the lasers are simply off.
+        """
+        assessment = stats.get('bias_assessment') or {}
+        events = assessment.get('events') or []
+        low = {event['lane'] for event in events
+               if event['direction'] == 'low' and not event.get('value_in_range')}
+        if not low:
+            return assessment
+        driven = any(
+            lane not in low and value > self.LASER_OFF_BIAS_MA
+            for lane, value in zip(stats.get('bias_current_lane_ids') or [],
+                                   stats.get('bias_current_lanes_ma') or [])
+        ) or any(
+            lane not in low and value > self.DARK_POWER_DBM
+            for lane, value in self._down_row_lanes(stats, 'tx_power')
+        )
+        if driven:
+            return assessment
+        kept = [event for event in events
+                if event['direction'] != 'low' or event.get('value_in_range')]
+        if kept:
+            status = ('critical' if any(e['severity'] == 'critical' for e in kept)
+                      else 'warning')
+            reason = assessment.get('reason', '')
+        else:
+            status = 'unknown'
+            reason = ('The port is down and none of its lasers is driven; '
+                      'low bias readings are not assessed.')
+        return {'status': status, 'reason': reason, 'events': kept}
+
+    def _down_row_reading(self, stats: Dict[str, Any]) -> tuple:
+        """(sentence, action) of a DOWN row, from what its receiver reads.
+
+        The badge says the link is down; the readings say whether light
+        still arrives, which lane does not get enough, or that nothing
+        arrives at all.
+        """
+        link_down = stats.get('link_state') == 'down'
+        lanes = self._down_row_lanes(stats, 'rx_power')
+        module_limits = stats.get('module_limits') or {}
+        dark = self.DARK_POWER_DBM
+        evidence = stats.get('lane_evidence') or {}
+        # Lanes set aside as out of service (no light, no laser bias).  On a
+        # link that is down such a lane is the likeliest reason, so it is
+        # named, unless it is a spare channel of a wider cage: the media
+        # text says the lanes in service are all the module has, or the
+        # lanes set aside are exactly the upper half of its channels (a
+        # four-lane module answers for eight channels in a QSFP-DD cage).
+        declared = evidence.get('declared_lanes')
+        inactive = stats.get('inactive_lanes') or []
+        in_service = [lane for lane, _value in lanes if lane is not None]
+        spare = bool(declared and len(lanes) >= declared) or (
+            bool(inactive) and len(inactive) == len(in_service) and
+            max(in_service) < min(inactive))
+        aside = inactive if link_down and not spare else []
+        aside_text = ''
+        if aside:
+            aside_text = ('; lane ' if len(aside) == 1 else '; lanes ') + (
+                ', '.join(str(lane) for lane in aside)
+                + ' without light and without laser bias')
+        if not lanes:
+            return ('Link down, the module reports no receive power',
+                    'Check fiber connection, peer state, and transceiver')
+        if all(value <= dark for _lane, value in lanes):
+            return (('Link down, no' if link_down else 'No')
+                    + ' receive light on any lane',
+                    'Check fiber connection, peer state, and transceiver')
+        # The lanes beyond the limit that grades them: the module's own
+        # alarm where its table decides, the generic limit otherwise.
+        if 'rx_power' in (module_limits.get('decided') or []):
+            beyond = {event['lane']: event['direction']
+                      for event in module_limits.get('events') or []
+                      if event['metric'] == 'rx_power'
+                      and event['severity'] == 'critical'}
+            faulty = [(lane, value, beyond[lane]) for lane, value in lanes
+                      if lane in beyond]
+        else:
+            low = self.thresholds['rx_power_min_dbm']
+            high = self.thresholds.get('rx_power_critical_high_dbm', 7.0)
+            faulty = [(lane, value, 'low' if value < low else 'high')
+                      for lane, value in lanes if value < low or value > high]
+        if faulty:
+            parts = []
+            for lane, value, _direction in faulty:
+                name = f'lane {lane}' if lane is not None else 'receive power'
+                parts.append(f'{name} without light' if value <= dark
+                             else f'{name} at {value:.1f} dBm')
+            too_low = any(direction == 'low' for _l, _v, direction in faulty)
+            return ('Link down, ' + ', '.join(parts) + aside_text,
+                    self.MODULE_LIMIT_ACTIONS[
+                        ('rx_power', 'low' if too_low else 'high')])
+        if aside and all(lane is not None for lane, _value in lanes):
+            return ('Link down, light present on '
+                    + ('lane ' if len(lanes) == 1 else 'lanes ')
+                    + ', '.join(str(lane) for lane, _value in lanes)
+                    + aside_text,
+                    'Check fiber connection, peer state, and transceiver')
+        sentence = ('Link down, light present on all lanes'
+                    if len(lanes) > 1 else 'Link down, receive light present')
+        # Receive light arrives, so the peer is alive.  A transmitter of
+        # this port that reads no light while its laser is driven is the
+        # nearer suspect than the peer's settings.
+        transmit = self._down_row_lanes(stats, 'tx_power')
+        if any(value <= dark and self._down_row_keeps(
+                stats, 'tx_power', 'low', lane) for lane, value in transmit):
+            return sentence, (
+                self.MODULE_LIMIT_ACTIONS[('tx_power', 'low')]
+                if any(value > dark for _lane, value in transmit)
+                else self.DOWN_TRANSMITTER_ACTION)
+        if self._down_row_dark_transmitter(stats):
+            return sentence, self.DARK_TRANSMITTER_ACTION
+        return (sentence,
+                'Check the peer port and the link settings on both ends '
+                '(admin state, speed, FEC)')
+
     def detect_optical_anomalies(self) -> List[Dict[str, Any]]:
         """Detect optical-related anomalies"""
         anomalies = []
-
         for port_name, stats in self.current_optical_stats.items():
-            health = coerce_optical_health(stats.get('health_status', 'unknown'))
+            anomalies.extend(self._port_anomalies(port_name, stats))
+        return self._merge_module_findings(anomalies)
 
-            if health == OpticalHealth.DOWN:
+    def _breakout_cage(self, port_name: str) -> Optional[str]:
+        """'<device>:swp<N>' for a breakout sub-port, None for any other port."""
+        device, _separator, interface = port_name.rpartition(':')
+        match = self.BREAKOUT_PORT_RE.fullmatch(interface)
+        return f"{device}:{match.group('cage')}" if match else None
+
+    def _merge_module_findings(self, anomalies: List[Dict[str, Any]]
+                               ) -> List[Dict[str, Any]]:
+        """Report a condition of the module once per breakout cage.
+
+        Every swp<N>s<M> of a cage reads the same module, so its temperature,
+        its voltage or its absence arrived once per sub-port: one hot module
+        in a 4x split was four findings.  One finding stays, carries the
+        worst of the sub-ports' readings and names them all (``ports``);
+        each row keeps its own badge.
+        """
+        merged = []
+        groups: Dict[tuple, Dict[str, Any]] = {}
+        for anomaly in anomalies:
+            cage = (self._breakout_cage(anomaly['port'])
+                    if anomaly.get('scope') == 'module' else None)
+            if cage is None:
+                merged.append(anomaly)
+                continue
+            key = (cage, anomaly['type'], anomaly['severity'])
+            if key in groups:
+                kept = groups[key]
+                kept['ports'].append(anomaly['port'])
+                # Each sub-port reads the module a moment apart, so the
+                # values differ slightly: the finding names the worst one.
+                value, worst = anomaly.get('value'), kept.get('value')
+                if (isinstance(value, (int, float)) and
+                        isinstance(worst, (int, float)) and
+                        anomaly.get('direction') == kept.get('direction') and
+                        (value < worst if kept.get('direction') == 'low'
+                         else value > worst)):
+                    ports = kept['ports']
+                    kept.clear()
+                    kept.update(anomaly, cage=cage, ports=ports)
+                continue
+            anomaly['cage'] = cage
+            anomaly['ports'] = [anomaly['port']]
+            groups[key] = anomaly
+            merged.append(anomaly)
+
+        def sub_port_index(port):
+            # Numeric order without int(): a corrupted file can carry an
+            # index of thousands of digits, which int() refuses.
+            digits = self.BREAKOUT_PORT_RE.fullmatch(
+                port.rpartition(':')[2]).group('index').lstrip('0')
+            return (len(digits), digits)
+
+        for anomaly in groups.values():
+            if len(anomaly['ports']) < 2:
+                continue
+            anomaly['ports'].sort(key=sub_port_index)
+            anomaly['port'] = anomaly['ports'][0]
+            anomaly['message'] += (
+                f" (one module in {anomaly['cage'].rpartition(':')[2]}, "
+                "sub-ports "
+                + ', '.join(port.rpartition(':')[2] for port in anomaly['ports'])
+                + ')')
+        return merged
+
+    def _anomalies_by_port(self, anomalies: List[Dict[str, Any]]
+                           ) -> Dict[str, List[Dict[str, Any]]]:
+        """port -> its findings; a merged module finding is on every sub-port."""
+        by_port: Dict[str, List[Dict[str, Any]]] = {}
+        for anomaly in anomalies:
+            for port in anomaly.get('ports') or [anomaly.get('port', '')]:
+                by_port.setdefault(port, []).append(anomaly)
+        # A merged finding sits where its first sub-port reported it; the
+        # sentence of a DOWN row still leads that row's list.
+        for findings in by_port.values():
+            findings.sort(key=lambda item: item.get('type') != 'OPTICAL_LINK_DOWN')
+        return by_port
+
+    def get_finding_counts(self) -> Dict[str, int]:
+        """Problem counts in which one module of a breakout cage counts once.
+
+        The port counts of get_optical_summary are what the page cards and
+        their row filters show, so they stay per port.  Here the sub-ports
+        of a cage whose state comes from the module alone (its temperature
+        or voltage, or the module pulled) are one finding.
+        """
+        counts = {'critical': 0, 'warning': 0, 'unplugged': 0}
+        seen = set()
+        for port_name, stats in self.current_optical_stats.items():
+            health = coerce_optical_health(
+                stats.get('health_status', 'unknown')).value
+            if health not in counts:
+                continue
+            cage = self._breakout_cage(port_name)
+            causes = stats.get('health_causes') or []
+            module_scope = health == 'unplugged' or (
+                causes and set(causes) <= self.MODULE_SCOPE_METRICS)
+            if cage is not None and module_scope:
+                if (cage, health) in seen:
+                    continue
+                seen.add((cage, health))
+            counts[health] += 1
+        return {
+            'critical_findings': counts['critical'],
+            'warning_findings': counts['warning'],
+            'unplugged_modules': counts['unplugged'],
+        }
+
+    def _port_anomalies(self, port_name: str,
+                        stats: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The findings of one port, before module findings are merged."""
+        anomalies = []
+        health = coerce_optical_health(stats.get('health_status', 'unknown'))
+        down = health == OpticalHealth.DOWN
+
+        if down:
+            # The badge stays; the sentence comes from the readings and
+            # the causes they show are listed below like on any row.
+            message, action = self._down_row_reading(stats)
+            anomalies.append({
+                "port": port_name,
+                "type": "OPTICAL_LINK_DOWN",
+                "severity": "warning",
+                "message": message,
+                "action": action,
+                "rx_power_dbm": stats.get('rx_power_dbm')
+            })
+
+        if health == OpticalHealth.UNPLUGGED:
+            anomalies.append({
+                "port": port_name,
+                "type": "OPTICAL_MODULE_UNPLUGGED",
+                "severity": "warning",
+                "message": "Optical module is unplugged",
+                "action": "Install or reseat the expected optical module",
+                "scope": "module"
+            })
+            return anomalies
+
+        if health == OpticalHealth.UNKNOWN and stats.get('note'):
+            anomalies.append({
+                "port": port_name,
+                "type": "OPTICAL_DOM_UNREADABLE",
+                "severity": "warning",
+                "message": stats['note'],
+                "action": ("Check that 'ethtool -m' answers for this port "
+                           "on the switch; reseat or replace the module if "
+                           "it stays unreadable"),
+                "scope": "module"
+            })
+            return anomalies
+
+        bias_events = (stats.get('bias_assessment') or {}).get('events', [])
+        for event in bias_events:
+            value = event.get('value_ma')
+            limit = event.get('threshold_ma')
+            measurement = f'{value:.3f} mA' if value is not None else 'reading unavailable'
+            boundary = f'{limit:.3f} mA' if limit is not None else 'unavailable'
+            if event.get('value_in_range'):
+                flag_text = '; module flag set, value in range'
+            elif event['source'] == 'module flag':
+                flag_text = '; module flag is On'
+            else:
+                flag_text = ''
+            anomalies.append({
+                'port': port_name,
+                'type': 'LASER_BIAS_' + event['direction'].upper(),
+                'severity': event['severity'],
+                'message': (
+                    f"Laser bias lane {event['lane']}: {measurement}; module "
+                    f"{event['direction']} {event['kind']} threshold: {boundary}"
+                    + flag_text
+                ),
+                'action': 'Review transceiver diagnostics and module operating limits',
+                'bias_current_ma': value,
+                'threshold_ma': limit,
+                'lane': event['lane'],
+                'metric': 'bias_current',
+            })
+
+        # A reading beyond a limit the module prints for itself names
+        # that limit; the generic texts below are for metrics no module
+        # table graded.
+        module_limits = stats.get('module_limits') or {}
+        module_decided = module_limits.get('decided') or []
+        limit_events = module_limits.get('events') or []
+        if down:
+            limit_events = [
+                event for event in limit_events
+                if event['severity'] == 'critical' and self._down_row_keeps(
+                    stats, event['metric'], event['direction'],
+                    event.get('lane'))
+            ]
+        # A link-down port none of whose transmit lanes shows light: a low
+        # TX finding kept there rests on the driven lasers alone.
+        down_transmit_dark = down and not any(
+            value > self.DARK_POWER_DBM
+            for _lane, value in self._down_row_lanes(stats, 'tx_power'))
+        for event in limit_events:
+            action = self.MODULE_LIMIT_ACTIONS.get(
+                (event['metric'], event['direction']),
+                'Review transceiver diagnostics and module operating limits')
+            if (down_transmit_dark and event['metric'] == 'tx_power'
+                    and event['direction'] == 'low'):
+                action = self.DOWN_TRANSMITTER_ACTION
+            anomalies.append({
+                'port': port_name,
+                'type': (f"MODULE_{event['metric'].upper()}_"
+                         f"{event['direction'].upper()}"),
+                'severity': event['severity'],
+                'message': self._module_limit_message(event),
+                'action': action,
+                'value': event['value'],
+                'threshold': event['threshold'],
+                'lane': event['lane'],
+                'metric': event['metric'],
+                'direction': event['direction'],
+            })
+            if event['metric'] in self.MODULE_SCOPE_METRICS:
+                anomalies[-1]['scope'] = 'module'
+
+        # A condition of the module alone is one finding for its cage.
+        causes = stats.get('health_causes') or []
+        module_scope = bool(causes) and set(causes) <= self.MODULE_SCOPE_METRICS
+
+        if health == OpticalHealth.CRITICAL or down:
+            # Critical optical issues
+            anomaly_count = len(anomalies)
+            rx_power = (None if 'rx_power' in module_decided
+                        else stats.get('rx_power_dbm'))
+            tx_power = (None if 'tx_power' in module_decided
+                        else stats.get('tx_power_dbm'))
+            temperature = (None if 'temperature' in module_decided
+                           else stats.get('temperature_c'))
+            voltage = (None if 'voltage' in module_decided
+                       else stats.get('voltage_v'))
+            rx_high = self.thresholds.get('rx_power_critical_high_dbm', 7.0)
+            tx_low = self.thresholds['tx_power_min_dbm']
+            tx_high = self.thresholds['tx_power_max_dbm']
+
+            def module_alarm(metric, direction):
+                # A limit of an incomplete module table already named this
+                # reading as critical; the generic text would repeat it.
+                return any(event['metric'] == metric and
+                           event['direction'] == direction and
+                           event['severity'] == 'critical'
+                           for event in limit_events)
+
+            if (rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm']
+                    and (not down or self._down_row_keeps(stats, 'rx_power', 'low'))):
                 anomalies.append({
                     "port": port_name,
-                    "type": "OPTICAL_LINK_DOWN",
-                    "severity": "warning",
-                    "message": "No receive light on the selected active optical lane",
-                    "action": "Check fiber connection, peer state, and transceiver",
-                    "rx_power_dbm": stats.get('rx_power_dbm')
+                    "type": "LOW_OPTICAL_POWER",
+                    "severity": "critical",
+                    "message": f"RX power too low: {rx_power:.2f} dBm (threshold: {self.thresholds['rx_power_min_dbm']} dBm)",
+                    "action": "Check fiber connection, clean connectors, or replace cable",
+                    "rx_power_dbm": rx_power,
+                    "metric": "rx_power"
                 })
-                continue
 
-            if health == OpticalHealth.UNPLUGGED:
+            if (rx_power is not None and rx_power > rx_high
+                    and not module_alarm('rx_power', 'high')):
                 anomalies.append({
                     "port": port_name,
-                    "type": "OPTICAL_MODULE_UNPLUGGED",
-                    "severity": "warning",
-                    "message": "Optical module is unplugged",
-                    "action": "Install or reseat the expected optical module"
+                    "type": "HIGH_OPTICAL_POWER",
+                    "severity": "critical",
+                    "message": f"RX power too high: {rx_power:.2f} dBm (threshold: {rx_high} dBm)",
+                    "action": self.MODULE_LIMIT_ACTIONS[('rx_power', 'high')],
+                    "rx_power_dbm": rx_power,
+                    "metric": "rx_power"
                 })
-                continue
 
-            bias_events = (stats.get('bias_assessment') or {}).get('events', [])
-            for event in bias_events:
-                value = event.get('value_ma')
-                limit = event.get('threshold_ma')
-                measurement = f'{value:.3f} mA' if value is not None else 'reading unavailable'
-                boundary = f'{limit:.3f} mA' if limit is not None else 'unavailable'
+            if down and tx_power is not None:
+                # The displayed lane need not be the one that can explain
+                # the outage: take the worst lane the DOWN row keeps.
+                tx_power = next((
+                    value for lane, value in sorted(
+                        self._down_row_lanes(stats, 'tx_power'),
+                        key=lambda item: self._lane_risk('tx_power', item[1]),
+                        reverse=True)
+                    if (value < tx_low or value > tx_high) and
+                    self._down_row_keeps(
+                        stats, 'tx_power',
+                        'low' if value < tx_low else 'high', lane)), None)
+            if tx_power is not None and (tx_power < tx_low or tx_power > tx_high):
                 anomalies.append({
-                    'port': port_name,
-                    'type': 'LASER_BIAS_' + event['direction'].upper(),
-                    'severity': event['severity'],
-                    'message': (
-                        f"Laser bias lane {event['lane']}: {measurement}; module "
-                        f"{event['direction']} {event['kind']} threshold: {boundary}"
-                        + ('; module flag is On' if event['source'] == 'module flag' else '')
-                    ),
-                    'action': 'Review transceiver diagnostics and module operating limits',
-                    'bias_current_ma': value,
-                    'threshold_ma': limit,
-                    'lane': event['lane'],
+                    "port": port_name,
+                    "type": "TX_POWER_OUT_OF_RANGE",
+                    "severity": "critical",
+                    "message": f"TX power out of range: {tx_power:.2f} dBm",
+                    "action": (self.DOWN_TRANSMITTER_ACTION
+                               if down_transmit_dark and tx_power < tx_low
+                               else "Inspect or replace the transceiver and verify module compatibility"),
+                    "tx_power_dbm": tx_power,
+                    "metric": "tx_power"
                 })
 
-            if health == OpticalHealth.CRITICAL:
-                # Critical optical issues
-                anomaly_count = len(anomalies)
-                rx_power = stats.get('rx_power_dbm')
-                tx_power = stats.get('tx_power_dbm')
-                temperature = stats.get('temperature_c')
+            dark_transmitter = (self._down_row_dark_transmitter(stats)
+                                if down else None)
+            if dark_transmitter:
+                # Not graded: the dump cannot tell a failed transmitter
+                # from a module without transmit power monitoring.
+                bias = dark_transmitter['bias_ma']
+                if len(bias) == 1:
+                    drawn = f"the laser draws {bias[0]:.1f} mA"
+                    where = ''
+                else:
+                    span = (f"{min(bias):.1f} mA" if min(bias) == max(bias)
+                            else f"{min(bias):.1f} to {max(bias):.1f} mA")
+                    drawn = f"the lasers draw {span}"
+                    where = ' on any lane'
+                anomalies.append({
+                    "port": port_name,
+                    "type": "TX_DARK_LASER_DRIVEN",
+                    "severity": "warning",
+                    "message": (f"TX reads no light{where} while {drawn} "
+                                "(failed transmitter or TX power not "
+                                "monitored)"),
+                    "action": self.DARK_TRANSMITTER_ACTION,
+                    "metric": "tx_power"
+                })
 
-                if rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm']:
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "LOW_OPTICAL_POWER",
-                        "severity": "critical",
-                        "message": f"RX power too low: {rx_power:.2f} dBm (threshold: {self.thresholds['rx_power_min_dbm']} dBm)",
-                        "action": "Check fiber connection, clean connectors, or replace cable",
-                        "rx_power_dbm": rx_power
-                    })
+            if temperature is not None and temperature > self.thresholds['temperature_max_c']:
+                anomalies.append({
+                    "port": port_name,
+                    "type": "HIGH_TEMPERATURE",
+                    "severity": "critical",
+                    "message": f"SFP temperature too high: {temperature:.1f}°C (threshold: {self.thresholds['temperature_max_c']}°C)",
+                    "action": "Check cooling, reduce load, or replace SFP module",
+                    "temperature_c": temperature,
+                    "value": temperature,
+                    "direction": "high",
+                    "metric": "temperature",
+                    "scope": "module"
+                })
 
-                if tx_power is not None and (
-                        tx_power < self.thresholds['tx_power_min_dbm'] or
-                        tx_power > self.thresholds['tx_power_max_dbm']):
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "TX_POWER_OUT_OF_RANGE",
-                        "severity": "critical",
-                        "message": f"TX power out of range: {tx_power:.2f} dBm",
-                        "action": "Inspect or replace the transceiver and verify module compatibility",
-                        "tx_power_dbm": tx_power
-                    })
+            # Voltage and a temperature below the minimum are conditions of
+            # the module like the one above: named with value and limit on
+            # link-up and link-down rows alike, so a DOWN row lists them
+            # and its stored causes carry them.
+            if (temperature is not None
+                    and temperature < self.thresholds['temperature_min_c']
+                    and not module_alarm('temperature', 'low')):
+                anomalies.append({
+                    "port": port_name,
+                    "type": "LOW_TEMPERATURE",
+                    "severity": "critical",
+                    "message": f"SFP temperature too low: {temperature:.1f}°C (threshold: {self.thresholds['temperature_min_c']}°C)",
+                    "action": "Check the module's environment; replace the module if the reading is wrong",
+                    "temperature_c": temperature,
+                    "value": temperature,
+                    "direction": "low",
+                    "metric": "temperature",
+                    "scope": "module"
+                })
 
-                if temperature is not None and temperature > self.thresholds['temperature_max_c']:
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "HIGH_TEMPERATURE",
-                        "severity": "critical",
-                        "message": f"SFP temperature too high: {temperature:.1f}°C (threshold: {self.thresholds['temperature_max_c']}°C)",
-                        "action": "Check cooling, reduce load, or replace SFP module",
-                        "temperature_c": temperature
-                    })
+            if voltage is not None and (
+                    voltage < self.thresholds['voltage_min_v'] or
+                    voltage > self.thresholds['voltage_max_v']
+            ) and not module_alarm(
+                    'voltage',
+                    'low' if voltage < self.thresholds['voltage_min_v']
+                    else 'high'):
+                anomalies.append({
+                    "port": port_name,
+                    "type": "VOLTAGE_OUT_OF_RANGE",
+                    "severity": "critical",
+                    "message": (f"Module voltage out of range: {voltage:.4f} V "
+                                f"(limits: {self.thresholds['voltage_min_v']} "
+                                f"to {self.thresholds['voltage_max_v']} V)"),
+                    "action": "Reseat the transceiver; replace it or check the port's power supply if the voltage stays out of range",
+                    "voltage_v": voltage,
+                    "value": voltage,
+                    "direction": ("low" if voltage < self.thresholds['voltage_min_v']
+                                  else "high"),
+                    "metric": "voltage",
+                    "scope": "module"
+                })
 
-                if (len(anomalies) == anomaly_count and
-                        not any(e['severity'] == 'critical' for e in bias_events)):
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "CRITICAL_OPTICAL_PARAMETER",
-                        "severity": "critical",
-                        "message": "A voltage, bias, high-RX, or lane threshold is critical",
-                        "action": "Inspect the displayed worst-lane values and transceiver diagnostics"
-                    })
+            if (not down and len(anomalies) == anomaly_count and
+                    not any(e['severity'] == 'critical'
+                            for e in bias_events + limit_events)):
+                anomalies.append({
+                    "port": port_name,
+                    "type": "CRITICAL_OPTICAL_PARAMETER",
+                    "severity": "critical",
+                    "message": "A voltage, bias, high-RX, or lane threshold is critical",
+                    "action": "Inspect the displayed worst-lane values and transceiver diagnostics"
+                })
+                if module_scope:
+                    anomalies[-1]['scope'] = 'module'
 
-            elif health == OpticalHealth.WARNING:
-                # Warning level issues
-                link_margin = stats.get('link_margin_db')
-                if (isinstance(link_margin, (int, float)) and
-                        link_margin < self.thresholds['link_margin_min_db']):
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "LOW_LINK_MARGIN",
-                        "severity": "warning",
-                        "message": f"Low link margin: {link_margin:.2f} dB (threshold: {self.thresholds['link_margin_min_db']} dB)",
-                        "action": "Monitor closely, schedule proactive maintenance",
-                        "link_margin_db": link_margin
-                    })
-                elif not bias_events:
-                    anomalies.append({
-                        "port": port_name,
-                        "type": "OPTICAL_PARAMETER_WARNING",
-                        "severity": "warning",
-                        "message": "An optical power or temperature value is near its limit",
-                        "action": "Review the displayed worst-lane value and monitor the port"
-                    })
+        elif health == OpticalHealth.WARNING:
+            # Warning level issues
+            link_margin = stats.get('link_margin_db')
+            if (isinstance(link_margin, (int, float)) and
+                    link_margin < self.thresholds['link_margin_min_db']):
+                margin_reference = ''
+                if 'rx_power' in module_decided:
+                    rx_low_alarm = ((module_limits.get('thresholds') or {})
+                                    .get('rx_power') or {}).get('low_alarm')
+                    if rx_low_alarm is not None:
+                        margin_reference = (
+                            " above the module's RX low alarm "
+                            f"{rx_low_alarm:.2f} dBm")
+                anomalies.append({
+                    "port": port_name,
+                    "type": "LOW_LINK_MARGIN",
+                    "severity": "warning",
+                    "message": f"Low link margin: {link_margin:.2f} dB{margin_reference} (threshold: {self.thresholds['link_margin_min_db']} dB)",
+                    "action": "Monitor closely, schedule proactive maintenance",
+                    "link_margin_db": link_margin,
+                    "metric": "rx_power"
+                })
+            elif not bias_events and not limit_events:
+                anomalies.append({
+                    "port": port_name,
+                    "type": "OPTICAL_PARAMETER_WARNING",
+                    "severity": "warning",
+                    "message": "An optical power or temperature value is near its limit",
+                    "action": "Review the displayed worst-lane value and monitor the port"
+                })
+                if module_scope:
+                    anomalies[-1]['scope'] = 'module'
 
         return anomalies
 
@@ -1547,6 +2777,10 @@ class OpticalAnalyzer:
         health = port_info.get('health', 'unknown')
 
         if health == OpticalHealth.DOWN.value:
+            # What to check follows from what the receiver reads.
+            stats = self.current_optical_stats.get(port_info.get('port'))
+            if stats:
+                return self._down_row_reading(stats)[1]
             return "Check fiber connection, peer state, and transceiver"
 
         if health == OpticalHealth.UNPLUGGED.value:
@@ -1558,10 +2792,27 @@ class OpticalAnalyzer:
         if health == OpticalHealth.CRITICAL.value:
             rx_power = port_info.get('rx_power_dbm')
             temperature = port_info.get('temperature_c')
+            # The limits that made the port critical choose the advice: the
+            # module's own alarm where its table graded the metric, the
+            # generic limit otherwise.
+            module_limits = (self.current_optical_stats.get(
+                port_info.get('port')) or {}).get('module_limits') or {}
+            module_decided = module_limits.get('decided') or []
+            module_alarms = {
+                (event['metric'], event['direction'])
+                for event in module_limits.get('events') or []
+                if event['severity'] == 'critical'
+            }
+            if 'rx_power' in module_decided:
+                rx_power = None
+            if 'temperature' in module_decided:
+                temperature = None
 
-            if rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm']:
+            if (('rx_power', 'low') in module_alarms or
+                    (rx_power is not None and rx_power < self.thresholds['rx_power_min_dbm'])):
                 return "Check fiber connection, clean connectors, or replace cable"
-            elif temperature is not None and temperature > self.thresholds['temperature_max_c']:
+            elif (('temperature', 'high') in module_alarms or
+                    (temperature is not None and temperature > self.thresholds['temperature_max_c'])):
                 return "Check cooling, reduce load, or replace SFP module"
             else:
                 return "Investigate critical optical parameters immediately"
@@ -1589,9 +2840,7 @@ class OpticalAnalyzer:
     def build_export_rows(self, summary: Dict[str, Any],
                           anomalies: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Flat export rows in the same problems-first order as the HTML table."""
-        anomalies_by_port: Dict[str, List[Dict[str, Any]]] = {}
-        for anomaly in anomalies:
-            anomalies_by_port.setdefault(anomaly.get('port', ''), []).append(anomaly)
+        anomalies_by_port = self._anomalies_by_port(anomalies)
 
         all_ports = self._ordered_ports(summary)
 
@@ -1630,10 +2879,29 @@ class OpticalAnalyzer:
                 'inactive_lanes': ' '.join(
                     str(lane) for lane in (stats.get('inactive_lanes') or [])
                 ),
+                # Items are joined with '; ', so a semicolon inside a
+                # message is written as a comma: the cell splits back into
+                # its items on ';' alone.
                 'anomalies': '; '.join(
-                    f"{str(item.get('severity', '')).upper()}: {item.get('message', '')}"
+                    f"{str(item.get('severity', '')).upper()}: "
+                    f"{str(item.get('message', '')).replace(';', ',')}"
                     for item in anomalies_by_port.get(port_name, [])
                 ),
+                # Which module channel each value of rx_lanes, tx_lanes and
+                # bias_lanes belongs to (a breakout sub-port does not start
+                # at channel 1), and the lane of the headline values.
+                'rx_lane_ids': ' '.join(
+                    str(lane) for lane in (stats.get('rx_power_lane_ids') or [])
+                ),
+                'tx_lane_ids': ' '.join(
+                    str(lane) for lane in (stats.get('tx_power_lane_ids') or [])
+                ),
+                'bias_lane_ids': ' '.join(
+                    str(lane) for lane in (stats.get('bias_current_lane_ids') or [])
+                ),
+                'rx_power_lane': port.get('rx_power_lane'),
+                'tx_power_lane': port.get('tx_power_lane'),
+                'bias_current_lane': port.get('bias_current_lane'),
             })
         return rows
 
@@ -1688,9 +2956,7 @@ class OpticalAnalyzer:
         # Group the already-computed anomalies (exact measured values and the
         # specific remediation string) by port so they can be surfaced in the
         # expandable per-row detail panel instead of being discarded.
-        anomalies_by_port: Dict[str, List[Dict[str, Any]]] = {}
-        for anomaly in anomalies:
-            anomalies_by_port.setdefault(anomaly.get('port', ''), []).append(anomaly)
+        anomalies_by_port = self._anomalies_by_port(anomalies)
 
         # True data age: the newest sample timestamp actually collected, not the
         # report-generation time.  This prevents a stale collection reading as
@@ -1737,6 +3003,15 @@ class OpticalAnalyzer:
             f' data-optical-total="{summary["total_ports"]}"'
             f' data-optical-unplugged="{len(summary["unplugged_ports"])}"'
             f' data-optical-unknown="{len(summary["unknown_ports"])}"'
+        )
+        # The same problems with one module of a breakout cage counted once
+        # (its temperature, its voltage, the module pulled); the cards and
+        # their row filters stay per port.
+        finding_counts = self.get_finding_counts()
+        coverage_attrs += (
+            f' data-optical-critical-findings="{finding_counts["critical_findings"]}"'
+            f' data-optical-warning-findings="{finding_counts["warning_findings"]}"'
+            f' data-optical-unplugged-modules="{finding_counts["unplugged_modules"]}"'
         )
 
         coverage_warning_html = ''
@@ -1966,6 +3241,9 @@ class OpticalAnalyzer:
                 'bias_lane': port.get('bias_current_lane'),
                 'bias_thresholds_ma': stats.get('bias_thresholds_ma') or {},
                 'bias_assessment': stats.get('bias_assessment') or {},
+                'module_limits': stats.get('module_limits') or {},
+                'not_monitored': stats.get('not_monitored') or [],
+                'link_state': stats.get('link_state'),
                 'anomalies': [
                     {
                         'severity': item.get('severity', ''),
@@ -2123,13 +3401,14 @@ class OpticalAnalyzer:
                     <tr><th>Parameter</th><th>Min Threshold</th><th>Max Threshold</th><th>Description</th></tr>
                 </thead>
                 <tbody>
-                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Received power on in-service optical lanes only (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm); media-declared placeholder channels and lanes with no light and no laser bias current are excluded</td></tr>
-                    <tr><td>TX Power</td><td>{self.thresholds['tx_power_min_dbm']} dBm</td><td>{self.thresholds['tx_power_max_dbm']} dBm</td><td>Transmitted optical power range</td></tr>
-                    <tr><td>Temperature</td><td>{self.thresholds['temperature_min_c']}°C</td><td>{self.thresholds['temperature_max_c']}°C</td><td>SFP/QSFP operating temperature</td></tr>
-                    <tr><td>Voltage</td><td>{self.thresholds['voltage_min_v']}V</td><td>{self.thresholds['voltage_max_v']}V</td><td>Supply voltage range</td></tr>
-                    <tr><td>Link Margin</td><td>{self.thresholds['link_margin_min_db']} dB</td><td>-</td><td>Minimum margin from notifications.yaml; based on the current generic RX sensitivity until module-specific limits are collected</td></tr>
+                    <tr><td>Module limits</td><td>Module low alarm / warning</td><td>Module high warning / alarm</td><td>RX power, TX power, temperature and voltage are graded by the limits the module prints for itself (ethtool -m) whenever its table for that parameter is complete, consistent and physically plausible (an unprogrammed table such as -128 / +128 C is ignored): a lane or module value beyond an alarm limit is Critical, beyond a warning limit is Warning, close to a warning limit is Good. The generic values in the rows below are then not applied to that parameter. Expand a port to see which limits graded it.</td></tr>
+                    <tr><td>RX Power</td><td>{self.thresholds['rx_power_min_dbm']} dBm</td><td>{self.thresholds['rx_power_critical_high_dbm']} dBm</td><td>Generic limits, used when the module prints no valid RX power table (warning above {self.thresholds['rx_power_warning_high_dbm']} dBm). Received power on in-service optical lanes only; media-declared placeholder channels and lanes with no light and no laser bias current are excluded</td></tr>
+                    <tr><td>TX Power</td><td>{self.thresholds['tx_power_min_dbm']} dBm</td><td>{self.thresholds['tx_power_max_dbm']} dBm</td><td>Generic transmitted optical power range, used when the module prints no valid TX power table (warning within 1 dB of either end)</td></tr>
+                    <tr><td>Temperature</td><td>{self.thresholds['temperature_min_c']}°C</td><td>{self.thresholds['temperature_max_c']}°C</td><td>Generic SFP/QSFP operating temperature, used when the module prints no valid temperature table (warning within 10°C of the maximum)</td></tr>
+                    <tr><td>Voltage</td><td>{self.thresholds['voltage_min_v']}V</td><td>{self.thresholds['voltage_max_v']}V</td><td>Generic supply voltage range, used when the module prints no valid voltage table</td></tr>
+                    <tr><td>Link Margin</td><td>{self.thresholds['link_margin_min_db']} dB</td><td>-</td><td>Minimum margin from notifications.yaml; a lane below it is Warning. Counted from the module's RX power low alarm when the module prints a valid RX power table, otherwise from the generic {self.thresholds['rx_power_min_dbm']} dBm RX sensitivity</td></tr>
                     <tr><td>Bias Current</td><td>Module low limits</td><td>Module high limits</td><td>Module-reported warning/alarm limits and flags, in mA. Expand a port to see its limits and assessment. Without sufficient module evidence, bias assessment is unavailable; other optical parameters are still graded.</td></tr>
-                    <tr><td>Down</td><td>-</td><td>{self.DARK_POWER_DBM} dBm RX</td><td>No receive light on every selected active optical lane; reported separately from Critical threshold violations</td></tr>
+                    <tr><td>Down</td><td>-</td><td>{self.DARK_POWER_DBM} dBm RX</td><td>The port's link is down while its module still answers, whatever the module reads: expand the port to see whether light is present on all lanes, which lane is too low, or that no receive light arrives, and any module alarm behind the outage. Without a collected link state, a port with no receive light (at or below {self.DARK_POWER_DBM} dBm) on every in-service lane. A port whose link is up is never Down. Reported separately from Critical threshold violations</td></tr>
                 </tbody>
             </table>
         </div>
@@ -2264,6 +3543,58 @@ class OpticalAnalyzer:
                     'Bias assessment unavailable: module limits and flags were not recorded.') +
                 '</div></div>';
             inner += '</div>';
+
+            // Which limits graded each parameter: the module's own table
+            // when it prints a complete one, the generic values otherwise.
+            const moduleLimits = data.module_limits;
+            if (moduleLimits && Array.isArray(moduleLimits.decided)) {
+                const limitTables = moduleLimits.thresholds || {};
+                // A table the module prints but that no real module could
+                // mean (an unprogrammed one) grades nothing.
+                const ignoredTables = moduleLimits.ignored || {};
+                inner += '<div class="detail-empty">Limits used for grading:</div>' +
+                    '<div class="detail-lane-values">';
+                [
+                    ['rx_power', 'RX power', ' dBm', 2], ['tx_power', 'TX power', ' dBm', 2],
+                    ['temperature', 'Temperature', ' C', 2], ['voltage', 'Voltage', ' V', 4]
+                ].forEach(([key, label, unit, digits]) => {
+                    const limitText = table => [
+                        ['low_alarm', 'low alarm'], ['low_warning', 'low warning'],
+                        ['high_warning', 'high warning'], ['high_alarm', 'high alarm']
+                    ].filter(([name]) => typeof table[name] === 'number' && Number.isFinite(table[name]))
+                        .map(([name, text]) => text + ' ' + table[name].toFixed(digits) + unit)
+                        .join(', ');
+                    const printed = limitText(limitTables[key] || {});
+                    const ignored = limitText(ignoredTables[key] || {});
+                    let source = 'generic limits (the module prints no valid table)';
+                    if (moduleLimits.decided.includes(key)) {
+                        source = 'module limits: ' + printed;
+                    } else if (printed) {
+                        source = 'generic limits; the module prints only ' + printed +
+                            ', which can still raise an alarm';
+                    } else if (ignored) {
+                        source = 'generic limits (module table ignored: implausible; it prints ' +
+                            ignored + ')';
+                    }
+                    inner += esc(label) + ': ' + esc(source) + '<br>';
+                });
+                inner += '</div>';
+            }
+
+            // A power side this module does not monitor has no value: it
+            // read no light on every lane while the link was up or, on a
+            // port without a collected link state, while the lasers were
+            // driven and light arrived, so it was not graded.
+            const notMonitored = data.not_monitored || [];
+            if (notMonitored.length) {
+                const sideNames = {tx_power: 'TX power', rx_power: 'RX power'};
+                const contradiction = data.link_state === 'up'
+                    ? 'although the link is up'
+                    : 'although the lasers draw bias and the port receives light';
+                inner += '<div class="detail-empty">Not monitored by this module, not graded: ' +
+                    esc(notMonitored.map(side => sideNames[side] || side).join(', ')) +
+                    ' (reads no light on every lane ' + contradiction + ').</div>';
+            }
 
             const inactive = data.inactive_lanes || [];
             if (inactive.length) {

@@ -2074,12 +2074,14 @@ def _validate_notifications(value):
             "thresholds.network.link_flaps_critical must be greater than or equal "
             "to link_flaps_per_hour"
         )
+    # A link margin in dB, the same range Setup accepts: a negative value
+    # is not in effect (the optical analyzer ignores it).
     _known_number(
         network,
         "optical_power_margin",
         "thresholds.network.optical_power_margin",
-        -100,
-        100,
+        0,
+        30,
     )
     _known_number(
         hardware,

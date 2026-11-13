@@ -41,9 +41,17 @@ OPTICAL_COLLECTION_ERROR_RE = re.compile(
 )
 
 
+DOM_UNREADABLE_NOTE = ('Module diagnostics could not be read although the link '
+                       'is up (ethtool -m returned no data)')
+
+
 def record_optical_state(analyzer, port_name, hostname, health_status,
-                         raw_data=''):
-    """Keep an explicit row when diagnostics are unavailable or unplugged."""
+                         raw_data='', note=None):
+    """Keep an explicit row when diagnostics are unavailable or unplugged.
+
+    ``note`` says why a row has no readings; the report lists it with the
+    row's findings.
+    """
     analyzer.current_optical_stats[port_name] = {
         'port': port_name,
         'device': hostname,
@@ -57,6 +65,23 @@ def record_optical_state(analyzer, port_name, hostname, health_status,
         'last_updated': time.time(),
         'raw_data': raw_data[:500],
     }
+    if note:
+        analyzer.current_optical_stats[port_name]['note'] = note
+
+
+def _has_optical_history(analyzer, port_name):
+    """True when the port delivered optical diagnostics in an earlier run.
+
+    A row that never held a reading (a copper pluggable once listed as
+    'unknown') left history entries too; they do not make the port optical.
+    """
+    return any(
+        entry.get('health') not in (None, 'unknown', 'unplugged')
+        or any(entry.get(key) is not None for key in (
+            'rx_power_dbm', 'tx_power_dbm', 'temperature_c'))
+        for entry in analyzer.optical_history.get(port_name) or []
+        if isinstance(entry, dict)
+    )
 
 def parse_optical_collection_errors(content):
     """Return validated category-local optical collection failures."""
@@ -243,11 +268,12 @@ def _classify_optical_file(filepath, hostname):
         source_mtime = None
     ops = []
 
-    def state_op(port_name, health, snippet):
+    def state_op(port_name, health, snippet, note=None):
         # Mirror the parent's merge locally so the shard's persisted current
         # matches the fabric snapshot for this device.
-        record_optical_state(analyzer, port_name, hostname, health, snippet)
-        ops.append(('state', port_name, health, snippet))
+        record_optical_state(analyzer, port_name, hostname, health, snippet,
+                             note)
+        ops.append(('state', port_name, health, snippet, note))
 
     def updated_entries(port_name):
         stats_entry = analyzer.current_optical_stats.get(port_name)
@@ -296,23 +322,30 @@ def _classify_optical_file(filepath, hostname):
                     re.search(r'^\s*Interface\s+state\s*:\s*down\b',
                               optical_data,
                               re.IGNORECASE | re.MULTILINE)):
-                if port_name in analyzer.optical_history:
+                if _has_optical_history(analyzer, port_name):
                     state_op(port_name, 'unplugged', optical_data[:500])
+            # A link that is up has a module in the cage: the same text on
+            # a port that delivered diagnostics before is a module that
+            # stopped answering (EEPROM I/O error, refused read), not an
+            # empty cage.  Fixed copper ports never have optical history.
+            elif (NO_TRANSCEIVER_DATA_RE.search(optical_data) and
+                    re.search(r'^\s*Interface\s+state\s*:\s*up\b',
+                              optical_data,
+                              re.IGNORECASE | re.MULTILINE) and
+                    _has_optical_history(analyzer, port_name)):
+                state_op(port_name, 'unknown', optical_data[:500],
+                         DOM_UNREADABLE_NOTE)
             continue
 
         # DAC/Copper cables do not provide optical diagnostics.  Keep
         # this check before interface-state handling so a down DAC is
-        # not reclassified as a failed optical link.  Vendor identity
-        # lines (SN/PN/date code) may coincidentally contain 'DAC', so
-        # classify from descriptor lines only.
-        if any(indicator in line
-               for line in optical_data.split('\n')
-               if not re.match(r'\s*(?:vendor|serial|date)',
-                               line, re.IGNORECASE)
-               for indicator in [
-                   'Passive copper', 'Active copper', 'Copper cable',
-                   'Base-CR', 'DAC', 'Twinax', 'No separable connector'
-               ]):
+        # not reclassified as a failed optical link.  The analyzer holds
+        # the one rule that tells copper from optical (an active optical
+        # cable is optical); it answers None for copper.
+        parsed = parsed_blocks.get(interface)
+        if parsed is None:
+            parsed = analyzer.parse_optical_data(optical_data)
+        if parsed is None:
             continue
 
         # Check for unplugged ports - add as "unplugged" status for troubleshooting
@@ -333,10 +366,7 @@ def _classify_optical_file(filepath, hostname):
         if interface_state in {'down', 'lowerlayerdown', 'dormant'}:
             # Preserve a DOWN row only when real DOM values remain
             # readable.  The no-data and DAC cases were excluded above.
-            parsed = parsed_blocks.get(interface)
-            if parsed is None:
-                parsed = analyzer.parse_optical_data(optical_data)
-            usable_dom = parsed is not None and any(
+            usable_dom = any(
                 parsed.get(metric) is not None for metric in (
                     'rx_power_dbm', 'tx_power_dbm', 'temperature_c',
                     'voltage_v', 'bias_current_ma'
@@ -344,15 +374,13 @@ def _classify_optical_file(filepath, hostname):
             )
             if not usable_dom:
                 continue
+            # The row is DOWN whatever the module reads; the analyzer keeps
+            # the readings that can explain the outage next to the state.
             if analyzer.update_optical_stats(
                     port_name, optical_data, parsed=parsed,
-                    lanes_per_subport=breakout_lanes.get(interface)):
-                stats_entry, history_entry = updated_entries(port_name)
-                if stats_entry:
-                    stats_entry['health_status'] = 'down'
-                if history_entry:
-                    history_entry['health'] = 'down'
-                ops.append(('update', port_name, stats_entry, history_entry))
+                    lanes_per_subport=breakout_lanes.get(interface),
+                    link_down=True):
+                ops.append(('update', port_name, *updated_entries(port_name)))
             continue
         if interface_state == 'unknown':
             state_op(port_name, 'unknown', optical_data[:500])
@@ -366,10 +394,19 @@ def _classify_optical_file(filepath, hostname):
             state_op(port_name, 'unknown', optical_data[:500])
             continue
 
+        # A block with identity lines but no DOM value at all is not an
+        # optical port (a copper type no indicator names, a module without
+        # monitors) unless the port delivered diagnostics before.
+        if (not any(parsed.get(metric) is not None for metric in (
+                'rx_power_dbm', 'tx_power_dbm', 'temperature_c',
+                'voltage_v', 'bias_current_ma'))
+                and not parsed.get('bias_flags')
+                and not _has_optical_history(analyzer, port_name)):
+            continue
+
         # Update optical analyzer
         if analyzer.update_optical_stats(
-                port_name, optical_data,
-                parsed=parsed_blocks.get(interface),
+                port_name, optical_data, parsed=parsed,
                 lanes_per_subport=breakout_lanes.get(interface)):
             ops.append(('update', port_name, *updated_entries(port_name)))
 
@@ -432,8 +469,9 @@ def _merge_optical_ops(analyzer, hostname, ops):
     for op in ops:
         kind = op[0]
         if kind == 'state':
-            _kind, port_name, health, snippet = op
-            record_optical_state(analyzer, port_name, hostname, health, snippet)
+            _kind, port_name, health, snippet = op[:4]
+            record_optical_state(analyzer, port_name, hostname, health, snippet,
+                                 op[4] if len(op) > 4 else None)
         elif kind == 'update':
             _kind, port_name, stats_entry, _history_entry = op
             if stats_entry:
@@ -547,8 +585,10 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
 
     print("Processing optical diagnostics data")
     print(f"Data directory: {data_dir}")
+    # A module that prints a valid limit table is graded by it; these are
+    # the generic values every other reading is held against.
     print(
-        f"Using optical thresholds: RX Power min={optical_analyzer.thresholds['rx_power_min_dbm']:.1f} dBm, "
+        f"Using generic optical thresholds where a module prints none: RX Power min={optical_analyzer.thresholds['rx_power_min_dbm']:.1f} dBm, "
         f"warn high={optical_analyzer.thresholds.get('rx_power_warning_high_dbm', 5.0):.1f} dBm, "
         f"crit high={optical_analyzer.thresholds.get('rx_power_critical_high_dbm', 7.0):.1f} dBm, "
         f"Temperature max={optical_analyzer.thresholds['temperature_max_c']:.1f}°C"
@@ -716,6 +756,10 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
         "down": len(summary["down_ports"]),
         "unplugged": len(summary["unplugged_ports"]),
         "unknown": len(summary["unknown_ports"]),
+        # The same problems with one module of a breakout cage counted once
+        # (module temperature or voltage, the module pulled): one hot or
+        # pulled module in a 4x split is four ports above and one here.
+        **optical_analyzer.get_finding_counts(),
     }
     _atomic_write(
         os.path.join(result_dir, "summary", "optical-summary.json"),
@@ -737,14 +781,15 @@ def process_optical_data_files(data_dir="monitor-results/optical-data"):
     finish_phase("write_summary")
     print(f"Summary stats: {len(optical_analyzer.current_optical_stats)} total ports analyzed")
 
-    print(f"\nOptical Analysis Summary:")
+    print("\nOptical Analysis Summary:")
     print(f"  Total ports monitored: {summary['total_ports']}")
     print(f"  Excellent health: {len(summary['excellent_ports'])}")
     print(f"  Good health: {len(summary['good_ports'])}")
     print(f"  Warning level: {len(summary['warning_ports'])}")
     print(f"  Critical issues: {len(summary['critical_ports'])}")
-    print(f"  No receive light / down: {len(summary['down_ports'])}")
-    print(f"  Modules unplugged: {len(summary['unplugged_ports'])}")
+    print(f"  Link down / no receive light: {len(summary['down_ports'])}")
+    print(f"  Modules unplugged: {summary_counts['unplugged_modules']} "
+          f"({len(summary['unplugged_ports'])} ports)")
     print(f"  Diagnostics unavailable: {len(summary['unknown_ports'])}")
     print(f"  Anomalies detected: {len(anomalies)}")
 

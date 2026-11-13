@@ -138,6 +138,10 @@ class CsvSemanticsTests(unittest.TestCase):
         self.assertEqual(export_artifacts.csv_field(0), "0")
         # Untrusted text that merely looks numeric stays guarded.
         self.assertEqual(export_artifacts.csv_field("-5"), "'-5")
+        # Only a cell of a list-of-numbers column (the optical lane lists)
+        # is written as it is.
+        self.assertEqual(
+            export_artifacts.csv_field("-5", numeric_list=True), "-5")
 
     def test_quoting(self):
         self.assertEqual(export_artifacts.csv_field("a,b"), '"a,b"')

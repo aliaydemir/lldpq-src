@@ -294,9 +294,18 @@ def _load_optical_current_stats(mr_dir):
     return stats
 
 
+# Every swp<N>s<M> of a breakout cage reads the same module, so a state the
+# module's temperature or voltage alone caused reaches the optical current
+# stats once per sub-port.
+_BREAKOUT_PORT_RE = re.compile(r"(swp\d{1,6})s(\d{1,6})")
+_OPTICAL_MODULE_CAUSES = frozenset(("temperature", "voltage"))
+
+
 def _collect_optical(mr_dir):
     stats = _load_optical_current_stats(mr_dir)
     anomalies = []
+    # (device, cage, health) -> [position in anomalies, [(index, anomaly)]]
+    modules = {}
     for key in sorted(stats if isinstance(stats, dict) else {}):
         record = stats[key]
         if not isinstance(record, dict):
@@ -312,11 +321,43 @@ def _collect_optical(mr_dir):
             if reading is not None:
                 parts.append("%s=%.1fdB%s" % (label, reading,
                                               "" if label == "margin" else "m"))
-        anomalies.append(_anomaly(
+        # Power values alone do not explain a state the module's
+        # temperature, voltage or laser bias caused; name the one that did.
+        causes = record.get("health_causes")
+        if not isinstance(causes, list):
+            causes = []
+        for cause, label, field, layout in (
+                ("temperature", "temp", "temperature_c", "%s=%.1fC"),
+                ("voltage", "voltage", "voltage_v", "%s=%.2fV"),
+                ("bias_current", "bias", "bias_current_ma", "%s=%.1fmA")):
+            reading = _number(record.get(field))
+            if cause in causes and reading is not None:
+                parts.append(layout % (label, reading))
+        anomaly = _anomaly(
             "optical", device, port, "health_status", health, health,
             "Optical health %s%s" % (health, " (" + " ".join(parts) + ")" if parts else ""),
             "optical-history/",
-        ))
+        )
+        # One hot module in a 4x split is one problem, not four.  A down
+        # link stays per port: each sub-port's link is its own.
+        cage = _BREAKOUT_PORT_RE.fullmatch(port)
+        if (cage and health != "down" and causes and all(
+                isinstance(cause, str) and cause in _OPTICAL_MODULE_CAUSES
+                for cause in causes)):
+            group = modules.setdefault(
+                (device, cage.group(1), health), [len(anomalies), []])
+            group[1].append((int(cage.group(2)), anomaly))
+            if len(group[1]) > 1:
+                continue
+        anomalies.append(anomaly)
+    for (_device, cage, _health), (position, members) in modules.items():
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda member: member[0])
+        merged = members[0][1]
+        merged["detail"] += "; one module in %s, sub-ports %s" % (
+            cage, ", ".join(member[1]["port"] for member in members))
+        anomalies[position] = merged
     return anomalies
 
 

@@ -967,6 +967,10 @@ as the steps below do. Afterwards
 `sudo docker exec lldpq cat /var/www/html/VERSION` prints the new version.
 After an update from 4.2.x or earlier, also go through
 [after updating from 4.2.x](README.md#after-updating-from-42x-or-earlier).
+What changes on the first runs after an update from 4.3.1 or earlier (rows
+and counts of the Optical, Link Flap, BER, Transceiver and Duplicate pages,
+one extra summary alert) is listed under
+[after updating from 4.3.1](README.md#after-updating-from-431-or-earlier).
 
 ### Cumulus switch with host networking
 

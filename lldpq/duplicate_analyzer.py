@@ -10,8 +10,13 @@ network, grouped per VLAN/VNI. Combines several signals collected by monitor.sh
   * show evpn mac vni all duplicate        -> duplicate MACs (when FRR latches them)
   * zebra log "detected as duplicate"      -> timestamped event history (recency + rate)
   * show evpn (duplicate-detection config) -> max-moves/time, enabled? (avoid false-negatives)
-  * bridge fdb show                        -> same MAC LOCAL on >=2 switches (non-EVPN + location)
+  * bridge fdb show                        -> same MAC LOCAL on edge ports of >=2 switches (non-EVPN + location)
   * ip -4 neigh show                       -> APIPA (169.254/16 = DHCP failed) + IP<->multi-MAC
+
+The FDB rule also reads lldp-results/lldp_neighbors.json (written by the LLDP
+check) to tell an edge port from an inter-switch link, where every MAC behind
+the link is LOCAL on both ends. The duplicate-IP rows place their owners by the
+same port roles.
 
 Each duplicate-IP record keeps its MACs in separate sets, because they answer
 different questions. rec["macs"] holds the MACs that claim the address in the
@@ -111,6 +116,53 @@ STALE_AGE_SEC = 7 * 86400      # a quiesced dup whose EVPN sequence has not move
 # because a rolling union that only ever grows turns a two-device conflict into
 # "every MAC this address has ever had" (one factory-default address reached 425).
 IP_EVIDENCE_TTL_SEC = 6 * 3600
+# The FDB MAC rule has to know which ports hosts are attached to, and a port
+# name does not say: an uplink is a swp port too, and every MAC behind an
+# inter-switch link is LOCAL on both of its ends.
+#
+# A port holding this many MACs in one VLAN carries a segment rather than
+# hosts and is never an attachment point. An access port holds one MAC, or a
+# handful when it serves a hypervisor, a host with a few virtual functions, or
+# a phone with a PC behind it; an inter-switch link holds every MAC the VLAN
+# has beyond it. The bound sits well above that handful so those edge ports
+# keep working, and low enough that an uplink into an access VLAN is recognised
+# from the FDB alone when no LLDP data covers it. It also caps what a transit
+# port missed by every test can produce: fewer than this many rows per VLAN.
+# Bonds are exempt: a bond is never an attachment point for the MAC rule, so
+# the count would only remove a dual-homed hypervisor from the listed ports.
+#
+# Below the bound the FDB still gives a transit port away by fan-out: when
+# another monitored switch holds two MACs of one port on two different ports
+# of its own, the far side of that port has more than one attachment point,
+# so the port faces a segment (_index_fdb_ports).
+FDB_SEGMENT_MIN_MACS = 16
+# LLDP adjacency describes cabling, which changes far more slowly than the FDB,
+# so the neighbour sidecar may be much older than the duplicate sample. Past
+# this age the LLDP stage has stopped publishing and the file can no longer
+# prove that a port is an edge port; what it says about inter-switch links is
+# still used, because dropping it would turn every trunk back into a finding.
+LLDP_EVIDENCE_MAX_AGE_SEC = 24 * 3600
+# The sidecar's "created" stamp is local wall-clock time, so it may run an hour
+# ahead of this run across a DST change. A stamp further ahead than this is a
+# clock fault and cannot date the file; the file time is used instead.
+LLDP_EVIDENCE_MAX_AHEAD_SEC = 2 * 3600
+# The sidecar records the neighbour's name and the port it advertises, not its
+# LLDP capabilities, so a bridge/router neighbour is recognised by that port:
+#   swpN         Cumulus/NVUE front-panel port. Every link to a managed switch
+#                matches, and so does a Cumulus switch outside the inventory.
+#   Ethernet<N>  Arista EOS / SONiC.
+#   any '/'      slot/port notation of network operating systems (Ethernet1/1,
+#                Gi1/0/24, xe-0/0/1, 1/1/49). The Linux kernel rejects '/' in
+#                an interface name, so no server NIC carries one.
+# A managed device reached on any other port is an endpoint and stays an
+# attachment point: a switch's management port (eth0), a managed server's NIC.
+_SWITCH_PORT_RE = re.compile(r'^(?:swp\d|Ethernet\d+$)')
+
+
+def _is_switch_port(port):
+    """True when an LLDP-advertised port name belongs to a bridge/router."""
+    port = str(port or "")
+    return "/" in port or bool(_SWITCH_PORT_RE.match(port))
 
 
 def _atomic_write(path, content):
@@ -193,6 +245,20 @@ class DuplicateAnalyzer:
                                        # VRR sub-if, physical/breakout ports) and EVPN syncs it to
                                        # ~every VTEP, so any dev-qualified key overcounts devices.
         self.fdb_local = {}            # (vlan, mac) -> {host -> port}   (kernel view: VLAN only)
+        self.fdb_other_ports = {}      # (vlan, mac) -> {host -> set(port)}  rows fdb_local overwrote
+        self.fdb_port_macs = {}        # (host, port, vlan) -> number of MACs learned there
+        self.fdb_fanout_ports = set()  # (host, port, vlan) whose MACs fan out on another switch
+        # Port-role evidence for the FDB MAC rule (see _fdb_port_role), read
+        # from the neighbour sidecar check-lldp.sh publishes beside monitor-results.
+        self.lldp_sidecar = os.path.join(
+            os.path.dirname(os.path.abspath(data_dir)),
+            "lldp-results", "lldp_neighbors.json",
+        )
+        self.lldp_neighbor_ports = {}  # (host.casefold(), port) -> port its LLDP neighbour advertises
+        self.lldp_neighbor_hosts = {}  # (host.casefold(), port) -> that neighbour's name, casefolded
+        self.lldp_switch_links = set() # (host.casefold(), port) linked to a switch port of a monitored switch
+        self.lldp_hosts = set()        # host.casefold() with current LLDP neighbour data
+        self.lldp_state = "missing"    # missing | stale | ok
         self.if_desc = {}              # (host, port) -> interface description (ifalias)
         self.arp_pairs = {}            # (vlan, ip) -> {mac -> set(hosts)}   (kernel view: VLAN only)
         self.arp_states = {}           # (vlan, ip, mac) -> set(NUD states seen fabric-wide)
@@ -314,6 +380,7 @@ class DuplicateAnalyzer:
                 )
                 if neigh_ok:
                     self._parse_neigh(ch, neigh_text)
+        self._load_lldp_evidence()
         self._finalize_coverage()
         self._merge_arp_conflicts()
         self._finalize()
@@ -676,6 +743,8 @@ class DuplicateAnalyzer:
                 "dad_flagged": False, "dad_event": False, "dad_event_active": False,
                 "local": {}, "vteps": set(),
                 "delta": None, "fdb_multi": False, "physical_local_count": 0,
+                "fdb_unverified": False, "fdb_seen_count": 0,
+                "fdb_unverified_hosts": [],
                 "confirmed_conflict": False, "mobility": False,
                 "mobility_only": False, "sequence_active": False,
                 "seq_interval_sec": None, "seq_rate_per_min": None,
@@ -786,7 +855,18 @@ class DuplicateAnalyzer:
             is_remote = ("extern_learn" in line) or dev.startswith("vxlan")
             if is_remote or not (dev.startswith(("swp", "bond"))):
                 continue
-            self.fdb_local.setdefault((vlan, mac), {})[host] = dev
+            owners = self.fdb_local.setdefault((vlan, mac), {})
+            # One switch can list a MAC twice in a VLAN (two VLAN-aware
+            # bridges). fdb_local keeps the last row; the MAC rule still has
+            # to see the other port, or a row on a transit port hides the
+            # port the host is attached to.
+            if owners.get(host, dev) != dev:
+                others = self.fdb_other_ports.setdefault(
+                    (vlan, mac), {}
+                ).setdefault(host, set())
+                others.add(owners[host])
+                others.discard(dev)
+            owners[host] = dev
 
     def _parse_neigh(self, host, text):
         ap = self.apipa.setdefault(host, {"total": 0, "per_vlan": {}})
@@ -1144,25 +1224,263 @@ class DuplicateAnalyzer:
                 self.new_state[key] = value
         self.new_state["__mac_observer_state_version__"] = MAC_OBSERVER_STATE_VERSION
 
-    def _finalize_mac_semantics(self, vlan, mac, rec):
-        fdb_current_hosts = self._fdb_current_hosts()
-        dad_current_hosts = self._mac_dad_current_hosts()
-        current_fdb = {
-            host: port
-            for host, port in self.fdb_local.get((vlan, mac), {}).items()
-            if host in fdb_current_hosts
+    def _load_lldp_evidence(self):
+        """Read which ports face another switch from the LLDP neighbour sidecar.
+
+        lldp-validate.py writes neighbors[device][port] = {device, port} for
+        every port with a named LLDP neighbour, managed or not. Each link is
+        indexed from its far end as well, so a switch whose own capture misses
+        the neighbour is still known to sit on an inter-switch link. A switch
+        counts as covered only when the file holds a neighbour for it: a
+        capture without any means LLDP was not answering there, which proves
+        nothing about its ports.
+        """
+        self.lldp_neighbor_ports = {}
+        self.lldp_neighbor_hosts = {}
+        self.lldp_hosts = set()
+        self.lldp_state = "missing"
+        try:
+            with open(self.lldp_sidecar, encoding="utf-8") as f:
+                sidecar = json.load(f)
+            written = os.path.getmtime(self.lldp_sidecar)
+        except FileNotFoundError:
+            return
+        except Exception as e:
+            print(f"Error reading LLDP neighbor sidecar: {e}")
+            return
+        neighbors = sidecar.get("neighbors") if isinstance(sidecar, dict) else None
+        if not isinstance(neighbors, dict):
+            return
+        direct, reverse, hosts = {}, {}, set()
+        direct_names, reverse_names = {}, {}
+        for device, ports in neighbors.items():
+            if not isinstance(ports, dict):
+                continue
+            key = str(device).strip().casefold()
+            for port, neighbor in ports.items():
+                if not isinstance(neighbor, dict):
+                    continue
+                port = str(port).strip()
+                far_device = str(neighbor.get("device") or "").strip()
+                far_port = str(neighbor.get("port") or "").strip()
+                if not port or not far_port:
+                    continue
+                hosts.add(key)
+                direct[(key, port)] = far_port
+                if far_device:
+                    direct_names[(key, port)] = far_device.casefold()
+                    far_key = (far_device.casefold(), far_port)
+                    if far_key not in reverse:
+                        reverse[far_key] = port
+                        reverse_names[far_key] = key
+        reverse.update(direct)
+        for link in direct:
+            reverse_names.pop(link, None)
+        reverse_names.update(direct_names)
+        self.lldp_neighbor_ports = reverse
+        self.lldp_neighbor_hosts = reverse_names
+        # "created" is the LLDP run's local wall clock; the file time stands in
+        # when the field is missing or unreadable. A stamp slightly ahead of
+        # this run (the repeated hour of a DST change) says nothing against
+        # the data; one far ahead cannot date the file at all, so the file
+        # time stands in for it too.
+        now = self.analysis_now.timestamp()
+        try:
+            created = datetime.strptime(
+                str(sidecar.get("created")), "%Y-%m-%d %H-%M-%S"
+            ).timestamp()
+        except (ValueError, OverflowError, OSError):
+            created = written
+        if created - now > LLDP_EVIDENCE_MAX_AHEAD_SEC:
+            created = written
+        if (-LLDP_EVIDENCE_MAX_AHEAD_SEC <= now - created
+                <= LLDP_EVIDENCE_MAX_AGE_SEC):
+            self.lldp_hosts = hosts
+            self.lldp_state = "ok"
+        else:
+            self.lldp_state = "stale"
+
+    def _index_fdb_ports(self):
+        """Index what the port roles are read from. Per VLAN, the FDB side:
+        how many MACs a port holds, and whether those MACs fan out on another
+        switch. And the LLDP links between switches of this collection."""
+        counts = {}
+        for (vlan, _mac), hosts in self.fdb_local.items():
+            for host, port in hosts.items():
+                key = (host, port, vlan)
+                counts[key] = counts.get(key, 0) + 1
+        for (vlan, _mac), hosts in self.fdb_other_ports.items():
+            for host, ports in hosts.items():
+                for port in ports:
+                    key = (host, port, vlan)
+                    counts[key] = counts.get(key, 0) + 1
+        self.fdb_port_macs = counts
+        # Fan-out. Everything behind one attachment point reaches any other
+        # switch over one path, so that switch holds all of it on one port.
+        # When another monitored switch holds two MACs of this port on two
+        # different ports of its own, the far side of this port has more than
+        # one attachment point: the port faces a segment. A switch that lists
+        # one MAC on several ports is not counted as holding it on different
+        # ports; only MACs with no port in common are.
+        # Walked per shared MAC, and a port is dropped from the walk once it
+        # is settled, so a flat L2 domain does not cost switches squared per
+        # MAC: its uplinks are settled by the count or within a few MACs.
+        current = self._fdb_current_hosts()
+        fanout = set()
+        common = {}  # port -> {other switch: its ports holding every shared MAC so far}
+        for (vlan, mac), hosts in self.fdb_local.items():
+            if len(hosts) < 2:
+                continue
+            extra = self.fdb_other_ports.get((vlan, mac), {})
+            seen = [
+                (host, {port} | extra.get(host, set()))
+                for host, port in hosts.items() if host in current
+            ]
+            if len(seen) < 2:
+                continue
+            for host, ports in seen:
+                for port in ports:
+                    key = (host, port, vlan)
+                    held = counts.get(key, 0)
+                    if key in fanout or held < 2 or (
+                            held >= FDB_SEGMENT_MIN_MACS
+                            and not port.startswith("bond")):
+                        continue
+                    shared = common.setdefault(key, {})
+                    for other, other_ports in seen:
+                        if other == host:
+                            continue
+                        shared[other] = (
+                            shared[other] & other_ports if other in shared
+                            else other_ports
+                        )
+                        if not shared[other]:
+                            fanout.add(key)
+                            del common[key]
+                            break
+        self.fdb_fanout_ports = fanout
+        # Links whose far end is a switch port of a switch with a current FDB
+        # sample (see _is_monitored_switch_link).
+        names = {str(name).casefold() for name in current}
+        self.lldp_switch_links = {
+            link for link, far_port in self.lldp_neighbor_ports.items()
+            if _is_switch_port(far_port)
+            and self.lldp_neighbor_hosts.get(link) in names
         }
-        for host, port in current_fdb.items():
+
+    def _fdb_port_role(self, host, port, vlan):
+        """Classify one FDB sighting: 'transit', 'edge' or 'unknown'.
+
+        A transit port is never an attachment point: it holds enough MACs in
+        the VLAN to be carrying a segment, its LLDP neighbour is a switch, or
+        its MACs fan out over several ports of another monitored switch.
+        Any other port counts as an edge port when current LLDP data covers
+        the switch. A switch behind it that does not speak LLDP cannot be seen
+        this way and is left to the two FDB tests. Without LLDP data for the
+        switch the port cannot be told from an uplink.
+        """
+        port = str(port)
+        if (not port.startswith("bond") and self.fdb_port_macs.get(
+                (host, port, vlan), 0) >= FDB_SEGMENT_MIN_MACS):
+            return "transit"
+        key = str(host).casefold()
+        if _is_switch_port(self.lldp_neighbor_ports.get((key, port))):
+            return "transit"
+        if (host, port, vlan) in self.fdb_fanout_ports:
+            return "transit"
+        return "edge" if key in self.lldp_hosts else "unknown"
+
+    def _fdb_attachments(self, vlan, mac):
+        """{host: (port, role)} for the ports this MAC may be attached to.
+
+        Only switches with a current FDB sample are considered and transit
+        ports are left out.
+        """
+        current = self._fdb_current_hosts()
+        others = self.fdb_other_ports.get((vlan, mac), {})
+        attachments = {}
+        for host, port in self.fdb_local.get((vlan, mac), {}).items():
+            if host not in current:
+                continue
+            for candidate in [port] + sorted(others.get(host, ())):
+                role = self._fdb_port_role(host, candidate, vlan)
+                if role != "transit":
+                    attachments[host] = (candidate, role)
+                    break
+        return attachments
+
+    def _is_monitored_switch_link(self, host, port):
+        """True when LLDP shows this port linked to a switch port of another
+        switch whose FDB is in this collection.
+
+        A MAC seen across such a link is located by that switch's own FDB: on
+        one of its ports when something is attached there, on none when the
+        MAC is the switch's own. The sighting itself places nothing.
+        """
+        return (str(host).casefold(), str(port)) in self.lldp_switch_links
+
+    def _fdb_places_endpoint(self, vlan, mac):
+        """True when the FDB places the MAC behind a port, other than across
+        links to monitored switches only."""
+        others = self.fdb_other_ports.get((vlan, mac), {})
+        for host, port in self.fdb_local.get((vlan, mac), {}).items():
+            for candidate in [port] + sorted(others.get(host, ())):
+                if not self._is_monitored_switch_link(host, candidate):
+                    return True
+        return False
+
+    def _fdb_located(self, vlan, mac):
+        """{host: port} where the duplicate-IP rows place this MAC.
+
+        The ports it may be attached to. When every sighting is on a transit
+        port, the ports it is seen through are returned instead, so the row
+        still says which way the device lies -- except links to a monitored
+        switch, which add nothing to that switch's own FDB.
+        """
+        others = self.fdb_other_ports.get((vlan, mac), {})
+        attached, beyond = {}, {}
+        for host, port in self.fdb_local.get((vlan, mac), {}).items():
+            for candidate in [port] + sorted(others.get(host, ())):
+                if self._fdb_port_role(host, candidate, vlan) != "transit":
+                    attached.setdefault(host, candidate)
+                elif not self._is_monitored_switch_link(host, candidate):
+                    beyond.setdefault(host, candidate)
+        return attached or beyond
+
+    def _finalize_mac_semantics(self, vlan, mac, rec):
+        dad_current_hosts = self._mac_dad_current_hosts()
+        attachments = self._fdb_attachments(vlan, mac)
+        for host, (port, _role) in attachments.items():
             rec["local"][host] = port
-        # Only simultaneous LOCAL attachment on physical switch ports confirms
-        # a MAC conflict.  Bonds are normal EVPN-MH dual attachment.
+        # Only simultaneous LOCAL attachment on edge ports of two switches
+        # confirms a MAC conflict.  Bonds are normal EVPN-MH dual attachment,
+        # and a transit port (left out above) is one end of an inter-switch
+        # link, where every MAC behind the link is LOCAL as well.
         physical = {
-            host: port for host, port in current_fdb.items()
+            host: role for host, (port, role) in attachments.items()
             if port.startswith("swp")
         }
-        rec["fdb_multi"] = len(physical) >= 2
-        rec["physical_local_count"] = len(physical)
+        edge = [host for host, role in physical.items() if role == "edge"]
+        rec["fdb_multi"] = len(edge) >= 2
+        rec["physical_local_count"] = len(edge)
         rec["confirmed_conflict"] = rec["fdb_multi"]
+        # The same sighting without proof that two of the ports are edge
+        # ports: it may be one host seen through an uplink, so it is reported
+        # as seen on several switches and never as a conflict.
+        rec["fdb_unverified"] = not rec["fdb_multi"] and len(physical) >= 2
+        rec["fdb_seen_count"] = len(physical)
+        rec["fdb_unverified_hosts"] = sorted(
+            host for host, role in physical.items() if role != "edge"
+        )
+        if not rec["fdb_multi"] and not rec["fdb_unverified"]:
+            # The row exists for another reason (FRR DAD, mobility), so the
+            # port roles decide nothing on it. Say where the MAC is LOCAL,
+            # transit and bond ports included: left out, the switch that
+            # holds the MAC would be shown as the conflicting VTEP.
+            current = self._fdb_current_hosts()
+            for host, port in self.fdb_local.get((vlan, mac), {}).items():
+                if host in current:
+                    rec["local"].setdefault(host, port)
         rec["dad_flagged"] = bool(
             set(rec.get("flagged_hosts", set())) & dad_current_hosts
         )
@@ -1184,6 +1502,7 @@ class DuplicateAnalyzer:
 
         rec["mobility_only"] = bool(
             rec.get("mobility") and not rec["confirmed_conflict"]
+            and not rec["fdb_unverified"]
             and not rec["dad_flagged"] and not rec.get("dad_event")
         )
         if rec["confirmed_conflict"]:
@@ -1192,6 +1511,8 @@ class DuplicateAnalyzer:
             rec["incident_type"] = "dad_event_mac"
         elif rec["dad_flagged"]:
             rec["incident_type"] = "dad_flagged_mac"
+        elif rec["fdb_unverified"] and not rec["sequence_active"]:
+            rec["incident_type"] = "fdb_observed_mac"
         elif rec.get("mobility"):
             rec["incident_type"] = (
                 "mac_mobility_active" if rec["sequence_active"]
@@ -1207,6 +1528,7 @@ class DuplicateAnalyzer:
 
     def _finalize(self):
         self._build_vlan_to_vni()
+        self._index_fdb_ports()
         for host, ips in self.self_vteps.items():
             for ip in ips:
                 self.vtep2host[ip] = host
@@ -1224,36 +1546,39 @@ class DuplicateAnalyzer:
                 rec["vteps"].update(ev["vteps"])
             rec["recency"] = self._recency(rec["latest"])
             rec["delta"] = self._seq_delta("ip", "%s|%s" % (rec["vni"], ip), rec["seq"])
-            # owner port from FDB local for any of its MACs
+            # owner port from FDB local for any of its MACs (the ports the
+            # device may be attached to, not the trunks it is seen through)
             for mac in self._evidence_macs(rec):
-                for h, port in self.fdb_local.get((rec["vlan"], mac), {}).items():
+                for h, port in self._fdb_located(rec["vlan"], mac).items():
                     rec["local_hosts"].add(h)
                     rec["ports"].add("%s:%s" % (h, port))
             rec["severity"] = self._ip_sev(rec)
 
         for rec in self.mac_dups.values():
-            for h, port in self.fdb_local.get((rec["vlan"], rec["mac"]), {}).items():
-                if h in self._fdb_current_hosts():
-                    rec["local"].setdefault(h, port)
+            for h, (port, _role) in self._fdb_attachments(rec["vlan"], rec["mac"]).items():
+                rec["local"].setdefault(h, port)
 
         # FDB-only MAC duplicates: same MAC LOCAL on >=2 switches via PHYSICAL (swp) ports.
         # Bonds are intentionally excluded: a bond is a LAG / EVPN-MH Ethernet Segment, so a
         # dual-homed host's MAC is LOCAL on BOTH pair members BY DESIGN (FRR marks it
         # peer-active "P", seq 0/0) -- that is NOT a duplicate. Real bond/ES-level conflicts
         # are caught by FRR's own "show evpn mac vni all duplicate".
+        # Transit ports are excluded as well (_fdb_attachments). Whether the ports that remain
+        # confirm a conflict or only show the MAC on several switches is decided for every
+        # record in _finalize_mac_semantics.
         for (vlan, mac), hosts in self.fdb_local.items():
+            if len(hosts) < 2:
+                continue
             vni = self.vlan_to_vni.get(vlan, vlan)
             if (vni, mac) in self.mac_dups:
                 continue
             phys = {
-                h: p for h, p in hosts.items()
-                if h in self._fdb_current_hosts() and p.startswith("swp")
+                h: p for h, (p, _role) in self._fdb_attachments(vlan, mac).items()
+                if p.startswith("swp")
             }
             if len(phys) >= 2:
                 rec = self._blank_mac(vlan, vni, mac)
                 rec["local"] = dict(phys)
-                rec["fdb_multi"] = True
-                rec["severity"] = "CRITICAL"
                 self.mac_dups[(vni, mac)] = rec
 
         # Mobility context (high EVPN sequence). This remains available where DAD is OFF, but it is
@@ -1322,7 +1647,7 @@ class DuplicateAnalyzer:
             # Resolve owner ports from FDB for ALL macs now assembled. Mobility/log-detected IP dups
             # are added AFTER the early port pass, so without this they carry no port at all.
             for mac in self._evidence_macs(rec):
-                for h, port in self.fdb_local.get((rec["vlan"], mac), {}).items():
+                for h, port in self._fdb_located(rec["vlan"], mac).items():
                     rec["local_hosts"].add(h)
                     rec["ports"].add("%s:%s" % (h, port))
             rec["severity"] = self._ip_sev(rec)
@@ -1358,7 +1683,9 @@ class DuplicateAnalyzer:
         for rec in self.ip_dups.values():
             key = "%s|%s" % (rec["vlan"], rec["ip"])
             ports = {}
-            for p in rec["ports"]:
+            # Sorted: when a switch holds two of the address's MACs on two
+            # ports, the one remembered must not depend on set order.
+            for p in sorted(rec["ports"]):
                 if ":" in p:
                     h, pt = p.split(":", 1)
                     ports[h] = pt
@@ -1370,7 +1697,10 @@ class DuplicateAnalyzer:
             remembered = self._remembered_macs(prev, now_ts)
             if prev.get("ts", 0) >= now_ts - IP_EVIDENCE_TTL_SEC:
                 for h, pt in (prev.get("ports") or {}).items():
-                    if h not in ports:
+                    # A port remembered from a collection that could not tell
+                    # it was a transit port is not an owner location.
+                    if h not in ports and self._fdb_port_role(
+                            h, pt, rec["vlan"]) != "transit":
                         ports[h] = pt
                         rec["ports"].add("%s:%s" % (h, pt))
             rec["evidence_macs"].update(remembered)
@@ -1429,8 +1759,11 @@ class DuplicateAnalyzer:
         def _mark_stale(rec, kind, key):
             qa = self._quiet_age(kind, "%s|%s" % (rec["vni"], key))
             rec["quiet_age"] = qa
+            # A MAC the FDB shows on several switches is this collection's own
+            # observation, not a latched flag, so it never ages out of the list.
             rec["stale"] = bool(rec.get("severity") == "WARNING" and qa is not None
                                 and qa >= STALE_AGE_SEC
+                                and not rec.get("fdb_unverified")
                                 and (rec.get("recency") is None or rec["recency"] >= STALE_AGE_SEC))
         for rec in self.ip_dups.values():
             _mark_stale(rec, "ip", rec["ip"])
@@ -1471,7 +1804,8 @@ class DuplicateAnalyzer:
         if (rec.get("confirmed_conflict") or rec.get("sequence_active")
                 or rec.get("dad_event_active")):
             return "CRITICAL"
-        if rec.get("dad_flagged") or rec.get("dad_event") or rec.get("mobility"):
+        if (rec.get("dad_flagged") or rec.get("dad_event") or rec.get("mobility")
+                or rec.get("fdb_unverified")):
             return "WARNING"
         return "OK"
 
@@ -1531,7 +1865,12 @@ class DuplicateAnalyzer:
 
         A MAC that the local bridge FDB places behind a swp/bond port belongs to
         something plugged into the fabric. A MAC that answers for an address yet
-        sits behind no port is a switch's own routed interface.
+        sits behind no port is a switch's own routed interface. So is one seen
+        only across LLDP-proven links to monitored switches: an L2 switch
+        below a gateway learns the gateway's SVI MAC on its uplink, and the
+        switch at the far end, which lists every MAC attached to it, lists
+        this one on no port. The MAC count and the fan-out test are kept out
+        of this: a host behind an unmanaged switch is still an endpoint.
 
         Every MAC this collection binds to the address is partitioned, including
         the ones held only in a STALE neighbour entry. What kind of thing a MAC
@@ -1543,7 +1882,7 @@ class DuplicateAnalyzer:
         responders = set(rec["macs"]) | self._stale_binding_macs(rec)
         endpoints = {
             mac for mac in responders
-            if self.fdb_local.get((rec["vlan"], mac))
+            if self._fdb_places_endpoint(rec["vlan"], mac)
         }
         return endpoints, responders - endpoints
 
@@ -1585,6 +1924,28 @@ class DuplicateAnalyzer:
         return rec.get("incident_type") in (
             "mac_mobility_active", "mac_mobility_historical",
         )
+
+    @staticmethod
+    def _is_mac_fdb_observed(rec):
+        """The MAC is LOCAL on several switches, but the ports could not be
+        shown to be edge ports. Lower confidence than a confirmed conflict, so
+        it is its own class and never merged into the confirmed counter."""
+        return rec.get("incident_type") == "fdb_observed_mac"
+
+    def _fdb_observed_note(self, rec):
+        """Why the FDB sighting on several switches could not be confirmed."""
+        if self.lldp_state == "stale":
+            reason = ("LLDP neighbor data is stale (older than %d hours; the "
+                      "inter-switch links it lists are still excluded)"
+                      % (LLDP_EVIDENCE_MAX_AGE_SEC // 3600))
+        elif self.lldp_hosts:
+            reason = "LLDP has no neighbor data for %s" % ", ".join(
+                rec.get("fdb_unverified_hosts") or ["these switches"])
+        else:
+            reason = "no LLDP neighbor data"
+        return ("Seen on %d switches (FDB only): edge ports not verified, %s; "
+                "may be one host seen through an inter-switch link" % (
+                    rec.get("fdb_seen_count") or len(rec["local"]), reason))
 
     # -------------------------------------------------------------- summary
     def summary(self):
@@ -1655,6 +2016,12 @@ class DuplicateAnalyzer:
                 1 for r in confirmed_macs if r.get("severity") == "CRITICAL"
             ),
             "mac_dad_total": len(dad_macs),
+            # FDB sightings on several switches whose ports could not be shown
+            # to be edge ports: WARNING rows with a card and summary key of
+            # their own, never counted above.
+            "mac_fdb_observed_total": sum(
+                1 for r in macs if self._is_mac_fdb_observed(r)
+            ),
             "mac_mobility_total": len(mobility_macs),
             "mac_mobility_active": mobility_active,
             "mac_mobility_settled": len(mobility_macs) - mobility_active,
@@ -1843,10 +2210,13 @@ class DuplicateAnalyzer:
             owner = "<br>".join(owner_parts) or \
                     ("<br>".join(html.escape(h) for h in sorted(r["local_hosts"])) or "&mdash;")
             ip_ports = {}
-            for _m in self._evidence_macs(r):
-                for _h, _p in self.fdb_local.get((r["vlan"], _m), {}).items():
-                    ip_ports[_h] = _p
-            vteps = self._vtep_cell(r["vteps"], r["local_hosts"], ip_ports)
+            # A switch that holds one of the MACs LOCAL, even through a trunk,
+            # is on the owner's side: its VTEP is not the other end.
+            ip_fdb_hosts = set(r["local_hosts"])
+            for _m in sorted(self._evidence_macs(r)):
+                ip_ports.update(self._fdb_located(r["vlan"], _m))
+                ip_fdb_hosts.update(self.fdb_local.get((r["vlan"], _m), {}))
+            vteps = self._vtep_cell(r["vteps"], ip_fdb_hosts, ip_ports)
             vlanvni = self._vlan_vni_cell(r)
             devs = set(r["local_hosts"]) | set(p.split(":")[0] for p in r["ports"])
             # The contender switches (Conflict VTEP column) must be searchable too.
@@ -1972,7 +2342,7 @@ class DuplicateAnalyzer:
                     "%s:%s" % (canonical(p.split(":", 1)[0]), p.split(":", 1)[1])
                     if ":" in p else canonical(p)
                     for p in r["ports"])) or None,
-                "vteps": self._vtep_export(r["vteps"], r["local_hosts"], ip_ports),
+                "vteps": self._vtep_export(r["vteps"], ip_fdb_hosts, ip_ports),
                 "sequence": r["seq"] or None,
                 "delta": r["delta"],
                 "events": r["events"] or None,
@@ -2005,7 +2375,7 @@ class DuplicateAnalyzer:
             if not self._is_confirmed_ip(irec):
                 continue
             ports = {}
-            for p in irec["ports"]:
+            for p in sorted(irec["ports"]):
                 if ":" in p:
                     h, pt = p.split(":", 1)
                     ports[h] = pt
@@ -2023,9 +2393,15 @@ class DuplicateAnalyzer:
             if r.get("classification") == "loop":
                 note = "Possible loop (%d MACs)" % r.get("loop_count", 0)
             elif r.get("confirmed_conflict"):
-                note = "Confirmed MAC conflict: LOCAL on %d physical switches" % r.get(
-                    "physical_local_count", len(r["local"])
-                )
+                proven = r.get("physical_local_count", len(r["local"]))
+                note = "Confirmed MAC conflict: LOCAL on edge ports of %d switches" % proven
+                # Local On also lists the ports whose role could not be shown.
+                unproven = (r.get("fdb_seen_count") or 0) - proven
+                if unproven > 0:
+                    note += " (%d more switch%s not verified)" % (
+                        unproven, "" if unproven == 1 else "es")
+            elif self._is_mac_fdb_observed(r):
+                note = self._fdb_observed_note(r)
             elif r.get("incident_type") == "dad_flagged_mac":
                 note = "FRR MAC DAD flag (latched; not proven simultaneous)"
             elif r.get("incident_type") == "dad_event_mac":
@@ -2046,6 +2422,12 @@ class DuplicateAnalyzer:
                     note = "Historical MAC mobility (flat); not a simultaneous conflict"
             else:
                 note = ""
+            if (note and r.get("fdb_unverified") and not r.get("confirmed_conflict")
+                    and not self._is_mac_fdb_observed(r)):
+                # A DAD or mobility row whose MAC the FDB also shows on swp
+                # ports of several switches: keep that sighting on the row.
+                seen = self._fdb_observed_note(r)
+                note = "%s; also s%s" % (note, seen[1:])
             if r.get("classification") == "ip-conflict-participant":
                 participant = "Participant in current authoritative IP DAD finding"
                 note = "%s; %s" % (note, participant) if note else participant
@@ -2066,6 +2448,8 @@ class DuplicateAnalyzer:
                 kind = "dad"
             elif self._is_mac_mobility(r):
                 kind = "mobility"
+            elif self._is_mac_fdb_observed(r):
+                kind = "fdb-observed"
             else:
                 kind = "context"
             export_note = note
@@ -2151,6 +2535,11 @@ class DuplicateAnalyzer:
             ("card-critical" if s["confirmed_mac_total"] else "card-excellent",
              s["confirmed_mac_total"], "CONFIRMED MAC CONFLICTS",
              "mac" if s["confirmed_mac_total"] else ""),
+            # Not a confirmed conflict and not counted as one, but a real
+            # duplicate without LLDP proof lands here, so it needs a number.
+            ("card-warning" if s["mac_fdb_observed_total"] else "card-excellent",
+             s["mac_fdb_observed_total"], "MAC SEEN ON SEVERAL SWITCHES",
+             "fdb-observed" if s["mac_fdb_observed_total"] else ""),
             ("card-warning" if s["mac_dad_total"] else "card-excellent",
              s["mac_dad_total"], "MAC DAD FINDINGS",
              "dad" if s["mac_dad_total"] else ""),
@@ -2227,6 +2616,7 @@ class DuplicateAnalyzer:
             ' data-ip-multi-mac="%d"'
             ' data-ip-single-mac="%d"'
             ' data-confirmed-mac-total="%d"'
+            ' data-mac-fdb-observed-total="%d"'
             ' data-mac-dad-total="%d"'
             ' data-mac-mobility-active="%d"'
             ' data-mac-mobility-total="%d"'
@@ -2243,7 +2633,8 @@ class DuplicateAnalyzer:
             s["confirmed_ip_active"], s["ip_quiesced"],
             s["ip_arp_observed"],
             s["ip_multi_mac"], s["ip_single_mac"],
-            s["confirmed_mac_total"], s["mac_dad_total"],
+            s["confirmed_mac_total"], s["mac_fdb_observed_total"],
+            s["mac_dad_total"],
             s["mac_mobility_active"], s["mac_mobility_total"],
             s["coverage_expected"], s["coverage_current"],
             s["coverage_ip_current"],
@@ -2293,6 +2684,8 @@ class DuplicateAnalyzer:
         html_doc = html_doc.replace("__CLUSTER_MIN__", str(IP_CLUSTER_MIN_MACS))
         html_doc = html_doc.replace("__SEQ_STORM__", "{:,}".format(SEQ_STORM))
         html_doc = html_doc.replace("__LOOP_MIN__", str(LOOP_MIN_MACS))
+        html_doc = html_doc.replace("__SEGMENT_MIN__", str(FDB_SEGMENT_MIN_MACS))
+        html_doc = html_doc.replace("__LLDP_MAX_AGE_H__", str(LLDP_EVIDENCE_MAX_AGE_SEC // 3600))
         html_doc = html_doc.replace("__CARDS__", cards_html)
         html_doc = html_doc.replace("__IP_ROWS__", "\n".join(ip_html))
         html_doc = html_doc.replace("__MAC_ROWS__", "\n".join(mac_html))
@@ -2315,6 +2708,7 @@ class DuplicateAnalyzer:
             "ip_multi_mac": s["ip_multi_mac"],
             "ip_single_mac": s["ip_single_mac"],
             "confirmed_mac_total": s["confirmed_mac_total"],
+            "mac_fdb_observed_total": s["mac_fdb_observed_total"],
             "mac_dad_total": s["mac_dad_total"],
             "mac_mobility_active": s["mac_mobility_active"],
             "mac_mobility_total": s["mac_mobility_total"],
@@ -2477,7 +2871,7 @@ __COVERAGE_BANNER__
   </div>
 </div>
 <div class="dashboard-section">
-  <div class="section-header">MAC Findings &mdash; Confirmed Conflicts / DAD / Mobility (per VLAN / VNI)</div>
+  <div class="section-header">MAC Findings &mdash; Confirmed Conflicts / Seen on Several Switches / DAD / Mobility (per VLAN / VNI)</div>
   <div class="section-content">
     <table class="dup-table" id="mact" data-filterable>
       <thead><tr><th>Severity</th><th>VLAN / VNI</th><th>MAC</th><th>Local On (switch:port)</th><th>Conflict / Observed VTEP(s)</th><th>EVPN Seq (&#916;)</th><th>Meaning</th></tr></thead>
@@ -2504,7 +2898,8 @@ __COVERAGE_BANNER__
       <code>show evpn arp-cache vni all duplicate</code> &mdash; authoritative duplicate IPs + EVPN mobility sequence.<br>
       <code>show evpn mac vni all duplicate</code> &mdash; current/latched FRR MAC DAD findings.<br>
       <code>show evpn mac / arp-cache vni all</code> &mdash; mobility evidence (works with DAD off); this is shown separately from confirmed conflicts.<br>
-      <code>bridge fdb show</code> &mdash; same MAC LOCAL on &ge;2 <i>physical</i> ports (bonds excluded = EVPN-MH dual-homing).<br>
+      <code>bridge fdb show</code> &mdash; same MAC LOCAL on <i>edge</i> ports of &ge;2 switches (bonds excluded = EVPN-MH dual-homing; inter-switch links excluded).<br>
+      LLDP neighbors (from the LLDP check) &mdash; tell an edge port from an inter-switch link for the FDB rule above.<br>
       <code>ip -4 neigh show</code> &mdash; APIPA (169.254/16 = DHCP failed) + IP&harr;multi-MAC.<br>
       zebra log <code>"detected as duplicate"</code> &mdash; timestamped event history (recency &amp; rate).
       <h4>Severity</h4>
@@ -2512,7 +2907,8 @@ __COVERAGE_BANNER__
       collection cycle. A current but flat/old authoritative IP DAD row is quiesced WARNING.<br>
       <b>MAC CRITICAL</b> &mdash; a confirmed simultaneous physical MAC conflict, a recent DAD event,
       or mobility that reaches the configured move-rate threshold.<br>
-      <b>MAC WARNING</b> &mdash; a latched DAD flag or below-threshold / historical mobility evidence.
+      <b>MAC WARNING</b> &mdash; a latched DAD flag, below-threshold / historical mobility evidence, or a
+      MAC seen on several switches whose ports could not be verified as edge ports.
       A positive MAC &#916; below policy is movement context, not proof of a duplicate.<br>
       <b>Aged</b> &mdash; a quiesced duplicate whose sequence has not moved for &ge;__STALE_DAYS__ days is
       collapsed out of the list (use <i>Show aged</i> to reveal). These persist in FRR until the address is
@@ -2566,6 +2962,12 @@ __COVERAGE_BANNER__
       by design. An address claimed by &ge; __CLUSTER_MIN__ MACs at once is named in the section header
       above the table &mdash; that is a group of devices sharing one address (a factory default left in
       place, or overlapping IPAM), not a pair to reconcile.
+      <h4>Owner (local) column (IP table)</h4>
+      The ports a MAC of the address may be attached to, by the same edge / transit rule as the MAC
+      findings below. A transit port is listed only when the MAC is attached to no port of a monitored
+      switch, to show which way the device lies. A MAC seen only across LLDP-proven links between monitored
+      switches belongs to a switch interface (a gateway SVI learned by the L2 switch below it), not to an
+      endpoint.
       <h4>Note column &mdash; conflict vs flapping (IP table)</h4>
       <b>Confirmed &mdash; duplicate address</b> &mdash; 2+ distinct MACs claim the same IP in this
       collection (that many devices).
@@ -2580,8 +2982,29 @@ __COVERAGE_BANNER__
       HSRP, GLBP, Cumulus VRR <code>44:38:39:ff:00:xx</code>) is annotated as a likely anycast/VRR gateway &mdash;
       the same virtual MAC on multiple switches is expected there, not a conflict.
       <h4>MAC finding types</h4>
-      <b>Confirmed MAC conflict</b> requires the same MAC to be simultaneously LOCAL on at least two
-      physical switch ports. <b>FRR MAC DAD</b> is a current/latched DAD finding but does not by itself
+      <b>Confirmed MAC conflict</b> requires the same MAC to be simultaneously LOCAL on <i>edge</i> ports
+      of at least two switches. Every MAC behind an inter-switch link is LOCAL on both of its ends, so a
+      port is a transit port, and is ignored, when (1) its LLDP neighbor is another switch or router,
+      recognised by the port name that neighbor advertises: <code>swpN</code>, <code>EthernetN</code>, or
+      slot/port notation such as <code>Ethernet1/1</code>; (2) it holds
+      __SEGMENT_MIN__ or more MACs in the VLAN (bonds excepted); or (3) another monitored switch holds
+      two of its MACs on two different ports, so more than one device lies behind it.<br>
+      An upstream device that does not speak LLDP, or that advertises another kind of name
+      (<code>port1</code>, <code>ether1</code>, a bare number, a two-word name such as
+      <code>TenGigabitEthernet 1/1</code>, a SONiC port that carries a description), is recognised only
+      by (2) or (3). MACs that two switches each hold on one port only cannot be told from duplicates
+      this way and are still reported: an uplink that carries a single MAC of the VLAN, or everything
+      upstream of two chained switches when LLDP does not show the link between them.<br>
+      What the rule gives up: a duplicate behind a port with __SEGMENT_MIN__ or more MACs, behind a port
+      whose neighbor advertises a switch port name, or behind a multi-MAC port (a hypervisor) whose other
+      MACs another switch holds on a different port, is not reported by it. Inside one L2 domain the
+      kernel keeps one FDB row per MAC and VLAN, so a duplicate shows only while both switches hold the
+      MAC on a host port.<br>
+      <b>Seen on several switches</b> (WARNING) is the same FDB observation without that proof: LLDP
+      neighbor data is missing, older than __LLDP_MAX_AGE_H__ hours, or does not cover one of the switches, so the MAC may
+      be a single host seen through an inter-switch link. These rows have their own summary card and are
+      never part of the confirmed count.
+      <b>FRR MAC DAD</b> is a current/latched DAD finding but does not by itself
       prove simultaneous owners. <b>MAC mobility</b> records moves and is not counted as a duplicate.
       <b>IP DAD participant</b> is shown only when the MAC appears in a current authoritative IP
       DAD finding. <b>Possible loop</b> &mdash; &ge; __LOOP_MIN__ active MACs moving between the same
@@ -2678,13 +3101,14 @@ function cardFilter(kind, card){
     setFilterInfo(kind==='multi-mac'
       ? 'Addresses claimed by 2+ distinct MACs in this collection'
       : 'Addresses with a single claiming MAC (endpoint mobility)');
-  } else if(kind==='mac'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
+  } else if(kind==='mac'||kind==='fdb-observed'||kind==='dad'||kind==='mobility'||kind==='mobility-active'){
     if(card) card.classList.add('active');
     var matched=[];
     Array.prototype.slice.call(document.querySelectorAll('#mact tbody tr')).forEach(function(r){
       if(r.querySelector('.empty')) return;
       var rowKind=r.getAttribute('data-kind');
       var matches=(kind==='mac'&&rowKind==='confirmed') ||
+        (kind==='fdb-observed'&&rowKind==='fdb-observed') ||
         (kind==='dad'&&rowKind==='dad') ||
         (kind==='mobility'&&rowKind==='mobility') ||
         (kind==='mobility-active'&&rowKind==='mobility'&&r.getAttribute('data-mobility-active')==='true');
@@ -2693,7 +3117,7 @@ function cardFilter(kind, card){
     });
     revealAgedIfNeeded(matched);
     document.getElementById('mact').scrollIntoView({behavior:'smooth', block:'start'});
-    var labels={mac:'Confirmed MAC conflicts',dad:'MAC DAD findings',mobility:'MAC mobility signals','mobility-active':'Active MAC mobility'};
+    var labels={mac:'Confirmed MAC conflicts','fdb-observed':'MACs seen on several switches (edge ports not verified)',dad:'MAC DAD findings',mobility:'MAC mobility signals','mobility-active':'Active MAC mobility'};
     setFilterInfo(labels[kind]);
   } else if(kind==='apipa'){
     document.getElementById('apt').scrollIntoView({behavior:'smooth', block:'start'});
@@ -2756,7 +3180,7 @@ function tableCSV(tid){
 function downloadCSV(){
   var out=[];
   [['Duplicate IPs (per VLAN / VNI)','ipt'],
-   ['MAC Findings (Confirmed / DAD / Mobility)','mact'],
+   ['MAC Findings (Confirmed / Seen on Several Switches / DAD / Mobility)','mact'],
    ['APIPA / DHCP-failed (169.254.0.0/16)','apt']].forEach(function(sec){
     var body=tableCSV(sec[1]);
     out.push([sec[0]]);

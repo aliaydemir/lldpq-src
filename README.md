@@ -118,9 +118,14 @@ cd lldpq-src
   bond/LACP member state, bypass activity, VNI consistency and BGP ES state
 - **duplicate address detection**: duplicate IP/MAC detection via EVPN DAD + MAC-mobility sequences, with severity, quiesced/aged lifecycle, and per-port interface descriptions (see [02e])
 - **optical diagnostics**: power levels, temperature, bias current, link
-  margins, unplugged modules and ports whose diagnostics are unavailable
-- **link flap detection**: carrier transitions on all interfaces (including breakouts), with time-windowed flap counts (1h / 12h / 24h)
-- **Link error / BER**: directional frame-error density from interface counters, plus separately graded raw/effective PHY BER and PHY symbol-error deltas
+  margins, unplugged modules and ports whose diagnostics are unavailable.
+  RX/TX power, temperature and voltage are graded by the limits the module
+  prints for itself when its table is valid, by generic limits otherwise
+  (see [Optical module limits](#optical-module-limits)).
+  Active optical cables are monitored like transceivers; copper cables and
+  copper SFPs are not listed (see [Optical port states](#optical-port-states))
+- **link flap detection**: carrier transitions on every physical switch port (`swpN` and breakout sub-ports `swpNsM`), with time-windowed flap counts (1h / 12h / 24h). VLAN sub-interfaces (`swp6.100`) are not counted: they copy the carrier state of their parent port, so the parent's row already covers them. A port that no longer exists on a switch (breakout change) leaves the page, the export and the stored history only when a second complete carrier collection from that switch does not list it either; if the same name returns later (split, then merge) it starts from a new baseline, without its earlier counter and flap history. One short listing (switchd restarting, a breakout being applied) removes nothing, and neither does a collection that reports an inventory error or a malformed row.
+- **Link error / BER**: directional frame-error density from interface counters, plus separately graded raw/effective PHY BER and PHY symbol-error deltas. Only physical ports are analysed: `swpN` and breakout `swpNsM` (and non-Cumulus NIC names such as `eth1`); a VLAN sub-interface such as `swp6.100` is never a BER row. A port without new packets, errors or drops since the previous collection, and whose L1 data shows no live link, is listed as `IDLE` under **Not Graded** and is not counted as awaiting a traffic sample: it is unused or its link is down, also when it went down in the middle of a sample. A port still collecting its first or a complete sample stays `UNKNOWN`. When a port leaves a switch (breakout split, merge back, rename), its BER baseline and history are dropped after the next complete interface-counter collection of that switch that still lists a physical port, so a re-created port starts with a fresh baseline; a collection without any physical port (switchd stopped) drops nothing. A frame-counter reset also restarts the PHY symbol-error comparison.
 - **PFC/ECN**: telemetry-free per-port analysis of traffic-class 3 ECN
   marks, transmitted frames, unicast-buffer/WRED discards, and
   switch-priority 3 RX/TX pause frames. The first usable sample establishes a
@@ -168,6 +173,9 @@ cd lldpq-src
   never inferred). Drivers that do not disclose their active FEC
   ("Not-reported") are skipped instead of fabricating mismatches. An
   informational fabric-wide MTU distribution table makes outliers obvious.
+  VLAN sub-interfaces (`swp6.100`) are not ports: the LLDP stage leaves them
+  out of the per-port status, speed, MTU and FEC/autoneg capture, so they
+  appear neither in the checks nor in the MTU distribution.
 
 ### PFC/ECN report
 
@@ -231,6 +239,7 @@ access via web UI: `http://<server>/search.html`
 - **VRF tabs** for route filtering (click to filter by VRF)
 - **route best match**: when IP not found, shows best matching route per VRF
 - sortable table columns (click headers)
+- the LLDP tab lists neighbors by local port in natural order (`swp1`, `swp1s0`, `swp2`, `swp10`), ignoring case, until a column header is clicked
 - search/filter support
 - CSV export for MAC/ARP tables
 - "All Devices" mode serves results from the fabric-scan cache; single-device queries run live over SSH
@@ -349,8 +358,9 @@ works with 2-tier (leaf-spine) and 3-tier (leaf-spine-core) Clos topologies.
 access via web UI: **Duplicate** menu (`/monitor-results/duplicate-analysis.html`)
 
 The report correlates current FRR EVPN duplicate-address-detection (DAD)
-output, EVPN mobility sequences, local FDB entries, IPv4 neighbor data,
-interface descriptions, and recent FRR duplicate logs. EVPN-derived IP/MAC
+output, EVPN mobility sequences, local FDB entries, LLDP neighbor data, IPv4
+neighbor data, interface descriptions, and recent FRR duplicate logs.
+EVPN-derived IP/MAC
 findings are keyed by VNI—the fabric-wide L2 domain—so different per-observer
 VLAN views cannot split one conflict into duplicate rows. The resolved access
 VLAN is displayed when available. Kernel-only FDB/ARP evidence can fall back
@@ -363,17 +373,81 @@ fabricated from the VLAN number.
 |---------|---------|
 | **Active IP duplicate** | A current authoritative FRR IP DAD row has a recent duplicate event or its EVPN sequence increased since the previous analysis sample |
 | **Quiesced IP duplicate** | A current authoritative FRR IP DAD row is still present but is flat/old; after seven quiet days it is collapsed under **Show aged** |
-| **Confirmed MAC conflict** | The same MAC is currently LOCAL on physical switch ports on at least two switches; bond/EVPN-MH attachment is excluded |
+| **Confirmed MAC conflict** | The same MAC is currently LOCAL on edge ports of at least two switches. Bond/EVPN-MH attachment is excluded, and so are transit ports: a port whose LLDP neighbor advertises a switch port, a port that holds 16 or more MACs in that VLAN (bonds excepted), and a port whose MACs another monitored switch holds on two or more different ports |
+| **MAC seen on several switches** | The same FDB observation without proof that the ports are edge ports, because LLDP neighbor data is missing, older than 24 hours, or holds no neighbor for one of the switches. Reported as WARNING on its own summary card and never counted as a confirmed conflict: it may be one host seen through an inter-switch link |
 | **MAC DAD finding** | A current/latched FRR MAC DAD flag or recent FRR DAD event; a flag alone does not prove simultaneous owners |
 | **Active MAC mobility** | A per-observer sequence delta meets the switch's configured DAD moves/window policy; the fallback policy is 5 moves / 180 seconds |
 | **Historical mobility** | Below-threshold movement or an extreme but currently flat mobility sequence; shown separately and not counted as a confirmed MAC conflict |
 | **Possible loop** | A MAC that is not currently DAD-flagged, is not a confirmed MAC conflict, and does not participate in a current authoritative IP-DAD finding is classified as a loop candidate when it spans at least two endpoints and ten active-mobility or confirmed-conflict signals share that VLAN and endpoint set |
 | **APIPA / DHCP-failed** | IPv4 link-local (`169.254.0.0/16`) endpoints; the headline counts unique IPs fabric-wide while the table shows EVPN-synchronized sightings per switch/VLAN; 50 or more sightings in one switch/VLAN is critical |
 
+### edge and transit ports
+
+A MAC behind an inter-switch link is LOCAL on both ends of that link, so the
+FDB rule only counts edge ports. A port is a transit port, and is ignored,
+when:
+
+1. its LLDP neighbor advertises a switch port name (`swpN`, `EthernetN`, or
+   slot/port notation such as `Ethernet1/1`, `Gi1/0/24` or `xe-0/0/1`), read
+   from the observed-neighbor sidecar that the LLDP check publishes
+   (`lldp-results/lldp_neighbors.json`);
+2. it holds 16 or more MACs in the VLAN (bonds excepted); or
+3. another monitored switch holds two of its MACs on two different ports,
+   which means more than one device lies behind it.
+
+A neighbor that advertises any other port name is an endpoint: a server NIC,
+or the `eth0` management port of a switch. Tests 2 and 3 need no LLDP data,
+so an upstream switch, router or firewall that does not speak LLDP, or that
+advertises a name outside that list (`port1`, `ether1`, a bare number, a
+two-word name such as `TenGigabitEthernet 1/1`, a SONiC port that carries a
+description), is still recognized when its uplink carries 16 or more MACs of
+the VLAN, or two or more MACs that another monitored switch holds on
+different ports.
+
+Known limits. Still reported as a confirmed conflict although nothing is
+duplicated: MACs that two switches each hold on one port only, that is an
+uplink that carries a single MAC of the VLAN (for example only the gateway),
+and everything upstream of two chained switches when LLDP does not show the
+link between them and the upper switch has no host of its own in the VLAN.
+Not reported although a duplicate exists: a duplicate behind a port with 16
+or more MACs in the VLAN; behind a port whose LLDP neighbor advertises a
+switch port name (a host that names its NIC `swp1` or `Ethernet0`); behind a
+multi-MAC port such as a hypervisor when another monitored switch holds the
+port's other MACs on a different port, which is the normal picture in an L2
+tier where the guests are visible through a trunk; and, inside one L2 domain,
+while one of the two switches currently has the MAC on its trunk instead of
+the host port, because the kernel keeps one FDB row per MAC and VLAN.
+
+**Owner (local)** of a duplicate-IP row lists the ports a claiming MAC may be
+attached to, by the same edge / transit rule. A transit port is listed only
+when the MAC is attached to no port of a monitored switch, to show which way
+the device lies. A MAC seen only across LLDP-proven links between monitored
+switches is a switch interface, not an endpoint: an L2 switch below a gateway
+pair learns the gateway SVI MACs on its uplinks, and the address stays an
+expected gateway row. An uplink that is a bond is not recognized this way,
+because LLDP neighbors are recorded on the bond members; a gateway address
+learned over a bond uplink is still listed as observed.
+
+If MAC rows read
+`Seen on N switches (FDB only): edge ports not verified, no LLDP neighbor data`,
+the LLDP check has not published `lldp-results/lldp_neighbors.json`. The LLDP
+stage writes the file only after `topology.dot` has been read without error,
+so fix the topology file and run the full `lldpq` pipeline once before
+`./monitor.sh --only duplicate`. With `SKIP_LLDP=true` nothing refreshes the
+file: after 24 hours the rows read `LLDP neighbor data is stale`, and a
+duplicate MAC on two host ports stays in this WARNING class instead of
+becoming a confirmed conflict. A DAD or active-mobility row whose MAC the FDB
+also shows on `swp` ports of several switches, without proof that they are
+edge ports, keeps its class and ends with
+`; also seen on N switches (FDB only): edge ports not verified, ...`, and a
+confirmed row that lists more `swp` ports than were proven says so
+(`Confirmed MAC conflict: LOCAL on edge ports of 2 switches (1 more switch not verified)`).
+
 ### features
 
 - shows local and contender `switch:port` locations with interface descriptions when available
-- keeps current IP DAD, confirmed MAC conflicts, MAC DAD evidence, and MAC mobility as separate summary counters
+- keeps current IP DAD, confirmed MAC conflicts, MACs seen on several switches, MAC DAD evidence, and MAC mobility as separate summary counters
+- lists a MAC that the FDB shows on several switches as a separate WARNING row when LLDP cannot show that the ports are edge ports; these rows are not part of the confirmed MAC conflict counter and are not collapsed under **Show aged**
 - calculates MAC mobility deltas per observing switch and normalizes them against the configured moves/window policy
 - treats counter resets and newly established baselines without creating negative deltas
 - treats DAD disabled by FRR during EVPN multi-homing as an informational
@@ -404,6 +478,8 @@ correlations, and the checks performed by the agent.
 - Analysis findings carry **NEW** / **ONGOING** / **RESOLVED** badges (plus worsened/reopened) tracked across runs; a device missing from the current collection is never marked resolved.
 - Known-benign findings can be acknowledged with `suppress: <device|*|@role> [CATEGORY] <regex> [ttl=7d] [because ...]` and removed with `unsuppress: <id or fragment>`. Suppressions expire on TTL and auto-reopen when the finding's severity worsens past the acknowledged level.
 - Recent fabric changes (24h git log of the Ansible directory plus running-config drift) are correlated into analysis and change-related chat questions.
+- Optical events in the timeline: a change of a port's optical health is always reported. A link-margin drop of 3 dB or more is reported between two consecutive samples that grade the same Rx lanes, an Rx-power drop when they also name the same worst lane. When the graded lanes change (a breakout plan change, an upgrade that assigns lanes differently) the comparison starts again and the change alone creates no event. Two samples that do not both list their lanes (history written by an earlier version) are compared unless they name different worst lanes.
+- Optical correlation: sub-ports of one breakout cage whose warning or critical state the module's temperature or voltage alone caused are one optical entry (`...; one module in swp3, sub-ports swp3s0, swp3s1, swp3s2, swp3s3`); sub-ports whose link is down stay separate entries.
 - Optional critical/error logs can be attached to the request.
 - Persistent site facts can be saved in **Memory**, including with `remember: ...` or `hatırla: ...`; a fact can be removed with `forget: <fragment>`.
 - Chats can be exported for later review.
@@ -479,6 +555,10 @@ EVPN-MH, Hardware, Logs, Assets, and Transceiver views; it does not narrow
 collection.
 For LLDP, only the current `lldp.html` report is scoped; LLDP Problems and
 Archive remain global.
+On the Transceiver view the scoped **Total Modules** figure counts each
+physical module once and the port figure beside it counts the visible rows.
+On the BER view the scoped **Not Graded** figure counts the ports of the
+selected switches, and so do the two numbers under it (awaiting sample, idle).
 
 Changing Analysis Scope never redirects to a separate lifecycle dashboard.
 If a supported report is open, that report reloads in place so its rows,
@@ -608,7 +688,7 @@ publish; use the index when that state is expected.
 |---|---|---|---|
 | `/export_json` | JSON | Generated on request | Discovery/freshness index; no CSV form |
 | `/lldp_results/export_json` | JSON | Generated on request from published `lldp_results.ini` | Counts and classified wiring rows |
-| `/lldp_results/export_csv` | CSV | Generated on request | Byte-equivalent to the LLDP page's default problems-first Download CSV; optional `?p2p=1` renders the display-alias labels |
+| `/lldp_results/export_csv` | CSV | Generated on request | Byte-equivalent to the LLDP page's default problems-first Download CSV, except that the P2P design columns of a three-part breakout port can name another design line (see [03a]); optional `?p2p=1` renders the display-alias labels |
 | `/bgp/export_json`, `/bgp/export_csv` | JSON / CSV | Atomic monitor artifact | BGP rows; JSON `extra.evpn` contains the EVPN VNI/route summary |
 | `/evpn-mh/export_json`, `/evpn-mh/export_csv` | JSON / CSV | Atomic monitor artifact | Ethernet Segment/PE/LACP/DF findings |
 | `/duplicate/export_json`, `/duplicate/export_csv` | JSON / CSV | Atomic monitor artifact | IP, MAC and APIPA findings |
@@ -621,7 +701,7 @@ publish; use the index when that state is expected.
 | `/config-drift/export_json`, `/config-drift/export_csv` | JSON / CSV | Atomic monitor artifact | Recent config drift events (detected time, +/- line counts) |
 | `/routes/export_json`, `/routes/export_csv` | JSON / CSV | Atomic monitor artifact | Per device/VRF route-table metrics and anomaly notes |
 | `/fabric-check/export_json`, `/fabric-check/export_csv` | JSON / CSV | Atomic monitor artifact | MTU/speed/config consistency findings per link/port |
-| `/transceiver/export_json`, `/transceiver/export_csv` | JSON / CSV | Atomic transceiver-scan artifact | Firmware/vendor/part/serial inventory |
+| `/transceiver/export_json`, `/transceiver/export_csv` | JSON / CSV | Atomic transceiver-scan artifact | Firmware/vendor/part/serial inventory, one row per port (module totals in `counts`) |
 | `/ai/export_json` | JSON only | Verbatim current `analysis.json` | Latest autonomous/manual persisted report; `analysis` is Markdown and must be checked for a non-empty value |
 
 There is no separate public EVPN-summary endpoint: it is carried in the BGP
@@ -817,20 +897,50 @@ The complete version-1 registry is:
   `inconsistent`, `bypass_active`
 - **Duplicate:** `finding_type`, `severity`, `kind`, `vlan`, `vni`, `address`,
   `macs`, `hosts`, `local_ports`, `vteps`, `sequence`, `delta`, `events`,
-  `stale`, `count`, `note`
+  `stale`, `count`, `note`. For MAC rows `kind` is `confirmed`, `dad`,
+  `mobility`, `fdb-observed` (seen on several switches, edge ports not
+  verified) or `context`. The export `counts` object and
+  `summary/duplicate-summary.json` carry `mac_fdb_observed_total` next to
+  `confirmed_mac_total`
 - **Flap:** `device`, `interface`, `status`, `flaps_30s`, `flaps_1m`,
-  `flaps_5m`, `flaps_1h`, `flaps_12h`, `flaps_24h`, `total_transitions`
+  `flaps_5m`, `flaps_1h`, `flaps_12h`, `flaps_24h`, `total_transitions`.
+  One row per physical port the switch lists. A port whose counter could not
+  be read keeps its row, and so does a port that the latest complete carrier
+  collection did not list, until a second one confirms that it is gone. VLAN
+  sub-interfaces have no row, and `total_ports` and `stability_percent` in
+  `counts` are computed over these rows only
 - **Optical:** `device`, `interface`, `health`, `rx_power_dbm`,
   `tx_power_dbm`, `temperature_c`, `link_margin_db`, `voltage_v`,
   `bias_current_ma`, `rx_lanes`, `tx_lanes`, `bias_lanes`, `anomalies`,
   `inactive_lanes` (channels the module exposes but does not light: no
-  optical power and no laser bias current, so they are not graded). For a
-  breakout sub-port (`swpNsM`) the lane fields cover only the channels that
-  sub-port owns
+  optical power and no laser bias current, so they are not graded),
+  `rx_lane_ids`, `tx_lane_ids`, `bias_lane_ids`, `rx_power_lane`,
+  `tx_power_lane`, `bias_current_lane`. The `*_lane_ids` columns give the
+  module channel of each value in `rx_lanes`, `tx_lanes` and `bias_lanes`, in
+  the same order and blank-separated. For a breakout sub-port (`swpNsM`) the
+  lane fields cover only the channels that sub-port owns, so its ids need
+  not start at 1 (for example `5 6 7 8`).
+  `rx_power_lane`, `tx_power_lane` and `bias_current_lane` name the channel
+  of the headline `rx_power_dbm`, `tx_power_dbm` and `bias_current_ma`
+  values. A power side the module does not monitor has an empty lane list
+  and a null headline value. `link_margin_db` is the lowest graded lane's RX
+  power above the module's own RX low alarm when the module prints a valid
+  RX power threshold table, otherwise above the generic -14 dBm sensitivity.
+  `anomalies` holds one `SEVERITY: message` item per finding, joined with
+  `; `; a semicolon inside a message is written as a comma, so the cell
+  splits into its items on `;`. `counts` carries per-module figures next to
+  the per-port ones: `critical_findings`, `warning_findings` and
+  `unplugged_modules` (see [Optical port states](#optical-port-states))
 - **BER:** `device`, `interface`, `neighbor_device`, `neighbor_port`, `status`,
   `sample_status`, `raw_ber`, `effective_ber`, `frame_error_density`,
   `symbol_errors`, `symbol_error_delta`, `delta_packets`, `delta_rx_errors`,
-  `delta_tx_errors`, `sample_window`, `severity_reasons`
+  `delta_tx_errors`, `delta_rx_dropped`, `delta_tx_dropped`, `sample_window`,
+  `severity_reasons`. `sample_status` is `analyzed`, `baseline`,
+  `counter_reset`, `insufficient_traffic` or `idle` (no new packets, errors
+  or drops since the previous collection: an unused or down port; its
+  `status` stays `UNKNOWN`). The BER `counts` object carries `unknown` (all
+  ungraded ports) and `idle` (the idle subset of `unknown`);
+  `summary/ber-summary.json` carries the same two keys
 - **PFC/ECN:** `device`, `interface`, `status`, `signal`,
   `ecn_marked_delta`, `ecn_marked_rate`, `rx_pause_delta`, `rx_pause_rate`,
   `tx_pause_delta`, `tx_pause_rate`, `loss_delta`, `sample_status`
@@ -841,7 +951,15 @@ The complete version-1 registry is:
   `message`
 - **Transceiver:** `device`, `port`, `identifier`, `vendor`, `part_number`,
   `serial`, `vendor_rev`, `connector`, `fw_version`, `cable_byte130`,
-  `fw_status`, `fw_status_detail`
+  `fw_status`, `fw_status_detail`, `module` (the physical module the port
+  row belongs to: `<device>/<cage>`, plus `/<serial>` when a serial is
+  printed; the sub-ports of a breakout cage share the value, so rows can be
+  counted per module). Rows are per port: a module in a breakout cage
+  appears once per sub-port with the same `serial`. `counts.total_modules`,
+  `counts.fw_versions` and `counts.status_counts` count each physical module
+  once (device + cage `swpN`, plus the serial when printed);
+  `counts.total_ports` equals `row_count`. Do not derive the module total
+  from `row_count`
 - **LLDP results:** `local_device`, `local_port`, `port_status`,
   `expected_device`, `expected_port`, `actual_device`, `actual_port`,
   `lldp_status`, `status`, `connection_health`
@@ -856,7 +974,12 @@ The complete version-1 registry is:
 - Text values beginning (after trimming) with `=`, `+`, `-`, or `@` are
   prefixed with `'` to prevent spreadsheet-formula execution. Numeric cells
   are never guarded, so negative telemetry (optical dBm, counter deltas)
-  stays machine-parseable.
+  stays machine-parseable. The only text cells exempt are the optical lane
+  lists (`rx_lanes`, `tx_lanes`, `bias_lanes`, `inactive_lanes`,
+  `rx_lane_ids`, `tx_lane_ids`, `bias_lane_ids`), and only while such a cell
+  holds nothing but digits, signs, dots and blanks (for example
+  `-1.2 -0.9 -1.5`); any other text that merely looks numeric keeps the
+  guard, as on the LLDP page.
 - Monitor CSV downloads use `lldpq_<domain>_export.csv`; transceiver uses
   `lldpq_transceiver_export.csv`; LLDP uses
   `LLDP_Report_<report-created>.csv`, or
@@ -1088,6 +1211,16 @@ roles are optional tags for grouping. They are used for:
 
 Recommended roles: `leaf`, `spine`, `core`, `border`, `oob` (or any naming that fits your topology).
 
+A role name may contain ASCII letters, digits, `_`, `.` and `-`, for example
+`@border-leaf` or `@leaf.pod1`. A tag with any other character (a non-ASCII
+letter such as `ç`, a `+`) is not a role: the whole text, tag included, is
+then the hostname. The device pickers of the web pages, the
+Ask-AI inventory, provisioning discovery and the role drop-down read the tag
+exactly as the collectors do, so such a device is listed under its plain
+hostname and grouped by its role. The role tag is case-insensitive and is
+shown in lower case (`@Border-Leaf` is the role `border-leaf`), also in the
+Base Config device list and the OS upgrade candidates.
+
 IPv4 and IPv6 management addresses can coexist in the same inventory. See
 [IPv6 support](#03c-ipv6-support) for YAML/CSV examples, discovery inputs,
 link-local interface scopes and the current support boundaries.
@@ -1136,7 +1269,8 @@ bootstrap workspace; it is different from the operational device table under
   complete P2P cabling workbook is unavailable
 - retain recoverable versions and explicitly choose which version is the
   active design
-- run deterministic duplicate-port, breakout, blank/TBD endpoint, duplicate
+- run deterministic duplicate-port, breakout (including unproven or mixed
+  breakout widths of three-part ports), blank/TBD endpoint, duplicate
   cable/record and allocation checks without AI
 - preview and confirm generation of `topology.dot`, `devices.yaml`, and
   `topology_config.yaml`
@@ -1146,6 +1280,49 @@ Generated files are never applied silently: every candidate is previewed
 (including a diff where applicable) and requires confirmation. The active
 design is published as `active-p2p.json` / `active-ipam.json` for Ask-AI and
 Fabric Migration enrichment.
+
+**Three-part ports and breakout width.** A workbook port written
+`port/group/sub` (for example `1/2/1`) is converted to a breakout sub-port
+name with one width per port, so a switch may mix 2x, 4x and 8x splits. The
+port's own rows decide when only one split fits them (`1/1/1` to `1/2/4` can
+only be 8x). Otherwise **Generate topology.dot** and **Validate** take the
+width from the interfaces the switch reported in the last LLDP run
+(`lldp-results/lldp_neighbors.json`, used while it is less than 24 hours old;
+a design label finds its switch through the display aliases): a port the
+switch lists as `swp1s0` and `swp1s1` is 2x, and an unsplit port written
+`X/1/1` becomes `swpX`. Without that file the widest three-part port of the
+same switch decides and an unsplit `X/1/1` is written `swpXs0`. **Validate**
+reports `breakout-width-ambiguous`, with every candidate name, for each port
+whose sub-port names nothing proves: the width was borrowed from another
+port, or the rows stop at group 2 of a port with 4 or 8 sub-ports, which fits
+two groups (the reading used) as well as one group per leg. It reports
+`breakout-mixed-width` when a switch is known to mix widths. Check the named
+`swpN` on the switch before applying a generated `topology.dot`. An FQDN and
+the short name of one switch are one device; two FQDNs that share only their
+first label (`leaf-01.site-a`, `leaf-01.site-b`) are two.
+
+On the LLDP **Results** page the Design vs Actual panel fits each three-part
+design port to the ports of the current LLDP report; a port counts when the
+switch lists it (Port Status UP, DOWN or UNKNOWN) or a neighbor advertises
+it. A neighbor on a different breakout leg than the design names is a
+`Mismatch`, and the row of the leg the cable really sits on shows
+`Design Unresolved` when the design has no row for that leg. Where the report
+cannot prove the sub-port (the width was borrowed from another port, or the
+live sub-ports fit two notations), every candidate lane of the design port
+still counts as a match. Design ports that do not resolve to one sub-port
+(two-part `49/1`, plain `49`) keep the notation-tolerant comparison.
+
+The Fabric Migration design join, the Ask-AI design lookup and incident
+correlation, and the P2P Sheet / Line / SEQ columns of
+`/lldp_results/export_csv` take the breakout width of three-part ports from
+the same `lldp-results/lldp_neighbors.json`. When the file is missing,
+unreadable or older than 24 hours they work from the design alone. The LLDP
+page itself fits against the report it shows, so for a port the two sources
+describe differently the page's Download CSV and the headless CSV can name
+different design lines. Where the sub-port of a design row is proven, another
+leg of the same breakout port that has no design row of its own gets blank
+P2P columns in either CSV; an unproven row still answers for every candidate
+lane of its design port.
 
 ### Rack / Unit Mapping
 
@@ -1291,7 +1468,9 @@ Configure Slack alerting entirely from the web UI — no manual YAML editing:
 - **Slack webhook URL** + channel
 - **Alert mode** and minimum repeat interval for individual-alert strategies
 - **Per-type toggles** for hardware, network, system, topology, and log alerts
-- **Key thresholds** (temperature, link-flap count, …) editable inline
+- **Key thresholds** (temperature, link-flap count, …) editable inline. The
+  optical margin is a link margin in dB (0 to 30), not a power level in dBm;
+  a negative value is refused
 - **Test alert** button — sends a sample message to verify the webhook end-to-end
 
 Changes are validated and written atomically; existing comments and unrelated YAML keys are preserved. If the file changes elsewhere while the form is open, Setup keeps the form contents and asks you to reload/review instead of silently overwriting the newer file.
@@ -1314,6 +1493,7 @@ complete runtime or bare-metal backup.
 - **Not included:** monitoring/config history, DHCP leases and full DHCP configuration, uploaded OS images, generated provisioning files, LLDPq users/sessions, private Ask-AI analysis/learnings, or active job state.
 - **Import** restores every file to the right location, merges the portable prefs into `/etc/lldpq.conf`, and applies any schedule changes to cron.
 - **Transactional restore:** every included file is validated and staged before activation. Restore is all-or-rollback; native systemd recovery and Docker startup recovery consume retained rollback authority after an interruption.
+- **Optical margin:** a restored `notifications.yaml` is held to the same range as the Setup form: `thresholds.network.optical_power_margin` must be between 0 and 30 (dB), otherwise the restore is refused.
 - **Size limits:** `topology.dot` supports 10 MiB; other individual configuration
   files support 2 MiB. The compressed bundle and its total expanded contents
   each support up to 32 MiB.
@@ -1777,6 +1957,91 @@ These apply to native and Docker installations alike:
 - **Scripts that read `/configs/`, `/hstr/` or `/monitor-results/`** without
   a login now get HTTP 401; see [authentication](#10-authentication).
 
+### after updating from 4.3.1 or earlier
+
+These apply to native and Docker installations alike. Nothing has to be
+changed by hand; this is what an operator notices on the first runs after
+the update:
+
+- **Optical grading**: ports whose module prints a valid limit table are
+  graded by the module's own limits (see
+  [Optical module limits](#optical-module-limits)), so the Warning, Critical
+  and Good counts shift once. An optic at 60-70 °C, a TX power above 3 dBm or
+  a long-reach RX below -14 dBm is no longer Warning or Critical when the
+  module's limits allow it, and a lane beyond the module's own limits now is.
+  On CMIS modules a bias alarm flag that is On while the measured bias is
+  inside the module's limit is Warning instead of Critical.
+- **Link margin**: for modules that print a valid RX table, `link_margin_db`
+  changes once because it is now counted from the module's RX low alarm
+  instead of -14 dBm. The stored history is restated to the new level, so
+  trend views such as the Ask-AI timeline see no step.
+- **Optical rows**: active optical cables appear as new optical ports. Copper
+  cables and copper SFPs that were listed as Unknown disappear. A link-up
+  port is never Down: a link-up breakout sub-port whose own receive lanes are
+  dark is Critical, and a power side the module does not monitor shows N/A
+  instead of a Critical -40 dBm (TX) or a Down row (RX). A link-up port that
+  delivered diagnostics before and whose module stopped answering is an
+  Unknown row (see [Optical port states](#optical-port-states)).
+- **Optical export**: six columns are appended (`rx_lane_ids`, `tx_lane_ids`,
+  `bias_lane_ids`, `rx_power_lane`, `tx_power_lane`, `bias_current_lane`),
+  and `counts` gains `critical_findings`, `warning_findings` and
+  `unplugged_modules`. In the CSV a lane-list cell that begins with a minus
+  sign is no longer prefixed with `'`, and a semicolon inside an `anomalies`
+  message is written as a comma.
+- **Link Flap**: the page can list fewer ports than before. Rows of VLAN
+  sub-interfaces disappear at the first complete collection of each switch,
+  rows of ports that an earlier breakout change removed at the second one,
+  and Total Ports and Stability Ratio change accordingly. Link-flap events
+  that were already published for sub-interfaces stay on the Timeline until
+  they age out (30 days, or earlier once the 500-event cap is reached).
+- **BER**: rows of VLAN sub-interfaces disappear and the port total drops.
+  The **Awaiting Sample** card is now **Not Graded** and shows how many of
+  its ports are awaiting a sample and how many are idle; unused or down ports
+  carry the badge `IDLE`. The export gains the `sample_status` value `idle`
+  and the count `idle`.
+- **Alerts**: summary mode sends one extra summary because the format of the
+  stored change signature changed. BER ports awaiting a traffic sample no
+  longer turn the summary into a warning, and unplugged optics read
+  `N ports with an expected module unplugged`. Immediate mode sends one
+  `BER Recovered` for each switch that idle ports had held in `BER Warning`,
+  and one `Optical Warning` for each switch where a warning sits next to a
+  link-down, unplugged or unreadable port.
+- **Transceiver**: **Total Modules**, the firmware distribution and the
+  coverage badges count each physical module once, so on a fabric with
+  breakout ports the numbers drop (a cage split 4x was 4 and is 1). The page
+  and the Ask-AI summary re-total an existing inventory at once; the public
+  export shows the new totals and the `module` column after the next
+  transceiver scan.
+- **Duplicate**: a MAC seen through an inter-switch link is no longer a
+  **Confirmed MAC conflict**, so that counter can drop. MACs whose ports
+  cannot be shown to be edge ports are listed as WARNING under the new
+  **MAC seen on several switches** card. The rule reads
+  `lldp-results/lldp_neighbors.json`: while that file is missing or older
+  than 24 hours, a real duplicate MAC on two host ports is reported in this
+  WARNING class instead of CRITICAL. Trunk ports disappear from
+  **Owner (local)** of duplicate-IP rows, and a gateway address that an L2
+  switch learns on its uplinks stays an expected gateway row (see
+  [02e]).
+- **Design vs Actual and generated topology**: on the LLDP **Results** page a
+  neighbor on a different breakout leg than the design names is now a
+  `Mismatch`, and a leg without a design row shows `Design Unresolved`.
+  **Generate topology.dot** on the Inventory page can produce other sub-port
+  names than before for switches that mix breakout widths and for unsplit
+  ports written `X/1/1`, and **Validate** can report
+  `breakout-width-ambiguous` and `breakout-mixed-width` (see [03a]).
+- **Device lists**: a device whose inline role contains `-` or `.`
+  (`@border-leaf`) is listed under its hostname and grouped by its role; the
+  device pickers could list it ungrouped with the tag in its name. Roles are
+  shown in lower case. The LLDP tab of the Search page lists ports in natural
+  order.
+- **Setup**: the optical margin field accepts 0 to 30 dB. A
+  `notifications.yaml` that holds a value outside that range cannot be saved
+  from the Notifications form, or restored from a bundle, until the value is
+  corrected; the optical analysis ignores a negative value, keeps 3 dB and
+  now says so in its output.
+- **Fabric check**: VLAN sub-interfaces are no longer part of the per-port
+  data, so they drop out of the MTU distribution.
+
 ## [06] dependency management
 
 `install.sh` checks and installs nginx, fcgiwrap, ISC DHCP components and the
@@ -1931,6 +2196,20 @@ SN2010, SN2100, SN2201, and SN2210 are always skipped for safety; devices with
 an unknown model are skipped unless
 `TRANSCEIVER_FW_UNKNOWN_MODEL_POLICY=run` is explicitly configured.
 
+The Transceiver table has one row per port, and every breakout sub-port of a
+cage (`swpNsM`) reports the same physical module. Module totals count each
+module once: **Total Modules**, the per-model firmware distribution behind
+**Mixed FW Models** and the `mixed` badge, and the skipped / no-data /
+failed coverage badges. The number of port rows is shown next to it
+(`Total Modules (N ports)`, `# Total Ports` in the downloaded CSV). A module
+is identified by its device and cage (`swpN`) plus its serial number when the
+module prints one, so two different serials reported in one cage count as two
+modules and modules without a serial are told apart by their cage. An
+inventory collected before this change is re-totalled per module by the
+Transceiver page and by the Ask-AI summary, which reads
+`N modules on M ports`; the public export shows the new totals and the
+`module` column after the next transceiver scan.
+
 **L1 BER collection**: `SKIP_L1=false` is the default, so monitoring attempts
 to collect `l1-show all -p` data for Physical BER, Effective BER, and PHY
 symbol counters.
@@ -2014,11 +2293,34 @@ The following optional values tune bounded collection:
 - `OPTICAL_PORT_TIMEOUT_SECONDS=5` — timeout for one DOM read
 - `MONITOR_TIMING=true` — emit per-device section timings
 
+Carrier, optical and PFC/ECN collection walk one inventory of physical ports
+(`swpN` and breakout sub-ports `swpNsM`). VLAN sub-interfaces such as
+`swp6.100` are not part of it; they appear only in the Port Status table of
+the device page, with their own description.
+
 Optical collection retries the first timeout in a streak while staying inside
 the per-switch budget. Four consecutive full timeouts, or roughly 40 seconds
 spent in unsuccessful DOM reads, stop further EEPROM access on that device;
 unvisited ports are still emitted as explicit partial/Unknown coverage rather
 than disappearing from the report.
+
+The module of a breakout cage is read once per collection cycle. The first
+sub-port (`swpNsM`) the sweep reaches reads the EEPROM; the other sub-ports
+of that cage, link-down ones included, reuse the result (the dump, no data,
+or the timeout) under their own interface name and link state, without
+another `ethtool -m` call. A cage therefore counts once towards the
+four-timeout streak and the 40-second limit: one module that stops answering
+in a 4x or 8x breakout is reported as timed out on each of its sub-ports and
+no longer ends DOM collection for the rest of the switch. Because one answer
+stands for the whole cage, an immediate error without data (what an empty
+cage returns, but also a momentary EEPROM access error) is asked a second
+time before the cage is recorded as empty, so an empty breakout cage costs
+two `ethtool -m` calls. Sub-ports of a cage that was read before the budget
+ran out or the sweep was stopped still show its result; only cages that were
+never read are reported as unvisited. A read that the remaining budget cut
+below `OPTICAL_PORT_TIMEOUT_SECONDS` is not taken as the module's timeout:
+the sub-port that was read reports the timeout, its siblings are reported as
+unvisited.
 
 Verbose `lldpq -` runs also print one lightweight **Analyzer timings
 (parallel)** block with the elapsed time of every analyzer. This is always
@@ -2051,6 +2353,14 @@ The Optical page's expanded port details show the module limits in mA and the
 bias assessment; a bias alert identifies the affected lane, measured value and
 available limit.
 
+For CMIS modules (QSFP-DD, OSFP, QSFP112) a per-channel bias flag counts as
+an alarm only together with a measured value beyond the corresponding limit:
+`ethtool` can print a channel flag on the wrong channels, so a flag that is
+On while the lane's bias is inside the module's limit is reported as
+`module flag set, value in range` at Warning. Without a measured value or a
+valid limit, and for all SFF-8636 and SFF-8472 modules, a flag that is On is
+graded as before.
+
 For example, an MMS4X00-NM-T reporting a 100 mA low alarm, 120 mA low warning,
 480 mA high warning and 500 mA high alarm accepts a reading around 339 mA.
 A reading at or above 480 mA raises a warning, while at or above 500 mA raises a
@@ -2059,8 +2369,9 @@ other optics.
 
 If sufficient valid module limits or flags are unavailable, the bias assessment
 is explicitly unavailable rather than inferred from a fixed current limit.
-Other optical metrics continue to determine port health using their existing
-rules. Breakout selection and unused-lane exclusions also apply to bias checks.
+RX power, TX power, temperature and voltage are graded as described under
+[Optical module limits](#optical-module-limits) below. Breakout selection and
+unused-lane exclusions also apply to bias checks.
 
 A breakout sub-port (`swpNsM`) is graded only on the module channels it owns,
 because `ethtool -m` returns the whole module for every sub-port. The
@@ -2078,6 +2389,129 @@ by the number of sub-ports. A 400G-DR4 split into 4x100G prints eight
 channels, so until then it is shown with two channels per sub-port (the third
 and fourth sub-port on the unused channels 5-8); a link on the third or fourth
 sub-port settles it.
+
+### Optical module limits
+
+RX power, TX power, module temperature and supply voltage are graded by the
+limits the module prints for itself in the existing `ethtool -m` collection
+(the `Laser rx power`, `Laser output power`, `Module temperature` and
+`Module voltage` high/low alarm and warning `threshold` lines, printed alike
+for CMIS, SFF-8636 and SFF-8472 modules). No additional switch command is
+needed.
+
+Each of the four parameters is decided separately. When the module's table
+for a parameter is complete, consistent (four finite limits, in order, not
+all zero, low below high) and physically plausible:
+
+- a lane (or the module value) beyond an alarm limit is Critical and beyond a
+  warning limit is Warning; a reading exactly on a limit is not beyond it
+- a healthy reading close to a warning limit is Good: RX with a link margin
+  below the configured margin + 3 dB or within 1 dB of the high warning, TX
+  within 1 dB of a warning limit, temperature within 5 °C, voltage within
+  0.05 V; otherwise it is Excellent
+- the generic limits (RX -14 / +5 / +7 dBm, TX -11 / +4 dBm, temperature
+  0-70 °C with a warning from 60 °C, voltage 3.0-3.6 V) are not applied to
+  that parameter
+
+A table is plausible when every limit it prints lies within -45 to 125 °C
+(temperature), 2.5 to 4.0 V (voltage), or above -40 dBm and up to +10 dBm (RX
+and TX power). Anything else is what an unprogrammed module prints (for
+example -128 / +128 °C, 0 / 6.5535 V or 0.0001 / 6.5535 mW): the table is
+ignored as a whole, the parameter keeps the generic limits, and the expanded
+port detail says `module table ignored: implausible` together with the limits
+the module printed. A limit printed as 0.0000 V is unset, like 0 mW for power.
+
+A parameter whose table is missing, incomplete or inconsistent keeps the
+generic limits. A limit that an incomplete table does print can still raise a
+Warning or Critical, as for bias current. A Critical reading beyond a generic
+RX power, temperature or voltage limit is named with its value and the limit,
+for example `Module voltage out of range: 2.6000 V (limits: 3.0 to 3.6 V)`,
+`SFP temperature too low: -5.0°C (threshold: 0.0°C)` or
+`RX power too high: 8.00 dBm (threshold: 7.0 dBm)`. A generic TX power
+finding names the value only (`TX power out of range: -12.50 dBm`), and a
+generic Warning other than a low link margin is reported without value and
+limit (`An optical power or temperature value is near its limit`).
+
+Link margin is the RX power above the module's RX low alarm when the RX table
+is valid (the row shows the lowest lane), otherwise above the generic -14 dBm
+sensitivity. A lane whose margin is below
+`thresholds.network.optical_power_margin` (dB, default 3) is Warning. Example:
+with a module RX low alarm of -8.4 dBm and the default margin, a lane below
+-5.4 dBm is Warning and a lane below -8.4 dBm is Critical.
+
+The Rx and Tx columns show the lane that explains the badge. The expanded
+port detail lists for every parameter whether the module's limits or the
+generic limits graded it, and a finding raised by a module limit names that
+limit, for example
+`RX power -9.00 dBm on lane 3 is below the module's low alarm -8.40 dBm`. The
+module limits themselves are published in the per-device detail file
+(`optical-details/<host>.json`) only, not in the export.
+
+Every history sample records the level its margin counts from
+(`link_margin_ref_dbm`) and the receive lanes it graded
+(`rx_power_lane_ids`). When that level changes for a port, for example when a
+module with other limits is plugged in, the port's earlier samples are
+restated to it, so trend views such as the Ask-AI timeline see no step.
+
+### Optical port states
+
+The Optical page lists ports whose module has an optical path. Copper is
+recognised from what `ethtool -m` prints for it: a `Copper pigtail` or `RJ45`
+connector, `Passive Cable` or `Copper cable` technology, a
+`Passive Cu cmplnce.` / `Active Cu cmplnce.` line, or a Base-CR / BASE-T
+standard. DACs, active copper cables and copper SFPs are therefore not
+listed. An active optical cable is optical: `No separable connector` alone
+does not make a cable copper, and `AOC` / `Active Optical` in the transceiver
+type, or a lane that carries light or laser bias, decides for optical. A
+block without any diagnostic value on a port that never delivered optical
+diagnostics is not listed either.
+
+States beyond the health grades:
+
+- **Down**: the port's link is down while its module still answers. The
+  expanded row says what the receiver reads
+  (`Link down, light present on all lanes`, `Link down, lane 2 at -16.0 dBm`,
+  `Link down, no receive light on any lane`), names a lane that has neither
+  light nor laser bias
+  (`Link down, light present on lanes 1, 2, 4; lane 3 without light and without laser bias`;
+  the unused upper half of a wider cage's channels is not named), and lists
+  what can explain the outage: a laser bias alarm, a critical power,
+  temperature or voltage reading, or a transmitter that reads no light
+  although its laser is driven. When no channel of the module shows transmit
+  light, that last one is a note
+  (`TX reads no light while the laser draws 6.0 mA (failed transmitter or TX power not monitored)`),
+  because the readings cannot tell a failed transmitter from a module without
+  transmit power monitoring. Readings that only show a shut port (lasers off,
+  no light) are not listed as alarms. A port whose link is up is never Down.
+- **Unknown**: diagnostics are incomplete.
+  `Module diagnostics could not be read although the link is up` means
+  `ethtool -m` returned no data for a port that delivered diagnostics before.
+- **Unplugged**: a port that delivered diagnostics before now reads empty
+  with its link down.
+
+A power side the module does not monitor is not graded: when TX (or RX) power
+reads no light (0 mW) on every channel of the module while the link is up,
+the side is shown as N/A and the expanded row says
+`Not monitored by this module`. Without a collected link state the same holds
+for TX while the lasers are driven and the port receives light. On a port
+whose link is down the readings are kept as they are. A temperature of
+exactly 0.00 C and a voltage of exactly 0.0000 V are treated as not read, and
+a malformed number as missing. A module that reports receive power as OMA
+(`Receiver signal OMA`) is read like one that reports average power.
+
+A row without any reading adds no history sample, so a module that stops
+printing diagnostics keeps its Unknown row and is still reported as Unplugged
+when it is removed.
+
+In a breakout cage every sub-port reads the same module. Each sub-port row
+keeps its own badge and the summary cards count rows, but a condition of the
+module itself (module temperature or voltage, the module pulled or
+unreadable) is reported as one finding that names the cage and its sub-ports
+and carries the worst reading among them. `summary/optical-summary.json`, the
+export `counts` and the report's `data-optical-*` attributes carry per-module
+counts next to the per-port ones: `critical_findings`, `warning_findings` and
+`unplugged_modules`. The Ask-AI correlation follows the same rule (see
+[02f]).
 
 ## [10] authentication
 
@@ -2239,13 +2673,21 @@ python3 verify_alerts.py                             # test configuration
 
 ### how it works:
 - **smart detection**: individual alerts are stateful and deduplicated; the default summary mode also sends scheduled health summaries at its configured times (09:00 and 17:00 by default)
+- **summary changes**: between its scheduled times the summary is re-sent only when one of the counts it tracks changes: warning, critical, down, unplugged, unknown and coverage counts, and the device, log, BGP, asset, link-flap, LLDP and duplicate counts. Devices or ports moving between Excellent and Good, and BER ports moving between graded, idle and awaiting a sample, do not trigger a new summary.
+- **BER and optics in the summary**: BER ports that are idle (no traffic and no errors: unused or down) or still collecting a traffic sample are shown as `Idle` and `Awaiting Sample` in the BER block; neither raises an issue or turns the summary into a warning. Unplugged optics are counted per port (`N ports with an expected module unplugged`), so one module pulled from a 4x breakout cage reads as 4 ports.
+- **immediate mode, optical**: a link-down, unplugged or unreadable port does not hide a degrading one on the same switch. A warning that appears next to such a port is sent at once as `Optical Warning` (`a warning condition; a monitored optical link is also down`, `...; an expected optical module is also unplugged` or `...; current diagnostics are also incomplete or unknown`). When it clears, `Optical Warning Cleared` (after a critical: `Optical Critical Cleared`) reports that the other condition is still there. This recovery is sent only when every port that was degraded is healthy again and no other port failed; if the degraded port itself went down, stopped answering or was pulled, the normal warning for that condition is sent instead. A port that keeps going down, unreadable or unplugged next to a lasting warning raises this `Optical Warning` again when it reappears, at most once per minimum repeat interval. A critical condition still outranks everything.
+- **immediate mode, BER**: idle ports do not grade a switch, so an unused port does not keep it in `BER Warning`. While idle ports are left ungraded, the recovery reads `no warning or critical condition; N idle ports are not graded` instead of `healthy`.
 - **default 10-minute evaluation**: scheduled alerts run as part of the complete `lldpq` pipeline; a total-fabric outage/recovery pre-check runs after Assets collection, followed by the normal alert evaluation after monitoring reports are published
-- **customizable**: adjust thresholds in notifications.yaml
+- **customizable**: adjust thresholds in notifications.yaml. `thresholds.network.optical_power_margin` is in dB. A value that is negative or not a number is ignored: the optical analysis keeps the 3 dB default and says so once per run in its output
 - **state tracking**: prevents duplicate alerts, tracks recovery
 
 Alerts start after both the master notifications switch and Slack are enabled
 and a valid webhook is configured. Check `~/lldpq/alert-states/` for alert
 history.
+
+After an update, summary mode sends one extra summary and immediate mode can
+send one `BER Recovered` or `Optical Warning` per switch; see
+[after updating from 4.3.1 or earlier](#after-updating-from-431-or-earlier).
 
 ## [12] streaming telemetry
 

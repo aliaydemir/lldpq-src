@@ -59,6 +59,19 @@ def parse_proc_net_dev(content):
     
     return interfaces
 
+def proc_net_dev_is_complete(content, interfaces):
+    """True when a /proc/net/dev capture parsed without losing a row.
+
+    Only a complete capture proves that an interface missing from it is gone
+    from the device; a truncated or damaged file must not be read that way.
+    """
+    lines = content.strip().split('\n')
+    if (len(lines) < 3 or not lines[0].lstrip().startswith('Inter-')
+            or not lines[1].lstrip().startswith('face')):
+        return False
+    data_lines = [line for line in lines[2:] if line.strip()]
+    return len(data_lines) == len(interfaces)
+
 def process_ber_data_files(data_dir="monitor-results/ber-data"):
     """Process BER data files and update BER analyzer"""
     data_dir = os.path.abspath(data_dir)
@@ -95,6 +108,8 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     total_interfaces_processed = 0
     hosts_with_interfaces = set()
     category_failed_hosts = set()
+    # hostname -> physical ports of a completely collected counter file
+    complete_host_ports = {}
     
     assets_file = os.path.join(os.path.dirname(result_dir), "assets.ini")
     asset_snapshot = read_asset_snapshot(assets_file)
@@ -198,6 +213,18 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
                     print(f"⚠️  No interface data found in {filename}")
                     category_failed_hosts.add(hostname)
                     continue
+                
+                # Only a complete capture may retire the baseline and
+                # history of ports it no longer lists (pruned after the loop).
+                # A capture without a single physical port (switchd stopped
+                # or restarting) proves nothing about the ports: it must not
+                # erase the whole host, as in the flap analyzer.
+                physical_ports = {
+                    name for name in interfaces
+                    if ber_analyzer.is_physical_port(name)
+                }
+                if physical_ports and proc_net_dev_is_complete(content, interfaces):
+                    complete_host_ports[hostname] = physical_ports
                 
                 # Process each interface with delta-based calculation
                 processed_interfaces = 0
@@ -330,6 +357,7 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             except Exception as e:
                 print(f"❌ Error processing {filename}: {e}")
                 category_failed_hosts.add(hostname)
+                complete_host_ports.pop(hostname, None)
 
     # Per-file content problems above only degrade that host to partial
     # coverage (category_failed_hosts, flap-analyzer precedent); returning
@@ -347,15 +375,23 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
             + ", ".join(missing_interface_hosts)
         )
     
+    if (total_interfaces_processed == 0 and not all_devices_unavailable
+            and not category_failed_hosts and not missing_hosts):
+        print("❌ No physical interface counters were processed")
+        return False
+
+    # A port that left a completely collected host (split, merged back,
+    # renamed) must not hand its baseline and history to a later interface
+    # of the same name; hosts without a complete capture keep everything.
+    # Nothing is pruned or saved before the failure exits above, so a run
+    # that fails cannot leave a half-pruned baseline behind.
+    ber_analyzer.prune_absent_interfaces(complete_host_ports)
+
     # Save baseline data once after all interfaces processed.  History is
     # saved after classification because _analyze_port enriches the current
     # record with the L1 snapshot required by the next symbol-delta sample.
     if not ber_analyzer.save_baseline_data():
         print("❌ BER baseline state could not be saved")
-        return False
-    if (total_interfaces_processed == 0 and not all_devices_unavailable
-            and not category_failed_hosts and not missing_hosts):
-        print("❌ No physical interface counters were processed")
         return False
 
     # Classify every port once, then reuse the exact same objects for anomaly
@@ -391,7 +427,9 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
     print(f"  Good quality: {len(summary['good_ports'])}")
     print(f"  Warning level: {len(summary['warning_ports'])}")
     print(f"  Critical issues: {len(summary['critical_ports'])}")
-    print(f"  Awaiting a complete sample: {len(summary['unknown_ports'])}")
+    idle_ports = ber_analyzer.idle_port_count(summary)
+    print(f"  Awaiting a complete sample: {len(summary['unknown_ports']) - idle_ports}")
+    print(f"  Idle (no traffic, no errors): {idle_ports}")
     print(f"  Anomalies detected: {len(anomalies)}")
     
     # Show critical issues
@@ -454,6 +492,9 @@ def process_ber_data_files(data_dir="monitor-results/ber-data"):
         "warning": len(summary["warning_ports"]),
         "critical": len(summary["critical_ports"]),
         "unknown": len(summary["unknown_ports"]),
+        # Subset of "unknown": unused or down ports that are not awaiting
+        # a traffic sample.
+        "idle": idle_ports,
     }
     ber_analyzer._atomic_json_write(
         os.path.join(result_dir, "summary", "ber-summary.json"),

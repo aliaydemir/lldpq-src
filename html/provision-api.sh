@@ -2728,7 +2728,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
                             devices_roles[hostname] = role.lower()
                     elif isinstance(info, str):
                         raw = info.strip()
-                        m = re.match(r'^(.+?)\s+@(\w+)$', raw)
+                        # Role characters as in parse_devices.py ('-', '.' valid)
+                        m = re.match(r'^(.+?)\s+@([A-Za-z0-9_.-]+)$', raw)
                         if m:
                             hostname = m.group(1).strip()
                             devices_roles[hostname] = m.group(2).lower()
@@ -5315,7 +5316,8 @@ def action_list_devices():
             if '@' in raw:
                 parts = raw.split('@')
                 hostname = parts[0].strip()
-                role = parts[1].strip()
+                # Roles are case-insensitive: parse_devices.py lower-cases them.
+                role = parts[1].strip().lower()
             else:
                 hostname = raw
             username = default_username
@@ -6077,7 +6079,8 @@ def action_upgrade_candidates():
             elif isinstance(info, str):
                 parts = info.strip().split('@')
                 hostname = parts[0].strip()
-                role = parts[1].strip() if len(parts) > 1 else 'ungrouped'
+                # Roles are case-insensitive: parse_devices.py lower-cases them.
+                role = parts[1].strip().lower() if len(parts) > 1 else 'ungrouped'
                 username = default_username
             else:
                 hostname = str(info) if info else str(ip)
@@ -9484,7 +9487,8 @@ def action_list_roles():
                     if ip in ('defaults', 'endpoint_hosts'):
                         continue
                     if isinstance(info, str):
-                        m = re.match(r'^.+?\s+@(\w+)$', info.strip())
+                        # Role characters as in parse_devices.py ('-', '.' valid)
+                        m = re.match(r'^.+?\s+@([A-Za-z0-9_.-]+)$', info.strip())
                         if m:
                             roles.add(m.group(1).lower())
                     elif isinstance(info, dict):

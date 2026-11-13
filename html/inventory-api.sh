@@ -866,7 +866,10 @@ def action_validate():
                        for c in preview['conflicts']],
             'counts': preview['counts'], 'warnings': preview['warnings']})
     if kind == 'p2p':
-        report = ai_generate.validate_p2p(data)
+        # Judge the sub-port names generate-topology will write.
+        report = ai_generate.validate_p2p(
+            data, live_ports=_live_ports(),
+            device_aliases=_reverse_display_aliases()[0])
     else:
         report = validate_ipam(data)
     ok(kind=kind, version=version, report=report)
@@ -947,6 +950,15 @@ def _reverse_display_aliases():
     return reverse(data.get('devices')), reverse(data.get('interfaces'))
 
 
+def _live_ports():
+    """Interfaces the switches reported in the last LLDP run (the 'ports'
+    section of lldp-results/lldp_neighbors.json), so three-part design ports
+    take their breakout width from the switch. None when the file is missing,
+    unreadable or stale: the design alone then decides, as before."""
+    return ai_p2p.load_live_ports(
+        os.path.join(LLDPQ_DIR, 'lldp-results', 'lldp_neighbors.json'))
+
+
 def action_generate_topology():
     mode = QS_MODE or 'preview'
     # Default mirrors the UI default: the expected topology LLDPq validates is
@@ -975,7 +987,7 @@ def action_generate_topology():
     content = ai_generate.p2p_to_topology_dot(
         data, device_aliases=device_aliases, port_aliases=port_aliases,
         scope=scope, include_mgmt=include_mgmt,
-        switch_names=switch_names or None)
+        switch_names=switch_names or None, live_ports=_live_ports())
     token = content_token(content)
     stats = {'edges': content.count(' -- '), 'source_version': version,
              'scope': scope, 'include_mgmt': include_mgmt,

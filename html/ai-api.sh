@@ -1574,7 +1574,8 @@ def build_fabric_summary():
                     if ip in ('defaults', 'endpoint_hosts'):
                         continue
                     if isinstance(info, str):
-                        m = re.match(r'^(.+?)\s+@(\w+)$', info.strip())
+                        # Role characters as in parse_devices.py ('-', '.' valid)
+                        m = re.match(r'^(.+?)\s+@([A-Za-z0-9_.-]+)$', info.strip())
                         hostname = m.group(1).strip() if m else info.strip()
                         role = m.group(2).lower() if m else 'unknown'
                     elif isinstance(info, dict):
@@ -3666,8 +3667,36 @@ def build_transceiver_context(hosts=None, max_chars=9000):
                      f"[{m.get('fw_status','')}]")
     s = inv.get('summary') or {}
     if s:
-        lines.append(f"  SUMMARY: {s.get('total_modules')} modules, {s.get('unique_models')} models, "
-                     f"mixed-fw={s.get('mixed_fw_models')}, status={s.get('status_counts')}")
+        total_modules, total_ports = s.get('total_modules'), s.get('total_ports')
+        status_counts = s.get('status_counts')
+        if total_ports is None:
+            # An inventory written before modules were counted once per cage
+            # has per-port totals and no port count (it is rebuilt only by the
+            # on-demand transceiver scan). Total its rows by the rule of
+            # process_transceiver_data.py: a module is device + cage (swp<N>)
+            # + serial when one is printed, and of its rows the first one
+            # with a firmware version speaks for it.
+            physical = {}
+            rows = [m for m in inv['modules'] if isinstance(m, dict)]
+            for m in rows:
+                port = str(m.get('port') or '')
+                cage = re.match(r'swp\d+', port)
+                key = m.get('module') or '/'.join(
+                    str(part) for part in (m.get('device'), cage.group(0) if cage else port,
+                                           m.get('serial')) if part)
+                seen = physical.get(key)
+                if seen is None or (m.get('fw_version') and not seen.get('fw_version')):
+                    physical[key] = m
+            status_counts = {}
+            for m in physical.values():
+                status = m.get('fw_status', 'ok')
+                status_counts[status] = status_counts.get(status, 0) + 1
+            total_modules, total_ports = len(physical), len(rows)
+        # The lines above are one per port; a module in a breakout cage is
+        # listed once per sub-port.
+        lines.append(f"  SUMMARY: {total_modules} modules on {total_ports} ports, "
+                     f"{s.get('unique_models')} models, "
+                     f"mixed-fw={s.get('mixed_fw_models')}, status={status_counts}")
     return '\n'.join(lines)[:max_chars]
 
 
@@ -6257,6 +6286,29 @@ def _display_alias_variants(device, port):
     return variants[:6]
 
 
+def _p2p_live_ports():
+    """Interfaces the switches reported in the last LLDP run, for the breakout
+    fit of three-part design ports (also reachable under the design label
+    display-aliases.json gives a switch). None when lldp_neighbors.json is
+    missing, unreadable or stale: the design alone then decides, as before."""
+    load = getattr(_p2p_module, 'load_live_ports', None)
+    if not callable(load):
+        return None
+    try:
+        aliases = {}
+        try:
+            with open(os.path.join(WEB_ROOT, 'display-aliases.json'), 'r') as fh:
+                devices = (json.load(fh) or {}).get('devices') or {}
+            aliases = {str(label).strip().lower(): str(real).strip()
+                       for real, label in devices.items() if real and label}
+        except Exception:
+            aliases = {}
+        return load(os.path.join(LLDPQ_DIR, 'lldp-results', 'lldp_neighbors.json'),
+                    aliases)
+    except Exception:
+        return None
+
+
 # Precise-first port resolution: ai_p2p.lookup expands ambiguous three-part
 # 'X/Y/Z' design ports to every candidate lane (swp1s0 matches both 1/1/1 and
 # 1/2/1), so the group-fitted index must answer first. Single-slot memo keyed
@@ -6276,7 +6328,13 @@ def _p2p_precise_entry(conns, device, port):
         return None
     try:
         if _P2P_INDEX_MEMO['conns'] is not conns:
-            _P2P_INDEX_MEMO['index'] = build(conns)
+            try:
+                live_ports = _p2p_live_ports()
+            except Exception:
+                # Optional evidence: without it the design alone decides.
+                live_ports = None
+            _P2P_INDEX_MEMO['index'] = (build(conns, live_ports) if live_ports
+                                        else build(conns))
             _P2P_INDEX_MEMO['conns'] = conns
         return find(_P2P_INDEX_MEMO['index'], device, port)
     except Exception:
@@ -8357,7 +8415,13 @@ def _build_analysis_v2(mr_dir, devices, cookie, deadline):
             resolver = getattr(_p2p_module, 'resolve_port_map', None)
             resolved_port = getattr(_p2p_module, 'resolved_os_port', None)
             if callable(resolver) and callable(resolved_port):
-                resolved = resolver(p2p_conns)
+                try:
+                    live_ports = _p2p_live_ports()
+                except Exception:
+                    # Optional evidence: without it the design alone decides.
+                    live_ports = None
+                resolved = (resolver(p2p_conns, live_ports) if live_ports
+                            else resolver(p2p_conns))
                 for link in design_links:
                     for dev_key, port_key in (('a_dev', 'a_port'), ('b_dev', 'b_port')):
                         os_spelling = resolved_port(resolved, link.get(dev_key, ''),

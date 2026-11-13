@@ -102,6 +102,9 @@ class LinkFlapAnalyzer:
         # its earliest possible time across polls/restarts until its mate
         # arrives; otherwise +1, +1 (or an odd delta) silently loses a flap.
         self.pending_transition_start = {}
+        # port -> time of the first complete carrier listing that did not
+        # name it. The port keeps its state until a second one confirms.
+        self.absent_since = {}
         self.flapping_counters = {}  # port -> {period: count}
         self.cycle_events = []  # flaps detected THIS run (Timeline sidecar)
         self._port_cache = {}  # Cache for calculated port status/counters
@@ -184,6 +187,7 @@ class LinkFlapAnalyzer:
                 self.prev_cumulative = dict(data.get("prev_cumulative", {}))
                 self.prev_sample_time = dict(data.get("prev_sample_time", {}))
                 self.pending_transition_start = dict(data.get("pending_transition_start", {}))
+                self.absent_since = dict(data.get("absent_since", {}))
                 # Restore the per-port cumulative counter. Every report surface
                 # (total_ports, table, summary, anomalies) is keyed off it, so a
                 # port that fails collection this cycle -- exactly what a hard
@@ -215,6 +219,7 @@ class LinkFlapAnalyzer:
                 "prev_cumulative": self.prev_cumulative,
                 "prev_sample_time": self.prev_sample_time,
                 "pending_transition_start": self.pending_transition_start,
+                "absent_since": self.absent_since,
                 "carrier_transitions_stats": self.carrier_transitions_stats,
                 "collection_coverage": self.collection_coverage,
                 "last_update": time.time()

@@ -1308,6 +1308,16 @@ def _health_severity(value: Any) -> str:
     return "info"
 
 
+def _lane_id_set(value: Any) -> frozenset:
+    """Lane identities of one optical sample; empty when it lists none."""
+    if not isinstance(value, (list, tuple)):
+        return frozenset()
+    # A module has at most a few lanes; the bound keeps a damaged file cheap.
+    return frozenset(
+        text for text in (_bounded_text(item, 40) for item in value[:64]) if text
+    )
+
+
 def _extract_optical(path: Path, start: float, now: float, max_age: int, deadline: Optional[float] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     events = _EventAccumulator()
     sample_count = 0
@@ -1339,14 +1349,40 @@ def _extract_optical(path: Path, start: float, now: float, max_age: int, deadlin
                 if old_health and new_health and old_health != new_health:
                     parts.append("health %s→%s" % (old_health, new_health))
                     severity = _health_severity(new_health)
+                # rx_power_dbm is the reading of the row's worst lane
+                # (rx_power_lane), not of a fixed lane, and link_margin_db is
+                # taken over the same set of lanes.  A drop is therefore only
+                # meaningful between two samples that describe the same lane:
+                # when the lane changed (breakout plan flip, another lane
+                # turning worst) the comparison restarts at this sample and
+                # the change is not an event by itself.  Samples that carry no
+                # lane are compared as before.
+                old_lane = _bounded_text(previous.get("rx_power_lane"), 40)
+                new_lane = _bounded_text(current.get("rx_power_lane"), 40)
+                same_lane = not old_lane or not new_lane or old_lane == new_lane
+                # What invalidates a comparison is a change of the graded
+                # lanes, not of the lane that happens to be worst: on a
+                # healthy module the brightest lane is "worst", so almost any
+                # real drop names another lane.  When both samples list the
+                # lanes they grade (rx_power_lane_ids), the margin (always the
+                # dimmest of them) is compared whenever that set is the same,
+                # and the Rx value when the named lane is the same as well.
+                # A sample without the list keeps the lane rule above.
+                old_set = _lane_id_set(previous.get("rx_power_lane_ids"))
+                new_set = _lane_id_set(current.get("rx_power_lane_ids"))
+                if old_set and new_set:
+                    same_set = old_set == new_set
+                    same_lane = same_lane and same_set
+                else:
+                    same_set = same_lane
                 old_rx = _number(previous.get("rx_power_dbm"))
                 new_rx = _number(current.get("rx_power_dbm"))
-                if old_rx is not None and new_rx is not None and old_rx - new_rx >= 3.0:
+                if same_lane and old_rx is not None and new_rx is not None and old_rx - new_rx >= 3.0:
                     parts.append("Rx power %.1f→%.1f dBm" % (old_rx, new_rx))
                     severity = "warning" if severity == "info" else severity
                 old_margin = _number(previous.get("link_margin_db"))
                 new_margin = _number(current.get("link_margin_db"))
-                if old_margin is not None and new_margin is not None and old_margin - new_margin >= 3.0:
+                if same_set and old_margin is not None and new_margin is not None and old_margin - new_margin >= 3.0:
                     parts.append("link margin %.1f→%.1f dB" % (old_margin, new_margin))
                     severity = "warning" if severity == "info" else severity
                 if parts:

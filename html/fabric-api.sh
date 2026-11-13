@@ -443,8 +443,9 @@ if not devices and devices_yaml and os.path.isfile(devices_yaml):
                 hostname = None
                 role = None
                 if isinstance(device_config, str):
-                    # Parse "Hostname @role" format
-                    match = re.match(r'^(.+?)\s+@(\w+)$', device_config.strip())
+                    # Parse "Hostname @role" format; the role characters are
+                    # those of parse_devices.py ('-' and '.' are valid)
+                    match = re.match(r'^(.+?)\s+@([A-Za-z0-9_.-]+)$', device_config.strip())
                     if match:
                         hostname = match.group(1).strip()
                         role = match.group(2).lower()
@@ -4034,7 +4035,16 @@ for record in ai_p2p._records_of(conns):
         for k in ai_p2p._device_keys(name):
             index.setdefault(k, []).append((side, peer, record))
 
-resolved = ai_p2p.resolve_port_map(conns)
+# Three-part design ports take their breakout width from the interfaces the
+# switches reported in the last LLDP run, looked up under the design label
+# too. A missing, unreadable or stale neighbour file gives None: the design
+# alone then decides, as before.
+try:
+    live_ports = ai_p2p.load_live_ports(
+        os.path.join(lldpq_dir, 'lldp-results', 'lldp_neighbors.json'), alias_rev)
+except Exception:
+    live_ports = None
+resolved = ai_p2p.resolve_port_map(conns, live_ports)
 SU_RE = re.compile(r'\bSU\s*[-_]?(\d+)', re.IGNORECASE)
 
 out = {}

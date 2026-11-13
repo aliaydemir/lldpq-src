@@ -749,52 +749,304 @@ def _port_key(port):
     return p
 
 
-def resolve_port_map(conns):
-    """Group-fitted OS spelling for three-part 'X/Y/Z' design ports.
+# Sub-port counts a breakout can give (per group or per port): a cage is
+# split 2x, 4x or 8x, never wider.
+_BREAKOUT_STEPS = (1, 2, 4, 8)
 
-    'X/Y/Z' = port X, group Y, sub Z (all 1-based). The OS lane is
-    s = (Y-1)*maxZ + (Z-1), where maxZ (subs per group) is inferred from every
-    design row sharing the same device+port — e.g. rows 1/1/1..1/2/4 mean an
-    8x split, so 1/2/1 -> swp1s4. This is p2p-parser's breakout formula family
-    (2x_group/2x_sub/4x/8x) collapsed to the one consistent general form.
 
-    Returns {(device_key, port_text): 'swpXsN'} with device_key =
-    min(_device_keys(name)) and port_text the cleaned lowercase design port.
+def _breakout_step(count):
+    """Smallest breakout size holding `count` sub-ports; 0 when none does."""
+    for step in _BREAKOUT_STEPS:
+        if step >= count:
+            return step
+    return 0
+
+
+# The LLDP stage rewrites its neighbour sidecar on every run. Past this age
+# the stage has stopped publishing and the port list no longer describes the
+# switches; a stamp further ahead than the second value is a clock fault and
+# the file time dates the file instead (the rule lldpq/duplicate_analyzer.py
+# applies to the same file).
+LIVE_PORTS_MAX_AGE_SEC = 24 * 3600
+LIVE_PORTS_MAX_AHEAD_SEC = 2 * 3600
+
+
+def design_live_ports(live_ports, device_aliases=None):
+    """Live interface inventory that design labels can look up.
+
+    live_ports is {live device name: interface names} (the 'ports' section of
+    lldp_neighbors.json works as is). P2P workbooks often label a switch
+    differently from its hostname, so every {lower(designLabel): liveName}
+    display alias also gets the inventory of the switch it names.
+    """
+    if not isinstance(live_ports, dict) or not live_ports:
+        return None
+    by_key = {}
+    for name, ports in live_ports.items():
+        for key in _device_keys(name):
+            by_key.setdefault(key, ports)
+    merged = dict(live_ports)
+    for label, real in (device_aliases or {}).items():
+        for key in _ordered_device_keys(real):
+            if key in by_key:
+                merged.setdefault(label, by_key[key])
+                break
+    return merged
+
+
+def load_live_ports(path, device_aliases=None, now=None):
+    """Live interface inventory for resolve_port_map() from the LLDP neighbour
+    sidecar (lldp-results/lldp_neighbors.json): its 'ports' section,
+    {device: {interface name: attributes}}, one entry per collected port,
+    re-keyed through design_live_ports() when display aliases are given.
+
+    None when the file is missing, unreadable, malformed, without ports or
+    stale, so a caller then gets exactly the inventory-free resolution.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+        written = Path(path).stat().st_mtime
+    except (OSError, ValueError, RecursionError):
+        return None
+    ports = sidecar.get("ports") if isinstance(sidecar, dict) else None
+    if not isinstance(ports, dict) or not ports:
+        return None
+    now = time.time() if now is None else now
+    try:
+        # 'created' is the local wall clock of the LLDP run.
+        created = time.mktime(time.strptime(
+            str(sidecar.get("created")), "%Y-%m-%d %H-%M-%S"))
+    except (ValueError, OverflowError):
+        created = written
+    if created - now > LIVE_PORTS_MAX_AHEAD_SEC:
+        created = written
+    if not -LIVE_PORTS_MAX_AHEAD_SEC <= now - created <= LIVE_PORTS_MAX_AGE_SEC:
+        return None
+    return design_live_ports(ports, device_aliases)
+
+
+def _breakout_device_key(names):
+    """key(name) for the breakout fit, built over the known device names.
+
+    A name is its lowercase spelling. A dotted name folds to its first label
+    when that bare label is itself a known device or when no other known
+    name shares the label, so 'leaf-01.example.com' and 'LEAF-01' are one
+    switch while 'leaf-01.site-a' and 'leaf-01.site-b' stay two (the
+    DeviceNameResolver rule of lldpq/topology_edges.py). '' = unusable name.
+    """
+    bare, claims = set(), {}
+    for name in names:
+        low = str(name or "").strip().lower()
+        if "." in low:
+            claims.setdefault(low.split(".", 1)[0], set()).add(low)
+        elif low:
+            bare.add(low)
+
+    def key(name):
+        low = str(name or "").strip().lower()
+        if "." not in low:
+            return low
+        short = low.split(".", 1)[0]
+        if not short or short in bare or len(claims.get(short, ())) <= 1:
+            return short
+        return low
+    return key
+
+
+def design_device_key(conns, live_ports=None):
+    """key(name) telling the devices of a design apart: _breakout_device_key
+    over every endpoint name of the design and every device of the live
+    inventory. The keys of resolve_port_map() are made with it."""
+    return _breakout_device_key(
+        [record.get(side + "_name", "") for record in _records_of(conns)
+         if isinstance(record, dict) for side in ("source", "dest")]
+        + (list(live_ports) if isinstance(live_ports, dict) else []))
+
+
+def _live_port_index(live_ports, device_key=None):
+    """{device_key: {port number: highest live sub-port index}} from a live
+    interface inventory {device: interface names}; -1 = swpX itself is live
+    (unsplit). Names other than swpX / swpXsN are ignored. device_key is the
+    _breakout_device_key() function of the fit."""
+    index = {}
+    if not isinstance(live_ports, dict):
+        return index
+    if device_key is None:
+        device_key = _breakout_device_key(live_ports)
+    for name, ports in live_ports.items():
+        dev = device_key(name)
+        if not dev or not isinstance(ports, (dict, list, tuple, set, frozenset)):
+            continue
+        per_port = index.setdefault(dev, {})
+        for port in ports:
+            m = re.match(r"^swp(\d+)(?:s(\d+))?$", str(port).strip().lower())
+            if not m:
+                continue
+            sub = -1 if m.group(2) is None else int(m.group(2))
+            base = int(m.group(1))
+            per_port[base] = max(per_port.get(base, -1), sub)
+    return index
+
+
+def _subs_per_group(own_y, own_z, live_top, device_z):
+    """(sub-ports per group, evidence, other widths) for one three-part port.
+
+    own_y / own_z are the highest group and sub the port's own rows use,
+    live_top the highest live sub-port index of swpX (None = no inventory,
+    -1 = unsplit) and device_z the widest sub of any three-part port on the
+    device. Evidence is 'rows', 'live' or 'device'. Other widths are the
+    sub-ports per group the same live port gives when the design counts more
+    groups than its rows show (see below); empty when the evidence is firm.
+    """
+    if own_y == 1:
+        return own_z, "rows", ()  # every row sits in group 1: lane = Z-1 for any width
+    groups = _breakout_step(own_y)
+    fitting = [w for w in _BREAKOUT_STEPS
+               if groups and w >= own_z and groups * w <= _BREAKOUT_STEPS[-1]]
+    if len(fitting) == 1:
+        return fitting[0], "rows", ()
+    # A live sub-port swpXsN proves at least N+1 sub-ports; the inventory may
+    # be partial (LLDP report rows), so the count is the highest index seen
+    # rounded up to a breakout size, never the number of names.
+    total = _breakout_step(live_top + 1) if live_top is not None and live_top >= 0 else 0
+    if total and groups and total % groups == 0 and total // groups >= own_z:
+        # The live count settles the width only for the groups the rows
+        # show. Rows reaching group 2 of a port with 4 or 8 sub-ports are two
+        # groups of two/four (the documented notation, used here) or the
+        # first legs of a design written with one group per leg.
+        others = tuple(total // more for more in _BREAKOUT_STEPS
+                       if more > groups and total % more == 0
+                       and total // more >= own_z)
+        return total // groups, "live", others
+    return device_z, "device", ()
+
+
+def _fit_breakout_ports(conns, live_ports=None):
+    """Resolve every named three-part port -> (resolved map, per-port fits).
+
+    One fit per device+port: device (label), device_key, port (number), rows
+    [(group, sub, design text)], groups / subs (highest the port's own rows
+    use), width (subs per group used), source ('rows' | 'live' | 'device'),
+    device_width, other_widths (see _subs_per_group) and guessed: True when
+    the names of the rows beyond group 1 rest on a width nothing proves (it
+    was borrowed from another port, or the live sub-ports fit another group
+    count as well). ai_generate.validate_p2p reports on them.
     """
     groups = {}
     device_max_z = {}
-    for record in _records_of(conns):
+    labels = {}
+    records = [record for record in _records_of(conns) if isinstance(record, dict)]
+    device_key = design_device_key(conns, live_ports)
+    for record in records:
         for side in ("source", "dest"):
             name = record.get(side + "_name", "")
             port = _clean_value(record.get(side + "_port", "")).lower().replace(" ", "")
             m = re.match(r"^(\d+)/(\d+)/(\d+)$", port)
             if not name or not m:
                 continue
-            keys = _device_keys(name)
-            if not keys:
+            dev = device_key(name)
+            if not dev:
                 continue
-            dev = min(keys)
+            labels.setdefault(dev, str(name).strip())
             group = groups.setdefault((dev, int(m.group(1))), set())
             group.add((int(m.group(2)), int(m.group(3)), port))
             device_max_z[dev] = max(device_max_z.get(dev, 1), int(m.group(3)))
+    live = _live_port_index(live_ports, device_key)
     resolved = {}
+    fits = []
     for (dev, x), entries in groups.items():
-        # Subs-per-group comes from the device, not the single port: a port may
-        # leave trailing lanes uncabled (3/2/1..3/2/3 on a 4x-split switch still
-        # means lanes s4..s6), while the breakout type is uniform per switch.
-        max_z = device_max_z.get(dev, 1)
+        own_y = max(entry[0] for entry in entries)
+        own_z = max(entry[1] for entry in entries)
+        live_top = live.get(dev, {}).get(x)
+        # Sub-ports per group are decided per port: by the port's own rows
+        # when only one breakout fits them, else by the live sub-ports of
+        # swpX, and only then by the widest three-part port of the device (a
+        # port may leave trailing lanes uncabled: 3/1/1 + 3/2/1 next to a port
+        # reaching sub 4 still means lanes s0 and s4).
+        width, source, others = _subs_per_group(
+            own_y, own_z, live_top, device_max_z[dev])
+        # An unsplit port written X/1/1: the switch has swpX, not swpXs0.
+        whole = live_top == -1 and own_y == 1 and own_z == 1
         for y, z, port in entries:
-            resolved[(dev, port)] = "swp%ds%d" % (x, (y - 1) * max_z + (z - 1))
-    return resolved
+            resolved[(dev, port)] = (
+                "swp%d" % x if whole
+                else "swp%ds%d" % (x, (y - 1) * width + (z - 1)))
+        fits.append({
+            "device": labels[dev], "device_key": dev, "port": x,
+            "rows": sorted(entries), "groups": own_y, "subs": own_z,
+            "width": width, "source": source,
+            "device_width": device_max_z[dev],
+            "other_widths": list(others),
+            "guessed": bool(others) or (source == "device" and width != own_z),
+        })
+    return resolved, fits
+
+
+def _guessed_ports(fits):
+    """{(device_key, design text)} of the resolved ports whose sub-port name
+    is a guess: the rows beyond group 1 of a fit marked guessed."""
+    return {(fit["device_key"], port)
+            for fit in fits if fit["guessed"]
+            for y, _z, port in fit["rows"] if y > 1}
+
+
+def resolve_port_map(conns, live_ports=None):
+    """Group-fitted OS spelling for three-part 'X/Y/Z' design ports.
+
+    'X/Y/Z' = port X, group Y, sub Z (all 1-based). The OS lane is
+    s = (Y-1)*W + (Z-1), where W (subs per group) is decided per port, so a
+    switch may mix breakout widths:
+
+      1. the port's own rows, when only one breakout fits them (rows
+         1/1/1..1/2/4 can only be an 8x split, so 1/2/1 -> swp1s4);
+      2. the live interface inventory, when the caller has one: the sub-ports
+         of swpX that exist on the switch divided by the groups in use;
+      3. the widest sub of any three-part port on the device, as before.
+
+    Rows alone cannot tell a narrow split from a sparsely cabled wide one
+    (1/1/1 + 1/2/1 is a 2x port or two legs of a 4x/8x port), which is why
+    the inventory outranks the device-wide value. This is p2p-parser's
+    breakout formula family (2x_group/2x_sub/4x/8x) in one general form.
+    Even the inventory leaves one case open: rows that stop at group 2 of a
+    port with 4 or 8 live sub-ports are read as two groups (the family
+    above), and the fit is marked guessed because a design written with one
+    group per leg would give other names (see _fit_breakout_ports).
+
+    live_ports is {device: interface names} (any iterable of names, or a
+    mapping keyed by them such as the 'ports' section of lldp_neighbors.json).
+    With it, a port whose only row is X/1/1 and whose swpX is live without
+    sub-ports resolves to 'swpX' instead of 'swpXs0'.
+
+    html/lldp.html resolvePortMapJs is the browser mirror: keep both in step.
+
+    Returns {(device_key, port_text): 'swpXsN' | 'swpX'} with device_key
+    from _breakout_device_key() (the lowercase short name, or the full name
+    of an FQDN that shares its first label with another device) and
+    port_text the cleaned lowercase design port. Use resolved_os_port() to
+    look an entry up by device name.
+    """
+    return _fit_breakout_ports(conns, live_ports)[0]
+
+
+def _resolved_key(resolved, name, port):
+    """The resolve_port_map() key of a device name + design port, or None."""
+    p = _clean_value(port).lower().replace(" ", "")
+    if not p:
+        return None
+    # The map is keyed by the full name only for FQDNs that share their first
+    # label with another device (see _breakout_device_key), else by the short
+    # name: the exact spelling answers first, then the first label.
+    for key in _ordered_device_keys(name):
+        if (key, p) in resolved:
+            return (key, p)
+    return None
 
 
 def resolved_os_port(resolved, name, port):
     """Look up a resolve_port_map() entry by any device spelling; '' if absent."""
-    p = _clean_value(port).lower().replace(" ", "")
-    keys = _device_keys(name)
-    if not p or not keys:
-        return ""
-    return resolved.get((min(keys), p), "")
+    key = _resolved_key(resolved, name, port)
+    return resolved[key] if key else ""
 
 
 def _meta_of(record):
@@ -850,14 +1102,25 @@ def _ordered_port_aliases(port):
     return [exact, *sorted(_port_aliases(port) - {exact})]
 
 
-def build_port_index(conns):
+def build_port_index(conns, live_ports=None):
     """Build the browser-equivalent precise-first device/port design index.
 
-    Group-fitted OS spellings from resolve_port_map() are indexed before raw
-    design-port aliases.  setdefault preserves that precise winner when an
-    ambiguous three-part alias from another row maps to the same live port.
+    The first writer of a (device, port) key wins, in this order:
+
+      1. group-fitted OS spellings of three-part ports that rest on evidence;
+      2. design ports that need no fitting (OS names, two-part, plain numbers)
+         under their tolerant aliases;
+      3. group-fitted spellings that are a guess (_guessed_ports): they must
+         not take a port from a row that names it outright;
+      4. the design text of three-part ports: only the exact text when the
+         spelling is firm (its other candidate lanes are other legs of the
+         port), every tolerant alias when it is a guess.
+
+    live_ports is the optional live interface inventory of resolve_port_map().
+    html/lldp.html buildP2pIndex is the browser mirror: keep both in step.
     """
-    resolved = resolve_port_map(conns)
+    resolved, fits = _fit_breakout_ports(conns, live_ports)
+    guessed = _guessed_ports(fits)
     entries = []
     for record in _records_of(conns):
         if not isinstance(record, dict):
@@ -867,10 +1130,12 @@ def build_port_index(conns):
             port = record.get(side + "_port", "")
             if not _ordered_device_keys(name) or not _port_aliases(port):
                 continue
+            key = _resolved_key(resolved, name, port)
             entries.append((
                 name,
                 port,
-                resolved_os_port(resolved, name, port),
+                resolved[key] if key else "",
+                key in guessed,
                 _entry_of(record, side, peer),
             ))
 
@@ -881,11 +1146,22 @@ def build_port_index(conns):
             for port_key in _port_aliases(port):
                 index.setdefault((device_key, port_key), entry)
 
-    for name, _port, resolved_port, entry in entries:
-        if resolved_port:
+    for name, _port, resolved_port, guess, entry in entries:
+        if resolved_port and not guess:
             add(name, resolved_port, entry)
-    for name, port, _resolved_port, entry in entries:
-        add(name, port, entry)
+    for name, port, resolved_port, _guess, entry in entries:
+        if not resolved_port:
+            add(name, port, entry)
+    for name, _port, resolved_port, guess, entry in entries:
+        if resolved_port and guess:
+            add(name, resolved_port, entry)
+    for name, port, resolved_port, guess, entry in entries:
+        if resolved_port and guess:
+            add(name, port, entry)
+        elif resolved_port:
+            exact = _clean_value(port).lower().replace(" ", "")
+            for device_key in _ordered_device_keys(name):
+                index.setdefault((device_key, exact), entry)
     return index
 
 

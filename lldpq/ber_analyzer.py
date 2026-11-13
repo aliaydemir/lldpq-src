@@ -134,6 +134,7 @@ class BERAnalyzer:
         self._l1_extras_cache = {}  # hostname -> { interface: {effective_ber, symbol_errors} }
         self._last_delta_details = {}  # port -> directional deltas/sample window
         self.baseline_data = {}  # hostname -> { interface: {counters, timestamp} }
+        self._pruned_history_hosts = set()  # hosts whose departed ports left the history
         self._load_network_thresholds()
         
         # Ensure ber-data directory exists
@@ -617,6 +618,10 @@ class BERAnalyzer:
                     port_name.split(":", 1)[0]
                     for port_name in self.current_ber_stats
                 }
+            # A host that lost history to prune_absent_interfaces() must be
+            # rewritten even without current-run evidence, or its shard
+            # would keep the departed ports.
+            dirty_hosts |= getattr(self, '_pruned_history_hosts', set())
             unsafe_hosts = sorted(
                 host for host in dirty_hosts
                 if not SHARD_HOST_RE.fullmatch(host)
@@ -662,6 +667,7 @@ class BERAnalyzer:
                 except OSError:
                     pass
                 self._legacy_history_loaded = False
+            self._pruned_history_hosts = set()
             return True
         except Exception as e:
             print(f"Error saving BER history: {e}")
@@ -802,9 +808,15 @@ class BERAnalyzer:
         # Exclude management interfaces
         if interface_name in ['eth0', 'mgmt', 'lo']:
             return False
+        # A VLAN sub-interface (swp6.100, swp1s0.300) rides on its parent
+        # port and is never a port of its own.
+        if '.' in interface_name:
+            return False
+        # Cumulus front-panel ports are exactly swp<N> or breakout swp<N>s<M>.
+        if interface_name.startswith('swp'):
+            return re.fullmatch(r'swp\d+(?:s\d+)?', interface_name) is not None
         
         physical_patterns = [
-            r'^swp\d+',      # Cumulus swp interfaces
             r'^eth\d+',      # Ethernet interfaces (eth1, eth2, etc. but not eth0)
             r'^eno\d+',      # Predictable network interface names
             r'^ens\d+',      # Systemd predictable names
@@ -815,6 +827,32 @@ class BERAnalyzer:
             if re.match(pattern, interface_name):
                 return True
         return False
+    
+    def prune_absent_interfaces(self, present_by_host: Dict[str, Any]) -> None:
+        """Forget baselines and history of ports a host no longer has.
+
+        ``present_by_host`` maps each host whose interface counters were
+        collected completely to its current port names; other hosts are left
+        untouched.  A port that is split, merged back or renamed returns as
+        a new interface instance with restarted counters, so a re-created
+        name must start from a fresh baseline instead of being compared with
+        its predecessor.
+        """
+        for hostname, present in present_by_host.items():
+            baseline = self.baseline_data.get(hostname)
+            if not isinstance(baseline, dict):
+                continue
+            for interface in list(baseline):
+                if interface not in present:
+                    del baseline[interface]
+        if not hasattr(self, '_pruned_history_hosts'):
+            self._pruned_history_hosts = set()
+        for port_name in list(self.ber_history):
+            hostname, _, interface = port_name.partition(':')
+            present = present_by_host.get(hostname)
+            if present is not None and interface not in present:
+                del self.ber_history[port_name]
+                self._pruned_history_hosts.add(hostname)
     
     def calculate_delta_ber(self, hostname: str, interface: str, current_stats: Dict[str, int]) -> tuple:
         """Calculate delta-based interface error-event density.
@@ -838,8 +876,10 @@ class BERAnalyzer:
                      delta_rx_bytes=0, delta_tx_bytes=0,
                      delta_rx_packets=0, delta_tx_packets=0,
                      sample_seconds=0.0, reset=False,
-                     delta_rx_dropped=0, delta_tx_dropped=0):
+                     delta_rx_dropped=0, delta_tx_dropped=0,
+                     counters_static=False):
             self._last_delta_details[port_key] = {
+                'counters_static': counters_static,
                 'delta_rx_errors': delta_rx_errors,
                 'delta_tx_errors': delta_tx_errors,
                 'delta_rx_dropped': delta_rx_dropped,
@@ -934,6 +974,22 @@ class BERAnalyzer:
         total_delta_bytes = delta_rx_bytes + delta_tx_bytes
         total_delta_packets = delta_rx_packets + delta_tx_packets
 
+        # A partial sample keeps its baseline, so its deltas never return to
+        # zero once the port stops (link down after a few packets). Whether
+        # the port is idle is therefore decided against the totals of the
+        # previous collection, kept beside the baseline; right after a
+        # baseline that previous collection is the baseline itself.
+        seen_totals = [
+            current_rx_packets, current_tx_packets, current_rx_errors,
+            current_tx_errors, current_rx_dropped, current_tx_dropped,
+        ]
+        counters_static = seen_totals == baseline.get('last_seen', [
+            baseline['rx_packets'], baseline['tx_packets'],
+            baseline['rx_errors'], baseline['tx_errors'],
+            baseline_rx_dropped, baseline_tx_dropped,
+        ])
+        baseline['last_seen'] = seen_totals
+
         remember(
             delta_rx_errors, delta_tx_errors,
             delta_rx_bytes, delta_tx_bytes,
@@ -941,6 +997,7 @@ class BERAnalyzer:
             sample_seconds,
             delta_rx_dropped=delta_rx_dropped,
             delta_tx_dropped=delta_tx_dropped,
+            counters_static=counters_static,
         )
         
         # Calculate the observed directional event density before applying the
@@ -1261,7 +1318,12 @@ class BERAnalyzer:
 
         previous_symbols = self._previous_symbol_errors(port_name, stats)
         symbol_delta = None
-        if isinstance(symbol_errors, int) and isinstance(previous_symbols, int):
+        # A frame-counter reset means the interface (or its counters) was
+        # re-created, so the earlier symbol count belongs to the previous
+        # instance: this sample only re-establishes the symbol baseline.
+        if (sample_status != 'counter_reset'
+                and isinstance(symbol_errors, int)
+                and isinstance(previous_symbols, int)):
             # A reset/wrap establishes a new baseline instead of inventing a
             # negative or enormous delta.
             if symbol_errors >= previous_symbols:
@@ -1272,12 +1334,19 @@ class BERAnalyzer:
         # errors appeared, or the FEC symbol counter advanced. An idle/down port
         # (no traffic, no errors, no symbol advance) keeps its stale snapshot
         # for display but stays ungraded.
+        # The deltas of a partial sample are measured against its retained
+        # baseline and stay above zero once the port stops (link down after
+        # a few packets), so they prove traffic only while the counters
+        # still moved since the previous collection.
         error_delta = (stats.get('delta_rx_errors', 0)
                        + stats.get('delta_tx_errors', 0))
+        counters_static = getattr(self, '_last_delta_details', {}).get(
+            port_name, {}
+        ).get('counters_static', False)
         link_active = (
             sample_status == 'analyzed'
-            or stats.get('delta_packets', 0) > 0
-            or error_delta > 0
+            or (not counters_static
+                and (stats.get('delta_packets', 0) > 0 or error_delta > 0))
             or (isinstance(symbol_delta, int) and symbol_delta > 0)
         )
         # Guard 2 fallback: some platforms' l1-show reports no
@@ -1319,6 +1388,23 @@ class BERAnalyzer:
 
         status = (max(grades, key=self._grade_priority)
                   if grades else BERGrade.UNKNOWN.value)
+
+        # An ungraded sample without a single packet, error or drop belongs
+        # to an unused or down port.  It keeps its row under its own sample
+        # state, but it is not waiting for traffic to complete a sample.
+        # The same holds for a partial sample whose counters stopped moving
+        # (link down after a few packets): its deltas against the retained
+        # baseline stay above zero for good, so the comparison with the
+        # previous collection decides.
+        if (not grades
+                and sample_status in ('insufficient_traffic', 'idle')
+                and (counters_static or (
+                    stats.get('delta_packets', 0) <= 0
+                    and error_delta <= 0
+                    and (stats.get('delta_rx_dropped', 0)
+                         + stats.get('delta_tx_dropped', 0)) <= 0))):
+            sample_status = 'idle'
+            stats['sample_status'] = sample_status
 
         # Persist the L1 snapshot on the current history record so the next run
         # can calculate a real symbol counter delta.
@@ -1386,6 +1472,14 @@ class BERAnalyzer:
                 summary["unknown_ports"].append(port_info)
         
         return summary
+    
+    @staticmethod
+    def idle_port_count(summary: Dict[str, Any]) -> int:
+        """Ungraded ports that are unused or down, not awaiting a sample."""
+        return sum(
+            1 for port_info in summary.get("unknown_ports", [])
+            if port_info.get("sample_status") == "idle"
+        )
     
     def detect_ber_anomalies(
         self, summary: Optional[Dict[str, Any]] = None
@@ -1585,6 +1679,14 @@ class BERAnalyzer:
                     'status below may be incomplete.</div>'
                 )
 
+        # Ungraded ports are either still awaiting a complete traffic sample
+        # or idle (unused/down).  The idle count is also published as a
+        # machine-readable attribute so the summary alert does not have to
+        # parse table rows; it does not alter the report's layout.
+        idle_count = self.idle_port_count(summary)
+        awaiting_count = len(summary['unknown_ports']) - idle_count
+        coverage_attrs += f' data-ber-idle="{idle_count}"'
+
         # Determine overall health status
         total_problematic = len(summary['warning_ports']) + len(summary['critical_ports'])
         
@@ -1643,6 +1745,9 @@ class BERAnalyzer:
         .card-info {{ border-left-color: #4fc3f7; }}
         .metric {{ font-size: 22px; font-weight: bold; color: #d4d4d4; }}
         .metric-label {{ font-size: 12px; color: #888; margin-top: 4px; }}
+        .metric-note {{ font-size: 11px; color: #888; margin-top: 2px; }}
+        /* A lifecycle scope recounts #unknown-ports from the visible rows but not this breakdown. */
+        #unknown-ports[data-lifecycle-original] ~ .metric-note {{ display: none; }}
         .card-excellent .metric {{ color: #76b900; }}
         .card-good .metric {{ color: #8bc34a; }}
         .card-warning .metric {{ color: #ff9800; }}
@@ -1775,9 +1880,10 @@ class BERAnalyzer:
                     <div class="metric" id="critical-ports">{len(summary['critical_ports'])}</div>
                     <div class="metric-label">Critical</div>
                 </div>
-                <div class="summary-card card-info" id="unknown-card">
+                <div class="summary-card card-info" id="unknown-card" title="Ports without a graded sample: still awaiting a complete traffic sample, or idle (no traffic and no errors: unused or down)">
                     <div class="metric" id="unknown-ports">{len(summary['unknown_ports'])}</div>
-                    <div class="metric-label">Awaiting Sample</div>
+                    <div class="metric-label">Not Graded</div>
+                    <div class="metric-note"><span id="awaiting-ports">{awaiting_count}</span> awaiting sample &middot; <span id="idle-ports">{idle_count}</span> idle</div>
                 </div>
             </div>
         </div>
@@ -1973,6 +2079,11 @@ class BERAnalyzer:
             }.get(status, "badge badge-gray")
             
             sample_status = port_info.get('sample_status')
+            # An idle (unused/down) port keeps its ungraded row and filter
+            # bucket but is labelled as such instead of UNKNOWN.
+            is_idle = sample_status == 'idle'
+            badge_label = 'IDLE' if is_idle else status
+            idle_attr = ' data-idle="1"' if is_idle else ''
             delta_packets = port_info.get('delta_packets', 0)
             sample_target = self.config['min_packets_for_analysis']
             if (sample_status == 'insufficient_traffic'
@@ -1985,7 +2096,7 @@ class BERAnalyzer:
                     f'accumulating">{observed} '
                     f'({delta_packets:,}/{sample_target:,})</span>'
                 )
-            elif sample_status == 'insufficient_traffic':
+            elif sample_status in ('insufficient_traffic', 'idle'):
                 ber_display = "No traffic"
             elif sample_status == 'counter_reset':
                 ber_display = "Counter reset"
@@ -2084,12 +2195,12 @@ class BERAnalyzer:
             })
 
             row_html = f"""
-                <tr class="ber-row" data-device-key="{device_key}" data-status="{status.lower()}" data-port="{port_key}" onclick="toggleBerDetails(this)">
+                <tr class="ber-row" data-device-key="{device_key}" data-status="{status.lower()}"{idle_attr} data-port="{port_key}" onclick="toggleBerDetails(this)">
                     <td>{canonical(device)}</td>
                     <td>{interface}</td>
                     <td>{nbr_device_display}</td>
                     <td>{nbr_port_display}</td>
-                    <td><span class="{badge_class}">{status}</span></td>
+                    <td><span class="{badge_class}">{badge_label}</span></td>
                     <td>{ber_display}</td>
                     <td>{raw_phy_display}</td>
                     <td>{eff_display}</td>
@@ -2173,6 +2284,7 @@ class BERAnalyzer:
                 <li><strong style="color: #d4d4d4;">Effective BER</strong>: Post-FEC bit error rate from l1-show (<code>effective_ber_coef × 10^effective_ber_magnitude</code>). This is the error rate the traffic actually sees after FEC correction — the primary day-to-day health metric.</li>
                 <li><strong style="color: #d4d4d4;">PHY Symbol Errors</strong>: The table shows new symbol errors and the lifetime total from <code>l1-show</code>. Severity uses only the new delta; a reset establishes a fresh baseline.</li>
                 <li><strong style="color: #d4d4d4;">Sample window</strong>: The Δ packet/error columns and the window beside Updated describe the exact interval used for Frame Error Density. A value followed by progress such as <code>0 (509/1,000)</code> is the observed low-traffic value; the baseline keeps accumulating and a zero-error sample is not graded until the target is reached. Errors observed before the target are evaluated immediately. Raw and Effective BER are current L1 snapshots.</li>
+                <li><strong style="color: #d4d4d4;">Idle</strong>: A port without new packets, errors or drops since the previous collection, and whose L1 data shows no sign of a live link, is unused or down. It is listed as <code>IDLE</code> under Not Graded and is not waiting for a traffic sample.</li>
             </ul>
         </div>
     </div>
@@ -2410,7 +2522,8 @@ class BERAnalyzer:
                 document.getElementById('critical-card').classList.add('active');
             } else if (filterType === 'UNKNOWN') {
                 filteredRows = allRows.filter(row => row.dataset.status === 'unknown');
-                filterText = 'Showing ' + filteredRows.length + ' Ports Awaiting Sample';
+                const idleRows = filteredRows.filter(row => row.dataset.idle === '1').length;
+                filterText = 'Showing ' + filteredRows.length + ' Ports Not Graded (' + (filteredRows.length - idleRows) + ' awaiting sample, ' + idleRows + ' idle)';
                 document.getElementById('unknown-card').classList.add('active');
             } else if (filterType === 'TOTAL') {
                 filteredRows = allRows;
@@ -2925,7 +3038,7 @@ class BERAnalyzer:
                 csvContent += `# Good: ${document.getElementById('good-ports').textContent}\\n`;
                 csvContent += `# Warning: ${document.getElementById('warning-ports').textContent}\\n`;
                 csvContent += `# Critical: ${document.getElementById('critical-ports').textContent}\\n`;
-                csvContent += `# Awaiting Sample: ${document.getElementById('unknown-ports').textContent}\\n`;
+                csvContent += `# Not Graded (awaiting sample or idle): ${document.getElementById('unknown-ports').textContent}\\n`;
                 if (filterActive) {
                     csvContent += `# NOTE: a filter is active - only the currently visible rows are exported; the counts above reflect the full fabric.\\n`;
                 }

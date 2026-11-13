@@ -226,6 +226,9 @@ class DuplicateMacClassificationTests(unittest.TestCase):
             "tor-a": "swp31",
             "tor-b": "swp32",
         }
+        # Both ports are edge ports: LLDP covers the switches and neither
+        # port has a switch behind it.
+        self.analyzer.lldp_hosts = {"tor-a", "tor-b"}
 
     def mac_table_html(self):
         output = Path(self.tmp.name) / "duplicate-analysis.html"

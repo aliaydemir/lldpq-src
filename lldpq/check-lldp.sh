@@ -861,7 +861,11 @@ execute_commands_optimized() {
                 vxlan*|vni*|vrf*|dummy*|tun*|tap*) continue ;;
             esac
             if [ ! -e \"\$port/device\" ]; then
+                # A VLAN sub-interface (swp6.100) has no device link either,
+                # but it is not a port: it has no cable, speed or FEC of its
+                # own and cannot be a topology endpoint.
                 case \"\$port_name\" in
+                    *.*) continue ;;
                     swp*) ;;
                     *) continue ;;
                 esac
@@ -893,6 +897,7 @@ execute_commands_optimized() {
             esac
             if [ ! -e \"\$port/device\" ]; then
                 case \"\$port_name\" in
+                    *.*) continue ;;
                     swp*) ;;
                     *) continue ;;
                 esac
@@ -918,6 +923,7 @@ execute_commands_optimized() {
             esac
             if [ ! -e \"\$port/device\" ]; then
                 case \"\$port_name\" in
+                    *.*) continue ;;
                     swp*) ;;
                     *) continue ;;
                 esac
@@ -945,6 +951,7 @@ execute_commands_optimized() {
                 esac
                 if [ ! -e \"\$port/device\" ]; then
                     case \"\$port_name\" in
+                        *.*) continue ;;
                         swp*) ;;
                         *) continue ;;
                     esac
