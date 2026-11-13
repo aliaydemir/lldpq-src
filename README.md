@@ -34,6 +34,14 @@ recreation. An immediate restart loop with
 older image or an incompatible host bind mount; update the image and use the
 documented `lldpq-provision-state` volume.
 
+Published images from 2.2.3 (built on or after 2026-02-11) through 4.2.4 add
+a routing rule to a Cumulus switch that runs them with host networking, and
+the switch then stops answering on its in-band IPv4 addresses; 4.2.5 and
+later do not. The version is not the definitive check: run
+`ip -4 rule show | grep '^100:'` on the switch and look for
+`outbound via mgmt` in the container log, as described under
+[Management VRF](DOCKER.md#management-vrf).
+
 ## Requirements (non-Docker install)
 
 - **Ubuntu Server** 22.04+ (tested on 22.04, 24.04) — Python 3.9+ required
@@ -281,6 +289,17 @@ access via web UI: `http://<server>/device.html`
   capture/bundle cleanup, and interface up/down (port bounce) operations used
   by Fabric Migration
 - switch configuration commands are blocked
+- the read-only forms accepted here and by Ask-AI include
+  `ethtool --show-fec <port>`, `ip -d link|addr|route|neigh show ...`,
+  `cat /sys/class/net/<if>/mtu`, and a line-start anchor in an FRR filter,
+  as in `sudo vtysh -c 'show ip route | include ^B'`
+- a command is refused when `mlxlink`, `onie-install`, `reboot`, `shutdown`,
+  `ztp`, `nv set`, `nv unset` or
+  `nv config apply|replace|save|delete|patch|edit|detach|history` appears
+  anywhere in it, also as an argument or filter (whole words, any case):
+  `nv show system reboot reason` is refused, a filter for `rebooted` is not.
+  The Command Runner answers `Command is not allowed from Device Details`;
+  Ask-AI names the word and shows the command as blocked in a dry run
 
 > **Authorization:** Device Details—including NVT, Config, and Command
 > Runner—is admin-only. Operators can use the shared monitoring and analysis
@@ -396,6 +415,13 @@ correlations, and the checks performed by the agent.
 > endpoint. This can create privacy, data-egress, and usage-cost implications.
 > Optional web search is used only when a search model is configured and the
 > request calls for web research.
+>
+> Credential-like values in everything sent to such an endpoint are replaced
+> by `***REDACTED***`. With the local Ollama provider the chat context is not
+> masked, because it stays on the host. The input of the autonomous analysis
+> and of **Analyze**, and the report that is saved and returned, are masked
+> for every provider, Ollama included: that report is published without login
+> at `/ai/export_json`. Masking is pattern-based and not a guarantee.
 
 The autonomous analyzer is triggered after a successful full collection and
 throttled to at most once per hour; it runs only when an AI provider and model
@@ -425,7 +451,12 @@ not expose them):
 | `AI_SEARCH_URL` / `AI_SEARCH_KEY` | Separate endpoint and API key for the optional search model; they default to the main endpoint and its key when unset |
 
 `AI_SEARCH_MODEL` and `AI_PROXY_URL` are also stored in `/etc/lldpq.conf` and
-correspond to the search model and proxy fields in the settings UI.
+correspond to the search model and proxy fields in the settings UI. The Gemini
+provider sends its API key in the `x-goog-api-key` request header, not in the
+URL; a proxy that filters request headers has to let that header through.
+**Test Connection** rejects an API key that contains a line break or a
+character that cannot be sent in an HTTP header, before it contacts the
+provider: paste the key as a single line.
 `AI_ANALYSIS_MIN_INTERVAL_SECONDS=3600` is an environment-only override for
 the post-pipeline autonomous attempt throttle.
 
@@ -488,10 +519,11 @@ grouped by role and support search, per-group selection and select-all.
 Command presets mirror Device Details (system, interfaces, L2, routing,
 EVPN/VXLAN, EVPN-MH, config and logs); a custom command can also be entered.
 
-Runs use a bounded four-device client pool, per-device output cards, Stop, and
-short retries when another command owns a device lock. Ask-AI can prefill the
-targets and command through **Run in Commands**, but it never auto-executes:
-the administrator must review and click **Run**.
+Runs use a bounded three-device client pool, per-device output cards, Stop,
+and short retries when another command owns a device lock. Three at a time
+leaves one of the four default CGI workers to the rest of the UI. Ask-AI can
+prefill the targets and command through **Run in Commands**, but it never
+auto-executes: the administrator must review and click **Run**.
 
 ## [02j] machine-readable exports (public API)
 
@@ -506,6 +538,19 @@ systems; no browser session is required.
 > analysis. Restrict the LLDPq web service with network ACLs/TLS, or remove the
 > export nginx locations if this disclosure is not acceptable. No CORS headers
 > are added, so cross-origin browser JavaScript is not enabled by default.
+
+The exports of this section are public. Everything under `/configs/`,
+`/hstr/` and `/monitor-results/` needs a login (see
+[authentication](#10-authentication)); that includes the files behind these
+exports when they are requested by their directory path, such as
+`/monitor-results/export/<domain>.json`. Other content is served without a
+login too: the login page with the scripts, styles and images of the UI,
+`/lldp_results.ini` and `/problems-lldp_results.ini` (LLDP neighbor data),
+`/topology.dot`, `/topology_config.yaml`, `/display-aliases.json`, and what
+ONIE and ZTP fetch (`/cumulus-ztp.sh`, the OS images with their
+`onie-installer` aliases, `/serial-mapping.txt`, `/generated_config_folder/`
+with the complete NVUE start-up configuration of each device,
+`/provision-uploads/`).
 
 ### Discover available exports
 
@@ -741,6 +786,24 @@ reused, whether collection coverage was complete, and which design/audit
 enrichment was available. Consumers should tolerate absent additive fields.
 There is no AI CSV endpoint.
 
+`analysis.json` is written masked for every provider, the local Ollama
+provider included. The value that follows a keyword such as `password`,
+`secret`, `community` (also `readonly-community-v6` and the `snmpd.conf`
+`rocommunity`/`rwcommunity` forms), `key-string`, `psk`, `md5`,
+`auth-md5`/`auth-sha*`, `encrypt-aes*`/`encrypt-des`, `authentication-key`,
+`cak`, `token` or `api-key`, and the keys of an `snmpd.conf` `createUser`
+line, appear as `***REDACTED***`. Expect that marker inside `.analysis`, also
+after such a word in plain prose where no secret followed. Such a keyword
+also counts as the last part of a name joined with `_` (`ansible_password`,
+`tacacs_secret`, `snmp_community`), and so do `..._pass` and the NVUE
+`md5-key`. After `_`, `community` is masked only in SNMP names, so
+`bgp_community` keeps its value, and `..._md5` is taken for a checksum and
+left as it is. In JSON the string value of such a key is masked
+(`"password": "..."`); objects, lists and numbers are not, so SNMP community
+names and SNMPv3 keys that `nv ... -o json` prints as object keys stay
+readable. The masking is pattern-based and not a guarantee, so the
+public-data boundary above applies unchanged.
+
 ### Ordered row columns
 
 The complete version-1 registry is:
@@ -761,7 +824,9 @@ The complete version-1 registry is:
   `tx_power_dbm`, `temperature_c`, `link_margin_db`, `voltage_v`,
   `bias_current_ma`, `rx_lanes`, `tx_lanes`, `bias_lanes`, `anomalies`,
   `inactive_lanes` (channels the module exposes but does not light: no
-  optical power and no laser bias current, so they are not graded)
+  optical power and no laser bias current, so they are not graded). For a
+  breakout sub-port (`swpNsM`) the lane fields cover only the channels that
+  sub-port owns
 - **BER:** `device`, `interface`, `neighbor_device`, `neighbor_port`, `status`,
   `sample_status`, `raw_ber`, `effective_ber`, `frame_error_density`,
   `symbol_errors`, `symbol_error_delta`, `delta_packets`, `delta_rx_errors`,
@@ -1238,6 +1303,11 @@ an installed LLDPq host. This is a configuration-migration bundle, not a
 complete runtime or bare-metal backup.
 
 - **Included:** `devices.yaml`, `tracking.yaml`, `bmc.yaml`, `topology.dot`, `topology_config.yaml`, `notifications.yaml`, `display-aliases.json`, and a whitelist of **portable** `/etc/lldpq.conf` preferences (schedules, parallelism, feature toggles, AI settings)
+- **Empty inventory:** `devices.yaml` is left out of the bundle while its
+  `devices:` mapping is empty (a new Docker deployment). The reply of the
+  export lists `devices.yaml was left out of the bundle: it has no devices.`
+  under `warnings`, and restoring that bundle does not change the target's
+  inventory. The page shows that sentence after its download message.
 - **Excluded from portable prefs:** host-specific paths and secrets (e.g. the
   AI API key), plus host-bound telemetry collector IP/port/VRF settings
 - **SSH key** (optional checkbox, on by default): includes the collector key pair so the restored install can reach devices immediately. Bundles can already contain notification webhooks; always store them securely, especially when the private key is included.
@@ -1686,6 +1756,27 @@ without recursively deleting an unrecognized install directory. After
 verifying that guarded path manually, `./uninstall.sh --force-partial` also
 removes the remaining partial tree.
 
+### after updating from 4.2.x or earlier
+
+These apply to native and Docker installations alike:
+
+- **ZTP script**: a script saved by 4.2.x still carries the `cumulus` password
+  in clear text. Open **Provision → ZTP** and press **Save** once to store it
+  as a hash (see [ZTP Tab](#ztp-tab)).
+- **Ask-AI with Ollama**: the report published at `/ai/export_json` stays as
+  the earlier version wrote it, unmasked, until the next saved analysis. Run
+  **Analyze** once.
+- **Ask-AI job files**: job files written by the earlier version under
+  `/var/lib/lldpq/ai/jobs/` can hold the session cookie of the admin who
+  started them. They are deleted 24 hours later at the next chat or analysis;
+  to remove them at once, run
+  `sudo sh -c 'rm -rf /var/lib/lldpq/ai/jobs/*'` (in Docker:
+  `sudo docker exec lldpq sh -c 'rm -rf /var/lib/lldpq/ai/jobs/*'`), which
+  also drops a chat that is still running. Logging that admin out ends the
+  session the cookie belongs to.
+- **Scripts that read `/configs/`, `/hstr/` or `/monitor-results/`** without
+  a login now get HTTP 401; see [authentication](#10-authentication).
+
 ## [06] dependency management
 
 `install.sh` checks and installs nginx, fcgiwrap, ISC DHCP components and the
@@ -1756,6 +1847,15 @@ cd ~/lldpq && ./send-key.sh -p "pass"   # non-interactive mode
 
 Inventory-aware tools default to `devices.yaml`; `pping` can also target one
 IP or an explicit IP range directly.
+
+`pping -v <vrf>` pings from that VRF: with the Cumulus `vrf` command where it
+exists, otherwise through `ip vrf exec <vrf>`, directly as root or with
+`sudo -n` for another user (passwordless sudo). When the VRF cannot be
+entered, no host is pinged and `pping` ends with exit status 1 and one line:
+`Error: cannot ping in VRF '<vrf>': no 'vrf' command, and 'ip vrf exec <vrf>' failed (unknown VRF, or root is needed)`.
+In the Docker image `pping` already runs inside the management VRF, so
+`-v mgmt` is not needed there; a bridge-network container does not see the
+host's VRFs, and `-v mgmt` ends in that error.
 
 ```bash
 # parallel ping
@@ -1962,6 +2062,23 @@ is explicitly unavailable rather than inferred from a fixed current limit.
 Other optical metrics continue to determine port health using their existing
 rules. Breakout selection and unused-lane exclusions also apply to bias checks.
 
+A breakout sub-port (`swpNsM`) is graded only on the module channels it owns,
+because `ethtool -m` returns the whole module for every sub-port. The
+sub-ports of a cage share the module's channels equally and in order: on a
+twin-port 2x400G module split in two, `s0` owns channels 1-4 and `s1` owns
+channels 5-8. How many channels each sub-port gets is read from the DOM
+itself: the channels of a link-up sub-port must be in service. For a module
+with fewer optical lanes than host lanes (a 400G-DR4 split into 4x100G has one
+optical channel per sub-port) this intentionally differs from the host-lane
+view of `nv show interface <port> transceiver`. Known limit: only a link-up
+sub-port whose wider block would include an out-of-service channel can rule
+that block out. Until one does, for example while every sub-port is down, the
+widest block the dump allows is used: the channels the module prints divided
+by the number of sub-ports. A 400G-DR4 split into 4x100G prints eight
+channels, so until then it is shown with two channels per sub-port (the third
+and fourth sub-port on the unused channels 5-8); a link on the third or fourth
+sub-port settles it.
+
 ## [10] authentication
 
 web interface is protected with session-based authentication:
@@ -1996,6 +2113,63 @@ operator / operator   # limited access
 Authorization is enforced server-side; hiding controls in the UI is not the
 security boundary.
 
+### login-protected paths:
+
+Every path under `/configs/`, `/hstr/` and `/monitor-results/`, directory
+listings included, requires a valid session; the admin and the operator role
+both qualify. Without one the answer is HTTP 401 with the login page as its
+body, so `curl -f` fails. A script logs in once and keeps the cookie; a
+session lasts 8 hours, or 7 days with `remember=true`:
+
+```bash
+curl -sS -c jar -d 'username=<user>&password=<password>' \
+  'http://<host>/auth-api?action=login'
+curl -fsS -b jar 'http://<host>/configs/<device>.txt'
+```
+
+The [machine-readable exports](#02j-machine-readable-exports-public-api) stay
+public. A link to one of the three directories that is followed from another
+site (chat, wiki, web mail) arrives without the session cookie
+(`SameSite=Strict`): the login page appears and then leads to `/`. A bookmark
+or a typed address works. The session check for these paths runs through
+fcgiwrap; while that service is down they answer 500. While every fcgiwrap
+worker is busy the request waits, and it answers 500 when no worker has
+answered the check within 60 seconds. The **Commands** page and the Verify
+step of **Fabric Migration** run three device commands at a time, so they
+leave one of the four default workers free; with fewer workers (Docker:
+`LLDPQ_FCGI_WORKERS` set to 1-3) they can still occupy the whole pool.
+
+A login that arrives over TLS gets the session cookie with the `Secure` flag,
+and the client then sends it to `https://` addresses only; a login over plain
+HTTP is unchanged. The Docker image has a TLS listener when `LLDPQ_HTTPS_PORT`
+is set (see [HTTPS](DOCKER.md#https)); a native installation has one only
+where the operator added it to nginx.
+
+### login attempt limit:
+
+Only login attempts are limited (`/auth-api` with `action=login`); session
+checks, pages and the health check are not.
+
+| Scope | Allowed | Then |
+|---|---|---|
+| per client address (IPv4 or IPv6) | 6 attempts in a row | 1 every 10 seconds |
+| all addresses together | 21 attempts in a row | 1 every 2 seconds |
+
+Successful logins count as well. An attempt over the limit gets HTTP 429 with
+`Retry-After: 10` and the body
+`{"success": false, "error": "Too many login attempts. Wait a few seconds and try again."}`,
+and nginx writes a `limiting requests ... by zone "lldpq_login_client"` (or
+`"lldpq_login_all"`) line to its error log. No account is locked and nothing
+is stored: the limit lifts by itself once the attempts stop. The values are
+fixed in the nginx site file (`etc/nginx/sites-available/lldpq`); there is no
+setting for them. Behind a reverse proxy or NAT all users arrive from one
+address and share its limit. An integration should reuse its session cookie
+instead of logging in for every call.
+
+Both features need nginx's `auth_request` and `limit_req` modules. The Docker
+image and the Ubuntu `nginx` package have them; a reduced build such as
+`nginx-light` may not, and `nginx -t` then rejects the site file.
+
 ### user management (admin only):
 1. login as admin
 2. click username in sidebar
@@ -2017,6 +2191,10 @@ security boundary.
 2. click username in sidebar
 3. select "Change Passwords"
 4. choose user and set new password
+
+Changing a password ends every other session of that user at once; only the
+session that made the change stays logged in. A session that was opened with
+a default password therefore does not outlive the change.
 
 **important**: change default passwords after installation!
 
@@ -2086,6 +2264,21 @@ real-time telemetry dashboard with OTEL Collector + Prometheus (optional feature
 ./install.sh --enable-telemetry    # installs Docker, starts stack automatically
 ```
 
+Both options install Docker when it is missing. Only then, and only when
+`/etc/docker/daemon.json` does not exist, the installer writes
+`{"storage-driver": "vfs"}` to that file and restarts Docker
+(`Configuring Docker storage driver...`). Where Docker was already installed,
+the file and the Docker service are left alone and one line says so:
+`[!] Docker was already installed: /etc/docker/daemon.json and the Docker service are left unchanged. ...`
+`vfs` is needed only on a host without overlay support. To set it yourself,
+add `"storage-driver": "vfs"` to `/etc/docker/daemon.json` and run
+`sudo systemctl restart docker`: the images and containers that exist then
+are no longer shown, and `vfs` stores every layer as a full copy. Versions up
+to 4.2.x wrote the file also for a Docker installation that was already there
+and had none. On such a host the file stays; to return to the default driver,
+delete it and restart Docker (the telemetry images are then pulled again).
+`--disable-telemetry` does not touch the file.
+
 **disable — native install:**
 
 ```bash
@@ -2120,6 +2313,35 @@ from the web UI (admin only):
 5. click **Enable on Selected Devices**
 
 **note**: operators can view the dashboard but cannot enable/disable telemetry.
+
+Before it prepares anything on a switch, LLDPq runs `nv config diff` there
+with the device SSH account (`username` in `devices.yaml`, `cumulus` by
+default). A switch that has pending, un-applied NVUE changes is left
+untouched and counted as failed, while the other switches continue:
+
+```text
+Failed: Pending un-applied NVUE changes on this switch, nothing was changed. Review them with 'nv config diff', then apply or 'nv config detach' them and retry.
+```
+
+The device account is shared, and `nv config apply` would apply the whole
+pending revision, not only the telemetry settings. Look at the change with
+`nv config diff` on the switch, apply it or run `nv config detach`, and retry.
+**Disable Telemetry** is guarded the same way; there is no setting that turns
+the check off.
+
+When one of LLDPq's own `nv set`/`nv unset` commands or its
+`nv config apply -y` fails, LLDPq runs `nv config detach` in the same session
+and shows NVUE's error, so its half-prepared change does not block the next
+attempt. When that error contains `Stale revision`, the line ends in
+`- LLDPq detached its own staged change, retry`. Limits of the check:
+
+- it sees only the pending revision of the SSH account LLDPq uses
+- a change prepared with that account in the seconds between the check and
+  the apply is still applied together with the telemetry settings
+- if the 120-second timeout strikes during the apply, nothing is detached;
+  the next attempt then reports pending changes, and `nv config detach` has
+  to be run on the switch
+- the command preview in the dialog shows neither the check nor the detach
 
 ### dashboard features
 - **real-time metrics**: interface throughput, errors, drops
@@ -2278,6 +2500,13 @@ IPv6 probes use ICMPv6, TCP/22, SSH and NDP where available. A stale NDP entry
 alone does not mark a device reachable. Importing an IPv6 discovery result into
 Inventory keeps DHCP disabled and does not run post-provision actions.
 See [IPv6 support](#03c-ipv6-support) for complete examples and unsupported features.
+
+With an empty Discovery Range, the range is taken from the first
+`subnet a.b.c.d` line of `dhcpd.conf` that is not commented out
+(`a.b.c.10-a.b.c.249`); the `#subnet ...` sample lines of a packaged file do
+not count. With neither a range nor such a subnet, the scheduled scan creates
+no job, and **Scan** answers
+`No discovery range configured. Set it in DHCP Server Configuration.`
 
 The Discover tab also owns the discovery IP range and the independent
 post-provision toggles for Base Config, ZTP disable, and hostname assignment.
@@ -2440,6 +2669,52 @@ Manage the Zero Touch Provisioning script (`cumulus-ztp.sh`):
 - **Script Editor**: collapsible Monaco-style editor with Reload/Save
 
 The ZTP script handles: OS version check + upgrade, password change, sudo fix, SSH key installation.
+
+`/cumulus-ztp.sh` is served without login, as ZTP requires. **Save** therefore
+stores the `cumulus` password as a SHA-512 crypt hash, not in clear text:
+
+```text
+echo 'cumulus:$6$<salt>$<hash>' | chpasswd -e
+```
+
+The hash is produced inside LLDPq with `openssl passwd -6`. It can still be
+attacked offline by anyone who can fetch the script, so choose a strong
+password (at most 128 characters). If the hash cannot be produced, the script
+is not saved and the message begins `ZTP script was not saved:`. The same
+happens when the `cumulus` line ends in `chpasswd -e` and its value is not a
+crypt hash; the message then continues
+`"chpasswd -e" needs a crypt hash for cumulus; remove -e to have a clear-text password hashed on save`.
+
+- **Quick Settings** no longer shows the stored password. The line under the
+  field says whether it is `stored as a hash`, still `in clear text`, or
+  missing from the script. Leaving the field blank keeps the stored password;
+  typing one replaces it. For a script without a password line, a generated
+  template uses the built-in default when the field is blank, so type a
+  password of your own. A typed password reaches the script only through
+  **Apply to Script**. **Save** without it stores the script that is in the
+  editor, keeps the typed password in the field and reports
+  `ZTP script saved, but the typed password was NOT applied: click Apply to Script, then Save`.
+- **After an upgrade from 4.2.x** the saved script keeps working and still
+  carries the password in clear text until **Save** is pressed once; the
+  password need not be typed again. Check with
+  `curl -s http://<lldpq>/cumulus-ztp.sh | grep -n chpasswd`: the line has to
+  end in `chpasswd -e`. A script that was never saved serves the packaged
+  template with the built-in default password in clear text until then.
+- **Device upgrades** started from a hashed script use a hook that carries
+  the hash. Started from a clear-text script, the hook published under
+  `/provision-uploads/ztp-artifacts/` carries the password in clear text, so
+  save the script once before starting an upgrade.
+- **After a rollback to a 4.2.x image** a hashed script is still served to
+  switches unchanged. The 4.2.x page cannot change that password line with
+  **Apply to Script** (a typed password is silently not applied); where it
+  offers to regenerate the template, a blank password field writes the
+  built-in default in clear text. It also refuses to start a device upgrade
+  with `one literal cumulus password is required`: edit the line in the
+  script editor back to `echo 'cumulus:<password>' | chpasswd` and save.
+
+To verify on a switch after ZTP:
+`sudo getent shadow cumulus | cut -d: -f2 | cut -c1-3` prints `$6$`, and
+`sudo chage -l cumulus | head -2` must not ask for a password change.
 
 ### Upgrade Tab
 
@@ -2636,6 +2911,20 @@ Key conventions used by LLDPq:
 - Profiles prefixed with `VxLAN_UNDERLAY` — automatically excluded from user-facing lists
 - `ipv4_unicast_af.route_import.from_vrf` — used for inter-VRF route leaking management
 - The `fabric_exit` tag is ignored by Ansible — it only affects LLDPq's Fabric Exit UI
+- **Fabric Exit interface lists** — in **Add External Peer** the parent
+  interface list comes from the device's `host_vars` `interfaces` keys (`swpN`
+  and breakout children `swpNsM`), not from the live switch. Breakout parents
+  (ports with a `breakout` key) and bond members
+  (`bonds.<name>.bond_members`) are left out. Declared ports are listed under
+  *In inventory*, the remaining `swp1`-`swp16` under *Not in inventory*; a
+  device that declares no `swp` port gets the fixed `swp1`-`swp16` list. In
+  **Edit External Peer** a peer on a subinterface (`swpX.VLAN`) can be moved
+  to the same VLAN on another port: saving removes the old subinterface from
+  `host_vars` and writes the new one with the same address and VRF.
+  Subinterfaces that already exist are not offered, the VLAN ID cannot be
+  changed there (delete and re-add the peer), and a peer on `lo` or on a
+  direct interface address keeps its single entry. As with every Fabric Exit
+  edit, the switch changes only after Generate/Diff/Deploy.
 
 If these keys or structures differ in your Ansible repo, the corresponding UI features will not work correctly.
 

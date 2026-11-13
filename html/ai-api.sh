@@ -417,6 +417,10 @@ DEFAULT_LLM_MAX_OUTPUT_TOKENS = 4096
 CONTEXT_MAP_MAX_OUTPUT_TOKENS = 1200
 
 _SECRET_VALUE_PATTERN = r'(?:"[^"\r\n]*"|\'[^\'\r\n]*\'|\S+)'
+# These two patterns stay exactly as 4.2.x shipped them. Keys added later are
+# matched in redact_secrets, after these patterns and on their output: merged
+# into one alternation, a new key takes an old key as its value
+# ("mka_cak: secret X") and X, which 4.2.x masked, would stay in the text.
 _TYPED_SECRET_RE = re.compile(
     r'(?i)\b(password|passwd|secret|key-string|psk|pre-?shared-?key|md5|'
     r'auth-?key|priv-?key|wpa-psk)\b'
@@ -426,6 +430,15 @@ _SECRET_RE = re.compile(
     r'(?i)\b(password|passwd|secret|community|key-string|psk|pre-?shared-?key|md5|'
     r'auth-?key|priv-?key|snmp-community|wpa-psk|api[-_]?key|token)\b'
     r'(\s*(?::|=)\s*|\s+)' + _SECRET_VALUE_PATTERN
+)
+# snmpd.conf: createUser [-e ENGINEID] user (MD5|SHA*) [-m|-l] authkey
+#             [(DES|AES*) [-m|-l] [privkey]] -- both keys follow a bare
+# algorithm name, so no keyword of _SECRET_RE precedes them.
+_SNMP_CREATEUSER_RE = re.compile(
+    r'(?i)\b(createUser[ \t]+(?:-e[ \t]+\S+[ \t]+)?\S+[ \t]+(?:MD5|SHA[\w-]*)[ \t]+'
+    r'(?:-[ml][ \t]+)?)' + _SECRET_VALUE_PATTERN
+    + r'(?:([ \t]+(?:DES|AES[\w-]*)[ \t]+(?:-[ml][ \t]+)?)'
+    + _SECRET_VALUE_PATTERN + r')?'
 )
 _BEARER_RE = re.compile(r'(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)(\S+)')
 _URI_CREDENTIAL_RE = re.compile(r'(?i)(https?://[^\s/@:]+:)([^\s/@]+)(@)')
@@ -458,7 +471,48 @@ def redact_secrets(text):
     text = _BEARER_RE.sub(r'\1***REDACTED***', text)
     text = _URI_CREDENTIAL_RE.sub(r'\1***REDACTED***\3', text)
     text = _URL_KEY_RE.sub(r'\1***REDACTED***', text)
-    return text
+    # Up to here this is the 4.2.x result. The passes below only replace more
+    # text in it, so a value masked above cannot come back.
+    text = _SNMP_CREATEUSER_RE.sub(
+        lambda m: m.group(1) + '***REDACTED***'
+        + (m.group(2) + '***REDACTED***' if m.group(2) else ''), text
+    )
+
+    def mask_added_key(match):
+        key, json_separator, separator, value = match.group(1, 3, 4, 5)
+        if json_separator:
+            return key + json_separator + '***REDACTED***"'
+        if value.startswith('***REDACTED***'):
+            # Masked by a pass above: leave that result byte for byte.
+            return match.group(0)
+        return key + separator + '***REDACTED***'
+
+    # The pattern stays inside the function (re caches the compiled form) so
+    # that loading redact_secrets needs no further module-level name.
+    return re.sub(
+        # The key is the last part of a name: it follows "_" (bgp_password,
+        # ansible_become_password) or any character but a letter or digit.
+        r'(?i)(?<![a-z0-9])('
+        # Group 2: keys whose value may follow a numeric type ("secret 5 X").
+        # "pass" only as "..._pass"; "..._md5" names a checksum, not a key.
+        r'(password|passwd|secret|psk|key[-_]string|pre[-_]?shared[-_]?key|'
+        r'auth[-_]?key|priv[-_]?key|authentication[-_]key|'
+        r'pass(?<=_pass)|md5(?<!_md5))'
+        r'|api[-_]?key|token|cak|md5[-_]key'
+        r'|(?:auth-(?:md5|sha)|encrypt-(?:aes|des))[\w-]{0,16}'
+        # After "_", community only in an SNMP name: bgp_community and the
+        # like keep their value. (?=[cr]) spares other words the look-behinds.
+        r'|(?=[cr])(?:(?<!_)|(?<=snmp_)|(?<=snmpd_)|(?<=(?<![a-z0-9])r[ow]_)'
+        r'|(?<=read_)|(?<=write_)|(?<=readonly_)|(?<=readwrite_)|(?<=trap_)'
+        r'|(?<=v2c_))(?:ro|rw)?community(?:-v6|6)?'
+        r')(?:'
+        # JSON ("nv ... -o json"): a string value only, so that objects and
+        # arrays under such a key (BGP communities) keep their content.
+        r'("\s*:\s*")(?:[^"\\\r\n]|\\.)+"'
+        r'|\b(\s*(?::|=)\s*|\s+)(?(2)(?:[0-9]{1,2}\s+)?)('
+        + _SECRET_VALUE_PATTERN + r'))',
+        mask_added_key, text,
+    )
 
 
 def maybe_redact(text):
@@ -4618,11 +4672,13 @@ def _provider_request_once(
                    'anthropic-version': '2023-06-01'}
     elif AI_PROVIDER == 'gemini':
         model = model or 'gemini-2.5-flash'
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={AI_API_KEY}"
+        # The key rides in a header, never in the URL: request URLs end up in
+        # proxy/access logs and in urllib error text.
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         payload = json.dumps(
             _build_gemini_payload(safe_messages, max_output_tokens)
         ).encode()
-        headers = {'Content-Type': 'application/json'}
+        headers = {'Content-Type': 'application/json', 'x-goog-api-key': AI_API_KEY}
     else:
         url = f"{AI_API_URL.rstrip('/')}/chat/completions"
         openai_msgs = []
@@ -5257,8 +5313,9 @@ def _policy_block_hint(command, error):
     if tokens[:1] == ['vtysh'] or tokens[:2] == ['vtysh', '-c']:
         return "only show commands are allowed: sudo vtysh -c 'show ...'"
     return ("allowed read-only families: nv show ..., nv config show|diff|find, "
-            "sudo vtysh -c 'show ...', ip link|addr|route|neigh show, "
-            "bridge fdb|vlan show, ethtool -m|-S|-i <port>, lldpctl, clagctl, "
+            "sudo vtysh -c 'show ...', ip [-d] link|addr|route|neigh show, "
+            "bridge fdb|vlan show, ethtool -m|-S|-i|--show-fec <port>, "
+            "cat /sys/class/net/<port>/mtu, lldpctl, clagctl, "
             "journalctl --no-pager -n 200, dmesg, uptime, free, df")
 
 
@@ -7633,12 +7690,12 @@ def action_chat_submit():
     job_dir, events_path, _cancel_path = _job_paths(job_id)
     try:
         os.makedirs(job_dir, mode=0o2770)
-        # The session cookie rides in the private job spec so the worker's
-        # tool subprocesses keep using fabric-api's own admin auth.
+        # The session cookie is never persisted: the worker inherits the
+        # LLDPQ_AUTH_ROLE/LLDPQ_AUTH_USER exported by auth-guard.sh for this
+        # request, which fabric-api's own guard accepts (as for the cron run).
         spec = {
             'message': question,
             'history': history,
-            'cookie': os.environ.get('HTTP_COOKIE', ''),
             'user': os.environ.get('LLDPQ_AUTH_USER', ''),
             'created': time.time(),
         }
@@ -7817,11 +7874,6 @@ def action_chat_worker(job_id):
     if not isinstance(spec, dict) or not str(spec.get('message') or '').strip():
         _job_emit({'event': 'error', 'error': 'job spec missing or unreadable'})
         sys.exit(1)
-    cookie = str(spec.get('cookie') or '')
-    if cookie:
-        # run_device_tool/run_promql/... forward this to fabric-api's own
-        # session auth, exactly as in the sync path.
-        os.environ['HTTP_COOKIE'] = cookie
     if spec.get('user'):
         os.environ.setdefault('LLDPQ_AUTH_USER', str(spec.get('user')))
     _worker_post = {'message': spec.get('message', ''),
@@ -8044,7 +8096,14 @@ def action_test_connection():
     api_key = submitted_key or (AI_API_KEY if same_saved_boundary else '')
     if provider != 'ollama' and not api_key:
         error_json("API key required for the selected provider and endpoint")
-    
+    # Each cloud provider below sends the key in a request header. http.client
+    # refuses a header value with a line break, and what cannot be encoded as
+    # latin-1 fails there too; both error texts quote the value. Such a key is
+    # rejected here, before a request exists, with a text that has no part of it.
+    if provider != 'ollama' and re.search(r'[\r\n]|[^\x00-\xff]', api_key):
+        error_json("API key contains a line break or a character that cannot "
+                   "be sent in an HTTP header; paste the key as a single line")
+
     # Set proxy for test if provided
     proxy_url = data.get('proxy_url', '')
     if proxy_url:
@@ -8083,9 +8142,9 @@ def action_test_connection():
             if proxy_url:
                 os.environ['http_proxy'] = proxy_url
                 os.environ['https_proxy'] = proxy_url
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             payload = json.dumps({"contents": [{"role": "user", "parts": [{"text": "Test connection. Reply with exactly: OK"}]}]}).encode()
-            headers = {'Content-Type': 'application/json'}
+            headers = {'Content-Type': 'application/json', 'x-goog-api-key': api_key}
             req = urllib.request.Request(url, data=payload, headers=headers)
             resp = urllib.request.urlopen(req, timeout=30)
             result = json.loads(resp.read().decode())
@@ -8424,6 +8483,23 @@ def _generation_still_current(devices, initial_generation):
         return False
 
 
+def _redact_report(value):
+    """Mask credential-like values in every string of an analysis report.
+
+    The report never stays in the admin browser: analysis.json is served by
+    the unauthenticated /ai/export_json endpoint and the reply is written to
+    the job event log and the cron log. Both are therefore masked for every
+    provider, local models included.
+    """
+    if isinstance(value, dict):
+        return {key: _redact_report(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact_report(item) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
+
+
 def _commit_analysis_state(devices, initial_generation, analysis, snapshot=None,
                            findings=None, covered_devices=None):
     """Commit against the input generation while excluding monitor publishers.
@@ -8453,7 +8529,7 @@ def _commit_analysis_state(devices, initial_generation, analysis, snapshot=None,
                 findings, covered_devices, persist=True
             )
             analysis.update(findings=classified, findings_summary=summary)
-        _save_json_state(ANALYSIS_FILE, analysis)
+        _save_json_state(ANALYSIS_FILE, _redact_report(analysis))
         if snapshot is not None:
             _save_json_state(
                 os.path.join(AI_STATE_DIR, 'analysis-snapshot.json'), snapshot
@@ -8603,18 +8679,19 @@ def action_analyze():
             except Exception as error:
                 error_json("AI analysis refresh could not be saved: "
                            + redact_secrets(str(error)))
-            result_json({"success": True, "analysis": analysis['analysis'],
-                         "timestamp": analysis['timestamp'],
-                         "changes": changes, "collection": collection_metadata,
-                         "timeline": timeline, "evidence": evidence_bundle['records'],
-                         "confidence": evidence_bundle['confidence'],
-                         "persisted": persisted, "snapshot_updated": persisted,
-                         "model": analysis['model'],
-                         "fallback_used": analysis['fallback_used'],
-                         "reused": True,
-                         **{key: analysis[key]
-                            for key in ('findings', 'findings_summary')
-                            if key in analysis}})
+            result_json(_redact_report({
+                "success": True, "analysis": analysis['analysis'],
+                "timestamp": analysis['timestamp'],
+                "changes": changes, "collection": collection_metadata,
+                "timeline": timeline, "evidence": evidence_bundle['records'],
+                "confidence": evidence_bundle['confidence'],
+                "persisted": persisted, "snapshot_updated": persisted,
+                "model": analysis['model'],
+                "fallback_used": analysis['fallback_used'],
+                "reused": True,
+                **{key: analysis[key]
+                   for key in ('findings', 'findings_summary')
+                   if key in analysis}}))
 
     # RECENT FABRIC CHANGES (git log + config drift) rides with the change
     # detection text; the whole block is silently absent when empty.
@@ -8666,8 +8743,11 @@ Correlations show temporal coincidence only and do not prove causation.""")
             "role": "user", "content": scan_objective,
             "context_pin": True, "context_kind": "question",
         }
+        # The report built from this input is persisted and served by the
+        # unauthenticated export endpoint, so the analysis input is masked for
+        # every provider (chat keeps the cloud-only rule for local models).
         scan_observations = _reduce_untrusted_context_if_needed(
-            analysis_observations,
+            redact_secrets(analysis_observations),
             scan_objective,
             [scan_system_message, scan_objective_message],
             scan_deadline,
@@ -8754,19 +8834,20 @@ Correlations show temporal coincidence only and do not prove causation.""")
                 except Exception as error:
                     error_json("AI analysis completed but could not be saved: "
                                + redact_secrets(str(error)))
-            result_json({"success": True, "analysis": response,
-                         "timestamp": analysis['timestamp'],
-                         "changes": changes, "collection": collection_metadata,
-                         "timeline": timeline,
-                         "evidence": evidence_bundle['records'],
-                         "confidence": evidence_bundle['confidence'],
-                         "persisted": persisted, "snapshot_updated": persisted,
-                         "baseline": baseline_established,
-                         "model": analysis['model'],
-                         "fallback_used": analysis['fallback_used'],
-                         "findings": classified,
-                         "findings_summary": findings_summary,
-                         "stages": stages})
+            result_json(_redact_report({
+                "success": True, "analysis": response,
+                "timestamp": analysis['timestamp'],
+                "changes": changes, "collection": collection_metadata,
+                "timeline": timeline,
+                "evidence": evidence_bundle['records'],
+                "confidence": evidence_bundle['confidence'],
+                "persisted": persisted, "snapshot_updated": persisted,
+                "baseline": baseline_established,
+                "model": analysis['model'],
+                "fallback_used": analysis['fallback_used'],
+                "findings": classified,
+                "findings_summary": findings_summary,
+                "stages": stages}))
         if scan_findings:
             # Stage C: targeted read-only drill-down, only for CRITICAL
             # findings, worst-first, at most 3 devices. Results feed the
@@ -8919,8 +9000,9 @@ Correlations show temporal coincidence only and do not prove causation.""")
         "role": "user", "content": analysis_objective,
         "context_pin": True, "context_kind": "question",
     }
+    # Masked for every provider, like the scan input above.
     analysis_observations = _reduce_untrusted_context_if_needed(
-        analysis_observations,
+        redact_secrets(analysis_observations),
         analysis_objective,
         [system_message, objective_message],
         deadline,
@@ -9035,14 +9117,15 @@ Correlations show temporal coincidence only and do not prove causation.""")
         except Exception as error:
             error_json(f"AI analysis completed but could not be saved: {redact_secrets(str(error))}")
 
-    result_json({"success": True, "analysis": response, "timestamp": analysis['timestamp'],
-                 "changes": changes, "collection": collection_metadata,
-                 "timeline": timeline, "evidence": evidence_bundle['records'],
-                 "confidence": evidence_bundle['confidence'],
-                 "persisted": persisted, "snapshot_updated": snapshot_updated,
-                 "baseline": baseline_established,
-                 "model": llm_result['model'], "fallback_used": llm_result['fallback_used'],
-                 **findings_fields})
+    result_json(_redact_report({
+        "success": True, "analysis": response, "timestamp": analysis['timestamp'],
+        "changes": changes, "collection": collection_metadata,
+        "timeline": timeline, "evidence": evidence_bundle['records'],
+        "confidence": evidence_bundle['confidence'],
+        "persisted": persisted, "snapshot_updated": snapshot_updated,
+        "baseline": baseline_established,
+        "model": llm_result['model'], "fallback_used": llm_result['fallback_used'],
+        **findings_fields}))
 
 
 def action_analyze_submit():
@@ -9062,7 +9145,6 @@ def action_analyze_submit():
         os.makedirs(job_dir, mode=0o2770)
         spec = {
             'type': 'analyze',
-            'cookie': os.environ.get('HTTP_COOKIE', ''),
             'user': os.environ.get('LLDPQ_AUTH_USER', ''),
             'created': time.time(),
         }
@@ -9130,9 +9212,6 @@ def action_analyze_worker(job_id):
     if not isinstance(spec, dict) or spec.get('type') != 'analyze':
         _job_emit({'event': 'error', 'error': 'analyze job spec missing or invalid'})
         sys.exit(1)
-    cookie = str(spec.get('cookie') or '')
-    if cookie:
-        os.environ['HTTP_COOKIE'] = cookie
     if spec.get('user'):
         os.environ.setdefault('LLDPQ_AUTH_USER', str(spec.get('user')))
     import threading

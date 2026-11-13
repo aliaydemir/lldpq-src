@@ -8315,8 +8315,28 @@ for cmd in commands:
         print(json.dumps({'success': False, 'error': f'Only telemetry commands allowed: {cmd}'}))
         sys.exit()
 
+# The device account is shared, so "nv config apply" would also apply whatever
+# another operator staged on that switch. Refuse a device whose pending
+# revision is not empty before staging anything ("[]"/"{}" count as empty),
+# or cannot be read, and detach our own staged change when the sequence fails
+# so that it does not block the next attempt. "nv config diff" exits 1 when
+# it prints a difference (Cumulus Linux 5.18), so its output decides first;
+# a non-zero status with nothing printed says nothing about the revision.
+pending_guard = (
+    "d=$(nv config diff); rc=$?; "
+    "if [ -n \"$(printf %s \"$d\" | tr -d '[:space:][]{}')\" ]; then "
+    "echo \"Pending un-applied NVUE changes on this switch, nothing was changed. "
+    "Review them with 'nv config diff', then apply or 'nv config detach' them "
+    "and retry.\" >&2; exit 3; fi; "
+    "[ \"$rc\" -eq 0 ] || { echo \"Could not check this switch for pending "
+    "NVUE changes ('nv config diff' failed), nothing was changed.\" >&2; exit 4; }"
+)
+
 # Join commands with && to run sequentially on each device
-combined_cmd = ' && '.join(commands)
+combined_cmd = (
+    pending_guard + '; { ' + ' && '.join(commands) + '; } || '
+    '{ rc=$?; nv config detach >/dev/null 2>&1; exit $rc; }'
+)
 
 # Run on all devices in bounded parallelism
 results = []
@@ -10095,9 +10115,9 @@ ALLOWED_PATTERNS = [
     r'^sudo l1-show [A-Za-z0-9_.:-]+$',
     r'^l1-show [A-Za-z0-9_.:-]+$',
     # ethtool variants
-    r'^(sudo )?(/sbin/)?ethtool( -(m|S|i))? [A-Za-z0-9_.:-]+$',
+    r'^(sudo )?(/sbin/)?ethtool( (-(m|S|i)|--show-fec))? [A-Za-z0-9_.:-]+$',
     # IP/network commands
-    r'^(?:sudo )?ip (?:(?:-4|-6|-br|--brief) )*(?:link|addr|route|neigh)\b',
+    r'^(?:sudo )?ip (?:(?:-4|-6|-br|--brief|-d) )*(?:link|addr|route|neigh)\b',
     r'^/sbin/bridge fdb\b',
     r'^/sbin/bridge vlan\b',
     r'^bridge fdb\b',
@@ -10109,6 +10129,9 @@ ALLOWED_PATTERNS = [
     # Bonding/LAG / MLAG (read-only status only)
     r'^cat /proc/net/bonding/[A-Za-z0-9_.:-]+$',
     r'^sudo cat /proc/net/bonding/[A-Za-z0-9_.:-]+$',
+    # Interface MTU from sysfs (read-only, one fixed attribute per interface)
+    r'^cat /sys/class/net/[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}/mtu$',
+    r'^sudo cat /sys/class/net/[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}/mtu$',
     r'^clagctl$',
     r'^sudo clagctl$',
     r'^clagctl status$',
@@ -10277,6 +10300,7 @@ def approved_read_path(path):
         re.fullmatch(r'/proc/net/bonding/[A-Za-z0-9_.:-]+', path)
         or re.fullmatch(r'/var/log/[A-Za-z0-9_.@:/+-]+', path)
         or re.fullmatch(r'/tmp/(?:live|tail)_[A-Za-z0-9_.:-]+', path)
+        or re.fullmatch(r'/sys/class/net/[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}/mtu', path)
     )
 
 
@@ -10375,8 +10399,8 @@ def validate_ip_command(tokens):
     if len(tokens) < 2 or tokens[0] != 'ip':
         return False
     index = 1
-    # Address-family and brief flags may precede the read-only subcommand.
-    while index < len(tokens) and tokens[index] in {'-4', '-6', '-br', '--brief'}:
+    # Address-family, brief and details flags may precede the read-only subcommand.
+    while index < len(tokens) and tokens[index] in {'-4', '-6', '-br', '--brief', '-d'}:
         index += 1
     if len(tokens) <= index:
         return False
@@ -10412,12 +10436,13 @@ def validate_vtysh_command(tokens):
     if '|' not in inner:
         return True
     # FRR output modifiers are interpreted by vtysh itself inside the quoted
-    # -c string, never by the shell. Permit exactly one safe filter tail.
+    # -c string, never by the shell. Permit exactly one safe filter tail; '^'
+    # anchors a filter regex ("| include ^neighbor").
     _head, _sep, tail = inner.partition('|')
     return bool(
         '|' not in tail
         and re.fullmatch(
-            r'\s*(?:include|exclude|begin|section)\s+[A-Za-z0-9_.:/,@%+= -]{1,160}',
+            r'\s*(?:include|exclude|begin|section)\s+[A-Za-z0-9_.:/,@%+=^ -]{1,160}',
             tail,
             re.IGNORECASE,
         )

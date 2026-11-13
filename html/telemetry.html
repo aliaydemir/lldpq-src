@@ -2670,7 +2670,11 @@
             const entry = document.createElement('div');
             entry.className = `log-entry ${type}`;
             if (device) {
-                entry.innerHTML = `<span class="device">[${device}]</span> ${message}`;
+                // Text nodes only: the message can be a device's own stderr.
+                const label = document.createElement('span');
+                label.className = 'device';
+                label.textContent = `[${device}]`;
+                entry.append(label, ' ' + message);
             } else {
                 entry.textContent = message;
             }
@@ -2749,9 +2753,11 @@
                     if (result.success) {
                         successCount++;
                         addLogEntry(successLabel, 'success', result.device);
-                    } else if (result.error && result.error.includes('Stale revision')) {
+                    } else if (result.error && result.error.includes('Stale revision')
+                               && !result.error.includes('nothing was changed')) {
                         errorCount++;
-                        addLogEntry('Failed: Pending config exists - run "nv config detach" on device', 'error', result.device);
+                        // The backend has already detached the change it staged itself
+                        addLogEntry(`Failed: ${result.error} - LLDPq detached its own staged change, retry`, 'error', result.device);
                     } else {
                         errorCount++;
                         addLogEntry(`Failed: ${result.error || 'Unknown error'}`, 'error', result.device);

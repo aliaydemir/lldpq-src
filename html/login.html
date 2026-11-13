@@ -268,7 +268,26 @@
                 const data = await response.json();
                 
                 if (data.success) {
-                    getTopWindow().location.href = '/';
+                    // A browser that holds a Secure session cookie for this host
+                    // (it signed in over HTTPS) drops the cookie of a login over
+                    // http://, so the accepted login would only reload this page.
+                    let kept = true;
+                    try {
+                        const check = await fetch('/auth-api?action=check', {cache: 'no-store'});
+                        kept = (await check.json()).authenticated === true;
+                    } catch (e) {
+                    }
+                    if (kept) {
+                        getTopWindow().location.href = '/';
+                    } else {
+                        errorDiv.textContent = 'Signed in, but this browser did not keep the session cookie. ' +
+                            (window.location.protocol === 'http:'
+                                ? 'It holds an HTTPS session for this host: use the https:// address, or delete the lldpq_session cookie of this host and sign in again.'
+                                : 'Allow cookies for this host and sign in again.');
+                        errorDiv.classList.add('show');
+                        btn.disabled = false;
+                        btn.textContent = 'Sign In';
+                    }
                 } else {
                     errorDiv.textContent = data.error || 'Invalid username or password';
                     errorDiv.classList.add('show');

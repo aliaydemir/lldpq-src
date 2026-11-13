@@ -2679,7 +2679,8 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
         try:
             with open(conf_path, 'r') as f:
                 content = f.read()
-            m = re.search(r'subnet\s+([\d.]+)', content)
+            # Commented "#subnet ..." samples (packaged dhcpd.conf) are not a range.
+            m = re.search(r'(?m)^[^#\n]*?\bsubnet\s+([\d.]+)', content)
             if m:
                 prefix = '.'.join(m.group(1).split('.')[:3])
                 disc_range = f'{prefix}.10-{prefix}.249'
@@ -3618,6 +3619,19 @@ def action_discovery_active():
     result_json({'success': True, 'job': job})
 
 
+def discovery_range_available():
+    """True when a scan would have a range: DISCOVERY_RANGE or an active dhcpd subnet."""
+    if read_lldpq_conf_key('DISCOVERY_RANGE', DISCOVERY_RANGE):
+        return True
+    conf_path = os.environ.get('DHCP_CONF_FILE', '/etc/dhcp/dhcpd.conf')
+    try:
+        with open(conf_path, 'r') as f:
+            # Keep in step with the run_subnet_scan fallback.
+            return bool(re.search(r'(?m)^[^#\n]*?\bsubnet\s+([\d.]+)', f.read()))
+    except Exception:
+        return False
+
+
 def run_discovery_schedule():
     """Cheap once-per-minute due/resume check called outside the browser."""
     try:
@@ -3636,6 +3650,10 @@ def run_discovery_schedule():
                 launch_discovery_worker(job['id'])
             except Exception:
                 pass
+        return
+    if not discovery_range_available():
+        # Nothing was entered and dhcpd.conf has no active subnet: a job could
+        # only fail with "No discovery range configured" once a minute.
         return
     last_success = 0
     try:
@@ -3886,6 +3904,73 @@ def unbind_ztp_image_name(deleted_name):
         return False
 
 
+def hash_ztp_password(password):
+    """Return the SHA-512 crypt hash that "chpasswd -e" installs on a switch.
+
+    The password reaches openssl on stdin only: never argv, the environment
+    or a log. openssl is already required by the login CGI on every install.
+    """
+    try:
+        raw = password.encode('utf-8')
+    except (AttributeError, UnicodeError) as exc:
+        raise ValueError('Invalid cumulus password') from exc
+    if not raw or any(c in password for c in '\r\n\x00'):
+        raise ValueError('Invalid cumulus password')
+    # openssl reads at most 256 bytes per line and would hash a silent prefix.
+    if len(password) > 128 or len(raw) > 256:
+        raise ValueError('The cumulus password is too long (max 128 characters, 256 bytes)')
+    # The CGI keeps the request body (this password included) in POST_DATA.
+    child_env = {name: value for name, value in os.environ.items()
+                 if name != 'POST_DATA'}
+    try:
+        result = subprocess.run(
+            ['openssl', 'passwd', '-6', '-stdin'],
+            input=raw + b'\n', capture_output=True, timeout=10, env=child_env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError('Could not hash the cumulus password: openssl did not run') from exc
+    hashed = (result.stdout or b'').decode('ascii', 'replace').strip()
+    if result.returncode != 0 or not re.fullmatch(
+            r'\$6\$[A-Za-z0-9./]{1,16}\$[A-Za-z0-9./]{86}', hashed):
+        raise ValueError('Could not hash the cumulus password: openssl passwd -6 failed')
+    return hashed
+
+
+def hash_ztp_password_lines(content):
+    """Store the literal cumulus password of a ZTP script as a crypt hash.
+
+    cumulus-ztp.sh is served without login, so the managed line
+    "echo 'cumulus:<password>' | chpasswd" (the form earlier versions saved)
+    becomes "echo 'cumulus:<hash>' | chpasswd -e". Lines that are already
+    hashed, belong to another account or are not shell literals are kept.
+    A literal cumulus value that is not a crypt hash is refused with "-e".
+    """
+    def store_hash(match):
+        try:
+            account = upgrade_literal_shell_word(match.group(2))
+        except ValueError:
+            return match.group(0)
+        if not account.startswith('cumulus:'):
+            return match.group(0)
+        if match.group(3):
+            # "chpasswd -e" installs the value as it is: a clear-text password
+            # left there would lock the account and stay readable without login.
+            if not re.fullmatch(r'\$[A-Za-z0-9]+\$[A-Za-z0-9./$=,-]+', account[8:]):
+                raise ValueError(
+                    '"chpasswd -e" needs a crypt hash for cumulus; remove -e to '
+                    'have a clear-text password hashed on save')
+            return match.group(0)
+        if account == 'cumulus:':
+            return match.group(0)
+        return "%secho 'cumulus:%s' | chpasswd -e" % (
+            match.group(1), hash_ztp_password(account[8:]))
+
+    return re.sub(
+        r'^([ \t]*)echo[ \t]+(.+?)[ \t]*\|[ \t]*chpasswd([ \t]+-e)?[ \t]*$',
+        store_hash, content, flags=re.MULTILINE,
+    )
+
+
 def action_save_ztp_script():
     try:
         data = json.loads(POST_DATA)
@@ -3900,6 +3985,7 @@ def action_save_ztp_script():
     content = data.get('content', '')
     try:
         content = validate_ztp_script_content(content)
+        content = hash_ztp_password_lines(content)
     except ValueError as exc:
         result_json({
             'success': False, 'error_code': 'invalid_ztp_script',
@@ -3925,7 +4011,8 @@ def action_save_ztp_script():
             'error': f'ZTP script was not saved: {exc}',
         })
     
-    result_json({"success": True, "message": "ZTP script saved"})
+    # The stored script differs from the request once the password is hashed.
+    result_json({"success": True, "message": "ZTP script saved", "content": content})
 
 # ======================== DHCP STATUS ========================
 
@@ -7503,14 +7590,22 @@ def upgrade_literal_assignment(content, name):
     return upgrade_literal_shell_word(matches[0].strip())
 
 
-def render_upgrade_preserve_hook(public_key, password, target_release, server_ip):
-    """Build the entire supported post-install program; site script code is never copied."""
+def render_upgrade_preserve_hook(public_key, password, target_release, server_ip,
+                                 hashed=False):
+    """Build the entire supported post-install program; site script code is never copied.
+
+    hashed=True renders hook version 2: the Quick Settings line carried a crypt
+    hash, applied with "chpasswd -e". Version 1 (a clear-text password from a
+    script saved by an earlier release) stays byte-for-byte what 4.2 pinned.
+    """
     from addressing import normalize_server_ref
     server_ip = normalize_server_ref(server_ip)
     if not re.fullmatch(r'[0-9][A-Za-z0-9._-]{0,99}', target_release):
         raise ValueError('Invalid upgrade target release')
     if not password or len(password) > 128 or any(c in password for c in '\r\n\x00'):
         raise ValueError('Invalid cumulus password in Quick Settings')
+    if hashed and not re.fullmatch(r'\$[A-Za-z0-9]+\$[A-Za-z0-9./$=,-]+', password):
+        raise ValueError('Invalid cumulus password hash in Quick Settings')
     if any(c in public_key for c in '\r\n\x00') or not ztp_script_public_key(
             'KEY=' + shlex.quote(public_key)):
         raise ValueError('Invalid SSH key in Quick Settings')
@@ -7518,11 +7613,15 @@ def render_upgrade_preserve_hook(public_key, password, target_release, server_ip
         ('IMAGE_SERVER_HOSTNAME', server_ip),
         ('CUMULUS_TARGET_RELEASE', target_release),
         ('KEY', public_key),
-        ('CUMULUS_PASSWORD', password),
+        ('CUMULUS_PASSWORD_HASH' if hashed else 'CUMULUS_PASSWORD', password),
     ))
+    if hashed:
+        version, set_password = '2', '"cumulus:$CUMULUS_PASSWORD_HASH" | chpasswd -e'
+    else:
+        version, set_password = '1', '"cumulus:$CUMULUS_PASSWORD" | chpasswd'
     return '''#!/bin/bash
 # CUMULUS-AUTOPROVISIONING
-# LLDPQ_UPGRADE_HOOK_VERSION=1
+# LLDPQ_UPGRADE_HOOK_VERSION=''' + version + '''
 # Upgrade only: the installer restores the saved NVUE startup.yaml.
 # Only literal access settings are copied from the site's ZTP Quick Settings.
 ''' + settings + r'''
@@ -7576,7 +7675,7 @@ function main(){
         return 1
     fi
     if ! passwd -x 99999 cumulus ||
-        ! printf '%s\n' "cumulus:$CUMULUS_PASSWORD" | chpasswd; then
+        ! printf '%s\n' ''' + set_password + r'''; then
         echo 'Failed to restore the cumulus password' >&2
         return 1
     fi
@@ -7591,14 +7690,19 @@ fi
 
 def validate_upgrade_preserve_hook_content(content):
     """Reject old provisioning hooks and modified/custom programs before dispatch."""
-    if not isinstance(content, str) or '\n# LLDPQ_UPGRADE_HOOK_VERSION=1\n' not in content:
+    # Version 2 carries a crypt hash for "chpasswd -e"; version 1 is the
+    # clear-text form pinned by jobs that started from an older saved script.
+    hashed = isinstance(content, str) and '\n# LLDPQ_UPGRADE_HOOK_VERSION=2\n' in content
+    if not isinstance(content, str) or not (
+            hashed or '\n# LLDPQ_UPGRADE_HOOK_VERSION=1\n' in content):
         raise ValueError('Pinned upgrade hook predates config preservation; start a new upgrade job')
+    secret = 'CUMULUS_PASSWORD_HASH' if hashed else 'CUMULUS_PASSWORD'
     actual = {name: upgrade_literal_assignment(content, name) for name in (
-        'KEY', 'CUMULUS_PASSWORD', 'CUMULUS_TARGET_RELEASE', 'IMAGE_SERVER_HOSTNAME',
+        'KEY', secret, 'CUMULUS_TARGET_RELEASE', 'IMAGE_SERVER_HOSTNAME',
     )}
     expected = render_upgrade_preserve_hook(
-        actual['KEY'], actual['CUMULUS_PASSWORD'], actual['CUMULUS_TARGET_RELEASE'],
-        actual['IMAGE_SERVER_HOSTNAME'],
+        actual['KEY'], actual[secret], actual['CUMULUS_TARGET_RELEASE'],
+        actual['IMAGE_SERVER_HOSTNAME'], hashed=hashed,
     )
     if content != expected:
         raise ValueError('Pinned upgrade hook is not the managed config-preserving program')
@@ -7615,15 +7719,20 @@ def prepare_upgrade_post_install_script(content, server_ip):
     validate_ztp_script_content(content)
     key = upgrade_literal_assignment(content, 'KEY')
     target = upgrade_literal_assignment(content, 'CUMULUS_TARGET_RELEASE')
+    # "chpasswd -e" lines carry a crypt hash; the bare form is the clear-text
+    # password of a script saved before hashes were stored.
     password_lines = re.findall(
-        r'^\s*echo\s+(.+?)\s*\|\s*chpasswd\s*$', content, re.MULTILINE,
+        r'^\s*echo\s+(.+?)\s*\|\s*chpasswd(\s+-e)?\s*$', content, re.MULTILINE,
     )
     if len(password_lines) != 1:
         raise ValueError('Apply and save Quick Settings: one literal cumulus password is required')
-    account_password = upgrade_literal_shell_word(password_lines[0])
+    account_password = upgrade_literal_shell_word(password_lines[0][0])
     if not account_password.startswith('cumulus:'):
         raise ValueError('Quick Settings password must belong to cumulus')
-    hook = render_upgrade_preserve_hook(key, account_password[8:], target, server_ip)
+    hook = render_upgrade_preserve_hook(
+        key, account_password[8:], target, server_ip,
+        hashed=bool(password_lines[0][1]),
+    )
     validate_ztp_script_content(hook)
     validate_upgrade_preserve_hook_content(hook)
     return hook

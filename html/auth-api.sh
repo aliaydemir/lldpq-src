@@ -260,8 +260,16 @@ case "$ACTION" in
             USERNAME_JSON=$(printf '%s' "$USERNAME" | json_escape)
             ROLE_JSON=$(printf '%s' "$ROLE" | json_escape)
             LLDPQ_HOSTNAME_JSON=$(get_lldpq_hostname | json_escape)
+            # A session opened over TLS (nginx passes HTTPS=on) is never sent
+            # over http:// again. A login over plain HTTP gets the header it
+            # always got: port 80 has to keep working.
+            if [ "$HTTPS" = "on" ]; then
+                COOKIE_SECURE="Secure; "
+            else
+                COOKIE_SECURE=""
+            fi
             echo "Content-Type: application/json"
-            echo "Set-Cookie: lldpq_session=$TOKEN; Path=/; HttpOnly; SameSite=Strict; $COOKIE_EXPIRY"
+            echo "Set-Cookie: lldpq_session=$TOKEN; Path=/; HttpOnly; SameSite=Strict; ${COOKIE_SECURE}$COOKIE_EXPIRY"
             echo ""
             echo "{\"success\": true, \"username\": $USERNAME_JSON, \"role\": $ROLE_JSON, \"lldpq_hostname\": $LLDPQ_HOSTNAME_JSON}"
         else
@@ -279,6 +287,8 @@ case "$ACTION" in
         fi
         
         echo "Content-Type: application/json"
+        # No Secure here: a browser replaces a cookie by name and path, so over
+        # TLS this line removes the Secure session cookie as well.
         echo "Set-Cookie: lldpq_session=; Path=/; HttpOnly; Max-Age=0"
         echo ""
         echo '{"success": true}'
@@ -333,11 +343,13 @@ case "$ACTION" in
         RESULT=$(auth_users_mutate change-password "$TARGET_USER" "$NEW_HASH")
         MUTATION_STATUS=$?
 
-        # An admin reset of ANOTHER user must invalidate that user's active
-        # sessions (same sweep as delete-user); a self change keeps this one.
-        if [ "$MUTATION_STATUS" -eq 0 ] && [ "$TARGET_USER" != "$CURRENT_USER" ]; then
+        # A password change must invalidate the target user's active sessions
+        # (same sweep as delete-user). Only the session making the change is
+        # kept, so a self change drops every OTHER session of that user: one
+        # opened earlier with the old password does not stay valid.
+        if [ "$MUTATION_STATUS" -eq 0 ]; then
             for session_file in "$SESSIONS_DIR"/*; do
-                if [ -f "$session_file" ]; then
+                if [ -f "$session_file" ] && [ "$session_file" != "$SESSIONS_DIR/$TOKEN" ]; then
                     SESSION_USER=$(sed -n '2p' "$session_file" 2>/dev/null)
                     if [ "$SESSION_USER" = "$TARGET_USER" ]; then
                         rm -f "$session_file"

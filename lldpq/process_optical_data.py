@@ -80,11 +80,23 @@ def _parse_optical_diagnostics_content(content):
         lines = section.strip().split('\n')
         if not lines:
             continue
-        interface_match = re.match(r'(\w+)', lines[0].strip())
+        # The key is the whole interface name.  A word-only match filed the
+        # block of a VLAN sub-interface ("swp6.100") under its parent "swp6"
+        # and replaced the parent's module readings with it.
+        interface_match = re.match(r'(\S+)', lines[0].strip())
         if not interface_match:
             continue
         port_data[interface_match.group(1)] = '\n'.join(lines[1:])
     return port_data
+
+
+def _is_subinterface(interface):
+    """A VLAN sub-interface (swp6.100) rides its parent's module.
+
+    It has no cage of its own, so whatever its block holds it is never an
+    optical port: no row, no state and no place among breakout siblings.
+    """
+    return '.' in interface
 
 
 def read_optical_diagnostics_file(filepath):
@@ -117,6 +129,81 @@ def describe_optical_collection_failure(reason, interface=None):
     if reason == 'OPTICAL_TOOL_UNAVAILABLE':
         return f'Bounded optical diagnostics are unavailable for {interface}'
     return 'Optical diagnostics collection was incomplete'
+
+
+BREAKOUT_SUBPORT_RE = re.compile(r'swp(\d+)s(\d+)')
+# Only blanks and tabs may precede the label on its line.  "^\s*" also runs
+# over line ends, so a block with a long run of empty lines was rescanned
+# from every one of them.
+INTERFACE_STATE_RE = re.compile(
+    r'^[^\S\n]*Interface\s+state\s*:\s*([^\s]+)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _plan_breakout_cages(analyzer, port_data, failed_interfaces, hostname):
+    """Plan channel ownership for every breakout cage in one device's file.
+
+    ``ethtool -m`` returns the whole module for each swp<N>s<M>, so which
+    channels a sub-port owns can only be told from its siblings, wherever
+    they sit in the file (link-up ports are collected first).  Returns
+    ({interface: channels per sub-port}, {interface: parsed block}); the
+    parsed blocks are handed on so no block is parsed twice.  A cage that
+    cannot be planned is absent from the first map and keeps the standalone
+    rule (channel M+1).
+    """
+    cages = {}
+    for interface in port_data:
+        match = BREAKOUT_SUBPORT_RE.fullmatch(interface)
+        if not match:
+            continue
+        try:
+            index = int(match.group(2))
+        except ValueError:
+            # int() refuses a run of thousands of digits (a corrupted file).
+            # A sub-port number that large is beyond any module's channels,
+            # so its cage has no plan, like any suffix above the channel
+            # count, and the device keeps its rows.
+            index = None
+        cages.setdefault(match.group(1), {})[index] = interface
+    lanes_per_subport = {}
+    parsed_blocks = {}
+    for members in cages.values():
+        if None in members:
+            continue
+        try:
+            siblings = {}
+            for index, interface in members.items():
+                optical_data = port_data[interface] or ''
+                params = None
+                # A block without module readings (failed read, empty cage,
+                # DAC) is still a sub-port; it only contributes no lanes.
+                if (interface not in failed_interfaces
+                        and len(optical_data.strip()) >= 10
+                        and not NO_TRANSCEIVER_DATA_RE.search(optical_data)):
+                    params = analyzer.parse_optical_data(optical_data)
+                    if params is not None:
+                        parsed_blocks[interface] = params
+                state_match = INTERFACE_STATE_RE.search(optical_data)
+                siblings[index] = {
+                    'state': (state_match.group(1).strip().lower()
+                              if state_match else None),
+                    'params': params,
+                }
+            block = analyzer.plan_breakout_lanes(siblings)
+        except Exception as exc:
+            # Odd input costs the cage its plan, never the device its rows.
+            # Say so: those rows are back on channel M+1.
+            names = ', '.join(members[index] for index in sorted(members))
+            print(f"⚠ {hostname}: breakout channels of {names[:200]} could "
+                  f"not be planned ({type(exc).__name__}); each sub-port "
+                  f"keeps channel M+1")
+            continue
+        if block is not None:
+            for interface in members.values():
+                lanes_per_subport[interface] = block
+    return lanes_per_subport, parsed_blocks
+
 
 # Per-process analyzer for parse workers: thresholds and parsing logic only,
 # without the multi-megabyte history the parent keeps.
@@ -167,8 +254,17 @@ def _classify_optical_file(filepath, hostname):
         history = analyzer.optical_history.get(port_name)
         return stats_entry, (history[-1] if history else None)
 
+    # Breakout siblings are planned together before any of them is graded.
+    # Locals only: the pooled analyzer must carry nothing to the next device.
+    breakout_lanes, parsed_blocks = _plan_breakout_cages(
+        analyzer, port_data, failed_interfaces, hostname
+    )
+
     for interface, optical_data in port_data.items():
         port_name = f"{hostname}:{interface}"
+
+        if _is_subinterface(interface):
+            continue
 
         if interface in failed_interfaces:
             state_op(port_name, 'unknown', optical_data[:500])
@@ -237,7 +333,9 @@ def _classify_optical_file(filepath, hostname):
         if interface_state in {'down', 'lowerlayerdown', 'dormant'}:
             # Preserve a DOWN row only when real DOM values remain
             # readable.  The no-data and DAC cases were excluded above.
-            parsed = analyzer.parse_optical_data(optical_data)
+            parsed = parsed_blocks.get(interface)
+            if parsed is None:
+                parsed = analyzer.parse_optical_data(optical_data)
             usable_dom = parsed is not None and any(
                 parsed.get(metric) is not None for metric in (
                     'rx_power_dbm', 'tx_power_dbm', 'temperature_c',
@@ -246,7 +344,9 @@ def _classify_optical_file(filepath, hostname):
             )
             if not usable_dom:
                 continue
-            if analyzer.update_optical_stats(port_name, optical_data):
+            if analyzer.update_optical_stats(
+                    port_name, optical_data, parsed=parsed,
+                    lanes_per_subport=breakout_lanes.get(interface)):
                 stats_entry, history_entry = updated_entries(port_name)
                 if stats_entry:
                     stats_entry['health_status'] = 'down'
@@ -267,14 +367,19 @@ def _classify_optical_file(filepath, hostname):
             continue
 
         # Update optical analyzer
-        if analyzer.update_optical_stats(port_name, optical_data):
+        if analyzer.update_optical_stats(
+                port_name, optical_data,
+                parsed=parsed_blocks.get(interface),
+                lanes_per_subport=breakout_lanes.get(interface)):
             ops.append(('update', port_name, *updated_entries(port_name)))
 
     # A well-formed timeout marker normally sits inside its interface
     # block.  Retain visibility even if a future collector emits the
-    # marker without that block.
+    # marker without that block.  A sub-interface's marker still makes the
+    # collection incomplete (file_failures), but it is not a port.
     for reason, interface in file_failures:
-        if interface and interface not in port_data:
+        if (interface and interface not in port_data
+                and not _is_subinterface(interface)):
             state_op(
                 f"{hostname}:{interface}", 'unknown',
                 describe_optical_collection_failure(reason, interface),
@@ -286,7 +391,8 @@ def _classify_optical_file(filepath, hostname):
     # ports still appear in the file.  An incomplete collection (budget,
     # timeout, inventory failure) must not prune anything.
     if not file_failures and analyzer.optical_history:
-        live = {f"{hostname}:{iface}" for iface in port_data}
+        live = {f"{hostname}:{iface}" for iface in port_data
+                if not _is_subinterface(iface)}
         analyzer.optical_history = {
             port: entries
             for port, entries in analyzer.optical_history.items()

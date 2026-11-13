@@ -81,6 +81,20 @@ _NETWORK_SECRET_RE = re.compile(
     r"(?i)\b(snmp[-_ ]?community|community|key[-_ ]?string|psk|password|passwd)"
     r"(?:\s+7)?\s*(?:[:=]|\s)\s*([^\s,;]+)"
 )
+# Keys the two patterns above do not know (redact_secrets in ai-api.sh masks
+# the same ones). They are applied after those two, on their output, so a
+# value those two mask stays masked.
+_ADDED_SECRET_RE = re.compile(
+    r"(?i)\b(secret|(?:\w+_)?(?:token|cak)|(?:ro|rw)?community(?:-v6|6)?|"
+    r"authentication-key|(?:auth-(?:md5|sha)|encrypt-(?:aes|des))[\w-]{0,16})"
+    r"(?:\s+7)?\s*(?:[:=]|\s)\s*([^\s,;]+)"
+)
+# snmpd.conf: createUser [-e ENGINEID] user (MD5|SHA*) [-m|-l] authkey
+#             [(DES|AES*) [-m|-l] [privkey]] -- no key name precedes the keys.
+_SNMP_CREATEUSER_RE = re.compile(
+    r"(?i)\b(createUser\s+(?:-e\s+\S+\s+)?\S+\s+(?:MD5|SHA[\w-]*)\s+(?:-[ml]\s+)?)"
+    r"[^\s,;]+(?:(\s+(?:DES|AES[\w-]*)\s+(?:-[ml]\s+)?)[^\s,;]+)?"
+)
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
 _PEM_RE = re.compile(r"-----BEGIN [^-]+-----.*?-----END [^-]+-----", re.DOTALL)
 _ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])/(?:[^\s'\";,]+)")
@@ -107,6 +121,16 @@ def _redacted_detail(value: Any, limit: int = MAX_DETAIL_CHARS) -> str:
     text = _SECRET_ASSIGN_RE.sub(lambda m: "%s%s[redacted]" % (m.group(1), m.group(2)), text)
     text = _NETWORK_SECRET_RE.sub(lambda m: "%s [redacted]" % m.group(1), text)
     text = _ABS_PATH_RE.sub("[path]", text)
+    text = _SNMP_CREATEUSER_RE.sub(
+        lambda m: m.group(1) + "[redacted]"
+        + (m.group(2) + "[redacted]" if m.group(2) else ""), text
+    )
+    # A value already replaced above is left as it is: event ids are hashes of
+    # this text and must not change for input the older patterns handled.
+    text = _ADDED_SECRET_RE.sub(
+        lambda m: m.group(0) if m.group(2).startswith("[redacted]")
+        else "%s [redacted]" % m.group(1), text
+    )
     return _bounded_text(text, limit)
 
 

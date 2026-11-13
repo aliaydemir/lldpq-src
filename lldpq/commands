@@ -29,7 +29,7 @@
 #nv co replace /tmp/${HOSTNAME}.yaml ; nv co diff
 #
 #ls -lah | grep cumulus-linux-5.14 | grep -v 787M
-#sudo netq config add cli server 10.15.22.244 access-key a19c5b66edcd3f71e0cff056c8e2b07fda6b7310e83d21bea04934c519c26bed secret-key hYjBn0YhOH6JADtNqniBTOuNpUknoK4/fT4GDysaFKY= premises OPID0 $(if [[ $(ip vrf identify 2>&1) == "mgmt" ]]; then echo "vrf mgmt"; fi) && sudo netq config restart cli
+#sudo netq config add cli server 10.15.22.244 access-key <access-key> secret-key <secret-key> premises OPID0 $(if [[ $(ip vrf identify 2>&1) == "mgmt" ]]; then echo "vrf mgmt"; fi) && sudo netq config restart cli
 #sudo netq config add agent server 10.158.232.244 vrf mgmt ; sudo netq config restart agent
 #netq config status agent
 #sensors | egrep -i 'pwr|power|psu|pmic|vr|rail'

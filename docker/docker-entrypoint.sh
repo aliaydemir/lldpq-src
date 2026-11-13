@@ -36,6 +36,12 @@ fi
 LLDPQ_MGMT_VRF=mgmt
 # The VRF the services run in, when they run in one. Read by lldpq-vrf.
 LLDPQ_SERVICE_VRF_FILE="${LLDPQ_SERVICE_VRF_FILE:-/run/lldpq-service-vrf}"
+# Where the kernel publishes each network device's ifindex.
+LLDPQ_SYS_CLASS_NET="${LLDPQ_SYS_CLASS_NET:-/sys/class/net}"
+# ifindex of the VRF device the services were started in; empty when they run
+# in the default VRF. The services' sockets stay bound to that one device, so
+# the watchdog at the end of this file reports when the VRF is replaced.
+MGMT_VRF_IFINDEX=""
 # One-line outcome, repeated next to the ready message at the end of start-up.
 MGMT_VRF_STATUS=""
 # Set while the rule of an earlier image is still on the host; repeated there
@@ -118,6 +124,8 @@ _enter_mgmt_vrf() {
     if [ "$(ip vrf identify 2>/dev/null)" = "$vrf" ]; then
         [ -e "$LLDPQ_SERVICE_VRF_FILE" ] ||
             printf '%s\n' "$vrf" > "$LLDPQ_SERVICE_VRF_FILE" 2>/dev/null || true
+        MGMT_VRF_IFINDEX=$(cat "$LLDPQ_SYS_CLASS_NET/$vrf/ifindex" 2>/dev/null) || MGMT_VRF_IFINDEX=""
+        case "$MGMT_VRF_IFINDEX" in *[!0-9]*) MGMT_VRF_IFINDEX="" ;; esac
         MGMT_VRF_STATUS="✓ $vrf VRF detected (table $table) — services run inside it"
         echo "$MGMT_VRF_STATUS"
         return 0
@@ -674,7 +682,12 @@ fi
 if [ -f /home/lldpq/lldpq/devices.yaml ]; then
     chown lldpq:www-data /home/lldpq/lldpq/devices.yaml
     chmod 664 /home/lldpq/lldpq/devices.yaml
-    echo "✓ devices.yaml loaded ($(grep -c '^\s*[0-9]' /home/lldpq/lldpq/devices.yaml 2>/dev/null || echo 0) devices)"
+    # grep -c prints the 0 itself when nothing matches.
+    echo "✓ devices.yaml loaded ($(grep -c '^\s*[0-9]' /home/lldpq/lldpq/devices.yaml 2>/dev/null || true) devices)"
+    # The image ships an empty inventory; nothing is collected until it has devices.
+    if grep -qx 'devices: {}' /home/lldpq/lldpq/devices.yaml 2>/dev/null; then
+        echo "  No devices defined yet — add them under Assets → Edit Devices (sample: /home/lldpq/lldpq/devices.yaml.example)"
+    fi
 else
     echo "⚠ No devices.yaml found"
     echo "  Mount with: -v /path/to/devices.yaml:/home/lldpq/lldpq/devices.yaml"
@@ -2269,7 +2282,24 @@ else
 fi
 
 # ─── SSH Server Setup ───
-echo "lldpq:lldpq" | chpasswd 2>/dev/null
+# LLDPQ_SSHD=no: no SSH service on TCP/2033 and no known password on the lldpq
+# account (`docker exec` still gives a shell). Unset or yes: both as before.
+SSHD_ENABLED=true
+case "$(printf '%s' "${LLDPQ_SSHD:-yes}" | tr '[:upper:]' '[:lower:]')" in
+    no|false|off|0) SSHD_ENABLED=false ;;
+    yes|true|on|1) ;;
+    *)
+        echo "⚠ LLDPQ_SSHD=$LLDPQ_SSHD is not understood (use yes or no); starting the SSH service" >&2
+        ;;
+esac
+if [ "$SSHD_ENABLED" = true ]; then
+    echo "lldpq:lldpq" | chpasswd 2>/dev/null
+else
+    # The image ships the account without a password. Lock it all the same: a
+    # writable layer that went through an SSH-enabled start holds the known one.
+    passwd -l lldpq >/dev/null 2>&1 ||
+        echo "⚠ the password of the lldpq account could not be locked" >&2
+fi
 
 # ─── Start Services ───
 echo ""
@@ -2383,7 +2413,11 @@ fi
 echo "  ✓ fcgiwrap ($LLDPQ_FCGI_WORKERS workers)"
 
 # Start SSH server (port 2033)
-/usr/sbin/sshd 2>/dev/null && echo "  ✓ sshd (port 2033)" || echo "  ⚠ sshd failed to start"
+if [ "$SSHD_ENABLED" = true ]; then
+    /usr/sbin/sshd 2>/dev/null && echo "  ✓ sshd (port 2033)" || echo "  ⚠ sshd failed to start"
+else
+    echo "  sshd: not started (LLDPQ_SSHD=$LLDPQ_SSHD)"
+fi
 
 # Console bridge lifecycle helpers. The supervisor owns and reaps each bridge
 # process, then restarts it if it exits while nginx keeps the container alive.
@@ -2520,6 +2554,7 @@ _supervise_services() {
     local now
     local fcgiwrap_deaths=0 fcgiwrap_window_start=0 fcgiwrap_abandoned=false
     local cron_deaths=0 cron_window_start=0 cron_abandoned=false
+    local vrf_ifindex vrf_ifindex_seen="$MGMT_VRF_IFINDEX"
     trap '_stop_fcgiwrap || true' EXIT
     trap 'exit 0' TERM INT
 
@@ -2557,10 +2592,192 @@ _supervise_services() {
                 _restart_cron || echo "  ⚠ cron restart failed; watchdog will retry" >&2
             fi
         fi
+
+        # Only when the services were started inside the management VRF. A VRF
+        # that is deleted and created again is a new device with a new ifindex,
+        # while every socket opened so far stays bound to the old one. Nothing
+        # is restarted from here: one line per change, the operator decides.
+        if [ -n "$MGMT_VRF_IFINDEX" ]; then
+            vrf_ifindex=$(cat "$LLDPQ_SYS_CLASS_NET/$LLDPQ_MGMT_VRF/ifindex" 2>/dev/null) || vrf_ifindex=""
+            if [ "$vrf_ifindex" != "$vrf_ifindex_seen" ]; then
+                vrf_ifindex_seen=$vrf_ifindex
+                if [ -z "$vrf_ifindex" ]; then
+                    echo "CRITICAL: the $LLDPQ_MGMT_VRF VRF device the services were started in (ifindex $MGMT_VRF_IFINDEX) is gone; the services are still bound to that old device. When the VRF is back, restart the container: docker restart lldpq" >&2
+                elif [ "$vrf_ifindex" != "$MGMT_VRF_IFINDEX" ]; then
+                    echo "CRITICAL: the $LLDPQ_MGMT_VRF VRF was re-created (ifindex $MGMT_VRF_IFINDEX at start, now $vrf_ifindex); the services are still bound to the old device and do not use the new one. Restart the container: docker restart lldpq" >&2
+                fi
+            fi
+        fi
     done
 }
 
 _supervise_services &
+
+# ─── HTTPS (optional) ───
+# LLDPQ_HTTPS_PORT=<port> adds a TLS listener on that port to the same nginx
+# server block, so every location answers there as well. Plain HTTP on port 80
+# stays exactly as it is: ONIE/ZTP clients and the health probes use it. Unset
+# or empty: no listener, no certificate, and the site file is not touched.
+#
+# The certificate is the operator's own pair when one is mounted in
+# HTTPS_SUPPLIED_DIR (tls.crt and tls.key, PEM), otherwise a self-signed pair
+# created once and kept in the system-config volume, where it survives the
+# container being re-created.
+#
+# nginx is the container's main process: a listener it cannot open or a
+# certificate it cannot load would stop the container and, with a restart
+# policy, loop. Whatever goes wrong here therefore ends in one warning line and
+# a container that serves HTTP only.
+HTTPS_SITE_FILE=/etc/nginx/sites-available/lldpq
+HTTPS_SUPPLIED_DIR=/etc/lldpq-tls
+HTTPS_GENERATED_DIR="$SYSTEM_CONFIG_DIR/tls"
+# Ends every line added to the site file. A restarted container keeps its
+# writable layer; the lines of the earlier start are found by it.
+HTTPS_SITE_MARK='# lldpq-https'
+# One-line outcome, printed under the ready message.
+HTTPS_STATUS=""
+
+# Rewrite the site file without the lines of an earlier start and, when a port
+# is given ($1, with certificate $2 and key $3), with a TLS twin of every
+# port-80 listen line (IPv4, and IPv6 where the file still has it) followed by
+# the certificate. Fails, leaving the file as it was, when there is no port-80
+# listen line to follow.
+_https_write_site() {
+    local staged
+    staged=$(mktemp) || return 1
+    if HTTPS_PORT="${1:-}" HTTPS_CERT="${2:-}" HTTPS_KEY="${3:-}" HTTPS_MARK="$HTTPS_SITE_MARK" \
+        awk '
+            BEGIN { port = ENVIRON["HTTPS_PORT"]; mark = ENVIRON["HTTPS_MARK"] }
+            length($0) >= length(mark) &&
+                substr($0, length($0) - length(mark) + 1) == mark { next }
+            { print }
+            port != "" && /^[ \t]*listen[ \t]+(\[::\]:)?80([ \t][^;]*)?;/ {
+                match($0, /^[ \t]*/)
+                indent = substr($0, 1, RLENGTH)
+                match($0, /^[ \t]*listen[ \t]+/)
+                rest = substr($0, RLENGTH + 1)
+                address = ""
+                if (substr(rest, 1, 5) == "[::]:") { address = "[::]:"; rest = substr(rest, 6) }
+                rest = substr(rest, 3)
+                sub(/;.*/, "", rest)
+                print indent "listen " address port " ssl" rest "; " mark
+                if (!added++) {
+                    print indent "ssl_certificate \"" ENVIRON["HTTPS_CERT"] "\"; " mark
+                    print indent "ssl_certificate_key \"" ENVIRON["HTTPS_KEY"] "\"; " mark
+                    print indent "ssl_protocols TLSv1.2 TLSv1.3; " mark
+                }
+            }
+            END { exit (port != "" && !added) }
+        ' "$HTTPS_SITE_FILE" > "$staged" && cat "$staged" > "$HTTPS_SITE_FILE"; then
+        rm -f "$staged"
+        return 0
+    fi
+    rm -f "$staged"
+    return 1
+}
+
+# $1 certificate, $2 key: an earlier start's pair that is still good for a day.
+_https_generated_pair_usable() {
+    [ -s "$1" ] && [ -s "$2" ] || return 1
+    openssl x509 -in "$1" -noout -checkend 86400 >/dev/null 2>&1
+}
+
+# $1 certificate, $2 key. The key is readable by root only, which is who the
+# nginx master process reads it as; both files appear only once complete.
+_https_generate_pair() {
+    local cert="$1" key="$2" directory name
+    directory=$(dirname "$cert")
+    name=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9.-' | cut -c1-63) || name=""
+    [ -n "$name" ] || name=lldpq
+    mkdir -p "$directory" && chown root:root "$directory" && chmod 700 "$directory" || return 1
+    rm -f "$cert.new" "$key.new"
+    if (umask 077 && openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 825 \
+            -subj "/CN=$name" -addext "subjectAltName=DNS:$name" \
+            -keyout "$key.new" -out "$cert.new") >/dev/null 2>&1 &&
+       [ -s "$cert.new" ] && [ -s "$key.new" ] &&
+       chmod 600 "$key.new" && chmod 644 "$cert.new" &&
+       mv -f "$key.new" "$key" && mv -f "$cert.new" "$cert"; then
+        return 0
+    fi
+    rm -f "$cert.new" "$key.new"
+    return 1
+}
+
+# $1 why
+_https_not_enabled() {
+    HTTPS_STATUS="⚠ HTTPS not enabled (LLDPQ_HTTPS_PORT=$LLDPQ_HTTPS_PORT): $1; the web UI is served over HTTP only"
+}
+
+_setup_https() {
+    local port="${LLDPQ_HTTPS_PORT:-}" cert key kind listeners report
+    # First the lines of an earlier start, so that every return below leaves
+    # the site file as the image ships it.
+    if grep -q "$HTTPS_SITE_MARK\$" "$HTTPS_SITE_FILE" 2>/dev/null && ! _https_write_site 2>/dev/null; then
+        HTTPS_STATUS="⚠ the HTTPS lines of an earlier start could not be removed from $HTTPS_SITE_FILE"
+        return 0
+    fi
+    [ -n "$port" ] || return 0
+    case "$port" in
+        *[!0-9]*|0*|80|??????*) port="" ;;
+        *) [ "$port" -le 65535 ] 2>/dev/null || port="" ;;
+    esac
+    if [ -z "$port" ]; then
+        _https_not_enabled "the value is not a usable TCP port (1-65535, and not 80)"
+        return 0
+    fi
+    # Every other listener of this container is up by now, and with host
+    # networking the host's own are visible as well.
+    if ! listeners=$(ss -H -ltn "sport = :$port" 2>/dev/null); then
+        _https_not_enabled "TCP port $port could not be checked for another listener ('ss' failed)"
+        return 0
+    fi
+    if [ -n "$listeners" ]; then
+        _https_not_enabled "TCP port $port is already in use"
+        return 0
+    fi
+    cert="$HTTPS_SUPPLIED_DIR/tls.crt"
+    key="$HTTPS_SUPPLIED_DIR/tls.key"
+    if [ -e "$cert" ] || [ -L "$cert" ] || [ -e "$key" ] || [ -L "$key" ]; then
+        # The operator's pair is never replaced by a self-signed one, a link
+        # whose target is outside the mount included.
+        kind="certificate $cert"
+        if [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+            _https_not_enabled "$HTTPS_SUPPLIED_DIR must hold both tls.crt and tls.key"
+            return 0
+        fi
+        # nginx would ask for the passphrase on the terminal, where there is one.
+        if grep -q 'ENCRYPTED' "$key" 2>/dev/null; then
+            _https_not_enabled "$key is protected by a passphrase"
+            return 0
+        fi
+    else
+        cert="$HTTPS_GENERATED_DIR/lldpq.crt"
+        key="$HTTPS_GENERATED_DIR/lldpq.key"
+        kind="self-signed certificate $cert"
+        if ! command -v openssl >/dev/null 2>&1; then
+            _https_not_enabled "openssl is not available to create a certificate; mount one in $HTTPS_SUPPLIED_DIR (tls.crt, tls.key)"
+            return 0
+        fi
+        if ! _https_generated_pair_usable "$cert" "$key" &&
+           ! _https_generate_pair "$cert" "$key" 2>/dev/null; then
+            _https_not_enabled "a self-signed certificate could not be created in $HTTPS_GENERATED_DIR"
+            return 0
+        fi
+    fi
+    if ! _https_write_site "$port" "$cert" "$key" 2>/dev/null; then
+        _https_not_enabled "the listener could not be added to $HTTPS_SITE_FILE (no port-80 listen line, or the file cannot be written)"
+        return 0
+    fi
+    # nginx loads the certificate and key here exactly as it will at start.
+    if ! report=$(nginx -t 2>&1 </dev/null); then
+        report=$(printf '%s\n' "$report" | grep -F -m 1 '[emerg]') || report="nginx -t failed"
+        _https_write_site 2>/dev/null || true
+        _https_not_enabled "nginx does not accept the configuration [reported: $report]"
+        return 0
+    fi
+    HTTPS_STATUS="HTTPS: container port $port, $kind"
+}
+_setup_https
 
 # Start nginx (foreground - keeps container alive)
 echo "  ✓ nginx (port 80)"
@@ -2572,7 +2789,17 @@ case "${LLDPQ_PORT:-}" in
     *:*) echo "LLDPq is ready! Access: http://${LLDPQ_PORT}" ;;
     *)   echo "LLDPq is ready! Access: http://localhost:${LLDPQ_PORT}" ;;
 esac
-echo "  SSH: container port 2033 (reachable only if published or with host networking)"
+# Only with LLDPQ_HTTPS_PORT: the TLS listener's port, or why there is none.
+case "$HTTPS_STATUS" in
+    "") ;;
+    ⚠*) echo "  $HTTPS_STATUS" >&2 ;;
+    *)  echo "  $HTTPS_STATUS" ;;
+esac
+if [ "$SSHD_ENABLED" = true ]; then
+    echo "  SSH: container port 2033 (reachable only if published or with host networking)"
+else
+    echo "  SSH: disabled (LLDPQ_SSHD=$LLDPQ_SSHD); use 'docker exec' for a shell"
+fi
 # The VRF line is printed first thing; repeat it where the log is usually read.
 [ -z "$MGMT_VRF_STATUS" ] || echo "  $MGMT_VRF_STATUS"
 [ -z "$MGMT_RULE_WARNING" ] || echo "  $MGMT_RULE_WARNING"

@@ -300,7 +300,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
         </div>
         <div class="step active">
             <div class="step-title">ZTP: Set default password</div>
-            <div class="step-desc"><span class="step-code">echo 'cumulus:PASSWORD' | chpasswd</span> — password configured in Provision → ZTP → Quick Settings.</div>
+            <div class="step-desc"><span class="step-code">echo 'cumulus:$6$&lt;salt&gt;$&lt;hash&gt;' | chpasswd -e</span> — password configured in Provision → ZTP → Quick Settings; Save stores it in the script as a SHA-512 crypt hash.</div>
         </div>
         <div class="step active">
             <div class="step-title">ZTP: Install SSH public key</div>
@@ -500,7 +500,7 @@ h1 { color: #76b900; font-size: 28px; margin-bottom: 5px; }
         </div>
         <div class="step active">
             <div class="step-title">Monitoring & Telemetry active</div>
-            <div class="step-desc">Cron job (<span class="step-code">/usr/local/bin/lldpq</span> every 5 min) polls the new device for LLDP, interfaces, BGP, and alerts.</div>
+            <div class="step-desc">Cron job (<span class="step-code">/usr/local/bin/lldpq</span> every 10 min by default) polls the new device for LLDP, interfaces, BGP, and alerts.</div>
         </div>
     </div>
 </div>

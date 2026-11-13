@@ -4441,10 +4441,12 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
         echo "Enabling Streaming Telemetry..."
         echo ""
 
+        _docker_installed_now=false
         if ! command -v docker &> /dev/null; then
             echo "Docker not found. Installing Docker..."
             curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
             sudo sh /tmp/get-docker.sh
+            _docker_installed_now=true
             sudo usermod -aG docker "$(whoami)"
             rm /tmp/get-docker.sh
             echo "Docker installed successfully"
@@ -4493,11 +4495,15 @@ if [[ "$ENABLE_TELEMETRY" == "true" ]] || [[ "$DISABLE_TELEMETRY" == "true" ]]; 
         echo "Telemetry support enabled!"
         echo ""
 
-        if [[ ! -f /etc/docker/daemon.json ]]; then
+        # Only a Docker this run installed is switched to vfs: on a Docker that
+        # was already there the change would hide its images and containers.
+        if [[ ! -f /etc/docker/daemon.json ]] && [[ "$_docker_installed_now" == "true" ]]; then
             echo "Configuring Docker storage driver..."
             sudo mkdir -p /etc/docker
             echo '{"storage-driver": "vfs"}' | sudo tee /etc/docker/daemon.json > /dev/null
             sudo systemctl restart docker
+        elif [[ ! -f /etc/docker/daemon.json ]]; then
+            echo "[!] Docker was already installed: /etc/docker/daemon.json and the Docker service are left unchanged. On a host without overlay support, add \"storage-driver\": \"vfs\" to /etc/docker/daemon.json and run 'sudo systemctl restart docker' yourself (this hides the existing images and containers)."
         fi
 
         if [[ -f "$LLDPQ_INSTALL_DIR/telemetry/docker-compose.yaml" ]]; then
@@ -6589,10 +6595,12 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
         echo ""
         echo "  Checking Docker installation..."
 
+        _docker_installed_now=false
         if ! command -v docker &> /dev/null; then
             echo "  Docker not found. Installing Docker..."
             curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
             sudo sh /tmp/get-docker.sh
+            _docker_installed_now=true
             sudo usermod -aG docker "$LLDPQ_USER"
             rm /tmp/get-docker.sh
             echo "  Docker installed successfully"
@@ -6634,11 +6642,15 @@ if [[ "$INSTALL_MODE" == "fresh" ]]; then
         echo ""
 
         # Configure Docker storage driver if needed (for VMs without overlay support)
-        if [[ ! -f /etc/docker/daemon.json ]]; then
+        # Only a Docker this run installed is switched to vfs: on a Docker that
+        # was already there the change would hide its images and containers.
+        if [[ ! -f /etc/docker/daemon.json ]] && [[ "$_docker_installed_now" == "true" ]]; then
             echo "  Configuring Docker storage driver..."
             sudo mkdir -p /etc/docker
             echo '{"storage-driver": "vfs"}' | sudo tee /etc/docker/daemon.json > /dev/null
             sudo systemctl restart docker
+        elif [[ ! -f /etc/docker/daemon.json ]]; then
+            echo "  [!] Docker was already installed: /etc/docker/daemon.json and the Docker service are left unchanged. On a host without overlay support, add \"storage-driver\": \"vfs\" to /etc/docker/daemon.json and run 'sudo systemctl restart docker' yourself (this hides the existing images and containers)."
         fi
 
         # Start the telemetry stack automatically

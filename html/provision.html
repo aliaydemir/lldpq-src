@@ -1225,6 +1225,7 @@
                     <input type="password" class="form-input" id="ztpPassword" style="width: 100%; padding-right: 36px;" placeholder="Default password" autocomplete="new-password">
                     <button type="button" onclick="togglePasswordVisibility()" style="position:absolute; right:4px; top:50%; transform:translateY(-50%); background:none; border:none; color:#888; cursor:pointer; padding:4px;" title="Show/Hide" id="pwToggle"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg></button>
                 </form>
+                <div id="ztpPasswordStatus" style="margin-top: 4px; font-size: 11px; color: #888;"></div>
             </div>
             <div>
                 <label style="font-size: 11px; color: #888; display: block; margin-bottom: 4px;">IMAGE SERVER IP</label>
@@ -4567,16 +4568,42 @@ function toggleScriptEditor() {
 }
 
 // --- Quick Settings ---
+// cumulus-ztp.sh is served without login, so the cumulus password is stored
+// as a crypt hash applied with "chpasswd -e". A script saved by an earlier
+// version still carries the clear-text form until it is saved again.
+const ZTP_PASSWORD_LINE = /^(\s*)echo\s+'cumulus:.*'\s*\|\s*chpasswd(\s+-e)?[ \t]*$/m;
+
+function ztpPasswordCommand(content) {
+    // The stored set-password command without its indentation, or ''.
+    const match = (content || '').match(ZTP_PASSWORD_LINE);
+    return match ? match[0].slice(match[1].length).trim() : '';
+}
+
+function renderZtpPasswordState(content) {
+    const input = document.getElementById('ztpPassword');
+    const status = document.getElementById('ztpPasswordStatus');
+    const command = ztpPasswordCommand(content);
+    if (!command) {
+        input.placeholder = 'Default password';
+        status.innerHTML = 'No password line in the script. A generated template uses the built-in default when this is left blank.';
+    } else if (/\s-e$/.test(command)) {
+        input.placeholder = 'Password is set - leave blank to keep it';
+        status.innerHTML = '<span style="color:#76b900;">Password is set</span> (stored as a hash, it cannot be shown). Leave blank to keep it.';
+    } else {
+        input.placeholder = 'Password is set - leave blank to keep it';
+        status.innerHTML = '<span style="color:#ff9800;">Password is set in clear text.</span> Save the script to store it as a hash; leave blank to keep it.';
+    }
+}
+
 function parseQuickSettings(content) {
     const osMatch = content.match(/CUMULUS_TARGET_RELEASE=(\S+)/);
-    const pwMatch = content.match(/^\s*echo\s+'cumulus:(.*)'\s*\|\s*chpasswd\s*$/m);
     const ipMatch = content.match(/IMAGE_SERVER_HOSTNAME=(\S+)/);
     // Don't overwrite SSH key from script — loadSSHKey() handles that from actual key file
 
     if (osMatch) document.getElementById('ztpTargetOS').value = osMatch[1];
-    if (pwMatch) {
-        document.getElementById('ztpPassword').value = pwMatch[1].replace(/'\\''/g, "'");
-    }
+    // The stored password is never read back into the field: blank keeps it.
+    document.getElementById('ztpPassword').value = '';
+    renderZtpPasswordState(content);
     if (ipMatch) document.getElementById('ztpImageServer').value = ipMatch[1];
     syncUpgradeServerIPFromZTP();
 }
@@ -4627,7 +4654,11 @@ function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
     }
     let content = document.getElementById('ztpEditor').value;
     const os = document.getElementById('ztpTargetOS').value.trim() || '5.14.0';
-    const pwRaw = document.getElementById('ztpPassword').value.trim() || 'Nvidia@123';
+    const pwTyped = document.getElementById('ztpPassword').value.trim();
+    // Blank keeps the stored password line. A script that never had one gets
+    // the built-in default; the server stores either as a hash on save.
+    const keptPassword = pwTyped ? '' : ztpPasswordCommand(content);
+    const pwRaw = pwTyped || 'Nvidia@123';
     const ip = document.getElementById('ztpImageServer').value.trim() || '192.168.100.200';
     const key = document.getElementById('ztpSSHKey').value.trim();
 
@@ -4652,7 +4683,7 @@ function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
 
     // If script is placeholder/empty, generate full template
     if (!content.includes('CUMULUS_TARGET_RELEASE') && !content.includes('init_ztp')) {
-        content = generateZTPTemplate(os, pw, ip, key);
+        content = generateZTPScript(os, pw, ip, key, keptPassword);
     } else if (needsUpgrade && !upgradeConfirmed) {
         // Never silently overwrite a customized persisted script. Upgrade is
         // explicit, but v1 serial logic is no longer treated as current.
@@ -4667,7 +4698,7 @@ function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
             '<span style="color:#ff9800;">The editor content will be replaced only after confirmation.</span><br><br>' +
             'Quick Settings (OS version, password, IP, SSH key) will be preserved.',
             () => {
-                const newContent = generateZTPTemplate(os, pw, ip, key);
+                const newContent = generateZTPScript(os, pw, ip, key, keptPassword);
                 document.getElementById('ztpEditor').value = newContent;
                 if (!scriptEditorVisible) toggleScriptEditor();
                 showToast('Script upgraded to hardened template (unsaved — click Save)', 'success');
@@ -4676,12 +4707,12 @@ function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
         );
         return false;
     } else if (needsUpgrade) {
-        content = generateZTPTemplate(os, pw, ip, key);
+        content = generateZTPScript(os, pw, ip, key, keptPassword);
     } else {
         // Update existing script via regex (already has serial logic or custom)
         if (os) content = content.replace(/CUMULUS_TARGET_RELEASE=\S+/, `CUMULUS_TARGET_RELEASE=${os}`);
-        if (pw) content = content.replace(
-            /^(\s*)echo\s+'cumulus:.*'\s*\|\s*chpasswd\s*$/m,
+        if (pwTyped) content = content.replace(
+            ZTP_PASSWORD_LINE,
             (_match, indent) => `${indent}echo 'cumulus:${pw}' | chpasswd`
         );
         if (ip) content = content.replace(/IMAGE_SERVER_HOSTNAME=\S+/, `IMAGE_SERVER_HOSTNAME=${ip}`);
@@ -4707,6 +4738,15 @@ function applyQuickSettings(afterApply = null, upgradeConfirmed = false) {
     showToast('Quick settings applied to script (unsaved — click Save)', 'info');
     if (afterApply) afterApply();
     return true;
+}
+
+function generateZTPScript(os, pw, ip, key, keptPassword) {
+    // A regenerated template carries the stored password line over when the
+    // field was left blank: a hash cannot be typed back in.
+    const generated = generateZTPTemplate(os, pw, ip, key);
+    return keptPassword
+        ? generated.replace(ZTP_PASSWORD_LINE, (_match, indent) => indent + keptPassword)
+        : generated;
 }
 
 function generateZTPTemplate(os, pw, ip, key) {
@@ -5078,9 +5118,20 @@ fi
 
 async function saveZTPScript() {
     const content = document.getElementById('ztpEditor').value;
+    // A typed password is only saved once "Apply to Script" wrote it into the editor.
+    const typed = document.getElementById('ztpPassword').value.trim();
+    const applied = !typed ||
+        ztpPasswordCommand(content) === `echo 'cumulus:${escapeBashSingleQuote(typed)}' | chpasswd`;
     const data = await apiCall('save-ztp-script', { content });
     if (data.success) {
-        showToast('ZTP script saved', 'success');
+        // The server stores the cumulus password as a hash: show what was saved.
+        if (typeof data.content === 'string') {
+            document.getElementById('ztpEditor').value = data.content;
+            if (applied) document.getElementById('ztpPassword').value = '';
+            renderZtpPasswordState(data.content);
+        }
+        if (applied) showToast('ZTP script saved', 'success');
+        else showToast('ZTP script saved, but the typed password was NOT applied: click Apply to Script, then Save', 'error');
         return true;
     } else {
         showToast('Save failed: ' + (data.error || 'Unknown error'), 'error');

@@ -66,6 +66,32 @@ class ReadOnlyPolicyTest(unittest.TestCase):
         self.assert_rejected("ethtool --show-fec swp1; reboot")
         self.assert_rejected("cat /sys/class/net/swp1/mtu > /tmp/x")
 
+    def test_words_the_device_runner_forbids_are_rejected(self):
+        # fabric-api.sh rejects these words anywhere in a command, even as an
+        # argument or filter; allowing them here would only make [DRYRUN:]
+        # promise what [RUN:] then refuses.
+        for command in (
+            "nv show system reboot reason",
+            "nv show system ztp",
+            "nv config find shutdown",
+            "sudo vtysh -c 'show running-config | include shutdown'",
+            "journalctl --no-pager -n 100 -g reboot",
+            'journalctl --no-pager -n 50 -g "nv config apply"',
+        ):
+            self.assert_rejected(command)
+        ok, reason = validate_ai_readonly_command(
+            "journalctl --no-pager -n 100 -g reboot"
+        )
+        self.assertFalse(ok)
+        self.assertEqual(
+            reason,
+            "'reboot' is not allowed by the device command runner, even as an "
+            "argument or filter",
+        )
+        # Whole words only: neighbouring diagnostics are unaffected.
+        self.assert_allowed("journalctl --no-pager -n 100 -g rebooted")
+        self.assert_allowed("nv show system")
+
 
 if __name__ == "__main__":
     unittest.main()

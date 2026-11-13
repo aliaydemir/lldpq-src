@@ -5,7 +5,7 @@
 # Usage: ./docker/docker-build.sh
 # Run from repo root directory, on any machine with Docker installed
 #
-# Output: ~/lldpq.tar.gz
+# Output: ~/lldpq-<arch>.tar.gz and ~/lldpq-<arch>.tar.gz.sha256
 
 set -euo pipefail
 
@@ -67,6 +67,25 @@ sudo docker save ${IMAGE_NAME}:${IMAGE_TAG} | gzip > "${OUTPUT_FILE}"
 chmod 644 "${OUTPUT_FILE}"
 SIZE=$(du -h "${OUTPUT_FILE}" | awk 'NR == 1 {print $1}')
 echo -e "${GREEN}  ✓ Exported (${SIZE})${NC}"
+# SHA-256 next to the archive, named by its bare file name so that
+# "sha256sum -c" works wherever both files are downloaded to. The guide tells
+# operators to verify one before loading the image.
+CHECKSUM_FILE="${OUTPUT_FILE}.sha256"
+if (
+    cd "$(dirname "${OUTPUT_FILE}")" || exit 1
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$(basename "${OUTPUT_FILE}")"
+    else
+        shasum -a 256 "$(basename "${OUTPUT_FILE}")"
+    fi
+) > "${CHECKSUM_FILE}"; then
+    chmod 644 "${CHECKSUM_FILE}"
+    echo -e "${GREEN}  ✓ SHA-256 written to ${CHECKSUM_FILE}${NC}"
+else
+    rm -f "${CHECKSUM_FILE}"
+    CHECKSUM_FILE=""
+    echo -e "${YELLOW}  ⚠ SHA-256 not written (neither sha256sum nor shasum worked)${NC}"
+fi
 echo ""
 
 echo -e "${YELLOW}[4/4]${NC} Cleaning up old test containers..."
@@ -82,7 +101,13 @@ echo -e "Image:  ${CYAN}${IMAGE_NAME}:${VERSION}${NC} (${SIZE})"
 echo -e "Commit: ${CYAN}${GIT_COMMIT}${NC}"
 echo -e "Arch:   ${CYAN}${ARCH_LABEL}${NC}"
 echo -e "File:   ${CYAN}${OUTPUT_FILE}${NC}"
+[ -z "${CHECKSUM_FILE}" ] || echo -e "SHA256: ${CYAN}${CHECKSUM_FILE}${NC}"
 echo ""
-echo -e "Run:    ${YELLOW}docker run -d -p 80:80 lldpq:latest${NC}"
-echo -e "Upload: ${YELLOW}scp ~/lldpq-${ARCH_LABEL}.tar.gz user@host:~/${NC}"
+if [ -n "${CHECKSUM_FILE}" ]; then
+    echo -e "Upload: ${YELLOW}scp ~/lldpq-${ARCH_LABEL}.tar.gz ~/lldpq-${ARCH_LABEL}.tar.gz.sha256 user@host:~/${NC}"
+else
+    echo -e "Upload: ${YELLOW}scp ~/lldpq-${ARCH_LABEL}.tar.gz user@host:~/${NC}"
+fi
 echo -e "Load:   ${YELLOW}docker load < lldpq-${ARCH_LABEL}.tar.gz${NC}"
+echo -e "Run:    ${YELLOW}see \"Quick start\" in DOCKER.md${NC}"
+echo -e "Release: check the image once on a Cumulus switch: ${YELLOW}sudo bash docker/test-mgmt-vrf-switch.sh${NC}"

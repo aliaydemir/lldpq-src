@@ -1,3 +1,24 @@
+# Login throttling. map and limit_req_zone belong to the http context, which
+# is where nginx includes this file. Only a request whose query string can
+# select the login action gets a key; every other request, including
+# /auth-api?action=check that each page and the Docker HEALTHCHECK poll, has
+# an empty key and is never counted. The match is a plain substring on
+# purpose: auth-api.sh takes the text after the LAST "action=", so a stricter
+# test here could be bypassed with a second action parameter.
+map $query_string $lldpq_login_client {
+        default "";
+        "~action=login" $binary_remote_addr;
+}
+map $query_string $lldpq_login_any {
+        default "";
+        "~action=login" login;
+}
+# Per client address, IPv4 or IPv6: 6 attempts at once, then one every 10 s.
+limit_req_zone $lldpq_login_client zone=lldpq_login_client:1m rate=6r/m;
+# All addresses together, so that rotating the source address does not lift
+# the limit: 21 attempts at once, then one every 2 s.
+limit_req_zone $lldpq_login_any zone=lldpq_login_all:1m rate=30r/m;
+
 server {
         listen 80 default_server;
         listen [::]:80 default_server;
@@ -102,23 +123,78 @@ server {
         location ~ ^/\.(?:assets\.ini|device-cache\.json)\. {
             return 404;
         }
-        location /configs/ {
+        # Collected device configurations, the LLDP problem archive and the
+        # monitor reports are served only to a logged-in user (admin or
+        # operator). nginx still delivers the bytes (autoindex, gzip, ranges);
+        # the internal session-gate subrequest validates the same session
+        # cookie as the APIs first. A request without a valid session gets
+        # 401 with the login page as its body.
+        # "^~" keeps the server-level regex locations (.ini, .sh, .py) from
+        # taking a URI out of these trees and answering it without the
+        # session check; the nested blocks keep those three rules in force.
+        # The public /<domain>/export_* locations at the end of this file
+        # alias single files out of monitor-results/ and stay unauthenticated.
+        location ^~ /configs/ {
+            auth_request /lldpq-session-gate;
+            error_page 401 /login.html;
             autoindex on;
             autoindex_exact_size off;
             autoindex_localtime on;
+            location ~ \.(?:sh|pyc?)$ {
+                return 404;
+            }
+            location ~* \.ini$ {
+                default_type text/plain;
+                add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+                add_header Pragma "no-cache";
+                add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+            }
         }
-        location /hstr/ {
+        location ^~ /hstr/ {
+            auth_request /lldpq-session-gate;
+            error_page 401 /login.html;
             autoindex on;
             autoindex_exact_size off;
             autoindex_localtime on;
+            location ~ \.(?:sh|pyc?)$ {
+                return 404;
+            }
+            location ~* \.ini$ {
+                default_type text/plain;
+                add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+                add_header Pragma "no-cache";
+                add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+            }
         }
-        location /monitor-results/ {
+        location ^~ /monitor-results/ {
+            auth_request /lldpq-session-gate;
+            error_page 401 /login.html;
             autoindex on;
             autoindex_exact_size off;
             autoindex_localtime on;
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
             add_header Pragma "no-cache";
             add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+            location ~ \.(?:sh|pyc?)$ {
+                return 404;
+            }
+            location ~* \.ini$ {
+                default_type text/plain;
+                add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+                add_header Pragma "no-cache";
+                add_header Expires "Thu, 01 Jan 1970 00:00:00 GMT";
+            }
+        }
+
+        # Session check behind the three locations above (auth_request
+        # subrequest, not reachable from outside). auth-guard.sh run directly
+        # answers 204 for a valid session cookie and 401 otherwise.
+        location = /lldpq-session-gate {
+            internal;
+            fastcgi_pass unix:/var/run/fcgiwrap.socket;
+            fastcgi_param SCRIPT_FILENAME /var/www/html/auth-guard.sh;
+            fastcgi_param HTTP_COOKIE $http_cookie;
+            fastcgi_pass_request_body off;
         }
 
         # .ini has no mime.types mapping and would fall back to octet-stream,
@@ -293,6 +369,15 @@ server {
         
         # Authentication API endpoint with fcgiwrap
         location = /auth-api {
+            # Password guessing: login attempts beyond the limits declared at
+            # the top of this file are answered here with 429 and never reach
+            # fcgiwrap, so they neither occupy nor sleep in one of its few
+            # workers. Nothing is stored and no account is locked: the limit
+            # lifts by itself once the attempts stop.
+            limit_req zone=lldpq_login_client burst=5 nodelay;
+            limit_req zone=lldpq_login_all burst=20 nodelay;
+            limit_req_status 429;
+            error_page 429 = @lldpq_login_throttled;
             fastcgi_pass unix:/var/run/fcgiwrap.socket;
             fastcgi_param SCRIPT_FILENAME /var/www/html/auth-api.sh;
             fastcgi_param QUERY_STRING $query_string;
@@ -300,6 +385,15 @@ server {
             fastcgi_param CONTENT_TYPE $content_type;
             fastcgi_param CONTENT_LENGTH $content_length;
             fastcgi_param HTTP_COOKIE $http_cookie;
+            # "on" for a request that arrived over TLS, not passed at all over
+            # plain HTTP: auth-api.sh marks the session cookie Secure by it.
+            fastcgi_param HTTPS $https if_not_empty;
+        }
+        # Same JSON shape as a failed login, so the login page shows the text.
+        location @lldpq_login_throttled {
+            default_type application/json;
+            add_header Retry-After 10 always;
+            return 429 '{"success": false, "error": "Too many login attempts. Wait a few seconds and try again."}';
         }
         
         # Ansible API endpoint with .sh extension (alias for compatibility)

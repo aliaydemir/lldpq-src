@@ -63,3 +63,13 @@ require_admin() {
         _guard_deny 403 "Admin privileges required"
     fi
 }
+
+# Run directly instead of sourced: the nginx auth_request subrequest for the
+# session-gated static directories (/configs/, /hstr/, /monitor-results/).
+# require_auth answers 401 itself; a valid session gets an empty 204 and nginx
+# then serves the requested file.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    require_auth
+    echo "Status: 204 No Content"
+    echo ""
+fi

@@ -453,12 +453,12 @@
 
                     <!-- Docker deployments: a container can't replace its own image — update on the host. -->
                     <div id="update-docker" style="display:none;">
-                        <div class="note">This is a <strong>Docker</strong> deployment. A container can't replace its own image, so run the update on the <strong>host</strong> that runs the container:</div>
+                        <div class="note">This is a <strong>Docker</strong> deployment. A container can't replace its own image, so update on the <strong>host</strong> that runs the container, with the steps under <strong>Updating</strong> in <a href="https://github.com/aliaydemir/lldpq-src/blob/main/DOCKER.md#updating" target="_blank" rel="noopener" style="color:#76b900;">DOCKER.md</a>. For a <strong>Compose</strong> deployment the short form is:</div>
                         <pre id="docker-cmd" class="run-output" style="height:auto; min-height:0; padding:14px;">curl -fsSL https://aliaydemir.com/lldpq-amd64.tar.gz | gunzip | docker load &amp;&amp; docker compose up -d</pre>
                         <div class="p-toolbar">
                             <button class="btn secondary" onclick="copyDockerCmd(this)"><svg viewBox="0 0 24 24"><path d="M19,21H8V7H19M19,5H8A2,2 0 0,0 6,7V21A2,2 0 0,0 8,23H19A2,2 0 0,0 21,21V7A2,2 0 0,0 19,5M16,1H4A2,2 0 0,0 2,3V17H4V3H16V1Z"/></svg>Copy command</button>
                         </div>
-                        <p class="p-desc">Loads the new image and recreates the container; named volumes (config &amp; monitoring data) persist. Run it from the directory containing your <code>docker-compose.yml</code>.</p>
+                        <p class="p-desc">Compose only: loads the new image and recreates the service; named volumes (config &amp; monitoring data) persist. Run it from the directory containing your <code>docker-compose.yml</code>, with the same environment variables (such as <code>LLDPQ_PORT</code>) used to create it. A container created with <code>docker run</code>, as on a Cumulus switch, is not replaced by this command: the image is loaded and the old container keeps running.</p>
                     </div>
 
                     <div id="update-bare">
@@ -1966,6 +1966,10 @@ async function runLLDPq() {
     }
 }
 
+// bin/lldpq ends a run on an inventory without devices with this line and
+// status 0: the run finished, but no page was refreshed.
+const RUN_COLLECTED_NOTHING = /^No devices in .* yet, so nothing was collected\./m;
+
 async function pollRunLog(epoch = runPollEpoch) {
     if (epoch !== runPollEpoch) return;
     if (runPollTimer) { clearTimeout(runPollTimer); runPollTimer = null; }
@@ -1995,7 +1999,10 @@ async function pollRunLog(epoch = runPollEpoch) {
             if (d.done) {
                 runActive = false;
                 document.getElementById('run-btn').disabled = false;
-                if (d.ok) {
+                if (d.ok && RUN_COLLECTED_NOTHING.test(d.log || '')) {
+                    setStatus('run-status', 'Finished \u2014 the inventory has no devices, so nothing was collected.', 'info');
+                    markDone('run', false);
+                } else if (d.ok) {
                     setStatus('run-status', 'Done \u2713 \u2014 Fabric / LLDP / Analysis pages are now up to date.', 'ok');
                     markDone('run', true);
                 } else if (!Number.isInteger(d.exit_code)) {
@@ -2044,7 +2051,10 @@ async function showRunLog() {
                 setStatus('run-status', 'The previous run was interrupted before an exit status was recorded.', 'err');
                 markDone('run', false);
             } else {
-                if (d.ok) {
+                if (d.ok && RUN_COLLECTED_NOTHING.test(d.log || '')) {
+                    setStatus('run-status', 'Last run collected nothing: the inventory has no devices.', 'info');
+                    markDone('run', false);
+                } else if (d.ok) {
                     setStatus('run-status', 'Last run finished successfully.', 'info');
                     markDone('run', true);
                 } else if (!Number.isInteger(d.exit_code)) {
@@ -2848,7 +2858,8 @@ async function backupExport(){
         const blob=new Blob([arr],{type:'application/gzip'}); const url=URL.createObjectURL(blob);
         const a=document.createElement('a'); a.href=url; a.download=d.filename||'lldpq-config.tar.gz';
         document.body.appendChild(a); a.click(); setTimeout(()=>{URL.revokeObjectURL(url); a.remove();},100);
-        setStatus('bk-export-msg','Downloaded bundle \u2014 store it securely'+(d.has_key?'; it includes the collector private key':'')+' \u2713','ok');
+        const notes=Array.isArray(d.warnings)?d.warnings:[];
+        setStatus('bk-export-msg','Downloaded bundle \u2014 store it securely'+(d.has_key?'; it includes the collector private key':'')+' \u2713'+(notes.length?' \u2014 '+notes.join(' '):''),'ok');
     }catch(e){ setStatus('bk-export-msg','Export failed: '+e.message,'err'); }
 }
 

@@ -812,7 +812,7 @@ def ipam_to_topology_config_yaml(ipam, p2p=None):
                     continue
                 if _map_switch_role("", dev) is not None:
                     continue
-                fam = re.split(r"[-_]", dev, 1)[0].lower()
+                fam = re.split(r"[-_]", dev, maxsplit=1)[0].lower()
                 if len(fam) >= 3:
                     host_families.setdefault(fam, []).append(dev)
     stagger = []

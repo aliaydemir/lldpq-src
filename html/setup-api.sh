@@ -1825,7 +1825,7 @@ if action == 'update':
     # (docker load + docker compose up); refuse here and let the UI show the host command.
     if os.path.exists('/.dockerenv'):
         print(json.dumps({'success': False, 'docker': True,
-                          'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
+                          'error': 'Docker deployment: update on the host that runs the container, with the steps under Updating in DOCKER.md.'}))
         sys.exit(0)
     backup = post_data.get('backup', False)
     if not isinstance(backup, bool):
@@ -1961,7 +1961,7 @@ if action == 'update-offline':
     if os.path.exists('/.dockerenv'):
         cleanup_uploaded_tarball(tarball)
         print(json.dumps({'success': False, 'docker': True,
-                          'error': 'Docker deployment: update on the host (docker load + docker compose up). See the instructions on this page.'}))
+                          'error': 'Docker deployment: update on the host that runs the container, with the steps under Updating in DOCKER.md.'}))
         sys.exit(0)
     backup = post_data.get('backup', False)
     if not isinstance(backup, bool):
@@ -2473,6 +2473,7 @@ if action == 'backup-export':
               ('display-aliases.json', web_root)]
     buf = io.BytesIO()
     added = []
+    left_out = []
     has_key = False
     sensitive_files = []
     try:
@@ -2489,6 +2490,20 @@ if action == 'backup-export':
         )
         with tarfile.open(fileobj=buf, mode='w:gz') as tar:
             for fn, content in config_files:
+                # A new deployment's inventory has an empty device map. Restore
+                # rejects a bundle that carries one (this release and 4.2.x), so
+                # that file is left out and reported; the rest is still exported
+                # and a restore leaves the target's inventory as it is.
+                if fn == 'devices.yaml':
+                    try:
+                        inventory = backup_tools._load_yaml_mapping(content.decode('utf-8'), fn)
+                    except Exception:
+                        inventory = None
+                    if (isinstance(inventory, dict)
+                            and isinstance(inventory.get('devices'), dict)
+                            and not inventory['devices']):
+                        left_out.append('devices.yaml was left out of the bundle: it has no devices.')
+                        continue
                 # Never return a successful bundle that this same release will
                 # reject during restore. This catches hand-edited/legacy drift
                 # across every managed config, not only display aliases.
@@ -2573,11 +2588,13 @@ if action == 'backup-export':
         print(json.dumps({'success': False, 'error': 'Bundle failed: ' + str(e)}))
         sys.exit(0)
     if not added:
-        print(json.dumps({'success': False, 'error': 'No config files found to back up.'}))
+        print(json.dumps({'success': False,
+                          'error': ' '.join(['No config files found to back up.'] + left_out)}))
         sys.exit(0)
     name = ('lldpq-backup-%s.tar.gz' if has_key else 'lldpq-config-%s.tar.gz') % _t.strftime('%Y%m%d-%H%M%S')
     print(json.dumps({'success': True, 'filename': name, 'files': added, 'has_key': has_key,
                       'sensitive': bool(sensitive_files), 'sensitive_files': sensitive_files,
+                      'warnings': left_out,
                       'data': base64.b64encode(buf.getvalue()).decode()}))
     sys.exit(0)
 

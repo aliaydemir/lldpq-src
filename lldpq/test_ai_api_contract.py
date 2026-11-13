@@ -142,7 +142,7 @@ class AskAiApiContractTest(unittest.TestCase):
                              and node.name == '_commit_analysis_state')
         )
         self.assertLess(
-            commit.index("_save_json_state(ANALYSIS_FILE, analysis)"),
+            commit.index("_save_json_state(ANALYSIS_FILE, _redact_report(analysis))"),
             commit.index("if snapshot is not None:"),
         )
         self.assertIn("snapshot_updated = persisted and collection_complete", PYTHON_TEXT)
@@ -514,6 +514,7 @@ class AskAiApiContractTest(unittest.TestCase):
             "_SECRET_VALUE_PATTERN",
             "_TYPED_SECRET_RE",
             "_SECRET_RE",
+            "_SNMP_CREATEUSER_RE",
             "_BEARER_RE",
             "_URI_CREDENTIAL_RE",
             "_URL_KEY_RE",

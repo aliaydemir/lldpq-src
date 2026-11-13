@@ -50,6 +50,15 @@ services:
       # Host with a "mgmt" VRF whose DHCP/ONIE clients are in-band: keep the
       # services in the default VRF (see "Management VRF" in DOCKER.md).
       # LLDPQ_ENTER_MGMT_VRF: "no"
+      # Keep the container's SSH service off. With host networking it listens
+      # on TCP/2033 of the host itself; "docker exec" still gives a shell.
+      # LLDPQ_SSHD: "no"
+      # Serve the web UI over HTTPS as well, on this TCP port of the host (it
+      # must be free). Port 80 stays plain HTTP for ONIE/ZTP clients. Your own
+      # certificate: mount a directory holding tls.crt and tls.key (PEM) at
+      # /etc/lldpq-tls; without it a self-signed one is kept in
+      # lldpq-system-config.
+      # LLDPQ_HTTPS_PORT: "8443"
 
 volumes:
   lldpq-data:

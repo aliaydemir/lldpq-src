@@ -147,7 +147,9 @@ const CMD_GROUPS = [
     { title:'Logs', color:'#ef5350', cmds:['sudo journalctl -p err -n 100 --no-pager','sudo journalctl -n 100 --no-pager'] },
 ];
 
-const POOL = 4;             // max parallel device sessions (single-worker fcgiwrap — keep low)
+// Max parallel device sessions. fcgiwrap runs 4 workers by default: one stays free
+// for the rest of the UI and the login check of the report directories.
+const POOL = 3;
 const CMD_TIMEOUT_MS = 45000;
 const NGINX_CAP_MS = 60000; // nginx caps fabric-api.sh at 60s; run-device-command has no background path
 const MAX_TRIES = 3;        // retries on backend device_busy (flock contention)

@@ -226,7 +226,7 @@ command_maker() {
         hostname=$(echo "$entry" | cut -d' ' -f1)
         ip=$(echo "$entry" | cut -d' ' -f2)
         if [[ -n "$vrf" ]]; then
-            command="timeout $timeout vrf task exec $vrf ping -c$count $ip"
+            command="$vrf_ping -c$count $ip"
         else
             command="timeout $timeout ping -c$count $ip"
         fi
@@ -398,6 +398,22 @@ main() {
         esac
     done
     shift $((OPTIND-1))
+
+    # Cumulus has the `vrf` wrapper. The Docker image has iproute2 only, where
+    # entering a VRF needs root. The entry stays outside the timeout so that a
+    # slow start under many parallel pings is not counted as a lost reply.
+    if [[ -n "$vrf_name" ]]; then
+        if command -v vrf > /dev/null 2>&1; then
+            vrf_ping="timeout $timeout vrf task exec $vrf_name ping"
+        elif ip vrf exec "$vrf_name" true > /dev/null 2>&1; then
+            vrf_ping="ip vrf exec $vrf_name timeout $timeout ping"
+        elif sudo -n ip vrf exec "$vrf_name" true > /dev/null 2>&1; then
+            vrf_ping="sudo -n ip vrf exec $vrf_name timeout $timeout ping"
+        else
+            echo -e "\e[91mError: cannot ping in VRF '$vrf_name': no 'vrf' command, and 'ip vrf exec $vrf_name' failed (unknown VRF, or root is needed)\e[0m" >&2
+            exit 1
+        fi
+    fi
     
     # Check for IP range arguments (remaining positional args)
     if [[ $# -eq 2 ]]; then

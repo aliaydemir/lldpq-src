@@ -673,6 +673,15 @@ class OpticalAnalyzer:
             bias_thresholds = {}
         optical_params['bias_thresholds_ma'] = bias_thresholds
         optical_params['bias_flags'] = bias_flags
+        # Every lane as collected, before the declared-single-lane filter
+        # below.  A breakout sub-port shares the module with its siblings, so
+        # the channels it owns are told from the whole dump.  Internal: the
+        # stored stats, history and exports copy named fields only.
+        optical_params['_unfiltered_lane_readings'] = {
+            'rx_power': rx_readings,
+            'tx_power': tx_readings,
+            'bias_current': bias_readings,
+        }
         self._set_lane_readings(optical_params, 'rx_power', rx_readings)
         self._set_lane_readings(optical_params, 'tx_power', tx_readings)
         self._set_lane_readings(optical_params, 'bias_current', bias_readings)
@@ -860,17 +869,184 @@ class OpticalAnalyzer:
         optical_params[value_key] = value
         optical_params[lane_key] = lane
 
-    def _select_breakout_lane(self, port_name: str,
-                              optical_params: Dict[str, Any]) -> None:
-        """Limit a breakout interface to its matching physical channel.
+    @staticmethod
+    def _power_of_two_ceiling(value: int) -> int:
+        """Smallest power of two that is not below ``value``."""
+        power = 1
+        while power < value:
+            power <<= 1
+        return power
 
-        Drivers often return all cage lanes for every `swpNsM` interface.  In
-        that case channel M+1 is the only lane owned by the logical interface.
+    @staticmethod
+    def _lane_readings_as_collected(
+            optical_params: Optional[Dict[str, Any]]) -> Dict[str, List[tuple]]:
+        """metric -> [(channel, value)] before any lane was filtered out."""
+        params = optical_params or {}
+        collected = params.get('_unfiltered_lane_readings')
+        if collected is None:
+            # Not a parse_optical_data result: the lane lists it carries are
+            # all the evidence there is.
+            collected = {}
+            for metric in ('rx_power', 'tx_power', 'bias_current'):
+                lanes_key = (f'_{metric}_lanes_dbm' if metric != 'bias_current'
+                             else '_bias_current_lanes_ma')
+                collected[metric] = zip(params.get(f'_{metric}_lane_ids') or [],
+                                        params.get(lanes_key) or [])
+        return {metric: list(collected.get(metric) or [])
+                for metric in ('rx_power', 'tx_power', 'bias_current')}
+
+    def plan_breakout_lanes(self, siblings: Dict[int, Dict[str, Any]]
+                            ) -> Optional[int]:
+        """Channels per sub-port for one breakout cage, or None.
+
+        ``ethtool -m`` on swp<N>s<M> returns the whole module, identical for
+        every sibling, so the channels a sub-port owns can only be told from
+        the cage: its sub-ports share the module's channels equally and in
+        order, sub-port k owning channels k*B+1 .. (k+1)*B.  B is chosen from
+        the DOM itself: a link-up sub-port's channels must be in service.
+        The switch side's host-lane width is deliberately not used; a module
+        with fewer optical lanes than host lanes (400G-DR4 split 4x100G)
+        numbers its DOM channels by optical lane, one per sub-port.
+
+        ``siblings`` maps the suffix M of every swp<N>s<M> block the device's
+        collection holds for the cage to ``{'state': <operstate or None>,
+        'params': <parse_optical_data result or None>}``.  A block without
+        lane readings (no module data, failed read, DAC) still counts as a
+        sub-port.  None means the cage gives nothing to plan from and every
+        block keeps the standalone rule (channel M+1).
+        """
+        tables: Dict[int, Dict[int, Dict[str, float]]] = {}
+        for index, sibling in siblings.items():
+            table: Dict[int, Dict[str, float]] = {}
+            collected = self._lane_readings_as_collected(
+                (sibling or {}).get('params'))
+            for metric, readings in collected.items():
+                for lane, value in readings:
+                    table.setdefault(lane, {})[metric] = value
+            if table:
+                tables[index] = table
+        if not tables:
+            return None
+
+        # A lone swpNs0 block is still one of at least two sub-ports.
+        sub_ports = max(2, self._power_of_two_ceiling(
+            max(len(siblings), max(siblings) + 1)))
+        channels = self._power_of_two_ceiling(
+            max(max(table) for table in tables.values()))
+
+        dark, off = self.DARK_POWER_DBM, self.LASER_OFF_BIAS_MA
+
+        def receiving(reading):
+            return reading.get('rx_power', dark) > dark
+
+        def driven(reading):
+            return (reading.get('tx_power', dark) > dark or
+                    reading.get('bias_current', off) > off)
+
+        every_reading = [reading for table in tables.values()
+                         for reading in table.values()]
+        # A DOM side the module never shows alive (rx power not implemented,
+        # no transmit monitoring) is not evidence against any block size.
+        rx_seen = any(receiving(reading) for reading in every_reading)
+        tx_seen = any(driven(reading) for reading in every_reading)
+        # The sub-ports together must cover every channel that is alive.
+        need = max((lane for table in tables.values()
+                    for lane, reading in table.items()
+                    if receiving(reading) or driven(reading)), default=0)
+        candidates = []
+        block = 1
+        while sub_ports * block <= channels:
+            if sub_ports * block >= need:
+                candidates.append(block)
+            block <<= 1
+        if not candidates:
+            # More sub-ports than channels: nothing to share out.
+            return None
+
+        # A sub-port's link state is judged against its own dump, read back
+        # to back with that state; a sibling's dump only stands in for a
+        # channel its own dump does not report.
+        shared: Dict[int, Dict[str, float]] = {}
+        for index in sorted(tables):
+            for lane, reading in tables[index].items():
+                shared.setdefault(lane, reading)
+
+        def out_of_service(reading):
+            rx = reading.get('rx_power')
+            if rx_seen and rx is not None and rx <= dark:
+                return True
+            tx = reading.get('tx_power')
+            bias = reading.get('bias_current')
+            if not tx_seen or (tx is None and bias is None):
+                return False
+            return ((tx is None or tx <= dark) and
+                    (bias is None or bias <= off))
+
+        link_up = {
+            index for index, sibling in siblings.items()
+            if str((sibling or {}).get('state') or '').strip().lower() == 'up'
+        }
+
+        def refuting(block):
+            """Channels a link-up sub-port would own although out of service."""
+            # One pass over the reported channels, each asking for its
+            # owner: walking every sub-port's block over every channel made
+            # an oversized (corrupted) cage quadratic.  The block is a power
+            # of two, so the owner is a shift, cheap for any channel number.
+            shift = block.bit_length() - 1
+            count = 0
+            for lane, reading in shared.items():
+                index = (lane - 1) >> shift
+                if index in link_up and out_of_service(
+                        tables.get(index, {}).get(lane, reading)):
+                    count += 1
+            return count
+
+        # Fewest contradictions wins; when no link-up sub-port can decide,
+        # the widest consistent block is used.
+        return min(candidates, key=lambda block: (refuting(block), -block))
+
+    def _select_breakout_block(self, index: int, optical_params: Dict[str, Any],
+                               lanes_per_subport: int) -> None:
+        """Limit sub-port ``index`` to the channel block the cage plan gave it."""
+        first = index * lanes_per_subport + 1
+        last = (index + 1) * lanes_per_subport
+        collected = self._lane_readings_as_collected(optical_params)
+        flags = optical_params.get('bias_flags') or {}
+        reported = {lane for readings in collected.values()
+                    for lane, _value in readings}
+        reported.update(int(lane) for lane in flags)
+        if not any(first <= lane <= last for lane in reported):
+            # Already interface-scoped or numbered in an unfamiliar way:
+            # hiding evidence would be worse than showing a sibling's lane.
+            return
+        optical_params['bias_flags'] = {
+            lane: state for lane, state in flags.items()
+            if first <= int(lane) <= last
+        }
+        for metric, readings in collected.items():
+            self._set_lane_readings(optical_params, metric, [
+                item for item in readings if first <= item[0] <= last
+            ])
+
+    def _select_breakout_lane(self, port_name: str,
+                              optical_params: Dict[str, Any],
+                              lanes_per_subport: Optional[int] = None) -> None:
+        """Limit a breakout interface to the physical channels it owns.
+
+        Drivers often return all cage lanes for every `swpNsM` interface.
+        With the cage's plan (``lanes_per_subport``, see plan_breakout_lanes)
+        the interface owns channels M*B+1 .. (M+1)*B.  Without sibling
+        context channel M+1 is the only lane owned by the logical interface.
         A single returned lane is already interface-scoped and is left intact.
         """
         interface = port_name.split(':', 1)[-1]
         match = re.fullmatch(r'swp\d+s(\d+)', interface)
         if not match:
+            return
+        if lanes_per_subport is not None:
+            self._select_breakout_block(int(match.group(1)), optical_params,
+                                        lanes_per_subport)
             return
         wanted_lane = int(match.group(1)) + 1
         flags = optical_params.get('bias_flags') or {}
@@ -1095,18 +1271,28 @@ class OpticalAnalyzer:
             return OpticalHealth.GOOD
         return OpticalHealth.EXCELLENT
 
-    def update_optical_stats(self, port_name: str, optical_data: str):
+    def update_optical_stats(self, port_name: str, optical_data: str,
+                             parsed: Optional[Dict[str, Any]] = None,
+                             lanes_per_subport: Optional[int] = None):
         """Update optical statistics for a port
         
         Returns False if port is DAC/Copper (skipped), True if processed
+
+        ``parsed`` is this block's parse_optical_data result when the caller
+        already holds it (it is consumed: lane selection edits it in place).
+        ``lanes_per_subport`` is the breakout cage's plan from
+        plan_breakout_lanes; without it a breakout interface keeps channel
+        M+1.
         """
-        optical_params = self.parse_optical_data(optical_data)
+        optical_params = (parsed if parsed is not None
+                          else self.parse_optical_data(optical_data))
         
         # Skip DAC/Copper cables - parse_optical_data returns None for these
         if optical_params is None:
             return False
 
-        self._select_breakout_lane(port_name, optical_params)
+        self._select_breakout_lane(port_name, optical_params,
+                                   lanes_per_subport)
         # After the interface owns its lanes, and never before: a breakout
         # sub-interface whose own lane is dark is still that interface's
         # verdict, not a spare channel to set aside.

@@ -2,7 +2,8 @@
 # Single container: nginx + fcgiwrap + python3 + ssh + cron
 FROM ubuntu:22.04
 
-ARG LLDPQ_VERSION=4.0.4
+# docker/docker-build.sh sets this from the VERSION file.
+ARG LLDPQ_VERSION=unknown
 LABEL maintainer="ali@lldpq.dev"
 LABEL description="LLDPq Network Monitoring"
 LABEL version="${LLDPQ_VERSION}"
@@ -40,7 +41,8 @@ COPY docker/dotf/UTC /etc/localtime
 COPY etc/tmux.conf /etc/tmux.conf
 RUN chmod 755 /usr/bin/exa && chmod 644 /etc/nanorc /etc/bash.bashrc /etc/tmux.conf && echo "UTC" > /etc/timezone
 
-# SSH server (port 2033 for container access)
+# SSH server (port 2033 for container access). The entrypoint starts it unless
+# the container runs with LLDPQ_SSHD=no.
 RUN mkdir -p /run/sshd && \
     sed -i 's/^#Port 22/Port 2033/' /etc/ssh/sshd_config && \
     sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
@@ -158,6 +160,19 @@ RUN mv /home/lldpq/lldpq/topology.dot /var/www/html/topology.dot \
     && chmod 664 /var/www/html/topology.dot /var/www/html/topology_config.yaml \
     && chown lldpq:www-data /home/lldpq/lldpq/devices.yaml \
     && chmod 664 /home/lldpq/lldpq/devices.yaml
+
+# A new deployment starts without devices. lldpq/devices.yaml in the repository
+# is a sample inventory; as the live file it would have cron poll the sample's
+# addresses from a container nobody has configured. Keep the sample next to the
+# live file, which gets the sample's header and defaults with an empty device map.
+# The web editor shows the file as it is: a comment says that the {} has to go.
+RUN cd /home/lldpq/lldpq \
+    && mv devices.yaml devices.yaml.example \
+    && awk -v hint='# No devices yet. To add some here, delete the {} below and list them under that line, indented by two spaces: IP: Hostname @role' \
+        '/^devices:/ { print hint; print "devices: {}"; exit } { print }' devices.yaml.example > devices.yaml \
+    && grep -qx 'devices: {}' devices.yaml \
+    && chown lldpq:www-data devices.yaml devices.yaml.example \
+    && chmod 664 devices.yaml devices.yaml.example
 
 # Prepare DHCP server directories and config
 RUN mkdir -p /etc/dhcp /var/lib/dhcp /var/run \

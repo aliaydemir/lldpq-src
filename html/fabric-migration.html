@@ -2160,7 +2160,9 @@
         let pass = 0, warn = 0;
         try {
             const liveByDev = {};
-            await Promise.all(devs.map(async dev => {
+            // 3 at a time: fcgiwrap runs 4 workers by default, one stays free for the
+            // rest of the UI and the login check of the report directories.
+            await fetchPool(devs, 3, async dev => {
                 try {
                     const resp = await fetch('/fabric-api.sh?action=run-device-command', {
                         method: 'POST',
@@ -2171,7 +2173,7 @@
                 } catch (e) {
                     liveByDev[dev] = { __error: e.message };
                 }
-            }));
+            });
 
             for (const dev of devs) {
                 const live = liveByDev[dev] || {};
@@ -2355,8 +2357,9 @@
                 appliedPlan.changes[dev] = { applied: rec.applied || [] };
             }
             // Load device data for the plan's devices so verify can resolve profiles
+            // (3 at a time, for the same reason as in runVerification)
             const devs = planDevices();
-            await Promise.all(devs.map(async h => {
+            await fetchPool(devs, 3, async h => {
                 if (deviceData[h]) return;
                 try {
                     const r = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(h)}`);
@@ -2367,7 +2370,7 @@
                         if (d.vlan_profiles && Object.keys(d.vlan_profiles).length) vlanProfilesData = d.vlan_profiles;
                     }
                 } catch (e) { /* verify will report missing data */ }
-            }));
+            });
             $('rollback-btn').disabled = false;
             $('to-step4-btn').disabled = false;
             $('loaded-plan-banner').style.display = 'block';

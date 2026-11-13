@@ -37,8 +37,10 @@ class GenerationCommitTests(unittest.TestCase):
             '_max_collection_age_seconds', '_load_json_file', '_mr_path',
             '_pipeline_generation_state', '_generation_still_current',
             '_commit_analysis_state', '_save_json_state', 'action_analyze',
+            '_redact_report',
         )
         self.ns.update(os=os, math=math, datetime=datetime, timezone=timezone,
+                       redact_secrets=lambda value: value,
                        tempfile=tempfile, LLDPQ_DIR=str(self.root),
                        WEB_ROOT=str(self.root / 'web'), AI_STATE_DIR=str(self.state),
                        ANALYSIS_FILE=str(self.state / 'analysis.json'),

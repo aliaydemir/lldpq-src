@@ -577,7 +577,11 @@
         
         function listFiles() {
             fetch('/configs/')
-                .then(response => response.text())
+                .then(response => {
+                    // /configs/ needs a login: a 401/500 body is not a listing
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    return response.text();
+                })
                 .then(data => {
                     const parser = new DOMParser();
                     const htmlDoc = parser.parseFromString(data, 'text/html');

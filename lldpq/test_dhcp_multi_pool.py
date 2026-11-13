@@ -1493,8 +1493,129 @@ class DiscoveryIsUntouchedTests(unittest.TestCase):
     def test_the_scan_still_derives_its_range_from_the_first_subnet(self):
         source = extract_source("run_subnet_scan")
         self.assertIn("DISCOVERY_RANGE", source)
-        self.assertIn(r"re.search(r'subnet\s+([\d.]+)'", source)
+        self.assertIn(r"re.search(r'(?m)^[^#\n]*?\bsubnet\s+([\d.]+)'", source)
         self.assertNotIn("parse_dhcp_pools", source)
+
+    # The distribution's sample dhcpd.conf, which a monitoring-only container
+    # keeps: every subnet in it is commented out.
+    PACKAGED_SAMPLE_CONF = (
+        "# dhcpd.conf\n"
+        "#subnet 10.152.187.0 netmask 255.255.255.0 {\n"
+        "#}\n"
+        "\n"
+        "# This is a very basic subnet declaration.\n"
+        "\n"
+        "#subnet 10.254.239.0 netmask 255.255.255.224 {\n"
+        "#  range 10.254.239.10 10.254.239.20;\n"
+        "#}\n"
+    )
+
+    class RangeChosen(Exception):
+        pass
+
+    def scan_range(self, conf_text, configured=""):
+        """Run the real scan just far enough to learn which range it picked."""
+        def chosen(value):
+            raise self.RangeChosen(value)
+
+        namespace = {
+            "os": os, "re": re, "DISCOVERY_RANGE": "",
+            "read_lldpq_conf_key":
+                lambda key, default="": configured or default,
+            "ip_range_to_list": chosen,
+        }
+        exec(extract_source("run_subnet_scan"), namespace)
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "dhcpd.conf"
+            if conf_text is not None:
+                conf.write_text(conf_text, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"DHCP_CONF_FILE": str(conf)}):
+                try:
+                    namespace["run_subnet_scan"]()
+                except self.RangeChosen as picked:
+                    return picked.args[0]
+        raise AssertionError("the scan went past its range selection")
+
+    def test_a_commented_out_subnet_is_not_a_discovery_range(self):
+        # Nobody entered 10.152.187.0: the scan must not derive a range from it.
+        with self.assertRaisesRegex(ValueError, "No discovery range configured"):
+            self.scan_range(self.PACKAGED_SAMPLE_CONF)
+        with self.assertRaisesRegex(ValueError, "No discovery range configured"):
+            self.scan_range("  option routers 10.9.9.1; # subnet 10.9.9.0\n")
+        with self.assertRaisesRegex(ValueError, "No discovery range configured"):
+            self.scan_range(None)
+
+    def test_the_first_active_subnet_wins_over_a_commented_one(self):
+        conf = (self.PACKAGED_SAMPLE_CONF +
+                "shared-network OOB {\n"
+                "  subnet 192.168.100.0 netmask 255.255.255.0 {\n"
+                "    range 192.168.100.210 192.168.100.249;\n"
+                "  }\n"
+                "}\n")
+        self.assertEqual(self.scan_range(conf),
+                         "192.168.100.10-192.168.100.249")
+        self.assertEqual(self.scan_range(STAGING_FIXTURE),
+                         "192.168.100.10-192.168.100.249")
+        self.assertEqual(self.scan_range(CONFIG_VALIDATION_FIXTURE),
+                         "10.0.0.10-10.0.0.249")
+
+    def test_a_configured_range_never_consults_dhcpd_conf(self):
+        self.assertEqual(
+            self.scan_range(self.PACKAGED_SAMPLE_CONF, "10.7.0.5-10.7.0.9"),
+            "10.7.0.5-10.7.0.9")
+
+    def schedule(self, conf_text, configured="", active=()):
+        """Run the real once-per-minute check; report what it started."""
+        started, relaunched = [], []
+        with tempfile.TemporaryDirectory() as directory:
+            conf = Path(directory) / "dhcpd.conf"
+            if conf_text is not None:
+                conf.write_text(conf_text, encoding="utf-8")
+            namespace = {
+                "os": os, "re": re, "json": json, "time": time,
+                "DISCOVERY_RANGE": "",
+                # Never scanned: a scan is due as soon as a range exists.
+                "DISCOVERY_CACHE_FILE": str(Path(directory) / "no-cache.json"),
+                "read_lldpq_conf_key": lambda key, default="": (
+                    configured if key == "DISCOVERY_RANGE" and configured
+                    else default),
+                "list_discovery_jobs":
+                    lambda unfinished_only=False: list(active),
+                "launch_discovery_worker": relaunched.append,
+                "start_discovery_job":
+                    lambda trigger, apply: started.append((trigger, apply)),
+            }
+            for name in ("discovery_range_available", "run_discovery_schedule"):
+                exec(extract_source(name), namespace)
+            with mock.patch.dict(os.environ, {"DHCP_CONF_FILE": str(conf)}):
+                namespace["run_discovery_schedule"]()
+        return started, relaunched
+
+    def test_the_scheduler_creates_no_job_without_a_range(self):
+        # An unconfigured container used to queue a failing job every minute.
+        for conf in (self.PACKAGED_SAMPLE_CONF, "", None):
+            with self.subTest(conf=conf):
+                self.assertEqual(self.schedule(conf), ([], []))
+
+    def test_the_scheduler_still_scans_a_configured_or_active_range(self):
+        self.assertEqual(
+            self.schedule(self.PACKAGED_SAMPLE_CONF, "10.7.0.5-10.7.0.9"),
+            ([("schedule", False)], []))
+        self.assertEqual(self.schedule(STAGING_FIXTURE),
+                         ([("schedule", False)], []))
+
+    def test_the_scheduler_still_resumes_a_stalled_job_without_a_range(self):
+        stalled = {"id": "job-1", "created_at": 1, "worker_heartbeat": 1}
+        self.assertEqual(
+            self.schedule(self.PACKAGED_SAMPLE_CONF, active=[stalled]),
+            ([], ["job-1"]))
+
+    def test_the_scheduler_and_the_scan_share_one_fallback_expression(self):
+        expression = r"re.search(r'(?m)^[^#\n]*?\bsubnet\s+([\d.]+)'"
+        self.assertIn(expression, extract_source("run_subnet_scan"))
+        self.assertIn(expression, extract_source("discovery_range_available"))
+        self.assertIn("discovery_range_available()",
+                      extract_source("run_discovery_schedule"))
 
     def test_extra_ranges_remain_an_operator_choice(self):
         """Comma-separated ranges already work, so no code had to change."""

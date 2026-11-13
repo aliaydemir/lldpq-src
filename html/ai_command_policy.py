@@ -28,6 +28,20 @@ _VTYSH_SHOW_RE = re.compile(
     r"(?:\| *(?:include|exclude|begin|section) +[A-Za-z0-9_.:/,@%+=^ -]{1,160})?$",
     re.IGNORECASE,
 )
+# The device command runner in fabric-api.sh re-checks every Ask-AI command
+# against its FORBIDDEN_PATTERNS, which reject these words anywhere in the
+# text, even as an argument or a filter. Keep this list identical to that one
+# so that "allowed" here (also the [DRYRUN:] verdict) is what the runner runs.
+_RUNNER_FORBIDDEN_PATTERNS = (
+    r"\bmlxlink\b",
+    r"\bonie-install\b",
+    r"\breboot\b",
+    r"\bshutdown\b",
+    r"\bnv\s+config\s+(apply|replace|save|delete|patch|edit|detach|history)\b",
+    r"\bnv\s+set\b",
+    r"\bnv\s+unset\b",
+    r"\bztp\b",
+)
 
 
 def _result(ok: bool, reason: str = "") -> Tuple[bool, str]:
@@ -299,6 +313,14 @@ def validate_ai_readonly_command(command: str) -> Tuple[bool, str]:
 
     if not allowed:
         return _result(False, "command is not in the Ask-AI read-only policy")
+    for pattern in _RUNNER_FORBIDDEN_PATTERNS:
+        blocked = re.search(pattern, command, re.IGNORECASE)
+        if blocked:
+            return _result(
+                False,
+                "'%s' is not allowed by the device command runner, even as an "
+                "argument or filter" % blocked.group(0),
+            )
     return _result(True)
 
 

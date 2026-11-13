@@ -224,6 +224,35 @@ run_command() {
     fi
 }
 
+# An inventory that parses and lists no devices is how a new deployment starts,
+# not a collection failure: there is nothing to gather, so the run ends here
+# without marking, logging or publishing anything. A marker an earlier run left
+# is not touched either; only a complete publication clears it. The parser the
+# stages load decides. Everything else (no file, invalid YAML, a devices key
+# that is not a mapping, a parser that cannot run) is left to fail in its stage.
+# Not applied when assets.sh is pointed at another inventory, nor when every
+# stage that reads the inventory is switched off (that run stays silent), nor
+# once a generation has been published: an inventory emptied after that has to
+# fail in its stage, or the pages keep presenting the last report as current.
+inventory_lists_no_devices() {
+    python3 - "$LLDPQ_DIR" <<'PYTHON' >/dev/null 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import parse_devices
+config = parse_devices.load_devices_yaml(sys.argv[1] + "/devices.yaml")
+devices = parse_devices.get_all_devices(config)
+sys.exit(3 if isinstance(config.get("devices"), dict) and not devices else 0)
+PYTHON
+    [[ $? -eq 3 ]]
+}
+if [[ "$SKIP_ASSETS" != "true" || "$SKIP_LLDP" != "true" ||
+      "$SKIP_MONITOR" != "true" || "$SKIP_FABRIC_SCAN" != "true" ]] &&
+   [[ -z "${LLDPQ_DEVICES_FILE:-}" && ! -e "$CURRENT_MANIFEST" ]] &&
+   inventory_lists_no_devices; then
+    echo "No devices in $LLDPQ_DIR/devices.yaml yet, so nothing was collected. Add them under Assets → Edit Devices or in that file."
+    exit 0
+fi
+
 # Mark the complete generation as collecting before its first mutable input is
 # gathered.  monitor.sh replaces this marker with its own in-progress state and
 # clears it only after a successful, atomic report publication.  With the

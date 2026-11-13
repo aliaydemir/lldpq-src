@@ -1288,10 +1288,10 @@
             } catch (e) {}
             const isAdmin = !!(window.LLDPqAuth && LLDPqAuth.isAdmin && LLDPqAuth.isAdmin());
             const upCmd = docker
-                ? 'curl -fsSL https://aliaydemir.com/lldpq-amd64.tar.gz | gunzip | docker load && docker compose up -d'
+                ? 'https://github.com/aliaydemir/lldpq-src/blob/main/DOCKER.md#updating'
                 : 'cd ~/lldpq-src\ngit pull\n./install.sh';
             const upIntro = docker
-                ? "This is a <b style=\"color:#d4d4d4;\">Docker</b> deployment \u2014 a container can't replace its own image. Update on the <b style=\"color:#d4d4d4;\">host</b>:"
+                ? "This is a <b style=\"color:#d4d4d4;\">Docker</b> deployment \u2014 a container can't replace its own image, and loading the new image alone leaves the old container running. Update on the <b style=\"color:#d4d4d4;\">host</b> with the steps under <b style=\"color:#d4d4d4;\">Updating</b> in DOCKER.md (Compose, <code>docker run</code> or Cumulus switch):"
                 : 'Update in one click from <b style="color:#d4d4d4;">Setup &rarr; Update LLDPq</b>, or run on the server:';
             const upCmdHtml = upCmd.replace(/&/g, '&amp;').replace(/</g, '&lt;');
             const upGoBtn = (!docker && isAdmin)

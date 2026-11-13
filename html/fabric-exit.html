@@ -521,6 +521,7 @@
                 <input type="hidden" id="edit-original-device">
                 <input type="hidden" id="edit-original-vrf">
                 <input type="hidden" id="edit-original-peer">
+                <input type="hidden" id="edit-original-interface">
                 
                 <div class="form-group">
                     <label>Device</label>
@@ -1064,13 +1065,92 @@
             document.getElementById('bfd-warning-profile').textContent = peer.bgp_profile;
             document.getElementById('bfd-warning').style.display = 'none';
             
-            // TODO: Populate interface dropdown
+            // Start with the peer's current interface; loadEditInterfaces() adds
+            // the device's other ports once its config is loaded
+            document.getElementById('edit-original-interface').value = peer.interface || '';
             const interfaceSelect = document.getElementById('edit-interface');
             interfaceSelect.innerHTML = `<option value="${escapeHtml(peer.interface)}">${escapeHtml(peer.interface)}</option>`;
+            loadEditInterfaces(peer);
             
             document.getElementById('edit-peer-modal').classList.add('visible');
         }
         
+        // Parent ports an external subinterface can be placed on, read from the
+        // device's host_vars (get-device config). 'device' holds the swp ports
+        // its inventory lists; breakout parents and bond members cannot carry a
+        // subinterface. 'other' is the generic swp1-swp16 range for ports the
+        // inventory does not list yet (the backend creates the parent entry on
+        // save), and is the whole list when the inventory lists no port at all.
+        function getParentPorts(config) {
+            const interfaces = (config && config.interfaces) || {};
+            const unusable = new Set();
+            for (const bond of Object.values((config && config.bonds) || {})) {
+                const members = bond && (bond.bond_members || bond.members);
+                if (Array.isArray(members)) members.forEach(m => unusable.add(String(m)));
+            }
+            const device = [];
+            for (const [name, cfg] of Object.entries(interfaces)) {
+                if (!/^swp\d+(s\d+)?$/.test(name)) continue;
+                if (cfg && cfg.breakout && !/s\d+$/.test(name)) {
+                    unusable.add(name);
+                } else if (!unusable.has(name)) {
+                    device.push(name);
+                }
+            }
+            device.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+            const other = [];
+            for (let i = 1; i <= 16; i++) {
+                if (!device.includes(`swp${i}`) && !unusable.has(`swp${i}`)) other.push(`swp${i}`);
+            }
+            return { device, other };
+        }
+
+        // <option> markup for getParentPorts() output. toValue maps a port to its
+        // option value (a falsy result skips the port). The two lists are only
+        // grouped when both have entries.
+        function parentPortOptions(ports, toValue) {
+            const render = list => list.map(toValue).filter(v => v)
+                .map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+            const device = render(ports.device);
+            const other = render(ports.other);
+            if (!device || !other) return device + other;
+            return `<optgroup label="In inventory">${device}</optgroup>` +
+                `<optgroup label="Not in inventory">${other}</optgroup>`;
+        }
+
+        let editInterfaceRequest = 0;  // Latest edit-dialog lookup; older replies are dropped
+
+        // Offer the peer's VLAN on the device's other ports in the edit dialog.
+        // Only swpX.VLAN peers can move (the backend rewrites no interface for
+        // lo or direct-interface peers), and a subinterface that already exists
+        // is not offered because saving onto it would overwrite it. On any
+        // failure the dialog keeps its single current interface, and also when
+        // the returned config does not show the peer's own subinterface: the
+        // existing subinterfaces are then unknown (get-device does not read
+        // <host>.yml host_vars and still answers success).
+        async function loadEditInterfaces(peer) {
+            const request = ++editInterfaceRequest;
+            const match = /^([^.]+)\.(\d+)$/.exec(peer.interface || '');
+            if (!match) return;
+            try {
+                const response = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(peer.device)}`);
+                const data = await response.json();
+                if (request !== editInterfaceRequest || !data.success || !data.config) return;
+
+                const interfaces = data.config.interfaces || {};
+                const own = interfaces[match[1]] && interfaces[match[1]].subinterfaces;
+                if (!(own && typeof own === 'object' && match[2] in own)) return;
+                const options = parentPortOptions(getParentPorts(data.config), port => {
+                    const subs = interfaces[port] && interfaces[port].subinterfaces;
+                    return (subs && typeof subs === 'object' && match[2] in subs) ? '' : `${port}.${match[2]}`;
+                });
+                const interfaceSelect = document.getElementById('edit-interface');
+                interfaceSelect.innerHTML = `<option value="${escapeHtml(peer.interface)}">${escapeHtml(peer.interface)}</option>` + options;
+            } catch (e) {
+                console.error('Failed to load device interfaces:', e);
+            }
+        }
+
         function showBfdWarning() {
             const newValue = document.getElementById('edit-bfd').value === 'true';
             const warning = document.getElementById('bfd-warning');
@@ -1104,6 +1184,7 @@
             document.getElementById('add-soft-reconfig').checked = false;
             
             currentDeviceConfig = null;
+            addDeviceRequest++;  // A lookup still in flight belongs to the dialog that was closed
             
             // Populate device dropdown with ALL leaf devices
             const deviceSelect = document.getElementById('add-device');
@@ -1117,7 +1198,13 @@
             document.getElementById('add-peer-modal').classList.add('visible');
         }
         
+        let addDeviceRequest = 0;  // Latest add-dialog lookup; older replies are dropped
+
         async function onAddDeviceChange() {
+            const request = ++addDeviceRequest;
+            // The port list belongs to one device: empty it until the selected
+            // device's reply fills it (it stays empty when that lookup fails)
+            document.getElementById('add-parent-interface').innerHTML = '<option value="">Select interface...</option>';
             const device = document.getElementById('add-device').value;
             if (!device) return;
             
@@ -1125,6 +1212,7 @@
             try {
                 const response = await fetch(`/fabric-api.sh?action=get-device&hostname=${encodeURIComponent(device)}`);
                 const data = await response.json();
+                if (request !== addDeviceRequest) return;
                 currentDeviceConfig = data;
                 
                 if (data.success && data.config) {
@@ -1141,17 +1229,15 @@
                         }
                     }
                     
-                    // Populate interfaces (physical ports only - swp1-swp16 range for external)
+                    // Populate interfaces from the device's real ports (physical ports
+                    // only); the swp1-swp16 range stays for ports not in its inventory
                     const interfaceSelect = document.getElementById('add-parent-interface');
-                    interfaceSelect.innerHTML = '<option value="">Select interface...</option>';
-                    
-                    // Add swp1-swp16 for external connections (common range)
-                    for (let i = 1; i <= 16; i++) {
-                        interfaceSelect.innerHTML += `<option value="swp${i}">swp${i}</option>`;
-                    }
+                    interfaceSelect.innerHTML = '<option value="">Select interface...</option>' +
+                        parentPortOptions(getParentPorts(data.config), port => port);
                 }
             } catch (e) {
                 console.error('Failed to load device config:', e);
+                if (request !== addDeviceRequest) return;
                 showResult(false, 'Error', 'Failed to load device configuration', e.message);
             }
         }
@@ -1200,6 +1286,8 @@
                 vrf: document.getElementById('edit-original-vrf').value,
                 original_peer: document.getElementById('edit-original-peer').value,
                 interface: document.getElementById('edit-interface').value,
+                // Lets the backend drop the previous subinterface when the interface was changed
+                original_interface: document.getElementById('edit-original-interface').value,
                 local_ip: localIpVal,
                 remote_peer: rp.value,
                 weight: (weightToggle && weightVal) ? parseInt(weightVal) : null,
@@ -1240,7 +1328,8 @@
                 device: document.getElementById('edit-original-device').value,
                 vrf: document.getElementById('edit-original-vrf').value,
                 remote_peer: document.getElementById('edit-original-peer').value,
-                interface: document.getElementById('edit-interface').value
+                // The peer's saved interface, not an unsaved selection in the dropdown
+                interface: document.getElementById('edit-original-interface').value
             };
             
             // Populate delete modal

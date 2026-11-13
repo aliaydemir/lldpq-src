@@ -11,9 +11,11 @@ For native Linux installation and application features, see the
 - [Host-network monitoring with host-managed config](#host-network-monitoring-with-host-managed-config-advanced)
 - [Persistent deployment](#persistent-deployment)
 - [First-time setup](#first-time-setup)
+- [HTTPS](#https)
 - [DHCP/ONIE provisioning](#dhcponie-provisioning)
 - [Ansible integration](#ansible-integration)
 - [Updating](#updating)
+- [Building and checking an image](#building-and-checking-an-image)
 - [Streaming telemetry](#streaming-telemetry)
 - [Removing LLDPq completely](#removing-lldpq-completely)
 - [File transfer and shell access](#file-transfer-and-shell-access)
@@ -28,10 +30,17 @@ No installation needed: download the pre-built Docker image and run it.
 The examples use `sudo` for a typical Linux Docker Engine; omit it when the
 Docker CLI already runs as your user, as is usual with Docker Desktop.
 
+A block with a `set -Eeuo pipefail` line at its top is a script: save it to a
+file and run it with `bash <file>`. Pasted into a login shell, its `set` and
+`exit` lines act on that shell, and the next failing command closes the
+session.
+
 > The image runs with host-level privileges. For production, verify a
 > release-published SHA-256/signature before loading the archive, or build from
-> a reviewed source revision. A filename, HTTPS download, or the image's
-> `lldpq:latest` tag alone does not authenticate its contents.
+> a reviewed source revision (see
+> [Building and checking an image](#building-and-checking-an-image)). A
+> filename, HTTPS download, or the image's `lldpq:latest` tag alone does not
+> authenticate its contents.
 
 Downloading and loading the image is the same everywhere; only the run command
 differs between a Linux server and a switch.
@@ -47,6 +56,16 @@ curl -O https://aliaydemir.com/lldpq-arm64.tar.gz   # ARM64  (Apple Silicon Mac,
 
 sudo docker load < lldpq-amd64.tar.gz   # or lldpq-arm64.tar.gz
 ```
+
+The build writes a checksum file for every archive,
+`lldpq-<arch>.tar.gz.sha256`. Where you received it with the archive, verify
+the archive before the `docker load` line, with both files in one directory:
+
+```bash
+sha256sum -c lldpq-amd64.tar.gz.sha256    # prints "lldpq-amd64.tar.gz: OK"
+```
+
+On macOS use `shasum -a 256 -c lldpq-amd64.tar.gz.sha256`.
 
 ### On a Linux server
 
@@ -74,6 +93,12 @@ on `docker run`, or add `LLDPQ_FCGI_WORKERS: "8"` to the Compose service's
 `environment`, to change the pool size (1–32). The watchdog restores the pool
 if its master or workers exit. This setting is separate from device collection
 parallelism; increasing it allows more requests and can increase memory use.
+The **Commands** page and the Verify step of **Fabric Migration** run three
+device commands at a time, which leaves one of the four default workers to the
+rest of the UI. With 1 to 3 workers they can occupy the whole pool; a request
+for `/configs/`, `/hstr/` or `/monitor-results/` then waits for its login
+check, and gets HTTP 500 when no worker has answered it within 60 seconds (see
+[login-protected paths](README.md#login-protected-paths)).
 
 Management networks frequently permit SSH to the host but block HTTP, so the
 page never loads even though the container is healthy. Forward the port through
@@ -98,6 +123,10 @@ answers. Share the host network instead.
 One port has to move first: the console bridge listens on TCP/8765, which
 Cumulus already serves its own NVUE REST API on. Without `CONSOLE_PTY_PORT` the
 entrypoint stops at `console port 127.0.0.1:8765 is already owned by another process` and the restart policy turns that into a crash loop.
+Only a switch whose API was bound to one other address
+(`nv set system api listening-address <address>`) leaves loopback TCP/8765
+free; the image starts there without the variable, and setting it does no
+harm.
 
 ```bash
 sudo docker run -d --name lldpq \
@@ -107,13 +136,15 @@ sudo docker run -d --name lldpq \
   -e CONSOLE_PTY_PORT=18765 \
   -e LLDPQ_DHCP_MODE=disabled \
   -e DHCP_AUTOSTART=false \
+  -e LLDPQ_SSHD=no \
   lldpq:latest
 ```
 
-The web UI is now on the switch's own **TCP/80**, not 8080, and the container's
-SSH service takes TCP/2033; both host ports must be free. Confirm the start
-before looking for the page, because the entrypoint runs for some seconds before
-nginx is the last service to come up:
+The web UI is now on the switch's own **TCP/80**, not 8080, and that host port
+must be free. `LLDPQ_SSHD=no` keeps the container's SSH service off; without it
+that service takes TCP/2033 of the switch as well (see the security note
+below). Confirm the start before looking for the page, because the entrypoint
+runs for some seconds before nginx is the last service to come up:
 
 ```bash
 sleep 30
@@ -147,8 +178,9 @@ What follows from that:
   VRF.
 - Commands started with `docker exec` begin outside the VRF. An interactive
   `bash` and the `lldpq`, `get-conf`, `send-cmd`, `pping` and `curl` commands
-  move themselves in; prefix anything else that needs the network, or the
-  services' own `127.0.0.1` listeners, with `lldpq-vrf`, for example
+  move themselves in (`pping` needs no `-v mgmt` here); prefix anything else
+  that needs the network, or the services' own `127.0.0.1` listeners, with
+  `lldpq-vrf`, for example
   `sudo docker exec -u lldpq lldpq lldpq-vrf ping -c 1 <device>`. For a user
   other than root the move goes through `sudo`, which drops variables given
   with `docker exec -e`; put them behind the helper instead:
@@ -156,7 +188,12 @@ What follows from that:
 - Restart LLDPq with `sudo docker restart lldpq`, not by restarting a service
   through `docker exec`: a service started that way runs outside the VRF.
   Restart it as well after the `mgmt` VRF itself was taken down and brought
-  back.
+  back. The container does not restart by itself: while its services run
+  inside the VRF, its watchdog logs one line per change, beginning
+  `CRITICAL: the mgmt VRF was re-created` or
+  `CRITICAL: the mgmt VRF device the services were started in`, and ending
+  with the restart command. Look for it with
+  `sudo docker logs lldpq 2>&1 | grep CRITICAL`.
 - Entering the VRF needs `--privileged`, and the entrypoint first checks
   that a `127.0.0.1` connection works inside the VRF, because the services
   talk to each other that way. It needs `127.0.0.1` on the VRF device and
@@ -183,6 +220,12 @@ What follows from that:
 > go down, while BGP unnumbered sessions and all links stay up.
 > Stopping or removing the container does not remove the rule. A reboot does,
 > and an older container adds it again at every start.
+>
+> The published images from 2.2.3 (built on or after 2026-02-11) through
+> 4.2.4 add the rule; 4.2.5 and later do not. The version number is not the
+> definitive check. These two are: the rule on the host, shown by the first
+> command of the block below, and the `outbound via mgmt` line in the log of
+> the container, `sudo docker logs lldpq 2>&1 | grep -m1 'outbound via mgmt'`.
 >
 > The current image removes the rule when it starts with host networking and
 > `--privileged`. Where it shares the host network but may not change routing
@@ -222,6 +265,11 @@ nv config diff
 nv config apply -y
 ```
 
+Where the web UI is served over HTTPS as well (`LLDPQ_HTTPS_PORT`, see
+[HTTPS](#https)), the rule has to permit that port instead of, or besides, 80:
+run the block with `web_port` set to it, and with a rule ID of its own when
+both ports are to be reachable.
+
 Where HTTP is blocked, tunnel to that port instead and browse
 `http://127.0.0.1:8080` as before:
 
@@ -255,16 +303,36 @@ below for that workflow. See Docker's
 > **Critical security boundary:** the image runs with `--privileged`. It also
 > starts an internal SSH service whose `lldpq` user has passwordless sudo, and
 > the current entrypoint resets that user's password to the known value
-> `lldpq` on every start. The bridge command deliberately does not publish
-> TCP/2033, but host networking exposes it by definition: on a switch, permit
-> only the web port in the control-plane ACL and never add a rule for 2033.
+> `lldpq` on every start. `LLDPQ_SSHD=no` turns that service off:
+> nothing listens on TCP/2033, the known password is not set and the account's
+> password is locked. The bridge command deliberately does not publish
+> TCP/2033, but host networking exposes it by definition: on a switch, start
+> the container with `-e LLDPQ_SSHD=no` as shown above, permit only the web
+> port in the control-plane ACL and never add a rule for 2033.
 > Prefer `docker exec` for shell access. The web defaults are `admin/admin` and `operator/operator`; change
 > both immediately from **User Management**. Do not submit login or switch
 > credentials over plaintext HTTP on an untrusted or routed network. Publishing
 > on every interface as shown above reaches as far as the host's own firewall or
 > ACL allows, so restrict the port to trusted management sources, or bind the
-> publish to loopback and use the SSH tunnel, or put LLDPq behind a TLS reverse
-> proxy.
+> publish to loopback and use the SSH tunnel, or serve the UI over
+> [HTTPS](#https), or put LLDPq behind a TLS reverse proxy.
+
+`LLDPQ_SSHD` is read when the container is created. `no`, `false`, `off` or
+`0` (in any case) keep the SSH service off; unset, empty, `yes`, `true`, `on`
+or `1` start it as before, and any other value does so with a one-line `⚠`
+warning. With `docker run` pass `-e LLDPQ_SSHD=no`. With Compose, uncomment
+the `LLDPQ_SSHD` line under `environment:` in the Compose file; the stock
+files do not take this variable from the shell. The start-up log confirms it:
+
+```text
+  sshd: not started (LLDPQ_SSHD=no)
+  SSH: disabled (LLDPQ_SSHD=no); use 'docker exec' for a shell
+```
+
+`docker exec`, including `-u lldpq`, and the container's own cron jobs work
+as before; `sudo docker exec lldpq passwd -S lldpq` shows `L` for the locked
+password. With host networking only TCP/80 (and the loopback
+`CONSOLE_PTY_PORT`) of the host then has to be free.
 
 The commands above run LLDPq in **non-persistent monitoring mode** for
 evaluation. Recreating that container loses configuration, SSH keys, and
@@ -289,7 +357,8 @@ Anything created on the switch by hand still has to be undone separately, such
 as the control-plane ACL rule above:
 
 ```bash
-nv unset acl acl-default-whitelist rule 200
+rule=200                      # the rule ID chosen for it above
+nv unset acl acl-default-whitelist rule "$rule"
 nv config diff
 # Run only if the diff contains no unrelated pending changes:
 nv config apply -y
@@ -310,8 +379,10 @@ Use this only with Linux Docker Engine, when direct host-network reachability
 is required and the host firewall/ACL restricts access. `network_mode: host`
 exposes the LLDPq web service on host TCP/80 and the container SSH service on
 TCP/2033; there is no Docker port-publishing boundary, and both host ports must
-be free. This monitoring example explicitly keeps DHCP disabled—use the
-dedicated provisioning Compose file for physical-L2 DHCP/ONIE.
+be free. Adding `LLDPQ_SSHD: "no"` to the service's `environment:` keeps the
+SSH service off and TCP/2033 unused. This monitoring example explicitly keeps
+DHCP disabled—use the dedicated provisioning Compose file for physical-L2
+DHCP/ONIE.
 
 The console bridge also binds host loopback TCP/8765, which Cumulus Linux
 already uses for its own NVUE REST API. Sharing the host network on a switch
@@ -520,7 +591,7 @@ checkout directory and optional Compose project name for later operations.
 ## First-time setup
 
 Complete these steps over the SSH tunnel above, a source-restricted management
-network, or a TLS reverse proxy:
+network, [HTTPS](#https), or a TLS reverse proxy:
 
 1. Login as admin.
 2. Either upload/activate the P2P/IPAM design on **Inventory** and preview the
@@ -532,6 +603,8 @@ network, or a TLS reverse proxy:
 5. Click **Run Setup** to generate and distribute SSH keys.
 6. Retry failed devices with the appropriate password.
 7. Change both default web passwords immediately from **User Management**.
+   Changing a password ends that user's other sessions, so a session opened
+   with the default password does not outlive it.
 
 The admin **Setup** page also provides the guided inventory → SSH keys →
 topology → aliases → Ansible → notifications → run workflow; see
@@ -541,6 +614,53 @@ LLDPq needs only the switch hostnames and management IPs; SSH keys are
 generated and distributed from the web UI. Docker deployments work on common
 Linux distributions, Cumulus Linux, and Docker Desktop on macOS.
 
+A new deployment starts with an empty inventory: `devices.yaml` holds the
+`defaults:` block and `devices: {}`, and the start-up log says so.
+
+```text
+✓ devices.yaml loaded (0 devices)
+  No devices defined yet — add them under Assets → Edit Devices (sample: /home/lldpq/lldpq/devices.yaml.example)
+```
+
+The repository's example inventory stays in the image under that path; read
+it with `sudo docker exec lldpq cat /home/lldpq/lldpq/devices.yaml.example`.
+Until the first device is added, the collectors contact no address. A
+scheduled run (every 10 minutes by default) ends at once: it does not mark
+the reports stale and writes nothing to
+`/home/lldpq/lldpq/monitor-failures.log`. Run by hand or from
+**Setup → Run LLDPq**, `lldpq` prints one line and exits with status 0:
+
+```text
+No devices in /home/lldpq/lldpq/devices.yaml yet, so nothing was collected. Add them under Assets → Edit Devices or in that file.
+```
+
+The Setup page reports that run as
+`Finished — the inventory has no devices, so nothing was collected.`
+
+This applies only while `devices:` is a mapping without devices, as shipped,
+and no report has been published yet. A `devices.yaml` that is missing, is not
+valid YAML or has no `devices:` mapping is a failed collection as before, and
+so is an inventory that is emptied after a report was published: the pages
+keep that report and mark the latest collection as failed. A stale mark left
+by an earlier failed run stays until the first run with devices completes. A
+collection started from a page (**Run Analysis**, **Refresh Assets**,
+**Run LLDP Check**) is not ended early either: without devices it still ends
+as failed.
+
+The export under **Setup → Backup & Restore** leaves `devices.yaml` out of the
+bundle while it has no devices (its reply lists
+`devices.yaml was left out of the bundle: it has no devices.` under
+`warnings`), and restoring that bundle leaves the target's inventory as it
+is. The page shows that sentence after its download message. Saving an
+inventory without devices, and restoring a bundle that carries one, are
+refused with
+`devices.yaml must contain a non-empty 'devices' mapping`.
+
+An existing deployment keeps the inventory in its volume or config directory.
+One that was created from an earlier image and never configured still holds
+the example devices there and keeps polling their addresses; replace them
+under **Assets → Edit Devices**.
+
 On a Cumulus Docker host, direct access needs the control-plane ACL rule shown
 in [Quick start](#quick-start). Where the management network blocks HTTP, the
 SSH tunnel from that section reaches the UI without any ACL or firewall change,
@@ -549,8 +669,110 @@ section). To narrow direct access to one source prefix, add a source match to
 the same rule:
 
 ```bash
-nv set acl acl-default-whitelist rule 200 match ip source-ip 10.0.0.0/24
+rule=200                      # the rule ID chosen in Quick start
+nv set acl acl-default-whitelist rule "$rule" match ip source-ip 10.0.0.0/24
+nv config diff
+# Run only if the diff contains no unrelated pending changes:
+nv config apply -y
 ```
+
+## HTTPS
+
+The image can serve the web UI over HTTPS in addition to HTTP. Set
+`LLDPQ_HTTPS_PORT` to a TCP port (1-65535, not 80) when the container is
+created:
+
+- `docker run`: add `-e LLDPQ_HTTPS_PORT=8443`. With bridge networking also
+  publish the port under the same number, `-p 8443:8443`, because redirects
+  issued by the web server carry the container port.
+- `docker/docker-compose.yml`: uncomment `- LLDPQ_HTTPS_PORT=8443` under
+  `environment:` and `- "8443:8443"` under `ports:`.
+- `docker/docker-compose.provisioning.yml`: uncomment
+  `LLDPQ_HTTPS_PORT: "8443"`.
+
+Every page then answers on that port with TLS as well. Port 80 stays plain
+HTTP and is not redirected: ONIE/ZTP clients, the health check and the probes
+in this guide use it. Without the variable nothing changes. The line under the
+ready message reports the listener and the certificate in use:
+
+```text
+  HTTPS: container port 8443, self-signed certificate /home/lldpq/lldpq/system-config/tls/lldpq.crt
+```
+
+```bash
+sudo docker logs lldpq 2>&1 | grep -E 'HTTPS|ready'
+curl -k -sS -o /dev/null -w 'HTTPS %{http_code}\n' https://127.0.0.1:8443/login.html
+```
+
+On a switch run that `curl` through `sudo ip vrf exec mgmt`, as in
+[Quick start](#on-a-cumulus-switch).
+
+With host networking the port is a TCP port of the host itself and must be
+free; on a switch it listens in the management VRF, like port 80, and the
+control-plane ACL has to permit it (see the rule in
+[Quick start](#on-a-cumulus-switch)). Choose a port such as 443 or 8443, not
+one from the host's ephemeral range (`net.ipv4.ip_local_port_range`,
+32768-60999 by default): the start-up check sees listening sockets only. On
+Cumulus, 8765 belongs to the NVUE API.
+
+**Your own certificate.** Mount a directory that holds `tls.crt` (PEM; the
+chain may follow the certificate) and `tls.key` (PEM, no passphrase) at
+`/etc/lldpq-tls`, read-only if you like: `-v /path/on/host:/etc/lldpq-tls:ro`,
+or `- ./tls:/etc/lldpq-tls:ro` in the Compose file. As soon as one of the two
+files is there, only that pair is used: if the other is missing or empty, or
+the key has a passphrase, HTTPS stays off instead of falling back to a
+self-signed certificate. A symbolic link counts as a file that is there. One
+whose target is outside the mounted directory does not resolve in the
+container (links taken from a Let's Encrypt `live/<host>` directory point
+into `archive/`): that pair is supplied but unusable, so the log carries the
+warning with `/etc/lldpq-tls must hold both tls.crt and tls.key`, the web UI is
+served over HTTP only and no self-signed pair is created. Links whose targets
+are inside the mounted directory work. The container never changes these
+files; keep the key readable by root only. After replacing the certificate,
+run `sudo docker restart lldpq`.
+
+**Without one**, the first start creates a self-signed pair,
+`/home/lldpq/lldpq/system-config/tls/lldpq.crt` and `lldpq.key` (RSA 2048,
+valid 825 days, issued for the container's host name, which is the switch's
+name with host networking). It is kept in the `lldpq-system-config` volume;
+without that volume it survives `docker restart` but not a re-created
+container. A start renews it once it expires within a day; to renew it
+earlier, delete the two files and restart the container. Browsers warn about
+this certificate.
+
+If HTTPS cannot be enabled, the container starts all the same and serves HTTP
+only. The log then carries one line with the reason:
+
+```text
+  ⚠ HTTPS not enabled (LLDPQ_HTTPS_PORT=8443): TCP port 8443 is already in use; the web UI is served over HTTP only
+```
+
+Other reasons are a value that is not a usable port, `/etc/lldpq-tls` not
+holding both files, a key with a passphrase, a certificate that could not be
+created, and a configuration that nginx rejects (for example a key that does
+not belong to the certificate; the line quotes nginx's message).
+
+**Session cookie.** A login that arrives on the HTTPS port gets its session
+cookie with the `Secure` flag: the browser sends it to `https://` addresses
+only, so the same host opened with `http://` shows the login page. A login
+over plain HTTP on port 80 gets the cookie without the flag, as before. Keep
+to `https://` in a browser that has logged in over it: while it holds that
+cookie, it discards the cookie of a login over `http://` to the same host
+name: that login is accepted, and the login page stays and says that the
+browser did not keep the session cookie. Logging out
+over HTTPS removes the cookie; otherwise it stays until the browser is closed,
+or for 7 days with **Remember me**. Where HTTPS is no longer served
+(`LLDPQ_HTTPS_PORT` was removed, HTTPS could not be enabled at a later start,
+or the container was rolled back to a 4.2.x image), a browser that still
+holds the `Secure` cookie can log in over `http://` only after its
+`lldpq_session` cookie for that host has been deleted or has expired.
+
+Behind a reverse proxy that terminates TLS the container receives plain HTTP
+and does not set the flag; forwarded headers are not read. Add the flag on
+the proxy, with nginx 1.19.3 or later:
+`proxy_cookie_flags lldpq_session secure;`.
+
+The 4.2.x images ignore the variable, so a rollback to one serves HTTP only.
 
 
 
@@ -637,7 +859,10 @@ shape and the save-time validation.
 > plaintext web service on TCP/80 and its internal SSH service on TCP/2033.
 > Restrict both at the host/network boundary to the exact provisioning and
 > administration source ranges required. Never expose TCP/2033 publicly, and
-> use a TLS-protected management path for web administration.
+> use a TLS-protected management path for web administration. In
+> `docker/docker-compose.provisioning.yml`, uncommenting `LLDPQ_SSHD: "no"`
+> keeps the SSH service off, and `LLDPQ_HTTPS_PORT` adds an
+> [HTTPS](#https) listener; ONIE/ZTP clients keep using plain HTTP on port 80.
 
 
 
@@ -720,7 +945,11 @@ project structure.
 > and loses its BGP sessions with numbered IPv4 neighbors. A rollback to such
 > an image, automatic or by hand, brings the rule back; so does starting a
 > retained pre-upgrade container. If that happened, stop the container and
-> clear the rule as described under [Management VRF](#management-vrf).
+> clear the rule as described under [Management VRF](#management-vrf). The
+> two update scripts below print a `WARNING:` line when they find the rule on
+> the host after a rollback. A failed `docker run` migration starts the
+> previous container again only if it was running when the script stopped
+> it; a container that was stopped beforehand stays stopped.
 >
 > Take the update steps from this revision of the guide: they enter the
 > management VRF explicitly with `lldpq-vrf`. Earlier revisions test readiness
@@ -731,7 +960,57 @@ project structure.
 > runs inside the VRF: an update script that uses one would report a healthy
 > replacement as failed and roll back to the old image.
 
+Loading a new archive does not update a running container: `docker load`
+only moves the `lldpq:latest` tag, and `sudo docker restart lldpq` starts the
+image the container was created from. The container has to be created again,
+as the steps below do. Afterwards
+`sudo docker exec lldpq cat /var/www/html/VERSION` prints the new version.
+After an update from 4.2.x or earlier, also go through
+[after updating from 4.2.x](README.md#after-updating-from-42x-or-earlier).
 
+### Cumulus switch with host networking
+
+The container has to be created with host networking again, and the current
+image does not start without `CONSOLE_PTY_PORT` on a switch whose NVUE API
+holds loopback TCP/8765 (see [Quick start](#on-a-cumulus-switch)). A container
+created from an image older than 4.0.0 runs without that variable, so add it
+now.
+
+The evaluation container from Quick start keeps nothing outside itself.
+Replacing it discards its configuration, SSH keys and results:
+
+```bash
+sudo docker load < lldpq-amd64.tar.gz &&
+  sudo docker rm -f lldpq &&
+  sudo docker run -d --name lldpq \
+    --privileged \
+    --restart unless-stopped \
+    --network host \
+    -e CONSOLE_PTY_PORT=18765 \
+    -e LLDPQ_DHCP_MODE=disabled \
+    -e DHCP_AUTOSTART=false \
+    -e LLDPQ_SSHD=no \
+    lldpq:latest
+```
+
+Then check the start, the version, and that the routing rule of the older
+images is gone:
+
+```bash
+sleep 30
+sudo docker logs lldpq 2>&1 | grep -E 'VRF|ready|ERROR'
+sudo docker exec lldpq cat /var/www/html/VERSION
+ip -4 rule show | grep '^100:'    # prints nothing
+```
+
+A container that has to keep its data is updated with one of the two scripts
+below. For a Compose deployment, first make sure the service's `environment:`
+sets `CONSOLE_PTY_PORT`, as shown under
+[Host-network monitoring](#host-network-monitoring-with-host-managed-config-advanced).
+For a `docker run` container, put `--network host` and
+`-e CONSOLE_PTY_PORT=18765` in the migration script's `extra_args` in place
+of its `-p` line; the script stops before changing anything when the old
+container used host networking and `extra_args` does not.
 
 ### Compose deployments
 
@@ -742,7 +1021,12 @@ create it. The example below is monitoring mode; substitute
 values for provisioning mode. If the deployment used `-p`, export that exact
 name as `LLDPQ_COMPOSE_PROJECT_NAME` first. The manifest check below prevents
 loading an archive with the wrong tag; it does not replace the release
-checksum/signature verification described in [Quick start](#quick-start):
+checksum/signature verification described in [Quick start](#quick-start).
+
+Save the block as a file in the checkout directory, for example
+`lldpq-update.sh`, and run it with `bash ./lldpq-update.sh`. Do not paste it
+into a login shell: `set -Eeuo pipefail` and `exit` would act on that shell
+and close the session at the first failing command.
 
 ```bash
 set -Eeuo pipefail
@@ -769,8 +1053,9 @@ fi
 
 wait_ready() {
   for _ in {1..30}; do
-    # The web service may be listening inside the management VRF, where a
-    # plain `docker exec` cannot reach it; older images have no lldpq-vrf.
+    # The web service may be listening inside the management VRF; lldpq-vrf
+    # starts the probe there. Images before 4.2.5 have no lldpq-vrf and keep
+    # their services outside the VRF.
     if sudo docker exec lldpq sh -c '
          if command -v lldpq-vrf >/dev/null 2>&1; then
            exec lldpq-vrf curl -fsS http://127.0.0.1/login.html
@@ -783,6 +1068,19 @@ wait_ready() {
   return 1
 }
 
+# A rollback can restore an image that adds the management-VRF routing rule
+# to a Cumulus switch at every start (see "Management VRF" in this guide).
+warn_mgmt_rule() {
+  local table
+  if table=$(ip vrf show mgmt 2>/dev/null | awk '$1 == "mgmt" {print $2}') &&
+     [[ -n $table ]] &&
+     ip -4 rule show 2>/dev/null |
+       grep -E "^100:[[:space:]]+from all lookup (mgmt|$table)[[:space:]]*\$" \
+         >/dev/null; then
+    echo "WARNING: the routing rule '100: from all lookup mgmt' is on this host. Images before 4.2.5 add it at every start: see Management VRF in DOCKER.md before leaving the restored container running." >&2
+  fi
+}
+
 "${compose[@]}" config >/dev/null
 test -s "$image_archive"
 archive_manifest=$(tar -xOzf "$image_archive" manifest.json)
@@ -790,13 +1088,22 @@ archive_manifest=$(tar -xOzf "$image_archive" manifest.json)
 old_image_id=$(sudo docker inspect --format '{{.Image}}' lldpq)
 sudo docker image tag "$old_image_id" "$rollback_image"
 sudo docker load < "$image_archive"
+new_image_id=$(sudo docker image inspect --format '{{.Id}}' lldpq:latest)
+if [[ $new_image_id == "$old_image_id" ]]; then
+  sudo docker image rm "$rollback_image" >/dev/null || true
+  echo "The archive holds the image that lldpq already runs; nothing was replaced." >&2
+  exit 1
+fi
 if ! "${compose[@]}" up -d --no-build --force-recreate || \
    ! wait_ready; then
   "${compose[@]}" logs --tail 100 lldpq || true
   sudo docker image tag "$rollback_image" lldpq:latest
-  "${compose[@]}" up -d --no-build --force-recreate
-  wait_ready
+  "${compose[@]}" up -d --no-build --force-recreate ||
+    echo "Recreating the service from the previous image failed." >&2
+  wait_ready ||
+    echo "The previous image is not ready either." >&2
   echo "Replacement failed; the previous image was restored." >&2
+  warn_mgmt_rule
   exit 1
 fi
 echo "Readiness verified; rollback image retained as $rollback_image"
@@ -808,19 +1115,22 @@ rollback: startup may migrate or otherwise update shared named volumes, and
 those changes are not reversed. Take a consistent external snapshot first if
 the deployment requires data rollback as well.
 
-For a post-readiness image rollback while the variables/functions from the
-script above are still present, retag the printed rollback image and recreate
-the same Compose service:
+For an image rollback after readiness was verified, the variables and
+functions of the script are gone with it. Copy the saved file, keep its lines
+up to and including the `warn_mgmt_rule` function (they rebuild the same
+`compose` array and environment), and replace the rest with the lines below,
+with `rollback_image` set to the exact tag the update printed. Run the copy
+with `bash` in the same way, with the same exported variables:
 
 ```bash
+rollback_image='lldpq:pre-upgrade-<timestamp>'
 sudo docker image tag "$rollback_image" lldpq:latest
 "${compose[@]}" up -d --no-build --force-recreate
-wait_ready
+wait_ready || echo "The restored image is not ready." >&2
+warn_mgmt_rule
 ```
 
-In a later shell, set `rollback_image` to the exact retained tag and rebuild
-the same `compose` array/environment from the first block. After final
-acceptance, remove that tag with
+After final acceptance, remove that tag with
 `sudo docker image rm lldpq:pre-upgrade-<timestamp>`.
 
 ### Legacy or direct `docker run` migration
@@ -839,6 +1149,11 @@ mounts deliberately reused through `extra_args` remain shared.
 > `LLDPQ_MIGRATION_OPTIONS_CONFIRMED` unset and inspect the old container; the
 > script will only inspect the deployment and prepare backup metadata; it will
 > not load the candidate image or stop/replace the running container.
+
+Save the block as a file next to the image archive, for example
+`lldpq-migrate.sh`, edit `extra_args` in that file, and run it with
+`bash ./lldpq-migrate.sh`. Do not paste it into a login shell: its `set` and
+`exit` lines, the first pass's `exit 2` among them, would close the session.
 
 ```bash
 # One-time migration backup + image/container rollback replacement
@@ -913,13 +1228,27 @@ copy_tree_optional() {
   rm -f "$error_file"
   return 1
 }
+# A rollback can restore an image that adds the management-VRF routing rule
+# to a Cumulus switch at every start (see "Management VRF" in this guide).
+warn_mgmt_rule() {
+  local table
+  if table=$(ip vrf show mgmt 2>/dev/null | awk '$1 == "mgmt" {print $2}') &&
+     [[ -n $table ]] &&
+     ip -4 rule show 2>/dev/null |
+       grep -E "^100:[[:space:]]+from all lookup (mgmt|$table)[[:space:]]*\$" \
+         >/dev/null; then
+    echo "WARNING: the routing rule '100: from all lookup mgmt' is on this host. Images before 4.2.5 add it at every start: see Management VRF in DOCKER.md before leaving the restored container running." >&2
+  fi
+}
 
 # Review the captured options before allowing the short outage. Add every
 # deployment-specific -e/-v/-p/--network/--restart option to extra_args below.
 # If Ansible was a host bind mount, remove the Ansible named-volume entry
 # from persistent_args and put that bind mount in extra_args instead.
 # The defaults below are intentionally bridge-mode monitoring and do not expose
-# the image's internal SSH service.
+# the image's internal SSH service. On a Cumulus switch replace the -p line
+# with --network host and -e CONSOLE_PTY_PORT=18765, and add -e LLDPQ_SSHD=no
+# to keep that SSH service off the switch's own TCP/2033.
 cat "$backup/container-options.txt"
 extra_args=(
   --privileged
@@ -953,6 +1282,21 @@ for ((i=0; i<${#persistent_args[@]}; i+=2)); do
   volume_spec=${persistent_args[i+1]}
   migration_volumes+=("${volume_spec%%:*}")
 done
+# A container that shares the host network of a Cumulus switch (a host with a
+# VRF named mgmt) needs host networking again: from a bridge network the new
+# image can neither remove the routing rule an older image left on the switch
+# nor serve the web UI on the switch's management address.
+old_network=$(sudo docker inspect --format '{{.HostConfig.NetworkMode}}' "$container")
+extra_args_text=" ${extra_args[*]} "
+if [[ $old_network == host ]] &&
+   [[ $(ip vrf show mgmt 2>/dev/null) == "mgmt "* ]] &&
+   [[ $extra_args_text != *" --network host "* &&
+      $extra_args_text != *" --network=host "* &&
+      $extra_args_text != *" --net host "* &&
+      $extra_args_text != *" --net=host "* ]]; then
+  echo "Running container unchanged. It uses host networking on a host with a mgmt VRF (a Cumulus switch), and extra_args does not: replace the -p line in extra_args with --network host and -e CONSOLE_PTY_PORT=18765, then rerun." >&2
+  exit 2
+fi
 if [[ ${LLDPQ_MIGRATION_OPTIONS_CONFIRMED:-false} != true ]]; then
   echo "Running container unchanged. Review $backup/container-options.txt, edit extra_args/persistent_args, export LLDPQ_MIGRATION_OPTIONS_CONFIRMED=true, then rerun." >&2
   exit 2
@@ -964,6 +1308,10 @@ if ! sudo docker load < "$image_archive" || \
   sudo docker image tag "$rollback_image" lldpq:latest
   exit 1
 fi
+new_image_id=$(sudo docker image inspect --format '{{.Id}}' lldpq:latest)
+if [[ $new_image_id == "$old_image_id" ]]; then
+  echo "WARNING: the archive holds the image that $container already runs; the migration continues with that same image." >&2
+fi
 
 rollback_container() {
   rc=$?
@@ -973,16 +1321,27 @@ rollback_container() {
      sudo docker container inspect "$old_container" >/dev/null 2>&1; then
     sudo docker rm -f "$container" >/dev/null 2>&1
     sudo docker rename "$old_container" "$container"
-    sudo docker start "$container"
-    echo "Replacement failed; the previous container was restarted (deliberately reused mounts were not rolled back)." >&2
+    if [[ $was_running == true ]]; then
+      sudo docker start "$container"
+      echo "Replacement failed; the previous container was restarted (deliberately reused mounts were not rolled back)." >&2
+    else
+      echo "Replacement failed; the previous container was left stopped, as it was before the migration (deliberately reused mounts were not rolled back)." >&2
+    fi
   else
     # Failure before/while rename: the live container still has its original
     # name and may only need to be started again.
-    sudo docker start "$container" >/dev/null 2>&1 || true
-    echo "Replacement failed before the rollback rename completed; the original container was left in place." >&2
+    if [[ $was_running == true ]]; then
+      sudo docker start "$container" >/dev/null 2>&1 || true
+      echo "Replacement failed before the rollback rename completed; the original container was left in place." >&2
+    else
+      echo "Replacement failed before the rollback rename completed; the original container was left in place and stopped, as it was before the migration." >&2
+    fi
   fi
   sudo docker volume rm "${migration_volumes[@]}" >/dev/null 2>&1 || true
   sudo docker image tag "$rollback_image" lldpq:latest >/dev/null 2>&1 || true
+  # An affected image adds the rule within its first seconds.
+  sleep 3
+  warn_mgmt_rule
   exit "$rc"
 }
 
@@ -992,6 +1351,9 @@ if sudo docker container inspect "$old_container" >/dev/null 2>&1; then
   exit 1
 fi
 old_rename_intent=false
+# A container that was already stopped is not started again by a rollback: an
+# image before 4.2.5 would add the routing rule back to a Cumulus switch.
+was_running=$(sudo docker inspect -f '{{.State.Running}}' "$container")
 trap rollback_container ERR INT TERM
 sudo docker stop "$container"
 
@@ -1104,7 +1466,7 @@ fi
 trap - ERR INT TERM
 echo "Upgrade verified. Rollback container retained as: $old_container"
 echo "Rollback image retained as: $rollback_image"
-echo "After final acceptance, use the removal section to inspect and delete retained rollback volumes."
+echo "For a later rollback, or the clean-up after final acceptance, use the steps that follow this script in the guide with: container=$container stamp=$stamp"
 ```
 
 
@@ -1112,20 +1474,118 @@ echo "After final acceptance, use the removal section to inspect and delete reta
 If you need an image/container rollback after the readiness check, the old
 container and old image are retained. The migration uses per-attempt named
 volumes, so its copied state is not shared with the old container; only bind
-mounts deliberately preserved through `extra_args` remain shared. In the same
-shell run:
+mounts deliberately preserved through `extra_args` remain shared. The script
+has ended and its variables with it: put the `stamp` it printed into the
+second line and run:
 
 ```bash
+container=lldpq
+stamp=20260708-120000        # the stamp the migration printed
+old_container="${container}-pre-upgrade-${stamp}"
+rollback_image="lldpq:pre-migration-$stamp"
 failed_container="${container}-failed-${stamp}"
-sudo docker image tag "$rollback_image" lldpq:latest
-sudo docker stop lldpq
-sudo docker rename lldpq "$failed_container"
-sudo docker rename "$old_container" lldpq
-sudo docker start lldpq
+# Each step runs only if the one before it succeeded: a stamp that names no
+# retained container or image leaves the running container untouched.
+sudo docker container inspect "$old_container" >/dev/null &&
+  sudo docker image tag "$rollback_image" lldpq:latest &&
+  sudo docker stop "$container" &&
+  sudo docker rename "$container" "$failed_container" &&
+  sudo docker rename "$old_container" "$container" &&
+  sudo docker start "$container"
 ```
 
-The failed candidate is kept under the printed `lldpq-failed-*` name so its
-per-attempt volumes remain inspectable and removable.
+The failed candidate is kept as `lldpq-failed-<stamp>` so its per-attempt
+volumes remain inspectable and removable. If the block prints
+`No such container` or `No such image` instead, the stamp is not the one the
+migration printed and nothing was changed.
+
+After final acceptance, remove what the migration retained: the stopped
+pre-upgrade container, the volumes only that container uses, and the rollback
+image. Do not use [Removing LLDPq completely](#removing-lldpq-completely) for
+this; its script also deletes the running container and every volume. First
+look at what is about to go:
+
+```bash
+container=lldpq
+stamp=20260708-120000        # the stamp the migration printed
+old_container="${container}-pre-upgrade-${stamp}"
+# Read the volume names while the container still exists.
+old_volumes=$(sudo docker inspect --format \
+  '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+  "$old_container")
+sudo docker ps -a --filter "name=$old_container" --format '{{.Names}}: {{.Status}}'
+printf '%s\n' "$old_volumes"
+```
+
+Then, in the same shell, remove it. `docker rm` without `-f` refuses a
+container that was started again, and Docker refuses to delete a volume that
+another container still uses, such as one deliberately shared through
+`extra_args`; that volume is kept:
+
+```bash
+sudo docker rm "$old_container"
+while IFS= read -r volume; do
+  [ -n "$volume" ] || continue
+  sudo docker volume rm "$volume" ||
+    echo "kept (still in use): $volume" >&2
+done <<< "$old_volumes"
+sudo docker image rm "lldpq:pre-migration-$stamp"
+```
+
+A failed candidate left by a rollback is removed the same way, with
+`old_container="${container}-failed-${stamp}"`. The backup directory
+`~/lldpq-container-backup-<stamp>` holds configuration and SSH keys; review it
+and delete it by hand.
+
+A migration that failed and put the previous container back by itself leaves
+no extra container or volume, but it keeps its image tag and its backup
+directory, one of each per attempt. List the tags and remove the ones of
+abandoned attempts; the image itself stays while a container uses it:
+
+```bash
+sudo docker image ls --filter 'reference=lldpq:pre-migration-*'
+stamp=20260708-120000        # the stamp of the abandoned attempt, from the list
+sudo docker image rm "lldpq:pre-migration-$stamp"
+```
+
+## Building and checking an image
+
+Build the archive from the root of a reviewed source checkout, on a machine
+with Docker:
+
+```bash
+./docker/docker-build.sh
+```
+
+The build leaves two files in the home directory, `~/lldpq-<arch>.tar.gz` and
+`~/lldpq-<arch>.tar.gz.sha256`. The second holds one line, the SHA-256 and the
+bare archive name, so `sha256sum -c` works wherever both files are kept
+together (see [Quick start](#quick-start)); publish or copy them as a pair.
+If neither `sha256sum` nor `shasum` is available, the build prints
+`SHA-256 not written` and continues without that file. When releasing,
+publish the archive and its checksum before the new `VERSION` file: the web
+UI's update notice follows `VERSION`, and an operator who fetches the archive
+too early gets the image that is already running.
+
+Before an image is released, check it once on a Cumulus switch. The check
+needs the switch's TCP/80 and the console port, so no LLDPq container may be
+running there. Copy the archive and `docker/test-mgmt-vrf-switch.sh` to the
+switch, then:
+
+```bash
+sudo docker load < lldpq-amd64.tar.gz
+sudo bash docker/test-mgmt-vrf-switch.sh
+```
+
+`IMAGE=<tag>` chooses another image than `lldpq:latest`, for example
+`sudo IMAGE=lldpq:4.3.0 bash docker/test-mgmt-vrf-switch.sh`. The script
+starts a temporary container with host networking, checks that the services
+run inside the management VRF, compares the host's routing rules, routes and
+sysctls before the start, while the container runs and after it is removed,
+and removes the container again. It prints one `ok` or `FAIL` line per check
+and ends with `<n> checks, <m> failed`: exit status 0 when every check
+passed, 1 when one failed, 2 when it could not run on this host (no `mgmt`
+VRF, a port in use, the image not loaded).
 
 ## Streaming telemetry
 
@@ -1212,7 +1672,9 @@ PROMETHEUS_URL=http://127.0.0.1:9090
 
 For a bridge deployment, replace the example URL with the reachable host
 endpoint. Then configure selected switches from **Telemetry → Configuration →
-Enable Telemetry**.
+Enable Telemetry**. A switch that has pending, un-applied NVUE changes is
+skipped with a `Failed: Pending un-applied NVUE changes` line; see
+[enable on switches](README.md#enable-on-switches).
 
 Useful checks:
 

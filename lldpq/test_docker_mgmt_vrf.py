@@ -119,6 +119,83 @@ def args(text):
     return text.split(' ')
 
 
+def shell_function(name):
+    """One function of the entrypoint, up to its closing brace in the first column."""
+    lines = ENTRYPOINT[ENTRYPOINT.index(f'\n{name}() {{\n') + 1:].splitlines(keepends=True)
+    return ''.join(lines[:lines.index('}\n') + 1])
+
+
+def syntax_sweep():
+    """The Makefile's bash -n loop: its file patterns and the loop as a shell script."""
+    loop = re.search(r'(?ms)^\t@(for f in (?P<files>.*?); do \\\n.*?\n\tdone)$', MAKEFILE)
+    assert loop, 'the bash -n sweep is missing from the Makefile'
+    patterns = loop.group('files').replace('\\\n', ' ').split()
+    return patterns, loop.group(1).replace('\\\n', ' ').replace('$$', '$')
+
+
+def first_line(path):
+    with open(path, 'rb') as handle:
+        return handle.readline(200)
+
+
+# Sourced by a shell, so they carry no shebang to recognise them by.
+SOURCED_BASH = ('docker/dotf/bashrc', 'lldpq/sw-base/bash.bashrc')
+
+
+def source_files():
+    """What git tracks or would track; without a checkout, the source directories."""
+    try:
+        listed = subprocess.run(
+            ['git', '-C', str(ROOT), 'ls-files', '-z', '--cached', '--others',
+             '--exclude-standard'], capture_output=True, timeout=60, check=True).stdout
+        return [ROOT / os.fsdecode(name) for name in listed.split(b'\0') if name]
+    except (OSError, subprocess.SubprocessError):
+        files = [path for path in ROOT.iterdir() if path.is_file()]
+        for top in ('bin', 'docker', 'etc', 'html', 'lldpq', 'telemetry'):
+            for directory, subdirectories, names in os.walk(ROOT / top):
+                subdirectories[:] = [name for name in subdirectories
+                                     if not name.startswith('.')
+                                     and name not in ('__pycache__', 'monitor-results')]
+                files.extend(Path(directory, name) for name in names)
+        return files
+
+
+def bash_files():
+    """Every bash file of the source tree, by shebang, plus the sourced ones."""
+    found = set(SOURCED_BASH)
+    for path in source_files():
+        if path.is_file() and re.match(rb'#!.*\b(ba)?sh\b', first_line(path)):
+            found.add(path.relative_to(ROOT).as_posix())
+    return found
+
+
+def _prefixes(word, shortest=1):
+    # iproute2 accepts every prefix of an object name: `ip ro`, `ip rou`, `ip route`.
+    return '|'.join(word[:length] for length in range(len(word), shortest - 1, -1))
+
+
+# Commands that change the routing, sysctl or firewall state of whatever
+# network namespace they run in.  With --network host that is the switch.
+HOST_STATE_CHANGES = tuple(re.compile(pattern) for pattern in (
+    r'\bip\b(\s+-\S+)*\s+(' + '|'.join((
+        _prefixes('rule', 2), _prefixes('route'), _prefixes('address'), _prefixes('link'),
+        _prefixes('neighbour'), 'neighbor', _prefixes('netns', 4), _prefixes('nexthop', 3),
+        _prefixes('tunnel', 3), _prefixes('tuntap', 4)))
+    + r')\s+(a|ad|add|d|de|del|delete|replace|change|chg|flush|set|append|prepend)\b',
+    r'\bsysctl\b[^|;&#)]*\s(-\w*[wp]\w*\b|--(write|load|system)\b|[\w.]+=\S)',
+    r'(>|\btee\b[^|;&]*\s)\s*["\']?/proc/sys/',
+    r'\b(iptables|ip6tables|ebtables|arptables|ipset|nft)(-restore)?\s+\S',
+    r'\btc\b(\s+-\S+)*\s+(qdisc|filter|class)\s+(add|del|delete|replace|change|link)\b',
+))
+
+
+def host_state_changes(text):
+    """(line number, line) of every non-comment line holding such a command."""
+    return [(number, line) for number, line in enumerate(text.splitlines(), 1)
+            if not line.lstrip().startswith('#')
+            and any(pattern.search(line) for pattern in HOST_STATE_CHANGES)]
+
+
 class FakeHost:
     """A PATH with stand-in ip/sudo/id binaries that record how they are called."""
 
@@ -133,6 +210,20 @@ class FakeHost:
         self.sudo_log = self.root / 'sudo.log'
         self.probe_file = self.root / 'probe.py'
         self.marker = self.root / 'service-vrf'
+        # Stands in for /sys/class/net; empty until a test gives mgmt an ifindex.
+        self.sys_net = self.root / 'sys-class-net'
+        self.sys_net.mkdir()
+
+    def set_ifindex(self, content, device='mgmt'):
+        """The device's ifindex file as the kernel publishes it; None: no such device."""
+        directory = self.sys_net / device
+        if content is None:
+            (directory / 'ifindex').unlink(missing_ok=True)
+            if directory.exists():
+                directory.rmdir()
+            return
+        directory.mkdir(exist_ok=True)
+        (directory / 'ifindex').write_text(content)
 
     def add_binary(self, name, body):
         path = self.bin / name
@@ -149,6 +240,7 @@ class FakeHost:
                    IP_LOG=str(self.ip_log), SUDO_LOG=str(self.sudo_log),
                    PROBE_FILE=str(self.probe_file),
                    LLDPQ_SERVICE_VRF_FILE=str(self.marker),
+                   LLDPQ_SYS_CLASS_NET=str(self.sys_net),
                    FAKE_VRF_ADDR=LOOPBACK_ADDR)
         env.update(overrides)
         return env
@@ -393,18 +485,54 @@ class EnterManagementVrfTests(FakeHostCase):
                     'entering the mgmt VRF\n')
                 self.assertEqual(self.ip_calls()[-1], ['reexec-marker', '1'])
 
+    # The ifindex of the VRF device, kept for the watchdog (VrfReplacedTests).
+    def remembered_ifindex(self, **env):
+        source = (f'set -e\n{VRF_BLOCK}\n_enter_mgmt_vrf "$@"\n'
+                  'echo "IFINDEX=<$MGMT_VRF_IFINDEX>"\n')
+        result = subprocess.run(['bash', '-c', source, '/docker-entrypoint.sh'],
+                                capture_output=True, text=True, timeout=20,
+                                env=self.host.env(**env))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()[-1], result.stderr
+
+    INSIDE = dict(FAKE_VRF_TABLE='1001', FAKE_CURRENT_VRF='mgmt', LLDPQ_VRF_REEXEC='1')
+
+    def test_ifindex_of_the_vrf_is_remembered_once_the_services_are_inside(self):
+        self.host.set_ifindex('9\n')
+        self.assertEqual(self.remembered_ifindex(**self.INSIDE), ('IFINDEX=<9>', ''))
+
+    def test_no_ifindex_is_remembered_outside_the_vrf(self):
+        # The device is there each time; the services are not started in it.
+        self.host.set_ifindex('9\n')
+        for env in ({},
+                    dict(FAKE_VRF_TABLE='1001', FAKE_RULES=STOCK_RULES,
+                         LLDPQ_ENTER_MGMT_VRF='no'),
+                    dict(FAKE_VRF_TABLE='1001', FAKE_RULES=STOCK_RULES, FAKE_VRF_ADDR=''),
+                    dict(FAKE_VRF_TABLE='1001', FAKE_RULES=STOCK_RULES, FAKE_VRF_EXEC_RC='1'),
+                    dict(FAKE_VRF_TABLE='1001', FAKE_RULES=STOCK_RULES, LLDPQ_VRF_REEXEC='1')):
+            with self.subTest(env=env):
+                self.host.ip_log.unlink(missing_ok=True)
+                self.assertEqual(self.remembered_ifindex(**env)[0], 'IFINDEX=<>')
+
+    def test_unreadable_ifindex_leaves_the_start_alone(self):
+        for content in (None, '', 'mgmt\n', '9 9\n', '-1\n'):
+            with self.subTest(content=content):
+                self.host.set_ifindex(content)
+                self.assertEqual(self.remembered_ifindex(**self.INSIDE), ('IFINDEX=<>', ''))
+                self.assertEqual(self.host.marker.read_text(), 'mgmt\n')
+
 
 class TwoPassStartTests(FakeHostCase):
     """The real head of the entrypoint, run through the re-exec and back."""
 
     ARGS = ('first', 'two  spaces', '*', '')
+    REPORT = ('echo "STATUS=$MGMT_VRF_STATUS"\n'
+              'echo "RULE=$MGMT_RULE_WARNING"\n'
+              'echo "HANDOVER=${LLDPQ_MGMT_RULE_WARNING-unset}"\n')
 
-    def start(self, **env):
+    def start(self, report=REPORT, **env):
         script = self.host.root / 'docker-entrypoint.sh'
-        script.write_text(ENTRYPOINT_HEAD + 'printf "ARG<%s>\\n" "$@"\n'
-                          'echo "STATUS=$MGMT_VRF_STATUS"\n'
-                          'echo "RULE=$MGMT_RULE_WARNING"\n'
-                          'echo "HANDOVER=${LLDPQ_MGMT_RULE_WARNING-unset}"\n')
+        script.write_text(ENTRYPOINT_HEAD + 'printf "ARG<%s>\\n" "$@"\n' + report)
         return subprocess.run(
             ['bash', str(script), *self.ARGS], capture_output=True, text=True, timeout=20,
             env=self.host.env(FAKE_VRF_TABLE='1001', FAKE_VRF_EXEC_RUN='1', **env))
@@ -435,6 +563,127 @@ class TwoPassStartTests(FakeHostCase):
         # environment of the services.
         self.assertTrue(result.stdout.endswith(f'RULE={warning}\nHANDOVER=unset\n'),
                         result.stdout)
+
+    def test_ifindex_is_remembered_by_the_pass_that_starts_the_services(self):
+        self.host.set_ifindex('9\n')
+        result = self.start(report='echo "IFINDEX=<$MGMT_VRF_IFINDEX>"\n',
+                            FAKE_RULES=STOCK_RULES)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.endswith('ARG<>\nIFINDEX=<9>\n'), result.stdout)
+
+
+class VrfReplacedTests(unittest.TestCase):
+    """The watchdog notices that the VRF the services were started in was re-created.
+
+    Deleting the VRF and creating it again (ifdown/ifup of mgmt) gives a new
+    device with a new ifindex, while the sockets the services opened stay bound
+    to the old one.  The watchdog only says so, once per change; it restarts
+    nothing.  The real loop runs here against a stand-in for /sys/class/net.
+    """
+
+    GONE = ('CRITICAL: the mgmt VRF device the services were started in (ifindex 9) is '
+            'gone; the services are still bound to that old device. When the VRF is back, '
+            'restart the container: docker restart lldpq')
+
+    @staticmethod
+    def replaced(now, start=9):
+        return (f'CRITICAL: the mgmt VRF was re-created (ifindex {start} at start, now {now}); '
+                'the services are still bound to the old device and do not use the new one. '
+                'Restart the container: docker restart lldpq')
+
+    def setUp(self):
+        self.host = FakeHost()
+        self.addCleanup(self.host.close)
+
+    def watch(self, polls, start='9'):
+        """Run the loop for len(polls) rounds; before each the device gets that ifindex.
+
+        None removes the device.  Returns what the loop wrote, one list per stream.
+        """
+        device = self.host.sys_net / 'mgmt'
+        steps = []
+        for number, ifindex in enumerate(polls, 1):
+            if ifindex is None:
+                steps.append(f'{number}) rm -rf "{device}" ;;')
+            else:
+                steps.append(f'{number}) mkdir -p "{device}"; '
+                             f'echo {ifindex} > "{device}/ifindex" ;;')
+        source = '\n'.join((
+            'set -e',
+            'WATCHDOG_POLL_DELAY=0', 'WATCHDOG_STORM_LIMIT=5', 'WATCHDOG_STORM_WINDOW=60',
+            'LLDPQ_MGMT_VRF=mgmt',
+            f'LLDPQ_SYS_CLASS_NET="{self.host.sys_net}"',
+            f'MGMT_VRF_IFINDEX={start}',
+            'polls=0',
+            'sleep() {',
+            '    polls=$((polls + 1))',
+            '    case $polls in',
+            *steps,
+            '        *) exit 0 ;;',
+            '    esac',
+            '}',
+            # The other two things the loop looks after are healthy throughout.
+            '_fcgiwrap_pool_healthy() { return 0; }',
+            'pgrep() { return 0; }',
+            '_stop_fcgiwrap() { :; }',
+            '_restart_fcgiwrap() { echo ACTED: fcgiwrap restarted; }',
+            '_restart_cron() { echo ACTED: cron restarted; }',
+            'kill() { echo "ACTED: kill $*"; }',
+            'cat() { echo read >> "$READS"; command cat "$@"; }',
+            shell_function('_supervise_services'),
+            '_supervise_services', ''))
+        self.reads = self.host.root / 'reads'
+        self.reads.unlink(missing_ok=True)
+        result = subprocess.run(['bash', '-c', source], capture_output=True, text=True,
+                                timeout=20, env=self.host.env(READS=str(self.reads)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines(), result.stderr.splitlines()
+
+    def test_unchanged_vrf_is_never_mentioned(self):
+        self.assertEqual(self.watch([9, 9, 9, 9]), ([], []))
+        # It was looked at on every round.
+        self.assertEqual(len(self.reads.read_text().splitlines()), 4)
+
+    def test_recreated_vrf_is_reported_once(self):
+        self.assertEqual(self.watch([9, 14, 14, 14, 14]), ([], [self.replaced(14)]))
+
+    def test_removed_vrf_is_reported_once_and_again_when_it_is_back(self):
+        self.assertEqual(self.watch([9, None, None, None, 14, 14]),
+                         ([], [self.GONE, self.replaced(14)]))
+
+    def test_every_further_change_gets_its_own_line(self):
+        self.assertEqual(self.watch([14, 14, 21, None, 30, 30]),
+                         ([], [self.replaced(14), self.replaced(21), self.GONE,
+                               self.replaced(30)]))
+
+    def test_same_device_back_after_a_failed_read_is_not_reported_as_replaced(self):
+        self.assertEqual(self.watch([None, 9, 9]), ([], [self.GONE]))
+
+    def test_nothing_is_watched_when_the_services_run_in_the_default_vrf(self):
+        # No VRF, opt-out or a VRF that could not be entered: no ifindex was
+        # remembered, so the device is not even looked at.
+        self.assertEqual(self.watch([9, 14, None, 21], start=''), ([], []))
+        self.assertFalse(self.reads.exists())
+
+    def test_watchdog_only_reports(self):
+        # stdout stays empty in every scenario above: nothing was killed or
+        # restarted.  The loop's own text agrees.
+        watchdog = shell_function('_supervise_services')
+        watch = watchdog[watchdog.index('if [ -n "$MGMT_VRF_IFINDEX" ]; then'):]
+        commands = [line.strip() for line in watch.splitlines()
+                    if line.strip() and not line.strip().startswith(('#', 'echo "CRITICAL: '))]
+        self.assertEqual(commands, [
+            'if [ -n "$MGMT_VRF_IFINDEX" ]; then',
+            'vrf_ifindex=$(cat "$LLDPQ_SYS_CLASS_NET/$LLDPQ_MGMT_VRF/ifindex" 2>/dev/null)'
+            ' || vrf_ifindex=""',
+            'if [ "$vrf_ifindex" != "$vrf_ifindex_seen" ]; then',
+            'vrf_ifindex_seen=$vrf_ifindex',
+            'if [ -z "$vrf_ifindex" ]; then',
+            'elif [ "$vrf_ifindex" != "$MGMT_VRF_IFINDEX" ]; then',
+            'fi', 'fi', 'fi', 'done', '}'])
+        # CRITICAL is the loudest level the loop has, and it goes to stderr.
+        self.assertEqual(watch.count('echo "CRITICAL: '), 2)
+        self.assertEqual(watch.count('" >&2\n'), 2)
 
 
 class LegacyRuleCleanupTests(FakeHostCase):
@@ -767,7 +1016,11 @@ class ShippedContractTests(unittest.TestCase):
         files = [ROOT / 'install.sh', ROOT / 'docker/docker-entrypoint.sh', HELPER,
                  CURL_WRAPPER,
                  ROOT / 'docker/Dockerfile', ROOT / 'docker/dotf/bashrc',
-                 *sorted((ROOT / 'docker').glob('*.sh')),
+                 # docker/test-*.sh are checks a person runs on a host. The image
+                 # does not ship them, and the one for a switch can put the old
+                 # rule back to see it removed.
+                 *sorted(path for path in (ROOT / 'docker').glob('*.sh')
+                         if not path.name.startswith('test-')),
                  *sorted(path for path in (ROOT / 'bin').iterdir() if path.is_file()),
                  *sorted((ROOT / 'lldpq').glob('*.sh')),
                  *sorted((ROOT / 'html').glob('*.sh'))]
@@ -777,6 +1030,95 @@ class ShippedContractTests(unittest.TestCase):
                 if re.search(r'\bip\b(\s+-\S+)*\s+ru(le)?\s+(a|add|replace)\b', line):
                     offenders.append(f'{path.relative_to(ROOT)}:{number}')
         self.assertEqual(offenders, [])
+        self.assertNotIn('docker/test-', DOCKERFILE)
+
+    # The one place that may touch the host's routing policy: the entrypoint
+    # removes the rule of an earlier image, or prints the command that does.
+    LEGACY_RULE_CLEANUP = 'rule del pref 100 table'
+
+    def test_nothing_run_in_the_container_changes_host_network_state(self):
+        # Everything that runs inside the container at start, from cron or in a
+        # `docker exec` shell.  The collectors under lldpq/ and the CGIs under
+        # html/ are left out: they hold commands that are sent to the switches.
+        files = [ROOT / 'install.sh', ROOT / 'docker/docker-entrypoint.sh', HELPER,
+                 CURL_WRAPPER, ROOT / 'docker/Dockerfile', ROOT / 'docker/dotf/bashrc',
+                 *sorted(path for path in (ROOT / 'bin').iterdir() if path.is_file())]
+        offenders, allowed = [], []
+        for path in files:
+            for number, line in host_state_changes(path.read_text(errors='replace')):
+                if path.name == 'docker-entrypoint.sh' and self.LEGACY_RULE_CLEANUP in line:
+                    allowed.append(line.strip())
+                else:
+                    offenders.append(f'{path.relative_to(ROOT)}:{number}: {line.strip()}')
+        self.assertEqual(offenders, [])
+        self.assertEqual(len(allowed), 2, allowed)
+        self.assertEqual(allowed[0], 'if ! ip -4 rule del pref 100 table "$table" 2>/dev/null; then')
+        self.assertTrue(allowed[1].startswith('MGMT_RULE_WARNING="'), allowed[1])
+        self.assertIn('Run on the host: sudo ip rule del pref 100 table $table', allowed[1])
+
+    def test_host_state_scan_recognises_each_kind_of_change(self):
+        changes = (
+            'ip rule add pref 100 table "$table"',
+            'ip -4 ru a pref 100 lookup mgmt',
+            'sudo ip rule del pref 32765',
+            'ip route add default via 192.0.2.1 table mgmt',
+            'ip -6 route replace ::/0 via 2001:db8::1',
+            '/usr/sbin/ip r del 10.0.0.0/8',
+            'ip route flush table 1001',
+            'ip vrf exec mgmt ip ro change 10.0.0.0/8 dev eth0',
+            'ip addr add 127.0.0.1/8 dev mgmt',
+            'ip a flush dev eth0',
+            'ip link set dev eth0 master mgmt',
+            'ip link add mgmt type vrf table 1001',
+            'ip l set swp1 down',
+            'ip neigh flush all',
+            'ip netns add lldpq',
+            'ip nexthop replace id 1 via 192.0.2.1 dev eth0',
+            'sysctl -w net.ipv4.tcp_l3mdev_accept=1',
+            'sysctl -qw net.ipv4.udp_l3mdev_accept=1 || true',
+            'sysctl net.ipv4.ip_forward=1',
+            'sysctl -p /etc/sysctl.d/99-lldpq.conf',
+            'echo 1 > /proc/sys/net/ipv4/tcp_l3mdev_accept',
+            'echo 0 >> "/proc/sys/net/ipv4/conf/all/rp_filter"',
+            'echo 1 | tee /proc/sys/net/ipv4/ip_forward',
+            'iptables -I INPUT -p tcp --dport 80 -j ACCEPT',
+            'ip6tables -A INPUT -j DROP',
+            'iptables-restore < /etc/iptables.rules',
+            'ebtables -A FORWARD -j DROP',
+            'nft add rule inet filter input tcp dport 80 accept',
+            'nft -f /etc/nftables.conf',
+            'tc qdisc add dev eth0 root netem delay 10ms',
+            'tc -s filter del dev eth0',
+            'tc class replace dev eth0 classid 1:1 htb rate 1mbit',
+            'RUN ip link set lo up && sysctl -w net.ipv4.ip_forward=1',
+        )
+        for line in changes:
+            with self.subTest(line=line):
+                self.assertEqual(host_state_changes(f'echo before\n    {line}\n'),
+                                 [(2, f'    {line}')])
+        # Reading the state, entering the VRF and a commented-out command are fine.
+        harmless = (
+            'ip vrf show "$1" 2>/dev/null |',
+            'ip vrf identify 1',
+            'counts=$(ip -4 rule show 2>/dev/null | awk -v vrf="$vrf" \'',
+            'if ! ip -4 -o addr show dev "$vrf" 2>/dev/null | grep -q x; then',
+            'exec ip vrf exec "$vrf" /bin/bash "$0" "$@"',
+            'ip -j link show',
+            'ip route get 192.0.2.1',
+            'ip -4 neigh show dev eth0',
+            'accept=$(sysctl -n net.ipv4.tcp_l3mdev_accept) && seen=1',
+            'sysctl -a 2>/dev/null | grep rp_filter=1',
+            'forward=$(cat /proc/sys/net/ipv4/ip_forward)',
+            'read -r forward < /proc/sys/net/ipv4/ip_forward',
+            'iptables-save > "$dir/iptables"',
+            'tc -s qdisc show dev eth0',
+            '# ip rule add pref 100 table "$table"',
+            '    # sysctl -w net.ipv4.tcp_l3mdev_accept=1',
+            'echo "the ip address and the route are set by the operator"',
+        )
+        for line in harmless:
+            with self.subTest(line=line):
+                self.assertEqual(host_state_changes(line + '\n'), [])
 
     def test_vrf_is_entered_before_any_other_startup_work(self):
         self.assertEqual(ENTRYPOINT.count('_enter_mgmt_vrf "$@"'), 1)
@@ -791,9 +1133,67 @@ class ShippedContractTests(unittest.TestCase):
         self.assertIn('[ -z "$MGMT_RULE_WARNING" ] || echo "  $MGMT_RULE_WARNING"',
                       ENTRYPOINT[ready:])
 
+    def swept_files(self):
+        patterns, _ = syntax_sweep()
+        swept = set()
+        for pattern in patterns:
+            matched = [path for path in ROOT.glob(pattern) if path.is_file()]
+            # The loop skips what does not exist, so a stale name would go unnoticed.
+            self.assertTrue(matched, f'{pattern} in the Makefile sweep matches no file')
+            swept.update(path.relative_to(ROOT).as_posix() for path in matched
+                         if not re.match(rb'#!.*python', first_line(path)))
+        return swept
+
     def test_new_scripts_are_part_of_the_syntax_sweep(self):
-        self.assertIn('docker/docker-entrypoint.sh docker/lldpq-vrf docker/curl-vrf; do',
-                      MAKEFILE)
+        swept = self.swept_files()
+        for name in ('docker/docker-entrypoint.sh', 'docker/lldpq-vrf', 'docker/curl-vrf',
+                     'docker/dotf/bashrc',
+                     *(f'bin/{command}' for command in SELF_ENTERING_COMMANDS)):
+            self.assertIn(name, swept)
+
+    def test_syntax_sweep_covers_every_bash_file(self):
+        self.assertEqual(sorted(bash_files() - self.swept_files()), [])
+        for name in SOURCED_BASH:
+            self.assertTrue((ROOT / name).is_file(), name)
+
+    def run_sweep(self, files):
+        """Run the Makefile's loop in a scratch tree that holds only `files`."""
+        _, script = syntax_sweep()
+        with tempfile.TemporaryDirectory(prefix='lldpq-sweep-') as tree:
+            for name, content in files.items():
+                path = Path(tree, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+            Path(tree, 'bin', '__pycache__').mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(['sh', '-c', script], cwd=tree, capture_output=True,
+                                    text=True, timeout=60)
+        return result.returncode, result.stdout
+
+    def test_syntax_sweep_checks_by_content_not_by_shebang(self):
+        good = '#!/usr/bin/env bash\nif true; then echo ok; fi\n'
+        broken = 'if true; then\n'
+        python = '#!/usr/bin/python3\nimport os\nif os.sep:\n    pass\n'
+        clean = {'install.sh': good, 'bin/lldpq': good, 'bin/lldpq-config': python,
+                 'bin/zzh': python.replace('/usr/bin/python3', '/usr/bin/env python3'),
+                 'docker/dotf/bashrc': 'alias ll="ls -l"\n'}
+        self.assertEqual(self.run_sweep(clean), (0, ''))
+        for name, content in (
+                # Sourced files: no shebang at all.
+                ('docker/dotf/bashrc', broken),
+                ('lldpq/sw-base/bash.bashrc', broken),
+                # The commands that carry the VRF block.
+                ('bin/pping', '#!/usr/bin/env bash\n' + broken),
+                ('bin/get-conf', '#!/usr/bin/env bash\n' + broken),
+                ('bin/send-cmd', '#!/usr/bin/env bash\n' + broken),
+                # A script that lost its shebang is still a script.
+                ('bin/lldpq', broken),
+                ('lldpq/sw-base/nvc', '#!/bin/sh\n' + broken),
+                # Picked up by glob, without a Makefile change.
+                ('docker/test-something-new.sh', '#!/bin/bash\n' + broken),
+                ('telemetry/start.sh', '#!/bin/bash\n' + broken)):
+            with self.subTest(name=name):
+                self.assertEqual(self.run_sweep({**clean, name: content}),
+                                 (1, f'bash -n failed: {name}\n'))
 
     def test_image_installs_the_helper_and_probes_health_through_it(self):
         self.assertIn('COPY --chown=root:root docker/lldpq-vrf /usr/local/bin/lldpq-vrf',

@@ -58,11 +58,18 @@ def parse_optical_vendor_info(filepath):
             if not lines:
                 continue
 
-            iface_match = re.match(r'(\w+)', lines[0].strip())
+            # The key is the whole interface name.  A word-only match filed
+            # a VLAN sub-interface ("swp6.100") under its parent "swp6", so
+            # its block could replace the parent's module entry.
+            iface_match = re.match(r'(\S+)', lines[0].strip())
             if not iface_match:
                 continue
 
             iface = iface_match.group(1)
+            # A sub-interface rides its parent's module and has none of its
+            # own, whatever its block holds.
+            if '.' in iface:
+                continue
             data = '\n'.join(lines[1:])
 
             identifier = ''
