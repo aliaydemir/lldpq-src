@@ -2765,6 +2765,8 @@
                         state.files[path] = {
                             content: result.content,
                             originalContent: result.content,
+                            revision: typeof result.revision === 'string' ? result.revision : '',
+                            isNew: false,
                             modified: false,
                             valid: true
                         };
@@ -2933,12 +2935,15 @@
                     // Check if content actually changed
                     const oldContent = file.originalContent;
                     const newContent = result.content;
+                    const newRevision = typeof result.revision === 'string' ? result.revision : '';
                     
                     if (oldContent !== newContent) {
                         // Update file state
                         state.files[path] = {
                             content: newContent,
                             originalContent: newContent,
+                            revision: newRevision,
+                            isNew: false,
                             modified: false,
                             valid: true
                         };
@@ -2952,6 +2957,8 @@
                         updateUI();
                         showOutput('File reloaded: ' + path.split('/').pop(), 'success');
                     } else {
+                        file.revision = newRevision;
+                        file.isNew = false;
                         showOutput('File unchanged', 'info');
                     }
                 } else {
@@ -3336,15 +3343,25 @@
             showLoading(true, 'Saving...');
             try {
                 const file = state.files[state.currentFile];
+                const payload = { content: file.content };
+                if (file.isNew) {
+                    payload.create_only = true;
+                } else if (typeof file.revision === 'string') {
+                    payload.expected_revision = file.revision;
+                }
                 const result = await fetch('/ansible-api?action=write&file=' + encodeURIComponent(state.currentFile), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ content: file.content })
+                    body: JSON.stringify(payload)
                 }).then(r => r.json());
                 
                 if (result.success) {
-                    const wasNewFile = !file.originalContent;
+                    const wasNewFile = !!file.isNew || !file.originalContent;
                     file.originalContent = file.content;
+                    if (typeof result.revision === 'string') {
+                        file.revision = result.revision;
+                    }
+                    file.isNew = false;
                     file.modified = false;
                     showOutput('Saved: ' + state.currentFile, 'success');
                     updateUI();
@@ -3356,6 +3373,8 @@
                     
                     // Refresh git modified status (small delay for disk write)
                     setTimeout(() => loadGitModifiedFiles(), 500);
+                } else if (result.conflict) {
+                    showOutput('Save conflict: ' + (result.error || 'File changed on disk. Double-click the tab to reload.'), 'error');
                 } else {
                     showOutput('Error saving: ' + result.error, 'error');
                 }
@@ -3379,26 +3398,43 @@
             
             showLoading(true, 'Saving all files...');
             let saved = 0;
+            const conflicts = [];
             
             for (const [path, file] of modifiedFiles) {
                 try {
+                    const payload = { content: file.content };
+                    if (file.isNew) {
+                        payload.create_only = true;
+                    } else if (typeof file.revision === 'string') {
+                        payload.expected_revision = file.revision;
+                    }
                     const result = await fetch('/ansible-api?action=write&file=' + encodeURIComponent(path), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ content: file.content })
+                        body: JSON.stringify(payload)
                     }).then(r => r.json());
                     
                     if (result.success) {
                         file.originalContent = file.content;
+                        if (typeof result.revision === 'string') {
+                            file.revision = result.revision;
+                        }
+                        file.isNew = false;
                         file.modified = false;
                         saved++;
+                    } else if (result.conflict) {
+                        conflicts.push(path);
                     }
                 } catch (e) {
                     console.error('Error saving ' + path, e);
                 }
             }
             
-            showOutput(`Saved ${saved}/${modifiedFiles.length} files`, saved === modifiedFiles.length ? 'success' : 'error');
+            if (conflicts.length > 0) {
+                showOutput(`Saved ${saved}/${modifiedFiles.length} files (${conflicts.length} conflict(s): ${conflicts.join(', ')}; reload conflicted tab(s) before saving)`, 'error');
+            } else {
+                showOutput(`Saved ${saved}/${modifiedFiles.length} files`, saved === modifiedFiles.length ? 'success' : 'error');
+            }
             updateUI();
             
             // Refresh file tree in case new files were created
@@ -3872,6 +3908,8 @@
             state.files[fileName] = {
                 content: '# ' + userInput + '\n\n',
                 originalContent: '',
+                revision: '',
+                isNew: true,
                 modified: true,
                 valid: true
             };
@@ -3928,7 +3966,10 @@
                 const saveResult = await fetch('/ansible-api?action=write&file=' + encodeURIComponent(newPath), {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ content: content.replace(/^#\s*filename:.*\n?/i, '') })
+                    body: JSON.stringify({
+                        content: content.replace(/^#\s*filename:.*\n?/i, ''),
+                        create_only: true
+                    })
                 }).then(r => r.json());
                 
                 if (!saveResult.success) {
@@ -3948,6 +3989,8 @@
                 state.files[newPath] = {
                     content: content.replace(/^#\s*filename:.*\n?/i, ''),
                     originalContent: content.replace(/^#\s*filename:.*\n?/i, ''),
+                    revision: typeof saveResult.revision === 'string' ? saveResult.revision : '',
+                    isNew: false,
                     modified: false,
                     valid: true
                 };

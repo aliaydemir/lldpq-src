@@ -528,7 +528,7 @@ try:
     config = {}
     if os.path.exists(host_vars_file):
         with open(host_vars_file, 'r') as f:
-            config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
     
     # Find device info from hosts file
     device_info = {'hostname': hostname, 'group': None, 'ip': None}
@@ -561,7 +561,7 @@ try:
         group_vrfs_file = f"{ansible_dir}/inventory/group_vars/{device_info['group']}/vrfs.yaml"
         if os.path.exists(group_vrfs_file):
             with open(group_vrfs_file, 'r') as f:
-                group_config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+                group_config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
                 if 'vrfs' in group_config:
                     config['vrfs'] = group_config['vrfs']
     
@@ -569,7 +569,7 @@ try:
     port_profiles = {}
     if os.path.exists(port_profiles_file):
         with open(port_profiles_file, 'r') as f:
-            pp_config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            pp_config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             port_profiles = pp_config.get('sw_port_profiles', {})
     
     # Load VLAN profiles for VRF and IP resolution
@@ -579,7 +579,7 @@ try:
     
     if os.path.exists(vlan_profiles_file):
         with open(vlan_profiles_file, 'r') as f:
-            vp_config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            vp_config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             
             # Load vxlan_int mapping (nscale/kddi style: vxlan_int at top level)
             if 'vxlan_int' in vp_config and isinstance(vp_config['vxlan_int'], dict):
@@ -663,7 +663,7 @@ vlan_file = f"{ansible_dir}/inventory/group_vars/all/vlan_profiles.yaml"
 
 try:
     with open(vlan_file, 'r') as f:
-        config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+        config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
     
     print(json.dumps({
         'success': True,
@@ -1744,7 +1744,7 @@ for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os
     
     try:
         with open(host_file, 'r') as f:
-            host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            host_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             device_vrfs = host_data.get('vrfs', {})
             
             if device_vrfs:
@@ -1794,7 +1794,7 @@ vrfs = set()
 
 if os.path.exists(vlan_file):
     with open(vlan_file, 'r') as f:
-        data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+        data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
         vlan_profiles = data.get('vlan_profiles', {})
 
 # Collect VRFs from VLAN profiles
@@ -1820,7 +1820,7 @@ for host_file in glob.glob(os.path.join(host_vars_dir, '*.yaml')) + glob.glob(os
     
     try:
         with open(host_file, 'r') as f:
-            host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            host_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             vlan_templates = host_data.get('vlan_templates', [])
             
             if vlan_templates:
@@ -1868,7 +1868,7 @@ port_profiles = {}
 if os.path.exists(port_profiles_file):
     try:
         with open(port_profiles_file, 'r') as f:
-            port_profiles = (yaml.load(f, Loader=yaml.CSafeLoader) or {}).get('sw_port_profiles', {}) or {}
+            port_profiles = (yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}).get('sw_port_profiles', {}) or {}
     except Exception:
         port_profiles = {}
 
@@ -1878,7 +1878,7 @@ vlan_profiles_data = {}
 if os.path.exists(vlan_profiles_file):
     try:
         with open(vlan_profiles_file, 'r') as f:
-            vp_config = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            vp_config = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
         for profile_name, profile_data in (vp_config.get('vlan_profiles', {}) or {}).items():
             if not profile_data or 'vlans' not in profile_data:
                 continue
@@ -1912,7 +1912,7 @@ for host_file in sorted(glob.glob(os.path.join(host_vars_dir, '*.yaml')) +
     seen_hosts.add(hostname)
     try:
         with open(host_file, 'r') as f:
-            host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            host_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
     except Exception as e:
         parse_errors[os.path.basename(host_file)] = str(e)
         continue
@@ -4255,7 +4255,7 @@ bgp_file = f"{ansible_dir}/inventory/group_vars/all/bgp_profiles.yaml"
 
 try:
     with open(bgp_file, 'r') as f:
-        bgp_data = yaml.load(f, Loader=yaml.CSafeLoader)
+        bgp_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
     
     profiles = bgp_data.get('bgp_profiles', {})
     route_map_to_target = {}
@@ -4272,7 +4272,7 @@ try:
         _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
-                device_data = yaml.load(f, Loader=yaml.CSafeLoader)
+                device_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
             if not device_data:
                 continue
             
@@ -4348,7 +4348,7 @@ bgp_file = f"{ansible_dir}/inventory/group_vars/all/bgp_profiles.yaml"
 # Build route_map -> target_vrf mapping from bgp_profiles
 try:
     with open(bgp_file, 'r') as f:
-        bgp_data = yaml.load(f, Loader=yaml.CSafeLoader)
+        bgp_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
     
     profiles = bgp_data.get('bgp_profiles', {})
     
@@ -4367,7 +4367,7 @@ try:
         _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
-                device_data = yaml.load(f, Loader=yaml.CSafeLoader)
+                device_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
             if not device_data:
                 continue
             
@@ -4428,7 +4428,7 @@ host_vars_dir = f"{ansible_dir}/inventory/host_vars"
 
 try:
     with open(bgp_file, 'r') as f:
-        data = yaml.load(f, Loader=yaml.CSafeLoader)
+        data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
     
     profiles = data.get('bgp_profiles', {})
     
@@ -4456,7 +4456,7 @@ try:
         _seen_hosts.add(_stem)
         try:
             with open(yaml_file, 'r') as f:
-                device_data = yaml.load(f, Loader=yaml.CSafeLoader)
+                device_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader))
             if not device_data:
                 continue
             vrfs = device_data.get('vrfs') or {}
@@ -6654,7 +6654,7 @@ try:
 
         try:
             with open(host_file, 'r') as f:
-                host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+                host_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             
             # Check if vtep.state is true
             vtep_config = host_data.get('vtep', {})
@@ -6706,7 +6706,7 @@ try:
     
     if os.path.exists(bgp_profiles_file):
         with open(bgp_profiles_file, 'r') as f:
-            bgp_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+            bgp_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             bgp_profiles = bgp_data.get('bgp_profiles', {})
     
     # Find profiles with fabric_exit peer groups (fabric_exit: true tag or name == 'External')
@@ -6772,7 +6772,7 @@ try:
         # host_vars file must not blank the whole Fabric Exit page
         try:
             with open(host_file, 'r') as f:
-                host_data = yaml.load(f, Loader=yaml.CSafeLoader) or {}
+                host_data = yaml.load(f, Loader=getattr(yaml, 'CSafeLoader', yaml.SafeLoader)) or {}
             if not isinstance(host_data, dict):
                 host_data = {}
 

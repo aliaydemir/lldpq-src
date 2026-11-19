@@ -4075,6 +4075,39 @@ function discoveredIdentityConflict(bindings, discovered) {
 
 function filterDiscovered() { renderDiscovered(); }
 
+async function pollDeployJob(statusAction, jobId, onProgress) {
+    let pollFailures = 0;
+    while (true) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        let poll;
+        try {
+            poll = await apiCall(statusAction, { job_id: jobId });
+        } catch (err) {
+            pollFailures++;
+            if (pollFailures >= 5) {
+                return { success: false, error: err && err.message ? err.message : 'Lost connection while polling deploy status' };
+            }
+            continue;
+        }
+        if (!poll || !poll.success || !poll.job) {
+            pollFailures++;
+            if (pollFailures >= 5) {
+                return { success: false, error: (poll && poll.error) || 'Failed to read deploy status' };
+            }
+            continue;
+        }
+        pollFailures = 0;
+        const job = poll.job;
+        if (typeof onProgress === 'function') onProgress(job);
+        if (job.complete) {
+            if (job.status === 'failed') {
+                return { success: false, error: job.error || 'Deploy worker failed', job };
+            }
+            return { success: true, results: job.results || [], summary: job.summary || {}, job };
+        }
+    }
+}
+
 async function deployGeneratedConfig(hostname, ip) {
     showConfirmModal('Re-deploy NVUE Config',
         `Re-deploy the saved NVUE config to <strong>${escHtml(hostname)}</strong> (${escHtml(ip)})?<br><br>` +
@@ -4083,7 +4116,16 @@ async function deployGeneratedConfig(hostname, ip) {
         `<span style="color:#ff9800;">The switch configuration will be fully replaced.</span>`,
         async () => {
             showToast(`Re-deploying config to ${hostname}...`, 'info');
-            const data = await apiCall('deploy-generated-config', { hostname, ip });
+            const started = await apiCall('config-deploy-start', { hostname, ip });
+            if (!started.success || !started.job) {
+                showToast(`Deploy failed: ${started.error || 'Unknown error'}`, 'error');
+                return;
+            }
+            const data = started.job.complete
+                ? (started.job.status === 'failed'
+                    ? { success: false, error: started.job.error || 'Deploy failed' }
+                    : { success: true, results: started.job.results || [] })
+                : await pollDeployJob('config-deploy-status', started.job.id);
             if (data.success && data.results) {
                 const r = data.results[0];
                 if (r && r.success) {
@@ -5709,28 +5751,51 @@ async function deployBaseConfig() {
             </table>
         </div>`;
 
-    document.getElementById('deployStatusText').textContent = `Deploying to ${selectedDevices.length} devices...`;
+    document.getElementById('deployStatusText').textContent = `Deploying to ${selectedDevices.length} devices (0/${selectedDevices.length})...`;
 
-    // No files param = deploy all available sw-base files
-    const data = await apiCall('deploy-base-config', {
-        devices: selectedDevices,
-        disable_ztp: disableZTP
-    });
-
-    if (data.success && data.results) {
+    function renderDeployRows(results) {
         let okCount = 0, failCount = 0;
-        data.results.forEach(r => {
+        (results || []).forEach(r => {
             const row = document.getElementById(`deploy-${rowIdFromIp(r.ip)}`);
-            if (row) {
-                if (r.success) {
-                    okCount++;
+            if (r.success) {
+                okCount++;
+                if (row) {
                     row.innerHTML = `<td><strong>${escHtml(r.hostname)}</strong></td><td style="font-family:monospace;font-size:12px;">${escHtml(r.ip)}</td><td><span class="badge badge-success">OK</span></td><td style="color:#4caf50;">${escHtml(r.message || 'OK')}</td>`;
-                } else {
-                    failCount++;
+                }
+            } else {
+                failCount++;
+                if (row) {
                     row.innerHTML = `<td><strong>${escHtml(r.hostname)}</strong></td><td style="font-family:monospace;font-size:12px;">${escHtml(r.ip)}</td><td><span class="badge badge-error">FAIL</span></td><td style="color:#f44336;">${escHtml(r.error || 'Failed')}</td>`;
                 }
             }
         });
+        return { okCount, failCount };
+    }
+
+    // Start detached deploy worker so large fleets never hit the 180s CGI timeout.
+    const started = await apiCall('base-deploy-start', {
+        devices: selectedDevices,
+        disable_ztp: disableZTP
+    });
+
+    let data;
+    if (!started.success || !started.job) {
+        data = { success: false, error: started.error || 'Failed to start deploy job' };
+    } else if (started.job.complete) {
+        data = started.job.status === 'failed'
+            ? { success: false, error: started.job.error || 'Deploy worker failed' }
+            : { success: true, results: started.job.results || [] };
+    } else {
+        data = await pollDeployJob('base-deploy-status', started.job.id, (job) => {
+            renderDeployRows(job.results);
+            const done = Number(job.completed || (job.results ? job.results.length : 0));
+            const total = Number(job.total || selectedDevices.length);
+            document.getElementById('deployStatusText').textContent = `Deploying to ${total} devices (${done}/${total})...`;
+        });
+    }
+
+    if (data.success && data.results) {
+        const { okCount, failCount } = renderDeployRows(data.results);
         document.getElementById('deployStatusText').textContent = `Done: ${okCount} OK, ${failCount} failed`;
         showToast(`Deploy: ${okCount} OK, ${failCount} failed`, failCount > 0 ? 'error' : 'success');
     } else {

@@ -276,8 +276,22 @@ read_file() {
         return
     fi
     
-    local content=$(cat "$full_path" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
-    json_response "{\"success\": true, \"content\": $content}"
+    local payload
+    payload=$(FULL_PATH="$full_path" python3 -c '
+import hashlib, json, os
+with open(os.environ["FULL_PATH"], "rb") as fh:
+    raw = fh.read()
+print(json.dumps({
+    "success": True,
+    "content": raw.decode("utf-8", errors="replace"),
+    "revision": hashlib.sha256(raw).hexdigest(),
+}))
+' 2>/dev/null)
+    if [ -n "$payload" ]; then
+        json_response "$payload"
+    else
+        json_response '{"success": false, "error": "Failed to read file"}'
+    fi
 }
 
 # Write file
@@ -297,47 +311,114 @@ write_file() {
         return
     fi
 
-    # Read POST data
-    local post_data
-    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-        post_data=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
-    else
-        post_data=$(cat)
-    fi
-    
-    # Extract the content and write it atomically. The content is written
-    # straight from the parsed JSON to a same-directory temp file (exact bytes,
-    # no echo option/newline mangling) and then mv'd into place.
+    # Extract the content, check optimistic revision under the lock, and write
+    # straight to a same-directory temp file (exact bytes, no echo mangling).
     local tmp_file
     tmp_file=$(mktemp "${full_path}.XXXXXX.tmp" 2>/dev/null) || tmp_file="${full_path}.$$.tmp"
 
-    local write_status
-    write_status=$(echo "$post_data" | TMP_TARGET="$tmp_file" python3 -c '
-import sys, json, os
+    local write_json
+    write_json=$(FULL_PATH="$full_path" TMP_TARGET="$tmp_file" CONTENT_LENGTH="${CONTENT_LENGTH:-}" python3 -c '
+import hashlib, json, os, sys
+
+raw_len = os.environ.get("CONTENT_LENGTH", "").strip()
 try:
-    data = json.load(sys.stdin)
+    if raw_len.isdigit() and int(raw_len) > 0:
+        body = sys.stdin.buffer.read(int(raw_len))
+    else:
+        body = sys.stdin.buffer.read()
+    data = json.loads(body.decode("utf-8"))
 except Exception:
-    print("badjson")
+    print(json.dumps({"status": "badjson"}))
     sys.exit(0)
+
 if not isinstance(data, dict) or "content" not in data:
-    print("nocontent")
+    print(json.dumps({"status": "nocontent"}))
     sys.exit(0)
+
+expected_revision = data.get("expected_revision", None)
+if expected_revision is not None and not isinstance(expected_revision, str):
+    print(json.dumps({"status": "badrevision"}))
+    sys.exit(0)
+create_only = bool(data.get("create_only", False))
+
+full_path = os.environ["FULL_PATH"]
+exists = os.path.isfile(full_path)
+current_revision = ""
+if exists:
+    try:
+        with open(full_path, "rb") as fh:
+            current_revision = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        print(json.dumps({"status": "readerr"}))
+        sys.exit(0)
+
+if create_only and exists:
+    print(json.dumps({
+        "status": "conflict",
+        "current_revision": current_revision,
+        "error": "File already exists on disk",
+    }))
+    sys.exit(0)
+
+if expected_revision is not None and expected_revision != current_revision:
+    print(json.dumps({
+        "status": "conflict",
+        "current_revision": current_revision,
+        "error": "File was modified on disk since it was opened. Reload to review external changes before saving.",
+    }))
+    sys.exit(0)
+
 content = data.get("content", "")
 if content is None:
     content = ""
 elif not isinstance(content, str):
     content = str(content)
+encoded = content.encode("utf-8")
 try:
-    with open(os.environ["TMP_TARGET"], "w", encoding="utf-8") as f:
-        f.write(content)
+    with open(os.environ["TMP_TARGET"], "wb") as f:
+        f.write(encoded)
+except Exception:
+    print(json.dumps({"status": "writeerr"}))
+    sys.exit(0)
+print(json.dumps({"status": "ok", "revision": hashlib.sha256(encoded).hexdigest()}))
+' 2>/dev/null)
+
+    local write_status
+    write_status=$(WRITE_JSON="$write_json" python3 -c '
+import json, os
+try:
+    print(json.loads(os.environ.get("WRITE_JSON", "")).get("status", "writeerr"))
 except Exception:
     print("writeerr")
-    sys.exit(0)
-print("ok")
 ' 2>/dev/null)
 
     case "$write_status" in
         ok)
+            ;;
+        conflict)
+            rm -f "$tmp_file" 2>/dev/null
+            local conflict_resp
+            conflict_resp=$(WRITE_JSON="$write_json" python3 -c '
+import json, os
+info = json.loads(os.environ["WRITE_JSON"])
+print(json.dumps({
+    "success": False,
+    "conflict": True,
+    "current_revision": info.get("current_revision", ""),
+    "error": info.get("error", "File changed on disk"),
+}))
+' 2>/dev/null)
+            if [ -n "$conflict_resp" ]; then
+                json_response "$conflict_resp"
+            else
+                json_response '{"success": false, "conflict": true, "error": "File changed on disk"}'
+            fi
+            return
+            ;;
+        badrevision)
+            rm -f "$tmp_file" 2>/dev/null
+            json_response '{"success": false, "error": "Invalid expected_revision"}'
+            return
             ;;
         nocontent|badjson)
             rm -f "$tmp_file" 2>/dev/null
@@ -356,7 +437,12 @@ print("ok")
     restore_file_mode "$tmp_file" "$full_path"
 
     if mv -f "$tmp_file" "$full_path"; then
-        json_response '{"success": true, "message": "File saved successfully"}'
+        local new_rev
+        new_rev=$(WRITE_JSON="$write_json" python3 -c '
+import json, os
+print(json.loads(os.environ["WRITE_JSON"]).get("revision", ""))
+' 2>/dev/null)
+        json_response "{\"success\": true, \"message\": \"File saved successfully\", \"revision\": \"$new_rev\"}"
     else
         rm -f "$tmp_file" 2>/dev/null
         json_response '{"success": false, "error": "Failed to write file"}'
@@ -744,6 +830,30 @@ git_commit_push() {
 
     # Check if there are changes to commit
     if git diff --cached --quiet; then
+        # A prior commit may have succeeded while its push failed; retry pushing
+        # any commits ahead of upstream instead of reporting a clean no-op.
+        local upstream_ref ahead_count=0
+        upstream_ref=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+        if [ -n "$upstream_ref" ]; then
+            ahead_count=$(git rev-list --count "${upstream_ref}..HEAD" 2>/dev/null || echo 0)
+        fi
+        if [[ "$ahead_count" =~ ^[0-9]+$ ]] && (( ahead_count > 0 )); then
+            local push_output push_code summary output_json
+            push_output=$(git push 2>&1)
+            push_code=$?
+            fix_git_permissions
+            summary="Pushed ${ahead_count} pending commit(s)"
+            if [ -n "$push_output" ]; then
+                summary="$summary"$'\n'"$push_output"
+            fi
+            output_json=$(printf '%s\n' "$summary" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.buffer.read().decode("utf-8", errors="replace")))')
+            if [ $push_code -eq 0 ]; then
+                json_response "{\"success\": true, \"output\": $output_json}"
+            else
+                json_response "{\"success\": false, \"output\": $output_json, \"error\": \"Push failed\"}"
+            fi
+            return
+        fi
         json_response '{"success": true, "output": "Nothing to commit - working tree clean"}'
         return
     fi
@@ -913,8 +1023,8 @@ fi
 
 # Get commit message from POST data if present
 if [ "$ACTION" = "git-commit" ]; then
-    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
-        POST_DATA=$(dd bs=1 count="$CONTENT_LENGTH" 2>/dev/null)
+    if [[ "${CONTENT_LENGTH:-}" =~ ^[0-9]+$ ]] && (( CONTENT_LENGTH > 0 )); then
+        POST_DATA=$(dd bs=4096 count=$(( (CONTENT_LENGTH + 4095) / 4096 )) iflag=fullblock 2>/dev/null | head -c "$CONTENT_LENGTH")
         MESSAGE=$(echo "$POST_DATA" | sed -n 's/.*message=\([^&]*\).*/\1/p' | python3 -c "import sys, urllib.parse; print(urllib.parse.unquote(sys.stdin.read().strip()))")
     fi
 fi

@@ -1,51 +1,81 @@
-# Prometheus Alert Rules for Cumulus Linux Telemetry
+# Prometheus Alert Rules for Cumulus Linux OTEL Telemetry
+#
+# Metric and label names match the OpenTelemetry Collector Prometheus exporter
+# (namespace: cumulus, resource_to_telemetry_conversion: enabled) and the
+# Cumulus Linux NVUE interface-stats / ai-ethernet-stats telemetry schema
+# queried by html/telemetry.html (cumulus_nvswitch_* with net_host_name and
+# interface labels).
+#
+# Note: BGP session state and platform CPU/fan sensors are not emitted by the
+# Cumulus interface-stats / ai-ethernet-stats OTEL stream; LLDPq monitors those
+# via check_alerts.py.
 
 groups:
   - name: interface_alerts
     rules:
-      # High interface utilization
-      - alert: HighInterfaceUtilization
-        expr: rate(cumulus_interface_tx_bytes[5m]) / cumulus_interface_speed * 8 > 0.8
+      # High interface error rate (RX + TX)
+      - alert: HighInterfaceErrors
+        expr: rate(cumulus_nvswitch_interface_if_in_errors[5m]) + rate(cumulus_nvswitch_interface_if_out_errors[5m]) > 10
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High interface utilization on {{ $labels.device }}:{{ $labels.interface }}"
-          description: "Interface {{ $labels.interface }} on {{ $labels.device }} is above 80% utilization for 5 minutes"
-      
-      # Interface down
-      - alert: InterfaceDown
-        expr: cumulus_interface_oper_state == 0
+          summary: "High error rate on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} has more than 10 errors/sec"
+
+      # High packet drops / discards
+      - alert: HighPacketDrops
+        expr: rate(cumulus_nvswitch_interface_if_in_discards[5m]) + rate(cumulus_nvswitch_interface_if_out_discards[5m]) + rate(cumulus_nvswitch_interface_ether_stats_drop_events[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High packet drops on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} is dropping more than 100 packets/sec"
+
+      # Frequent link carrier flaps
+      - alert: FrequentLinkFlaps
+        expr: increase(cumulus_nvswitch_interface_carrier_changes_total[5m]) > 5
         for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Frequent link flaps on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} had more than 5 carrier transitions in 5 minutes"
+
+      # RX buffer full (congestion / pause pressure)
+      - alert: RxBufferSaturation
+        expr: rate(cumulus_nvswitch_interface_rx_buffer_full[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RX buffer saturation on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} is experiencing RX buffer full events"
+
+      # CRC / FCS physical link errors
+      - alert: HighCrcOrFcsErrors
+        expr: rate(cumulus_nvswitch_interface_ether_stats_crc_align_errors[5m]) + rate(cumulus_nvswitch_interface_dot3_stats_fcs_errors[5m]) > 1
+        for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "Interface down on {{ $labels.device }}:{{ $labels.interface }}"
-          description: "Interface {{ $labels.interface }} on {{ $labels.device }} is operationally down"
-      
-      # High error rate
-      - alert: HighInterfaceErrors
-        expr: rate(cumulus_interface_rx_errors[5m]) > 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High error rate on {{ $labels.device }}:{{ $labels.interface }}"
-          description: "Interface {{ $labels.interface }} on {{ $labels.device }} has more than 10 errors/sec"
-      
-      # High packet drops
-      - alert: HighPacketDrops
-        expr: rate(cumulus_interface_rx_drops[5m]) + rate(cumulus_interface_tx_drops[5m]) > 100
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High packet drops on {{ $labels.device }}:{{ $labels.interface }}"
-          description: "Interface {{ $labels.interface }} on {{ $labels.device }} dropping more than 100 packets/sec"
+          summary: "CRC/FCS errors on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} is recording CRC/FCS errors (>1/sec)"
 
-  - name: device_alerts
+      # Egress Head-of-Line (HOQ) discards
+      - alert: EgressHoqDiscards
+        expr: rate(cumulus_nvswitch_interface_discards_egress_hoq[5m]) + rate(cumulus_nvswitch_interface_discards_egress_hoq_stall[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Egress HOQ discards on {{ $labels.net_host_name }}:{{ $labels.interface }}"
+          description: "Interface {{ $labels.interface }} on {{ $labels.net_host_name }} is experiencing egress HOQ discards/stalls"
+
+  - name: telemetry_health_alerts
     rules:
-      # Device unreachable (no metrics)
+      # OTEL Collector unreachable
       - alert: DeviceUnreachable
         expr: up{job="otel-collector"} == 0
         for: 2m
@@ -53,38 +83,14 @@ groups:
           severity: critical
         annotations:
           summary: "OTEL Collector unreachable"
-          description: "Cannot collect metrics from OTEL collector"
+          description: "Cannot scrape metrics from OTEL collector"
 
-  - name: bgp_alerts
-    rules:
-      # BGP session down
-      - alert: BGPSessionDown
-        expr: cumulus_bgp_session_state != 6
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "BGP session down on {{ $labels.device }}"
-          description: "BGP session {{ $labels.neighbor }} on {{ $labels.device }} is not in established state"
-
-  - name: hardware_alerts
-    rules:
-      # High CPU temperature
-      - alert: HighCPUTemperature
-        expr: cumulus_platform_cpu_temp > 85
+      # Collector is up but no Cumulus switch interface metrics are arriving
+      - alert: NoSwitchTelemetry
+        expr: absent(cumulus_nvswitch_interface_if_out_octets)
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "High CPU temperature on {{ $labels.device }}"
-          description: "CPU temperature on {{ $labels.device }} is {{ $value }}°C"
-      
-      # Fan failure
-      - alert: FanFailure
-        expr: cumulus_platform_fan_status == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Fan failure on {{ $labels.device }}"
-          description: "Fan {{ $labels.fan }} on {{ $labels.device }} has failed"
+          summary: "No switch telemetry received"
+          description: "Prometheus has received no cumulus_nvswitch_interface_if_out_octets series for 5 minutes"

@@ -25,6 +25,9 @@ Options:
                           pfc-ecn    PFC/ECN QoS analysis
                           hardware   Hardware health analysis
                           logs       System log analysis
+                          config-drift  Config drift analysis
+                          routes     Routes table analysis
+                          fabric-check  Fabric MTU/speed/FEC consistency check
                           all        Full collection (same as no --only)
   -s, --skip-optical   Skip optical collection during a full run
   -h, --help           Show this help and exit

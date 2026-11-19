@@ -11,6 +11,8 @@ DISCOVERY_WORKER_MODE=false
 DISCOVERY_SCHEDULE_MODE=false
 UPGRADE_RESUME_MODE=false
 DISCOVERY_JOB_ID=""
+DEPLOY_WORKER_MODE=false
+DEPLOY_JOB_ID=""
 case "${1:-}" in
     --upgrade-worker)
         [[ "${2:-}" =~ ^[a-f0-9-]{36}$ ]] || exit 2
@@ -21,6 +23,11 @@ case "${1:-}" in
         [[ "${2:-}" =~ ^[a-f0-9-]{36}$ ]] || exit 2
         DISCOVERY_WORKER_MODE=true
         DISCOVERY_JOB_ID="$2"
+        ;;
+    --deploy-worker)
+        [[ "${2:-}" =~ ^[a-f0-9-]{36}$ ]] || exit 2
+        DEPLOY_WORKER_MODE=true
+        DEPLOY_JOB_ID="$2"
         ;;
     --discovery-schedule)
         DISCOVERY_SCHEDULE_MODE=true
@@ -73,6 +80,8 @@ if [[ "$UPGRADE_WORKER_MODE" == true ]]; then
     ACTION="upgrade-worker"
 elif [[ "$DISCOVERY_WORKER_MODE" == true ]]; then
     ACTION="discovery-worker"
+elif [[ "$DEPLOY_WORKER_MODE" == true ]]; then
+    ACTION="deploy-worker"
 elif [[ "$DISCOVERY_SCHEDULE_MODE" == true ]]; then
     ACTION="discovery-schedule"
 elif [[ "$UPGRADE_RESUME_MODE" == true ]]; then
@@ -123,6 +132,7 @@ export PROVISION_UPLOAD_DIR
 export DISCOVERY_RANGE AUTO_BASE_CONFIG AUTO_ZTP_DISABLE AUTO_SET_HOSTNAME
 export POST_DATA POST_DATA_FILE ACTION LINES_PARAM UPGRADE_JOB_ID UPGRADE_WORKER_MODE
 export DISCOVERY_JOB_ID DISCOVERY_WORKER_MODE DISCOVERY_SCHEDULE_MODE UPGRADE_RESUME_MODE
+export DEPLOY_JOB_ID DEPLOY_WORKER_MODE
 export PROVISION_UPLOAD_FD
 export PROVISION_API_SCRIPT="${BASH_SOURCE[0]}"
 
@@ -196,6 +206,7 @@ UPGRADE_JOB_ID_PATTERN = (
 DISCOVERY_JOBS_DIR = '/var/lib/lldpq/provision-jobs'
 UPGRADE_JOB_ID = os.environ.get('UPGRADE_JOB_ID', '')
 DISCOVERY_JOB_ID = os.environ.get('DISCOVERY_JOB_ID', '')
+DEPLOY_JOB_ID = os.environ.get('DEPLOY_JOB_ID', '')
 PROVISION_API_SCRIPT = os.path.abspath(os.environ.get('PROVISION_API_SCRIPT', 'provision-api.sh'))
 INVENTORY_LOCK_FILE = f'{WEB_ROOT}/.inventory.lock'
 PROVISION_TRANSACTION_FILE = os.environ.get(
@@ -1279,6 +1290,84 @@ def inventory_shared_lock():
         lock.close()
 
 
+SSH_USERNAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.-]{0,31}$')
+
+
+def _valid_ssh_username(value):
+    text = str(value or '').strip()
+    return text if SSH_USERNAME_RE.fullmatch(text) else ''
+
+
+def _devices_yaml_ssh_users():
+    """Read default and per-device SSH usernames from devices.yaml."""
+    from addressing import normalize_address
+    default_user = 'cumulus'
+    by_ip = {}
+    by_hostname = {}
+    path = os.path.join(LLDPQ_DIR, 'devices.yaml')
+    try:
+        import yaml
+        with open(path, 'r', encoding='utf-8') as handle:
+            raw = yaml.safe_load(handle) or {}
+    except Exception:
+        return default_user, by_ip, by_hostname
+    if not isinstance(raw, dict):
+        return default_user, by_ip, by_hostname
+    defaults = raw.get('defaults')
+    if isinstance(defaults, dict):
+        parsed_default = _valid_ssh_username(defaults.get('username', ''))
+        if parsed_default:
+            default_user = parsed_default
+    entries = raw.get('devices', raw)
+    if not isinstance(entries, dict):
+        return default_user, by_ip, by_hostname
+    for raw_ip, info in entries.items():
+        if raw_ip in ('defaults', 'endpoint_hosts'):
+            continue
+        if isinstance(info, dict):
+            hostname = str(info.get('hostname', '') or '').strip()
+            user = _valid_ssh_username(info.get('username', '')) or default_user
+        elif isinstance(info, str):
+            hostname = info.strip().split('@')[0].strip()
+            user = default_user
+        else:
+            hostname = str(info or '').strip()
+            user = default_user
+        ip_text = str(raw_ip).strip()
+        try:
+            ip_norm = normalize_address(ip_text)
+        except ValueError:
+            ip_norm = ip_text
+        if ip_norm:
+            by_ip[ip_norm] = user
+        if hostname:
+            by_hostname[hostname.lower()] = user
+    return default_user, by_ip, by_hostname
+
+
+def resolve_device_ssh_username(hostname='', ip='', explicit='', user_map=None):
+    """Resolve the SSH username for a target device from explicit input or devices.yaml."""
+    explicit_valid = _valid_ssh_username(explicit)
+    if explicit_valid:
+        return explicit_valid
+    if user_map is None:
+        user_map = _devices_yaml_ssh_users()
+    default_user, by_ip, by_hostname = user_map
+    ip_text = str(ip or '').strip()
+    if ip_text:
+        try:
+            from addressing import normalize_address
+            ip_key = normalize_address(ip_text)
+        except ValueError:
+            ip_key = ip_text
+        if ip_key in by_ip:
+            return by_ip[ip_key]
+    host_key = str(hostname or '').strip().lower()
+    if host_key and host_key in by_hostname:
+        return by_hostname[host_key]
+    return default_user or 'cumulus'
+
+
 def _devices_yaml_targets():
     """(ip, hostname) for every device LLDPq monitors, from devices.yaml."""
     targets = []
@@ -1453,9 +1542,22 @@ def canonicalize_inventory_target(device, bindings=None):
     if requested_serial and requested_serial != current_serial:
         raise ValueError('Inventory serial changed after target selection')
     canonical = dict(device)
+    _resolver = globals().get('resolve_device_ssh_username')
+    explicit_user = str(device.get('username', '') or '').strip()
+    if callable(_resolver):
+        resolved_user = _resolver(
+            hostname=binding['hostname'], ip=ip, explicit=explicit_user
+        )
+    else:
+        resolved_user = (
+            explicit_user
+            if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,31}', explicit_user)
+            else 'cumulus'
+        )
     canonical.update({
         'hostname': binding['hostname'], 'ip': ip,
         'expected_mac': current_mac, 'expected_serial': current_serial,
+        'username': resolved_user,
     })
     return canonical
 
@@ -2410,164 +2512,6 @@ def restart_dhcp():
     except Exception as e:
         return False, str(e)
 
-# ======================== DISCOVERED ========================
-
-def action_discovered():
-    """Cross-reference fabric ARP/LLDP data with DHCP bindings.
-    
-    Data sources (in priority order):
-    1. fabric-tables/*.json — per-device ARP tables from fabric-scan.sh
-       Contains eth0/mgmt ARP entries with IP→MAC mappings
-    2. device-cache.json — assets data with hostname→MAC
-    3. devices.yaml — known devices with IP→hostname mapping
-    
-    Cross-reference approach:
-    - Build IP→MAC map from all ARP tables (eth0 interface = mgmt MAC)
-    - For each DHCP binding (hostname, IP, MAC), look up discovered MAC by IP
-    - Compare binding MAC vs discovered MAC
-    """
-    import glob
-    
-    # Load bindings
-    bindings = parse_dhcp_hosts(get_dhcp_hosts_path())
-    binding_ip_map = {b['ip']: b for b in bindings}
-    
-    entries = []
-    discovered_ips = {}   # ip -> mac (from ARP)
-    discovered_hosts = {} # hostname -> mac (from device-cache)
-    
-    # --- Source 1: fabric-tables ARP data ---
-    # Each fabric-table JSON has "arp" list with entries like:
-    # {"ip": "192.168.100.11", "mac": "54:9b:24:aa:68:16", "interface": "eth0", "vrf": "mgmt"}
-    # Determine binding subnets to filter relevant ARP entries (no hardcoded prefixes)
-    binding_subnets = set()
-    for b in bindings:
-        parts = b['ip'].split('.')
-        if len(parts) == 4:
-            binding_subnets.add('.'.join(parts[:3]) + '.')
-    
-    fabric_tables_dir = os.path.join(LLDPQ_DIR, 'monitor-results', 'fabric-tables')
-    if os.path.isdir(fabric_tables_dir):
-        for fpath in glob.glob(os.path.join(fabric_tables_dir, '*.json')):
-            try:
-                with open(fpath, 'r') as f:
-                    data = json.load(f)
-                for arp_entry in data.get('arp', []):
-                    iface = arp_entry.get('interface', '')
-                    ip = arp_entry.get('ip', '')
-                    mac = arp_entry.get('mac', '').lower()
-                    # Only mgmt interface ARP within binding subnets
-                    if iface == 'eth0' and ip and mac and any(ip.startswith(s) for s in binding_subnets):
-                        discovered_ips[ip] = mac
-            except Exception:
-                continue
-    
-    # --- Source 2: device-cache.json ---
-    device_cache = os.path.join(WEB_ROOT, 'device-cache.json')
-    if os.path.exists(device_cache):
-        try:
-            with open(device_cache, 'r') as f:
-                dc = json.load(f)
-            if isinstance(dc, dict):
-                for hostname, info in dc.items():
-                    if isinstance(info, dict):
-                        mac = info.get('mac', '').lower()
-                        ip = info.get('ip', '')
-                        if mac:
-                            discovered_hosts[hostname] = mac
-                        if ip and mac:
-                            discovered_ips[ip] = mac
-        except Exception:
-            pass
-    
-    # --- Source 3: devices.yaml for hostname→IP mapping ---
-    devices_file = os.path.join(LLDPQ_DIR, 'devices.yaml')
-    hostname_to_ip = {}
-    if os.path.exists(devices_file):
-        try:
-            import yaml
-            with open(devices_file, 'r') as f:
-                dev_data = yaml.safe_load(f)
-            devices_section = dev_data.get('devices', dev_data)
-            for ip, info in devices_section.items():
-                if ip in ('defaults', 'endpoint_hosts'):
-                    continue
-                if isinstance(info, dict):
-                    hostname = info.get('hostname', str(ip))
-                elif isinstance(info, str):
-                    hostname = info.strip().split('@')[0].strip()
-                else:
-                    hostname = str(info) if info else str(ip)
-                hostname_to_ip[hostname] = str(ip)
-        except Exception:
-            pass
-    
-    # --- Cross-reference ---
-    seen_hostnames = set()
-    
-    for b in bindings:
-        hostname = b['hostname']
-        binding_mac = b['mac'].lower()
-        binding_ip = b['ip']
-        seen_hostnames.add(hostname)
-        
-        # Try to find discovered MAC: by IP first, then by hostname
-        disc_mac = discovered_ips.get(binding_ip, '')
-        source = 'ARP' if disc_mac else ''
-        
-        if not disc_mac:
-            disc_mac = discovered_hosts.get(hostname, '')
-            source = 'Cache' if disc_mac else ''
-        
-        entry = {
-            'hostname': hostname,
-            'binding_mac': b['mac'],
-            'binding_ip': binding_ip,
-            'discovered_mac': disc_mac,
-            'source': source,
-            'status': 'missing'
-        }
-        
-        if disc_mac:
-            if disc_mac == binding_mac:
-                entry['status'] = 'match'
-            else:
-                entry['status'] = 'mismatch'
-        
-        entries.append(entry)
-    
-    # Discovered IPs not in bindings (devices seen in ARP but no DHCP binding)
-    # Determine subnet from bindings to filter relevant IPs
-    binding_subnets = set()
-    for b in bindings:
-        parts = b['ip'].split('.')
-        if len(parts) == 4:
-            binding_subnets.add('.'.join(parts[:3]) + '.')
-    
-    for ip, mac in discovered_ips.items():
-        if ip not in binding_ip_map and any(ip.startswith(s) for s in binding_subnets):
-            # Try to find hostname from devices.yaml
-            hostname = ''
-            for h, h_ip in hostname_to_ip.items():
-                if h_ip == ip:
-                    hostname = h
-                    break
-            if not hostname:
-                hostname = ip  # fallback to IP
-            
-            if hostname not in seen_hostnames:
-                entries.append({
-                    'hostname': hostname,
-                    'binding_mac': '',
-                    'binding_ip': '',
-                    'discovered_mac': mac,
-                    'source': 'ARP',
-                    'status': 'unbound'
-                })
-                seen_hostnames.add(hostname)
-    
-    result_json({"success": True, "entries": entries})
-
 def action_ping_scan():
     """Parallel ping all binding IPs, then read local ARP for MAC cross-reference.
     Much more accurate than fabric-tables — gives real-time reachability + MAC match.
@@ -2703,26 +2647,42 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
     binding_by_ip = {b['ip']: b for b in inv_bindings}
     binding_by_hostname = {b.get('hostname',''): b for b in inv_bindings if b.get('hostname')}
     
-    # Load devices.yaml for hostname resolution + roles
+    # Load devices.yaml for hostname resolution + roles + SSH usernames
     devices_yaml = {}    # ip -> hostname
     devices_roles = {}   # hostname -> role
+    devices_ssh_by_ip = {}
+    devices_ssh_by_host = {}
+    default_ssh_user = 'cumulus'
+    ssh_user_re = re.compile(r'^[A-Za-z_][A-Za-z0-9_.-]{0,31}$')
     try:
         devices_path = os.path.join(LLDPQ_DIR, 'devices.yaml')
         if os.path.exists(devices_path):
             import yaml
             with open(devices_path, 'r') as f:
                 data = yaml.safe_load(f) or {}
-            devices_section = data.get('devices', data)
+            if isinstance(data, dict):
+                defaults_cfg = data.get('defaults')
+                if isinstance(defaults_cfg, dict):
+                    cand_default = str(defaults_cfg.get('username', '') or '').strip()
+                    if ssh_user_re.fullmatch(cand_default):
+                        default_ssh_user = cand_default
+            devices_section = data.get('devices', data) if isinstance(data, dict) else {}
             if isinstance(devices_section, dict):
                 for host_ip, info in devices_section.items():
                     if host_ip in ('defaults', 'endpoint_hosts'):
                         continue
                     if isinstance(info, dict):
                         hostname = info.get('hostname', str(host_ip))
+                        cand_user = str(info.get('username', '') or '').strip()
+                        dev_user = cand_user if ssh_user_re.fullmatch(cand_user) else default_ssh_user
                         try:
-                            devices_yaml[normalize_address(str(info.get('ip') or host_ip))] = hostname
+                            norm_ip = normalize_address(str(info.get('ip') or host_ip))
+                            devices_yaml[norm_ip] = hostname
+                            devices_ssh_by_ip[norm_ip] = dev_user
                         except ValueError:
                             pass
+                        if hostname:
+                            devices_ssh_by_host[str(hostname).strip().lower()] = dev_user
                         role = info.get('role', '')
                         if role:
                             devices_roles[hostname] = role.lower()
@@ -2736,11 +2696,26 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
                         else:
                             hostname = raw
                         try:
-                            devices_yaml[normalize_address(str(host_ip))] = hostname
+                            norm_ip = normalize_address(str(host_ip))
+                            devices_yaml[norm_ip] = hostname
+                            devices_ssh_by_ip[norm_ip] = default_ssh_user
                         except ValueError:
                             pass
+                        if hostname:
+                            devices_ssh_by_host[str(hostname).strip().lower()] = default_ssh_user
     except Exception:
         pass
+
+    def resolve_scan_ssh_user(ip='', hostname='', explicit=''):
+        exp = str(explicit or '').strip()
+        if ssh_user_re.fullmatch(exp):
+            return exp
+        if ip and ip in devices_ssh_by_ip:
+            return devices_ssh_by_ip[ip]
+        hkey = str(hostname or '').strip().lower()
+        if hkey and hkey in devices_ssh_by_host:
+            return devices_ssh_by_host[hkey]
+        return default_ssh_user
     
     # Check if range contains non-private IPs (possible typo like 92.x instead of 192.x)
     non_private = []
@@ -2856,13 +2831,17 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
 
     # Step 3: SSH probe candidates for classification + per-action state.
     def ssh_probe(ip):
-        """Try SSH with key auth as cumulus user (runs as LLDPQ_USER to use correct SSH keys).
-        Returns: (ip, device_type, serial, base_deployed)"""
+        """Try SSH with key auth using the device's configured SSH user
+        (runs as LLDPQ_USER to use correct SSH keys).
+        Returns: probe dict with device_type, serial, and post-provision state."""
+        binding = binding_by_ip.get(ip)
+        probe_host = (binding.get('hostname', '') if binding else '') or devices_yaml.get(ip, '')
+        probe_user = resolve_scan_ssh_user(ip=ip, hostname=probe_host)
         try:
             r = subprocess.run(
                 ['sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3',
                  '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
-                 '-o', 'LogLevel=ERROR', f'cumulus@{ip}',
+                 '-o', 'LogLevel=ERROR', f'{probe_user}@{ip}',
                  "echo LLDPQ_OK; "
                  "printf 'LLDPQ_SERIAL=%s\\n' \"$(sudo dmidecode -s system-serial-number 2>/dev/null | head -1)\"; "
                  "printf 'LLDPQ_MGMT_MAC=%s\\n' \"$(cat /sys/class/net/eth0/address 2>/dev/null | head -1)\"; "
@@ -3099,9 +3078,15 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
             needs_ztp = pending['ztp_disable']
             needs_hostname = pending['hostname']
 
+            ssh_user = resolve_scan_ssh_user(
+                ip=ip,
+                hostname=hostname,
+                explicit=canonical.get('username', ''),
+            )
+
             if needs_base:
                 result = _deploy_to_device(
-                    dict(canonical, username='cumulus'),
+                    dict(canonical, username=ssh_user),
                     available_base_files, False
                 )
                 actions['base_config'] = 'success' if result.get('success') else 'failed'
@@ -3111,7 +3096,7 @@ def run_subnet_scan(apply_post_provision=True, heartbeat=None):
                 'sudo', '-u', LLDPQ_USER, 'ssh', '-o', 'BatchMode=yes',
                 '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no',
                 '-o', 'UserKnownHostsFile=/dev/null', '-o', 'LogLevel=ERROR',
-                f'cumulus@{ip}'
+                f'{ssh_user}@{ip}'
             ]
             if needs_ztp:
                 command = (
@@ -5655,50 +5640,71 @@ def deploy_to_device(device, files, disable_ztp):
             'error': f'Target authorization failed: {exc}',
         }
 
-def action_deploy_base_config():
+def prepare_base_config_deploy(data):
+    """Validate base-config deploy request and resolve per-device SSH usernames."""
     from addressing import normalize_address
+    if not isinstance(data, dict):
+        raise ValueError("Invalid JSON data")
+    files = data.get('files', [])
+    devices = data.get('devices', [])
+    disable_ztp = bool(data.get('disable_ztp', False))
+
+    if not files:
+        files = list(FILE_DEPLOY_MAP.keys())
+    if not isinstance(devices, list) or not devices:
+        raise ValueError("No devices selected")
+    if len(devices) > 1000:
+        raise ValueError('Too many devices selected')
+
+    ssh_users = _devices_yaml_ssh_users()
+    requested_devices = []
+    seen_ips = set()
+    for device in devices:
+        if not isinstance(device, dict):
+            raise ValueError('Invalid device target')
+        hostname = str(device.get('hostname', '')).strip()
+        raw_ip = str(device.get('ip', '')).strip()
+        raw_username = str(device.get('username', '') or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
+            raise ValueError('Invalid device hostname')
+        try:
+            ip = normalize_address(raw_ip)
+        except ValueError:
+            raise ValueError(f'Invalid device IP: {raw_ip}')
+        if ip in seen_ips:
+            raise ValueError(f'Duplicate deploy target: {ip}')
+        seen_ips.add(ip)
+        if raw_username:
+            if not SSH_USERNAME_RE.fullmatch(raw_username):
+                raise ValueError('Invalid SSH username')
+            username = raw_username
+        else:
+            username = resolve_device_ssh_username(
+                hostname=hostname, ip=ip, user_map=ssh_users
+            )
+        requested_devices.append({
+            'hostname': hostname, 'ip': ip, 'username': username,
+        })
+
+    available_files = [
+        f for f in files
+        if f in FILE_DEPLOY_MAP and os.path.exists(os.path.join(BASE_CONFIG_DIR, f))
+    ]
+    if not available_files:
+        raise ValueError("No deploy files found in " + BASE_CONFIG_DIR)
+    return requested_devices, available_files, disable_ztp
+
+
+def action_deploy_base_config():
     try:
         data = json.loads(POST_DATA)
     except Exception:
         error_json("Invalid JSON data")
-    
-    files = data.get('files', [])
-    devices = data.get('devices', [])
-    disable_ztp = data.get('disable_ztp', False)
-    
-    # If no files specified, deploy all known files (skip missing ones)
-    if not files:
-        files = list(FILE_DEPLOY_MAP.keys())
-    
-    if not isinstance(devices, list) or not devices:
-        error_json("No devices selected")
-    if len(devices) > 1000:
-        error_json('Too many devices selected')
-    requested_devices = []
-    for device in devices:
-        if not isinstance(device, dict):
-            error_json('Invalid device target')
-        hostname = str(device.get('hostname', '')).strip()
-        raw_ip = str(device.get('ip', '')).strip()
-        username = str(device.get('username', 'cumulus')).strip()
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
-            error_json('Invalid device hostname')
-        try:
-            ip = normalize_address(raw_ip)
-        except ValueError:
-            error_json(f'Invalid device IP: {raw_ip}')
-        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]{0,31}', username):
-            error_json('Invalid SSH username')
-        requested_devices.append({
-            'hostname': hostname, 'ip': ip, 'username': username,
-        })
-    
-    # Filter to only files that exist on disk (graceful skip)
-    available_files = [f for f in files if f in FILE_DEPLOY_MAP and os.path.exists(os.path.join(BASE_CONFIG_DIR, f))]
-    if not available_files:
-        error_json("No deploy files found in " + BASE_CONFIG_DIR)
-    files = available_files
-    
+    try:
+        requested_devices, files, disable_ztp = prepare_base_config_deploy(data)
+    except ValueError as exc:
+        error_json(str(exc))
+
     # Deploy in parallel (20 workers max)
     results = []
     with ThreadPoolExecutor(max_workers=20) as executor:
@@ -9018,9 +9024,14 @@ def deploy_config_to_device(device, server_ip="", config_bytes=None):
                 'sudo nv config save',
                 'echo LLDPQ_CONFIG_OK',
             ]) + '\n'
+            username = resolve_device_ssh_username(
+                hostname=hostname,
+                ip=ip,
+                explicit=canonical.get('username', '') or device.get('username', ''),
+            )
             r = subprocess.run(
                 ['sudo', '-u', LLDPQ_USER, 'ssh'] + ssh_opts +
-                [f'cumulus@{ip}', 'bash -s'],
+                [f'{username}@{ip}', 'bash -s'],
                 input=remote_script, capture_output=True, text=True, timeout=120
             )
         if r.returncode == 0 and 'LLDPQ_CONFIG_OK' in r.stdout:
@@ -9043,65 +9054,71 @@ def deploy_config_to_device(device, server_ip="", config_bytes=None):
             'success': False, 'error': f'Target authorization failed: {e}',
         }
 
-def action_deploy_generated_config():
-    """Deploy generated NVUE config to one or more switches via SSH."""
-    from addressing import address_family, normalize_address, normalize_server_ref
-    try:
-        data = json.loads(POST_DATA)
-    except Exception:
-        error_json("Invalid JSON data")
+def prepare_generated_config_deploy(data):
+    """Validate generated-config targets and freeze config snapshots under lock."""
+    from addressing import normalize_address
+    if not isinstance(data, dict):
+        return None, None, {'success': False, 'error': 'Invalid JSON data'}
 
     devices = data.get('devices', [])
-    # Single device shorthand
     if not devices and data.get('hostname') and data.get('ip'):
-        devices = [{'hostname': data['hostname'], 'ip': data['ip']}]
+        single = {'hostname': data['hostname'], 'ip': data['ip']}
+        if data.get('username'):
+            single['username'] = data['username']
+        devices = [single]
 
-    if not devices:
-        error_json("No devices specified")
+    if not isinstance(devices, list) or not devices:
+        return None, None, {'success': False, 'error': 'No devices specified'}
+    if len(devices) > 1000:
+        return None, None, {'success': False, 'error': 'Too many devices selected'}
 
     try:
         inventory = load_canonical_inventory_bindings(include_monitored=True)
     except Exception as exc:
-        error_json(f'Could not load current inventory: {exc}')
+        return None, None, {'success': False, 'error': f'Could not load current inventory: {exc}'}
     by_target = {
         (binding.get('hostname', '').lower(), binding.get('ip', '')): binding
         for binding in inventory
         if binding.get('hostname') and binding.get('ip')
     }
+    ssh_users = _devices_yaml_ssh_users()
     canonical_devices = []
     seen_ips = set()
     for requested in devices:
         if not isinstance(requested, dict):
-            error_json('Invalid device target')
+            return None, None, {'success': False, 'error': 'Invalid device target'}
         hostname = str(requested.get('hostname', '')).strip()
         raw_ip = str(requested.get('ip', '')).strip()
+        raw_username = str(requested.get('username', '') or '').strip()
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}', hostname):
-            error_json('Invalid device hostname')
+            return None, None, {'success': False, 'error': 'Invalid device hostname'}
         try:
             ip = normalize_address(raw_ip)
         except ValueError:
-            error_json(f'Invalid device IP: {raw_ip}')
+            return None, None, {'success': False, 'error': f'Invalid device IP: {raw_ip}'}
+        if raw_username and not SSH_USERNAME_RE.fullmatch(raw_username):
+            return None, None, {'success': False, 'error': 'Invalid SSH username'}
         binding = by_target.get((hostname.lower(), ip))
         if not binding:
-            result_json({
+            return None, None, {
                 'success': False,
                 'error_code': 'target_not_in_inventory',
                 'error': (
                     f'{hostname} at {ip} no longer matches the current inventory. '
                     'Refresh discovery before deploying.'
                 ),
-            })
+            }
         if ip in seen_ips:
-            error_json(f'Duplicate deploy target: {ip}')
+            return None, None, {'success': False, 'error': f'Duplicate deploy target: {ip}'}
         seen_ips.add(ip)
         expected_mac = normalize_identity_mac(binding.get('mac', ''))
         expected_serial = normalize_identity_serial(binding.get('serial', ''))
         if not expected_mac and not expected_serial:
-            result_json({
+            return None, None, {
                 'success': False,
                 'error_code': 'identity_unverifiable',
                 'error': f'{hostname} has no inventory MAC or serial for identity verification',
-            })
+            }
         config_filename = ''
         for suffix in ('.yaml', '.yml'):
             candidate = hostname + suffix
@@ -9109,17 +9126,22 @@ def action_deploy_generated_config():
                 config_filename = candidate
                 break
         if not config_filename:
-            error_json(f'No generated config found for {hostname}')
+            return None, None, {'success': False, 'error': f'No generated config found for {hostname}'}
+        username = resolve_device_ssh_username(
+            hostname=binding['hostname'],
+            ip=binding['ip'],
+            explicit=raw_username,
+            user_map=ssh_users,
+        )
         canonical_devices.append({
             'hostname': binding['hostname'],
             'ip': binding['ip'],
+            'username': username,
             'expected_mac': expected_mac,
             'expected_serial': expected_serial,
             'config_filename': config_filename,
         })
 
-    # Freeze the whole request before starting any worker. Upload/sync use the
-    # same coordinator, so even queued workers receive the selected revision.
     try:
         with upgrade_coordinator_lock():
             config_snapshots = {}
@@ -9131,7 +9153,21 @@ def action_deploy_generated_config():
                     raise ValueError(f'Generated config is empty: {filename}')
                 config_snapshots[filename] = content
     except Exception as exc:
-        error_json(f'Could not snapshot generated configs: {exc}')
+        return None, None, {'success': False, 'error': f'Could not snapshot generated configs: {exc}'}
+
+    return canonical_devices, config_snapshots, None
+
+
+def action_deploy_generated_config():
+    """Deploy generated NVUE config to one or more switches via SSH."""
+    try:
+        data = json.loads(POST_DATA)
+    except Exception:
+        error_json("Invalid JSON data")
+
+    canonical_devices, config_snapshots, err = prepare_generated_config_deploy(data)
+    if err is not None:
+        result_json(err)
 
     results = []
     with ThreadPoolExecutor(max_workers=20) as executor:
@@ -9152,6 +9188,349 @@ def action_deploy_generated_config():
         "results": results,
         "summary": {"ok": ok, "fail": fail, "total": len(results)}
     })
+
+
+# ======================== ASYNC DEPLOY JOBS ========================
+
+DEPLOY_JOB_RETENTION = 20
+
+
+def deploy_jobs_dir():
+    return os.path.join(DISCOVERY_JOBS_DIR, 'deploy-jobs')
+
+
+def ensure_deploy_jobs_dir():
+    directory = deploy_jobs_dir()
+    os.makedirs(directory, mode=0o2770, exist_ok=True)
+    try:
+        os.chmod(directory, 0o2770)
+    except OSError:
+        pass
+    return directory
+
+
+def deploy_job_path(job_id):
+    if not re.fullmatch(r'[a-f0-9-]{36}', job_id or ''):
+        raise ValueError('Invalid deploy job id')
+    return os.path.join(deploy_jobs_dir(), f'{job_id}.json')
+
+
+@contextmanager
+def deploy_job_lock(job_id):
+    ensure_deploy_jobs_dir()
+    with exclusive_file_lock(deploy_job_path(job_id) + '.lock'):
+        yield
+
+
+@contextmanager
+def deploy_coordinator_lock():
+    directory = ensure_deploy_jobs_dir()
+    with exclusive_file_lock(os.path.join(directory, '.coordinator.lock')):
+        yield
+
+
+def save_deploy_job(job):
+    ensure_deploy_jobs_dir()
+    path = deploy_job_path(job['id'])
+    atomic_write_text(path, json.dumps(job, indent=2) + '\n', 0o664)
+
+
+def load_deploy_job(job_id):
+    path = deploy_job_path(job_id)
+    if not os.path.exists(path):
+        raise FileNotFoundError('Deploy job not found')
+    with open(path, 'r', encoding='utf-8') as handle:
+        return json.load(handle)
+
+
+def public_deploy_job(job):
+    """Strip internal snapshot payloads before returning a deploy job to the UI."""
+    out = dict(job)
+    out.pop('config_snapshots_b64', None)
+    return out
+
+
+def list_deploy_jobs(kind=None, unfinished_only=False):
+    directory = ensure_deploy_jobs_dir()
+    jobs = []
+    for name in os.listdir(directory):
+        if not name.endswith('.json') or name.startswith('.'):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                job = json.load(handle)
+        except Exception:
+            continue
+        if not isinstance(job, dict) or not job.get('id'):
+            continue
+        if kind and job.get('kind') != kind:
+            continue
+        if unfinished_only and job.get('complete'):
+            continue
+        jobs.append(job)
+    jobs.sort(key=lambda item: int(item.get('created_at', 0)), reverse=True)
+    return jobs
+
+
+def prune_deploy_jobs(max_keep=DEPLOY_JOB_RETENTION):
+    directory = ensure_deploy_jobs_dir()
+    completed = [j for j in list_deploy_jobs() if j.get('complete')]
+    for old in completed[max_keep:]:
+        job_id = old.get('id', '')
+        if not re.fullmatch(r'[a-f0-9-]{36}', job_id):
+            continue
+        for suffix in ('.json', '.json.lock', '.json.worker.lock'):
+            try:
+                os.remove(os.path.join(directory, job_id + suffix))
+            except OSError:
+                pass
+
+
+def launch_deploy_worker(job_id):
+    env = os.environ.copy()
+    env.pop('POST_DATA', None)
+    env.pop('POST_DATA_FILE', None)
+    env.pop('QUERY_STRING', None)
+    env.pop('REQUEST_METHOD', None)
+    env.pop('CONTENT_LENGTH', None)
+    proc = subprocess.Popen(
+        ['/bin/bash', PROVISION_API_SCRIPT, '--deploy-worker', job_id],
+        env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+    )
+    return proc.pid
+
+
+def start_deploy_job(kind, devices, *, files=None, disable_ztp=False, config_snapshots=None):
+    with deploy_coordinator_lock():
+        now = int(time.time())
+        job = {
+            'id': str(uuid.uuid4()),
+            'kind': kind,
+            'created_at': now,
+            'status': 'queued',
+            'complete': False,
+            'worker_started_at': now,
+            'worker_heartbeat': now,
+            'devices': devices,
+            'total': len(devices),
+            'completed': 0,
+            'ok': 0,
+            'fail': 0,
+            'results': [],
+        }
+        if kind == 'base_config':
+            job['files'] = list(files or [])
+            job['disable_ztp'] = bool(disable_ztp)
+        elif kind == 'generated_config':
+            job['config_snapshots_b64'] = {
+                name: base64.b64encode(raw).decode('ascii')
+                for name, raw in (config_snapshots or {}).items()
+            }
+        with deploy_job_lock(job['id']):
+            save_deploy_job(job)
+        try:
+            launch_deploy_worker(job['id'])
+        except Exception as exc:
+            with deploy_job_lock(job['id']):
+                job['status'] = 'failed'
+                job['complete'] = True
+                job['completed_at'] = int(time.time())
+                job['error'] = 'Could not start deploy worker: ' + str(exc)[:300]
+                job.pop('config_snapshots_b64', None)
+                save_deploy_job(job)
+        return job
+
+
+def run_deploy_worker(job_id):
+    ensure_deploy_jobs_dir()
+    worker_path = deploy_job_path(job_id) + '.worker.lock'
+    worker = open(worker_path, 'a+')
+    try:
+        try:
+            fcntl.flock(worker.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        with deploy_job_lock(job_id):
+            job = load_deploy_job(job_id)
+            if job.get('complete'):
+                return
+            job['status'] = 'running'
+            if not job.get('started_at'):
+                job['started_at'] = int(time.time())
+            job['worker_heartbeat'] = int(time.time())
+            save_deploy_job(job)
+            kind = job.get('kind', '')
+            devices = list(job.get('devices') or [])
+            done_ips = {
+                str(item.get('ip', ''))
+                for item in (job.get('results') or [])
+                if isinstance(item, dict) and item.get('ip')
+            }
+            files = list(job.get('files') or [])
+            disable_ztp = bool(job.get('disable_ztp', False))
+            snapshots_b64 = dict(job.get('config_snapshots_b64') or {})
+
+        pending = [dev for dev in devices if str(dev.get('ip', '')) not in done_ips]
+        snapshots = {
+            name: base64.b64decode(encoded.encode('ascii'))
+            for name, encoded in snapshots_b64.items()
+        }
+
+        try:
+            def run_one(dev):
+                if kind == 'base_config':
+                    return deploy_to_device(dev, files, disable_ztp)
+                if kind == 'generated_config':
+                    return deploy_config_to_device(
+                        dev, '', snapshots.get(dev.get('config_filename', ''))
+                    )
+                raise ValueError(f'Unsupported deploy job kind: {kind}')
+
+            if pending:
+                with ThreadPoolExecutor(max_workers=20) as executor:
+                    futures = {executor.submit(run_one, dev): dev for dev in pending}
+                    for future in as_completed(futures):
+                        dev = futures[future]
+                        try:
+                            res = future.result()
+                        except Exception as exc:
+                            res = {
+                                'ip': dev.get('ip', ''),
+                                'hostname': dev.get('hostname', ''),
+                                'success': False,
+                                'error': str(exc),
+                            }
+                        with deploy_job_lock(job_id):
+                            current = load_deploy_job(job_id)
+                            results = list(current.get('results') or [])
+                            results.append(res)
+                            ok_count = sum(1 for r in results if r.get('success'))
+                            fail_count = len(results) - ok_count
+                            current['results'] = results
+                            current['completed'] = len(results)
+                            current['ok'] = ok_count
+                            current['fail'] = fail_count
+                            current['worker_heartbeat'] = int(time.time())
+                            save_deploy_job(current)
+
+            with deploy_job_lock(job_id):
+                final = load_deploy_job(job_id)
+                results = sorted(
+                    list(final.get('results') or []),
+                    key=lambda item: str(item.get('hostname', '')),
+                )
+                ok_count = sum(1 for r in results if r.get('success'))
+                fail_count = len(results) - ok_count
+                final['results'] = results
+                final['completed'] = len(results)
+                final['ok'] = ok_count
+                final['fail'] = fail_count
+                final['summary'] = {
+                    'ok': ok_count, 'fail': fail_count, 'total': len(results),
+                }
+                final['status'] = 'success'
+                final['complete'] = True
+                final['completed_at'] = int(time.time())
+                final['worker_heartbeat'] = int(time.time())
+                final.pop('config_snapshots_b64', None)
+                final.pop('error', None)
+                save_deploy_job(final)
+            try:
+                with deploy_coordinator_lock():
+                    prune_deploy_jobs()
+            except Exception:
+                pass
+        except BaseException as exc:
+            with deploy_job_lock(job_id):
+                failed_job = load_deploy_job(job_id)
+                failed_job['status'] = 'failed'
+                failed_job['complete'] = True
+                failed_job['completed_at'] = int(time.time())
+                failed_job['worker_heartbeat'] = int(time.time())
+                failed_job['error'] = str(exc)[:500]
+                failed_job.pop('config_snapshots_b64', None)
+                save_deploy_job(failed_job)
+    finally:
+        try:
+            fcntl.flock(worker.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        worker.close()
+
+
+def _action_deploy_status(expected_kind):
+    try:
+        data = json.loads(POST_DATA)
+        job_id = data.get('job_id', '')
+        with deploy_job_lock(job_id):
+            job = load_deploy_job(job_id)
+    except Exception as exc:
+        error_json(str(exc))
+    if job.get('kind') != expected_kind:
+        error_json('Deploy job type mismatch')
+    if not job.get('complete'):
+        heartbeat = max(int(job.get('worker_heartbeat', 0) or 0),
+                        int(job.get('worker_started_at', 0) or 0))
+        if time.time() - heartbeat > 180:
+            try:
+                launch_deploy_worker(job['id'])
+            except Exception:
+                pass
+    result_json({'success': True, 'job': public_deploy_job(job)})
+
+
+def _action_deploy_active(expected_kind):
+    active = list_deploy_jobs(kind=expected_kind, unfinished_only=True)
+    if active:
+        result_json({'success': True, 'job': public_deploy_job(active[0])})
+    result_json({'success': True, 'job': None})
+
+
+def action_base_deploy_start():
+    try:
+        data = json.loads(POST_DATA)
+    except Exception:
+        error_json("Invalid JSON data")
+    try:
+        requested_devices, files, disable_ztp = prepare_base_config_deploy(data)
+    except ValueError as exc:
+        error_json(str(exc))
+    job = start_deploy_job(
+        'base_config', requested_devices, files=files, disable_ztp=disable_ztp
+    )
+    result_json({'success': True, 'job': public_deploy_job(job)})
+
+
+def action_base_deploy_status():
+    _action_deploy_status('base_config')
+
+
+def action_base_deploy_active():
+    _action_deploy_active('base_config')
+
+
+def action_config_deploy_start():
+    try:
+        data = json.loads(POST_DATA)
+    except Exception:
+        error_json("Invalid JSON data")
+    canonical_devices, config_snapshots, err = prepare_generated_config_deploy(data)
+    if err is not None:
+        result_json(err)
+    job = start_deploy_job(
+        'generated_config', canonical_devices, config_snapshots=config_snapshots
+    )
+    result_json({'success': True, 'job': public_deploy_job(job)})
+
+
+def action_config_deploy_status():
+    _action_deploy_status('generated_config')
+
+
+def action_config_deploy_active():
+    _action_deploy_active('generated_config')
 
 # ======================== UPDATE ROLE ========================
 
@@ -9763,6 +10142,9 @@ except Exception as recovery_exc:
 if ACTION == 'discovery-worker':
     run_discovery_worker(DISCOVERY_JOB_ID)
     sys.exit(0)
+elif ACTION == 'deploy-worker':
+    run_deploy_worker(DEPLOY_JOB_ID)
+    sys.exit(0)
 elif ACTION == 'discovery-schedule':
     run_discovery_schedule()
     sys.exit(0)
@@ -9776,9 +10158,6 @@ elif ACTION == 'list-bindings':
     action_list_bindings()
 elif ACTION == 'save-bindings':
     action_save_bindings()
-elif ACTION == 'discovered':
-    # Legacy: replaced by subnet-scan. Kept for backward compat.
-    action_discovered()
 elif ACTION == 'get-ztp-script':
     action_get_ztp_script()
 elif ACTION == 'save-ztp-script':
@@ -9804,6 +10183,12 @@ elif ACTION == 'list-devices':
     action_list_devices()
 elif ACTION == 'deploy-base-config':
     action_deploy_base_config()
+elif ACTION == 'base-deploy-start':
+    action_base_deploy_start()
+elif ACTION == 'base-deploy-status':
+    action_base_deploy_status()
+elif ACTION == 'base-deploy-active':
+    action_base_deploy_active()
 elif ACTION == 'upgrade-candidates':
     action_upgrade_candidates()
 elif ACTION == 'upgrade-precheck':
@@ -9855,6 +10240,12 @@ elif ACTION == 'upload-generated-config':
     action_upload_generated_config()
 elif ACTION == 'deploy-generated-config':
     action_deploy_generated_config()
+elif ACTION == 'config-deploy-start':
+    action_config_deploy_start()
+elif ACTION == 'config-deploy-status':
+    action_config_deploy_status()
+elif ACTION == 'config-deploy-active':
+    action_config_deploy_active()
 elif ACTION == 'load-ztp-tab':
     action_load_ztp_tab()
 elif ACTION == 'update-role':

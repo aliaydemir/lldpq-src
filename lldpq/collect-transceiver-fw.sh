@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # collect-transceiver-fw.sh - Collect transceiver firmware versions via mlxlink
-# Runs independently from monitor.sh, CLI only (not triggered from web UI)
+# Runs independently from monitor.sh (CLI or admin web trigger via lldpq-trigger;
+# mlxlink is never executed directly from CGI/web command runners)
 # Skips known-risk models before running mlxlink
 #
 # Copyright (c) 2024-2026 LLDPq Project

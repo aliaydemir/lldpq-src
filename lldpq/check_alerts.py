@@ -873,7 +873,7 @@ class LLDPqAlerts:
                 "RECOVERED", device, alert_type, current_state
             )
 
-    def check_system_watchdog_alerts(self, device):
+    def check_system_watchdog_alerts(self, device, only_types=None):
         """Reboot / service-restart alerts from the hardware-side watchdog.
 
         Both alert types are one-shot by construction: only events stamped
@@ -889,38 +889,42 @@ class LLDPqAlerts:
             'send_recovery', True
         )
 
-        reboot = None
-        for event in events:
-            if event.get("kind") == "reboot":
-                reboot = event
-        current_state = "WARNING" if reboot is not None else "OK"
-        alert_type = "device_reboot"
-        last_state = self.get_alert_state(device, alert_type)
-        if current_state == "OK" and last_state == "UNKNOWN":
-            # New alert type: establish a healthy baseline silently so an
-            # upgrade cannot emit one false recovery per inventory device.
-            self.record_state_without_delivery(device, alert_type, current_state)
-        elif current_state == "OK" and not send_recovery:
-            self.record_state_without_delivery(device, alert_type, current_state)
-        elif self.should_send_alert(device, alert_type, current_state):
-            if current_state == "WARNING":
-                try:
-                    uptime_minutes = int(
-                        float(reboot.get("uptime_seconds") or 0) // 60)
-                except (TypeError, ValueError):
-                    uptime_minutes = 0
-                self.send_stateful_notification(
-                    f"⚠️ Device Rebooted",
-                    f"Device rebooted (uptime {uptime_minutes}m); "
-                    "counter resets expected (carrier/BGP/service baselines)",
-                    "WARNING", device, alert_type, current_state
-                )
-            elif current_state == "OK":
-                self.send_stateful_notification(
-                    f"Device Uptime Normal",
-                    f"No reboot detected in the current cycle",
-                    "RECOVERED", device, alert_type, current_state
-                )
+        if only_types is None or "device_reboot" in only_types:
+            reboot = None
+            for event in events:
+                if event.get("kind") == "reboot":
+                    reboot = event
+            current_state = "WARNING" if reboot is not None else "OK"
+            alert_type = "device_reboot"
+            last_state = self.get_alert_state(device, alert_type)
+            if current_state == "OK" and last_state == "UNKNOWN":
+                # New alert type: establish a healthy baseline silently so an
+                # upgrade cannot emit one false recovery per inventory device.
+                self.record_state_without_delivery(device, alert_type, current_state)
+            elif current_state == "OK" and not send_recovery:
+                self.record_state_without_delivery(device, alert_type, current_state)
+            elif self.should_send_alert(device, alert_type, current_state):
+                if current_state == "WARNING":
+                    try:
+                        uptime_minutes = int(
+                            float(reboot.get("uptime_seconds") or 0) // 60)
+                    except (TypeError, ValueError):
+                        uptime_minutes = 0
+                    self.send_stateful_notification(
+                        f"⚠️ Device Rebooted",
+                        f"Device rebooted (uptime {uptime_minutes}m); "
+                        "counter resets expected (carrier/BGP/service baselines)",
+                        "WARNING", device, alert_type, current_state
+                    )
+                elif current_state == "OK":
+                    self.send_stateful_notification(
+                        f"Device Uptime Normal",
+                        f"No reboot detected in the current cycle",
+                        "RECOVERED", device, alert_type, current_state
+                    )
+
+        if only_types is not None and "service_restart" not in only_types:
+            return
 
         # Service restarts. frr/switchd carry the forwarding plane; a reboot
         # in the same cycle already suppressed these events at the detector
@@ -1017,58 +1021,7 @@ class LLDPqAlerts:
         # A session that dropped and re-established BETWEEN samples looks
         # Established at both reads; only the analyzer's counter/uptime flap
         # events make it visible.
-        bgp_flap_counts = self.get_device_bgp_flap_counts(
-            device, window_seconds=3600
-        )
-        if bgp_flap_counts is not None:
-            high_flap_sessions = []
-            critical_flap_sessions = []
-
-            thresholds = self.config.get('thresholds', {}).get('network', {})
-            try:
-                bgp_flap_warning = float(thresholds.get('bgp_flaps_warning', 1))
-                bgp_flap_critical = float(thresholds.get('bgp_flaps_critical', 3))
-            except (TypeError, ValueError):
-                print("    ❌ Invalid BGP-flap thresholds; using 1/3")
-                self.had_error = True
-                bgp_flap_warning, bgp_flap_critical = 1, 3
-
-            for session, flap_count in sorted(bgp_flap_counts.items()):
-                if flap_count >= bgp_flap_critical:
-                    critical_flap_sessions.append(f"{session}: {flap_count}")
-                elif flap_count >= bgp_flap_warning:
-                    high_flap_sessions.append(f"{session}: {flap_count}")
-
-            if critical_flap_sessions:
-                current_state = "CRITICAL"
-            elif high_flap_sessions:
-                current_state = "WARNING"
-            else:
-                current_state = "OK"
-
-            send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
-            if current_state == "OK" and not send_recovery:
-                self.record_state_without_delivery(
-                    device, "bgp_session_flaps", current_state)
-            elif self.should_send_alert(device, "bgp_session_flaps", current_state):
-                if current_state == "CRITICAL":
-                    self.send_stateful_notification(
-                        f"⚡ Critical BGP Session Flapping",
-                        f"Sessions with excessive flaps: {', '.join(critical_flap_sessions)}",
-                        "CRITICAL", device, "bgp_session_flaps", current_state
-                    )
-                elif current_state == "WARNING":
-                    self.send_stateful_notification(
-                        f"⚠️ BGP Session Flapping",
-                        f"Sessions with flaps: {', '.join(high_flap_sessions)}",
-                        "WARNING", device, "bgp_session_flaps", current_state
-                    )
-                elif current_state == "OK":
-                    self.send_stateful_notification(
-                        f"BGP Sessions Stabilized",
-                        f"All BGP sessions stable",
-                        "RECOVERED", device, "bgp_session_flaps", current_state
-                    )
+        self._check_bgp_session_flaps_alert(device)
 
         # A session can stay Established while its peer floods route churn;
         # only the analyzer's msgRcvd inflow rate makes that visible.
@@ -1834,8 +1787,10 @@ class LLDPqAlerts:
         if mode == "summary":
             if not self.send_summary_alert(devices):
                 self.had_error = True
+            self.check_always_immediate_alerts(devices)
         elif mode == "change_only":
             self.check_changes_only(devices)
+            self.check_always_immediate_alerts(devices)
         elif mode == "immediate":
             self.check_immediate_alerts(devices)
         else:
@@ -1844,6 +1799,314 @@ class LLDPqAlerts:
         
         print("Alert check completed")
         return not self.had_error
+
+    @staticmethod
+    def _extract_hardware_temperatures(hardware_data):
+        """Return (max_cpu_temp, max_asic_temp) floats or None if unavailable."""
+        cpu_temps = []
+        for pattern in (
+            r'CPU ACPI temp:\s*\+?([0-9.]+)°C',
+            r'Core \d+:\s*\+?([0-9.]+)°C',
+            r'Package id \d+:\s*\+?([0-9.]+)°C',
+            r'HW_MGMT_CPU:\s*([0-9.]+)',
+        ):
+            cpu_temps.extend(float(v) for v in re.findall(pattern, hardware_data))
+        asic_temps = []
+        for pattern in (
+            r'ASIC.*temp.*:\s*\+?([0-9.]+)°C',
+            r'(?:HW_MGMT_ASIC|THERMAL_ZONE_ASIC|HWMON_ASIC):\s*([0-9.]+)',
+        ):
+            asic_temps.extend(
+                float(v) for v in re.findall(pattern, hardware_data, re.IGNORECASE)
+            )
+        return (max(cpu_temps) if cpu_temps else None,
+                max(asic_temps) if asic_temps else None)
+
+    def _check_bgp_session_flaps_alert(self, device):
+        """Evaluate BGP session flaps for one device using stateful alerts."""
+        bgp_flap_counts = self.get_device_bgp_flap_counts(
+            device, window_seconds=3600
+        )
+        if bgp_flap_counts is None:
+            return
+        high_flap_sessions = []
+        critical_flap_sessions = []
+
+        thresholds = self.config.get('thresholds', {}).get('network', {})
+        try:
+            bgp_flap_warning = float(thresholds.get('bgp_flaps_warning', 1))
+            bgp_flap_critical = float(thresholds.get('bgp_flaps_critical', 3))
+        except (TypeError, ValueError):
+            print("    ❌ Invalid BGP-flap thresholds; using 1/3")
+            self.had_error = True
+            bgp_flap_warning, bgp_flap_critical = 1, 3
+
+        for session, flap_count in sorted(bgp_flap_counts.items()):
+            if flap_count >= bgp_flap_critical:
+                critical_flap_sessions.append(f"{session}: {flap_count}")
+            elif flap_count >= bgp_flap_warning:
+                high_flap_sessions.append(f"{session}: {flap_count}")
+
+        if critical_flap_sessions:
+            current_state = "CRITICAL"
+        elif high_flap_sessions:
+            current_state = "WARNING"
+        else:
+            current_state = "OK"
+
+        send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+        if current_state == "OK" and not send_recovery:
+            self.record_state_without_delivery(
+                device, "bgp_session_flaps", current_state)
+        elif self.should_send_alert(device, "bgp_session_flaps", current_state):
+            if current_state == "CRITICAL":
+                self.send_stateful_notification(
+                    f"⚡ Critical BGP Session Flapping",
+                    f"Sessions with excessive flaps: {', '.join(critical_flap_sessions)}",
+                    "CRITICAL", device, "bgp_session_flaps", current_state
+                )
+            elif current_state == "WARNING":
+                self.send_stateful_notification(
+                    f"⚠️ BGP Session Flapping",
+                    f"Sessions with flaps: {', '.join(high_flap_sessions)}",
+                    "WARNING", device, "bgp_session_flaps", current_state
+                )
+            elif current_state == "OK":
+                self.send_stateful_notification(
+                    f"BGP Sessions Stabilized",
+                    f"All BGP sessions stable",
+                    "RECOVERED", device, "bgp_session_flaps", current_state
+                )
+
+    def check_always_immediate_alerts(self, devices):
+        """Deliver configured critical-bypass alerts immediately in summary/change_only modes."""
+        raw_bypass = self.config.get('alert_strategy', {}).get('always_immediate')
+        if not isinstance(raw_bypass, (list, tuple, set)):
+            return
+        enabled = {
+            str(item).strip()
+            for item in raw_bypass
+            if isinstance(item, str) and item.strip()
+        }
+        if not enabled:
+            return
+
+        alert_types = self.config.get('alert_types', {})
+        hw_enabled = alert_types.get('hardware_alerts', True)
+        net_enabled = alert_types.get('network_alerts', True)
+        sys_enabled = alert_types.get('system_alerts', True)
+        send_recovery = self.config.get('frequency', {}).get('send_recovery', True)
+        hw_thresholds = self.config.get('thresholds', {}).get('hardware', {})
+        run_manifest = getattr(self, "run_manifest", None)
+
+        need_hw = hw_enabled and bool(enabled & {
+            "cpu_temp_critical", "asic_temp_critical", "fan_critical_failure"
+        })
+        watchdog_types = enabled & {"device_reboot", "service_restart"}
+
+        for device in devices:
+            try:
+                if need_hw:
+                    hw_file = self.monitor_results / "hardware-data" / f"{device}_hardware.txt"
+                    if hw_file.exists():
+                        try:
+                            hw_data = read_stable_pipeline_file(hw_file, run_manifest)
+                        except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
+                            hw_data = None
+                        if hw_data is not None:
+                            cpu_temp, asic_temp = self._extract_hardware_temperatures(hw_data)
+                            if "cpu_temp_critical" in enabled and cpu_temp is not None:
+                                cpu_crit = hw_thresholds.get('cpu_temp_critical', 85)
+                                state = "CRITICAL" if cpu_temp >= cpu_crit else "OK"
+                                last = self.get_alert_state(device, "cpu_temp")
+                                if state == "CRITICAL" and self.should_send_alert(device, "cpu_temp", state):
+                                    self.send_stateful_notification(
+                                        "🔥 Critical CPU Temperature",
+                                        f"CPU temperature: {cpu_temp}°C (threshold: {cpu_crit}°C)",
+                                        "CRITICAL", device, "cpu_temp", state,
+                                    )
+                                elif state == "OK" and last == "CRITICAL":
+                                    if not send_recovery:
+                                        self.record_state_without_delivery(device, "cpu_temp", "OK")
+                                    elif self.should_send_alert(device, "cpu_temp", "OK"):
+                                        self.send_stateful_notification(
+                                            "CPU Temperature Recovered",
+                                            f"CPU temperature: {cpu_temp}°C (back to normal)",
+                                            "RECOVERED", device, "cpu_temp", "OK",
+                                        )
+                            if "asic_temp_critical" in enabled and asic_temp is not None:
+                                asic_crit = hw_thresholds.get('asic_temp_critical', 105)
+                                state = "CRITICAL" if asic_temp >= asic_crit else "OK"
+                                last = self.get_alert_state(device, "asic_temp")
+                                if state == "CRITICAL" and self.should_send_alert(device, "asic_temp", state):
+                                    self.send_stateful_notification(
+                                        "🔥 Critical ASIC Temperature",
+                                        f"ASIC temperature: {asic_temp}°C (threshold: {asic_crit}°C)",
+                                        "CRITICAL", device, "asic_temp", state,
+                                    )
+                                elif state == "OK" and last == "CRITICAL":
+                                    if not send_recovery:
+                                        self.record_state_without_delivery(device, "asic_temp", "OK")
+                                    elif self.should_send_alert(device, "asic_temp", "OK"):
+                                        self.send_stateful_notification(
+                                            "ASIC Temperature Recovered",
+                                            f"ASIC temperature: {asic_temp}°C (back to normal)",
+                                            "RECOVERED", device, "asic_temp", "OK",
+                                        )
+                            if "fan_critical_failure" in enabled:
+                                fans = evaluate_fan_health(hw_data, hw_thresholds)
+                                last_fan = self.get_alert_state(device, "fan_speed") or ""
+                                if fans.get('grade') == 'CRITICAL' or (
+                                    fans.get('grade') in ('EXCELLENT', 'GOOD')
+                                    and last_fan.startswith('CRITICAL')
+                                ):
+                                    self.check_component_alert(
+                                        device, fans, 'fan_speed', (('fan', 'fans'),),
+                                        'Fan State / Speed', 'Fans Recovered',
+                                    )
+
+                if net_enabled:
+                    if "bgp_neighbors_down" in enabled:
+                        bgp_status = self.get_device_bgp_status(device)
+                        last_bgp = self.get_alert_state(device, "bgp_neighbors")
+                        if bgp_status == "critical" and self.should_send_alert(
+                            device, "bgp_neighbors", "CRITICAL"
+                        ):
+                            self.send_stateful_notification(
+                                "BGP Neighbors Down",
+                                "Processed BGP analysis reports that a neighbor "
+                                "exceeded the configured down-duration threshold",
+                                "CRITICAL", device, "bgp_neighbors", "CRITICAL",
+                            )
+                        elif bgp_status == "established" and last_bgp == "CRITICAL":
+                            if not send_recovery:
+                                self.record_state_without_delivery(
+                                    device, "bgp_neighbors", "OK"
+                                )
+                            elif self.should_send_alert(device, "bgp_neighbors", "OK"):
+                                self.send_stateful_notification(
+                                    "BGP Neighbors Recovered",
+                                    "All BGP neighbors established",
+                                    "RECOVERED", device, "bgp_neighbors", "OK",
+                                )
+                    if "bgp_session_flaps" in enabled:
+                        self._check_bgp_session_flaps_alert(device)
+
+                if sys_enabled and watchdog_types:
+                    self.check_system_watchdog_alerts(
+                        device, only_types=watchdog_types
+                    )
+            except Exception as exc:
+                print(f"    ❌ Error evaluating critical bypass for {device}: {exc}")
+                self.had_error = True
+
+    def _change_metrics_path(self):
+        return self.state_dir / "network_summary_change_metrics.json"
+
+    def _read_change_metrics_baseline(self):
+        path = self._change_metrics_path()
+        if not path.exists():
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            return data if isinstance(data, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _write_change_metrics_baseline(self, metrics):
+        return self._atomic_write_state(
+            self._change_metrics_path(),
+            json.dumps(metrics, sort_keys=True, separators=(',', ':')),
+        )
+
+    def _collect_change_metrics(self, devices, asset_stats):
+        """Capture per-device temp/fan readings and online count for change_threshold."""
+        hw_thresholds = self.config.get('thresholds', {}).get('hardware', {})
+        run_manifest = getattr(self, "run_manifest", None)
+        per_device = {}
+        for device in devices:
+            hw_file = self.monitor_results / "hardware-data" / f"{device}_hardware.txt"
+            if not hw_file.exists():
+                continue
+            try:
+                hw_data = read_stable_pipeline_file(hw_file, run_manifest)
+            except (OSError, OverflowError, RuntimeError, TypeError, ValueError):
+                continue
+            cpu_temp, asic_temp = self._extract_hardware_temperatures(hw_data)
+            fans = evaluate_fan_health(hw_data, hw_thresholds)
+            rpms = [
+                float(row['rpm'])
+                for row in fans.get('fans', [])
+                if isinstance(row.get('rpm'), (int, float)) and math.isfinite(row['rpm'])
+            ]
+            entry = {}
+            if cpu_temp is not None:
+                entry['cpu_temp'] = round(cpu_temp, 2)
+            if asic_temp is not None:
+                entry['asic_temp'] = round(asic_temp, 2)
+            if rpms:
+                entry['min_fan_rpm'] = round(min(rpms), 1)
+            if entry:
+                per_device[device] = entry
+        return {
+            'online_devices': int(asset_stats.get('successful', 0)),
+            'devices': per_device,
+        }
+
+    def _detect_metric_threshold_changes(self, current_metrics):
+        """Return human-readable metric changes exceeding alert_strategy.change_threshold."""
+        baseline = self._read_change_metrics_baseline()
+        if not baseline:
+            return []
+        cfg = self.config.get('alert_strategy', {}).get('change_threshold') or {}
+        try:
+            temp_threshold = float(cfg.get('temperature_change', 10))
+        except (TypeError, ValueError):
+            temp_threshold = 10.0
+        try:
+            fan_threshold = float(cfg.get('fan_change', 1000))
+        except (TypeError, ValueError):
+            fan_threshold = 1000.0
+        try:
+            device_threshold = int(cfg.get('device_count_change', 1))
+        except (TypeError, ValueError):
+            device_threshold = 1
+
+        changes = []
+        if device_threshold > 0:
+            prev_online = baseline.get('online_devices')
+            curr_online = current_metrics.get('online_devices')
+            if isinstance(prev_online, int) and isinstance(curr_online, int):
+                if abs(curr_online - prev_online) >= device_threshold:
+                    changes.append(
+                        f"Online devices changed: {prev_online} -> {curr_online}"
+                    )
+
+        prev_devices = baseline.get('devices') or {}
+        curr_devices = current_metrics.get('devices') or {}
+        for device in sorted(curr_devices):
+            prev = prev_devices.get(device)
+            if not isinstance(prev, dict):
+                continue
+            curr = curr_devices[device]
+            if temp_threshold > 0:
+                if 'cpu_temp' in curr and 'cpu_temp' in prev:
+                    if abs(curr['cpu_temp'] - prev['cpu_temp']) >= temp_threshold:
+                        changes.append(
+                            f"{device} CPU temp: {prev['cpu_temp']:.1f}°C -> {curr['cpu_temp']:.1f}°C"
+                        )
+                if 'asic_temp' in curr and 'asic_temp' in prev:
+                    if abs(curr['asic_temp'] - prev['asic_temp']) >= temp_threshold:
+                        changes.append(
+                            f"{device} ASIC temp: {prev['asic_temp']:.1f}°C -> {curr['asic_temp']:.1f}°C"
+                        )
+            if fan_threshold > 0 and 'min_fan_rpm' in curr and 'min_fan_rpm' in prev:
+                if abs(curr['min_fan_rpm'] - prev['min_fan_rpm']) >= fan_threshold:
+                    changes.append(
+                        f"{device} fan speed: {prev['min_fan_rpm']:.0f} -> {curr['min_fan_rpm']:.0f} RPM"
+                    )
+        return changes
 
     def check_immediate_alerts(self, devices):
         """Run every enabled alert domain using individual stateful alerts."""
@@ -1890,7 +2153,8 @@ class LLDPqAlerts:
             if not checker():
                 self.had_error = True
 
-    def send_summary_alert(self, devices, *, include_schedule=True):
+    def send_summary_alert(self, devices, *, include_schedule=True,
+                           evaluate_change_thresholds=False):
         """Send dashboard-style summary alert"""
         print("Generating network health summary...")
         if (not isinstance(self.run_manifest, dict) or
@@ -2125,9 +2389,28 @@ class LLDPqAlerts:
             duplicate_signature,
         )))
         
-        # Check if summary changed or it's scheduled time (critical issues don't force immediate send in summary mode)
+        current_metrics = None
+        metric_changes = []
+        if evaluate_change_thresholds:
+            current_metrics = self._collect_change_metrics(devices, asset_stats)
+            metric_changes = self._detect_metric_threshold_changes(current_metrics)
+
+        # Check if summary changed, a change_threshold tripped, or a daily/weekly slot is due
+        last_signature = self.get_alert_state("network_summary", "last_summary")
+        signature_changed = summary_signature != last_signature
+        due_daily = self.due_summary_slot() if include_schedule else None
+        due_weekly = self.due_weekly_slot() if include_schedule else None
+        last_weekly = self.get_alert_state("network_summary", "last_weekly_report")
+        weekly_due_only = (
+            bool(include_schedule and due_weekly and due_weekly != last_weekly)
+            and not signature_changed
+            and not metric_changes
+        )
+
         if self.should_send_summary_alert(
-                summary_signature, include_schedule=include_schedule):
+                summary_signature,
+                include_schedule=include_schedule,
+                force_metric_change=bool(metric_changes)):
             server_url = self.config.get('notifications', {}).get('server_url', 'http://localhost')
             if optical_skipped:
                 optical_section = "Optical Diagnostics Analysis:\n\nSkipped by configuration"
@@ -2156,7 +2439,11 @@ class LLDPqAlerts:
                 )
 
             # Create clean dashboard-style message with spacing
-            title = "Network Health Summary"
+            title = (
+                "Network Health Summary (Weekly Report)"
+                if weekly_due_only
+                else "Network Health Summary"
+            )
             message = f"""
 
 Total Devices: {total_devices}
@@ -2237,6 +2524,14 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 )
                 if len(open_issues) > 5:
                     message += f"\n... and {len(open_issues) - 5} more issues"
+            if metric_changes:
+                message += (
+                    "\n─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──"
+                    "\n\nSignificant Metric Changes:\n"
+                    + "\n".join(f"- {item}" for item in metric_changes[:10])
+                )
+                if len(metric_changes) > 10:
+                    message += f"\n... and {len(metric_changes) - 10} more changes"
                     
             message += f"\n\n─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ──\n\n[View Full Dashboard]({server_url})"
             
@@ -2258,14 +2553,23 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
                 persisted = self.record_alert_delivery(
                     "network_summary", "last_summary", summary_signature
                 )
-                due_slot = self.due_summary_slot() if include_schedule else None
-                if due_slot is not None:
+                if current_metrics is not None:
+                    persisted = self._write_change_metrics_baseline(
+                        current_metrics
+                    ) and persisted
+                if due_daily is not None:
                     persisted = self.set_alert_state(
-                        "network_summary", "last_summary_time", due_slot
+                        "network_summary", "last_summary_time", due_daily
+                    ) and persisted
+                if due_weekly is not None:
+                    persisted = self.set_alert_state(
+                        "network_summary", "last_weekly_report", due_weekly
                     ) and persisted
                 return delivered and persisted
             return False
 
+        if current_metrics is not None and self._read_change_metrics_baseline() is None:
+            self._write_change_metrics_baseline(current_metrics)
         return True
 
     def check_lldp_alerts(self):
@@ -2535,8 +2839,10 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             "fabric_check", state,
         )
 
-    def should_send_summary_alert(self, current_signature, *, include_schedule=True):
-        """Check if summary should be sent based on changes or schedule"""
+    def should_send_summary_alert(self, current_signature, *,
+                                  include_schedule=True,
+                                  force_metric_change=False):
+        """Check if summary should be sent based on changes, metric deltas, or schedule"""
         retry_interval = self.get_frequency_seconds('retry_interval_minutes', 5)
         last_attempt = self._read_marker_time(
             "network_summary", "last_summary", "attempt"
@@ -2546,17 +2852,23 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
 
         last_signature = self.get_alert_state("network_summary", "last_summary")
         
-        # Send if data changed
-        if current_signature != last_signature:
+        # Send if summary state changed or a change_threshold metric delta tripped
+        if current_signature != last_signature or force_metric_change:
             return True
             
-        # Send if a scheduled slot was reached and not yet sent for today
+        # Send if a daily or weekly scheduled slot was reached and not yet sent
         if include_schedule:
             due_slot = self.due_summary_slot()
             if due_slot is not None:
                 last_summary_time = self.get_alert_state("network_summary", "last_summary_time")
 
                 if due_slot != last_summary_time:
+                    return True
+
+            due_weekly = self.due_weekly_slot()
+            if due_weekly is not None:
+                last_weekly = self.get_alert_state("network_summary", "last_weekly_report")
+                if due_weekly != last_weekly:
                     return True
 
         return False
@@ -3480,15 +3792,22 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
         return self.due_summary_slot() is not None
 
     def due_summary_slot(self):
-        """Return the newest summary slot already reached today, or None.
+        """Return the newest daily summary slot already reached today, or None.
 
         check_alerts runs at the end of the monitoring pipeline, minutes
         after the cron minute, so an exact HH:MM match would never fire.
         Comparing the reached slot against the last-sent slot marker lets a
         scheduled summary fire exactly once per configured time per day.
+        Setting frequency.daily_summary to false suppresses scheduled daily
+        slots while keeping state-change summaries active.
         """
+        freq = self.config.get('frequency', {})
+        if freq.get('daily_summary', True) is False:
+            return None
         strategy = self.config.get('alert_strategy', {})
-        summary_times = strategy.get('summary_times', ['09:00', '17:00'])
+        summary_times = strategy.get('summary_times')
+        if not summary_times:
+            summary_times = ['09:00']
 
         now = datetime.datetime.now()
         current_time = now.strftime("%H:%M")
@@ -3501,10 +3820,23 @@ Excellent: {ber_stats['excellent']}     Good: {ber_stats['good']}     Warnings: 
             return None
         return f"{now.strftime('%Y-%m-%d')} {max(due_times)}"
 
+    def due_weekly_slot(self):
+        """Return the ISO week token when frequency.weekly_report is due (Mon >= 09:00)."""
+        freq = self.config.get('frequency', {})
+        if not freq.get('weekly_report', False):
+            return None
+        now = datetime.datetime.now()
+        if now.weekday() != 0 or now.strftime("%H:%M") < "09:00":
+            return None
+        iso_year, iso_week, _ = now.isocalendar()
+        return f"{iso_year}-W{iso_week:02d}"
+
     def check_changes_only(self, devices):
-        """Send the complete health summary only when its state changes."""
+        """Send the complete health summary when state or change_threshold metrics change."""
         print("🔄 Evaluating complete network state for changes")
-        if not self.send_summary_alert(devices, include_schedule=False):
+        if not self.send_summary_alert(
+            devices, include_schedule=False, evaluate_change_thresholds=True
+        ):
             self.had_error = True
 
 def main():

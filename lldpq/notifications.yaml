@@ -103,7 +103,7 @@ alert_strategy:
   # Example: "Network Health Summary: 70 devices, 14 excellent, 1 warning..."
   
   # 🚨 CRITICAL BYPASS (always immediate regardless of mode):
-  # ⚠️ NOT IMPLEMENTED YET - critical issues are currently batched into the summary
+  # Listed critical conditions send individual immediate alerts even in summary/change_only modes
   always_immediate:
     - "cpu_temp_critical"            # CPU over 85°C (hardware failure risk)
     - "asic_temp_critical"           # ASIC over 105°C (switch could fail)
@@ -112,10 +112,9 @@ alert_strategy:
     - "device_reboot"                # Device rebooted between samples (counter resets expected)
     - "service_restart"              # Service restarted between samples (frr/switchd are critical)
     - "fan_critical_failure"         # Fan stopped (cooling failure)
-  # Note: These would bypass summary mode and send individual device alerts (not implemented yet)
 
   # 📈 CHANGE DETECTION (for change_only mode):
-  # ⚠️ NOT IMPLEMENTED YET - change_only mode compares the full summary state instead
+  # Triggers a summary when per-device temperature/fan deltas or online device count cross these thresholds
   change_threshold:
     temperature_change: 10          # Alert if temp jumps/drops by 10°C
     fan_change: 1000                # Alert if fan speed changes by 1000+ RPM
@@ -136,15 +135,12 @@ frequency:
   send_recovery: true
   # Example: "✅ CPU Temperature Recovered: 72°C (back to normal)"
   
-  # 📅 DAILY SUMMARY: Send health summary once per day
-  # ⚠️ NOT IMPLEMENTED YET - use alert_strategy.summary_times for scheduled summaries
+  # 📅 DAILY SUMMARY: Enable/disable scheduled daily summaries (uses alert_strategy.summary_times, default 09:00)
   daily_summary: true
-  # Sends comprehensive network health summary at 09:00 local time
+  # Set to false to disable scheduled summary_times while keeping state-change summaries
 
-  # 📊 WEEKLY REPORT: Send weekly health trends (optional)
-  # ⚠️ NOT IMPLEMENTED YET
+  # 📊 WEEKLY REPORT: Send weekly health summary every Monday at 09:00 local time
   weekly_report: false
-  # Would send weekly statistics and trends every Monday at 09:00
 
 # =============================================================================
 # ALERT TYPES - Enable/disable specific alert categories
@@ -181,7 +177,7 @@ templates:
 # 📊 WHAT YOU'LL GET:
 # • Summary mode: 1 clean dashboard-style message instead of 70+ spam alerts
 # • Smart scheduling: Morning (9 AM) and evening (5 PM) health summaries  
-# • Critical bypass: Immediate alerts for CPU/ASIC overheating, BGP down, fan failures (not implemented yet)
+# • Critical bypass: Immediate alerts for CPU/ASIC overheating, BGP down, fan failures
 # • Working links: Device links in alerts work from any machine (not just localhost)
 # • Rate limiting: Same alert won't spam - waits 30 minutes between repeats
 # • Recovery alerts: Get notified when problems are resolved

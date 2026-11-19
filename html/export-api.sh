@@ -203,6 +203,10 @@ try:
     reports.append(entry)
 
     # --- latest AI analysis ------------------------------------------------
+    # Must match ai-export-api.sh's contract: install.sh and Docker seed
+    # analysis.json with {}, which /ai/export_json serves as 503 no-report.
+    # Only a populated report carrying both "timestamp" and "analysis" is
+    # available.
     entry = {
         "report": "ai",
         "title": "Latest AI Analysis",
@@ -213,9 +217,11 @@ try:
     }
     analysis_file = Path(os.environ["AI_STATE_DIR"]) / "analysis.json"
     try:
-        entry["available"] = analysis_file.is_file()
-        if entry["available"]:
-            entry["updated"] = iso_utc(analysis_file.stat().st_mtime)
+        if analysis_file.is_file():
+            payload = read_small_json(analysis_file)
+            if isinstance(payload, dict) and "timestamp" in payload and "analysis" in payload:
+                entry["available"] = True
+                entry["updated"] = iso_utc(analysis_file.stat().st_mtime)
     except OSError:
         pass
     reports.append(entry)

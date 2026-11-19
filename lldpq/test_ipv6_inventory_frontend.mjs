@@ -271,7 +271,7 @@ test('IPv6 discovery leaves deployment manual and explicit generated config stil
     assert.equal(h.requests.length, 0);
     assert.equal(h.confirmations.length, 1);
     await h.confirmations[0].callback();
-    assert.equal(h.requests[0].action, 'deploy-generated-config');
+    assert.equal(h.requests[0].action, 'config-deploy-start');
     assert.equal(h.requests[0].payload.ip, device.ip);
 });
 
@@ -313,11 +313,19 @@ test('explicit Base Config sends mixed addresses and updates scoped IPv6 progres
         ? devices.map(dataset => ({ dataset })) : [];
     h.context.apiCall = async (action, payload) => {
         h.requests.push({ action, payload });
-        return { success: true, results: devices.map(device => ({ ...device, success: true, message: 'Applied' })) };
+        return {
+            success: true,
+            job: {
+                id: 'job-1',
+                complete: true,
+                status: 'success',
+                results: devices.map(device => ({ ...device, success: true, message: 'Applied' })),
+            },
+        };
     };
     await h.context.deployBaseConfig();
     assert.equal(h.requests.length, 1);
-    assert.equal(h.requests[0].action, 'deploy-base-config');
+    assert.equal(h.requests[0].action, 'base-deploy-start');
     assert.equal(h.requests[0].payload.devices[1].ip, 'fe80::1%en-1');
     assert.equal(h.requests[0].payload.disable_ztp, false);
     assert.match(h.element('deployProgress').innerHTML, /id="deploy-address-fe80%3A%3A1%25en-1"/);
@@ -340,10 +348,15 @@ test('scoped IPv6 interfaces with punctuation retain independent deployment prog
         ? devices.map(dataset => ({ dataset })) : [];
     h.context.apiCall = async () => ({
         success: true,
-        results: [
-            { ...devices[0], success: true, message: 'VLAN applied' },
-            { ...devices[1], success: false, error: 'Dash failed' },
-        ],
+        job: {
+            id: 'job-2',
+            complete: true,
+            status: 'success',
+            results: [
+                { ...devices[0], success: true, message: 'VLAN applied' },
+                { ...devices[1], success: false, error: 'Dash failed' },
+            ],
+        },
     });
     await h.context.deployBaseConfig();
     for (const rowId of rowIds) assert.ok(h.element('deployProgress').innerHTML.includes(`id="${rowId}"`));

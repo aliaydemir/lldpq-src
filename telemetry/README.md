@@ -39,13 +39,14 @@ This directory contains the Docker Compose configuration for running the LLDPq t
 - Edit this file to configure notification channels (Slack, email, etc.)
 
 ### Alert Rules (`config/alert_rules.yaml`)
-- Pre-configured alerts for:
-  - Interface down
-  - High interface utilization (>80%)
-  - High error/drop rates
-  - BGP session down
-  - High CPU temperature
-  - Fan failure
+- Pre-configured alerts using the Cumulus OTEL `cumulus_nvswitch_*` metrics (`net_host_name` / `interface` labels):
+  - High interface error rate (`if_in_errors` + `if_out_errors`)
+  - High packet drop / discard rate (`if_in_discards` + `if_out_discards` + `ether_stats_drop_events`)
+  - Frequent link carrier flaps (`carrier_changes_total`)
+  - RX buffer saturation (`rx_buffer_full`)
+  - CRC / FCS errors (`crc_align_errors` + `fcs_errors`)
+  - Egress HOQ discards (`discards_egress_hoq` + `discards_egress_hoq_stall`)
+  - OTEL Collector unreachable / no switch telemetry arriving
 
 ## Stack Management
 
