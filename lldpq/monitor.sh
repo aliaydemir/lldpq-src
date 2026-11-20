@@ -28,6 +28,7 @@ Options:
                           config-drift  Config drift analysis
                           routes     Routes table analysis
                           fabric-check  Fabric MTU/speed/FEC consistency check
+                          predictive    Multi-domain predictive health scoring (local-only)
                           all        Full collection (same as no --only)
   -s, --skip-optical   Skip optical collection during a full run
   -h, --help           Show this help and exit
@@ -103,6 +104,7 @@ done
 
 case "$MONITOR_SCOPE" in
     all|bgp|evpn-mh|duplicate|flap|optical|ber|pfc-ecn|hardware|logs|config-drift|routes|fabric-check) ;;
+    predictive) ;;
     "")
         echo "Error: --only requires a non-empty scope" >&2
         show_usage >&2
@@ -4831,6 +4833,35 @@ if [[ "$MONITOR_SCOPE" == "fabric-check" && "$SKIP_FABRIC_CHECK" == "true" ]]; t
     echo "Error: fabric-check analysis is disabled by SKIP_FABRIC_CHECK" >&2
     exit 2
 fi
+if [[ "$MONITOR_SCOPE" == "predictive" ]]; then
+    if [[ "${SKIP_PREDICTIVE:-false}" == "true" ]]; then
+        echo "Error: predictive analysis is disabled by SKIP_PREDICTIVE" >&2
+        exit 2
+    fi
+    if [[ ! -f "$SCRIPT_DIR/predictive_analyzer.py" ]]; then
+        echo "Error: predictive_analyzer.py not found in $SCRIPT_DIR" >&2
+        exit 1
+    fi
+    echo "Running local-only predictive health analysis..."
+    python3 "$SCRIPT_DIR/predictive_analyzer.py" --monitor-dir "$SCRIPT_DIR/monitor-results" || exit $?
+    if [[ -n "${WEB_ROOT:-}" && -d "$WEB_ROOT/monitor-results" ]]; then
+        if [[ -w "$WEB_ROOT" ]]; then
+            LLDPQ_PRIV=()
+        elif sudo -n true 2>/dev/null; then
+            LLDPQ_PRIV=(sudo -n)
+        else
+            echo "Warning: $WEB_ROOT is not writable; kept predictive outputs under $SCRIPT_DIR/monitor-results" >&2
+            exit 0
+        fi
+        "${LLDPQ_PRIV[@]}" mkdir -p "$WEB_ROOT/monitor-results/export" "$WEB_ROOT/monitor-results/summary"
+        for rel in export/predictive.json summary/predictive-summary.json; do
+            if [[ -f "$SCRIPT_DIR/monitor-results/$rel" ]]; then
+                "${LLDPQ_PRIV[@]}" install -m 0644 "$SCRIPT_DIR/monitor-results/$rel" "$WEB_ROOT/monitor-results/$rel"
+            fi
+        done
+    fi
+    exit 0
+fi
 [[ -n "${WEB_ROOT:-}" ]] || { echo "Error: WEB_ROOT is not configured" >&2; exit 1; }
 
 # Publication stages a complete sibling tree inside $WEB_ROOT and swaps it in,
@@ -5402,6 +5433,15 @@ for index in "${!analysis_labels[@]}"; do
 done
 analyzer_jobs_end=$(date +%s)
 analyzer_jobs_duration=$((analyzer_jobs_end - analyzer_jobs_start))
+
+if [[ "$MONITOR_SCOPE" == "all" && "${SKIP_PREDICTIVE:-false}" != "true" && -f "$SCRIPT_DIR/predictive_analyzer.py" ]]; then
+    predictive_start=$(date +%s)
+    if ! python3 "$SCRIPT_DIR/predictive_analyzer.py" --monitor-dir "$SCRIPT_DIR/monitor-results"; then
+        echo "Warning: predictive_analyzer.py failed (non-fatal; existing reports unaffected)" >&2
+    fi
+    predictive_end=$(date +%s)
+    echo "  predictive   $((predictive_end - predictive_start)).000s"
+fi
 
 analysis_end=$(date +%s)
 analysis_duration=$((analysis_end - analysis_start))

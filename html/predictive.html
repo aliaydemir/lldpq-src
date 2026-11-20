@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="shortcut icon" href="/png/favicon.ico">
+    <title>..::LLDPQ::.. Predictive Health</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <script src="css/auth.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-bottom: 20px;
+            padding-bottom: 14px;
+            border-bottom: 1px solid #404040;
+        }
+        .page-title {
+            font-size: 24px;
+            font-weight: 600;
+            color: #76b900;
+        }
+        .page-subtitle {
+            font-size: 13px;
+            color: #9e9e9e;
+            margin-top: 4px;
+        }
+        .action-buttons { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .btn {
+            padding: 7px 14px;
+            border: none;
+            border-radius: 4px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            color: #fff;
+        }
+        .btn-primary { background: linear-gradient(0deg, #689f38 0%, #76b900 100%); }
+        .btn-primary:hover { background: linear-gradient(0deg, #76b900 0%, #8bc34a 100%); }
+        .btn-secondary { background: #333; border: 1px solid #555; color: #e0e0e0; }
+        .btn-secondary:hover { background: #424242; }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
+            gap: 14px;
+            margin-bottom: 22px;
+        }
+        .summary-card {
+            background: #252526;
+            padding: 14px 16px;
+            border-radius: 6px;
+            border-left: 3px solid #76b900;
+        }
+        .summary-card.critical { border-left-color: #f44336; }
+        .summary-card.warning { border-left-color: #ff9800; }
+        .summary-card.early { border-left-color: #29b6f6; }
+        .card-value { font-size: 28px; font-weight: 700; color: #f5f5f5; }
+        .card-label { font-size: 12px; color: #9e9e9e; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
+
+        .controls-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 16px;
+            background: #252526;
+            padding: 12px 14px;
+            border-radius: 6px;
+        }
+        .filter-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .pill-btn {
+            padding: 6px 12px;
+            border-radius: 16px;
+            border: 1px solid #4a4a4a;
+            background: #2d2d30;
+            color: #d4d4d4;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .pill-btn.active {
+            background: #76b900;
+            color: #111;
+            border-color: #76b900;
+            font-weight: 600;
+        }
+        .search-input {
+            background: #1e1e1e;
+            border: 1px solid #555;
+            color: #e0e0e0;
+            padding: 7px 12px;
+            border-radius: 4px;
+            font-size: 13px;
+            min-width: 240px;
+        }
+        .search-input:focus { border-color: #76b900; outline: none; }
+        .toggle-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 13px;
+            color: #d4d4d4;
+            cursor: pointer;
+        }
+
+        .table-wrap {
+            background: #252526;
+            border-radius: 6px;
+            overflow-x: auto;
+            border: 1px solid #333;
+        }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th {
+            text-align: left;
+            padding: 10px 12px;
+            background: #2d2d30;
+            color: #bdbdbd;
+            font-weight: 600;
+            border-bottom: 1px solid #404040;
+            white-space: nowrap;
+        }
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #323234;
+            vertical-align: top;
+        }
+        tr:hover { background: #2c2c30; }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge-critical { background: rgba(244, 67, 54, 0.2); color: #ff6b60; border: 1px solid #f44336; }
+        .badge-warning { background: rgba(255, 152, 0, 0.2); color: #ffb74d; border: 1px solid #ff9800; }
+        .badge-info { background: rgba(118, 185, 0, 0.16); color: #a5d66b; border: 1px solid #689f38; }
+        .badge-early { background: rgba(41, 182, 246, 0.18); color: #4fc3f7; border: 1px solid #29b6f6; margin-left: 4px; }
+        .badge-family { background: #333; color: #ccc; border: 1px solid #555; }
+
+        .risk-bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 110px; }
+        .risk-bar-bg { flex: 1; height: 8px; background: #3c3c3c; border-radius: 4px; overflow: hidden; }
+        .risk-bar-fill { height: 100%; border-radius: 4px; }
+        .reasons-list { list-style: disc; padding-left: 16px; color: #cccccc; font-size: 12px; line-height: 1.45; }
+        .action-text { font-size: 12px; color: #a5d6a7; max-width: 280px; line-height: 1.4; }
+        .empty-state {
+            padding: 40px 20px;
+            text-align: center;
+            color: #9e9e9e;
+            font-size: 14px;
+        }
+        .meta-footer {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="page-header">
+        <div>
+            <div class="page-title">Predictive Health</div>
+            <div class="page-subtitle" id="meta-line">Loading predictive health model output...</div>
+        </div>
+        <div class="action-buttons">
+            <button class="btn btn-secondary" id="btn-export-csv" type="button">Download CSV</button>
+            <button class="btn btn-primary" id="btn-refresh" type="button">Refresh</button>
+        </div>
+    </div>
+
+    <div class="summary-grid">
+        <div class="summary-card critical">
+            <div class="card-value" id="kpi-critical">0</div>
+            <div class="card-label">Critical Risk (24h)</div>
+        </div>
+        <div class="summary-card warning">
+            <div class="card-value" id="kpi-warning">0</div>
+            <div class="card-label">Warning Risk (48-72h)</div>
+        </div>
+        <div class="summary-card early">
+            <div class="card-value" id="kpi-early">0</div>
+            <div class="card-label">Early Precursors (Sub-Threshold)</div>
+        </div>
+        <div class="summary-card">
+            <div class="card-value" id="kpi-devices">0</div>
+            <div class="card-label">Affected Switches</div>
+        </div>
+        <div class="summary-card">
+            <div class="card-value" id="kpi-scored">0</div>
+            <div class="card-label">Entities Scored</div>
+        </div>
+    </div>
+
+    <div class="controls-bar">
+        <div class="filter-group" id="family-filters">
+            <button class="pill-btn active" data-family="all" type="button">All Families</button>
+            <button class="pill-btn" data-family="physical" type="button">Physical &amp; Optical</button>
+            <button class="pill-btn" data-family="congestion" type="button">RoCEv2 Congestion</button>
+            <button class="pill-btn" data-family="hardware_control" type="button">Hardware &amp; Control</button>
+        </div>
+        <div class="filter-group">
+            <label class="toggle-label">
+                <input type="checkbox" id="chk-early-only" />
+                Early Warnings Only
+            </label>
+            <input type="text" class="search-input" id="search-box" placeholder="Filter switch, port, reason..." />
+        </div>
+    </div>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Severity</th>
+                    <th>Risk</th>
+                    <th>Horizon</th>
+                    <th>Entity</th>
+                    <th>Family</th>
+                    <th>Peer Z</th>
+                    <th>Top Risk Signals</th>
+                    <th>Recommended Action</th>
+                </tr>
+            </thead>
+            <tbody id="risk-tbody">
+                <tr><td colspan="8" class="empty-state">Loading predictive health data...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="meta-footer">
+        <span id="footer-count">Showing 0 rows</span>
+        <span id="footer-model">Model: --</span>
+    </div>
+
+    <script>
+        (function () {
+            let allRows = [];
+            let activeFamily = 'all';
+
+            function riskColor(score) {
+                if (score >= 70) return '#f44336';
+                if (score >= 40) return '#ff9800';
+                return '#76b900';
+            }
+
+            function familyLabel(fam) {
+                if (fam === 'physical') return 'Physical';
+                if (fam === 'congestion') return 'RoCEv2';
+                if (fam === 'hardware_control') return 'HW / Ctrl';
+                return fam || '--';
+            }
+
+            function getFilteredRows() {
+                const earlyOnly = document.getElementById('chk-early-only').checked;
+                const q = (document.getElementById('search-box').value || '').trim().toLowerCase();
+                return allRows.filter(function (row) {
+                    if (activeFamily !== 'all' && row.family !== activeFamily) return false;
+                    if (earlyOnly && !row.early_warning) return false;
+                    if (q) {
+                        const hay = [
+                            row.entity_key || '',
+                            row.device || '',
+                            row.port || '',
+                            row.family || '',
+                            row.severity || '',
+                            (row.top_reasons || []).join(' '),
+                            row.recommended_action || ''
+                        ].join(' ').toLowerCase();
+                        if (hay.indexOf(q) === -1) return false;
+                    }
+                    return true;
+                });
+            }
+
+            function renderTable() {
+                const tbody = document.getElementById('risk-tbody');
+                tbody.textContent = '';
+                const rows = getFilteredRows();
+                document.getElementById('footer-count').textContent =
+                    'Showing ' + rows.length + ' of ' + allRows.length + ' actionable signals';
+
+                if (rows.length === 0) {
+                    const tr = document.createElement('tr');
+                    const td = document.createElement('td');
+                    td.colSpan = 8;
+                    td.className = 'empty-state';
+                    td.textContent = allRows.length === 0
+                        ? 'No predictive warnings or critical risks detected in the latest snapshot.'
+                        : 'No predictive signals match the active filters.';
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
+                    return;
+                }
+
+                rows.forEach(function (row) {
+                    const tr = document.createElement('tr');
+
+                    const tdSev = document.createElement('td');
+                    const sevSpan = document.createElement('span');
+                    const sevLower = (row.severity || 'info').toLowerCase();
+                    sevSpan.className = 'badge badge-' + (sevLower === 'critical' ? 'critical' : (sevLower === 'warning' ? 'warning' : 'info'));
+                    sevSpan.textContent = row.severity || 'INFO';
+                    tdSev.appendChild(sevSpan);
+                    if (row.early_warning) {
+                        const earlySpan = document.createElement('span');
+                        earlySpan.className = 'badge badge-early';
+                        earlySpan.textContent = 'EARLY';
+                        tdSev.appendChild(earlySpan);
+                    }
+                    tr.appendChild(tdSev);
+
+                    const tdRisk = document.createElement('td');
+                    const wrap = document.createElement('div');
+                    wrap.className = 'risk-bar-wrap';
+                    const scoreNum = Number(row.risk_score || 0);
+                    const valSpan = document.createElement('strong');
+                    valSpan.textContent = scoreNum.toFixed(1);
+                    const bg = document.createElement('div');
+                    bg.className = 'risk-bar-bg';
+                    const fill = document.createElement('div');
+                    fill.className = 'risk-bar-fill';
+                    fill.style.width = Math.max(0, Math.min(100, scoreNum)) + '%';
+                    fill.style.background = riskColor(scoreNum);
+                    bg.appendChild(fill);
+                    wrap.appendChild(valSpan);
+                    wrap.appendChild(bg);
+                    tdRisk.appendChild(wrap);
+                    tr.appendChild(tdRisk);
+
+                    const tdHor = document.createElement('td');
+                    tdHor.textContent = (row.horizon_hours || 72) + 'h';
+                    tr.appendChild(tdHor);
+
+                    const tdEnt = document.createElement('td');
+                    const devStrong = document.createElement('strong');
+                    devStrong.textContent = row.device || row.entity_key || '--';
+                    tdEnt.appendChild(devStrong);
+                    if (row.port) {
+                        const portDiv = document.createElement('div');
+                        portDiv.style.color = '#9e9e9e';
+                        portDiv.style.fontSize = '12px';
+                        portDiv.textContent = row.port;
+                        tdEnt.appendChild(portDiv);
+                    }
+                    if (row.role_classification) {
+                        const roleDiv = document.createElement('div');
+                        roleDiv.style.color = '#ffb74d';
+                        roleDiv.style.fontSize = '11px';
+                        roleDiv.textContent = '[' + row.role_classification + ']';
+                        tdEnt.appendChild(roleDiv);
+                    }
+                    tr.appendChild(tdEnt);
+
+                    const tdFam = document.createElement('td');
+                    const famSpan = document.createElement('span');
+                    famSpan.className = 'badge badge-family';
+                    famSpan.textContent = familyLabel(row.family);
+                    tdFam.appendChild(famSpan);
+                    tr.appendChild(tdFam);
+
+                    const tdZ = document.createElement('td');
+                    const zVal = Number(row.peer_zscore || 0);
+                    tdZ.textContent = (zVal >= 0 ? '+' : '') + zVal.toFixed(2) + 'σ';
+                    tr.appendChild(tdZ);
+
+                    const tdReasons = document.createElement('td');
+                    const ul = document.createElement('ul');
+                    ul.className = 'reasons-list';
+                    (row.top_reasons || []).slice(0, 4).forEach(function (reason) {
+                        const li = document.createElement('li');
+                        li.textContent = reason;
+                        ul.appendChild(li);
+                    });
+                    tdReasons.appendChild(ul);
+                    tr.appendChild(tdReasons);
+
+                    const tdAct = document.createElement('td');
+                    const actDiv = document.createElement('div');
+                    actDiv.className = 'action-text';
+                    actDiv.textContent = row.recommended_action || '--';
+                    tdAct.appendChild(actDiv);
+                    tr.appendChild(tdAct);
+
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function downloadCsv() {
+                const rows = getFilteredRows();
+                const headers = ['severity', 'early_warning', 'risk_score', 'horizon_hours', 'device', 'port', 'family', 'peer_zscore', 'top_reasons', 'recommended_action'];
+                function esc(v) {
+                    const s = String(v == null ? '' : v);
+                    const safe = /^[=+\-@]/.test(s) ? "'" + s : s;
+                    return '"' + safe.replace(/"/g, '""') + '"';
+                }
+                const lines = [headers.join(',')];
+                rows.forEach(function (r) {
+                    lines.push([
+                        r.severity,
+                        r.early_warning ? 'true' : 'false',
+                        r.risk_score,
+                        r.horizon_hours,
+                        r.device,
+                        r.port || '',
+                        r.family,
+                        r.peer_zscore,
+                        (r.top_reasons || []).join(' | '),
+                        r.recommended_action || ''
+                    ].map(esc).join(','));
+                });
+                const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'lldpq-predictive-health.csv';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }
+
+            async function loadData() {
+                const metaEl = document.getElementById('meta-line');
+                try {
+                    const resp = await fetch('/monitor-results/export/predictive.json?_=' + Date.now(), { cache: 'no-store' });
+                    if (!resp.ok) {
+                        throw new Error('HTTP ' + resp.status);
+                    }
+                    const data = await resp.json();
+                    const c = data.counts || {};
+                    document.getElementById('kpi-critical').textContent = String(c.critical || 0);
+                    document.getElementById('kpi-warning').textContent = String(c.warning || 0);
+                    document.getElementById('kpi-early').textContent = String(c.early_warning || 0);
+                    document.getElementById('kpi-devices').textContent = String(c.affected_devices || 0);
+                    document.getElementById('kpi-scored').textContent = String(c.total_scored || 0);
+                    metaEl.textContent = 'Last updated: ' + (data.generated_at || '--') + ' (' + (data.elapsed_ms || 0) + ' ms)';
+                    document.getElementById('footer-model').textContent =
+                        'Model: ' + (data.model_mode || '--') + ' v' + (data.model_version || '--');
+                    allRows = Array.isArray(data.rows) ? data.rows : [];
+                    renderTable();
+                } catch (err) {
+                    metaEl.textContent = 'Predictive output unavailable yet — run monitor.sh to generate export/predictive.json';
+                    allRows = [];
+                    renderTable();
+                }
+            }
+
+            document.querySelectorAll('#family-filters .pill-btn').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    document.querySelectorAll('#family-filters .pill-btn').forEach(function (b) { b.classList.remove('active'); });
+                    btn.classList.add('active');
+                    activeFamily = btn.getAttribute('data-family') || 'all';
+                    renderTable();
+                });
+            });
+            document.getElementById('chk-early-only').addEventListener('change', renderTable);
+            document.getElementById('search-box').addEventListener('input', renderTable);
+            document.getElementById('btn-refresh').addEventListener('click', loadData);
+            document.getElementById('btn-export-csv').addEventListener('click', downloadCsv);
+
+            loadData();
+        })();
+    </script>
+</body>
+</html>

@@ -668,6 +668,69 @@ def _collect_logs(mr_dir, now=None):
     return anomalies
 
 
+def _collect_predictive(mr_dir, now=None):
+    """Collect actionable multi-domain predictive health risks from export/predictive.json."""
+    path = os.path.join(mr_dir, "export", "predictive.json")
+    document = _load_json(path)
+    if not isinstance(document, dict):
+        return []
+    reference = _reference_time(now)
+    stamp = _record_epoch(document.get("generated_epoch"))
+    if stamp is None:
+        stamp = _record_epoch(document.get("generated_at"))
+    if stamp is not None:
+        if reference - stamp > STALE_RECORD_SECONDS:
+            return []
+        if stamp - reference > CLOCK_SKEW_SECONDS:
+            return []
+    rows = document.get("rows")
+    if not isinstance(rows, list):
+        return []
+    anomalies = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        severity = _norm_status(row.get("severity"))
+        if severity not in ("critical", "warning"):
+            continue
+        device = str(row.get("device") or "").strip()
+        if not device:
+            continue
+        port = row.get("port")
+        port_text = str(port).strip() if port else None
+        family = str(row.get("family") or "general").strip()
+        risk_score = _number(row.get("risk_score"))
+        if risk_score is None:
+            continue
+        horizon = _integer(row.get("horizon_hours")) or 72
+        peer_z = _number(row.get("peer_zscore"))
+        early = bool(row.get("early_warning"))
+        reasons = row.get("top_reasons")
+        reason_text = "; ".join(
+            str(item).strip() for item in (reasons if isinstance(reasons, list) else [])[:3]
+            if str(item).strip()
+        ) or "elevated multi-domain predictive risk"
+        action = str(row.get("recommended_action") or "").strip()
+        early_tag = " [EARLY PRECURSOR]" if early else ""
+        z_tag = ", peer_z=%+.2f" % peer_z if peer_z is not None else ""
+        detail = "Predictive %s%s risk=%.1f/100 (horizon=%dh%s): %s" % (
+            family, early_tag, risk_score, horizon, z_tag, reason_text
+        )
+        if action:
+            detail += ". Action: " + action
+        anomalies.append(_anomaly(
+            "predictive",
+            device,
+            port_text,
+            "predictive_%s_risk" % family,
+            round(risk_score, 1),
+            severity,
+            detail,
+            "export/predictive.json",
+        ))
+    return anomalies
+
+
 _COLLECTORS = (
     _collect_bgp,
     _collect_optical,
@@ -677,6 +740,7 @@ _COLLECTORS = (
     _collect_hardware,
     _collect_system_watchdog,
     _collect_logs,
+    _collect_predictive,
 )
 
 # Collectors whose sources carry no self-anchoring horizon (unlike the flap
@@ -684,7 +748,7 @@ _COLLECTORS = (
 # clock and gate on record age (STALE_RECORD_SECONDS).
 _AGE_GATED_COLLECTORS = (
     _collect_bgp, _collect_ber, _collect_pfc_ecn, _collect_hardware,
-    _collect_system_watchdog, _collect_logs,
+    _collect_system_watchdog, _collect_logs, _collect_predictive,
 )
 
 
