@@ -19,15 +19,21 @@ sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(ROOT_DIR / "html"))
 
 import ai_correlate  # noqa: E402
+import ber_analyzer  # noqa: E402
+import generate_hardware_html  # noqa: E402
 import predictive_analyzer  # noqa: E402
 from predictive_engine import (  # noqa: E402
+    ALL_FAMILIES,
     FAMILY_CONGESTION,
     FAMILY_HARDWARE_CONTROL,
     FAMILY_PHYSICAL,
+    CongestionPortSample,
     FeatureExtractor,
     HardwareControlSample,
     HardwareSensorReading,
     LLDPqSnapshot,
+    LLDPqSnapshotLoader,
+    PhysicalPortSample,
     PredictiveRiskModel,
 )
 
@@ -133,8 +139,8 @@ class PredictiveAnalyzerTests(unittest.TestCase):
             self.assertIn("swp7", flagged_ports)
             self.assertTrue(flagged_ports["swp7"]["early_warning"])
             self.assertNotIn("swp8", flagged_ports)
-            # File permissions must be nginx-readable (0644)
-            self.assertEqual(os.stat(out / "export" / "predictive.json").st_mode & 0o777, 0o644)
+            # File permissions must follow shared CLI/www-data convention (0664)
+            self.assertEqual(os.stat(out / "export" / "predictive.json").st_mode & 0o777, 0o664)
 
     def test_localized_thermal_fault_regression(self):
         """Localized multi-sensor cooling fault (dgx-01 SXM3/4 pattern) caught vs healthy peers."""
@@ -249,7 +255,247 @@ class PredictiveAnalyzerTests(unittest.TestCase):
         self.assertEqual(res.returncode, 0, f"monitor.sh syntax error: {res.stderr}")
         index_html = (ROOT_DIR / "html" / "index.html").read_text(encoding="utf-8")
         self.assertIn('href="/predictive.html"', index_html)
-        self.assertTrue((ROOT_DIR / "html" / "predictive.html").is_file())
+        pred_html = (ROOT_DIR / "html" / "predictive.html").read_text(encoding="utf-8")
+        # Standard LLDPq analysis page contract: table-filter, sortable headers,
+        # clickable summary cards, dark autofill override, lifecycle-scope wiring.
+        for token in (
+            "/css/table-filter.css?v=20260716-tf-3",
+            "/css/table-filter.js?v=20260821-tf-6",
+            "input:-webkit-autofill",
+            'id="predictive-table"',
+            'class="sortable',
+            'data-card-filter="severity:CRITICAL"',
+            'data-card-filter="early"',
+            "color: #76b900;",
+        ):
+            self.assertIn(token, pred_html, f"missing UI standard token: {token}")
+        ls_js = (ROOT_DIR / "html" / "lifecycle-scope.js").read_text(encoding="utf-8")
+        self.assertIn("'/predictive.html'", ls_js)
+        self.assertIn("updatePredictive", ls_js)
+
+    def test_model_split_diversity_no_single_feature_collapse(self):
+        doc = json.loads((SCRIPT_DIR / "predictive_model.json").read_text(encoding="utf-8"))
+        for fam in ALL_FAMILIES:
+            names = doc["feature_names"][fam]
+            used = set()
+
+            def walk(node):
+                if "f" in node:
+                    used.add(names[node["f"]])
+                    walk(node["l"])
+                    walk(node["r"])
+
+            for tree in doc["classifiers"][fam]["trees"]:
+                walk(tree)
+            self.assertGreaterEqual(
+                len(used), 5,
+                f"family {fam} collapsed onto too few features: {sorted(used)}",
+            )
+
+    def test_false_positive_and_blindspot_regressions(self):
+        """Guard against PAM4 BER FP, normal DCQCN ECN FP, switch-wide PFC storm,
+        minor syslog FP, isolated fan/PSU + EVPN-MH detection, resolved 12h-old
+        faults staying pinned, and false early_warning on BGP-down switches.
+        """
+        model = PredictiveRiskModel.load(SCRIPT_DIR / "predictive_model.json")
+        ext = FeatureExtractor()
+        now = 1_763_650_000.0
+
+        def score_one(snap, key):
+            feats = ext.extract_all(snap)
+            sigs = {s.entity_key: s for s in model.predict_features(feats)}
+            raw_map = predictive_analyzer._build_raw_status_map(snap)
+            sig = sigs[key]
+            raw_st = raw_map.get((sig.family, key), "unknown")
+            early = predictive_analyzer._is_early_warning(sig, raw_st)
+            return sig, raw_st, early
+
+        # 1) Healthy 400G/800G PAM4 port (raw_ber=2e-7, bias=320mA, eff_ber=1e-15) -> INFO
+        s_pam4 = LLDPqSnapshot(timestamp=now)
+        for p in range(1, 7):
+            s_pam4.physical[f"dev-a:swp{p}s0"] = [
+                PhysicalPortSample(
+                    device="dev-a", port=f"swp{p}s0", timestamp=now - 3600 * h,
+                    rx_power_dbm=1.8, tx_power_dbm=2.1, bias_current_ma=320.0,
+                    temperature_c=48.0, link_margin_db=11.7,
+                    raw_ber=2e-7 if p == 1 else 1e-10, effective_ber=1e-15,
+                    health_status="excellent", ber_grade="excellent",
+                )
+                for h in (24, 12, 0)
+            ]
+        sig, _, early = score_one(s_pam4, "dev-a:swp1s0")
+        self.assertEqual(sig.severity, "INFO")
+        self.assertFalse(early)
+
+        # 2) Single-port normal DCQCN ECN 1.1% vs 5 quiet peers -> INFO
+        s_ecn = LLDPqSnapshot(timestamp=now)
+        for p in range(1, 7):
+            s_ecn.congestion[f"dev-a:swp{p}s0"] = [
+                CongestionPortSample(
+                    device="dev-a", port=f"swp{p}s0", timestamp=now - 600 * k,
+                    rx_pause_rate=0.0, tx_pause_rate=0.0,
+                    ecn_marked_rate=25.0 if p == 1 else 0.0,
+                    ecn_share_percent=1.1 if p == 1 else 0.0,
+                    signal="ecn" if p == 1 else "quiet",
+                )
+                for k in (5, 4, 3, 2, 1, 0)
+            ]
+        sig, _, _ = score_one(s_ecn, "dev-a:swp1s0")
+        self.assertEqual(sig.severity, "INFO")
+
+        # 3) Switch-wide ALL-port PFC storm (peer_z = 0.0) -> CRITICAL with high Tier-2
+        s_storm = LLDPqSnapshot(timestamp=now)
+        for p in range(1, 7):
+            s_storm.congestion[f"dev-a:swp{p}s0"] = [
+                CongestionPortSample(
+                    device="dev-a", port=f"swp{p}s0", timestamp=now - 600 * (5 - k),
+                    rx_pause_rate=20.0 + 40.0 * k, tx_pause_rate=30.0 + 50.0 * k,
+                    ecn_marked_rate=100.0 + 80.0 * k, ecn_share_percent=12.0,
+                    egress_hoq_rate=5.0 * k, signal="combined",
+                )
+                for k in range(6)
+            ]
+        sig, raw_st, early = score_one(s_storm, "dev-a:swp1s0")
+        self.assertEqual(sig.severity, "CRITICAL")
+        self.assertGreaterEqual(sig.tier_scores["tier2_ml"], 70.0)
+        self.assertEqual(raw_st, "critical")
+        self.assertFalse(early)
+
+        # 4) Healthy switch + 4 minor non-critical syslog errors -> INFO
+        s_log = LLDPqSnapshot(timestamp=now)
+        for d in range(1, 5):
+            s_log.hardware_control[f"dev-{d}"] = [
+                HardwareControlSample(
+                    device=f"dev-{d}", device_model="SN5610", timestamp=now,
+                    overall_grade="excellent", cpu_temp_c=40.0, asic_temp_c=66.0,
+                    tlimit_c=105.0, memory_pct=18.0, load_per_core=0.08,
+                    psu_efficiency=92.0, bgp_total_neighbors=16, bgp_established_neighbors=16,
+                    log_critical_count=0,
+                    log_error_count=4 if d == 1 else 0,
+                    log_error_velocity=4.0 if d == 1 else 0.0,
+                )
+            ]
+        sig, _, _ = score_one(s_log, "dev-1")
+        self.assertEqual(sig.severity, "INFO")
+
+        # 5) Isolated 2 fans failed + PSU fault (temp normal) -> CRITICAL & Tier-2 agrees
+        s_fan = LLDPqSnapshot(timestamp=now)
+        for d in range(1, 5):
+            s_fan.hardware_control[f"dev-{d}"] = [
+                HardwareControlSample(
+                    device=f"dev-{d}", device_model="SN5610", timestamp=now,
+                    overall_grade="critical" if d == 1 else "excellent",
+                    cpu_temp_c=40.0, asic_temp_c=67.0, tlimit_c=105.0,
+                    memory_pct=18.0, load_per_core=0.08, psu_efficiency=91.0,
+                    fan_failed_count=2 if d == 1 else 0,
+                    psu_failed_count=1 if d == 1 else 0,
+                    psu_redundancy_ok=(d != 1),
+                )
+            ]
+        sig, raw_st, early = score_one(s_fan, "dev-1")
+        self.assertEqual(sig.severity, "CRITICAL")
+        self.assertGreaterEqual(sig.tier_scores["tier2_ml"], 65.0)
+        self.assertEqual(raw_st, "critical")
+        self.assertFalse(early)
+
+        # 6) Resolved 12h-old fault (now healthy) -> INFO (must not stay pinned CRITICAL!)
+        s_old = LLDPqSnapshot(timestamp=now)
+        s_old.hardware_control["dev-1"] = [
+            HardwareControlSample(
+                device="dev-1", device_model="SN5610", timestamp=now - 12 * 3600,
+                overall_grade="critical", cpu_temp_c=42.0, asic_temp_c=66.0,
+                bgp_total_neighbors=16, bgp_down_neighbors=8,
+                evpn_mh_critical_es=2, dup_ip_active=2,
+                routes_total=200, routes_drop_fraction=0.4, vrf_disappeared_count=1,
+                log_critical_count=3, log_error_velocity=15.0,
+            ),
+            HardwareControlSample(
+                device="dev-1", device_model="SN5610", timestamp=now,
+                overall_grade="excellent", cpu_temp_c=40.0, asic_temp_c=65.0,
+                tlimit_c=105.0, memory_pct=18.0, load_per_core=0.06, psu_efficiency=92.0,
+                bgp_total_neighbors=16, bgp_established_neighbors=16, bgp_down_neighbors=0,
+                routes_total=400, routes_drop_fraction=0.0, vrf_disappeared_count=0,
+            ),
+        ]
+        sig, _, _ = score_one(s_old, "dev-1")
+        self.assertEqual(sig.severity, "INFO")
+
+        # 7) BGP 2 neighbors down + HW excellent -> raw_status=critical, early_warning=False
+        s_bgp = LLDPqSnapshot(timestamp=now)
+        s_bgp.hardware_control["dev-1"] = [
+            HardwareControlSample(
+                device="dev-1", device_model="SN5610", timestamp=now,
+                overall_grade="excellent", cpu_temp_c=40.0, asic_temp_c=66.0,
+                tlimit_c=105.0, memory_pct=18.0, load_per_core=0.06, psu_efficiency=92.0,
+                bgp_total_neighbors=16, bgp_established_neighbors=14, bgp_down_neighbors=2,
+            )
+        ]
+        sig, raw_st, early = score_one(s_bgp, "dev-1")
+        self.assertIn(sig.severity, ("WARNING", "CRITICAL"))
+        self.assertEqual(raw_st, "critical")
+        self.assertFalse(early)
+
+    def test_enriched_histories_roundtrip_into_snapshot_loader(self):
+        """History enrichments in ber_analyzer and generate_hardware_html feed predictive slopes."""
+        # BER slim record preserves raw_ber & effective_ber
+        slim = ber_analyzer.BERAnalyzer._history_record({
+            "timestamp": 1_763_650_000.0,
+            "ber_value": 0.0,
+            "grade": "excellent",
+            "sample_status": "analyzed",
+            "raw_ber": 2.5e-7,
+            "effective_ber": 1e-15,
+            "symbol_errors": 42,
+        })
+        self.assertAlmostEqual(slim["raw_ber"], 2.5e-7)
+        self.assertAlmostEqual(slim["effective_ber"], 1e-15)
+
+        # Hardware history preserves numeric telemetry and feeds temp_slope_24h + fan_rpms
+        now = 1_763_650_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            mr = Path(tmp) / "monitor-results"
+            mr.mkdir(parents=True)
+            hist_path = mr / "hardware_history.json"
+            generate_hardware_html.update_hardware_history(
+                {"dev-1": ("GOOD", now - 12 * 3600)},
+                history_path=str(hist_path),
+                now=now - 12 * 3600,
+                device_metrics={
+                    "dev-1": {
+                        "cpu_temp_c": 42.0,
+                        "asic_temp_c": 60.0,
+                        "memory_pct": 22.0,
+                        "load_per_core": 0.15,
+                        "psu_efficiency": 91.5,
+                        "fan_rpms": {"FAN1/1": 5200, "FAN2/1": 5210},
+                    }
+                },
+            )
+            generate_hardware_html.update_hardware_history(
+                {"dev-1": ("GOOD", now)},
+                history_path=str(hist_path),
+                now=now,
+                device_metrics={
+                    "dev-1": {
+                        "cpu_temp_c": 46.0,
+                        "asic_temp_c": 66.0,
+                        "memory_pct": 24.0,
+                        "load_per_core": 0.18,
+                        "psu_efficiency": 90.0,
+                        "fan_rpms": {"FAN1/1": 3400, "FAN2/1": 6200},
+                    }
+                },
+            )
+            snap = LLDPqSnapshotLoader().load(mr)
+            feats = {ef.entity_key: ef for ef in FeatureExtractor().extract_hardware_control(snap)}
+            self.assertIn("dev-1", feats)
+            fdict = feats["dev-1"].as_dict()
+            self.assertGreater(fdict["temp_slope_24h"], 10.0)
+            self.assertLess(fdict["fan_min_cohort_ratio"], 0.80)
+
+    def test_ai_correlate_single_kind_classifies_predictive_as_device_local(self):
+        kind = ai_correlate._single_kind([{"domain": "predictive", "device": "dev-1"}])
+        self.assertEqual(kind, "device-local")
 
 
 if __name__ == "__main__":

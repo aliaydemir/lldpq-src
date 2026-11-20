@@ -791,16 +791,19 @@ HARDWARE_HISTORY_MAX_ENTRIES = 200
 
 
 def update_hardware_history(device_grades, history_path=HARDWARE_HISTORY_FILE,
-                            now=None):
+                            now=None, device_metrics=None):
     """Append one graded entry per device and prune the 24h rolling window.
 
-    This file is the producer feed behind its three consumers (the history
-    enrichment above, check_alerts.get_device_hardware_status and
-    ai_correlate._collect_hardware), so entries carry the per-device keyed
-    ISO ``timestamp`` and ``overall_grade`` fields those readers parse.
+    This file is the producer feed behind its consumers (the history
+    enrichment above, check_alerts.get_device_hardware_status,
+    ai_correlate._collect_hardware, and predictive_analyzer trend features),
+    so entries carry the per-device keyed ISO ``timestamp`` and
+    ``overall_grade`` fields plus optional compact numeric telemetry when
+    supplied via ``device_metrics``.
     ``device_grades`` maps device -> (overall_grade, raw sample epoch).
     """
     now = time.time() if now is None else float(now)
+    metrics_by_device = device_metrics if isinstance(device_metrics, dict) else {}
     history = {}
     try:
         with open(history_path, "r") as f:
@@ -830,17 +833,23 @@ def update_hardware_history(device_grades, history_path=HARDWARE_HISTORY_FILE,
         timestamp = datetime.fromtimestamp(
             sample_epoch, tz=timezone.utc
         ).isoformat()
+        extra = metrics_by_device.get(device) or {}
         entries = pruned.setdefault(str(device), [])
         if entries and entries[-1].get("timestamp") == timestamp:
             # Re-analyzing the same raw sample updates the grade in place
             # instead of duplicating the entry.
             entries[-1]["overall_grade"] = overall_grade
+            if extra:
+                entries[-1].update(extra)
         else:
-            entries.append({
+            record = {
                 "device": str(device),
                 "timestamp": timestamp,
                 "overall_grade": overall_grade,
-            })
+            }
+            if extra:
+                record.update(extra)
+            entries.append(record)
         del entries[:-HARDWARE_HISTORY_MAX_ENTRIES]
 
     _atomic_write(history_path, json.dumps(
@@ -2630,6 +2639,7 @@ def generate_hardware_html(collection_unavailable=False):
     # report above stays authoritative even if the history cannot be written.
     try:
         device_grades = {}
+        device_metrics = {}
         for device_info in all_devices:
             name = device_info['device']
             raw_file = os.path.join(hardware_data_dir, f"{name}_hardware.txt")
@@ -2638,7 +2648,28 @@ def generate_hardware_html(collection_unavailable=False):
             except OSError:
                 sample_epoch = generated_at
             device_grades[name] = (device_info['health_grade'], sample_epoch)
-        update_hardware_history(device_grades, now=generated_at)
+            details = device_details.get(name) or {}
+            metrics = {}
+            if isinstance(details.get("cpu_temp"), (int, float)):
+                metrics["cpu_temp_c"] = round(float(details["cpu_temp"]), 1)
+            if isinstance(details.get("asic_temp"), (int, float)):
+                metrics["asic_temp_c"] = round(float(details["asic_temp"]), 1)
+            if isinstance(details.get("memory"), (int, float)):
+                metrics["memory_pct"] = round(float(details["memory"]), 1)
+            if isinstance(details.get("load_per_core"), (int, float)):
+                metrics["load_per_core"] = round(float(details["load_per_core"]), 2)
+            if isinstance(details.get("psu_efficiency"), (int, float)):
+                metrics["psu_efficiency"] = round(float(details["psu_efficiency"]), 1)
+            fan_rpms = {
+                str(f["name"]): int(f["rpm"])
+                for f in (details.get("fans") or [])
+                if isinstance(f, dict) and f.get("name") and isinstance(f.get("rpm"), (int, float))
+            }
+            if fan_rpms:
+                metrics["fan_rpms"] = fan_rpms
+            if metrics:
+                device_metrics[name] = metrics
+        update_hardware_history(device_grades, now=generated_at, device_metrics=device_metrics)
     except Exception as e:
         print(f"⚠️  Warning: could not update hardware_history.json: {e}")
 

@@ -895,7 +895,7 @@ def _single_kind(members):
     if domains == {"bgp"}:
         return "protocol"
     if domains <= {"bgp", "optical", "ber", "flap", "pfc_ecn", "hardware",
-                   "system", "log"}:
+                   "system", "log", "predictive"}:
         return "device-local"
     return "other"
 

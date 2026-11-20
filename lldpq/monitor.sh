@@ -1625,6 +1625,14 @@ EOF
         fi
     fi
 
+    if [[ "${SKIP_PREDICTIVE:-false}" == "true" ]]; then
+        if ! "${LLDPQ_PRIV[@]}" rm -f "$stage_dir/export/predictive.json" \
+                "$stage_dir/summary/predictive-summary.json"; then
+            "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
+            return 1
+        fi
+    fi
+
     if ! normalize_web_stage_permissions "$stage_dir"; then
         "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
         return 1
@@ -4853,10 +4861,14 @@ if [[ "$MONITOR_SCOPE" == "predictive" ]]; then
             echo "Warning: $WEB_ROOT is not writable; kept predictive outputs under $SCRIPT_DIR/monitor-results" >&2
             exit 0
         fi
+        LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
         "${LLDPQ_PRIV[@]}" mkdir -p "$WEB_ROOT/monitor-results/export" "$WEB_ROOT/monitor-results/summary"
+        "${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER}:www-data" "$WEB_ROOT/monitor-results/export" "$WEB_ROOT/monitor-results/summary" 2>/dev/null || true
+        "${LLDPQ_PRIV[@]}" chmod 0775 "$WEB_ROOT/monitor-results/export" "$WEB_ROOT/monitor-results/summary" 2>/dev/null || true
         for rel in export/predictive.json summary/predictive-summary.json; do
             if [[ -f "$SCRIPT_DIR/monitor-results/$rel" ]]; then
-                "${LLDPQ_PRIV[@]}" install -m 0644 "$SCRIPT_DIR/monitor-results/$rel" "$WEB_ROOT/monitor-results/$rel"
+                "${LLDPQ_PRIV[@]}" install -m 0664 "$SCRIPT_DIR/monitor-results/$rel" "$WEB_ROOT/monitor-results/$rel"
+                "${LLDPQ_PRIV[@]}" chown "${LLDPQ_USER}:www-data" "$WEB_ROOT/monitor-results/$rel" 2>/dev/null || true
             fi
         done
     fi

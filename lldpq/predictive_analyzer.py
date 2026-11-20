@@ -82,7 +82,7 @@ _SEVERITY_RANK = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
 
 
 def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    """Atomically write JSON with mode 0644 so nginx and ai_correlate see complete files."""
+    """Atomically write JSON with mode 0664 so CLI, cron, nginx, and ai_correlate share access."""
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(payload, indent=2, sort_keys=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
@@ -91,7 +91,7 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(serialized)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp_name, 0o644)
+        os.chmod(tmp_name, 0o664)
         os.replace(tmp_name, path)
     except Exception:
         try:
@@ -143,25 +143,83 @@ def _signal_to_row(signal: PredictiveRiskSignal, raw_status: str) -> dict[str, A
     }
 
 
+def _latest_matching(series: Any, predicate: Any, *, max_age_sec: float | None = None) -> Any | None:
+    if not series:
+        return None
+    latest_ts = getattr(series[-1], "timestamp", 0.0) or 0.0
+    for item in reversed(series):
+        if max_age_sec is not None and (latest_ts - (getattr(item, "timestamp", 0.0) or 0.0)) > max_age_sec:
+            break
+        if predicate(item):
+            return item
+    return None
+
+
 def _build_raw_status_map(snapshot: Any) -> dict[tuple[str, str], str]:
-    """Map (family, entity_key) -> latest raw LLDPq status string from snapshot samples."""
+    """Map (family, entity_key) -> aggregated raw LLDPq status across underlying domains.
+
+    An entity is only considered ``nominal`` (eligible for ``early_warning=True``)
+    when NONE of the underlying LLDPq domain analyzers have already raised a
+    warning/critical/down/mismatch alert within the active collection window.
+    """
+    active_win = 3600.0
+    bad_tokens = ("critical", "error", "bad", "down", "fail", "failed", "fault")
+    warn_tokens = ("warning", "warn", "degraded", "marginal")
     mapping: dict[tuple[str, str], str] = {}
+
     for key, series in (getattr(snapshot, "physical", None) or {}).items():
         if not series:
             continue
-        latest = series[-1]
-        statuses = [
-            str(s).strip().lower()
-            for s in (
-                getattr(latest, "health_status", None),
-                getattr(latest, "ber_grade", None),
-            )
-            if s is not None and str(s).strip() and str(s).strip().lower() != "unknown"
-        ]
-        if any(s in ("critical", "error", "bad", "down", "fail", "failed", "fault") for s in statuses):
+        opt_lat = _latest_matching(
+            series,
+            lambda s: str(getattr(s, "health_status", "") or "").strip().lower() not in ("", "unknown"),
+        )
+        ber_lat = _latest_matching(
+            series,
+            lambda s: str(getattr(s, "ber_grade", "") or "").strip().lower() not in ("", "unknown"),
+        )
+        flap_lat = _latest_matching(
+            series,
+            lambda s: (getattr(s, "flaps_1h", 0) or 0) > 0
+            or (getattr(s, "flaps_24h", 0) or 0) > 0
+            or (getattr(s, "flaps_5m", 0) or 0) > 0,
+            max_age_sec=active_win,
+        )
+        mm_lat = _latest_matching(
+            series,
+            lambda s: bool(
+                getattr(s, "mtu_mismatch", False)
+                or getattr(s, "speed_mismatch", False)
+                or getattr(s, "fec_mismatch", False)
+                or getattr(s, "autoneg_mismatch", False)
+                or getattr(s, "config_mtu_mismatch", False)
+            ),
+            max_age_sec=active_win,
+        )
+        statuses: list[str] = []
+        if opt_lat is not None:
+            statuses.append(str(getattr(opt_lat, "health_status", "")).strip().lower())
+        if ber_lat is not None:
+            statuses.append(str(getattr(ber_lat, "ber_grade", "")).strip().lower())
+        if flap_lat is not None:
+            f1 = int(getattr(flap_lat, "flaps_1h", 0) or 0)
+            f24 = int(getattr(flap_lat, "flaps_24h", 0) or 0)
+            if f1 >= 5 or f24 >= 20:
+                statuses.append("critical")
+            elif f1 >= 1 or f24 >= 5:
+                statuses.append("warning")
+        if mm_lat is not None:
+            if getattr(mm_lat, "mtu_mismatch", False) or getattr(mm_lat, "speed_mismatch", False):
+                statuses.append("critical")
+            else:
+                statuses.append("warning")
+
+        if any(s in bad_tokens for s in statuses):
             mapping[(FAMILY_PHYSICAL, key)] = "critical"
-        elif any(s in ("warning", "warn", "degraded", "marginal") for s in statuses):
+        elif any(s in warn_tokens for s in statuses):
             mapping[(FAMILY_PHYSICAL, key)] = "warning"
+        elif any(s == "unplugged" for s in statuses):
+            mapping[(FAMILY_PHYSICAL, key)] = "unplugged"
         elif statuses:
             mapping[(FAMILY_PHYSICAL, key)] = statuses[0]
 
@@ -172,24 +230,158 @@ def _build_raw_status_map(snapshot: Any) -> dict[tuple[str, str], str]:
         sig = str(getattr(latest, "signal", None) or "").strip().lower()
         if sig == "quiet":
             mapping[(FAMILY_CONGESTION, key)] = "ok"
+        elif sig in ("loss", "combined"):
+            mapping[(FAMILY_CONGESTION, key)] = "critical"
+        elif sig == "pfc":
+            mapping[(FAMILY_CONGESTION, key)] = "warning"
         elif sig:
             mapping[(FAMILY_CONGESTION, key)] = sig
 
     for key, series in (getattr(snapshot, "hardware_control", None) or {}).items():
         if not series:
             continue
-        latest = series[-1]
-        hw_grade = str(getattr(latest, "overall_grade", None) or "").strip().lower()
-        fan_failed = int(getattr(latest, "fan_failed_count", 0) or 0)
-        psu_failed = int(getattr(latest, "psu_failed_count", 0) or 0)
-        psu_ok = bool(getattr(latest, "psu_redundancy_ok", True))
-        if hw_grade in ("critical", "error", "bad", "fault") or fan_failed > 0 or psu_failed > 0 or not psu_ok:
+        hw_lat = (
+            _latest_matching(
+                series,
+                lambda s: (
+                    getattr(s, "asic_temp_c", None) is not None
+                    or getattr(s, "cpu_temp_c", None) is not None
+                    or getattr(s, "psu_efficiency", None) is not None
+                    or str(getattr(s, "psu_status", "unknown")).lower() != "unknown"
+                    or str(getattr(s, "fan_status", "unknown")).lower() != "unknown"
+                    or bool(getattr(s, "fan_rpms", None))
+                    or int(getattr(s, "fan_failed_count", 0) or 0) > 0
+                    or int(getattr(s, "psu_failed_count", 0) or 0) > 0
+                    or not bool(getattr(s, "psu_redundancy_ok", True))
+                ),
+            )
+            or series[-1]
+        )
+        grade_lat = _latest_matching(
+            series,
+            lambda s: str(getattr(s, "overall_grade", "unknown") or "unknown").strip().lower() not in ("", "unknown"),
+        )
+        bgp_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "bgp_total_neighbors", 0) or 0) > 0
+                or int(getattr(s, "bgp_down_neighbors", 0) or 0) > 0
+                or int(getattr(s, "bgp_flaps_1h", 0) or 0) > 0
+                or int(getattr(s, "bgp_update_storms", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+        evpn_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "evpn_mh_total_es", 0) or 0) > 0
+                or int(getattr(s, "evpn_mh_critical_es", 0) or 0) > 0
+                or int(getattr(s, "evpn_mh_warning_es", 0) or 0) > 0
+                or int(getattr(s, "evpn_mh_inconsistent_es", 0) or 0) > 0
+                or int(getattr(s, "evpn_mh_bypass_es", 0) or 0) > 0
+                or int(getattr(s, "lacp_desync_count", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+        routes_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "routes_total", 0) or 0) > 0
+                or float(getattr(s, "routes_drop_fraction", 0.0) or 0.0) > 0.0
+                or int(getattr(s, "vrf_disappeared_count", 0) or 0) > 0
+                or int(getattr(s, "ecmp_width_drop", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+        dup_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "dup_ip_active", 0) or 0) > 0
+                or int(getattr(s, "dup_mac_confirmed", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+        log_lat = _latest_matching(
+            series,
+            lambda s: int(getattr(s, "log_critical_count", 0) or 0) > 0,
+            max_age_sec=active_win,
+        )
+        sys_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "reboots_24h", 0) or 0) > 0
+                or int(getattr(s, "critical_service_restarts_24h", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+        bmc_lat = _latest_matching(
+            series,
+            lambda s: (
+                int(getattr(s, "bmc_mismatch_count", 0) or 0) > 0
+                or int(getattr(s, "bmc_sensor_faults", 0) or 0) > 0
+            ),
+            max_age_sec=active_win,
+        )
+
+        hw_grade = str(getattr(grade_lat, "overall_grade", "") or "").strip().lower() if grade_lat else ""
+        fan_failed = int(getattr(hw_lat, "fan_failed_count", 0) or 0)
+        psu_failed = int(getattr(hw_lat, "psu_failed_count", 0) or 0)
+        psu_ok = bool(getattr(hw_lat, "psu_redundancy_ok", True))
+
+        is_crit = (
+            hw_grade in bad_tokens
+            or fan_failed > 0
+            or psu_failed > 0
+            or not psu_ok
+            or (bgp_lat is not None and int(getattr(bgp_lat, "bgp_down_neighbors", 0) or 0) > 0)
+            or (
+                evpn_lat is not None
+                and (
+                    int(getattr(evpn_lat, "evpn_mh_critical_es", 0) or 0) > 0
+                    or int(getattr(evpn_lat, "evpn_mh_inconsistent_es", 0) or 0) > 0
+                    or int(getattr(evpn_lat, "evpn_mh_bypass_es", 0) or 0) > 0
+                    or int(getattr(evpn_lat, "lacp_desync_count", 0) or 0) > 0
+                )
+            )
+            or (
+                routes_lat is not None
+                and (
+                    int(getattr(routes_lat, "vrf_disappeared_count", 0) or 0) > 0
+                    or float(getattr(routes_lat, "routes_drop_fraction", 0.0) or 0.0) >= 0.25
+                )
+            )
+            or (dup_lat is not None)
+            or (log_lat is not None)
+        )
+        is_warn = (
+            hw_grade in warn_tokens
+            or (
+                bgp_lat is not None
+                and (
+                    int(getattr(bgp_lat, "bgp_flaps_1h", 0) or 0) >= 3
+                    or int(getattr(bgp_lat, "bgp_update_storms", 0) or 0) > 0
+                )
+            )
+            or (evpn_lat is not None and int(getattr(evpn_lat, "evpn_mh_warning_es", 0) or 0) > 0)
+            or (
+                routes_lat is not None
+                and (
+                    float(getattr(routes_lat, "routes_drop_fraction", 0.0) or 0.0) >= 0.10
+                    or int(getattr(routes_lat, "ecmp_width_drop", 0) or 0) >= 2
+                )
+            )
+            or (sys_lat is not None)
+            or (bmc_lat is not None)
+        )
+
+        if is_crit:
             mapping[(FAMILY_HARDWARE_CONTROL, key)] = "critical"
-        elif hw_grade in ("warning", "warn", "degraded"):
+        elif is_warn:
             mapping[(FAMILY_HARDWARE_CONTROL, key)] = "warning"
         elif hw_grade and hw_grade != "unknown":
             mapping[(FAMILY_HARDWARE_CONTROL, key)] = hw_grade
-        for sensor in getattr(latest, "sensors", None) or ():
+
+        for sensor in getattr(series[-1], "sensors", None) or ():
             s_status = str(getattr(sensor, "status", None) or "").strip().lower()
             if s_status and s_status != "unknown":
                 mapping[(FAMILY_HARDWARE_CONTROL, sensor.entity_key)] = s_status

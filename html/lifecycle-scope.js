@@ -31,7 +31,7 @@
             '/lldp.html', '/bgp-analysis.html', '/evpn-mh-analysis.html', '/duplicate-analysis.html',
             '/link-flap-analysis.html', '/optical-analysis.html', '/ber-analysis.html',
             '/pfc-ecn-analysis.html', '/hardware-analysis.html', '/log-analysis.html',
-            '/assets.html', '/transceiver.html'
+            '/assets.html', '/transceiver.html', '/predictive.html'
         ].some(function (suffix) { return path.endsWith(suffix); });
     }
 
@@ -424,6 +424,20 @@
         metric('#mixed-fw', mixed);
     }
 
+    function updatePredictive() {
+        var rows = scopedRows('#predictive-table > tbody > tr:not(.empty-row)');
+        function count(pred) { return rows.filter(pred).length; }
+        metric('#kpi-actionable', rows.length);
+        metric('#kpi-critical', count(function (r) { return r.dataset.severity === 'CRITICAL'; }));
+        metric('#kpi-warning', count(function (r) { return r.dataset.severity === 'WARNING'; }));
+        metric('#kpi-early', count(function (r) { return r.dataset.early === '1'; }));
+        metric('#kpi-physical', count(function (r) { return r.dataset.family === 'physical'; }));
+        metric('#kpi-congestion', count(function (r) { return r.dataset.family === 'congestion'; }));
+        metric('#kpi-hardware', count(function (r) { return r.dataset.family === 'hardware_control'; }));
+        metric('#kpi-devices', uniqueDevices(rows));
+        metric('#kpi-scored', '—');
+    }
+
     function updateSummaries() {
         var path = location.pathname.toLowerCase();
         if (path.endsWith('/lldp.html')) return updateLLDP();
@@ -445,6 +459,7 @@
         if (path.endsWith('/pfc-ecn-analysis.html')) return updatePFC();
         if (path.endsWith('/assets.html')) return updateAssets();
         if (path.endsWith('/transceiver.html')) return updateTransceiver();
+        if (path.endsWith('/predictive.html')) return updatePredictive();
     }
 
     function clearScope() {
@@ -490,6 +505,7 @@
         if (path.endsWith('/log-analysis.html')) return document.querySelector('#log-table');
         if (path.endsWith('/assets.html')) return document.querySelector('#assets-table');
         if (path.endsWith('/transceiver.html')) return document.querySelector('#module-table')?.closest('table');
+        if (path.endsWith('/predictive.html')) return document.querySelector('#predictive-table');
         return null;
     }
 

@@ -199,8 +199,8 @@ class HttpExportContractTests(unittest.TestCase):
             'add_header Cache-Control '
             '"no-store, no-cache, must-revalidate, max-age=0" always;'
         )
-        # monitor JSON/CSV + transceiver JSON/CSV
-        self.assertEqual(export_section.count(cache_line), 4)
+        # monitor JSON/CSV + transceiver JSON/CSV + predictive JSON
+        self.assertEqual(export_section.count(cache_line), 5)
 
     def test_gzip_covers_reports_and_exports_but_not_binary_fallback(self):
         source = NGINX_SITE.read_text(encoding="utf-8")
@@ -227,7 +227,7 @@ class HttpExportContractTests(unittest.TestCase):
         export_section = source.split(
             "# ── Public machine-readable exports", 1
         )[1]
-        self.assertEqual(export_section.count("charset utf-8;"), 4)
+        self.assertEqual(export_section.count("charset utf-8;"), 5)
 
 
 class WriteExportTests(unittest.TestCase):

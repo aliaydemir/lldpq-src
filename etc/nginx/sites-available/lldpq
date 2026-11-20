@@ -618,4 +618,14 @@ server {
             add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
             add_header Content-Disposition 'attachment; filename="lldpq_transceiver_export.csv"';
         }
+
+        # Predictive health analysis export (published by predictive_analyzer.py)
+        location = /predictive/export_json {
+            alias /var/www/html/monitor-results/export/predictive.json;
+            types { }
+            default_type application/json;
+            charset utf-8;
+            charset_types application/json;
+            add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+        }
 }

@@ -176,11 +176,19 @@ class DayOneAnomalyScorer:
                 )
 
         # 4) BER level & log10 velocity (pre-FEC runaway catches faults days early)
+        # Align with ber_analyzer.py raw_phy_ber_warning_threshold (1e-6 = 10^-6.0):
+        # static 400G/800G PAM4 links routinely sit at 1e-8..3e-7 with zero post-FEC
+        # errors, so only penalize static raw BER above 10^-6.5 (~3.2e-7) unless BER
+        # is actively climbing.
         if ctx.get("has_ber"):
-            if log_raw > -8.0:
-                pts = _clamp((log_raw + 8.0) * 8.5, 0.0, 30.0)
+            if log_raw > -6.5:
+                pts = _clamp((log_raw + 6.5) * 12.0, 0.0, 30.0)
                 score += pts
                 reasons.append(f"elevated pre-FEC raw BER (10^{log_raw:.1f})")
+            elif log_raw > -7.5 and ber_slope > 0.30:
+                pts = _clamp((log_raw + 7.5) * 8.0 + ber_slope * 6.0, 0.0, 18.0)
+                score += pts
+                reasons.append(f"rising pre-FEC raw BER (10^{log_raw:.1f}, +{ber_slope:.2f} dec/24h)")
             if log_eff > -11.5:
                 pts = _clamp((log_eff + 11.5) * 10.0, 0.0, 38.0)
                 score += pts
@@ -587,6 +595,25 @@ class _TreeNode:
                 node = node.right  # type: ignore[assignment]
         return node.value
 
+    def mean_leaf_value(self) -> float:
+        if self.is_leaf:
+            return self.value
+        assert self.left is not None and self.right is not None
+        return 0.5 * (self.left.mean_leaf_value() + self.right.mean_leaf_value())
+
+    def accumulate_contributions(
+        self, row: Sequence[float], lr: float, out: dict[int, float]
+    ) -> None:
+        node = self
+        cur_val = node.mean_leaf_value()
+        while not node.is_leaf:
+            nxt = node.left if row[node.feature_idx] <= node.threshold else node.right
+            assert nxt is not None
+            nxt_val = nxt.mean_leaf_value()
+            out[node.feature_idx] = out.get(node.feature_idx, 0.0) + lr * (nxt_val - cur_val)
+            node = nxt
+            cur_val = nxt_val
+
     def to_dict(self) -> dict[str, Any]:
         if self.is_leaf:
             return {"v": round(self.value, 6)}
@@ -611,20 +638,24 @@ class _TreeNode:
 
 
 class NativeBoostedTreeEnsemble:
-    """Compact pure-Python Newton-boosted binary GBDT (depth <= 2).
+    """Compact pure-Python Newton-boosted binary GBDT (depth <= 3) with feature subsampling.
 
-    Trains in < 0.5 s on ~1k rows, executes batch inference in < 1 ms, and
-    serializes to < 30 KB JSON with zero third-party dependencies.
+    Trains in < 2 s on ~1.5k rows, executes batch inference in < 1 ms, prevents
+    single-feature split collapse via ``colsample_bytree``, and serializes to
+    < 40 KB JSON with zero third-party dependencies.
     """
 
     def __init__(
         self,
-        n_estimators: int = 36,
-        learning_rate: float = 0.14,
-        max_depth: int = 2,
-        l2_reg: float = 1.5,
-        min_child_hess: float = 1.0,
+        n_estimators: int = 48,
+        learning_rate: float = 0.12,
+        max_depth: int = 3,
+        l2_reg: float = 2.0,
+        min_child_hess: float = 1.5,
         max_bins: int = 16,
+        colsample_bytree: float = 0.65,
+        subsample: float = 0.85,
+        seed: int = 42,
     ) -> None:
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
@@ -632,6 +663,9 @@ class NativeBoostedTreeEnsemble:
         self.l2_reg = l2_reg
         self.min_child_hess = min_child_hess
         self.max_bins = max_bins
+        self.colsample_bytree = colsample_bytree
+        self.subsample = subsample
+        self.seed = seed
         self.base_score: float = 0.0
         self.trees: list[_TreeNode] = []
         self.n_features: int = 0
@@ -670,6 +704,12 @@ class NativeBoostedTreeEnsemble:
 
         preds = [self.base_score] * n
         all_indices = list(range(n))
+        all_features = list(range(self.n_features))
+        rng = random.Random(self.seed)
+        col_k = max(2, int(round(self.n_features * _clamp(self.colsample_bytree, 0.25, 1.0))))
+        col_k = min(col_k, self.n_features)
+        row_k = max(8, int(round(n * _clamp(self.subsample, 0.4, 1.0))))
+        row_k = min(row_k, n)
         self.trees = []
 
         for _ in range(self.n_estimators):
@@ -681,7 +721,19 @@ class NativeBoostedTreeEnsemble:
                 grads[i] = (float(y[i]) - p) * w
                 hess[i] = max(p * (1.0 - p), 1e-5) * w
 
-            tree = self._build_node(cols, grads, hess, all_indices, cand_thresholds, depth=0)
+            feat_subset = (
+                sorted(rng.sample(all_features, col_k))
+                if col_k < self.n_features
+                else all_features
+            )
+            row_subset = (
+                rng.sample(all_indices, row_k)
+                if row_k < n
+                else all_indices
+            )
+            tree = self._build_node(
+                cols, grads, hess, row_subset, cand_thresholds, feat_subset, depth=0
+            )
             self.trees.append(tree)
             lr = self.learning_rate
             for i in range(n):
@@ -695,6 +747,7 @@ class NativeBoostedTreeEnsemble:
         hess: Sequence[float],
         indices: Sequence[int],
         cand_thresholds: Sequence[Sequence[float]],
+        feat_subset: Sequence[int],
         depth: int,
     ) -> _TreeNode:
         g_tot = sum(grads[i] for i in indices)
@@ -708,7 +761,7 @@ class NativeBoostedTreeEnsemble:
         best_feat = -1
         best_thr = 0.0
 
-        for j in range(self.n_features):
+        for j in feat_subset:
             thrs = cand_thresholds[j]
             if not thrs:
                 continue
@@ -747,8 +800,8 @@ class NativeBoostedTreeEnsemble:
             is_leaf=False,
             feature_idx=best_feat,
             threshold=best_thr,
-            left=self._build_node(cols, grads, hess, left_idx, cand_thresholds, depth + 1),
-            right=self._build_node(cols, grads, hess, right_idx, cand_thresholds, depth + 1),
+            left=self._build_node(cols, grads, hess, left_idx, cand_thresholds, feat_subset, depth + 1),
+            right=self._build_node(cols, grads, hess, right_idx, cand_thresholds, feat_subset, depth + 1),
         )
 
     def predict_proba_one(self, row: Sequence[float]) -> float:
@@ -760,6 +813,22 @@ class NativeBoostedTreeEnsemble:
 
     def predict_proba(self, X: Sequence[Sequence[float]]) -> list[float]:
         return [self.predict_proba_one(row) for row in X]
+
+    def explain_one(
+        self, row: Sequence[float], feature_names: Sequence[str], *, top_k: int = 3
+    ) -> list[tuple[str, float]]:
+        """Return top positive-contributing ``(feature_name, log_odds_delta)`` pairs."""
+        contribs: dict[int, float] = {}
+        lr = self.learning_rate
+        for tree in self.trees:
+            tree.accumulate_contributions(row, lr, contribs)
+        ranked = [
+            (feature_names[idx], delta)
+            for idx, delta in contribs.items()
+            if 0 <= idx < len(feature_names) and delta > 0.05
+        ]
+        ranked.sort(key=lambda pair: -pair[1])
+        return ranked[:top_k]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -855,10 +924,10 @@ class _FamilyClassifier:
             clf.fit(np.asarray(X, dtype=float), np.asarray(y, dtype=int), sample_weight=sample_weight)
             self._model = clf
             # Train a portable pure-JSON native twin for zero-dependency JSON export
-            self._native_export = NativeBoostedTreeEnsemble().fit(X, y, sample_weight=sample_weight)
+            self._native_export = NativeBoostedTreeEnsemble(seed=self.seed).fit(X, y, sample_weight=sample_weight)
             return self
 
-        self._model = NativeBoostedTreeEnsemble().fit(X, y, sample_weight=sample_weight)
+        self._model = NativeBoostedTreeEnsemble(seed=self.seed).fit(X, y, sample_weight=sample_weight)
         return self
 
     def predict_proba(self, X: Sequence[Sequence[float]]) -> list[float]:
@@ -870,6 +939,14 @@ class _FamilyClassifier:
             probs = self._model.predict_proba(np.asarray(X, dtype=float))
             return [float(row[1]) for row in probs]
         return self._model.predict_proba(X)
+
+    def explain_one(
+        self, row: Sequence[float], feature_names: Sequence[str], *, top_k: int = 2
+    ) -> list[tuple[str, float]]:
+        native = self._model if isinstance(self._model, NativeBoostedTreeEnsemble) else self._native_export
+        if native is not None:
+            return native.explain_one(row, feature_names, top_k=top_k)
+        return []
 
     def to_dict(self) -> dict[str, Any]:
         if self.backend == "lightgbm" and self._model is not None:
@@ -1074,12 +1151,17 @@ class PredictiveRiskModel:
                 # - Confirmed Tier-1 physics/hardware faults (>=40) smoothly retain at least
                 #   WARNING visibility and can never be suppressed back into INFO by Tier-2
                 # - Subtle multi-feature drifts benefit from Tier-2 early-warning detection
-                # - Quiet baselines (both low) stay cleanly low
+                # - When Tier-1 reports completely nominal telemetry (<12), require strong
+                #   ML consensus (>=80) before crossing WARNING so minor noise cannot
+                #   produce contradictory "WARNING + metrics nominal" alerts
                 blended = 0.50 * t1.score + 0.50 * s2
                 if t1.score >= 40.0:
                     blended = max(blended, 40.0 + 0.85 * (t1.score - 40.0))
-                elif t1.score < 12.0 and s2 < 35.0:
-                    blended = min(blended, 0.65 * t1.score + 0.35 * s2)
+                elif t1.score < 12.0:
+                    if s2 < 75.0:
+                        blended = min(blended, 0.55 * t1.score + 0.45 * s2, 38.0)
+                    else:
+                        blended = min(blended, 0.45 * t1.score + 0.55 * s2)
                 final_score = _clamp(blended - (offset if blended < 35.0 else 0.0), 0.0, 100.0)
                 tier_scores = {"tier1_physics": round(t1.score, 2), "tier2_ml": round(s2, 2)}
                 agreement = 1.0 - abs(t1.score - s2) / 100.0
@@ -1098,6 +1180,33 @@ class PredictiveRiskModel:
                 severity = "INFO"
                 horizon = 72
 
+            reasons = list(t1.reasons)
+            action = t1.recommended_action
+            if severity in ("WARNING", "CRITICAL") and t1.score < 20.0 and idx in ml_probs:
+                # Never pair an elevated severity with a "metrics nominal / quiet"
+                # fallback sentence from Tier-1; surface the driving ML features.
+                nominal_markers = (
+                    "metrics nominal",
+                    "pfc/ecn quiet",
+                    "within peer baseline",
+                )
+                reasons = [
+                    r for r in reasons if not any(m in r.lower() for m in nominal_markers)
+                ]
+                clf = self.classifiers.get(feat.family)
+                if clf is not None:
+                    fmap = feat.as_dict()
+                    for fname, _delta in clf.explain_one(feat.values, feat.feature_names, top_k=2):
+                        val = fmap.get(fname, 0.0)
+                        reasons.append(f"ML pattern driver: {fname.replace('_', ' ')} ({val:.2f})")
+                if not reasons:
+                    reasons.append(f"ML ensemble anomaly score ({tier_scores.get('tier2_ml', 0.0):.1f}/100)")
+                if action.lower().startswith("no action required"):
+                    action = (
+                        "Review multi-feature telemetry trend on this entity during the next "
+                        "maintenance window; ML precursor model detected an off-baseline pattern."
+                    )
+
             # Confidence grows with multi-sample depth, peer group size, and Tier 1/2 agreement
             depth_factor = min(1.0, 0.45 + 0.11 * min(feat.sample_count, 5))
             peer_factor = 1.0 if feat.peer_group_size >= 4 else (0.9 if feat.peer_group_size >= 2 else 0.8)
@@ -1114,10 +1223,10 @@ class PredictiveRiskModel:
                     severity=severity,
                     horizon_hours=horizon,
                     confidence=confidence,
-                    top_reasons=list(t1.reasons),
+                    top_reasons=reasons[:5],
                     peer_zscore=feat.peer_zscore,
                     slope_metrics=dict(feat.slope_metrics),
-                    recommended_action=t1.recommended_action,
+                    recommended_action=action,
                     role_classification=t1.role_classification,
                     tier_scores=tier_scores,
                     timestamp=feat.timestamp,
@@ -1238,21 +1347,21 @@ def generate_synthetic_trajectories(
 
     # --- Family A: Physical / Optical / BER / Flap ---
     n_pos_a = samples_per_family // 2
-    n_neg_a = samples_per_family - n_pos_a
     for idx in range(samples_per_family):
         is_pos = idx < n_pos_a
         snap = LLDPqSnapshot(timestamp=base_ts + 48 * 3600)
-        dev = f"leaf-{(idx % 12) + 1:03d}"
-        # Mix legacy SFP/QSFP (-3.5..-1.5 dBm, 35mA) and modern 400G/800G OSFP (+1.0..+3.0 dBm, 70..320mA)
-        is_osfp = (idx % 3 == 0)
-        sib_rx_lo, sib_rx_hi = (1.2, 2.9) if is_osfp else (-3.6, -1.6)
-        sib_bias_lo, sib_bias_hi = (70.0, 320.0) if is_osfp else (30.0, 42.0)
+        dev = f"dev-{(idx % 12) + 1:03d}"
+        # Mix legacy SFP/QSFP (-3.5..-1.5 dBm, 35mA) and modern 400G/800G PAM4 OSFP (+0.5..+3.2 dBm, 65..350mA)
+        is_osfp = (idx % 2 == 0)
+        sib_rx_lo, sib_rx_hi = (0.8, 3.0) if is_osfp else (-3.6, -1.6)
+        sib_bias_lo, sib_bias_hi = (65.0, 345.0) if is_osfp else (30.0, 44.0)
         sib_ref_dbm = -9.9 if is_osfp else -14.0
         # 5 healthy sibling ports for realistic peer-group statistics
         for sib in range(1, 6):
             base_rx = rng.uniform(sib_rx_lo, sib_rx_hi)
             base_bias = rng.uniform(sib_bias_lo, sib_bias_hi)
-            base_temp = rng.uniform(38.0, 54.0)
+            base_temp = rng.uniform(38.0, 56.0)
+            sib_raw_ber_exp = rng.uniform(-12.5, -6.7) if is_osfp else rng.uniform(-12.5, -8.5)
             pts: list[PhysicalPortSample] = []
             for h in range(0, 49, 8):
                 rx_v = base_rx + rng.gauss(0.0, 0.12)
@@ -1262,12 +1371,12 @@ def generate_synthetic_trajectories(
                         port=f"swp{sib}s0",
                         timestamp=base_ts + h * 3600,
                         rx_power_dbm=rx_v,
-                        tx_power_dbm=(1.8 if is_osfp else -1.8) + rng.gauss(0.0, 0.1),
+                        tx_power_dbm=(rng.uniform(0.5, 3.2) if is_osfp else rng.uniform(-2.4, -1.2)) + rng.gauss(0.0, 0.08),
                         bias_current_ma=base_bias + rng.gauss(0.0, 0.25),
                         temperature_c=base_temp + rng.gauss(0.0, 0.6),
                         voltage_v=3.28 + rng.gauss(0.0, 0.025),
                         link_margin_db=rx_v - sib_ref_dbm,
-                        raw_ber=10 ** rng.uniform(-12.5, -8.3),
+                        raw_ber=10 ** _clamp(sib_raw_ber_exp + rng.gauss(0.0, 0.08), -13.0, -6.6),
                         effective_ber=1e-15,
                         symbol_error_delta=0,
                         health_status="excellent",
@@ -1280,25 +1389,30 @@ def generate_synthetic_trajectories(
         target_key = f"{dev}:{target_port}"
         pts = []
         if not is_pos:
-            scenario = "healthy_noisy_optical"
+            # Include healthy 400G/800G PAM4 hard negatives with static pre-FEC raw BER
+            # up to ~2.5e-7 (well below LLDPq's 1e-6 warning threshold) and wide TX/bias range.
+            is_pam4_hard_neg = is_osfp and (idx % 4 == 0)
+            scenario = "healthy_pam4_high_bias_baseline" if is_pam4_hard_neg else "healthy_noisy_optical"
             lead_h = 0.0
-            base_rx = rng.uniform(sib_rx_lo - 0.5, sib_rx_hi)
+            base_rx = rng.uniform(sib_rx_lo - 0.6, sib_rx_hi)
             base_bias = rng.uniform(sib_bias_lo, sib_bias_hi)
-            base_temp = rng.uniform(36.0, 56.0)
+            base_temp = rng.uniform(36.0, 58.0)
+            base_tx = rng.uniform(0.2, 3.3) if is_osfp else rng.uniform(-2.6, -1.2)
+            base_raw_exp = rng.uniform(-8.5, -6.65) if is_pam4_hard_neg else rng.uniform(-12.5, -8.3)
             for h in range(0, 49, 8):
-                rx_v = base_rx + rng.gauss(0.0, 0.18)
+                rx_v = base_rx + rng.gauss(0.0, 0.16)
                 pts.append(
                     PhysicalPortSample(
                         device=dev,
                         port=target_port,
                         timestamp=base_ts + h * 3600,
                         rx_power_dbm=rx_v,
-                        tx_power_dbm=(1.7 if is_osfp else -1.9) + rng.gauss(0.0, 0.1),
+                        tx_power_dbm=base_tx + rng.gauss(0.0, 0.08),
                         bias_current_ma=base_bias + rng.gauss(0.0, 0.35),
-                        temperature_c=base_temp + rng.gauss(0.0, 0.9),
+                        temperature_c=base_temp + rng.gauss(0.0, 0.8),
                         voltage_v=3.28 + rng.gauss(0.0, 0.025),
                         link_margin_db=rx_v - sib_ref_dbm,
-                        raw_ber=10 ** rng.uniform(-12.5, -8.3),
+                        raw_ber=10 ** _clamp(base_raw_exp + rng.gauss(0.0, 0.08), -13.0, -6.55),
                         effective_ber=1e-15,
                         symbol_error_delta=0,
                         flaps_1h=0,
@@ -1308,7 +1422,7 @@ def generate_synthetic_trajectories(
                     )
                 )
         else:
-            mode = idx % 4
+            mode = idx % 6
             if mode == 0:
                 # Gradual laser aging + RX decay + BER climb BEFORE hard threshold
                 scenario = "laser_aging_precursor"
@@ -1317,8 +1431,8 @@ def generate_synthetic_trajectories(
                 rx_drop = rng.uniform(0.9, 2.4)  # dB / 24h
                 bias0 = rng.uniform(sib_bias_lo, sib_bias_hi * 0.9)
                 bias_rise = rng.uniform(2.8, 7.5)  # mA / 24h
-                ber0 = rng.uniform(-11.8, -10.0)
-                ber_rise = rng.uniform(1.1, 2.6)  # decades / 24h
+                ber0 = rng.uniform(-11.2, -9.2)
+                ber_rise = rng.uniform(1.2, 2.6)  # decades / 24h
                 for h in range(0, 49, 8):
                     d = h / 24.0
                     rx = rx0 - rx_drop * d + rng.gauss(0.0, 0.1)
@@ -1333,18 +1447,18 @@ def generate_synthetic_trajectories(
                             temperature_c=44.0 + 2.5 * d,
                             voltage_v=3.28 + rng.gauss(0.0, 0.025),
                             link_margin_db=rx - sib_ref_dbm,
-                            raw_ber=10 ** _clamp(ber0 + ber_rise * d, -13.0, -5.0),
-                            effective_ber=1e-15 if d < 1.5 else 10 ** rng.uniform(-12.5, -10.5),
-                            symbol_error_delta=int(max(0, (d - 0.5) * rng.uniform(15, 180))),
+                            raw_ber=10 ** _clamp(ber0 + ber_rise * d, -13.0, -4.8),
+                            effective_ber=1e-15 if d < 1.5 else 10 ** rng.uniform(-12.0, -10.0),
+                            symbol_error_delta=int(max(0, (d - 0.5) * rng.uniform(20, 200))),
                         )
                     )
             elif mode == 1:
-                # Dirty/bent fiber connector: low peer RX + rising pre-FEC BER
+                # Dirty/bent fiber connector: low peer RX + pre-FEC BER above 1e-6 warning band
                 scenario = "dirty_fiber_connector"
                 lead_h = rng.uniform(18.0, 60.0)
                 rx_base = rng.uniform(-7.0, -3.5) if is_osfp else rng.uniform(-11.8, -7.8)
-                ber0 = rng.uniform(-8.0, -6.5)
-                ber_rise = rng.uniform(0.5, 1.8)
+                ber0 = rng.uniform(-6.8, -5.8)
+                ber_rise = rng.uniform(0.4, 1.5)
                 for h in range(0, 49, 8):
                     d = h / 24.0
                     rx = rx_base - rng.uniform(0.2, 0.8) * d + rng.gauss(0.0, 0.12)
@@ -1360,8 +1474,8 @@ def generate_synthetic_trajectories(
                             voltage_v=3.28 + rng.gauss(0.0, 0.025),
                             link_margin_db=rx - sib_ref_dbm,
                             raw_ber=10 ** _clamp(ber0 + ber_rise * d, -12.0, -4.5),
-                            effective_ber=10 ** rng.uniform(-11.5, -9.0) if idx % 3 == 0 else 1e-15,
-                            symbol_error_delta=int(rng.uniform(25, 400)),
+                            effective_ber=10 ** rng.uniform(-11.2, -8.5) if idx % 3 == 0 else 1e-15,
+                            symbol_error_delta=int(rng.uniform(35, 450)),
                             crc_errors_rate=rng.uniform(0.2, 4.0) if idx % 2 == 0 else 0.0,
                         )
                     )
@@ -1386,14 +1500,14 @@ def generate_synthetic_trajectories(
                             temperature_c=48.0 + 1.5 * d,
                             voltage_v=3.28 + rng.gauss(0.0, 0.025),
                             link_margin_db=rx - sib_ref_dbm,
-                            raw_ber=10 ** rng.uniform(-8.2, -5.5),
-                            effective_ber=10 ** rng.uniform(-11.0, -8.5) if idx % 2 == 1 else 1e-15,
+                            raw_ber=10 ** rng.uniform(-7.0, -5.0),
+                            effective_ber=10 ** rng.uniform(-10.8, -8.5) if idx % 2 == 1 else 1e-15,
                             flaps_1h=f1 if h == 48 else 0,
                             flaps_24h=f24 if h >= 24 else 1,
                             crc_errors_rate=rng.uniform(0.8, 8.0) if h >= 32 and idx % 2 == 1 else 0.0,
                         )
                     )
-            else:
+            elif mode == 3:
                 # Fabric-check FEC/MTU mismatch driving post-FEC degradation
                 scenario = "fabric_mismatch_ber"
                 lead_h = rng.uniform(16.0, 54.0)
@@ -1412,11 +1526,65 @@ def generate_synthetic_trajectories(
                             temperature_c=44.0 + rng.gauss(0.0, 0.8),
                             voltage_v=3.28 + rng.gauss(0.0, 0.025),
                             link_margin_db=rx - sib_ref_dbm,
-                            raw_ber=10 ** _clamp(-8.5 + 1.2 * d, -12.0, -5.0),
+                            raw_ber=10 ** _clamp(-7.2 + 1.1 * d, -12.0, -4.8),
                             effective_ber=10 ** rng.uniform(-10.5, -8.0),
                             fec_mismatch=(idx % 2 == 0),
                             mtu_mismatch=(idx % 2 == 1),
                             symbol_error_delta=int(rng.uniform(40, 300)),
+                        )
+                    )
+            elif mode == 4:
+                # Pure optical RX power decay slope + elevated module temp (pre-BER failure)
+                scenario = "rx_decay_only_precursor"
+                lead_h = rng.uniform(18.0, 60.0)
+                rx0 = rng.uniform(0.5, 2.2) if is_osfp else rng.uniform(-3.0, -1.5)
+                rx_drop = rng.uniform(1.8, 7.0)  # steep daily RX loss
+                mod_t = rng.uniform(58.0, 69.0)
+                for h in range(0, 49, 8):
+                    d = h / 24.0
+                    rx = rx0 - rx_drop * d + rng.gauss(0.0, 0.12)
+                    pts.append(
+                        PhysicalPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + h * 3600,
+                            rx_power_dbm=rx,
+                            tx_power_dbm=(1.7 if is_osfp else -1.9) + rng.gauss(0.0, 0.1),
+                            bias_current_ma=rng.uniform(sib_bias_lo, sib_bias_hi) + rng.uniform(0.5, 3.0) * d,
+                            temperature_c=mod_t + rng.gauss(0.0, 0.5),
+                            voltage_v=3.28 + rng.gauss(0.0, 0.025),
+                            link_margin_db=rx - sib_ref_dbm,
+                            raw_ber=10 ** rng.uniform(-12.0, -8.5),
+                            effective_ber=1e-15,
+                            flaps_1h=1 if (h == 48 and idx % 2 == 0) else 0,
+                            flaps_24h=2 if (h >= 24 and idx % 2 == 0) else 0,
+                        )
+                    )
+            else:
+                # Sustained high-flap / bias-drift instability without static BER alarm
+                scenario = "bias_flap_instability"
+                lead_h = rng.uniform(12.0, 48.0)
+                f1 = rng.randint(1, 8)
+                f24 = f1 + rng.randint(5, 24)
+                rx_base = (sib_rx_lo - rng.uniform(2.5, 5.5)) if idx % 2 == 0 else rng.uniform(sib_rx_lo, sib_rx_hi)
+                for h in range(0, 49, 8):
+                    d = h / 24.0
+                    rx = rx_base - 0.4 * d + rng.gauss(0.0, 0.1)
+                    pts.append(
+                        PhysicalPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + h * 3600,
+                            rx_power_dbm=rx,
+                            tx_power_dbm=(1.7 if is_osfp else -1.9) + rng.gauss(0.0, 0.1),
+                            bias_current_ma=(sib_bias_hi * 1.15 if is_osfp else 78.0) + rng.uniform(1.5, 4.0) * d,
+                            temperature_c=rng.uniform(50.0, 66.0),
+                            voltage_v=3.28 + rng.gauss(0.0, 0.025),
+                            link_margin_db=rx - sib_ref_dbm,
+                            raw_ber=10 ** rng.uniform(-10.0, -5.8),
+                            effective_ber=1e-15,
+                            flaps_1h=f1 if h == 48 else 0,
+                            flaps_24h=f24 if h >= 24 else 1,
                         )
                     )
         snap.physical[target_key] = pts
@@ -1435,50 +1603,124 @@ def generate_synthetic_trajectories(
     for idx in range(samples_per_family):
         is_pos = idx < n_pos_b
         snap = LLDPqSnapshot(timestamp=base_ts + 6 * 3600)
-        dev = f"leaf-{(idx % 12) + 1:03d}"
-        # 5 quiet sibling ports
+        dev = f"dev-{(idx % 12) + 1:03d}"
+        # For switch-wide PFC storms (pos mode 3), ALL sibling ports also experience
+        # heavy congestion so peer_congestion_mad_zscore stays ~0.0 and the tree
+        # ensemble learns absolute PFC/ECN/HOQ/loss signals instead of collapsing
+        # onto the peer z-score alone.
+        is_switch_wide_storm = is_pos and (idx % 4 == 3)
+        is_balanced_healthy_ecn = (not is_pos) and (idx % 3 == 2)
+        storm_scale = rng.uniform(1.2, 4.5)
         for sib in range(1, 6):
             cpts: list[CongestionPortSample] = []
             for step in range(6):
-                cpts.append(
-                    CongestionPortSample(
-                        device=dev,
-                        port=f"swp{sib}s0",
-                        timestamp=base_ts + step * 3600,
-                        rx_pause_rate=0.0,
-                        tx_pause_rate=0.0,
-                        ecn_marked_rate=rng.uniform(0.0, 5.0),
-                        ecn_share_percent=rng.uniform(0.0, 0.4),
-                        signal="quiet",
+                if is_switch_wide_storm:
+                    ramp = (step / 5.0) ** 1.6
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=f"swp{sib}s0",
+                            timestamp=base_ts + step * 3600,
+                            tx_pause_rate=storm_scale * (10.0 + 95.0 * ramp) * rng.uniform(0.85, 1.15),
+                            rx_pause_rate=storm_scale * (8.0 + 70.0 * ramp) * rng.uniform(0.85, 1.15),
+                            ecn_marked_rate=storm_scale * (60.0 + 350.0 * ramp),
+                            ecn_share_percent=rng.uniform(5.0, 20.0) * (0.4 + 0.6 * ramp),
+                            rx_buffer_full_rate=storm_scale * 2.0 * ramp,
+                            egress_hoq_rate=storm_scale * 3.0 * ramp,
+                            signal="combined",
+                        )
                     )
-                )
+                elif is_balanced_healthy_ecn:
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=f"swp{sib}s0",
+                            timestamp=base_ts + step * 3600,
+                            rx_pause_rate=0.0,
+                            tx_pause_rate=0.0,
+                            ecn_marked_rate=rng.uniform(5.0, 45.0),
+                            ecn_share_percent=rng.uniform(0.4, 2.2),
+                            signal="ecn",
+                        )
+                    )
+                else:
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=f"swp{sib}s0",
+                            timestamp=base_ts + step * 3600,
+                            rx_pause_rate=0.0,
+                            tx_pause_rate=0.0,
+                            ecn_marked_rate=rng.uniform(0.0, 5.0),
+                            ecn_share_percent=rng.uniform(0.0, 0.35),
+                            signal="quiet",
+                        )
+                    )
             snap.congestion[f"{dev}:swp{sib}s0"] = cpts
 
         target_port = "swp8s0"
         target_key = f"{dev}:{target_port}"
         cpts = []
         if not is_pos:
-            scenario = "healthy_roce_baseline"
-            lead_h = 0.0
-            for step in range(6):
-                ecn = rng.uniform(0.0, 1.2)
-                cpts.append(
-                    CongestionPortSample(
-                        device=dev,
-                        port=target_port,
-                        timestamp=base_ts + step * 3600,
-                        rx_pause_rate=0.0,
-                        tx_pause_rate=0.0,
-                        ecn_marked_rate=rng.uniform(0.0, 18.0),
-                        ecn_share_percent=ecn,
-                        loss_delta=0,
-                        rx_buffer_full_rate=0.0,
-                        egress_hoq_rate=0.0,
-                        signal="ecn" if ecn > 0.6 else "quiet",
+            neg_mode = idx % 3
+            if neg_mode == 0:
+                scenario = "healthy_roce_quiet"
+                for step in range(6):
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + step * 3600,
+                            rx_pause_rate=0.0,
+                            tx_pause_rate=0.0,
+                            ecn_marked_rate=rng.uniform(0.0, 10.0),
+                            ecn_share_percent=rng.uniform(0.0, 0.5),
+                            loss_delta=0,
+                            signal="quiet",
+                        )
                     )
-                )
+            elif neg_mode == 1:
+                # Hard negative: single port with normal working DCQCN ECN (0.6..2.8%)
+                # next to 5 quiet siblings (elevated peer_congestion_mad_zscore, zero PFC/loss/HOQ).
+                scenario = "healthy_single_port_dcqcn_ecn"
+                base_ecn = rng.uniform(0.7, 2.8)
+                for step in range(6):
+                    ecn = _clamp(base_ecn + rng.gauss(0.0, 0.2), 0.3, 3.2)
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + step * 3600,
+                            rx_pause_rate=0.0,
+                            tx_pause_rate=0.0,
+                            ecn_marked_rate=rng.uniform(12.0, 95.0),
+                            ecn_share_percent=ecn,
+                            loss_delta=0,
+                            rx_buffer_full_rate=0.0,
+                            egress_hoq_rate=0.0,
+                            signal="ecn",
+                        )
+                    )
+            else:
+                scenario = "healthy_balanced_dcqcn_ecn"
+                for step in range(6):
+                    ecn = rng.uniform(0.4, 2.2)
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + step * 3600,
+                            rx_pause_rate=0.0,
+                            tx_pause_rate=0.0,
+                            ecn_marked_rate=rng.uniform(8.0, 55.0),
+                            ecn_share_percent=ecn,
+                            loss_delta=0,
+                            signal="ecn",
+                        )
+                    )
+            lead_h = 0.0
         else:
-            mode = idx % 3
+            mode = idx % 4
             if mode == 0:
                 # Culprit: accelerating TX pause + rising ECN + rx_buffer_full + HOQ onset
                 scenario = "pfc_storm_hoq_culprit"
@@ -1523,7 +1765,7 @@ def generate_synthetic_trajectories(
                             signal="loss",
                         )
                     )
-            else:
+            elif mode == 2:
                 # Downstream congestion propagating as victim RX pause escalation
                 scenario = "pfc_victim_propagation"
                 lead_h = rng.uniform(18.0, 48.0)
@@ -1540,6 +1782,28 @@ def generate_synthetic_trajectories(
                             ecn_marked_rate=rng.uniform(5.0, 30.0),
                             ecn_share_percent=rng.uniform(0.5, 3.0),
                             signal="pfc",
+                        )
+                    )
+            else:
+                # Switch-wide PFC storm: all ports on the switch experience heavy PFC/ECN
+                # (peer_congestion_mad_zscore ~= 0.0)
+                scenario = "switch_wide_pfc_storm"
+                lead_h = rng.uniform(10.0, 36.0)
+                for step in range(6):
+                    ramp = (step / 5.0) ** 1.6
+                    cpts.append(
+                        CongestionPortSample(
+                            device=dev,
+                            port=target_port,
+                            timestamp=base_ts + step * 3600,
+                            tx_pause_rate=storm_scale * (10.0 + 95.0 * ramp),
+                            rx_pause_rate=storm_scale * (8.0 + 70.0 * ramp),
+                            ecn_marked_rate=storm_scale * (60.0 + 350.0 * ramp),
+                            ecn_share_percent=rng.uniform(5.0, 20.0) * (0.4 + 0.6 * ramp),
+                            rx_buffer_full_rate=storm_scale * 2.0 * ramp,
+                            egress_hoq_rate=storm_scale * 3.0 * ramp,
+                            loss_delta=int(rng.uniform(0, 40) * ramp),
+                            signal="combined",
                         )
                     )
         snap.congestion[target_key] = cpts
@@ -1561,10 +1825,10 @@ def generate_synthetic_trajectories(
         ds = datasets[FAMILY_HARDWARE_CONTROL]
 
         if not is_pos:
-            if idx % 2 == 0:
-                # Healthy 8-GPU DGX chassis (all 8 peers tightly clustered)
-                scenario = "healthy_sxm_peer_group"
-                dev = f"dgx-{(idx % 8) + 1:03d}"
+            if idx % 3 == 0:
+                # Healthy 8-sensor multi-accelerator chassis (all 8 peers tightly clustered)
+                scenario = "healthy_sensor_peer_group"
+                dev = f"node-{(idx % 8) + 1:03d}"
                 amb = rng.uniform(20.0, 24.0)
                 base_t = rng.uniform(30.0, 38.0)
                 base_p = rng.uniform(72.0, 90.0)
@@ -1589,25 +1853,27 @@ def generate_synthetic_trajectories(
                     ]
                 target_key = f"{dev}:SXM3"
             else:
-                # Healthy switch hardware + control plane (spanning Spectrum-3/4 high-temp ASICs & 16-core low-load switches)
+                # Healthy switch hardware + control plane including realistic benign
+                # background non-critical syslog errors (0..8 errors, 0 critical, 0 restarts)
                 scenario = "healthy_switch_control"
-                is_spectrum = (idx % 3 == 0)
-                base_asic = rng.uniform(62.0, 74.0) if is_spectrum else rng.uniform(44.0, 52.0)
-                tlim = 105.0 if is_spectrum else 90.0
+                is_high_tlimit = (idx % 2 == 0)
+                base_asic = rng.uniform(62.0, 74.0) if is_high_tlimit else rng.uniform(44.0, 54.0)
+                tlim = 105.0 if is_high_tlimit else 90.0
+                bg_log_errs = rng.randint(0, 8) if (idx % 2 == 1) else 0
                 for sib in range(1, 5):
-                    sdev = f"leaf-{sib:03d}"
+                    sdev = f"dev-{sib:03d}"
                     snap.hardware_control[sdev] = [
                         HardwareControlSample(
                             device=sdev,
-                            device_model="SN5610" if is_spectrum else "",
+                            device_model="SN5610" if is_high_tlimit else "SN4600",
                             timestamp=base_ts + h * 3600,
                             overall_grade="excellent",
-                            cpu_temp_c=rng.uniform(34.0, 46.0) + rng.gauss(0.0, 1.2),
+                            cpu_temp_c=rng.uniform(34.0, 48.0) + rng.gauss(0.0, 1.2),
                             asic_temp_c=base_asic + rng.gauss(0.0, 1.8),
                             ambient_temp_c=24.0,
                             tlimit_c=tlim,
-                            memory_pct=rng.uniform(13.0, 48.0),
-                            load_per_core=rng.uniform(0.02, 0.45),
+                            memory_pct=rng.uniform(13.0, 52.0),
+                            load_per_core=rng.uniform(0.02, 0.48),
                             psu_efficiency=rng.uniform(89.0, 94.0),
                             psu_redundancy_ok=True,
                             fan_rpms={"FAN1/1": 5200.0, "FAN2/1": 5180.0, "FAN3/1": 5220.0},
@@ -1616,18 +1882,21 @@ def generate_synthetic_trajectories(
                             bgp_established_neighbors=16,
                             bgp_down_neighbors=0,
                             routes_total=420,
+                            log_critical_count=0,
+                            log_error_count=bg_log_errs if (sib == 1 and h == 48) else 0,
+                            log_error_velocity=float(bg_log_errs) if (sib == 1 and h == 48) else 0.0,
                         )
                         for h in (0, 24, 48)
                     ]
-                target_key = "leaf-001"
+                target_key = "dev-001"
             lead_h = 0.0
         else:
-            mode = idx % 4
+            mode = idx % 6
             if mode == 0:
-                # Localized cooling fault (6 healthy SXM peers + 2 hot SXM peers + elevated chassis fans)
-                scenario = "localized_sxm_cooling_fault"
+                # Localized cooling fault (6 healthy peers + 2 hot peers + elevated chassis fans)
+                scenario = "localized_sensor_cooling_fault"
                 lead_h = rng.uniform(24.0, 72.0)
-                dev = f"dgx-{(idx % 8) + 1:03d}"
+                dev = f"node-{(idx % 8) + 1:03d}"
                 amb = rng.uniform(20.0, 24.0)
                 cool_t = rng.uniform(30.0, 35.0)
                 hot_delta = rng.uniform(15.0, 27.0)
@@ -1654,31 +1923,60 @@ def generate_synthetic_trajectories(
                     ]
                 target_key = f"{dev}:SXM3"
             elif mode == 1:
-                # Switch fan tray degradation + rising ASIC temp + PSU fault/efficiency dip
-                scenario = "fan_psu_thermal_degradation"
-                lead_h = rng.uniform(18.0, 60.0)
-                is_psu_fan_fault = (idx % 2 == 0)
+                # Isolated fan failure and/or PSU fault even while chassis temp is still nominal
+                scenario = "isolated_fan_psu_fault"
+                lead_h = rng.uniform(12.0, 48.0)
+                fault_kind = idx % 3
                 for sib in range(1, 5):
-                    sdev = f"leaf-{sib:03d}"
+                    sdev = f"dev-{sib:03d}"
                     is_bad = sib == 1
                     snap.hardware_control[sdev] = [
                         HardwareControlSample(
                             device=sdev,
+                            device_model="SN5610",
+                            timestamp=base_ts + h * 3600,
+                            overall_grade="critical" if is_bad else "excellent",
+                            cpu_temp_c=rng.uniform(36.0, 44.0),
+                            asic_temp_c=rng.uniform(64.0, 71.0),
+                            ambient_temp_c=24.0,
+                            tlimit_c=105.0,
+                            memory_pct=rng.uniform(15.0, 40.0),
+                            load_per_core=rng.uniform(0.03, 0.35),
+                            psu_efficiency=rng.uniform(89.0, 93.0),
+                            psu_failed_count=rng.randint(1, 2) if (is_bad and fault_kind in (0, 2)) else 0,
+                            psu_redundancy_ok=not (is_bad and fault_kind in (0, 2)),
+                            fan_failed_count=rng.randint(1, 2) if (is_bad and fault_kind in (0, 1)) else 0,
+                            fan_rpms={"FAN1/1": 5200.0, "FAN2/1": 5200.0, "FAN3/1": 5200.0},
+                            fan_baseline_rpm=5200.0,
+                            bgp_total_neighbors=16,
+                            bgp_established_neighbors=16,
+                        )
+                        for h in (0, 24, 48)
+                    ]
+                target_key = "dev-001"
+            elif mode == 2:
+                # Switch fan tray degradation + rising ASIC temp + PSU efficiency dip
+                scenario = "fan_thermal_degradation"
+                lead_h = rng.uniform(18.0, 60.0)
+                for sib in range(1, 5):
+                    sdev = f"dev-{sib:03d}"
+                    is_bad = sib == 1
+                    snap.hardware_control[sdev] = [
+                        HardwareControlSample(
+                            device=sdev,
+                            device_model="SN4600",
                             timestamp=base_ts + h * 3600,
                             overall_grade="warning" if is_bad else "excellent",
-                            cpu_temp_c=(38.0 if is_psu_fan_fault else 58.0 + 4.5 * (h / 24.0)) if is_bad else 42.0,
-                            asic_temp_c=(67.0 if is_psu_fan_fault else 64.0 + 5.0 * (h / 24.0)) if is_bad else (66.0 if is_psu_fan_fault else 46.0),
+                            cpu_temp_c=(56.0 + 4.5 * (h / 24.0)) if is_bad else 42.0,
+                            asic_temp_c=(64.0 + 5.0 * (h / 24.0)) if is_bad else 46.0,
                             ambient_temp_c=24.0,
-                            tlimit_c=105.0 if is_psu_fan_fault else 85.0,
+                            tlimit_c=85.0,
                             memory_pct=rng.uniform(15.0, 50.0),
                             load_per_core=rng.uniform(0.03, 0.45),
-                            psu_efficiency=rng.uniform(90.0, 93.0) if is_psu_fan_fault else rng.uniform(72.0, 81.0) if is_bad else 92.0,
-                            psu_failed_count=rng.randint(1, 2) if (is_bad and is_psu_fan_fault) else 0,
-                            psu_redundancy_ok=not (is_bad and is_psu_fan_fault),
-                            fan_failed_count=rng.randint(1, 2) if (is_bad and is_psu_fan_fault) else 0,
+                            psu_efficiency=rng.uniform(72.0, 81.0) if is_bad else 92.0,
                             fan_rpms=(
                                 {"FAN1/1": rng.uniform(1800.0, 3100.0), "FAN2/1": 6200.0, "FAN3/1": 6300.0}
-                                if (is_bad and not is_psu_fan_fault)
+                                if is_bad
                                 else {"FAN1/1": 5200.0, "FAN2/1": 5200.0, "FAN3/1": 5200.0}
                             ),
                             fan_baseline_rpm=5200.0,
@@ -1687,49 +1985,76 @@ def generate_synthetic_trajectories(
                         )
                         for h in (0, 24, 48)
                     ]
-                target_key = "leaf-001"
-            elif mode == 2:
-                # Control-plane instability: BGP flaps/down + route drop + EVPN-MH LACP desync
-                scenario = "bgp_evpn_route_churn"
+                target_key = "dev-001"
+            elif mode == 3:
+                # Isolated BGP session down / flaps / update storms (zero syslog required)
+                scenario = "bgp_instability"
                 lead_h = rng.uniform(12.0, 48.0)
-                dev = "leaf-001"
+                dev = "dev-001"
                 snap.hardware_control[dev] = [
                     HardwareControlSample(
                         device=dev,
+                        device_model="SN5610",
                         timestamp=base_ts + h * 3600,
                         cpu_temp_c=40.0,
                         asic_temp_c=rng.uniform(48.0, 68.0),
                         ambient_temp_c=24.0,
                         tlimit_c=105.0,
-                        memory_pct=rng.uniform(15.0, 55.0),
-                        load_per_core=rng.uniform(0.04, 0.45),
+                        memory_pct=rng.uniform(15.0, 50.0),
+                        load_per_core=rng.uniform(0.04, 0.40),
+                        psu_efficiency=91.0,
+                        fan_rpms={"FAN1/1": 5200.0, "FAN2/1": 5200.0},
+                        fan_baseline_rpm=5200.0,
+                        bgp_total_neighbors=32,
+                        bgp_established_neighbors=24 if h == 48 else 32,
+                        bgp_down_neighbors=rng.randint(1, 16) if h == 48 else 0,
+                        bgp_flaps_1h=rng.randint(2, 12) if h == 48 else 0,
+                        bgp_flaps_24h=rng.randint(4, 24),
+                        bgp_update_storms=1 if (h == 48 and idx % 2 == 0) else 0,
+                        routes_total=420,
+                    )
+                    for h in (0, 24, 48)
+                ]
+                target_key = dev
+            elif mode == 4:
+                # Isolated EVPN-MH desync / bypass / LACP desync + Route drop / VRF loss
+                scenario = "evpn_route_instability"
+                lead_h = rng.uniform(12.0, 48.0)
+                dev = "dev-001"
+                snap.hardware_control[dev] = [
+                    HardwareControlSample(
+                        device=dev,
+                        device_model="SN5610",
+                        timestamp=base_ts + h * 3600,
+                        cpu_temp_c=41.0,
+                        asic_temp_c=rng.uniform(50.0, 68.0),
+                        ambient_temp_c=24.0,
+                        tlimit_c=105.0,
+                        memory_pct=rng.uniform(15.0, 48.0),
+                        load_per_core=rng.uniform(0.04, 0.40),
                         psu_efficiency=91.0,
                         fan_rpms={"FAN1/1": 5200.0, "FAN2/1": 5200.0},
                         fan_baseline_rpm=5200.0,
                         bgp_total_neighbors=16,
-                        bgp_established_neighbors=14 if h == 48 else 16,
-                        bgp_down_neighbors=rng.randint(1, 3) if h == 48 else 0,
-                        bgp_flaps_1h=rng.randint(3, 12),
-                        bgp_flaps_24h=rng.randint(6, 25),
-                        bgp_update_storms=1 if idx % 2 == 0 else 0,
-                        evpn_mh_critical_es=rng.randint(1, 3) if idx % 2 == 0 else 0,
-                        lacp_desync_count=rng.randint(1, 2) if idx % 2 == 0 else 0,
+                        bgp_established_neighbors=16,
+                        evpn_mh_critical_es=rng.randint(1, 4) if h == 48 else 0,
+                        lacp_desync_count=rng.randint(1, 3) if (h == 48 and idx % 2 == 0) else 0,
                         routes_total=320,
-                        routes_drop_fraction=rng.uniform(0.18, 0.45) if idx % 2 == 1 else 0.0,
-                        log_error_count=rng.randint(0, 15),
-                        log_error_velocity=rng.uniform(0.0, 20.0),
+                        routes_drop_fraction=rng.uniform(0.20, 0.50) if (h == 48 and idx % 2 == 1) else 0.0,
+                        vrf_disappeared_count=1 if (h == 48 and idx % 4 == 1) else 0,
                     )
                     for h in (0, 24, 48)
                 ]
                 target_key = dev
             else:
-                # Duplicate MAC/IP mobility storm + BMC anomalies + watchdog restarts
+                # Duplicate MAC/IP mobility storm + BMC anomalies + critical syslog / watchdog restarts
                 scenario = "dup_mac_bmc_watchdog_storm"
                 lead_h = rng.uniform(12.0, 48.0)
-                dev = "leaf-001"
+                dev = "dev-001"
                 snap.hardware_control[dev] = [
                     HardwareControlSample(
                         device=dev,
+                        device_model="SN5610",
                         timestamp=base_ts + h * 3600,
                         cpu_temp_c=42.0,
                         asic_temp_c=rng.uniform(48.0, 68.0),
@@ -1740,14 +2065,14 @@ def generate_synthetic_trajectories(
                         psu_efficiency=91.0,
                         fan_rpms={"FAN1/1": 5200.0, "FAN2/1": 5200.0},
                         fan_baseline_rpm=5200.0,
-                        bmc_mismatch_count=rng.randint(1, 3),
-                        bmc_port_down_count=rng.randint(0, 2),
-                        dup_ip_active=rng.randint(1, 3),
-                        dup_mac_confirmed=rng.randint(1, 2),
-                        mac_move_rate=rng.uniform(15.0, 250.0),
-                        log_critical_count=rng.randint(1, 4),
-                        log_error_velocity=rng.uniform(6.0, 30.0),
-                        critical_service_restarts_24h=rng.randint(1, 2),
+                        bmc_mismatch_count=rng.randint(1, 3) if h == 48 else 0,
+                        bmc_port_down_count=rng.randint(0, 2) if h == 48 else 0,
+                        dup_ip_active=rng.randint(1, 3) if h == 48 else 0,
+                        dup_mac_confirmed=rng.randint(1, 2) if h == 48 else 0,
+                        mac_move_rate=rng.uniform(15.0, 250.0) if h == 48 else 0.0,
+                        log_critical_count=rng.randint(1, 4) if h == 48 else 0,
+                        log_error_velocity=rng.uniform(12.0, 40.0) if h == 48 else 0.0,
+                        critical_service_restarts_24h=rng.randint(1, 2) if h == 48 else 0,
                     )
                     for h in (0, 24, 48)
                 ]
@@ -1863,25 +2188,28 @@ def extract_self_supervised_examples(
             sub = LLDPqSnapshot(timestamp=t_cut, physical=sub_phys)
             for ef in extractor.extract_physical(sub):
                 if ef.entity_key == key:
-                    # Downweight abrupt step transitions (e.g. sudden cable unplug on a flat
-                    # healthy port) vs genuine drifting/precursor trajectories so healthy
-                    # optical operating points aren't pulled toward false alarms.
+                    # Skip abrupt step transitions (e.g. sudden cable unplug on a flat
+                    # healthy port) that carry zero physical precursor signal so healthy
+                    # OSFP operating points are not poisoned as positive labels.
                     ef_d = ef.as_dict()
                     has_precursor_signal = (
                         ef_d["rx_power_slope_24h"] < -0.25
                         or ef_d["bias_current_slope_24h"] > 0.5
                         or ef_d["log10_ber_slope_24h"] > 0.25
-                        or ef_d["log10_raw_ber"] > -8.5
+                        or ef_d["log10_raw_ber"] > -6.5
                         or ef_d["symbol_error_rate_log1p"] > 0.5
                         or ef_d["flaps_24h"] >= 2.0
                         or ef_d["peer_rx_mad_zscore"] < -2.5
                         or ef_d["link_margin_db"] < 4.5
                     )
+                    if not has_precursor_signal:
+                        ds_phys.metadata["skipped_no_telemetry_transitions"] += 1
+                        break
                     ds_phys.X.append(ef.values)
                     ds_phys.y.append(1)
                     ds_phys.lead_time_hours.append(lead_h)
                     ds_phys.scenarios.append(f"live_self_supervised_{fail_kind}")
-                    ds_phys.weights.append(2.0 if has_precursor_signal else 0.35)
+                    ds_phys.weights.append(2.0)
                     break
         elif not any_bad_ever and (opt_healthy_seen >= min_prefix_samples or ber_healthy_seen >= min_prefix_samples):
             ef = full_phys_feats.get(key)

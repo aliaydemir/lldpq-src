@@ -2079,6 +2079,8 @@ class OpticalAnalyzer:
             'rx_power_dbm': optical_params['rx_power_dbm'],
             'tx_power_dbm': optical_params['tx_power_dbm'],
             'temperature_c': optical_params['temperature_c'],
+            'bias_current_ma': optical_params.get('bias_current_ma'),
+            'voltage_v': optical_params.get('voltage_v'),
             'link_margin_db': link_margin_db,
             'link_margin_ref_dbm': link_margin_ref_dbm,
             'rx_power_lane': optical_params.get('rx_power_lane'),

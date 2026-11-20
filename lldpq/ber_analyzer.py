@@ -546,6 +546,10 @@ class BERAnalyzer:
         symbol_errors = record.get("symbol_errors")
         if isinstance(symbol_errors, int):
             slim["symbol_errors"] = symbol_errors
+        for ber_key in ("raw_ber", "effective_ber"):
+            val = record.get(ber_key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0:
+                slim[ber_key] = float(val)
         delta_errors = record.get("delta_errors")
         if delta_errors is None and (
             record.get("delta_rx_errors") or record.get("delta_tx_errors")

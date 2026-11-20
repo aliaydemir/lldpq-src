@@ -187,18 +187,13 @@ def _norm_grade(value: Any) -> str:
 
 
 def _infer_role(device: str) -> str:
-    low = device.lower()
-    if "spine" in low or "core" in low:
-        return "spine"
-    if "leaf" in low or "tor" in low:
-        return "leaf"
-    if "dgx" in low or "hgx" in low or "gpu" in low or "compute" in low:
-        return "gpu_host"
-    if "oob" in low or "mgmt" in low:
-        return "oob"
-    if "bmc" in low:
-        return "bmc"
-    return "switch"
+    """Return a neutral default role without hostname-pattern heuristics.
+
+    Peer grouping uses hardware ``device_model`` whenever available, falling
+    back to this generic bucket so the engine stays topology- and naming-agnostic.
+    """
+    _ = device
+    return "device"
 
 
 def _parse_float_list(value: Any) -> list[float]:
@@ -1650,19 +1645,36 @@ class LLDPqSnapshotLoader:
         self, root: Path, snapshot: LLDPqSnapshot, devices: set[str], ref_now: float
     ) -> None:
         doc = _load_json(root / "log_summary.json")
-        if not isinstance(doc, dict) or not isinstance(doc.get("device_counts"), dict):
+        if isinstance(doc, dict) and isinstance(doc.get("device_counts"), dict):
+            ts = _epoch(doc.get("generated_at") or doc.get("timestamp"), ref_now) or ref_now
+            for dev, counts in doc["device_counts"].items():
+                if not isinstance(counts, dict):
+                    continue
+                devices.add(str(dev))
+                s = self._upsert_hw(snapshot, str(dev), ts)
+                s.log_critical_count = _int(counts.get("critical")) or 0
+                s.log_error_count = _int(counts.get("error")) or 0
+                s.log_warning_count = _int(counts.get("warning")) or 0
+                s.log_error_velocity = float(s.log_error_count + 2 * s.log_critical_count)
+            snapshot.domain_coverage["logs"] = "loaded"
             return
-        ts = _epoch(doc.get("generated_at"), ref_now) or ref_now
-        for dev, counts in doc["device_counts"].items():
-            if not isinstance(counts, dict):
-                continue
-            devices.add(str(dev))
-            s = self._upsert_hw(snapshot, str(dev), ts)
-            s.log_critical_count = _int(counts.get("critical")) or 0
-            s.log_error_count = _int(counts.get("error")) or 0
-            s.log_warning_count = _int(counts.get("warning")) or 0
-            s.log_error_velocity = float(s.log_error_count + 2 * s.log_critical_count)
-        snapshot.domain_coverage["logs"] = "loaded"
+
+        exp = _load_json(root / "export" / "log.json")
+        if isinstance(exp, dict) and isinstance(exp.get("rows"), list):
+            ts = _epoch(exp.get("generated_at"), ref_now) or ref_now
+            for row in exp["rows"]:
+                if not isinstance(row, dict):
+                    continue
+                dev = str(row.get("device") or "").strip()
+                if not dev:
+                    continue
+                devices.add(dev)
+                s = self._upsert_hw(snapshot, dev, ts)
+                s.log_critical_count = _int(row.get("critical")) or 0
+                s.log_error_count = _int(row.get("error")) or 0
+                s.log_warning_count = _int(row.get("warning")) or 0
+                s.log_error_velocity = float(s.log_error_count + 2 * s.log_critical_count)
+            snapshot.domain_coverage["logs"] = "loaded"
 
     def _load_config_drift(
         self, root: Path, snapshot: LLDPqSnapshot, devices: set[str], ref_now: float
@@ -1741,6 +1753,21 @@ class FeatureExtractor:
                 return item
         return series[-1]
 
+    @staticmethod
+    def _latest_recent_with(
+        series: Sequence[Any],
+        latest_ts: float,
+        window_sec: float,
+        predicate: Any,
+    ) -> Any | None:
+        """Return newest sample within ``window_sec`` of ``latest_ts`` matching ``predicate``, else ``None``."""
+        for item in reversed(series):
+            if (latest_ts - item.timestamp) > window_sec:
+                break
+            if predicate(item):
+                return item
+        return None
+
     def extract_physical(self, snapshot: LLDPqSnapshot) -> list[ExtractedEntityFeatures]:
         # Group latest RX power & bias by peer group (device, or fleet if device has < 3 ports)
         by_device_rx: dict[str, dict[str, float]] = {}
@@ -1795,21 +1822,32 @@ class FeatureExtractor:
                     or s.ber_grade != "unknown"
                 ),
             )
-            flap_lat = self._latest_with(
-                series,
-                lambda s: (latest.timestamp - s.timestamp) <= 3600.0
-                and (s.flaps_24h > 0 or s.flaps_1h > 0 or s.flaps_5m > 0),
+            empty_phys = PhysicalPortSample(
+                device=latest.device, port=latest.port, timestamp=latest.timestamp
             )
-            mm_lat = self._latest_with(
-                series,
-                lambda s: (latest.timestamp - s.timestamp) <= 3600.0
-                and (
-                    s.mtu_mismatch
-                    or s.speed_mismatch
-                    or s.fec_mismatch
-                    or s.autoneg_mismatch
-                    or s.config_mtu_mismatch
-                ),
+            flap_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    3600.0,
+                    lambda s: s.flaps_24h > 0 or s.flaps_1h > 0 or s.flaps_5m > 0,
+                )
+                or empty_phys
+            )
+            mm_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    3600.0,
+                    lambda s: (
+                        s.mtu_mismatch
+                        or s.speed_mismatch
+                        or s.fec_mismatch
+                        or s.autoneg_mismatch
+                        or s.config_mtu_mismatch
+                    ),
+                )
+                or empty_phys
             )
 
             rx_pts = [(s.timestamp, s.rx_power_dbm) for s in series if s.rx_power_dbm is not None]
@@ -1856,13 +1894,16 @@ class FeatureExtractor:
             log_raw_ber = safe_log10_ber(ber_lat.raw_ber)
             log_eff_ber = safe_log10_ber(ber_lat.effective_ber)
 
+            recent_ber_samples = [
+                s for s in series if (latest.timestamp - s.timestamp) <= 3600.0
+            ] or [ber_lat]
             sym_delta_recent = max(
-                ber_lat.symbol_error_delta,
-                max((s.symbol_error_delta for s in series[-3:]), default=0),
+                ber_lat.symbol_error_delta if (latest.timestamp - ber_lat.timestamp) <= 3600.0 else 0,
+                max((s.symbol_error_delta for s in recent_ber_samples), default=0),
             )
             fec_uncorr_recent = max(
-                ber_lat.fec_uncorrectable_delta,
-                max((s.fec_uncorrectable_delta for s in series[-3:]), default=0),
+                ber_lat.fec_uncorrectable_delta if (latest.timestamp - ber_lat.timestamp) <= 3600.0 else 0,
+                max((s.fec_uncorrectable_delta for s in recent_ber_samples), default=0),
             )
             sym_rate = math.log1p(max(0, sym_delta_recent) + 5 * max(0, fec_uncorr_recent))
             crc_rate = math.log1p(
@@ -2211,61 +2252,110 @@ class FeatureExtractor:
                 dev_temp_peer[dev] = stats.get(dev, (0.0, 0.0, 0.0))
                 dev_peer_sizes[dev] = len(eff)
 
+        active_win = 3600.0
+        route_win = 6 * 3600.0
         for dev in sorted(snapshot.hardware_control):
             series = snapshot.hardware_control[dev]
             if not series:
                 continue
             latest = series[-1]
             hw_lat = hw_latest_map[dev]
+            empty_hw = HardwareControlSample(device=dev, timestamp=latest.timestamp)
             grade_lat = self._latest_with(series, lambda s: s.overall_grade != "unknown")
-            bgp_lat = self._latest_with(
-                series,
-                lambda s: (
-                    s.bgp_total_neighbors > 0
-                    or s.bgp_down_neighbors > 0
-                    or s.bgp_flaps_1h > 0
-                    or s.bgp_flaps_24h > 0
-                    or s.bgp_update_storms > 0
-                ),
+            # Scope control-plane / log / BMC / event indicators to the active
+            # collection window so faults resolved hours earlier do not stay
+            # permanently pinned at CRITICAL after recovery.
+            bgp_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: (
+                        s.bgp_total_neighbors > 0
+                        or s.bgp_down_neighbors > 0
+                        or s.bgp_flaps_1h > 0
+                        or s.bgp_flaps_24h > 0
+                        or s.bgp_update_storms > 0
+                    ),
+                )
+                or empty_hw
             )
-            routes_lat = self._latest_with(
-                series,
-                lambda s: s.routes_total > 0 or s.routes_drop_fraction > 0 or s.vrf_disappeared_count > 0,
+            routes_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: s.routes_total > 0 or s.routes_drop_fraction > 0 or s.vrf_disappeared_count > 0,
+                )
+                or empty_hw
             )
-            evpn_lat = self._latest_with(
-                series,
-                lambda s: (
-                    s.evpn_mh_total_es > 0
-                    or s.evpn_mh_critical_es > 0
-                    or s.evpn_mh_warning_es > 0
-                    or s.evpn_mh_inconsistent_es > 0
-                    or s.evpn_mh_bypass_es > 0
-                    or s.lacp_desync_count > 0
-                ),
+            evpn_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: (
+                        s.evpn_mh_total_es > 0
+                        or s.evpn_mh_critical_es > 0
+                        or s.evpn_mh_warning_es > 0
+                        or s.evpn_mh_inconsistent_es > 0
+                        or s.evpn_mh_bypass_es > 0
+                        or s.lacp_desync_count > 0
+                    ),
+                )
+                or empty_hw
             )
-            dup_lat = self._latest_with(
-                series,
-                lambda s: s.dup_ip_active > 0 or s.dup_mac_confirmed > 0 or s.mac_move_rate > 0,
+            dup_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: s.dup_ip_active > 0 or s.dup_mac_confirmed > 0 or s.mac_move_rate > 0,
+                )
+                or empty_hw
             )
-            bmc_lat = self._latest_with(
-                series,
-                lambda s: (
-                    s.bmc_mismatch_count > 0
-                    or s.bmc_wrong_port_count > 0
-                    or s.bmc_port_down_count > 0
-                    or s.bmc_sensor_faults > 0
-                    or s.bmc_stale_count > 0
-                ),
+            bmc_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: (
+                        s.bmc_mismatch_count > 0
+                        or s.bmc_wrong_port_count > 0
+                        or s.bmc_port_down_count > 0
+                        or s.bmc_sensor_faults > 0
+                        or s.bmc_stale_count > 0
+                    ),
+                )
+                or empty_hw
             )
-            log_lat = self._latest_with(
-                series,
-                lambda s: s.log_critical_count > 0 or s.log_error_count > 0 or s.log_error_velocity > 0,
+            log_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: s.log_critical_count > 0 or s.log_error_count > 0 or s.log_error_velocity > 0,
+                )
+                or empty_hw
             )
-            sys_lat = self._latest_with(
-                series,
-                lambda s: s.reboots_24h > 0 or s.service_restarts_24h > 0 or s.critical_service_restarts_24h > 0,
+            sys_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: s.reboots_24h > 0 or s.service_restarts_24h > 0 or s.critical_service_restarts_24h > 0,
+                )
+                or empty_hw
             )
-            drift_lat = self._latest_with(series, lambda s: s.config_drift_events_24h > 0)
+            drift_lat = (
+                self._latest_recent_with(
+                    series,
+                    latest.timestamp,
+                    active_win,
+                    lambda s: s.config_drift_events_24h > 0,
+                )
+                or empty_hw
+            )
 
             temp_pts = [
                 (s.timestamp, max(t for t in (s.asic_temp_c, s.cpu_temp_c) if t is not None))
@@ -2341,9 +2431,32 @@ class FeatureExtractor:
                 + 0.5 * evpn_lat.evpn_mh_warning_es
                 + 0.5 * evpn_lat.evpn_mh_orphan_es
             )
-            route_drop_max = max((s.routes_drop_fraction for s in series), default=routes_lat.routes_drop_fraction)
-            vrf_lost_max = max((s.vrf_disappeared_count for s in series), default=routes_lat.vrf_disappeared_count)
-            ecmp_drop_max = max((s.ecmp_width_drop for s in series), default=routes_lat.ecmp_width_drop)
+            routes_recovered = (
+                routes_lat.routes_total > 0
+                and routes_lat.routes_drop_fraction < 0.05
+                and routes_lat.vrf_disappeared_count == 0
+                and routes_lat.ecmp_width_drop == 0
+            )
+            if routes_recovered:
+                route_drop_max = routes_lat.routes_drop_fraction
+                vrf_lost_max = routes_lat.vrf_disappeared_count
+                ecmp_drop_max = routes_lat.ecmp_width_drop
+            else:
+                recent_route_samples = [
+                    s for s in series if (latest.timestamp - s.timestamp) <= route_win
+                ]
+                route_drop_max = max(
+                    (s.routes_drop_fraction for s in recent_route_samples),
+                    default=routes_lat.routes_drop_fraction,
+                )
+                vrf_lost_max = max(
+                    (s.vrf_disappeared_count for s in recent_route_samples),
+                    default=routes_lat.vrf_disappeared_count,
+                )
+                ecmp_drop_max = max(
+                    (s.ecmp_width_drop for s in recent_route_samples),
+                    default=routes_lat.ecmp_width_drop,
+                )
             route_churn = float(
                 route_drop_max * 10.0
                 + 5.0 * vrf_lost_max

@@ -1,10 +1,11 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>..::LLDPQ::.. Predictive Health Analysis</title>
     <link rel="shortcut icon" href="/png/favicon.ico">
-    <title>..::LLDPQ::.. Predictive Health</title>
-    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+    <link rel="stylesheet" type="text/css" href="/css/table-filter.css?v=20260716-tf-3">
     <script src="css/auth.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -15,6 +16,13 @@
             padding: 20px;
             min-height: 100vh;
         }
+        input:-webkit-autofill,
+        input:-webkit-autofill:hover,
+        input:-webkit-autofill:focus {
+            -webkit-box-shadow: 0 0 0 1000px #1a1a1a inset !important;
+            -webkit-text-fill-color: #fff !important;
+            caret-color: #fff !important;
+        }
         .page-header {
             display: flex;
             justify-content: space-between;
@@ -22,147 +30,209 @@
             flex-wrap: wrap;
             gap: 12px;
             margin-bottom: 20px;
-            padding-bottom: 14px;
+            padding-bottom: 15px;
             border-bottom: 1px solid #404040;
         }
-        .page-title {
-            font-size: 24px;
-            font-weight: 600;
-            color: #76b900;
-        }
-        .page-subtitle {
-            font-size: 13px;
-            color: #9e9e9e;
-            margin-top: 4px;
-        }
+        .page-title { font-size: 24px; font-weight: 600; color: #76b900; }
+        .last-updated { font-size: 13px; color: #888; margin-top: 3px; }
         .action-buttons { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        .search-wrap { display: flex; align-items: center; gap: 6px; }
+        .search-input {
+            background: #3c3c3c;
+            border: 1px solid #555;
+            color: #d4d4d4;
+            padding: 7px 11px;
+            border-radius: 4px;
+            font-size: 13px;
+            min-width: 220px;
+            height: 34px;
+        }
+        .search-input::placeholder { color: #888; }
+        .search-input:focus { border-color: #76b900; outline: none; }
+        .clear-search-btn {
+            background: #f44336;
+            color: #fff;
+            border: none;
+            padding: 6px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            display: none;
+            height: 34px;
+        }
+        .clear-search-btn:hover { background: #d32f2f; }
+
         .btn {
-            padding: 7px 14px;
+            padding: 8px 14px;
             border: none;
             border-radius: 4px;
             font-size: 13px;
             font-weight: 500;
             cursor: pointer;
-            color: #fff;
-        }
-        .btn-primary { background: linear-gradient(0deg, #689f38 0%, #76b900 100%); }
-        .btn-primary:hover { background: linear-gradient(0deg, #76b900 0%, #8bc34a 100%); }
-        .btn-secondary { background: #333; border: 1px solid #555; color: #e0e0e0; }
-        .btn-secondary:hover { background: #424242; }
-
-        .summary-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(175px, 1fr));
-            gap: 14px;
-            margin-bottom: 22px;
-        }
-        .summary-card {
-            background: #252526;
-            padding: 14px 16px;
-            border-radius: 6px;
-            border-left: 3px solid #76b900;
-        }
-        .summary-card.critical { border-left-color: #f44336; }
-        .summary-card.warning { border-left-color: #ff9800; }
-        .summary-card.early { border-left-color: #29b6f6; }
-        .card-value { font-size: 28px; font-weight: 700; color: #f5f5f5; }
-        .card-label { font-size: 12px; color: #9e9e9e; margin-top: 4px; text-transform: uppercase; letter-spacing: 0.4px; }
-
-        .controls-bar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-            justify-content: space-between;
-            margin-bottom: 16px;
-            background: #252526;
-            padding: 12px 14px;
-            border-radius: 6px;
-        }
-        .filter-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-        .pill-btn {
-            padding: 6px 12px;
-            border-radius: 16px;
-            border: 1px solid #4a4a4a;
-            background: #2d2d30;
-            color: #d4d4d4;
-            font-size: 12px;
-            cursor: pointer;
-        }
-        .pill-btn.active {
-            background: #76b900;
-            color: #111;
-            border-color: #76b900;
-            font-weight: 600;
-        }
-        .search-input {
-            background: #1e1e1e;
-            border: 1px solid #555;
-            color: #e0e0e0;
-            padding: 7px 12px;
-            border-radius: 4px;
-            font-size: 13px;
-            min-width: 240px;
-        }
-        .search-input:focus { border-color: #76b900; outline: none; }
-        .toggle-label {
+            transition: all 0.2s;
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            font-size: 13px;
-            color: #d4d4d4;
-            cursor: pointer;
+            color: #fff;
         }
+        .btn-primary { background: linear-gradient(0deg, #76b900 0%, #5a8c00 100%); }
+        .btn-primary:hover { background: linear-gradient(0deg, #8bd400 0%, #6ba000 100%); }
+        .btn-secondary { background: linear-gradient(0deg, #4fc3f7 0%, #0288d1 100%); }
+        .btn-secondary:hover { background: linear-gradient(0deg, #81d4fa 0%, #039be5 100%); }
 
-        .table-wrap {
-            background: #252526;
-            border-radius: 6px;
-            overflow-x: auto;
-            border: 1px solid #333;
+        .dashboard-section {
+            background: #2d2d2d;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            overflow: hidden;
         }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th {
-            text-align: left;
-            padding: 10px 12px;
-            background: #2d2d30;
-            color: #bdbdbd;
+        .section-header {
+            padding: 12px 16px;
+            background: #333;
             font-weight: 600;
+            font-size: 14px;
+            color: #76b900;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
             border-bottom: 1px solid #404040;
-            white-space: nowrap;
         }
-        td {
-            padding: 10px 12px;
-            border-bottom: 1px solid #323234;
+        .section-header-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .section-header-meta {
+            font-size: 12px;
+            font-weight: 400;
+            color: #9e9e9e;
+        }
+        .section-content { padding: 16px; }
+        .section-content-table { padding: 0; overflow-x: auto; }
+
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            gap: 12px;
+        }
+        .summary-card {
+            background: #252526;
+            padding: 14px 15px;
+            border-radius: 6px;
+            border-left: 3px solid #76b900;
+            cursor: pointer;
+            transition: all 0.18s ease;
+            user-select: none;
+        }
+        .summary-card:hover { background: #2f2f30; transform: translateY(-1px); }
+        .summary-card.active { background: #333; border-left-width: 6px; box-shadow: inset 0 0 0 1px rgba(118, 185, 0, 0.35); }
+        .summary-card.noclick { cursor: default; }
+        .summary-card.noclick:hover { background: #252526; transform: none; }
+        .card-excellent { border-left-color: #76b900; }
+        .card-good { border-left-color: #8bc34a; }
+        .card-warning { border-left-color: #ff9800; }
+        .card-critical { border-left-color: #f44336; }
+        .card-info { border-left-color: #4fc3f7; }
+        .card-unknown { border-left-color: #9e9e9e; }
+        .metric { font-size: 22px; font-weight: bold; color: #d4d4d4; }
+        .metric-label { font-size: 12px; color: #888; margin-top: 4px; }
+        .card-excellent .metric { color: #76b900; }
+        .card-good .metric { color: #8bc34a; }
+        .card-warning .metric { color: #ff9800; }
+        .card-critical .metric { color: #f44336; }
+        .card-info .metric { color: #4fc3f7; }
+        .card-unknown .metric { color: #9e9e9e; }
+
+        .filter-info {
+            text-align: center;
+            padding: 10px 15px;
+            margin-bottom: 16px;
+            background: rgba(118, 185, 0, 0.1);
+            border: 1px solid rgba(118, 185, 0, 0.3);
+            border-radius: 6px;
+            color: #76b900;
+            display: none;
+            font-size: 13px;
+        }
+        .filter-info button {
+            margin-left: 10px;
+            padding: 4px 10px;
+            background: #76b900;
+            color: #000;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .filter-info button:hover { background: #8bd400; }
+
+        .predictive-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .predictive-table th,
+        .predictive-table td {
+            border: 1px solid #404040;
+            padding: 9px 11px;
+            text-align: left;
             vertical-align: top;
         }
-        tr:hover { background: #2c2c30; }
+        .predictive-table th {
+            background: #333;
+            color: #76b900;
+            font-weight: 600;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .predictive-table tbody tr { background: #252526; }
+        .predictive-table tbody tr:hover { background: #2d2d2d; }
+
+        .sortable { cursor: pointer; user-select: none; padding-right: 22px; }
+        .sortable:hover { background: #3c3c3c; }
+        .sort-arrow { font-size: 10px; color: #666; margin-left: 5px; opacity: 0.55; }
+        .sort-arrow::before { content: '▲▼'; }
+        .sortable.asc .sort-arrow::before { content: '▲'; color: #76b900; opacity: 1; }
+        .sortable.desc .sort-arrow::before { content: '▼'; color: #76b900; opacity: 1; }
+        .sortable.asc .sort-arrow,
+        .sortable.desc .sort-arrow { opacity: 1; }
+
         .badge {
             display: inline-block;
-            padding: 2px 8px;
-            border-radius: 10px;
+            padding: 3px 9px;
+            border-radius: 4px;
             font-size: 11px;
             font-weight: 600;
             text-transform: uppercase;
+            white-space: nowrap;
         }
-        .badge-critical { background: rgba(244, 67, 54, 0.2); color: #ff6b60; border: 1px solid #f44336; }
-        .badge-warning { background: rgba(255, 152, 0, 0.2); color: #ffb74d; border: 1px solid #ff9800; }
-        .badge-info { background: rgba(118, 185, 0, 0.16); color: #a5d66b; border: 1px solid #689f38; }
-        .badge-early { background: rgba(41, 182, 246, 0.18); color: #4fc3f7; border: 1px solid #29b6f6; margin-left: 4px; }
-        .badge-family { background: #333; color: #ccc; border: 1px solid #555; }
+        .badge-green { background: rgba(118, 185, 0, 0.2); color: #76b900; }
+        .badge-red { background: rgba(244, 67, 54, 0.2); color: #ff6b6b; }
+        .badge-orange { background: rgba(255, 152, 0, 0.2); color: #ffb74d; }
+        .badge-blue { background: rgba(79, 195, 247, 0.2); color: #4fc3f7; }
+        .badge-gray { background: rgba(158, 158, 158, 0.2); color: #aaa; }
+        .badge-early { margin-left: 4px; }
 
-        .risk-bar-wrap { display: flex; align-items: center; gap: 8px; min-width: 110px; }
-        .risk-bar-bg { flex: 1; height: 8px; background: #3c3c3c; border-radius: 4px; overflow: hidden; }
+        .mono { font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; }
+        .dim { color: #888; font-size: 11px; }
+        .role-tag { color: #ffb74d; font-size: 11px; margin-top: 2px; }
+
+        .risk-cell { min-width: 118px; }
+        .risk-bar-wrap { display: flex; align-items: center; gap: 8px; }
+        .risk-score-val { font-weight: 700; min-width: 34px; }
+        .risk-bar-bg { flex: 1; height: 7px; background: #3c3c3c; border-radius: 4px; overflow: hidden; min-width: 52px; }
         .risk-bar-fill { height: 100%; border-radius: 4px; }
-        .reasons-list { list-style: disc; padding-left: 16px; color: #cccccc; font-size: 12px; line-height: 1.45; }
-        .action-text { font-size: 12px; color: #a5d6a7; max-width: 280px; line-height: 1.4; }
-        .empty-state {
-            padding: 40px 20px;
-            text-align: center;
-            color: #9e9e9e;
-            font-size: 14px;
-        }
+        .tier-breakdown { font-size: 11px; color: #888; margin-top: 3px; font-family: 'Consolas', 'Courier New', monospace; }
+
+        .reasons-list { list-style: disc; padding-left: 16px; color: #cccccc; font-size: 12px; line-height: 1.45; margin: 0; }
+        .action-text { font-size: 12px; color: #a5d6a7; max-width: 290px; line-height: 1.4; }
+        .empty-row td { text-align: center; color: #888; padding: 28px; font-size: 13px; }
+        .empty-row.ok td { color: #76b900; }
+
         .meta-footer {
-            margin-top: 12px;
+            margin-top: 8px;
             font-size: 12px;
             color: #888;
             display: flex;
@@ -170,88 +240,199 @@
             flex-wrap: wrap;
             gap: 8px;
         }
+
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.72);
+        }
+        .modal.show { display: flex; justify-content: center; align-items: center; }
+        .modal-box {
+            background: #2d2d2d;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 680px;
+            max-height: 84vh;
+            overflow: auto;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.55);
+            border: 1px solid #444;
+        }
+        .modal-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            background: #333;
+            border-bottom: 1px solid #444;
+        }
+        .modal-head h3 { color: #76b900; font-size: 16px; margin: 0; }
+        .modal-close { background: none; border: none; color: #888; font-size: 24px; cursor: pointer; line-height: 1; }
+        .modal-close:hover { color: #fff; }
+        .modal-body { padding: 18px; font-size: 13px; line-height: 1.6; color: #d4d4d4; }
+        .modal-body h4 { color: #76b900; margin: 12px 0 4px; font-size: 13px; }
+        .modal-body h4:first-child { margin-top: 0; }
+        .modal-body code { background: #1e1e1e; padding: 1px 5px; border-radius: 3px; color: #e0c64a; }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #1e1e1e; }
+        ::-webkit-scrollbar-thumb { background: #404040; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
     </style>
 </head>
 <body>
     <div class="page-header">
         <div>
-            <div class="page-title">Predictive Health</div>
-            <div class="page-subtitle" id="meta-line">Loading predictive health model output...</div>
+            <div class="page-title">Predictive Health Analysis</div>
+            <div class="last-updated" id="meta-line">Loading predictive health model output...</div>
         </div>
         <div class="action-buttons">
-            <button class="btn btn-secondary" id="btn-export-csv" type="button">Download CSV</button>
-            <button class="btn btn-primary" id="btn-refresh" type="button">Refresh</button>
+            <div class="search-wrap">
+                <input type="text" class="search-input" id="search-box" autocomplete="off" placeholder="Search device, port, signal..." />
+                <button id="clearSearchBtn" class="clear-search-btn" type="button" title="Clear search">&#10005;</button>
+            </div>
+            <button id="btn-about" class="btn btn-secondary" type="button" title="Model &amp; scoring reference">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M3,17V19H9V17H3M3,5V7H13V5H3M13,21V19H21V17H13V15H11V21H13M7,9V11H3V13H7V15H9V9H7M21,13V11H11V13H21M15,9H17V7H21V5H17V3H15V9Z"/></svg>
+                About
+            </button>
+            <button id="btn-refresh" class="btn btn-secondary" type="button">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M17.65,6.35C16.2,4.9 14.21,4 12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20C15.73,20 18.84,17.45 19.73,14H17.65C16.83,16.33 14.61,18 12,18A6,6 0 0,1 6,12A6,6 0 0,1 12,6C13.66,6 15.14,6.69 16.22,7.78L13,11H20V4L17.65,6.35Z"/></svg>
+                Refresh
+            </button>
+            <button id="download-csv" class="btn btn-primary" type="button">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M14,2H6A2,2 0 0,0 4,4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V8L14,2M18,20H6V4H13V9H18V20Z"/></svg>
+                Download CSV
+            </button>
         </div>
     </div>
 
-    <div class="summary-grid">
-        <div class="summary-card critical">
-            <div class="card-value" id="kpi-critical">0</div>
-            <div class="card-label">Critical Risk (24h)</div>
+    <div class="dashboard-section">
+        <div class="section-header">
+            <span class="section-header-title">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+                Predictive Health Summary
+            </span>
+            <span class="section-header-meta" id="summary-model-pill">Model: --</span>
         </div>
-        <div class="summary-card warning">
-            <div class="card-value" id="kpi-warning">0</div>
-            <div class="card-label">Warning Risk (48-72h)</div>
-        </div>
-        <div class="summary-card early">
-            <div class="card-value" id="kpi-early">0</div>
-            <div class="card-label">Early Precursors (Sub-Threshold)</div>
-        </div>
-        <div class="summary-card">
-            <div class="card-value" id="kpi-devices">0</div>
-            <div class="card-label">Affected Switches</div>
-        </div>
-        <div class="summary-card">
-            <div class="card-value" id="kpi-scored">0</div>
-            <div class="card-label">Entities Scored</div>
+        <div class="section-content">
+            <div class="summary-grid">
+                <div class="summary-card card-excellent active" id="card-all" data-card-filter="all" title="Show all actionable predictive signals">
+                    <div class="metric" id="kpi-actionable">0</div>
+                    <div class="metric-label">Total Actionable</div>
+                </div>
+                <div class="summary-card card-critical" id="card-critical" data-card-filter="severity:CRITICAL" title="Filter Critical Risk (24h)">
+                    <div class="metric" id="kpi-critical">0</div>
+                    <div class="metric-label">Critical Risk (24h)</div>
+                </div>
+                <div class="summary-card card-warning" id="card-warning" data-card-filter="severity:WARNING" title="Filter Warning Risk (48-72h)">
+                    <div class="metric" id="kpi-warning">0</div>
+                    <div class="metric-label">Warning Risk (48-72h)</div>
+                </div>
+                <div class="summary-card card-info" id="card-early" data-card-filter="early" title="Filter sub-threshold Early Precursors (raw status nominal)">
+                    <div class="metric" id="kpi-early">0</div>
+                    <div class="metric-label">Early Precursors</div>
+                </div>
+                <div class="summary-card card-good" id="card-physical" data-card-filter="family:physical" title="Filter Physical &amp; Optical signals">
+                    <div class="metric" id="kpi-physical">0</div>
+                    <div class="metric-label">Physical &amp; Optical</div>
+                </div>
+                <div class="summary-card card-info" id="card-congestion" data-card-filter="family:congestion" title="Filter RoCEv2 Congestion signals">
+                    <div class="metric" id="kpi-congestion">0</div>
+                    <div class="metric-label">RoCEv2 Congestion</div>
+                </div>
+                <div class="summary-card card-warning" id="card-hardware" data-card-filter="family:hardware_control" title="Filter Hardware &amp; Control signals">
+                    <div class="metric" id="kpi-hardware">0</div>
+                    <div class="metric-label">Hardware &amp; Control</div>
+                </div>
+                <div class="summary-card card-excellent noclick" id="card-devices">
+                    <div class="metric" id="kpi-devices">0</div>
+                    <div class="metric-label">Affected Switches</div>
+                </div>
+                <div class="summary-card card-unknown noclick" id="card-scored">
+                    <div class="metric" id="kpi-scored">0</div>
+                    <div class="metric-label">Entities Scored</div>
+                </div>
+            </div>
         </div>
     </div>
 
-    <div class="controls-bar">
-        <div class="filter-group" id="family-filters">
-            <button class="pill-btn active" data-family="all" type="button">All Families</button>
-            <button class="pill-btn" data-family="physical" type="button">Physical &amp; Optical</button>
-            <button class="pill-btn" data-family="congestion" type="button">RoCEv2 Congestion</button>
-            <button class="pill-btn" data-family="hardware_control" type="button">Hardware &amp; Control</button>
-        </div>
-        <div class="filter-group">
-            <label class="toggle-label">
-                <input type="checkbox" id="chk-early-only" />
-                Early Warnings Only
-            </label>
-            <input type="text" class="search-input" id="search-box" placeholder="Filter switch, port, reason..." />
-        </div>
+    <div class="filter-info" id="filterInfo">
+        Filtered &mdash; <span id="filterLabel"></span>
+        <button id="btn-show-all" type="button">Show All</button>
     </div>
 
-    <div class="table-wrap">
-        <table>
-            <thead>
-                <tr>
-                    <th>Severity</th>
-                    <th>Risk</th>
-                    <th>Horizon</th>
-                    <th>Entity</th>
-                    <th>Family</th>
-                    <th>Peer Z</th>
-                    <th>Top Risk Signals</th>
-                    <th>Recommended Action</th>
-                </tr>
-            </thead>
-            <tbody id="risk-tbody">
-                <tr><td colspan="8" class="empty-state">Loading predictive health data...</td></tr>
-            </tbody>
-        </table>
+    <div class="dashboard-section">
+        <div class="section-header">
+            <span class="section-header-title">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M16,6L18.29,8.29L13.41,13.17L9.41,9.17L2,16.59L3.41,18L9.41,12L13.41,16L19.71,9.71L22,12V6H16Z"/></svg>
+                Predictive Risk Signals
+            </span>
+            <span class="section-header-meta" id="footer-count">Showing 0 rows</span>
+        </div>
+        <div class="section-content-table">
+            <table class="predictive-table" id="predictive-table" data-filterable>
+                <thead>
+                    <tr>
+                        <th class="sortable" data-col="0" data-type="num">Severity<span class="sort-arrow"></span></th>
+                        <th class="sortable desc" data-col="1" data-type="num">Risk Score<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="2" data-type="num">Horizon<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="3" data-type="str">Device<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="4" data-type="str">Port / Sensor<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="5" data-type="str">Family<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="6" data-type="str">Raw Status<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="7" data-type="num">Peer Z<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="8" data-type="str">Top Risk Signals<span class="sort-arrow"></span></th>
+                        <th class="sortable" data-col="9" data-type="str">Recommended Action<span class="sort-arrow"></span></th>
+                    </tr>
+                </thead>
+                <tbody id="risk-tbody">
+                    <tr class="empty-row"><td colspan="10">Loading predictive health data...</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <div class="meta-footer">
-        <span id="footer-count">Showing 0 rows</span>
+        <span id="footer-summary">Click any summary card to filter, click any column header to sort, or use the column funnel icon for per-column filtering.</span>
         <span id="footer-model">Model: --</span>
     </div>
 
+    <div class="modal" id="about-modal">
+        <div class="modal-box">
+            <div class="modal-head">
+                <h3>Predictive Health &mdash; Scoring &amp; Model Reference</h3>
+                <button class="modal-close" id="btn-close-about" type="button">&times;</button>
+            </div>
+            <div class="modal-body">
+                <h4>Two-Tier Hybrid Engine</h4>
+                Every monitored entity is scored locally with zero external dependencies using two complementary tiers:
+                <b>Tier-1 Physics &amp; Peer Heuristics</b> (optical decay slopes, laser bias rise, pre-FEC/post-FEC BER, RoCEv2 PFC/ECN/HOQ asymmetry, localized thermal/fan/PSU and control-plane anomalies) combined with
+                <b>Tier-2 Gradient-Boosted Trees (GBDT)</b> trained on physics-grounded trajectories and calibrated against anonymized fabric baselines.
+                <h4>Severity &amp; Horizon Bands</h4>
+                <code>CRITICAL</code> (score &ge; 70, 24h horizon) indicates imminent or active failure requiring immediate triage.
+                <code>WARNING</code> (score 40&ndash;69, 48&ndash;72h horizon) flags developing degradation to address in the next maintenance window.
+                <code>INFO</code> (score &lt; 40) entities are nominal and omitted from the actionable table.
+                <h4>Early Precursors (Sub-Threshold)</h4>
+                The <code>EARLY</code> badge marks entities flagged as WARNING/CRITICAL while <em>all</em> underlying raw LLDPq domain analyzers (optical, BER, flap, fabric-check, hardware, BGP, EVPN-MH, routes, duplicate, logs, system watchdog) still report nominal/healthy status.
+                <h4>Model Metadata</h4>
+                <div id="about-model-details">Loading...</div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/css/table-filter.js?v=20260821-tf-6"></script>
     <script>
         (function () {
-            let allRows = [];
-            let activeFamily = 'all';
+            'use strict';
+
+            var allRows = [];
+            var activeCardFilter = 'all';
+            var currentSortCol = 1;
+            var currentSortDir = 'desc';
 
             function riskColor(score) {
                 if (score >= 70) return '#f44336';
@@ -259,81 +440,227 @@
                 return '#76b900';
             }
 
+            function severityRank(sev) {
+                var s = String(sev || '').toUpperCase();
+                if (s === 'CRITICAL') return 0;
+                if (s === 'WARNING') return 1;
+                return 2;
+            }
+
             function familyLabel(fam) {
-                if (fam === 'physical') return 'Physical';
-                if (fam === 'congestion') return 'RoCEv2';
-                if (fam === 'hardware_control') return 'HW / Ctrl';
+                if (fam === 'physical') return 'Physical & Optical';
+                if (fam === 'congestion') return 'RoCEv2 Congestion';
+                if (fam === 'hardware_control') return 'Hardware & Control';
                 return fam || '--';
             }
 
-            function getFilteredRows() {
-                const earlyOnly = document.getElementById('chk-early-only').checked;
-                const q = (document.getElementById('search-box').value || '').trim().toLowerCase();
-                return allRows.filter(function (row) {
-                    if (activeFamily !== 'all' && row.family !== activeFamily) return false;
-                    if (earlyOnly && !row.early_warning) return false;
-                    if (q) {
-                        const hay = [
-                            row.entity_key || '',
-                            row.device || '',
-                            row.port || '',
-                            row.family || '',
-                            row.severity || '',
-                            (row.top_reasons || []).join(' '),
-                            row.recommended_action || ''
-                        ].join(' ').toLowerCase();
-                        if (hay.indexOf(q) === -1) return false;
-                    }
-                    return true;
-                });
+            function rawStatusBadgeClass(raw) {
+                var r = String(raw || 'unknown').toLowerCase();
+                if (r === 'critical' || r === 'error' || r === 'bad' || r === 'down' || r === 'fail' || r === 'failed' || r === 'fault') {
+                    return 'badge badge-red';
+                }
+                if (r === 'warning' || r === 'warn' || r === 'degraded' || r === 'marginal') {
+                    return 'badge badge-orange';
+                }
+                if (r === 'excellent' || r === 'good' || r === 'ok' || r === 'healthy' || r === 'normal' || r === 'quiet' || r === 'up') {
+                    return 'badge badge-green';
+                }
+                return 'badge badge-gray';
             }
 
-            function renderTable() {
-                const tbody = document.getElementById('risk-tbody');
-                tbody.textContent = '';
-                const rows = getFilteredRows();
-                document.getElementById('footer-count').textContent =
-                    'Showing ' + rows.length + ' of ' + allRows.length + ' actionable signals';
+            function isRowVisible(tr) {
+                if (!tr || tr.classList.contains('empty-row')) return false;
+                if (tr.style.display === 'none') return false;
+                if (tr.classList.contains('tf-hidden')) return false;
+                if (tr.classList.contains('lldpq-lifecycle-hidden')) return false;
+                return true;
+            }
 
-                if (rows.length === 0) {
-                    const tr = document.createElement('tr');
-                    const td = document.createElement('td');
-                    td.colSpan = 8;
-                    td.className = 'empty-state';
-                    td.textContent = allRows.length === 0
-                        ? 'No predictive warnings or critical risks detected in the latest snapshot.'
-                        : 'No predictive signals match the active filters.';
-                    tr.appendChild(td);
-                    tbody.appendChild(tr);
+            function updateVisibleCount() {
+                var tbody = document.getElementById('risk-tbody');
+                var dataTrs = Array.from(tbody.querySelectorAll('tr:not(.empty-row)'));
+                var scopedTrs = dataTrs.filter(function (tr) {
+                    return !tr.classList.contains('lldpq-lifecycle-hidden');
+                });
+                var visibleTrs = scopedTrs.filter(isRowVisible);
+                document.getElementById('footer-count').textContent =
+                    'Showing ' + visibleTrs.length + ' of ' + scopedTrs.length + ' actionable signals';
+            }
+
+            function updateFilterBanner() {
+                var info = document.getElementById('filterInfo');
+                var label = document.getElementById('filterLabel');
+                var q = (document.getElementById('search-box').value || '').trim();
+                var parts = [];
+                if (activeCardFilter === 'severity:CRITICAL') parts.push('Critical Risk (24h)');
+                else if (activeCardFilter === 'severity:WARNING') parts.push('Warning Risk (48-72h)');
+                else if (activeCardFilter === 'early') parts.push('Early Precursors (Sub-Threshold)');
+                else if (activeCardFilter === 'family:physical') parts.push('Physical & Optical');
+                else if (activeCardFilter === 'family:congestion') parts.push('RoCEv2 Congestion');
+                else if (activeCardFilter === 'family:hardware_control') parts.push('Hardware & Control');
+                if (q) parts.push('Search: "' + q + '"');
+
+                if (parts.length > 0) {
+                    label.textContent = parts.join(' + ');
+                    info.style.display = 'block';
+                } else {
+                    info.style.display = 'none';
+                }
+                document.getElementById('clearSearchBtn').style.display = q ? 'inline-block' : 'none';
+            }
+
+            function applyPageFilters() {
+                var q = (document.getElementById('search-box').value || '').trim().toLowerCase();
+                var tbody = document.getElementById('risk-tbody');
+                var rows = Array.from(tbody.querySelectorAll('tr:not(.empty-row)'));
+                rows.forEach(function (tr) {
+                    var show = true;
+                    if (activeCardFilter === 'severity:CRITICAL') {
+                        show = tr.dataset.severity === 'CRITICAL';
+                    } else if (activeCardFilter === 'severity:WARNING') {
+                        show = tr.dataset.severity === 'WARNING';
+                    } else if (activeCardFilter === 'early') {
+                        show = tr.dataset.early === '1';
+                    } else if (activeCardFilter.indexOf('family:') === 0) {
+                        show = tr.dataset.family === activeCardFilter.slice(7);
+                    }
+                    if (show && q) {
+                        var hay = (tr.dataset.search || '').toLowerCase();
+                        if (hay.indexOf(q) === -1) show = false;
+                    }
+                    tr.style.display = show ? '' : 'none';
+                });
+                updateFilterBanner();
+                updateVisibleCount();
+            }
+
+            function setCardFilter(filterKey, cardEl) {
+                activeCardFilter = filterKey || 'all';
+                document.querySelectorAll('.summary-card[data-card-filter]').forEach(function (c) {
+                    c.classList.toggle('active', c === cardEl || c.getAttribute('data-card-filter') === activeCardFilter);
+                });
+                applyPageFilters();
+            }
+
+            function showAllRows() {
+                document.getElementById('search-box').value = '';
+                setCardFilter('all', document.getElementById('card-all'));
+            }
+
+            function sortTableByColumn(colIdx, dir) {
+                var table = document.getElementById('predictive-table');
+                var ths = Array.from(table.querySelectorAll('thead th.sortable'));
+                var th = ths[colIdx];
+                if (!th) return;
+                var type = th.getAttribute('data-type') || 'str';
+                var tbody = document.getElementById('risk-tbody');
+                var rows = Array.from(tbody.querySelectorAll('tr:not(.empty-row)'));
+
+                rows.sort(function (a, b) {
+                    var cellA = a.cells[colIdx];
+                    var cellB = b.cells[colIdx];
+                    var valA = (cellA && cellA.dataset.sort != null) ? cellA.dataset.sort : (cellA ? cellA.textContent.trim() : '');
+                    var valB = (cellB && cellB.dataset.sort != null) ? cellB.dataset.sort : (cellB ? cellB.textContent.trim() : '');
+                    var cmp;
+                    if (type === 'num') {
+                        var nA = parseFloat(valA);
+                        var nB = parseFloat(valB);
+                        if (isNaN(nA)) nA = -1e12;
+                        if (isNaN(nB)) nB = -1e12;
+                        cmp = nA - nB;
+                    } else {
+                        cmp = String(valA).localeCompare(String(valB), undefined, { numeric: true, sensitivity: 'base' });
+                    }
+                    return dir === 'asc' ? cmp : -cmp;
+                });
+
+                var frag = document.createDocumentFragment();
+                rows.forEach(function (r) { frag.appendChild(r); });
+                tbody.appendChild(frag);
+
+                ths.forEach(function (h, i) {
+                    h.classList.remove('asc', 'desc');
+                    if (i === colIdx) h.classList.add(dir);
+                });
+                currentSortCol = colIdx;
+                currentSortDir = dir;
+            }
+
+            function buildTableRows() {
+                var tbody = document.getElementById('risk-tbody');
+                tbody.textContent = '';
+
+                if (allRows.length === 0) {
+                    var trEmpty = document.createElement('tr');
+                    trEmpty.className = 'empty-row ok';
+                    var tdEmpty = document.createElement('td');
+                    tdEmpty.colSpan = 10;
+                    tdEmpty.textContent = 'No predictive warnings or critical risks detected in the latest snapshot.';
+                    trEmpty.appendChild(tdEmpty);
+                    tbody.appendChild(trEmpty);
+                    updateVisibleCount();
                     return;
                 }
 
-                rows.forEach(function (row) {
-                    const tr = document.createElement('tr');
+                var frag = document.createDocumentFragment();
+                allRows.forEach(function (row) {
+                    var tr = document.createElement('tr');
+                    var sevUpper = String(row.severity || 'INFO').toUpperCase();
+                    var fam = String(row.family || '');
+                    var famTxt = familyLabel(fam);
+                    var rawSt = String(row.raw_status || 'unknown').toLowerCase();
+                    var dev = String(row.device || row.entity_key || '--');
+                    var port = row.port ? String(row.port) : '';
+                    var reasonsArr = Array.isArray(row.top_reasons) ? row.top_reasons : [];
+                    var actionTxt = String(row.recommended_action || '--');
 
-                    const tdSev = document.createElement('td');
-                    const sevSpan = document.createElement('span');
-                    const sevLower = (row.severity || 'info').toLowerCase();
-                    sevSpan.className = 'badge badge-' + (sevLower === 'critical' ? 'critical' : (sevLower === 'warning' ? 'warning' : 'info'));
-                    sevSpan.textContent = row.severity || 'INFO';
+                    tr.dataset.device = dev;
+                    tr.dataset.severity = sevUpper;
+                    tr.dataset.family = fam;
+                    tr.dataset.early = row.early_warning ? '1' : '0';
+                    tr.dataset.rawStatus = rawSt;
+                    tr.dataset.search = [
+                        row.entity_key || '', dev, port, fam, famTxt, sevUpper,
+                        rawSt, row.role_classification || '', reasonsArr.join(' '), actionTxt
+                    ].join(' ');
+
+                    // 0: Severity
+                    var tdSev = document.createElement('td');
+                    tdSev.dataset.sort = String(severityRank(sevUpper));
+                    tdSev.dataset.filter = row.early_warning ? (sevUpper + ' (EARLY)') : sevUpper;
+                    var sevSpan = document.createElement('span');
+                    sevSpan.className = 'badge ' + (sevUpper === 'CRITICAL' ? 'badge-red' : (sevUpper === 'WARNING' ? 'badge-orange' : 'badge-green'));
+                    sevSpan.textContent = sevUpper;
                     tdSev.appendChild(sevSpan);
                     if (row.early_warning) {
-                        const earlySpan = document.createElement('span');
-                        earlySpan.className = 'badge badge-early';
+                        var earlySpan = document.createElement('span');
+                        earlySpan.className = 'badge badge-blue badge-early';
+                        earlySpan.title = 'Sub-threshold early precursor: all raw LLDPq domain statuses are still nominal';
                         earlySpan.textContent = 'EARLY';
                         tdSev.appendChild(earlySpan);
                     }
                     tr.appendChild(tdSev);
 
-                    const tdRisk = document.createElement('td');
-                    const wrap = document.createElement('div');
+                    // 1: Risk Score + Tier-1 / Tier-2 breakdown
+                    var tdRisk = document.createElement('td');
+                    tdRisk.className = 'risk-cell';
+                    var scoreNum = Number(row.risk_score || 0);
+                    tdRisk.dataset.sort = scoreNum.toFixed(2);
+                    tdRisk.dataset.filter = scoreNum >= 70 ? '>= 70 (Critical)' : (scoreNum >= 40 ? '40-69 (Warning)' : '< 40 (Info)');
+                    var ts = row.tier_scores || {};
+                    var t1Str = (ts.tier1_physics != null) ? Number(ts.tier1_physics).toFixed(0) : '--';
+                    var t2Str = (ts.tier2_ml != null) ? Number(ts.tier2_ml).toFixed(0) : '--';
+                    tdRisk.title = 'Composite: ' + scoreNum.toFixed(1) + ' | Tier-1 Physics: ' + t1Str + ' | Tier-2 ML: ' + t2Str + ' | Confidence: ' + Math.round(Number(row.confidence || 0) * 100) + '%';
+
+                    var wrap = document.createElement('div');
                     wrap.className = 'risk-bar-wrap';
-                    const scoreNum = Number(row.risk_score || 0);
-                    const valSpan = document.createElement('strong');
+                    var valSpan = document.createElement('span');
+                    valSpan.className = 'risk-score-val';
+                    valSpan.style.color = riskColor(scoreNum);
                     valSpan.textContent = scoreNum.toFixed(1);
-                    const bg = document.createElement('div');
+                    var bg = document.createElement('div');
                     bg.className = 'risk-bar-bg';
-                    const fill = document.createElement('div');
+                    var fill = document.createElement('div');
                     fill.className = 'risk-bar-fill';
                     fill.style.width = Math.max(0, Math.min(100, scoreNum)) + '%';
                     fill.style.background = riskColor(scoreNum);
@@ -341,139 +668,253 @@
                     wrap.appendChild(valSpan);
                     wrap.appendChild(bg);
                     tdRisk.appendChild(wrap);
+
+                    var tierDiv = document.createElement('div');
+                    tierDiv.className = 'tier-breakdown';
+                    tierDiv.textContent = 'T1:' + t1Str + '  T2:' + t2Str;
+                    tdRisk.appendChild(tierDiv);
                     tr.appendChild(tdRisk);
 
-                    const tdHor = document.createElement('td');
-                    tdHor.textContent = (row.horizon_hours || 72) + 'h';
+                    // 2: Horizon
+                    var tdHor = document.createElement('td');
+                    var horNum = Number(row.horizon_hours || 72);
+                    tdHor.className = 'mono';
+                    tdHor.dataset.sort = String(horNum);
+                    tdHor.dataset.filter = horNum + 'h';
+                    tdHor.textContent = horNum + 'h';
                     tr.appendChild(tdHor);
 
-                    const tdEnt = document.createElement('td');
-                    const devStrong = document.createElement('strong');
-                    devStrong.textContent = row.device || row.entity_key || '--';
-                    tdEnt.appendChild(devStrong);
-                    if (row.port) {
-                        const portDiv = document.createElement('div');
-                        portDiv.style.color = '#9e9e9e';
-                        portDiv.style.fontSize = '12px';
-                        portDiv.textContent = row.port;
-                        tdEnt.appendChild(portDiv);
-                    }
+                    // 3: Device
+                    var tdDev = document.createElement('td');
+                    tdDev.dataset.sort = dev;
+                    tdDev.dataset.filter = dev;
+                    var devStrong = document.createElement('strong');
+                    devStrong.textContent = dev;
+                    tdDev.appendChild(devStrong);
                     if (row.role_classification) {
-                        const roleDiv = document.createElement('div');
-                        roleDiv.style.color = '#ffb74d';
-                        roleDiv.style.fontSize = '11px';
+                        var roleDiv = document.createElement('div');
+                        roleDiv.className = 'role-tag';
                         roleDiv.textContent = '[' + row.role_classification + ']';
-                        tdEnt.appendChild(roleDiv);
+                        tdDev.appendChild(roleDiv);
                     }
-                    tr.appendChild(tdEnt);
+                    tr.appendChild(tdDev);
 
-                    const tdFam = document.createElement('td');
-                    const famSpan = document.createElement('span');
-                    famSpan.className = 'badge badge-family';
-                    famSpan.textContent = familyLabel(row.family);
+                    // 4: Port / Sensor
+                    var tdPort = document.createElement('td');
+                    tdPort.className = 'mono';
+                    tdPort.dataset.sort = port || '';
+                    tdPort.dataset.filter = port || '—';
+                    if (port) {
+                        tdPort.textContent = port;
+                    } else {
+                        var dash = document.createElement('span');
+                        dash.className = 'dim';
+                        dash.textContent = '—';
+                        tdPort.appendChild(dash);
+                    }
+                    tr.appendChild(tdPort);
+
+                    // 5: Family
+                    var tdFam = document.createElement('td');
+                    tdFam.dataset.sort = famTxt;
+                    tdFam.dataset.filter = famTxt;
+                    var famSpan = document.createElement('span');
+                    famSpan.className = 'badge badge-gray';
+                    famSpan.textContent = famTxt;
                     tdFam.appendChild(famSpan);
                     tr.appendChild(tdFam);
 
-                    const tdZ = document.createElement('td');
-                    const zVal = Number(row.peer_zscore || 0);
+                    // 6: Raw Status
+                    var tdRaw = document.createElement('td');
+                    tdRaw.dataset.sort = rawSt;
+                    tdRaw.dataset.filter = rawSt.toUpperCase();
+                    var rawSpan = document.createElement('span');
+                    rawSpan.className = rawStatusBadgeClass(rawSt);
+                    rawSpan.textContent = rawSt.toUpperCase();
+                    tdRaw.appendChild(rawSpan);
+                    tr.appendChild(tdRaw);
+
+                    // 7: Peer Z
+                    var tdZ = document.createElement('td');
+                    var zVal = Number(row.peer_zscore || 0);
+                    tdZ.className = 'mono';
+                    tdZ.dataset.sort = zVal.toFixed(3);
+                    tdZ.dataset.filter = (Math.abs(zVal) >= 3.0) ? 'Outlier (|Z| >= 3)' : 'Within peers (|Z| < 3)';
                     tdZ.textContent = (zVal >= 0 ? '+' : '') + zVal.toFixed(2) + 'σ';
                     tr.appendChild(tdZ);
 
-                    const tdReasons = document.createElement('td');
-                    const ul = document.createElement('ul');
+                    // 8: Top Risk Signals
+                    var tdReasons = document.createElement('td');
+                    tdReasons.dataset.sort = reasonsArr.join(' | ');
+                    tdReasons.dataset.filter = reasonsArr[0] || '--';
+                    var ul = document.createElement('ul');
                     ul.className = 'reasons-list';
-                    (row.top_reasons || []).slice(0, 4).forEach(function (reason) {
-                        const li = document.createElement('li');
+                    reasonsArr.slice(0, 4).forEach(function (reason) {
+                        var li = document.createElement('li');
                         li.textContent = reason;
                         ul.appendChild(li);
                     });
                     tdReasons.appendChild(ul);
                     tr.appendChild(tdReasons);
 
-                    const tdAct = document.createElement('td');
-                    const actDiv = document.createElement('div');
+                    // 9: Recommended Action
+                    var tdAct = document.createElement('td');
+                    tdAct.dataset.sort = actionTxt;
+                    tdAct.dataset.filter = actionTxt;
+                    var actDiv = document.createElement('div');
                     actDiv.className = 'action-text';
-                    actDiv.textContent = row.recommended_action || '--';
+                    actDiv.textContent = actionTxt;
                     tdAct.appendChild(actDiv);
                     tr.appendChild(tdAct);
 
-                    tbody.appendChild(tr);
+                    frag.appendChild(tr);
                 });
+
+                tbody.appendChild(frag);
+                sortTableByColumn(currentSortCol, currentSortDir);
+                applyPageFilters();
             }
 
-            function downloadCsv() {
-                const rows = getFilteredRows();
-                const headers = ['severity', 'early_warning', 'risk_score', 'horizon_hours', 'device', 'port', 'family', 'peer_zscore', 'top_reasons', 'recommended_action'];
+            function downloadCSV() {
+                var tbody = document.getElementById('risk-tbody');
+                var visibleTrs = Array.from(tbody.querySelectorAll('tr:not(.empty-row)')).filter(isRowVisible);
+                var headers = [
+                    'Severity', 'Early Precursor', 'Risk Score', 'Tier1 Physics', 'Tier2 ML',
+                    'Horizon (h)', 'Device', 'Port / Sensor', 'Family', 'Raw Status',
+                    'Peer Z', 'Top Risk Signals', 'Recommended Action'
+                ];
                 function esc(v) {
-                    const s = String(v == null ? '' : v);
-                    const safe = /^[=+\-@]/.test(s) ? "'" + s : s;
+                    var s = String(v == null ? '' : v).replace(/\r?\n/g, ' ').trim();
+                    var safe = /^[=+\-@\t\r]/.test(s) ? "'" + s : s;
                     return '"' + safe.replace(/"/g, '""') + '"';
                 }
-                const lines = [headers.join(',')];
-                rows.forEach(function (r) {
+                var lines = [headers.map(esc).join(',')];
+                visibleTrs.forEach(function (tr) {
+                    var tierText = tr.cells[1].querySelector('.tier-breakdown')?.textContent || '';
+                    var t1m = tierText.match(/T1:([^\s]+)/);
+                    var t2m = tierText.match(/T2:([^\s]+)/);
+                    var reasons = Array.from(tr.cells[8].querySelectorAll('li')).map(function (li) { return li.textContent; }).join(' | ');
                     lines.push([
-                        r.severity,
-                        r.early_warning ? 'true' : 'false',
-                        r.risk_score,
-                        r.horizon_hours,
-                        r.device,
-                        r.port || '',
-                        r.family,
-                        r.peer_zscore,
-                        (r.top_reasons || []).join(' | '),
-                        r.recommended_action || ''
+                        tr.dataset.severity || '',
+                        tr.dataset.early === '1' ? 'true' : 'false',
+                        tr.cells[1].dataset.sort || '',
+                        t1m ? t1m[1] : '',
+                        t2m ? t2m[1] : '',
+                        tr.cells[2].dataset.sort || '',
+                        tr.dataset.device || '',
+                        tr.cells[4].dataset.sort || '',
+                        tr.cells[5].dataset.filter || '',
+                        tr.dataset.rawStatus || '',
+                        tr.cells[7].dataset.sort || '',
+                        reasons,
+                        tr.cells[9].dataset.sort || ''
                     ].map(esc).join(','));
                 });
-                const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
+                var blob = new Blob([lines.join('\n') + '\n'], { type: 'text/csv;charset=utf-8;' });
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
                 a.href = url;
-                a.download = 'lldpq-predictive-health.csv';
+                a.download = 'lldpq_predictive_health.csv';
                 document.body.appendChild(a);
                 a.click();
                 document.body.removeChild(a);
-                URL.revokeObjectURL(url);
+                setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
             }
 
             async function loadData() {
-                const metaEl = document.getElementById('meta-line');
+                var metaEl = document.getElementById('meta-line');
                 try {
-                    const resp = await fetch('/monitor-results/export/predictive.json?_=' + Date.now(), { cache: 'no-store' });
-                    if (!resp.ok) {
-                        throw new Error('HTTP ' + resp.status);
-                    }
-                    const data = await resp.json();
-                    const c = data.counts || {};
+                    var resp = await fetch('/monitor-results/export/predictive.json?_=' + Date.now(), {
+                        cache: 'no-store',
+                        headers: { Accept: 'application/json' }
+                    });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    var ct = resp.headers.get('content-type') || '';
+                    if (ct.indexOf('text/html') !== -1) throw new Error('Authentication required');
+                    var data = await resp.json();
+                    var c = data.counts || {};
+                    var bf = data.by_family || {};
+                    var physCount = ((bf.physical && bf.physical.critical) || 0) + ((bf.physical && bf.physical.warning) || 0);
+                    var congCount = ((bf.congestion && bf.congestion.critical) || 0) + ((bf.congestion && bf.congestion.warning) || 0);
+                    var hwCount = ((bf.hardware_control && bf.hardware_control.critical) || 0) + ((bf.hardware_control && bf.hardware_control.warning) || 0);
+
+                    document.getElementById('kpi-actionable').textContent = String(c.actionable || 0);
                     document.getElementById('kpi-critical').textContent = String(c.critical || 0);
                     document.getElementById('kpi-warning').textContent = String(c.warning || 0);
                     document.getElementById('kpi-early').textContent = String(c.early_warning || 0);
+                    document.getElementById('kpi-physical').textContent = String(physCount);
+                    document.getElementById('kpi-congestion').textContent = String(congCount);
+                    document.getElementById('kpi-hardware').textContent = String(hwCount);
                     document.getElementById('kpi-devices').textContent = String(c.affected_devices || 0);
                     document.getElementById('kpi-scored').textContent = String(c.total_scored || 0);
-                    metaEl.textContent = 'Last updated: ' + (data.generated_at || '--') + ' (' + (data.elapsed_ms || 0) + ' ms)';
-                    document.getElementById('footer-model').textContent =
-                        'Model: ' + (data.model_mode || '--') + ' v' + (data.model_version || '--');
+
+                    metaEl.textContent = 'Last Updated: ' + (data.generated_at || '--') + ' (' + (data.elapsed_ms || 0) + ' ms)';
+                    var modelLabel = 'Model: ' + (data.model_mode || '--') + ' v' + (data.model_version || '--');
+                    document.getElementById('footer-model').textContent = modelLabel;
+                    document.getElementById('summary-model-pill').textContent = modelLabel;
+                    document.getElementById('about-model-details').textContent =
+                        modelLabel + ' — Scored ' + (c.total_scored || 0) + ' entities across ' +
+                        Object.keys(bf).length + ' families (' + (data.elapsed_ms || 0) + ' ms).';
+
                     allRows = Array.isArray(data.rows) ? data.rows : [];
-                    renderTable();
+                    buildTableRows();
                 } catch (err) {
-                    metaEl.textContent = 'Predictive output unavailable yet — run monitor.sh to generate export/predictive.json';
+                    metaEl.textContent = 'Predictive output unavailable yet — run monitor.sh to generate export/predictive.json (' + (err && err.message ? err.message : 'error') + ')';
                     allRows = [];
-                    renderTable();
+                    buildTableRows();
                 }
             }
 
-            document.querySelectorAll('#family-filters .pill-btn').forEach(function (btn) {
-                btn.addEventListener('click', function () {
-                    document.querySelectorAll('#family-filters .pill-btn').forEach(function (b) { b.classList.remove('active'); });
-                    btn.classList.add('active');
-                    activeFamily = btn.getAttribute('data-family') || 'all';
-                    renderTable();
+            // Summary card click filtering
+            document.querySelectorAll('.summary-card[data-card-filter]').forEach(function (card) {
+                card.addEventListener('click', function () {
+                    var fk = card.getAttribute('data-card-filter') || 'all';
+                    if (fk !== 'all' && activeCardFilter === fk) {
+                        setCardFilter('all', document.getElementById('card-all'));
+                    } else {
+                        setCardFilter(fk, card);
+                    }
                 });
             });
-            document.getElementById('chk-early-only').addEventListener('change', renderTable);
-            document.getElementById('search-box').addEventListener('input', renderTable);
-            document.getElementById('btn-refresh').addEventListener('click', loadData);
-            document.getElementById('btn-export-csv').addEventListener('click', downloadCsv);
 
+            // Column header click sorting (ignore clicks on table-filter.js funnel button)
+            document.querySelectorAll('#predictive-table thead th.sortable').forEach(function (th) {
+                th.addEventListener('click', function (ev) {
+                    if (ev.target && ev.target.closest('.tf-btn')) return;
+                    var colIdx = parseInt(th.getAttribute('data-col'), 10);
+                    if (isNaN(colIdx)) return;
+                    var nextDir = (currentSortCol === colIdx && currentSortDir === 'asc') ? 'desc' : 'asc';
+                    sortTableByColumn(colIdx, nextDir);
+                });
+            });
+
+            // Keep footer row counter synchronized when table-filter.js or lifecycle-scope.js toggles classes
+            var tbodyObserver = new MutationObserver(updateVisibleCount);
+            tbodyObserver.observe(document.getElementById('risk-tbody'), {
+                attributes: true,
+                attributeFilter: ['class', 'style'],
+                subtree: true
+            });
+
+            document.getElementById('search-box').addEventListener('input', applyPageFilters);
+            document.getElementById('clearSearchBtn').addEventListener('click', function () {
+                document.getElementById('search-box').value = '';
+                applyPageFilters();
+            });
+            document.getElementById('btn-show-all').addEventListener('click', showAllRows);
+            document.getElementById('btn-refresh').addEventListener('click', loadData);
+            document.getElementById('download-csv').addEventListener('click', downloadCSV);
+            document.getElementById('btn-about').addEventListener('click', function () {
+                document.getElementById('about-modal').classList.add('show');
+            });
+            document.getElementById('btn-close-about').addEventListener('click', function () {
+                document.getElementById('about-modal').classList.remove('show');
+            });
+            document.getElementById('about-modal').addEventListener('click', function (ev) {
+                if (ev.target === this) this.classList.remove('show');
+            });
+
+            window.downloadCSV = downloadCSV;
             loadData();
         })();
     </script>

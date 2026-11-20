@@ -202,6 +202,29 @@ try:
         )
     reports.append(entry)
 
+    # --- predictive health export ----------------------------------------
+    pred_entry = {
+        "report": "predictive",
+        "title": "Predictive Health Analysis",
+        "export_json": "/predictive/export_json",
+        "export_csv": None,
+        "available": False,
+        "updated": None,
+    }
+    pred_file = monitor_dir / "export" / "predictive.json"
+    try:
+        pred_entry["available"] = pred_file.is_file()
+        if pred_entry["available"]:
+            pred_entry["updated"] = iso_utc(pred_file.stat().st_mtime)
+    except OSError:
+        pass
+    pred_payload = read_small_json(pred_file)
+    if pred_payload is not None:
+        pred_entry["updated"] = iso_utc(pred_payload.get("generated_at")) or pred_entry["updated"]
+        pred_entry["counts"] = pred_payload.get("counts")
+        pred_entry["row_count"] = len(pred_payload.get("rows") or [])
+    reports.append(pred_entry)
+
     # --- latest AI analysis ------------------------------------------------
     # Must match ai-export-api.sh's contract: install.sh and Docker seed
     # analysis.json with {}, which /ai/export_json serves as 503 no-report.
