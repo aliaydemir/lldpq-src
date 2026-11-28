@@ -18,6 +18,7 @@ lldpq_fatal() {
     printf 'lldpq: ERROR: %s\n' "$*" >&2
     exit 1
 }
+env_skip_predictive=${SKIP_PREDICTIVE:-false}
 LLDPQ_CONFIG_HELPER="${LLDPQ_CONFIG_HELPER:-/usr/local/bin/lldpq-config}"
 if [[ -x "$LLDPQ_CONFIG_HELPER" ]]; then
     if ! LLDPQ_CONFIG_ASSIGNMENTS=$("$LLDPQ_CONFIG_HELPER" --require-config \
@@ -73,6 +74,12 @@ SKIP_LLDP="$(normalize_bool "${SKIP_LLDP:-false}")"
 SKIP_MONITOR="$(normalize_bool "${SKIP_MONITOR:-false}")"
 SKIP_FABRIC_SCAN="$(normalize_bool "${SKIP_FABRIC_SCAN:-false}")"
 SKIP_ALERTS="$(normalize_bool "${SKIP_ALERTS:-false}")"
+# A one-run skip remains effective when the installed config says false.
+# Pass the resolved flag to the monitor even when WEB_ROOT was inherited.
+if [[ "$(normalize_bool "$env_skip_predictive")" == "true" ]]; then
+    SKIP_PREDICTIVE=true
+fi
+export SKIP_PREDICTIVE
 
 # Skip notices are informational and verbose-only: the scheduled cron line has
 # no output redirect, so unconditional stdout would become recurring cron mail.

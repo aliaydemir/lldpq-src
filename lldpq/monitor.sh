@@ -192,6 +192,7 @@ SKIP_PFC_ECN="${SKIP_PFC_ECN:-false}"
 SKIP_CONFIG_DRIFT="${SKIP_CONFIG_DRIFT:-false}"
 SKIP_ROUTES="${SKIP_ROUTES:-false}"
 SKIP_FABRIC_CHECK="${SKIP_FABRIC_CHECK:-false}"
+SKIP_PREDICTIVE="${SKIP_PREDICTIVE:-false}"
 
 # Use copy-on-write clones when GNU cp and the backing filesystem support
 # them.  --reflink=auto transparently falls back to an ordinary copy on ext4;
@@ -220,6 +221,7 @@ apply_monitor_tuning() {
     SKIP_CONFIG_DRIFT="$(normalize_bool "${SKIP_CONFIG_DRIFT:-false}")"
     SKIP_ROUTES="$(normalize_bool "${SKIP_ROUTES:-false}")"
     SKIP_FABRIC_CHECK="$(normalize_bool "${SKIP_FABRIC_CHECK:-false}")"
+    SKIP_PREDICTIVE="$(normalize_bool "${SKIP_PREDICTIVE:-false}")"
     MONITOR_TIMING="$(normalize_bool "${MONITOR_TIMING:-false}")"
 
     MAX_PARALLEL="${MONITOR_MAX_PARALLEL:-${MAX_PARALLEL:-100}}"
@@ -1186,6 +1188,7 @@ write_current_manifest() {
     [[ "$SKIP_CONFIG_DRIFT" == "true" ]] && skipped_list+="config-drift,"
     [[ "$SKIP_ROUTES" == "true" ]] && skipped_list+="routes,"
     [[ "$SKIP_FABRIC_CHECK" == "true" ]] && skipped_list+="fabric-check,"
+    [[ "$SKIP_PREDICTIVE" == "true" ]] && skipped_list+="predictive,"
     python3 - "$manifest" "$completed_at" "$device_count" \
         "$skipped_list" "$pipeline_id" \
         "$pipeline_started_at" \
@@ -1625,7 +1628,7 @@ EOF
         fi
     fi
 
-    if [[ "${SKIP_PREDICTIVE:-false}" == "true" ]]; then
+    if [[ "$SKIP_PREDICTIVE" == "true" ]]; then
         if ! "${LLDPQ_PRIV[@]}" rm -f "$stage_dir/export/predictive.json" \
                 "$stage_dir/summary/predictive-summary.json"; then
             "${LLDPQ_PRIV[@]}" rm -rf "$stage_dir" 2>/dev/null || true
@@ -4809,7 +4812,12 @@ if [[ -z "${WEB_ROOT:-}" ]]; then
         echo "Error: required runtime configuration is missing or invalid" >&2
         exit 1
     fi
+    # Both direct and wrapped runs may request a one-run skip.
+    env_skip_predictive=$SKIP_PREDICTIVE
     eval "$LLDPQ_CONFIG_ASSIGNMENTS" || exit 1
+    if [[ "$env_skip_predictive" == "true" ]]; then
+        SKIP_PREDICTIVE=true
+    fi
     unset LLDPQ_CONFIG_ASSIGNMENTS
 fi
 apply_monitor_tuning
@@ -4842,7 +4850,7 @@ if [[ "$MONITOR_SCOPE" == "fabric-check" && "$SKIP_FABRIC_CHECK" == "true" ]]; t
     exit 2
 fi
 if [[ "$MONITOR_SCOPE" == "predictive" ]]; then
-    if [[ "${SKIP_PREDICTIVE:-false}" == "true" ]]; then
+    if [[ "$SKIP_PREDICTIVE" == "true" ]]; then
         echo "Error: predictive analysis is disabled by SKIP_PREDICTIVE" >&2
         exit 2
     fi
@@ -5446,7 +5454,9 @@ done
 analyzer_jobs_end=$(date +%s)
 analyzer_jobs_duration=$((analyzer_jobs_end - analyzer_jobs_start))
 
-if [[ "$MONITOR_SCOPE" == "all" && "${SKIP_PREDICTIVE:-false}" != "true" && -f "$SCRIPT_DIR/predictive_analyzer.py" ]]; then
+if [[ "$MONITOR_SCOPE" == "all" && "$SKIP_PREDICTIVE" == "true" ]]; then
+    echo "  predictive   skipped (SKIP_PREDICTIVE=true)"
+elif [[ "$MONITOR_SCOPE" == "all" && -f "$SCRIPT_DIR/predictive_analyzer.py" ]]; then
     predictive_start=$(date +%s)
     if ! python3 "$SCRIPT_DIR/predictive_analyzer.py" --monitor-dir "$SCRIPT_DIR/monitor-results"; then
         echo "Warning: predictive_analyzer.py failed (non-fatal; existing reports unaffected)" >&2

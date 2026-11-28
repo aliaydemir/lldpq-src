@@ -196,6 +196,7 @@ RUN printf '%s\n' \
     'ANSIBLE_DIR=NoNe' \
     'EDITOR_ROOT=/home/lldpq' \
     'SKIP_L1=false' \
+    'SKIP_PREDICTIVE=false' \
     'MONITOR_TIMING=false' \
     'MONITOR_MAX_PARALLEL=100' \
     'MONITOR_COMMAND_TIMEOUT_SECONDS=20' \

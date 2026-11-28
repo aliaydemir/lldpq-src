@@ -943,6 +943,10 @@ refresh_monitor() (
     local requested_pipeline_id=${1-} requested_scope=${2:-all}
     local report_state=idle status scope_marker scope_reason detail
 
+    # Each web refresh must read current monitor settings, even when this
+    # long-lived daemon started with these variables in its environment.
+    export -n WEB_ROOT SKIP_PREDICTIVE
+
     trigger_monitor_exit_guard() {
         local exit_status=$?
         trap - EXIT

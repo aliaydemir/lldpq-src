@@ -373,7 +373,7 @@ load_lldpq_config() {
             DHCP_LEASES_FILE|ZTP_SCRIPT_FILE|BASE_CONFIG_DIR|AUTO_BASE_CONFIG|\
             AUTO_ZTP_DISABLE|AUTO_SET_HOSTNAME|SKIP_OPTICAL|SKIP_L1|SKIP_DUPLICATE|\
             SKIP_EVPN_MH|SKIP_PFC_ECN|SKIP_CONFIG_DRIFT|SKIP_ROUTES|\
-            SKIP_FABRIC_CHECK|SKIP_ASSETS|SKIP_LLDP|SKIP_MONITOR|\
+            SKIP_FABRIC_CHECK|SKIP_PREDICTIVE|SKIP_ASSETS|SKIP_LLDP|SKIP_MONITOR|\
             SKIP_FABRIC_SCAN|SKIP_ALERTS|MONITOR_TIMING|\
             MONITOR_MAX_PARALLEL|MONITOR_COMMAND_TIMEOUT_SECONDS|PFC_ECN_MAX_PARALLEL|\
             PFC_ECN_COLLECTION_BUDGET_SECONDS|PFC_ECN_PORT_TIMEOUT_SECONDS|\
@@ -941,13 +941,16 @@ render_runtime_tuning_config() {
     printf 'SKIP_L1=%s\n' "$skip_l1"
     # Collection skip toggles read from the ambient environment: preserved
     # values arrive via load_lldpq_config on update, caller overrides via env.
-    # Anything but exactly "true" renders as false (fail-safe).
+    # Preserve the effective runtime value when rewriting the config.
     local _skip_name _skip_value
     for _skip_name in SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN \
-        SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK SKIP_ASSETS \
+        SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK SKIP_PREDICTIVE SKIP_ASSETS \
         SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS; do
         _skip_value="${!_skip_name:-false}"
-        [[ "$_skip_value" == "true" ]] || _skip_value=false
+        case "${_skip_value,,}" in
+            true|1|yes|y|on) _skip_value=true ;;
+            *) _skip_value=false ;;
+        esac
         printf '%s=%s\n' "$_skip_name" "$_skip_value"
     done
     printf 'MONITOR_MAX_PARALLEL=%s\n' "$monitor_parallel"
@@ -3576,17 +3579,20 @@ import sys
 source = Path(sys.argv[1])
 trusted_uids = {0, int(sys.argv[2])}
 
-def reject(path):
-    raise SystemExit(f"[!] Admin update requires an operator- or root-controlled release checkout: {path}")
+def reject(path, reason=""):
+    message = f"[!] Admin update requires an operator- or root-controlled release checkout: {path}"
+    if reason:
+        message += f" ({reason})"
+    raise SystemExit(message)
 
 def check(path, allow_sticky=False):
     info = path.lstat()
     mode = info.st_mode
     if info.st_uid not in trusted_uids:
-        reject(path)
+        reject(path, f"owner UID {info.st_uid}, expected one of {sorted(trusted_uids)}")
     if not stat.S_ISLNK(mode) and mode & 0o022:
         if not (allow_sticky and info.st_uid == 0 and mode & stat.S_ISVTX and stat.S_ISDIR(mode)):
-            reject(path)
+            reject(path, f"mode {stat.S_IMODE(mode):04o} permits group or other writes")
     return mode
 
 try:
@@ -4624,7 +4630,7 @@ LLDPQ_SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # clean install must not carry old skip preferences into the new config,
 # but explicit environment overrides remain supported.
 _CALLER_SKIP_KEYS=(SKIP_L1 SKIP_OPTICAL SKIP_DUPLICATE SKIP_EVPN_MH SKIP_PFC_ECN \
-    SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK \
+    SKIP_CONFIG_DRIFT SKIP_ROUTES SKIP_FABRIC_CHECK SKIP_PREDICTIVE \
     SKIP_ASSETS SKIP_LLDP SKIP_MONITOR SKIP_FABRIC_SCAN SKIP_ALERTS)
 declare -A _CALLER_SKIP_WAS_SET=()
 declare -A _CALLER_SKIP_VALUE=()

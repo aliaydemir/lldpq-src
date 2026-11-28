@@ -49,6 +49,7 @@ ALLOWED_KEYS = frozenset({
     "SKIP_CONFIG_DRIFT",
     "SKIP_ROUTES",
     "SKIP_FABRIC_CHECK",
+    "SKIP_PREDICTIVE",
     "SKIP_ASSETS",
     "SKIP_LLDP",
     "SKIP_MONITOR",

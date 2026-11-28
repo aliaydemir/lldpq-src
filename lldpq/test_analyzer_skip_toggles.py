@@ -10,7 +10,9 @@ a manifest whose skipped analyzers are absent from `analyses`.
 import contextlib
 import io
 import json
+import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -148,6 +150,52 @@ class AnalyzerSkipStaticContractTests(unittest.TestCase):
 
 
 class AnalyzerSkipFunctionalTests(unittest.TestCase):
+    def test_predictive_scope_reads_config_and_honors_one_run_skip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            monitor = root / "monitor.sh"
+            shutil.copy2(MONITOR, monitor)
+            shutil.copy2(SCRIPT_DIR / "load_devices.sh", root)
+            # A marker distinguishes running the analyzer from a successful
+            # no-op, without loading any device data.
+            witness = root / "analyzer-ran"
+            (root / "predictive_analyzer.py").write_text(
+                "from pathlib import Path\nPath('analyzer-ran').touch()\n")
+            config = root / "lldpq.conf"
+            helper = root / "helper"
+            helper.write_text(
+                f'#!/bin/sh\nexec "{SCRIPT_DIR.parent / "bin/lldpq-config"}" '
+                f'--config "{config}" "$@"\n')
+            helper.chmod(0o755)
+            flock = root / "flock"
+            flock.write_text("#!/bin/sh\nexit 0\n")
+            flock.chmod(0o755)
+            for saved, override, skip in [
+                (None, None, False), ("false", None, False),
+                ("true", None, True), ("ON", "false", True),
+                ("false", "true", True),
+            ]:
+                with self.subTest(saved=saved, override=override):
+                    config.write_text(
+                        f"WEB_ROOT={root / 'web'}\nLLDPQ_USER=test\n" +
+                        (f"SKIP_PREDICTIVE={saved}\n" if saved else ""))
+                    env = {
+                        "PATH": f"{root}:{os.environ['PATH']}", "HOME": tmp,
+                        "TMPDIR": tmp, "LLDPQ_CONFIG_HELPER": str(helper),
+                        "LLDPQ_MONITOR_LOCK_FILE": str(root / "lock"),
+                    }
+                    if override is not None:
+                        env["SKIP_PREDICTIVE"] = override
+                    witness.unlink(missing_ok=True)
+                    result = subprocess.run(
+                        ["bash", str(monitor), "--only", "predictive"], env=env,
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(result.returncode, 2 if skip else 0,
+                                     result.stderr)
+                    self.assertEqual(witness.exists(), not skip)
+                    if skip:
+                        self.assertIn("disabled by SKIP_PREDICTIVE", result.stderr)
+
     def test_scoped_duplicate_run_exits_2_when_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             # macOS test hosts have no flock binary; the guard under test sits

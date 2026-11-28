@@ -367,3 +367,4 @@ class AdminUpdatePreflightTests(unittest.TestCase):
         result = self.preflight()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("release checkout", result.stderr)
+        self.assertIn("mode 0664", result.stderr)

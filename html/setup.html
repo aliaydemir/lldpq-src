@@ -394,7 +394,7 @@
 
                     <div class="sched-card">
                         <div class="key-row"><span class="k">Collection options (skip toggles)</span></div>
-                        <label class="key-lbl">Monitor sub-collections &mdash; skip individual data types inside the monitor stage:</label>
+                        <label class="key-lbl">Choose which collections or analyses to skip during monitoring.</label>
                         <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:6px 16px;">
                             <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-optical" style="width:15px;height:15px;accent-color:#76b900;"> Skip optical diagnostics</label>
                             <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-l1" style="width:15px;height:15px;accent-color:#76b900;"> Skip L1 / BER data</label>
@@ -404,6 +404,7 @@
                             <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-config-drift" style="width:15px;height:15px;accent-color:#76b900;"> Skip config drift</label>
                             <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-routes" style="width:15px;height:15px;accent-color:#76b900;"> Skip routes analysis</label>
                             <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-fabric-check" style="width:15px;height:15px;accent-color:#76b900;"> Skip fabric check</label>
+                            <label style="display:flex;align-items:center;gap:6px;color:#d4d4d4;font-size:13px;cursor:pointer;"><input type="checkbox" id="co-skip-predictive" style="width:15px;height:15px;accent-color:#76b900;"> Skip predictive analysis</label>
                         </div>
                         <label class="key-lbl" style="margin-top:12px;">Pipeline stages &mdash; skip whole steps of the scheduled lldpq run:</label>
                         <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:6px 16px;">
@@ -1025,7 +1026,7 @@ function initDirtyGuards() {
      'par-monitor', 'par-lldp', 'par-assets', 'par-getconfigs',
      'co-skip-optical', 'co-skip-l1', 'co-skip-duplicate', 'co-skip-evpn-mh',
      'co-skip-pfc-ecn', 'co-skip-config-drift', 'co-skip-routes',
-     'co-skip-fabric-check', 'co-skip-assets', 'co-skip-lldp', 'co-skip-monitor',
+     'co-skip-fabric-check', 'co-skip-predictive', 'co-skip-assets', 'co-skip-lldp', 'co-skip-monitor',
      'co-skip-fabric-scan', 'co-skip-alerts',
      'tfw-skip-models', 'tfw-policy', 'tfw-max-parallel', 'tfw-min-interval',
      'tfw-ssh-timeout'].forEach(function (id) {
@@ -2650,6 +2651,7 @@ const COLLECTION_SKIP_IDS = {
     skip_config_drift: 'co-skip-config-drift',
     skip_routes: 'co-skip-routes',
     skip_fabric_check: 'co-skip-fabric-check',
+    skip_predictive: 'co-skip-predictive',
     skip_assets: 'co-skip-assets',
     skip_lldp: 'co-skip-lldp',
     skip_monitor: 'co-skip-monitor',

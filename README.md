@@ -1882,6 +1882,27 @@ cat VERSION
 sudo -H ./install.sh --admin-update --backup
 ```
 
+The check includes the checkout's parent directories. If it reports a shared
+parent such as `/home`, create a private release directory under a
+root-controlled path and clone the release there as the operator. For example:
+
+```bash
+(
+  set -e
+  umask 022
+  release_dir=$(sudo mktemp -d /opt/lldpq-admin.XXXXXXXX)
+  sudo chown "$(id -u):$(id -g)" "$release_dir"
+  git clone https://github.com/aliaydemir/lldpq-src.git "$release_dir/src"
+  cd "$release_dir/src"
+  cat VERSION
+  pwd
+)
+```
+
+From the printed directory, select the intended release and run the update
+command above. The runtime's filesystem must also have a root-controlled
+parent directory for the rollback snapshot.
+
 `--admin-update` uses the account, runtime directory and web root recorded
 in `/etc/lldpq.conf` and verifies them against the installed, root-owned
 `lldpq-recovery.service`. A missing registration or a mismatch stops the
@@ -2246,6 +2267,14 @@ is replaced by a "skipped" placeholder, and alert summaries state "Skipped by
 configuration". Scoped re-runs (`monitor.sh --only <name>`) refuse a disabled
 analyzer with exit code 2. All of these are editable from **Setup → Run
 LLDPq → Collection options**.
+
+To skip predictive analysis on full CLI and scheduled runs, set
+`SKIP_PREDICTIVE=true` in `/etc/lldpq.conf`, or select **Skip predictive analysis**
+under **Setup → Run LLDPq → Collection options** and click **Save collection options**.
+The next run uses the saved setting. Predictive analysis runs by default when the
+setting is absent or `false`. An explicit `SKIP_PREDICTIVE=true` on the command
+line still skips that run. If you used this prefix in cron, remove it once the
+setting is saved to let Setup control future runs.
 
 **Pipeline stage skip toggles:** `SKIP_ASSETS`, `SKIP_LLDP`, `SKIP_MONITOR`,
 `SKIP_FABRIC_SCAN` and `SKIP_ALERTS` (all `false` by default) skip whole

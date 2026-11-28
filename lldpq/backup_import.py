@@ -2208,7 +2208,7 @@ def _validate_key(name, content, validation_dir):
 
 _PORTABLE_BOOLEAN_KEYS = {
     "SKIP_OPTICAL", "SKIP_L1", "SKIP_DUPLICATE", "SKIP_EVPN_MH", "SKIP_PFC_ECN",
-    "SKIP_CONFIG_DRIFT", "SKIP_ROUTES", "SKIP_FABRIC_CHECK",
+    "SKIP_CONFIG_DRIFT", "SKIP_ROUTES", "SKIP_FABRIC_CHECK", "SKIP_PREDICTIVE",
     "SKIP_ASSETS", "SKIP_LLDP", "SKIP_MONITOR", "SKIP_FABRIC_SCAN", "SKIP_ALERTS",
     "AUTO_BASE_CONFIG", "AUTO_ZTP_DISABLE",
     "AUTO_SET_HOSTNAME", "TELEMETRY_ENABLED", "MONITOR_TIMING",
@@ -2271,6 +2271,11 @@ def _validate_portable_preference(key, candidate, validate_cron):
         return shlex.quote(value)
     if key in _PORTABLE_BOOLEAN_KEYS:
         normalized = value.casefold()
+        if key.startswith("SKIP_"):
+            if normalized in ("1", "yes", "y", "on"):
+                return "true"
+            if normalized in ("0", "no", "n", "off"):
+                return "false"
         if normalized not in ("true", "false"):
             raise BackupImportError(
                 f"Portable preference {key} must be true or false"

@@ -140,7 +140,7 @@ class StageSkipFunctionalTests(unittest.TestCase):
         )
         return root, lldpq_dir, witness
 
-    def _run(self, root, lldpq_dir, verbose=False):
+    def _run(self, root, lldpq_dir, verbose=False, extra_env=None):
         env = dict(os.environ)
         env.update({
             "LLDPQ_CONFIG_HELPER": str(root / "lldpq-config"),
@@ -149,11 +149,28 @@ class StageSkipFunctionalTests(unittest.TestCase):
             # skipped deterministically.
             "LLDPQ_AI_ANALYZER": str(root / "missing-analyzer"),
         })
+        env.update(extra_env or {})
         args = ["bash", str(LLDPQ_BIN)] + (["-"] if verbose else [])
         return subprocess.run(
             args, cwd=lldpq_dir, env=env,
             capture_output=True, text=True, timeout=60,
         )
+
+    def test_predictive_skip_reaches_monitor_from_config_or_environment(self):
+        for saved, override in [("true", "false"), ("false", "true")]:
+            with self.subTest(saved=saved, override=override):
+                root, lldpq_dir, witness = self._make_tree([
+                    "SKIP_ASSETS=true", "SKIP_LLDP=true", "SKIP_ALERTS=true",
+                    "SKIP_FABRIC_SCAN=true", f"SKIP_PREDICTIVE={saved}",
+                ])
+                self._write_stub(
+                    lldpq_dir / "monitor.sh",
+                    f'echo "$SKIP_PREDICTIVE" > "{witness}/skip"\n'
+                    'rm -f monitor-results/.lldpq-stale\n')
+                result = self._run(root, lldpq_dir, extra_env={
+                    "WEB_ROOT": str(root / "www"), "SKIP_PREDICTIVE": override})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((witness / "skip").read_text().strip(), "true")
 
     def test_all_stage_skips_run_touches_nothing_and_exits_zero(self):
         root, lldpq_dir, witness = self._make_tree([

@@ -8,7 +8,11 @@ cannot drift apart silently.
 """
 
 import importlib.util
+import io
+import json
+import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -21,7 +25,7 @@ README = SCRIPT_DIR.parent / "README.md"
 SKIP_KEYS = (
     "SKIP_OPTICAL", "SKIP_L1", "SKIP_DUPLICATE", "SKIP_EVPN_MH",
     "SKIP_PFC_ECN", "SKIP_CONFIG_DRIFT", "SKIP_ROUTES", "SKIP_FABRIC_CHECK",
-    "SKIP_ASSETS", "SKIP_LLDP", "SKIP_MONITOR",
+    "SKIP_PREDICTIVE", "SKIP_ASSETS", "SKIP_LLDP", "SKIP_MONITOR",
     "SKIP_FABRIC_SCAN", "SKIP_ALERTS",
 )
 NEW_SKIP_KEYS = tuple(k for k in SKIP_KEYS if k not in ("SKIP_OPTICAL", "SKIP_L1"))
@@ -52,6 +56,37 @@ class SetupApiContractTests(unittest.TestCase):
         self.assertIn("isinstance(v, bool)", block)
         self.assertIn("'true' if v else 'false'", block)
 
+    def test_predictive_option_round_trip_with_legacy_client(self):
+        start = self.source.index("COLLECTION_SKIP_KEYS =")
+        end = self.source.index("if action == 'get-transceiver-fw':", start)
+        handlers = compile(self.source[start:end], str(SETUP_API), "exec")
+        conf = {}
+
+        def write_conf(pairs):
+            conf.update(pairs)
+            return True
+
+        def request(action, **fields):
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit):
+                exec(handlers, {
+                    "action": action, "post_data": fields, "read_conf": conf.copy,
+                    "write_conf": write_conf, "sys": sys, "json": json,
+                })
+            return json.loads(output.getvalue())
+
+        fields = {key.lower(): False for key in SKIP_KEYS if key != "SKIP_PREDICTIVE"}
+        self.assertFalse(request("get-collection-options")["skip_predictive"])
+        conf["SKIP_PREDICTIVE"] = "ON"
+        self.assertTrue(request("get-collection-options")["skip_predictive"])
+        self.assertTrue(request("set-collection-options", **fields, skip_predictive=True)["success"])
+        self.assertTrue(request("set-collection-options", **fields)["success"])
+        self.assertTrue(request("get-collection-options")["skip_predictive"])
+        self.assertFalse(request("set-collection-options", **fields, skip_predictive="false")["success"])
+        self.assertEqual(conf["SKIP_PREDICTIVE"], "true")
+        self.assertTrue(request("set-collection-options", **fields, skip_predictive=False)["success"])
+        self.assertFalse(request("get-collection-options")["skip_predictive"])
+
     def test_transceiver_actions_and_ranges(self):
         self.assertIn("if action == 'get-transceiver-fw':", self.source)
         self.assertIn("if action == 'set-transceiver-fw':", self.source)
@@ -79,7 +114,7 @@ class SetupHtmlContractTests(unittest.TestCase):
         for element_id in (
             "co-skip-optical", "co-skip-l1", "co-skip-duplicate",
             "co-skip-evpn-mh", "co-skip-pfc-ecn", "co-skip-assets",
-            "co-skip-lldp", "co-skip-monitor", "co-skip-fabric-scan",
+            "co-skip-predictive", "co-skip-lldp", "co-skip-monitor", "co-skip-fabric-scan",
             "co-skip-alerts", "save-collect-btn", "co-status", "co-core-warn",
         ):
             self.assertIn(f'id="{element_id}"', self.source)
@@ -151,6 +186,14 @@ class BackupImportParityTests(unittest.TestCase):
                     key, "TRUE", lambda value: True),
                 "true",
             )
+
+    def test_predictive_backup_preserves_hand_edited_switch(self):
+        validate = self.backup_import._validate_portable_preference
+        for saved, expected in (("ON", "true"), ("0", "false")):
+            with self.subTest(saved=saved):
+                self.assertEqual(validate("SKIP_PREDICTIVE", saved, None), expected)
+        with self.assertRaises(self.backup_import.BackupImportError):
+            validate("SKIP_PREDICTIVE", "sometimes", None)
 
     def test_transceiver_ranges_match_the_ui(self):
         ranges = self.backup_import._PORTABLE_INTEGER_RANGES

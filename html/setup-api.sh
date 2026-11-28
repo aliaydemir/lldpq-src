@@ -887,7 +887,7 @@ devices_yaml = os.path.join(lldpq_dir, 'devices.yaml')
 LLDPQ_PREF_KEYS = (
     'LLDPQ_HOSTNAME', 'LLDPQ_CRON', 'GETCONF_CRON', 'SCAN_INTERVAL',
     'SKIP_OPTICAL', 'SKIP_L1', 'SKIP_DUPLICATE', 'SKIP_EVPN_MH', 'SKIP_PFC_ECN',
-    'SKIP_CONFIG_DRIFT', 'SKIP_ROUTES', 'SKIP_FABRIC_CHECK',
+    'SKIP_CONFIG_DRIFT', 'SKIP_ROUTES', 'SKIP_FABRIC_CHECK', 'SKIP_PREDICTIVE',
     'SKIP_ASSETS', 'SKIP_LLDP', 'SKIP_MONITOR', 'SKIP_FABRIC_SCAN', 'SKIP_ALERTS',
     'MONITOR_TIMING', 'MONITOR_MAX_PARALLEL', 'MONITOR_COMMAND_TIMEOUT_SECONDS',
     'PFC_ECN_MAX_PARALLEL',
@@ -1709,6 +1709,7 @@ COLLECTION_SKIP_KEYS = {
     'skip_config_drift': 'SKIP_CONFIG_DRIFT',
     'skip_routes': 'SKIP_ROUTES',
     'skip_fabric_check': 'SKIP_FABRIC_CHECK',
+    'skip_predictive': 'SKIP_PREDICTIVE',
     'skip_assets': 'SKIP_ASSETS',
     'skip_lldp': 'SKIP_LLDP',
     'skip_monitor': 'SKIP_MONITOR',
@@ -1719,7 +1720,7 @@ COLLECTION_SKIP_KEYS = {
 if action == 'get-collection-options':
     conf = read_conf()
     out = {
-        fk: conf.get(ck, 'false').strip().casefold() == 'true'
+        fk: conf.get(ck, 'false').strip().casefold() in ('true', '1', 'yes', 'y', 'on')
         for fk, ck in COLLECTION_SKIP_KEYS.items()
     }
     print(json.dumps({'success': True, **out}))
@@ -1728,6 +1729,9 @@ if action == 'get-collection-options':
 if action == 'set-collection-options':
     pairs = {}
     for fk, ck in COLLECTION_SKIP_KEYS.items():
+        # An older Setup page omits this field. Keep its stored setting.
+        if fk == 'skip_predictive' and fk not in post_data:
+            continue
         v = post_data.get(fk)
         if not isinstance(v, bool):
             print(json.dumps({'success': False, 'error': 'Invalid value for ' + fk}))
