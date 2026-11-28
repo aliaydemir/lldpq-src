@@ -238,7 +238,7 @@ collect_device_data() {
         if [ "$_loopback_status" -ne 0 ]; then
             echo "__LLDPQ_COLLECTION_ERROR__:LOOPBACKS"
         else
-            printf "%s\n" "$_loopback_output" | awk '/inet / {print $2}'
+            printf "%s\n" "$_loopback_output" | awk "/inet / {print \$2}"
         fi
         echo "===NEXTHOPS==="
         _nexthop_output=$(/usr/sbin/ip nexthop show 2>/dev/null)
