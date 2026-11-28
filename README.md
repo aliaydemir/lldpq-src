@@ -1873,6 +1873,24 @@ git pull                    # get latest code
 ./install.sh                # auto-detects: fresh install or update
 ```
 
+A system administrator can update a native installation owned by a separate
+service account. From a trusted copy of the desired release owned by the
+administrator or root, check the version and run:
+
+```bash
+cat VERSION
+sudo -H ./install.sh --admin-update --backup
+```
+
+`--admin-update` uses the account, runtime directory and web root recorded
+in `/etc/lldpq.conf` and verifies them against the installed, root-owned
+`lldpq-recovery.service`. A missing registration or a mismatch stops the
+update. The service account keeps its existing privileges. Cron and systemd
+continue to use that account, and future web updates keep their registered
+source checkout. The optional `--backup` saves the service account's SSH keys
+and the scoped snapshot described below in a private directory under
+`/var/backups/`. The installer prints its exact path. Use `-y` to skip prompts.
+
 Runtime monitoring data and user configuration are preserved automatically.
 Every update also creates a temporary same-filesystem rollback snapshot of the
 previous runtime plus critical system configuration. If a later DHCP, service

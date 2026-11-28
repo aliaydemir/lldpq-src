@@ -10,6 +10,7 @@
 #
 # Usage: ./install.sh [-y] [--enable-telemetry] [--disable-telemetry]
 #                     [--replace-dhcp-config]
+#        sudo -H ./install.sh --admin-update [-y] [--backup]
 #   -y                  Auto-yes to all prompts (non-interactive mode, uses defaults)
 #   --enable-telemetry  Enable streaming telemetry support (installs Docker)
 #   --disable-telemetry Disable streaming telemetry support
@@ -353,6 +354,10 @@ load_lldpq_config() {
             return 1
         }
     fi
+    if [[ "${ADMIN_UPDATE:-false}" == true ]]; then
+        # Remember exactly the configuration used to select this installation.
+        ADMIN_UPDATE_CONFIG_DIGEST=$(sha256sum < "$config_file") || return 1
+    fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -451,11 +456,14 @@ guard_managed_path() {
 guard_recursive_target() {
     local label="$1" canonical="$2" allow_var_www="${3:-false}"
     local canonical_home
-    canonical_home=$(canonical_path "$HOME") || return 1
+    canonical_home=$(canonical_path "${4:-$HOME}") || return 1
     case "$canonical" in
         /home/*|/root/*)
             if [[ "$canonical" != "$canonical_home"/* ]]; then
                 echo "[!] Refusing $label under another user's home: '$canonical'" >&2
+                if [[ "$label" == "LLDPq install" ]]; then
+                    echo "    To update an existing service account's installation, use --admin-update from an administrator-controlled release checkout." >&2
+                fi
                 return 1
             fi
             ;;
@@ -471,6 +479,30 @@ guard_recursive_target() {
             ;;
     esac
     printf '%s\n' "$canonical"
+}
+
+# The service account can rename entries in its own home, including a
+# root-owned snapshot. Stage the admin's rollback data above that boundary
+# while retaining the atomic, same-filesystem moves used by recovery.
+admin_update_stage_parent() {
+    python3 -I - "$1" <<'PYTHON'
+from pathlib import Path
+import stat
+import sys
+
+runtime = Path(sys.argv[1])
+device = runtime.stat().st_dev
+selected = None
+for parent in reversed(runtime.parents):
+    info = parent.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        break
+    if info.st_dev == device:
+        selected = parent
+if selected is None or runtime.is_mount():
+    sys.exit("[!] Admin update needs a root-controlled staging directory on the runtime filesystem.")
+print(selected)
+PYTHON
 }
 
 paths_overlap() {
@@ -1198,13 +1230,13 @@ write_update_recovery_marker() {
     [[ -n "${_DATA_PRESERVE:-}" ]] || return 1
     sudo python3 - "$UPDATE_RECOVERY_STATE_DIR" "$UPDATE_RECOVERY_MARKER" \
         "$phase" "$LLDPQ_INSTALL_DIR" "$WEB_ROOT" "$_DATA_PRESERVE" \
-        "$rollback_dir" <<'PYTHON'
+        "$rollback_dir" "${ADMIN_UPDATE:-false}" <<'PYTHON'
 import json
 import os
 import sys
 import tempfile
 
-state_dir, marker, phase, install_dir, web_root, preserve_dir, rollback_dir = sys.argv[1:]
+state_dir, marker, phase, install_dir, web_root, preserve_dir, rollback_dir, admin_update = sys.argv[1:]
 if phase not in {"preserving", "rollback_ready"}:
     raise SystemExit("invalid update recovery phase")
 for label, value in (
@@ -1228,6 +1260,8 @@ payload = {
     "preserve_dir": preserve_dir,
     "rollback_dir": rollback_dir or None,
 }
+if admin_update == "true":
+    payload["admin_staging"] = True
 descriptor, temporary = tempfile.mkstemp(prefix=".active.", dir=state_dir)
 try:
     os.fchmod(descriptor, 0o600)
@@ -1318,6 +1352,55 @@ release_update_config_lock() {
     UPDATE_CONFIG_LOCK_FD=""
 }
 
+open_admin_process_lock() {
+    local lock_file="$1" service_uid="$2" pinned pid input output opened=false
+    if [[ ! -e "$lock_file" && ! -L "$lock_file" ]]; then
+        # O_EXCL lets the normal collector win a simultaneous first open.
+        sudo -H -u "$LLDPQ_USER" python3 -I -c '
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o644)
+except FileExistsError:
+    pass
+else:
+    os.close(fd)
+' "$lock_file" || return 1
+    fi
+    # Pin the directory entry without following symlinks or opening a FIFO
+    # or device. Bash then opens the verified regular inode read-only. Linux
+    # protected_regular can reject an O_CREAT open by root in sticky /tmp.
+    coproc LLDPQ_LOCK_PIN { python3 -I -c '
+import os, stat, sys
+fd = os.open(sys.argv[1], os.O_PATH | os.O_NOFOLLOW)
+info = os.fstat(fd)
+if not stat.S_ISREG(info.st_mode) or info.st_uid != int(sys.argv[2]) or info.st_nlink != 1:
+    sys.exit("Unexpected LLDPq collection lock type, owner or link count")
+print(f"/proc/{os.getpid()}/fd/{fd}", flush=True)
+sys.stdin.buffer.read(1)
+' "$lock_file" "$service_uid"; }
+    pid=$!
+    input=${LLDPQ_LOCK_PIN[0]:-} output=${LLDPQ_LOCK_PIN[1]:-}
+    if [[ -n "$input" && -n "$output" ]] && IFS= read -r pinned <&"$input" &&
+       [[ "$pinned" =~ ^/proc/[0-9]+/fd/[0-9]+$ ]] &&
+       exec {UPDATE_PROCESS_LOCK_FD}<"$pinned"; then
+        opened=true
+    fi
+    [[ -z "$output" ]] || exec {output}>&-
+    wait "$pid" || opened=false
+    if [[ "$opened" != "true" ]]; then
+        [[ -z "$UPDATE_PROCESS_LOCK_FD" ]] || exec {UPDATE_PROCESS_LOCK_FD}>&-
+        UPDATE_PROCESS_LOCK_FD=""
+        echo "[!] Could not open the collection lock for $LLDPQ_USER: $lock_file" >&2
+        return 1
+    fi
+}
+
+admin_process_lock_matches() {
+    local path="$1" service_uid="$2" descriptor="/proc/$BASHPID/fd/$UPDATE_PROCESS_LOCK_FD"
+    [[ ! -L "$path" && "$path" -ef "$descriptor" &&
+        "$(stat -Lc '%u:%h' -- "$descriptor")" == "$service_uid:1" ]]
+}
+
 acquire_update_process_lock() {
     local lock_file="${LLDPQ_MONITOR_LOCK_FILE:-/tmp/lldpq-monitor.lock}"
     local wait_seconds="${LLDPQ_UPDATE_LOCK_TIMEOUT:-600}"
@@ -1334,11 +1417,27 @@ acquire_update_process_lock() {
             ;;
     esac
 
-    exec {UPDATE_PROCESS_LOCK_FD}>"$lock_file" || return 1
+    local service_uid
+    if [[ "${ADMIN_UPDATE:-false}" == "true" ]]; then
+        service_uid=$(id -u "$LLDPQ_USER") || return 1
+        open_admin_process_lock "$lock_file" "$service_uid" || return 1
+        if ! admin_process_lock_matches "$lock_file" "$service_uid"; then
+            echo "[!] The collection lock changed while opening $lock_file" >&2
+            release_update_process_lock
+            return 1
+        fi
+    else
+        exec {UPDATE_PROCESS_LOCK_FD}>"$lock_file" || return 1
+    fi
     if ! flock -w "$wait_seconds" "$UPDATE_PROCESS_LOCK_FD"; then
         echo "[!] Timed out waiting for the active LLDPq collection to finish; update was not started" >&2
         exec {UPDATE_PROCESS_LOCK_FD}>&-
         UPDATE_PROCESS_LOCK_FD=""
+        return 1
+    fi
+    if [[ "${ADMIN_UPDATE:-false}" == "true" ]] && ! admin_process_lock_matches "$lock_file" "$service_uid"; then
+        echo "[!] The collection lock changed while waiting for $lock_file" >&2
+        release_update_process_lock
         return 1
     fi
     echo "  LLDPq collection lock acquired; cron/web refreshes will stay out of the update"
@@ -3324,13 +3423,14 @@ systemd_quote_value() {
     printf '"%s"' "$value"
 }
 
+lldpq_recovery_exec_start() {
+    printf 'ExecStart=/usr/bin/python3 %s recover --lldpq-dir %s --user %s --web-root %s\n' \
+        "$(systemd_quote_value "$LLDPQ_BACKUP_IMPORT_HELPER")" \
+        "$(systemd_quote_value "$2")" "$(systemd_quote_value "$1")" "$(systemd_quote_value "$3")"
+}
+
 render_lldpq_recovery_service() {
     local output="$1" user="$2" install_dir="$3" web_root="$4"
-    local script_q install_q user_q web_q
-    script_q=$(systemd_quote_value "$LLDPQ_BACKUP_IMPORT_HELPER")
-    install_q=$(systemd_quote_value "$install_dir")
-    user_q=$(systemd_quote_value "$user")
-    web_q=$(systemd_quote_value "$web_root")
     cat > "$output" <<EOF
 [Unit]
 Description=LLDPq retained backup-import recovery
@@ -3341,7 +3441,7 @@ Before=nginx.service fcgiwrap.service lldpq-console.service
 Type=oneshot
 TimeoutStartSec=0
 UMask=0077
-ExecStart=/usr/bin/python3 $script_q recover --lldpq-dir $install_q --user $user_q --web-root $web_q
+$(lldpq_recovery_exec_start "$user" "$install_dir" "$web_root")
 
 [Install]
 WantedBy=multi-user.target
@@ -3384,6 +3484,148 @@ resolve_lldpq_user_home() {
         return 1
     fi
     printf '%s\n' "$user_home"
+}
+
+# The service and web accounts can edit lldpq.conf. For an administrator's
+# update, bind its target tuple to the recovery unit installed by root.
+validate_admin_update_install() {
+    local user="$1" install_dir="$2" web_root="$3" unit="$4"
+    local uid service_home path metadata protected installed_start expected_start
+    if [[ ! "$user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9._-]*[$]?$ ]] ||
+       ! uid=$(id -u "$user") || ! service_home=$(resolve_lldpq_user_home "$user"); then
+        echo "[!] Cannot identify the installed LLDPq service account: $user" >&2
+        return 1
+    fi
+    case "$service_home" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/www)
+            echo "[!] Unsafe LLDPq service home: $service_home" >&2
+            return 1 ;;
+        /root)
+            if [[ "$uid" != 0 ]]; then
+                echo "[!] Refusing /root as the home of non-root service account $user" >&2
+                return 1
+            fi ;;
+    esac
+    for path in "$service_home" "$install_dir" "$web_root"; do
+        if [[ "$path" != /* || "$path" == *[[:cntrl:]]* || ! -d "$path" ||
+              "$path" != "$(canonical_path "$path")" ]]; then
+            echo "[!] Expected an existing canonical LLDPq directory: $path" >&2
+            return 1
+        fi
+    done
+    guard_managed_path "LLDPq install" "$install_dir" 2 >/dev/null &&
+        guard_recursive_target "LLDPq install" "$install_dir" false "$service_home" >/dev/null &&
+        guard_managed_path "web root" "$web_root" 2 >/dev/null &&
+        guard_recursive_target "web root" "$web_root" true "$service_home" >/dev/null || return 1
+    for path in "$install_dir" "$web_root"; do
+        if [[ "$service_home" == "$path" || "$service_home" == "$path"/* ||
+              "$path" == "$service_home"/lldpq-backup-* ]]; then
+            echo "[!] Refusing LLDPq target overlapping the service home or a backup: $path" >&2
+            return 1
+        fi
+        for protected in "$service_home/.ssh" "$service_home/.lldpq-state"; do
+            if paths_overlap "$path" "$protected"; then
+                echo "[!] Refusing LLDPq target overlapping preserved service data: $path" >&2
+                return 1
+            fi
+        done
+    done
+    if paths_overlap "$install_dir" "$web_root" ||
+       [[ "$(stat -c %u -- "$install_dir")" != "$uid" ||
+          ! -f "$install_dir/monitor.sh" || -L "$install_dir/monitor.sh" ||
+          ! -f "$install_dir/devices.yaml" || -L "$install_dir/devices.yaml" ||
+          ! -f "$web_root/setup.html" || -L "$web_root/setup.html" ]]; then
+        echo "[!] Cannot verify the installed LLDPq runtime and web trees for $user" >&2
+        return 1
+    fi
+    if [[ ! -f "$unit" || -L "$unit" || "$unit" != "$(canonical_path "$unit")" ]]; then
+        echo "[!] A root-owned, write-protected LLDPq recovery unit is required: $unit" >&2
+        return 1
+    fi
+    path=$unit
+    while [[ -n "$path" ]]; do
+        if ! metadata=$(stat -c '%u:%a' -- "$path") ||
+           [[ ! "$metadata" =~ ^0:([0-7]{3,4})$ ]] || (( (8#${BASH_REMATCH[1]} & 022) != 0 )); then
+            echo "[!] A root-owned, write-protected recovery unit and parent directories are required: $path" >&2
+            return 1
+        fi
+        path=${path%/*}
+    done
+    # Comments and unrelated unit settings may vary between releases. Require
+    # exactly the one installed command under [Service], including its arguments.
+    installed_start=$(awk '
+        /^[[:space:]]*\[/ { service = ($0 ~ /^[[:space:]]*\[Service\][[:space:]]*$/) }
+        service && /^[[:space:]]*ExecStart[[:space:]]*=/ { print }
+    ' "$unit") || return 1
+    expected_start=$(lldpq_recovery_exec_start "$user" "$install_dir" "$web_root") || return 1
+    if [[ -z "$expected_start" || "$installed_start" != "$expected_start" ]]; then
+        echo "[!] Installed recovery unit does not confirm the configured service user, runtime and web root" >&2
+        return 1
+    fi
+}
+
+# Validate the inputs actually copied to system locations. The invoking
+# administrator must already trust install.sh before launching it with sudo.
+validate_admin_update_source() {
+    python3 -I - "$1" "$2" <<'PYTHON'
+import os
+from pathlib import Path
+import stat
+import sys
+
+source = Path(sys.argv[1])
+trusted_uids = {0, int(sys.argv[2])}
+
+def reject(path):
+    raise SystemExit(f"[!] Admin update requires an operator- or root-controlled release checkout: {path}")
+
+def check(path, allow_sticky=False):
+    info = path.lstat()
+    mode = info.st_mode
+    if info.st_uid not in trusted_uids:
+        reject(path)
+    if not stat.S_ISLNK(mode) and mode & 0o022:
+        if not (allow_sticky and info.st_uid == 0 and mode & stat.S_ISVTX and stat.S_ISDIR(mode)):
+            reject(path)
+    return mode
+
+try:
+    if not source.is_absolute() or source != source.resolve(strict=True):
+        reject(source)
+    for ancestor in source.parents:
+        if not stat.S_ISDIR(check(ancestor, allow_sticky=True)):
+            reject(ancestor)
+    if not stat.S_ISDIR(check(source)):
+        reject(source)
+    for name in ("install.sh", "uninstall.sh", "VERSION", "README.md"):
+        if not stat.S_ISREG(check(source / name)):
+            reject(source / name)
+    for name in ("bin", "etc", "html", "lldpq", "telemetry"):
+        tree = source / name
+        if not stat.S_ISDIR(check(tree)):
+            reject(tree)
+        pending = [tree]
+        while pending:
+            for path in pending.pop().iterdir():
+                mode = check(path)
+                if stat.S_ISDIR(mode):
+                    pending.append(path)
+                elif stat.S_ISLNK(mode):
+                    # Relative, internal links still refer to the same files
+                    # after this payload tree is installed at a new location.
+                    target = Path(os.readlink(path))
+                    if target.is_absolute():
+                        reject(path)
+                    resolved = path.parent
+                    for part in target.parts:
+                        resolved = (resolved / part).resolve(strict=True)
+                        if resolved != tree and tree not in resolved.parents:
+                            reject(path)
+                elif not stat.S_ISREG(mode):
+                    reject(path)
+except (OSError, RuntimeError) as error:
+    raise SystemExit(f"[!] Cannot verify the admin update checkout: {error}")
+PYTHON
 }
 
 ensure_update_runtime_dependencies() {
@@ -3585,15 +3827,25 @@ def validate_paths(payload):
     preserve_dir = safe_absolute(payload, "preserve_dir")
     if not preserve_dir.name.startswith(".lldpq-data-preserve."):
         fail("unexpected runtime preservation directory")
+    snapshot_parent = install_dir.parent
+    if payload.get("admin_staging") is True:
+        snapshot_parent = preserve_dir.parent
+        if (snapshot_parent not in install_dir.parents
+                or snapshot_parent.stat().st_dev != install_dir.parent.stat().st_dev):
+            fail("admin snapshot is outside the managed filesystem")
+        for directory in (snapshot_parent, *snapshot_parent.parents):
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                fail("unsafe admin snapshot parent")
     rollback_value = payload.get("rollback_dir")
     rollback_dir = None
     if rollback_value is not None:
         if not isinstance(rollback_value, str) or not rollback_value.startswith("/"):
             fail("unsafe rollback directory")
         rollback_dir = Path(rollback_value)
-        if (rollback_dir.parent != install_dir.parent
+        if (rollback_dir.parent != snapshot_parent
                 or not rollback_dir.name.startswith(".lldpq-update-rollback.")):
-            fail("rollback directory is outside the managed install parent")
+            fail("rollback directory is outside the managed snapshot parent")
         metadata = rollback_dir.lstat()
         if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0:
             fail("rollback directory has unsafe ownership or type")
@@ -3915,7 +4167,10 @@ show_lldpq_recovery_diagnostics() {
 prepare_update_rollback() {
     local parent
     parent=$(dirname "$LLDPQ_INSTALL_DIR")
-    UPDATE_ROLLBACK_DIR=$(root_run mktemp -d "$parent/.lldpq-update-rollback.XXXXXXXX") || return 1
+    if [[ "${ADMIN_UPDATE:-false}" == true ]]; then
+        parent="${ADMIN_UPDATE_STAGE_PARENT:?}"
+    fi
+    UPDATE_ROLLBACK_DIR=$(root_run mktemp -d "${parent%/}/.lldpq-update-rollback.XXXXXXXX") || return 1
     # /etc/lldpq.conf.lock deliberately carries no data and is not snapshotted:
     # restore_update_file uses rm+cp, which would split concurrent flock users
     # across two inodes. prepare_shared_lock_files normalizes the stable inode.
@@ -4358,6 +4613,8 @@ AUTO_YES=false
 ENABLE_TELEMETRY=false
 DISABLE_TELEMETRY=false
 FORCE_BACKUP=false
+ADMIN_UPDATE=false
+ADMIN_UPDATE_STAGE_PARENT=""
 REPLACE_DHCP_CONFIG=false
 # Remember where we were installed FROM (the source repo) so the web "Update"
 # button can later git pull + reinstall from here (stored as LLDPQ_SRC in lldpq.conf).
@@ -4383,11 +4640,13 @@ for arg in "$@"; do
     case $arg in
         -y) AUTO_YES=true ;;
         --backup) FORCE_BACKUP=true ;;
+        --admin-update) ADMIN_UPDATE=true ;;
         --replace-dhcp-config) REPLACE_DHCP_CONFIG=true ;;
         --enable-telemetry) ENABLE_TELEMETRY=true ;;
         --disable-telemetry) DISABLE_TELEMETRY=true ;;
         -h|--help)
             echo "Usage: ./install.sh [-y] [--backup] [--replace-dhcp-config] [--enable-telemetry] [--disable-telemetry]"
+            echo "       sudo -H ./install.sh --admin-update [-y] [--backup]"
             echo ""
             echo "Automatically detects existing installation:"
             echo "  No existing install → Fresh install (packages, configs, everything)"
@@ -4396,6 +4655,8 @@ for arg in "$@"; do
             echo "Options:"
             echo "  -y                  Auto-yes to all prompts"
             echo "  --backup            (update mode) take a full backup before updating"
+            echo "  --admin-update      Update the registered native installation as an administrator,"
+            echo "                      preserving its service account, paths and data."
             echo "  --replace-dhcp-config"
             echo "                      Replace a non-LLDPq dhcpd.conf after validation + backup"
             echo "  --enable-telemetry  Enable streaming telemetry (requires Docker)"
@@ -4405,10 +4666,50 @@ for arg in "$@"; do
     esac
 done
 
+if [[ "$ADMIN_UPDATE" == true ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            --admin-update|-y|--backup) ;;
+            *) echo "[!] $arg cannot be combined with --admin-update" >&2; exit 1 ;;
+        esac
+    done
+    if [[ ${LLDPQ_CONFIG_FILE:-/etc/lldpq.conf} != /etc/lldpq.conf ]]; then
+        echo "[!] --admin-update requires the installed /etc/lldpq.conf" >&2
+        exit 1
+    fi
+    if (( EUID != 0 )); then
+        echo "[!] Run sudo -H ./install.sh --admin-update from your own trusted release checkout." >&2
+        exit 1
+    fi
+    validate_admin_update_source "$LLDPQ_SRC_DIR" "${SUDO_UID:-0}" || exit 1
+    if [[ ! -f /etc/lldpq.conf || -L /etc/lldpq.conf ]]; then
+        echo "[!] --admin-update requires an existing native installation with a regular /etc/lldpq.conf" >&2
+        exit 1
+    fi
+    # Read the configuration after any preceding lifecycle operation finishes.
+    # Older releases without the uninstall gateway use the normal update locks.
+    if [[ -e "$LLDPQ_UNINSTALL_WEB_GATEWAY" || -L "$LLDPQ_UNINSTALL_WEB_GATEWAY" ||
+          -e "$LLDPQ_UNINSTALL_ACTIVE_MARKER" || -L "$LLDPQ_UNINSTALL_ACTIVE_MARKER" ]]; then
+        acquire_install_lifecycle_lock || exit 1
+    fi
+fi
+
 LLDPQ_CONFIG_FILE="${LLDPQ_CONFIG_FILE:-/etc/lldpq.conf}"
 if ! load_lldpq_config "$LLDPQ_CONFIG_FILE"; then
     echo "[!] Existing runtime configuration could not be read safely: $LLDPQ_CONFIG_FILE" >&2
     exit 1
+fi
+
+if [[ "$ADMIN_UPDATE" == true ]]; then
+    for key in LLDPQ_USER LLDPQ_DIR WEB_ROOT; do
+        if [[ -z "${LLDPQ_CONFIG_LOADED_KEYS[$key]:-}" || -z "${!key}" ]]; then
+            echo "[!] Missing $key in /etc/lldpq.conf; cannot identify the existing installation." >&2
+            exit 1
+        fi
+    done
+    validate_admin_update_install "$LLDPQ_USER" "$LLDPQ_DIR" "$WEB_ROOT" \
+        /etc/systemd/system/lldpq-recovery.service || exit 1
+    ADMIN_UPDATE_STAGE_PARENT=$(admin_update_stage_parent "$LLDPQ_DIR") || exit 1
 fi
 
 # ============================================================================
@@ -4589,7 +4890,7 @@ validate_cron_schedule "${GETCONF_CRON:-0 */12 * * *}" || {
 # ============================================================================
 
 # Check if running via sudo from non-root user (causes $HOME issues)
-if [[ $EUID -eq 0 ]] && [[ -n "$SUDO_USER" ]] && [[ "$SUDO_USER" != "root" ]]; then
+if [[ "$ADMIN_UPDATE" == false && $EUID -eq 0 && -n "$SUDO_USER" && "$SUDO_USER" != root ]]; then
     echo "[!] Please run without sudo: ./install.sh"
     echo "    The script will ask for sudo when needed"
     exit 1
@@ -4628,10 +4929,12 @@ fi
 LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 WEB_ROOT="${WEB_ROOT:-/var/www/html}"
 
-LLDPQ_INSTALL_DIR=$(guard_managed_path "LLDPq install" "$LLDPQ_INSTALL_DIR" 2) || exit 1
-WEB_ROOT=$(guard_managed_path "web root" "$WEB_ROOT" 2) || exit 1
-LLDPQ_INSTALL_DIR=$(guard_recursive_target "LLDPq install" "$LLDPQ_INSTALL_DIR" false) || exit 1
-WEB_ROOT=$(guard_recursive_target "web root" "$WEB_ROOT" true) || exit 1
+if [[ "$ADMIN_UPDATE" == false ]]; then
+    LLDPQ_INSTALL_DIR=$(guard_managed_path "LLDPq install" "$LLDPQ_INSTALL_DIR" 2) || exit 1
+    WEB_ROOT=$(guard_managed_path "web root" "$WEB_ROOT" 2) || exit 1
+    LLDPQ_INSTALL_DIR=$(guard_recursive_target "LLDPq install" "$LLDPQ_INSTALL_DIR" false) || exit 1
+    WEB_ROOT=$(guard_recursive_target "web root" "$WEB_ROOT" true) || exit 1
+fi
 if paths_overlap "$LLDPQ_INSTALL_DIR" "$WEB_ROOT"; then
     echo "[!] LLDPQ_DIR and WEB_ROOT must not overlap" >&2
     exit 1
@@ -4666,7 +4969,10 @@ if [[ -e "$LLDPQ_UNINSTALL_WEB_GATEWAY" || -L "$LLDPQ_UNINSTALL_WEB_GATEWAY" ||
 fi
 
 # Running as root advisory
-if [[ $EUID -eq 0 ]]; then
+if [[ "$ADMIN_UPDATE" == true ]]; then
+    printf 'Updating %s as administrator. Service account: %s. Web root: %s.\n' \
+        "$LLDPQ_INSTALL_DIR" "$LLDPQ_USER" "$WEB_ROOT"
+elif [[ $EUID -eq 0 ]]; then
     echo ""
     echo "[!] Running as root"
     echo "    Files will be installed in $LLDPQ_INSTALL_DIR"
@@ -4723,7 +5029,9 @@ quiesce_recovery_units_for_fresh_install() {
 INSTALL_MODE="fresh"
 BACKUP_DIR=""
 
-if [[ -f /etc/lldpq.conf ]] || [[ -f /etc/lldpq-users.conf ]] || [[ -d /var/lib/lldpq ]]; then
+if [[ "$ADMIN_UPDATE" == true ]]; then
+    INSTALL_MODE="update"
+elif [[ -f /etc/lldpq.conf ]] || [[ -f /etc/lldpq-users.conf ]] || [[ -d /var/lib/lldpq ]]; then
     echo ""
     echo "Existing LLDPq installation detected:"
     [[ -f /etc/lldpq.conf ]] && echo "  • /etc/lldpq.conf"
@@ -4926,7 +5234,6 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # Allow-listed values were loaded once before mode detection.  Do not
     # re-read a group-writable file after validating its managed paths.
     WEB_ROOT="${WEB_ROOT:-/var/www/html}"
-    LLDPQ_USER="${LLDPQ_USER:-$(whoami)}"
 
     # -- Optional full backup (ask; default No) -------------------------------
     # NOTE: runtime monitoring data is ALWAYS preserved across the update (see the
@@ -4943,8 +5250,22 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
 
     if [[ "$_do_backup" == "true" ]]; then
         step "Creating backup..."
-        BACKUP_DIR="$HOME/lldpq-backup-$(date +%Y-%m-%d_%H-%M-%S)"
-        mkdir "$BACKUP_DIR"
+        if [[ "$ADMIN_UPDATE" == "true" ]]; then
+            # This snapshot contains keys and authentication data. Keep it
+            # private to the administrator, outside service-writable trees.
+            if [[ ! -e /var/backups && ! -L /var/backups ]]; then
+                mkdir -m 0755 /var/backups || exit 1
+            fi
+            if [[ ! -d /var/backups || -L /var/backups ||
+                  ! "$(stat -c '%u:%a' -- /var/backups)" =~ ^0:[0-7]?[0-7][0145][0145]$ ]]; then
+                echo "[!] --backup requires a root-controlled /var/backups directory" >&2
+                exit 1
+            fi
+            BACKUP_DIR=$(mktemp -d "/var/backups/lldpq-backup-$(date +%Y-%m-%d_%H-%M-%S).XXXXXX") || exit 1
+        else
+            BACKUP_DIR="$HOME/lldpq-backup-$(date +%Y-%m-%d_%H-%M-%S)"
+            mkdir -m 700 "$BACKUP_DIR" || exit 1
+        fi
         echo "  Backup directory: $BACKUP_DIR"
 
         _backup_copy() {
@@ -5021,7 +5342,7 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         done
 
         # SSH keys
-        _ssh_keys=("$HOME"/.ssh/id_*)
+        _ssh_keys=("$LLDPQ_USER_HOME"/.ssh/id_*)
         if [[ -e "${_ssh_keys[0]}" || -L "${_ssh_keys[0]}" ]]; then
             mkdir -p "$BACKUP_DIR/ssh-keys"
             for _ssh_key in "${_ssh_keys[@]}"; do
@@ -5076,7 +5397,8 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # Preserve runtime data across the rm+recopy (ALWAYS — independent of the optional
     # backup above). Uses sudo because monitor-results may contain root-owned files
     # written by cron; a rename keeps it on the same filesystem (fast, no big copy).
-    if ! _DATA_PRESERVE=$(mktemp -d "$HOME/.lldpq-data-preserve.XXXXXX"); then
+    _preserve_parent="${ADMIN_UPDATE_STAGE_PARENT:-$HOME}"
+    if ! _DATA_PRESERVE=$(mktemp -d "${_preserve_parent%/}/.lldpq-data-preserve.XXXXXX"); then
         echo "[!] Could not create runtime preservation directory; update was not started" >&2
         sudo rm -rf "$_preserved_dir" 2>/dev/null || true
         _preserved_dir=""
@@ -5119,6 +5441,10 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     # Preserve that global order here so an active collector cannot hold the
     # process lock while waiting behind this installer's config lock.
     acquire_update_config_lock || exit 1
+    if [[ "$ADMIN_UPDATE" == true && "$ADMIN_UPDATE_CONFIG_DIGEST" != "$(sha256sum < "$LLDPQ_CONFIG_FILE")" ]]; then
+        echo "[!] LLDPq configuration changed during preflight. Restart the admin update to use the new settings." >&2
+        exit 1
+    fi
     acquire_update_provision_locks || exit 1
 
     if [[ -f "$LLDPQ_INSTALL_DIR/devices.yaml" ]]; then
@@ -5395,6 +5721,7 @@ fi
 if [[ "$INSTALL_MODE" == "update" ]]; then
     _config_validation_file="$LLDPQ_CONFIG_FILE"
     _config_validation_snapshot=""
+    _config_validation_runner=()
     # Validate content with the freshly installed parser, but never execute
     # that newly copied program as root.  A private snapshot also avoids
     # rejecting a valid update merely because the invoking admin is not the
@@ -5407,8 +5734,15 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
             exit 1
         }
         _config_validation_file="$_config_validation_snapshot"
+        if [[ "$ADMIN_UPDATE" == "true" ]]; then
+            if ! setfacl -m "u:${LLDPQ_USER}:r" "$_config_validation_snapshot"; then
+                rm -f "$_config_validation_snapshot"
+                exit 1
+            fi
+            _config_validation_runner=(sudo -H -u "$LLDPQ_USER")
+        fi
     fi
-    if ! /usr/local/bin/lldpq-config --require-config \
+    if ! "${_config_validation_runner[@]}" /usr/local/bin/lldpq-config --require-config \
        --require-key LLDPQ_DIR --require-key LLDPQ_USER --require-key WEB_ROOT \
        --config "$_config_validation_file" >/dev/null; then
         [[ -z "$_config_validation_snapshot" ]] || rm -f "$_config_validation_snapshot"
@@ -5416,7 +5750,7 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
         exit 1
     fi
     [[ -z "$_config_validation_snapshot" ]] || rm -f "$_config_validation_snapshot"
-    unset _config_validation_file _config_validation_snapshot
+    unset _config_validation_file _config_validation_snapshot _config_validation_runner
 fi
 
 echo "  - Installing root-owned backup/import helper"
@@ -5762,7 +6096,10 @@ echo "    Web user can read and write the install tree"
 # Update git hooks if .git exists (update mode preserves .git from backup restore later)
 if [[ -d "$LLDPQ_INSTALL_DIR/.git" ]]; then
     echo "  - Updating git hooks..."
-    sudo tee "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" > /dev/null << 'HOOKEOF'
+    # The restored Git tree belongs to the service user. Create hooks with
+    # their final ownership and keep writes inside that account's privileges.
+    _hook_writer=(sudo -H -u "$LLDPQ_USER" -g www-data)
+    "${_hook_writer[@]}" tee "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" > /dev/null << 'HOOKEOF'
 #!/bin/bash
 # Fix permissions after git pull/merge (preserve group read access for www-data)
 chmod 750 "$(git rev-parse --show-toplevel)" 2>/dev/null || true
@@ -5781,10 +6118,9 @@ if [ -d "$(git rev-parse --show-toplevel)/monitor-results" ]; then
         -exec chmod 664 {} + 2>/dev/null || true
 fi
 HOOKEOF
-    sudo chmod +x "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge"
-    sudo cp "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
-    sudo chown "$LLDPQ_USER:www-data" "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" \
-        "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
+    "${_hook_writer[@]}" chmod +x "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge"
+    "${_hook_writer[@]}" cp "$LLDPQ_INSTALL_DIR/.git/hooks/post-merge" "$LLDPQ_INSTALL_DIR/.git/hooks/post-checkout"
+    unset _hook_writer
     sudo -u "$LLDPQ_USER" git -C "$LLDPQ_INSTALL_DIR" config core.sharedRepository group 2>/dev/null || true
     echo "    Git hooks updated"
 fi
@@ -5834,7 +6170,10 @@ if [[ "$INSTALL_MODE" == "update" ]]; then
     ANSIBLE_DIR="${_SAVE_ANSIBLE_DIR:-}"
     EDITOR_ROOT="${_SAVE_EDITOR_ROOT:-$ANSIBLE_DIR}"
 
-    if [[ "$ANSIBLE_DIR" == "NoNe" ]]; then
+    if [[ "$ADMIN_UPDATE" == "true" ]]; then
+        EDITOR_ROOT="${_SAVE_EDITOR_ROOT:-}"
+        echo "  Keeping the installed Ansible settings"
+    elif [[ "$ANSIBLE_DIR" == "NoNe" ]]; then
         echo "  Ansible not configured. Skipping."
     elif [[ -n "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR" ]]; then
         echo "  Using existing: $ANSIBLE_DIR"
@@ -5911,17 +6250,19 @@ fi
 # ANSIBLE_DIR is later used by recursive chmod/chown and git operations.  Treat
 # a configured or interactively supplied value with the same root-deny policy
 # as the install and web roots.
-if [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]]; then
+if [[ "$ADMIN_UPDATE" != "true" && "$ANSIBLE_DIR" != "NoNe" && -n "$ANSIBLE_DIR" ]]; then
     ANSIBLE_DIR=$(guard_managed_path "Ansible project" "$ANSIBLE_DIR" 2) || exit 1
     ANSIBLE_DIR=$(guard_recursive_target "Ansible project" "$ANSIBLE_DIR" false) || exit 1
 fi
-if [[ "${EDITOR_ROOT:-}" != "NoNe" ]] && [[ -n "${EDITOR_ROOT:-}" ]]; then
+if [[ "$ADMIN_UPDATE" != "true" && "${EDITOR_ROOT:-}" != "NoNe" && -n "${EDITOR_ROOT:-}" ]]; then
     EDITOR_ROOT=$(guard_managed_path "editor root" "$EDITOR_ROOT" 2) || exit 1
     EDITOR_ROOT=$(guard_recursive_target "editor root" "$EDITOR_ROOT" false) || exit 1
 fi
 
 # Configure Ansible directory permissions (if not NoNe and exists)
-if [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR" ]]; then
+if [[ "$ADMIN_UPDATE" == "true" ]]; then
+    echo "  Keeping existing Ansible permissions and hooks"
+elif [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]] && [[ -d "$ANSIBLE_DIR" ]]; then
     echo "  Configuring web access permissions..."
     sudo usermod -a -G "$LLDPQ_USER" www-data 2>/dev/null || true
     echo "  www-data user added to $LLDPQ_USER group"
@@ -5971,7 +6312,10 @@ elif [[ "$ANSIBLE_DIR" != "NoNe" ]] && [[ -n "$ANSIBLE_DIR" ]]; then
     echo "  It will be created when needed or you can create it manually"
 fi
 
-[[ -z "$ANSIBLE_DIR" ]] && ANSIBLE_DIR="NoNe"
+if [[ "$ADMIN_UPDATE" != "true" ]]; then
+    ANSIBLE_DIR="${ANSIBLE_DIR:-NoNe}"
+    EDITOR_ROOT="${EDITOR_ROOT:-$ANSIBLE_DIR}"
+fi
 
 # ============================================================================
 # COMMON: Write /etc/lldpq.conf
@@ -5988,7 +6332,15 @@ _lldpq_conf_render=$(mktemp "${TMPDIR:-/tmp}/lldpq-conf-render.XXXXXX") || exit 
 echo "# LLDPq Configuration" | tee "$_lldpq_conf_render" > /dev/null
 echo "LLDPQ_DIR=$LLDPQ_INSTALL_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
 echo "LLDPQ_USER=$LLDPQ_USER" | tee -a "$_lldpq_conf_render" > /dev/null
-echo "LLDPQ_SRC=$LLDPQ_SRC_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
+if [[ "$ADMIN_UPDATE" == "true" ]]; then
+    # A private administrator checkout is a release input. Web updates must
+    # keep using the registered source, including its absence on older hosts.
+    if [[ -n "${LLDPQ_CONFIG_LOADED_KEYS[LLDPQ_SRC]:-}" ]]; then
+        printf 'LLDPQ_SRC=%s\n' "$LLDPQ_SRC" >> "$_lldpq_conf_render"
+    fi
+else
+    printf 'LLDPQ_SRC=%s\n' "$LLDPQ_SRC_DIR" >> "$_lldpq_conf_render"
+fi
 _LLDPQ_HOSTNAME_TO_WRITE="${LLDPQ_HOSTNAME:-lldpq}"
 if [[ ! "$_LLDPQ_HOSTNAME_TO_WRITE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
     echo "  [!] Invalid LLDPQ_HOSTNAME; using default 'lldpq'" >&2
@@ -5998,7 +6350,7 @@ printf 'LLDPQ_HOSTNAME=%s\n' "$_LLDPQ_HOSTNAME_TO_WRITE" | \
     tee -a "$_lldpq_conf_render" > /dev/null
 echo "WEB_ROOT=$WEB_ROOT" | tee -a "$_lldpq_conf_render" > /dev/null
 echo "ANSIBLE_DIR=$ANSIBLE_DIR" | tee -a "$_lldpq_conf_render" > /dev/null
-echo "EDITOR_ROOT=${EDITOR_ROOT:-$ANSIBLE_DIR}" | tee -a "$_lldpq_conf_render" > /dev/null
+echo "EDITOR_ROOT=$EDITOR_ROOT" | tee -a "$_lldpq_conf_render" > /dev/null
 echo "DHCP_HOSTS_FILE=/etc/dhcp/dhcpd.hosts" | tee -a "$_lldpq_conf_render" > /dev/null
 echo "DHCP_CONF_FILE=/etc/dhcp/dhcpd.conf" | tee -a "$_lldpq_conf_render" > /dev/null
 echo "DHCP_LEASES_FILE=/var/lib/dhcp/dhcpd.leases" | tee -a "$_lldpq_conf_render" > /dev/null
@@ -6816,11 +7168,14 @@ fi
 # and every ordinary install step has succeeded, but before a successful update
 # discards its rollback snapshot. A crash/failure on either side is therefore
 # recovered with the matching previous manifest (or removes it on first update).
-if ! manage_lldpq_source_manifest install "$LLDPQ_SRC_DIR"; then
+if [[ "$ADMIN_UPDATE" == "true" ]]; then
+    echo "  Preserved existing source registration"
+elif ! manage_lldpq_source_manifest install "$LLDPQ_SRC_DIR"; then
     echo "[!] Could not publish the root-owned LLDPq source manifest" >&2
     exit 1
+else
+    echo "  Source provenance saved to $LLDPQ_SOURCE_MANIFEST"
 fi
-echo "  Source provenance saved to $LLDPQ_SOURCE_MANIFEST"
 
 # Finalize the update transaction before printing a success banner. Calling
 # the same EXIT handler explicitly keeps asynchronous failures (runtime data
